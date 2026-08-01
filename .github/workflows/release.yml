@@ -1,0 +1,185 @@
+name: Release
+
+# Builds a self-contained darwin-arm64 tarball for the zxcv Homebrew channel
+# and attaches it to a GitHub Release. This is the distribution channel for the
+# gateway — users install it with `zxcv install claudex` once the central
+# zxcv repo (wrtn-tech/zxcv) lists a packages/claudex.json pointing at a
+# release produced here.
+#
+# Releasing is automatic and idempotent: on every push to main the
+# pyproject.toml version is checked, and if no release v<version> exists yet
+# the tarball is built and the release (plus its v<version> tag) is created.
+# Merges that don't bump the version are skipped early, so they stay green.
+# Bump the version in pyproject.toml to ship a release.
+#
+# Contract with the central zxcv repo:
+#   - asset name:  claudex-gateway-<version>-darwin-arm64.tar.gz
+#   - tar root:    bin/claudex-gateway executable entrypoint
+#
+# The tarball is assembled (not compiled) by scripts/build-darwin-asset.sh —
+# see the layout, runtime pin, and pure-Python constraint documented there.
+# This runner is Linux, so the script cross-installs for darwin-arm64 and
+# smoke-tests the platform-independent parts with a host interpreter; a
+# developer Mac running the same script exercises the real bundled runtime.
+#
+# workflow_dispatch with dry_run=true (the default) uploads the tarball as an
+# actions artifact instead of creating a release, so the output can be
+# inspected without tagging. PRs that touch this workflow or the build script
+# get the same dry-run treatment automatically (GitHub only registers
+# workflow_dispatch for workflows on the default branch, so this is also how
+# changes to these files are verified before merge).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - '.github/workflows/release.yml'
+      - 'scripts/build-darwin-asset.sh'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Upload the tarball as an actions artifact instead of creating a release'
+        type: boolean
+        default: true
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    # GitHub-hosted x64 Linux; the build script cross-installs for darwin-arm64.
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # This workflow holds contents:write and also runs on PRs — don't
+          # leave the token in .git/config where code run by build steps
+          # could read it. Steps that need the token get it via env instead.
+          persist-credentials: false
+
+      - name: Install uv
+        run: |
+          # uv drives the wheel build, the darwin cross-install, and provides
+          # the host CPython used by tests and JSON parsing below.
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Resolve version and check for an existing release
+        id: resolve
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          # The release version is whatever pyproject.toml says — merging a
+          # version bump to main is what ships a release. If that version is
+          # already released, every remaining step is skipped so unrelated
+          # merges stay green and cheap.
+          VERSION="$(sed -n 's/^version = "\(.*\)"$/\1/p' pyproject.toml | head -1)"
+          if [ -z "${VERSION}" ]; then
+            echo "::error::Could not read version from pyproject.toml."
+            exit 1
+          fi
+          ASSET="claudex-gateway-${VERSION}-darwin-arm64.tar.gz"
+          echo "VERSION=${VERSION}" >> "${GITHUB_ENV}"
+          echo "ASSET=${ASSET}" >> "${GITHUB_ENV}"
+
+          # Only real release paths consult the API: pushes to main and
+          # manual runs with dry_run=false. Dry runs always build.
+          SKIP=false
+          if [ "${GITHUB_EVENT_NAME}" = "push" ] || { [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ] && [ "${DRY_RUN}" = "false" ]; }; then
+            STATUS="$(curl -sS -o release.json -w '%{http_code}' \
+              -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/releases/tags/v${VERSION}")"
+            case "${STATUS}" in
+              200)
+                # The release alone is not enough — a run that died between
+                # release creation and asset upload must be repairable by
+                # re-running, so only skip when the asset is attached too.
+                if uv run --no-project python -c "import json,sys; sys.exit(0 if any(a['name'] == sys.argv[1] for a in json.load(open('release.json'))['assets']) else 1)" "${ASSET}"; then
+                  echo "Release v${VERSION} already has ${ASSET} — nothing to do."
+                  SKIP=true
+                else
+                  echo "Release v${VERSION} exists but is missing ${ASSET} — rebuilding to attach it."
+                fi
+                ;;
+              404) echo "Release v${VERSION} does not exist yet — releasing." ;;
+              *)
+                echo "::error::Unexpected HTTP ${STATUS} while checking for release v${VERSION} — token or API problem."
+                exit 1
+                ;;
+            esac
+          fi
+          echo "skip=${SKIP}" >> "${GITHUB_OUTPUT}"
+
+      - name: Test
+        if: steps.resolve.outputs.skip != 'true'
+        run: |
+          uv sync --frozen
+          uv run --frozen pytest
+
+      - name: Build darwin-arm64 asset
+        if: steps.resolve.outputs.skip != 'true'
+        run: ./scripts/build-darwin-asset.sh
+
+      - name: Upload artifact (dry run)
+        if: github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && inputs.dry_run)
+        uses: actions/upload-artifact@v4
+        with:
+          name: claudex-gateway-${{ env.VERSION }}-darwin-arm64
+          path: build/${{ env.ASSET }}
+          if-no-files-found: error
+
+      - name: Create GitHub Release and upload asset
+        if: steps.resolve.outputs.skip != 'true' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && !inputs.dry_run))
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          # Uses the REST API directly — no gh CLI or credential setup needed.
+          # Creating the release with tag_name v<version> also creates the
+          # tag, pointing at this commit. The re-check below backs up the
+          # one in the resolve step (a queued run may have released this
+          # version meanwhile) and also covers the repair path: a release
+          # that exists but lacks the asset gets the asset attached.
+          TAG="v${VERSION}"
+          API="${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}"
+          AUTH="Authorization: Bearer ${GITHUB_TOKEN}"
+          ACCEPT="Accept: application/vnd.github+json"
+
+          STATUS="$(curl -sS -o release.json -w '%{http_code}' -H "${AUTH}" -H "${ACCEPT}" "${API}/releases/tags/${TAG}")"
+          if [ "${STATUS}" = "200" ]; then
+            if uv run --no-project python -c "import json,sys; sys.exit(0 if any(a['name'] == sys.argv[1] for a in json.load(open('release.json'))['assets']) else 1)" "${ASSET}"; then
+              echo "Release ${TAG} already has ${ASSET} — skipping."
+              exit 0
+            fi
+            echo "Release ${TAG} exists but is missing ${ASSET} — uploading to it."
+          elif [ "${STATUS}" = "404" ]; then
+            echo "Creating release ${TAG} ..."
+            STATUS="$(curl -sS -o release.json -w '%{http_code}' -X POST -H "${AUTH}" -H "${ACCEPT}" "${API}/releases" \
+              -d "{\"tag_name\":\"${TAG}\",\"name\":\"${TAG}\",\"target_commitish\":\"${GITHUB_SHA}\"}")"
+            if [ "${STATUS}" != "201" ]; then
+              echo "::error::Release creation failed (HTTP ${STATUS}): $(cat release.json)"
+              exit 1
+            fi
+          else
+            echo "::error::Unexpected HTTP ${STATUS} while checking for release ${TAG} — token or API problem."
+            exit 1
+          fi
+
+          UPLOAD_URL="$(uv run --no-project python -c "import json,re; print(re.sub(r'\{[^}]*\}\$', '', json.load(open('release.json'))['upload_url']))")"
+          echo "Uploading ${ASSET} ..."
+          STATUS="$(curl -sS -o upload.json -w '%{http_code}' -X POST -H "${AUTH}" -H "${ACCEPT}" \
+            -H "Content-Type: application/gzip" \
+            --data-binary @"build/${ASSET}" \
+            "${UPLOAD_URL}?name=${ASSET}")"
+          if [ "${STATUS}" != "201" ]; then
+            echo "::error::Asset upload failed (HTTP ${STATUS}): $(cat upload.json)"
+            exit 1
+          fi
+          echo "Release ${TAG} created with asset ${ASSET}."
