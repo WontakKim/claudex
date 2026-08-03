@@ -11,25 +11,29 @@ from pathlib import Path
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8787
 
-# Providers a model_map value may target via a "provider:" prefix; a bare
-# value keeps its historical meaning of a Codex model.
-KNOWN_ROUTE_PROVIDERS = ("codex", "kimi")
+# Providers a model_map value may target. Every value must name one via a
+# "provider:" prefix — bare model names are rejected so a map entry always
+# says which backend serves it.
+KNOWN_ROUTE_PROVIDERS = ("codex", "kimi", "xai")
 
 VALID_REASONING_EFFORTS = ("minimal", "low", "medium", "high", "xhigh", "max")
 
 VALID_LOG_LEVELS = ("debug", "info", "warning", "error")
 
 # Settings-file key for every supported variable: the environment variable
-# name minus its CLAUDEX_ prefix, lowercased (CODEX_HOME, having no prefix,
-# keeps its full name). New configuration must be registered here to be
-# loadable from either source; _read_settings_file rejects unknown keys so
-# typos fail at boot instead of being silently ignored.
+# name minus its CLAUDEX_ prefix, lowercased (the CLI-home variables —
+# CODEX_HOME, GROK_HOME, KIMI_CODE_HOME — having no prefix, keep their full
+# names). New configuration must be registered here to be loadable from
+# either source; _read_settings_file rejects unknown keys so typos fail at
+# boot instead of being silently ignored.
 SETTINGS_KEYS: dict[str, str] = {
     "host": "CLAUDEX_HOST",
     "port": "CLAUDEX_PORT",
     "model_map": "CLAUDEX_MODEL_MAP",
     "reasoning_effort": "CLAUDEX_REASONING_EFFORT",
     "codex_home": "CODEX_HOME",
+    "grok_home": "GROK_HOME",
+    "kimi_code_home": "KIMI_CODE_HOME",
     "local_token": "CLAUDEX_LOCAL_TOKEN",
     "log_level": "CLAUDEX_LOG_LEVEL",
 }
@@ -48,15 +52,21 @@ class RouteTarget:
 
 
 def parse_route_target(value: str) -> RouteTarget:
-    """Parse a model_map value like "kimi:k2.5" or a bare Codex model name.
+    """Parse a model_map value like "codex:gpt-5.6-luna" or "kimi:k2.5".
 
+    The provider prefix is mandatory: a bare model name is rejected rather
+    than defaulted to Codex, so every map entry says which backend serves it.
     Only the first colon separates the provider prefix, so upstream model
     names containing colons remain expressible. Unknown prefixes are rejected
     rather than treated as literal model names — a typo like "kim:k2.5" must
     fail at boot, not surface as a baffling upstream 404.
     """
     if ":" not in value:
-        return RouteTarget(provider="codex", model=value)
+        raise ConfigError(
+            f"model target {value!r} has no provider prefix; "
+            f"prefix the serving provider, e.g. 'codex:{value}' "
+            f"(known providers: {', '.join(KNOWN_ROUTE_PROVIDERS)})"
+        )
     prefix, _, model = value.partition(":")
     prefix = prefix.strip()
     model = model.strip()
@@ -74,8 +84,8 @@ def _default_settings_file() -> Path:
     return Path.home() / ".claudex" / "settings.json"
 
 
-def _default_kimi_auth_file() -> Path:
-    return Path.home() / ".claudex" / "kimi-auth.json"
+def _default_kimi_code_home() -> Path:
+    return Path.home() / ".kimi-code"
 
 
 @dataclass(frozen=True)
@@ -83,16 +93,19 @@ class GatewayConfig:
     host: str = DEFAULT_HOST
     port: int = DEFAULT_PORT
     # Maps a Claude model name (exact or substring, e.g. "haiku") to a target
-    # model, optionally prefixed with a provider ("kimi:k2.5"); a bare value
-    # is a Codex model. Unmapped models are relayed verbatim to Anthropic, so
-    # there is no default target — the map alone decides what runs where.
+    # model prefixed with its provider ("codex:gpt-5.6-luna", "kimi:k2.5").
+    # Unmapped models are relayed verbatim to Anthropic, so there is no
+    # default target — the map alone decides what runs where.
     model_map: dict[str, str] = field(default_factory=dict)
     # When set, overrides the reasoning effort derived from the Claude request.
     reasoning_effort_override: str | None = None
     codex_home: Path = field(default_factory=lambda: Path.home() / ".codex")
-    # Where the Kimi OAuth credentials created by `claudex-gateway login kimi`
-    # live; fixed beside settings.json rather than configurable.
-    kimi_auth_file: Path = field(default_factory=_default_kimi_auth_file)
+    # Where the Grok CLI login (`grok login`) lives; mirrors the CLI's own
+    # GROK_HOME. auth.json sits directly inside.
+    grok_home: Path = field(default_factory=lambda: Path.home() / ".grok")
+    # Where the Kimi Code CLI login (`kimi login`) lives; mirrors the CLI's
+    # own KIMI_CODE_HOME. credentials/kimi-code.json sits inside.
+    kimi_code_home: Path = field(default_factory=_default_kimi_code_home)
     local_token: str | None = None
     log_level: str = "info"
     # Where settings are read from and where runtime changes are persisted.
@@ -135,7 +148,7 @@ class GatewayConfig:
         if not 1 <= port <= 65535:
             raise ConfigError(f"{label} must be between 1 and 65535, got {port}")
 
-        model_map = _map_setting("model_map", settings, '{"haiku": "gpt-5.6-luna"}')
+        model_map = _map_setting("model_map", settings, '{"haiku": "codex:gpt-5.6-luna"}')
 
         value, label = _resolve("reasoning_effort", settings)
         if value is not None and not isinstance(value, str):
@@ -148,6 +161,10 @@ class GatewayConfig:
             )
 
         codex_home = _path_setting("codex_home", settings, Path.home() / ".codex")
+        grok_home = _path_setting("grok_home", settings, Path.home() / ".grok")
+        kimi_code_home = _path_setting(
+            "kimi_code_home", settings, _default_kimi_code_home()
+        )
 
         value, label = _resolve("host", settings)
         if value is None:
@@ -183,6 +200,8 @@ class GatewayConfig:
             model_map=model_map,
             reasoning_effort_override=effort,
             codex_home=codex_home,
+            grok_home=grok_home,
+            kimi_code_home=kimi_code_home,
             local_token=local_token,
             log_level=log_level,
             settings_file=settings_file,

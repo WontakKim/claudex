@@ -37,6 +37,7 @@ class CodexCredentials:
     access_token: str
     account_id: str | None
     is_api_key: bool = False
+    email: str | None = None
 
 
 def _decode_jwt_claims(token: str) -> dict[str, Any]:
@@ -60,6 +61,18 @@ def _account_id_from_token(token: str) -> str | None:
         if isinstance(account_id, str) and account_id:
             return account_id
     return None
+
+
+def _email_from_id_token(id_token: object) -> str | None:
+    """Read the account email from the OpenAI id_token, like the Codex CLI does."""
+    if not isinstance(id_token, str) or not id_token:
+        return None
+    claims = _decode_jwt_claims(id_token)
+    email = claims.get("email")
+    if not isinstance(email, str) or not email:
+        profile = claims.get("profile")
+        email = profile.get("email") if isinstance(profile, dict) else None
+    return email if isinstance(email, str) and email else None
 
 
 class CodexAuthManager:
@@ -114,7 +127,11 @@ class CodexAuthManager:
                     access_token = tokens.get("access_token", "")
 
         account_id = tokens.get("account_id") or _account_id_from_token(access_token)
-        return CodexCredentials(access_token=access_token, account_id=account_id)
+        return CodexCredentials(
+            access_token=access_token,
+            account_id=account_id,
+            email=_email_from_id_token(tokens.get("id_token")),
+        )
 
     def _load_auth_file(self) -> dict[str, Any]:
         try:

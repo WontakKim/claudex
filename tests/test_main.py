@@ -296,50 +296,12 @@ def test_unknown_argument_prints_usage_and_exits_2(tmp_path: Path) -> None:
     result = _run_cli(_gateway_env(tmp_path, _free_port()), "definitely-not-a-subcommand")
     assert result.returncode == 2
     assert "usage: claudex-gateway" in result.stderr
-    assert "login kimi" in result.stderr
 
 
-def test_login_requires_a_known_provider(tmp_path: Path) -> None:
-    for arguments in (["login"], ["login", "gemini"]):
+def test_login_subcommand_is_gone(tmp_path: Path) -> None:
+    # Provider logins belong to the CLIs (`codex`/`kimi`/`grok` login); the
+    # gateway only reuses their credential stores.
+    for arguments in (["login"], ["login", "kimi"], ["login", "xai"]):
         result = _run_cli(_gateway_env(tmp_path, _free_port()), *arguments)
         assert result.returncode == 2
-        assert "login kimi" in result.stderr
-
-
-def test_login_kimi_runs_device_flow_and_writes_credentials(
-    tmp_path: Path, monkeypatch, capsys
-) -> None:
-    import claudex_gateway.__main__ as main_module
-    from claudex_gateway.config import GatewayConfig
-    from claudex_gateway.kimi_auth import DeviceAuthorization
-
-    authorization = DeviceAuthorization(
-        device_code="dev-code",
-        user_code="ABCD-1234",
-        verification_uri="https://kimi.com/activate",
-        verification_uri_complete="https://kimi.com/activate?code=ABCD-1234",
-        interval=1.0,
-        expires_in=300.0,
-        device_id="device-1",
-    )
-
-    async def fake_request_device_authorization(http_client):
-        return authorization
-
-    async def fake_poll_device_token(http_client, granted):
-        assert granted is authorization
-        return {"type": "kimi", "access_token": "token", "device_id": "device-1"}
-
-    monkeypatch.setattr(
-        main_module, "request_device_authorization", fake_request_device_authorization
-    )
-    monkeypatch.setattr(main_module, "poll_device_token", fake_poll_device_token)
-
-    auth_file = tmp_path / "kimi-auth.json"
-    main_module._login_kimi(GatewayConfig(kimi_auth_file=auth_file))
-
-    output = capsys.readouterr().out
-    assert "https://kimi.com/activate?code=ABCD-1234" in output
-    assert "ABCD-1234" in output
-    assert json.loads(auth_file.read_text(encoding="utf-8"))["access_token"] == "token"
-    assert stat.S_IMODE(auth_file.stat().st_mode) == 0o600
+        assert "usage: claudex-gateway" in result.stderr

@@ -45,7 +45,7 @@ def test_non_loopback_bind_accepts_local_token(monkeypatch: pytest.MonkeyPatch) 
 
 
 def test_model_names_must_not_be_empty(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("CLAUDEX_MODEL_MAP", '{"":"gpt-5.6-sol"}')
+    monkeypatch.setenv("CLAUDEX_MODEL_MAP", '{"":"codex:gpt-5.6-sol"}')
     with pytest.raises(ConfigError, match="CLAUDEX_MODEL_MAP"):
         GatewayConfig.from_env()
 
@@ -62,14 +62,14 @@ class TestSettingsFile:
             tmp_path,
             {
                 "port": 9090,
-                "model_map": {"haiku": "gpt-5.6-luna"},
+                "model_map": {"haiku": "codex:gpt-5.6-luna"},
             },
         )
 
         config = GatewayConfig.load(settings_file)
 
         assert config.port == 9090
-        assert config.model_map == {"haiku": "gpt-5.6-luna"}
+        assert config.model_map == {"haiku": "codex:gpt-5.6-luna"}
 
     def test_env_overrides_settings_file(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -81,7 +81,7 @@ class TestSettingsFile:
     def test_empty_env_still_overrides(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        settings_file = self._write(tmp_path, {"model_map": {"haiku": "gpt-5.6-luna"}})
+        settings_file = self._write(tmp_path, {"model_map": {"haiku": "codex:gpt-5.6-luna"}})
         monkeypatch.setenv("CLAUDEX_MODEL_MAP", "")
         assert GatewayConfig.load(settings_file).model_map == {}
 
@@ -138,9 +138,12 @@ class TestSettingsFile:
 
 
 class TestMappedRoute:
-    def test_bare_value_routes_to_codex(self) -> None:
+    def test_bare_value_is_rejected(self) -> None:
+        # A programmatically built config bypasses load-time validation, so
+        # the bare target surfaces as a parse error at route time instead.
         config = GatewayConfig(model_map={"claude-fable-5": "gpt-5.6-sol"})
-        assert config.mapped_route("claude-fable-5") == RouteTarget("codex", "gpt-5.6-sol")
+        with pytest.raises(ConfigError, match="no provider prefix"):
+            config.mapped_route("claude-fable-5")
 
     def test_codex_prefix_is_accepted(self) -> None:
         config = GatewayConfig(model_map={"haiku": "codex:gpt-5.6-luna"})
@@ -150,42 +153,52 @@ class TestMappedRoute:
         config = GatewayConfig(model_map={"opus": "kimi:k2.5"})
         assert config.mapped_route("claude-opus-5") == RouteTarget("kimi", "k2.5")
 
+    def test_xai_prefix_routes_to_xai(self) -> None:
+        config = GatewayConfig(model_map={"opus": "xai:grok-4.5"})
+        assert config.mapped_route("claude-opus-5") == RouteTarget("xai", "grok-4.5")
+        assert config.maps_to_provider("xai")
+
     def test_substring_match(self) -> None:
-        config = GatewayConfig(model_map={"haiku": "gpt-5.6-luna"})
+        config = GatewayConfig(model_map={"haiku": "codex:gpt-5.6-luna"})
         assert config.mapped_route("claude-haiku-4-5-20251001") == RouteTarget(
             "codex", "gpt-5.6-luna"
         )
 
     def test_longest_substring_key_wins_over_map_order(self) -> None:
         config = GatewayConfig(
-            model_map={"claude": "gpt-5.5", "claude-haiku": "kimi:k2.5"}
+            model_map={"claude": "codex:gpt-5.5", "claude-haiku": "kimi:k2.5"}
         )
         assert config.mapped_route("claude-haiku-4-5") == RouteTarget("kimi", "k2.5")
         assert config.mapped_route("claude-fable-5") == RouteTarget("codex", "gpt-5.5")
 
     def test_exact_match_beats_substring_keys(self) -> None:
         config = GatewayConfig(
-            model_map={"fable": "gpt-5.6-sol", "claude-fable-5": "gpt-5.5"}
+            model_map={"fable": "codex:gpt-5.6-sol", "claude-fable-5": "codex:gpt-5.5"}
         )
         assert config.mapped_route("claude-fable-5") == RouteTarget("codex", "gpt-5.5")
 
     def test_unmapped_model_returns_none(self) -> None:
-        config = GatewayConfig(model_map={"haiku": "gpt-5.6-luna"})
+        config = GatewayConfig(model_map={"haiku": "codex:gpt-5.6-luna"})
         assert config.mapped_route("claude-sonnet-4-6") is None
 
     def test_missing_model_returns_none(self) -> None:
-        config = GatewayConfig(model_map={"haiku": "gpt-5.6-luna"})
+        config = GatewayConfig(model_map={"haiku": "codex:gpt-5.6-luna"})
         assert config.mapped_route(None) is None
         assert config.mapped_route("") is None
 
     def test_maps_to_provider(self) -> None:
-        config = GatewayConfig(model_map={"opus": "kimi:k2.5", "haiku": "gpt-5.6-luna"})
+        config = GatewayConfig(model_map={"opus": "kimi:k2.5", "haiku": "codex:gpt-5.6-luna"})
         assert config.maps_to_provider("kimi")
         assert config.maps_to_provider("codex")
-        assert not GatewayConfig(model_map={"haiku": "gpt-5.6-luna"}).maps_to_provider("kimi")
+        assert not GatewayConfig(model_map={"haiku": "codex:gpt-5.6-luna"}).maps_to_provider("kimi")
 
 
 class TestRouteTargetValidation:
+    def test_bare_value_fails_at_load(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("CLAUDEX_MODEL_MAP", '{"haiku": "gpt-5.6-luna"}')
+        with pytest.raises(ConfigError, match="no provider prefix"):
+            GatewayConfig.from_env()
+
     def test_unknown_prefix_fails_at_load(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("CLAUDEX_MODEL_MAP", '{"opus": "kim:k2.5"}')
         with pytest.raises(ConfigError, match="unknown provider prefix 'kim'"):
@@ -199,5 +212,11 @@ class TestRouteTargetValidation:
         with pytest.raises(ConfigError, match="names no model after the provider prefix"):
             GatewayConfig.load(settings_file)
 
-    def test_default_kimi_auth_file_location(self) -> None:
-        assert GatewayConfig().kimi_auth_file == Path.home() / ".claudex" / "kimi-auth.json"
+    def test_cli_credential_locations(self) -> None:
+        config = GatewayConfig()
+        assert config.kimi_code_home == Path.home() / ".kimi-code"
+        assert config.grok_home == Path.home() / ".grok"
+
+    def test_kimi_code_home_env_override(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("KIMI_CODE_HOME", "~/kimi-code-alt")
+        assert GatewayConfig.from_env().kimi_code_home == Path.home() / "kimi-code-alt"

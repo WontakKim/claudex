@@ -14,6 +14,7 @@ import pytest
 from claudex_gateway import usage
 from claudex_gateway.codex_auth import CodexAuthError, CodexCredentials
 from claudex_gateway.kimi_auth import KimiAuthError, KimiCredentials
+from claudex_gateway.xai_auth import XAIAuthError, XAICredentials
 
 
 def _run(coroutine: Coroutine[Any, Any, Any]) -> Any:
@@ -538,3 +539,149 @@ def test_reset_epoch_seconds_normalizes_units() -> None:
     assert usage._reset_epoch_seconds("not a date") is None
     assert usage._reset_epoch_seconds(None) is None
     assert usage._reset_epoch_seconds(True) is None
+
+
+# ---------------------------------------------------------------------------
+# xAI usage probe (Grok chat-proxy billing endpoint)
+# ---------------------------------------------------------------------------
+
+
+class XAICredentialsStore:
+    def __init__(self, access_token: str = "xai-tok") -> None:
+        self._credentials = XAICredentials(
+            access_token=access_token, email=None, user_id="user-1"
+        )
+
+    async def get_credentials(self, force_refresh: bool = False) -> XAICredentials:
+        return self._credentials
+
+
+class MissingXAICredentials:
+    async def get_credentials(self, force_refresh: bool = False) -> XAICredentials:
+        raise XAIAuthError("missing xAI credentials")
+
+
+def test_fetch_xai_usage_maps_weekly_credits_and_tier() -> None:
+    seen: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["url"] = str(request.url)
+        seen["authorization"] = request.headers.get("authorization")
+        seen["token_auth"] = request.headers.get("x-xai-token-auth")
+        seen["userid"] = request.headers.get("x-userid")
+        return httpx.Response(
+            200,
+            json={
+                "config": {
+                    "creditUsagePercent": 42.5,
+                    "subscriptionTier": "SUPERGROK",
+                    "currentPeriod": {
+                        "type": "USAGE_PERIOD_TYPE_WEEKLY",
+                        "start": "2026-07-30T00:00:00Z",
+                        "end": "2026-08-06T00:00:00Z",
+                    },
+                }
+            },
+        )
+
+    result = _run(usage.fetch_xai_usage(_mock_client(handler), XAICredentialsStore()))
+
+    assert seen["url"].endswith("/v1/billing?format=credits")
+    assert seen["authorization"] == "Bearer xai-tok"
+    assert seen["token_auth"] == "xai-grok-cli"
+    assert seen["userid"] == "user-1"
+    assert result["status"] == "ok"
+    assert result["plan_type"] == "supergrok"
+    assert result["weekly"]["used_percent"] == 42.5
+    assert result["weekly"]["window_minutes"] == 10080
+    expected = datetime(2026, 8, 6, tzinfo=timezone.utc).timestamp()
+    assert result["weekly"]["resets_at"] == expected
+    assert result["monthly"] is None
+
+
+def test_fetch_xai_usage_accepts_top_level_config() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"creditUsagePercent": 10})
+
+    result = _run(usage.fetch_xai_usage(_mock_client(handler), XAICredentialsStore()))
+
+    assert result["status"] == "ok"
+    assert result["weekly"]["used_percent"] == 10.0
+
+
+def test_fetch_xai_usage_confirmed_weekly_period_means_zero_used() -> None:
+    # Grok omits the protobuf zero, so a missing percent with matching billing
+    # bounds is a full weekly budget, not absent data (mirrors Orca).
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "config": {
+                    "currentPeriod": {
+                        "type": "USAGE_PERIOD_TYPE_WEEKLY",
+                        "start": "2026-07-30T00:00:00Z",
+                        "end": "2026-08-06T00:00:00Z",
+                    },
+                    "billingPeriodStart": "2026-07-30T00:00:00Z",
+                    "billingPeriodEnd": "2026-08-06T00:00:00Z",
+                }
+            },
+        )
+
+    result = _run(usage.fetch_xai_usage(_mock_client(handler), XAICredentialsStore()))
+
+    assert result["status"] == "ok"
+    assert result["weekly"]["used_percent"] == 0.0
+
+
+def test_fetch_xai_usage_falls_back_to_monthly_budget() -> None:
+    urls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        urls.append(str(request.url))
+        if "format=credits" in str(request.url):
+            # Unified-billing account: the credits view carries no percent.
+            return httpx.Response(200, json={"config": {"subscriptionTier": "PREMIUM"}})
+        return httpx.Response(
+            200,
+            json={
+                "config": {
+                    "monthlyLimit": {"val": "100.0"},
+                    "used": {"val": "25.0"},
+                    "billingPeriodEnd": "2026-09-01T00:00:00Z",
+                }
+            },
+        )
+
+    result = _run(usage.fetch_xai_usage(_mock_client(handler), XAICredentialsStore()))
+
+    assert len(urls) == 2
+    assert result["status"] == "ok"
+    assert result["weekly"] is None
+    assert result["monthly"]["used_percent"] == 25.0
+    assert result["monthly"]["window_minutes"] == 43200
+    assert result["plan_type"] == "premium"
+
+
+def test_fetch_xai_usage_without_credit_usage_is_unavailable() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"config": {}})
+
+    result = _run(usage.fetch_xai_usage(_mock_client(handler), XAICredentialsStore()))
+
+    assert result["status"] == "unavailable"
+
+
+def test_fetch_xai_usage_missing_credentials_is_unavailable() -> None:
+    result = _run(usage.fetch_xai_usage(_unused_client(), MissingXAICredentials()))
+    assert result["status"] == "unavailable"
+    assert "missing xAI credentials" in result["error"]
+
+
+def test_fetch_xai_usage_401_is_an_error() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(401, json={"error": "invalid token"})
+
+    result = _run(usage.fetch_xai_usage(_mock_client(handler), XAICredentialsStore()))
+    assert result["status"] == "error"
+    assert "401" in result["error"]

@@ -24,6 +24,8 @@ from claudex_gateway.codex_client import CodexClient, CodexUpstreamError
 from claudex_gateway.config import GatewayConfig
 from claudex_gateway.kimi_auth import KimiCredentials
 from claudex_gateway.kimi_client import KimiClient, KimiUpstreamError
+from claudex_gateway.xai_auth import XAICredentials
+from claudex_gateway.xai_client import XAIClient, XAIUpstreamError
 
 
 class AvailableCodexAuthManager:
@@ -31,7 +33,12 @@ class AvailableCodexAuthManager:
         pass
 
     async def get_credentials(self, force_refresh: bool = False) -> SimpleNamespace:
-        return SimpleNamespace(is_api_key=False, account_id="account", access_token="codex")
+        return SimpleNamespace(
+            is_api_key=False,
+            account_id="account",
+            access_token="codex",
+            email="codex@example.com",
+        )
 
 
 class MissingCodexAuthManager(AvailableCodexAuthManager):
@@ -49,17 +56,35 @@ class AvailableKimiAuthManager:
         pass
 
     async def get_credentials(self, force_refresh: bool = False) -> KimiCredentials:
-        return KimiCredentials(access_token="kimi-token", device_id="device-1")
+        return KimiCredentials(
+            access_token="kimi-token", device_id="device-1", account="kimi-user-1"
+        )
 
 
 class MissingKimiAuthManager(AvailableKimiAuthManager):
     async def get_credentials(self, force_refresh: bool = False) -> KimiCredentials:
-        raise server.KimiAuthError(
-            "no Kimi credentials; run `claudex-gateway login kimi` first"
-        )
+        raise server.KimiAuthError("no Kimi credentials; run `kimi login` first")
 
 
 class FakeKimiClient:
+    def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+        pass
+
+
+class AvailableXAIAuthManager:
+    def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+        pass
+
+    async def get_credentials(self, force_refresh: bool = False) -> XAICredentials:
+        return XAICredentials(access_token="xai-token", email="user@example.com")
+
+
+class MissingXAIAuthManager(AvailableXAIAuthManager):
+    async def get_credentials(self, force_refresh: bool = False) -> XAICredentials:
+        raise server.XAIAuthError("no xAI credentials; run `grok login` first")
+
+
+class FakeXAIClient:
     def __init__(self, *_args: Any, **_kwargs: Any) -> None:
         pass
 
@@ -72,12 +97,16 @@ def _create_test_client(
     codex_client: type = FakeCodexClient,
     kimi_auth: type = AvailableKimiAuthManager,
     kimi_client: type = FakeKimiClient,
+    xai_auth: type = AvailableXAIAuthManager,
+    xai_client: type = FakeXAIClient,
     base_url: str = "http://testserver",
 ) -> TestClient:
     monkeypatch.setattr(server, "CodexAuthManager", codex_auth)
     monkeypatch.setattr(server, "CodexClient", codex_client)
     monkeypatch.setattr(server, "KimiAuthManager", kimi_auth)
     monkeypatch.setattr(server, "KimiClient", kimi_client)
+    monkeypatch.setattr(server, "XAIAuthManager", xai_auth)
+    monkeypatch.setattr(server, "XAIClient", xai_client)
     return TestClient(server.create_app(config or GatewayConfig()), base_url=base_url)
 
 
@@ -113,8 +142,19 @@ def test_health_reports_ok_with_codex_credentials(
     assert health.json() == {
         "status": "ok",
         "providers": {
-            "codex": {"status": "ok", "auth_mode": "chatgpt", "account": "account"},
-            "kimi": {"status": "ok", "required": False},
+            "codex": {
+                "status": "ok",
+                "auth_mode": "chatgpt",
+                "account": "account",
+                "email": "codex@example.com",
+            },
+            "kimi": {"status": "ok", "required": False, "account": "kimi-user-1"},
+            "xai": {
+                "status": "ok",
+                "required": False,
+                "auth_mode": "oauth",
+                "account": "user@example.com",
+            },
         },
     }
 
@@ -155,6 +195,33 @@ def test_health_reports_error_without_kimi_credentials_when_map_routes_to_kimi(
     assert health.json()["status"] == "error"
     assert health.json()["providers"]["kimi"]["status"] == "error"
     assert health.json()["providers"]["kimi"]["required"] is True
+
+
+def test_health_stays_ok_without_xai_credentials_when_map_has_no_xai_route(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with _create_test_client(monkeypatch, xai_auth=MissingXAIAuthManager) as client:
+        health = client.get("/health")
+
+    assert health.status_code == 200
+    assert health.json()["status"] == "ok"
+    assert health.json()["providers"]["xai"]["status"] == "error"
+    assert health.json()["providers"]["xai"]["required"] is False
+
+
+def test_health_reports_error_without_xai_credentials_when_map_routes_to_xai(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = GatewayConfig(model_map={"opus": "xai:grok-4.5"})
+    with _create_test_client(
+        monkeypatch, config=config, xai_auth=MissingXAIAuthManager
+    ) as client:
+        health = client.get("/health")
+
+    assert health.status_code == 503
+    assert health.json()["status"] == "error"
+    assert health.json()["providers"]["xai"]["status"] == "error"
+    assert health.json()["providers"]["xai"]["required"] is True
 
 
 def _upstream_error(status_code: int, error: dict) -> CodexUpstreamError:
@@ -216,6 +283,7 @@ def _gateway(
     anthropic_handler,
     kimi_handler=None,
     kimi_auth: Any | None = None,
+    xai_client: Any | None = None,
 ) -> tuple[TestClient, StubCodexClient]:
     app = server.create_app(config)
     # The lifespan requires real Codex credentials, so set the state directly
@@ -235,6 +303,8 @@ def _gateway(
                 )
             ),
         )
+    if xai_client is not None:
+        app.state.xai_client = xai_client
     return TestClient(app), stub
 
 
@@ -257,7 +327,7 @@ def test_passthrough_forwards_unmapped_model_to_anthropic() -> None:
             headers={"request-id": "req_abc"},
         )
 
-    config = GatewayConfig(model_map={"opus": "gpt-5.6-sol"})
+    config = GatewayConfig(model_map={"opus": "codex:gpt-5.6-sol"})
     client, stub = _gateway(config, handler)
 
     response = client.post(
@@ -321,7 +391,7 @@ def test_mapped_model_routes_to_codex() -> None:
         captured.append(request)
         return httpx.Response(200, json={})
 
-    config = GatewayConfig(model_map={"opus": "gpt-5.6-sol"})
+    config = GatewayConfig(model_map={"opus": "codex:gpt-5.6-sol"})
     client, stub = _gateway(config, handler)
 
     response = client.post("/v1/messages", json=_message_body("claude-opus-4-6"))
@@ -333,7 +403,7 @@ def test_mapped_model_routes_to_codex() -> None:
 
 
 def test_mapped_request_without_max_tokens_is_rejected() -> None:
-    config = GatewayConfig(model_map={"opus": "gpt-5.6-sol"})
+    config = GatewayConfig(model_map={"opus": "codex:gpt-5.6-sol"})
     client, stub = _gateway(config, lambda request: httpx.Response(200, json={}))
 
     body = _message_body("claude-opus-4-6")
@@ -347,7 +417,7 @@ def test_mapped_request_without_max_tokens_is_rejected() -> None:
 
 
 def test_mapped_request_with_unsupported_document_is_rejected() -> None:
-    config = GatewayConfig(model_map={"opus": "gpt-5.6-sol"})
+    config = GatewayConfig(model_map={"opus": "codex:gpt-5.6-sol"})
     client, stub = _gateway(config, lambda request: httpx.Response(200, json={}))
 
     body = _message_body("claude-opus-4-6")
@@ -379,7 +449,7 @@ def test_invalid_json_passes_through_to_anthropic() -> None:
             400, json={"type": "error", "error": {"type": "invalid_request_error"}}
         )
 
-    config = GatewayConfig(model_map={"opus": "gpt-5.6-sol"})
+    config = GatewayConfig(model_map={"opus": "codex:gpt-5.6-sol"})
     client, stub = _gateway(config, handler)
 
     response = client.post(
@@ -398,7 +468,7 @@ def test_count_tokens_passes_through_for_unmapped_model() -> None:
         captured.append(request)
         return httpx.Response(200, json={"input_tokens": 1234})
 
-    config = GatewayConfig(model_map={"opus": "gpt-5.6-sol"})
+    config = GatewayConfig(model_map={"opus": "codex:gpt-5.6-sol"})
     client, _ = _gateway(config, handler)
 
     response = client.post(
@@ -417,7 +487,7 @@ def test_count_tokens_estimates_locally_for_mapped_model() -> None:
         captured.append(request)
         return httpx.Response(200, json={"input_tokens": 1234})
 
-    config = GatewayConfig(model_map={"opus": "gpt-5.6-sol"})
+    config = GatewayConfig(model_map={"opus": "codex:gpt-5.6-sol"})
     client, _ = _gateway(config, handler)
 
     response = client.post(
@@ -703,7 +773,7 @@ def test_kimi_missing_credentials_return_401_with_login_guidance() -> None:
 
     assert response.status_code == 401
     assert response.json()["error"]["type"] == "authentication_error"
-    assert "login kimi" in response.json()["error"]["message"]
+    assert "kimi login" in response.json()["error"]["message"]
 
 
 def test_kimi_anthropic_shaped_error_is_relayed_with_status() -> None:
@@ -737,7 +807,7 @@ def test_kimi_persistent_401_blames_gateway_credentials() -> None:
     assert response.status_code == 401
     message = response.json()["error"]["message"]
     assert "token expired" in message
-    assert "login kimi" in message
+    assert "kimi login" in message
 
 
 def test_kimi_unreachable_returns_502() -> None:
@@ -806,6 +876,77 @@ def test_count_tokens_falls_back_to_estimate_when_kimi_fails() -> None:
 
     assert response.status_code == 200
     assert response.json()["input_tokens"] > 0
+
+
+# --- /v1/messages routing: xai-mapped models go to the xAI Responses backend ---
+
+
+class StubXAIClient:
+    """Records translated payloads and replays a scripted Responses stream."""
+
+    def __init__(self, events: list[dict[str, Any]] | None = None) -> None:
+        self.payloads: list[dict[str, Any]] = []
+        self.events = events
+
+    async def stream_responses(self, payload: dict[str, Any], session_id: str):
+        self.payloads.append(payload)
+        if self.events is None:
+            raise XAIUpstreamError(503, "stub xai upstream")
+        for event in self.events:
+            yield event
+
+
+def _xai_config(target: str = "grok-4.5", **kwargs: Any) -> GatewayConfig:
+    return GatewayConfig(model_map={"opus": f"xai:{target}"}, **kwargs)
+
+
+def test_xai_mapped_model_streams_translated_response() -> None:
+    stub = StubXAIClient(
+        [
+            {"type": "response.created", "response": {"id": "resp_1", "model": "grok-4.5"}},
+            {"type": "response.output_text.delta", "delta": "hello"},
+            {
+                "type": "response.completed",
+                "response": {"id": "resp_1", "usage": {"input_tokens": 1, "output_tokens": 1}},
+            },
+        ]
+    )
+    client, codex_stub = _gateway(_xai_config(), _failing_anthropic_handler, xai_client=stub)
+
+    response = client.post("/v1/messages", json=_message_body("claude-opus-4-6"))
+
+    assert response.status_code == 200
+    # The gateway reports the requested Claude model, not the xAI target.
+    assert response.json()["model"] == "claude-opus-4-6"
+    assert codex_stub.payloads == []
+    (payload,) = stub.payloads
+    assert payload["model"] == "grok-4.5"
+    # No thinking block in the request: the derived medium survives clamping.
+    assert payload["reasoning"]["effort"] == "medium"
+
+
+def test_xai_route_strips_reasoning_for_non_thinking_model() -> None:
+    stub = StubXAIClient()
+    client, _ = _gateway(
+        _xai_config("grok-composer-2.5-fast"), _failing_anthropic_handler, xai_client=stub
+    )
+
+    response = client.post("/v1/messages", json=_message_body("claude-opus-4-6"))
+
+    assert response.status_code == 503
+    (payload,) = stub.payloads
+    assert "reasoning" not in payload
+
+
+def test_xai_route_clamps_effort_for_thinking_model() -> None:
+    stub = StubXAIClient()
+    config = _xai_config("grok-4.5", reasoning_effort_override="max")
+    client, _ = _gateway(config, _failing_anthropic_handler, xai_client=stub)
+
+    client.post("/v1/messages", json=_message_body("claude-opus-4-6"))
+
+    (payload,) = stub.payloads
+    assert payload["reasoning"]["effort"] == "high"
 
 
 # --- upstream stream ownership -------------------------------------------
@@ -917,7 +1058,7 @@ def test_non_streaming_request_closes_the_codex_stream(
     ScriptedCodexClient.closed = False
     client = _create_test_client(
         monkeypatch,
-        config=GatewayConfig(model_map={"opus": "gpt-5.6-sol"}),
+        config=GatewayConfig(model_map={"opus": "codex:gpt-5.6-sol"}),
         codex_client=ScriptedCodexClient,
     )
     with client:
@@ -952,7 +1093,7 @@ class MidStreamErrorCodexClient(FakeCodexClient):
 def test_transport_error_before_first_event_returns_claude_502(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    config = GatewayConfig(model_map={"opus": "gpt-5.6-sol"})
+    config = GatewayConfig(model_map={"opus": "codex:gpt-5.6-sol"})
     with _create_test_client(
         monkeypatch, config=config, codex_client=TimeoutCodexClient
     ) as client:
@@ -960,13 +1101,13 @@ def test_transport_error_before_first_event_returns_claude_502(
 
     assert response.status_code == 502
     assert response.json()["error"]["type"] == "api_error"
-    assert "Codex backend" in response.json()["error"]["message"]
+    assert "codex backend" in response.json()["error"]["message"]
 
 
 def test_transport_error_during_aggregation_returns_claude_502(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    config = GatewayConfig(model_map={"opus": "gpt-5.6-sol"})
+    config = GatewayConfig(model_map={"opus": "codex:gpt-5.6-sol"})
     with _create_test_client(
         monkeypatch, config=config, codex_client=MidStreamErrorCodexClient
     ) as client:
@@ -996,12 +1137,12 @@ class TestAdminMappingApi:
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         with self._admin_client(
-            monkeypatch, tmp_path, model_map={"haiku": "gpt-5.6-luna"}
+            monkeypatch, tmp_path, model_map={"haiku": "codex:gpt-5.6-luna"}
         ) as client:
             response = client.get("/admin/mapping")
 
         assert response.status_code == 200
-        assert response.json()["model_map"] == {"haiku": "gpt-5.6-luna"}
+        assert response.json()["model_map"] == {"haiku": "codex:gpt-5.6-luna"}
 
     def test_put_updates_runtime_and_persists(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -1011,25 +1152,25 @@ class TestAdminMappingApi:
         settings_file.write_text('{"port": 9317}', encoding="utf-8")
         with self._admin_client(monkeypatch, tmp_path) as client:
             response = client.put(
-                "/admin/mapping", json={"model_map": {"opus": "gpt-5.6-sol"}}
+                "/admin/mapping", json={"model_map": {"opus": "codex:gpt-5.6-sol"}}
             )
             # The swap is live for later requests ...
             reread = client.get("/admin/mapping")
 
         assert response.status_code == 200
-        assert response.json()["model_map"] == {"opus": "gpt-5.6-sol"}
-        assert reread.json()["model_map"] == {"opus": "gpt-5.6-sol"}
+        assert response.json()["model_map"] == {"opus": "codex:gpt-5.6-sol"}
+        assert reread.json()["model_map"] == {"opus": "codex:gpt-5.6-sol"}
         # ... and persisted without clobbering unrelated settings keys.
         saved = json.loads(settings_file.read_text(encoding="utf-8"))
-        assert saved == {"port": 9317, "model_map": {"opus": "gpt-5.6-sol"}}
+        assert saved == {"port": 9317, "model_map": {"opus": "codex:gpt-5.6-sol"}}
 
     def test_put_rejected_when_env_overrides(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        monkeypatch.setenv("CLAUDEX_MODEL_MAP", '{"haiku": "gpt-5.6-luna"}')
+        monkeypatch.setenv("CLAUDEX_MODEL_MAP", '{"haiku": "codex:gpt-5.6-luna"}')
         with self._admin_client(monkeypatch, tmp_path) as client:
             response = client.put(
-                "/admin/mapping", json={"model_map": {"opus": "gpt-5.6-sol"}}
+                "/admin/mapping", json={"model_map": {"opus": "codex:gpt-5.6-sol"}}
             )
 
         assert response.status_code == 409
@@ -1063,6 +1204,9 @@ class TestAdminMappingApi:
             accepted = client.put(
                 "/admin/mapping", json={"model_map": {"opus": "kimi:k2.5"}}
             )
+            bare_value = client.put(
+                "/admin/mapping", json={"model_map": {"opus": "gpt-5.6-sol"}}
+            )
             empty_model = client.put(
                 "/admin/mapping", json={"model_map": {"opus": "kimi:"}}
             )
@@ -1072,6 +1216,8 @@ class TestAdminMappingApi:
 
         assert accepted.status_code == 200
         assert accepted.json()["model_map"] == {"opus": "kimi:k2.5"}
+        assert bare_value.status_code == 400
+        assert "no provider prefix" in bare_value.json()["error"]["message"]
         assert empty_model.status_code == 400
         assert "names no model" in empty_model.json()["error"]["message"]
         assert unknown_prefix.status_code == 400
@@ -1107,13 +1253,14 @@ class TestAdminMappingApi:
     def test_get_reports_dashboard_facts_and_env_locks(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        monkeypatch.setenv("CLAUDEX_MODEL_MAP", '{"haiku": "gpt-5.6-luna"}')
+        monkeypatch.setenv("CLAUDEX_MODEL_MAP", '{"haiku": "codex:gpt-5.6-luna"}')
         with self._admin_client(monkeypatch, tmp_path) as client:
             payload = client.get("/admin/mapping").json()
 
         assert payload["env_locked"] == {"model_map": "CLAUDEX_MODEL_MAP"}
         assert payload["codex_home"].endswith(".codex")
-        assert payload["kimi_auth_file"].endswith("kimi-auth.json")
+        assert payload["kimi_code_home"].endswith(".kimi-code")
+        assert payload["grok_home"].endswith(".grok")
 
 
 class TestAdminLogLevel:
@@ -1210,9 +1357,13 @@ def test_admin_usage_returns_all_providers(monkeypatch: pytest.MonkeyPatch) -> N
     async def fake_kimi(http_client: Any, auth_manager: Any) -> dict[str, Any]:
         return {"provider": "kimi", "status": "ok", "error": None}
 
+    async def fake_xai(http_client: Any, auth_manager: Any) -> dict[str, Any]:
+        return {"provider": "xai", "status": "ok", "error": None}
+
     monkeypatch.setattr(server, "fetch_claude_usage", fake_claude)
     monkeypatch.setattr(server, "fetch_codex_usage", fake_codex)
     monkeypatch.setattr(server, "fetch_kimi_usage", fake_kimi)
+    monkeypatch.setattr(server, "fetch_xai_usage", fake_xai)
     with _create_test_client(monkeypatch, base_url="http://127.0.0.1:8787") as client:
         response = client.get("/admin/usage")
 
@@ -1221,6 +1372,7 @@ def test_admin_usage_returns_all_providers(monkeypatch: pytest.MonkeyPatch) -> N
     assert body["claude"]["status"] == "ok"
     assert body["codex"]["status"] == "unavailable"
     assert body["kimi"]["status"] == "ok"
+    assert body["xai"]["status"] == "ok"
     assert body["fetched_at"] > 0
 
 
@@ -1241,9 +1393,13 @@ def test_admin_usage_single_provider_skips_the_others(
     async def kimi_must_not_run(http_client: Any, auth_manager: Any) -> dict[str, Any]:
         raise AssertionError("kimi probe ran for ?provider=claude")
 
+    async def xai_must_not_run(http_client: Any, auth_manager: Any) -> dict[str, Any]:
+        raise AssertionError("xai probe ran for ?provider=claude")
+
     monkeypatch.setattr(server, "fetch_claude_usage", fake_claude)
     monkeypatch.setattr(server, "fetch_codex_usage", codex_must_not_run)
     monkeypatch.setattr(server, "fetch_kimi_usage", kimi_must_not_run)
+    monkeypatch.setattr(server, "fetch_xai_usage", xai_must_not_run)
     with _create_test_client(monkeypatch, base_url="http://127.0.0.1:8787") as client:
         response = client.get("/admin/usage", params={"provider": "claude"})
 
@@ -1252,6 +1408,7 @@ def test_admin_usage_single_provider_skips_the_others(
     assert body["claude"]["status"] == "ok"
     assert "codex" not in body
     assert "kimi" not in body
+    assert "xai" not in body
 
 
 def test_admin_usage_rejects_unknown_provider(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1498,7 +1655,7 @@ def test_dashboard_has_no_hardcoded_codex_model_snapshot(
     # via buildColumns.
     assert "CODEX_FALLBACK" not in page
     assert "gpt-5" not in page
-    assert "CATALOG={codex:[],kimi:[]}" in page
+    assert "CATALOG={codex:[],kimi:[],xai:[]}" in page
 
 
 def test_dashboard_board_shows_only_referenced_targets(
@@ -1512,9 +1669,10 @@ def test_dashboard_board_shows_only_referenced_targets(
     # stages; the catalogs survive purely as autocomplete for that box.
     assert "concat(Object.values(DIR.mapping),addedTargets)" in page
     assert 'list="add-catalog"' in page
-    # Both provider catalogs feed it, so the dashboard depends on the Kimi
-    # endpoint too — not just the Codex one.
+    # All provider catalogs feed it, so the dashboard depends on the Kimi
+    # and xAI endpoints too — not just the Codex one.
     assert '"/admin/kimi/models"' in page
+    assert '"/admin/xai/models"' in page
 
 
 class CatalogCodexClient(FakeCodexClient):
@@ -1565,6 +1723,32 @@ class RejectingKimiClient(FakeKimiClient):
         raise KimiUpstreamError(
             404, '{"type":"error","error":{"type":"not_found_error","message":"model not found"}}'
         )
+
+
+class ProbeXAIClient(FakeXAIClient):
+    async def stream_responses(
+        self, payload: dict[str, Any], session_id: str
+    ) -> AsyncIterator[dict[str, Any]]:
+        yield {"type": "response.created", "response": {"model": payload["model"]}}
+
+
+class CatalogXAIClient(FakeXAIClient):
+    async def list_models(self) -> list[str]:
+        return ["grok-4.5", "grok-4.3"]
+
+
+class FailingCatalogXAIClient(FakeXAIClient):
+    async def list_models(self) -> list[str]:
+        raise XAIUpstreamError(401, '{"error":{"message":"token expired"}}')
+
+
+class RejectingXAIClient(FakeXAIClient):
+    async def stream_responses(
+        self, payload: dict[str, Any], session_id: str
+    ) -> AsyncIterator[dict[str, Any]]:
+        if False:
+            yield {}
+        raise XAIUpstreamError(400, '{"error":{"message":"model_not_found"}}')
 
 
 def test_codex_client_list_models_filters_hidden_models() -> None:
@@ -1648,11 +1832,35 @@ class TestAdminDashboardApi:
         with _create_test_client(monkeypatch, kimi_client=CatalogKimiClient) as client:
             assert client.get("/admin/kimi/models").status_code == 403
 
+    def test_xai_models_returns_catalog_ids(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        with self._client(monkeypatch, xai_client=CatalogXAIClient) as client:
+            response = client.get("/admin/xai/models")
+
+        assert response.status_code == 200
+        assert response.json() == {"models": ["grok-4.5", "grok-4.3"]}
+
+    def test_xai_models_relays_upstream_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        with self._client(monkeypatch, xai_client=FailingCatalogXAIClient) as client:
+            response = client.get("/admin/xai/models")
+
+        assert response.status_code == 401
+        assert response.json()["error"]["message"] == "token expired"
+
+    def test_xai_models_refuses_foreign_host(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        with _create_test_client(monkeypatch, xai_client=CatalogXAIClient) as client:
+            assert client.get("/admin/xai/models").status_code == 403
+
     def test_connection_test_ok(self, monkeypatch: pytest.MonkeyPatch) -> None:
         with self._client(monkeypatch, codex_client=ProbeCodexClient) as client:
             response = client.post(
                 "/admin/test",
-                json={"source": "haiku", "target": "gpt-5.6-luna"},
+                json={"source": "haiku", "target": "codex:gpt-5.6-luna"},
             )
 
         assert response.status_code == 200
@@ -1662,18 +1870,17 @@ class TestAdminDashboardApi:
         assert result["response_model"] == "gpt-5.6-luna"
         assert isinstance(result["latency_ms"], int)
 
-    def test_connection_test_strips_explicit_codex_prefix(
+    def test_connection_test_rejects_bare_target(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         with self._client(monkeypatch, codex_client=ProbeCodexClient) as client:
             response = client.post(
                 "/admin/test",
-                json={"source": "haiku", "target": "codex:gpt-5.6-luna"},
+                json={"source": "haiku", "target": "gpt-5.6-luna"},
             )
 
-        result = response.json()
-        assert result["ok"] is True
-        assert result["response_model"] == "gpt-5.6-luna"
+        assert response.status_code == 400
+        assert "no provider prefix" in response.json()["error"]["message"]
 
     def test_connection_test_kimi_target_probes_kimi(
         self, monkeypatch: pytest.MonkeyPatch
@@ -1704,6 +1911,35 @@ class TestAdminDashboardApi:
         assert result["status"] == 404
         assert "model not found" in result["detail"]
 
+    def test_connection_test_xai_target_probes_xai(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        with self._client(monkeypatch, xai_client=ProbeXAIClient) as client:
+            response = client.post(
+                "/admin/test",
+                json={"source": "fable", "target": "xai:grok-4.5"},
+            )
+
+        assert response.status_code == 200
+        result = response.json()
+        assert result["ok"] is True
+        assert result["status"] == 200
+        assert result["response_model"] == "grok-4.5"
+
+    def test_connection_test_reports_xai_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        with self._client(monkeypatch, xai_client=RejectingXAIClient) as client:
+            response = client.post(
+                "/admin/test",
+                json={"source": "fable", "target": "xai:grok-nope"},
+            )
+
+        result = response.json()
+        assert result["ok"] is False
+        assert result["status"] == 400
+        assert "model_not_found" in result["detail"]
+
     def test_connection_test_rejects_unknown_prefix(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -1722,7 +1958,7 @@ class TestAdminDashboardApi:
         with self._client(monkeypatch, codex_client=RejectingCodexClient) as client:
             response = client.post(
                 "/admin/test",
-                json={"source": "haiku", "target": "gpt-nope"},
+                json={"source": "haiku", "target": "codex:gpt-nope"},
             )
 
         assert response.status_code == 200

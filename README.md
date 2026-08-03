@@ -1,18 +1,17 @@
 # claudex-gateway
 
 A lightweight local gateway that runs mapped Claude Code models on the OpenAI
-Codex or Kimi backend and relays everything else to Anthropic untouched.
+Codex, Kimi, or xAI backend and relays everything else to Anthropic untouched.
 
 ```text
-Claude Code ── mapped model ──────▶ claudex-gateway ── Codex Responses API ─▶ Codex
+Claude Code ── "codex:" mapped ───▶ claudex-gateway ── Codex Responses API ─▶ Codex
 Claude Code ── "kimi:" mapped ────▶ claudex-gateway ── near-verbatim relay ─▶ Kimi coding API
+Claude Code ── "xai:" mapped ─────▶ claudex-gateway ── xAI Responses API ───▶ Grok
 Claude Code ── unmapped model ────▶ claudex-gateway ── verbatim relay ──────▶ Anthropic API
 ```
 
-It ports the Claude → Responses translation layer and the Claude → Kimi relay
-of [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) to Python
-without the multi-provider registry: mapped models to Codex or Kimi,
-everything else to Anthropic.
+Mapped models run on Codex, Kimi, or xAI; everything else goes to Anthropic
+untouched.
 
 ## What it does
 
@@ -30,17 +29,23 @@ everything else to Anthropic.
 - Relays models mapped with a `kimi:` prefix to Kimi's coding endpoint
   (`api.kimi.com/coding`), which speaks the Anthropic Messages API natively —
   no schema translation, only the model name is rewritten out and restored,
-  and the client's credentials are replaced with the gateway's Kimi OAuth
-  token (`claudex-gateway login kimi`).
-- Answers as the Claude model the client requested — the Codex or Kimi target
-  model never appears on the Anthropic wire, so Claude Code heuristics keyed
-  on model names keep working.
-- Serves `GET /health` with the readiness state of the Codex and Kimi
+  and the client's credentials are replaced with the Kimi Code CLI's OAuth
+  token.
+- Routes models mapped with an `xai:` prefix to xAI's Grok Responses backend
+  (`cli-chat-proxy.grok.com`) through the same translation layer as Codex,
+  minus the payload fields xAI rejects and with reasoning effort clamped to
+  the model's supported levels.
+- Answers as the Claude model the client requested — the Codex, Kimi, or xAI
+  target model never appears on the Anthropic wire, so Claude Code heuristics
+  keyed on model names keep working.
+- Serves `GET /health` with the readiness state of the Codex, Kimi, and xAI
   upstreams.
 - Serves a runtime dashboard at `GET /` for editing the model map, checking
   provider health, and testing model connections before wiring them.
-- Reuses the Codex CLI login at `~/.codex/auth.json`; the Kimi login is built
-  in and stores its tokens at `~/.claudex/kimi-auth.json`.
+- Reuses each provider's CLI login — no gateway-side auth: the Codex CLI's
+  `~/.codex/auth.json`, the Kimi Code CLI's `~/.kimi-code` credential store,
+  and the Grok CLI's `~/.grok/auth.json`, each refreshed in place like the
+  CLI itself does.
 
 Two Anthropic contract points cannot be preserved on the Codex path and are
 explicit choices, not bugs:
@@ -61,8 +66,9 @@ explicit choices, not bugs:
 - Python 3.11+ and [uv](https://docs.astral.sh/uv/)
 - For Codex targets: a logged-in [Codex CLI](https://github.com/openai/codex)
   (`codex login`)
-- For Kimi targets: a Kimi subscription logged in via
-  `claudex-gateway login kimi`
+- For Kimi targets: a logged-in Kimi Code CLI (`kimi login`)
+- For xAI targets: a logged-in [Grok CLI](https://github.com/xai-org/grok-build)
+  (`grok login`)
 
 The server starts even when a login is missing; `/health` reports the
 credential state per provider.
@@ -130,7 +136,7 @@ ANTHROPIC_BASE_URL=http://127.0.0.1:8787 ANTHROPIC_AUTH_TOKEN=dummy claude
 
 The placeholder is forwarded to Anthropic for unmapped models and rejected
 there, so this setup needs a catch-all map entry — a substring key that every
-Claude model name contains, e.g. `{"claude": "gpt-5.5"}` — to keep every
+Claude model name contains, e.g. `{"claude": "codex:gpt-5.5"}` — to keep every
 request on Codex.
 
 zxcv installs ship this as the `claudex` command (which also starts the
@@ -146,25 +152,20 @@ Anthropic API, see
 
 ### Claude Code → Kimi
 
-Log in once with the built-in OAuth device flow — it prints a verification
-URL and a code, waits for approval in the browser, and stores the tokens at
-`~/.claudex/kimi-auth.json` (auto-refreshed from then on, no daemon restart
-needed):
-
-```sh
-uv run claudex-gateway login kimi
-```
-
-Then route models to Kimi with a `kimi:` prefix in the map:
+The gateway reuses the Kimi Code CLI login — no gateway-side login step.
+With the CLI logged in (`kimi login`, tokens at
+`~/.kimi-code/credentials/kimi-code.json`), route models to Kimi with a
+`kimi:` prefix in the map:
 
 ```json
 {
-  "model_map": {"opus": "kimi:k3", "haiku": "gpt-5.6-luna"}
+  "model_map": {"opus": "kimi:k3", "haiku": "codex:gpt-5.6-luna"}
 }
 ```
 
-A bare value stays a Codex model (`codex:` is also accepted explicitly), so
-existing maps keep working unchanged. Kimi's coding endpoint speaks the
+Every value names its provider (`codex:`, `kimi:`, or `xai:`); a bare model
+name is rejected at boot and on `PUT`, so an entry always says which backend
+serves it. Kimi's coding endpoint speaks the
 Anthropic Messages API natively, so requests and responses — streaming and
 non-streaming, thinking, tool use — are relayed as-is; only the model name
 and credentials are swapped.
@@ -179,11 +180,36 @@ exposes for map authoring (and as the preset source for the future dashboard):
 curl http://127.0.0.1:8787/admin/kimi/models
 ```
 
-The endpoint requires a completed `login kimi` and honors the same
+The endpoint requires a logged-in Kimi Code CLI and honors the same
 `CLAUDEX_LOCAL_TOKEN` and Host guard as the other admin routes; the response
 is Kimi's catalog verbatim, unshaped by the gateway. Copy the `id` exactly —
 the catalog mixes naming styles (e.g. `kimi-for-coding` next to `k3`), which
 is precisely why the gateway refuses to normalize them.
+
+### Claude Code → xAI
+
+The gateway reuses the Grok CLI login — no gateway-side login step. With the
+CLI logged in (`grok login`, tokens at `~/.grok/auth.json`, or
+`grok login --api-key` for a plain xAI API key), route models to Grok with an
+`xai:` prefix in the map:
+
+```json
+{
+  "model_map": {"opus": "xai:grok-4.5", "haiku": "codex:gpt-5.6-luna"}
+}
+```
+
+xAI speaks the same Responses API family as the Codex backend, so requests
+reuse the full Claude → Responses translation (streaming and non-streaming,
+thinking, tool use); only the wire quirks differ. On the way out the gateway
+drops the fields xAI rejects (`previous_response_id`, `stream_options`,
+`stop`, …) and adapts reasoning: models with thinking levels
+(`grok-4.5`, `grok-4.3`, `grok-3-mini`, `grok-3-mini-fast`,
+`grok-4.20-multi-agent-0309`) keep the effort, clamped to xAI's
+`low`/`medium`/`high` vocabulary, while every other model runs without a
+reasoning config — sending one to a non-thinking model fails upstream.
+A newly released thinking model simply runs at its default effort until the
+gateway's list catches up.
 
 ## Configuration
 
@@ -196,22 +222,25 @@ stays available for one-off overrides.
 | --- | --- | --- |
 | `CLAUDEX_HOST` | `127.0.0.1` | Bind address |
 | `CLAUDEX_PORT` | `8787` | Bind port |
-| `CLAUDEX_MODEL_MAP` | empty | JSON mapping of Claude names, exact or substring, to target models — bare or `codex:`-prefixed values run on Codex, `kimi:`-prefixed values on Kimi; unmapped models are relayed verbatim to Anthropic |
+| `CLAUDEX_MODEL_MAP` | empty | JSON mapping of Claude names, exact or substring, to provider-prefixed target models — `codex:`-prefixed values run on Codex, `kimi:`-prefixed values on Kimi, `xai:`-prefixed values on xAI; unmapped models are relayed verbatim to Anthropic |
 | `CLAUDEX_REASONING_EFFORT` | derived | Force `minimal`, `low`, `medium`, `high`, `xhigh`, or `max` on Codex requests |
 | `CODEX_HOME` | `~/.codex` | Directory containing Codex `auth.json` |
+| `GROK_HOME` | `~/.grok` | Directory containing the Grok CLI's `auth.json` |
+| `KIMI_CODE_HOME` | `~/.kimi-code` | Directory containing the Kimi Code CLI's credential store |
 | `CLAUDEX_LOG_LEVEL` | `info` | Process log verbosity: `debug`, `info`, `warning`, or `error`; editable at runtime from the dashboard |
 | `CLAUDEX_LOCAL_TOKEN` | unset | Bearer token required by the model request routes and the admin/dashboard routes when set; mandatory for non-loopback binds. See [the passthrough interaction](#mixing-claude-and-codex-models) |
 
 ### settings.json
 
 The settings key for each variable is its environment name minus the
-`CLAUDEX_` prefix, lowercased (`CODEX_HOME`, having no prefix, keeps its full
-name as `codex_home`). Values use native JSON types, so the model map is a
-plain object instead of JSON-in-a-string:
+`CLAUDEX_` prefix, lowercased (the CLI-home variables — `CODEX_HOME`,
+`GROK_HOME`, `KIMI_CODE_HOME` — having no prefix, keep their full names as
+`codex_home` / `grok_home` / `kimi_code_home`). Values use native JSON types,
+so the model map is a plain object instead of JSON-in-a-string:
 
 ```json
 {
-  "model_map": {"opus": "gpt-5.6-sol", "haiku": "gpt-5.6-luna"}
+  "model_map": {"opus": "codex:gpt-5.6-sol", "haiku": "codex:gpt-5.6-luna"}
 }
 ```
 
@@ -227,7 +256,7 @@ the gateway or its clients:
 curl http://127.0.0.1:8787/admin/mapping
 curl -X PUT http://127.0.0.1:8787/admin/mapping \
   -H 'Content-Type: application/json' \
-  -d '{"model_map": {"opus": "gpt-5.6-sol"}}'
+  -d '{"model_map": {"opus": "codex:gpt-5.6-sol"}}'
 ```
 
 A `PUT` accepts `model_map`, replaces it for all subsequent requests, and
@@ -262,10 +291,10 @@ URL, browser storage, or logs. A wrong token triggers exactly one re-prompt.
 
 ### Model mapping examples
 
-Route Claude Code model names to Codex and Kimi models:
+Route Claude Code model names to Codex, Kimi, and xAI models:
 
 ```sh
-CLAUDEX_MODEL_MAP='{"fable":"gpt-5.6-sol","opus":"kimi:k3","sonnet":"gpt-5.6-terra","haiku":"gpt-5.6-luna"}' \
+CLAUDEX_MODEL_MAP='{"fable":"xai:grok-4.5","opus":"kimi:k3","sonnet":"codex:gpt-5.6-terra","haiku":"codex:gpt-5.6-luna"}' \
   uv run claudex-gateway
 ```
 
@@ -289,7 +318,7 @@ Anthropic API. Model names stay real Claude names on both paths, so every
 Claude Code heuristic keyed on the model name keeps working.
 
 ```sh
-CLAUDEX_MODEL_MAP='{"opus":"gpt-5.6-sol","haiku":"gpt-5.6-luna"}' \
+CLAUDEX_MODEL_MAP='{"opus":"codex:gpt-5.6-sol","haiku":"codex:gpt-5.6-luna"}' \
 uv run claudex-gateway
 ```
 
@@ -304,7 +333,7 @@ set, clients authenticate to the gateway with it, and the same header is what
 Anthropic receives for unmapped models — so passthrough traffic fails with an
 auth error unless the token happens to be a credential Anthropic accepts. To
 run with a local token, add a catch-all map entry (a substring key every
-Claude model name contains, e.g. `{"claude": "gpt-5.5"}`) so no request ever
+Claude model name contains, e.g. `{"claude": "codex:gpt-5.5"}`) so no request ever
 reaches the passthrough path.
 
 ## Development

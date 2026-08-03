@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import os
@@ -16,17 +15,10 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-import httpx
 import uvicorn
 
 import claudex_gateway
 from claudex_gateway.config import ConfigError, GatewayConfig
-from claudex_gateway.kimi_auth import (
-    KimiAuthError,
-    poll_device_token,
-    request_device_authorization,
-    write_auth_file,
-)
 from claudex_gateway.server import create_app
 
 _READY_TIMEOUT = 15.0
@@ -92,7 +84,7 @@ def _run_foreground(config: GatewayConfig) -> None:
     )
     print(
         f"claudex-gateway listening on http://{config.host}:{config.port}\n"
-        f"Claude Code -> mapped models -> Codex or Kimi, others -> Anthropic passthrough\n"
+        f"Claude Code -> mapped models -> Codex, Kimi, or xAI, others -> Anthropic passthrough\n"
         f"point Claude Code at it with:\n"
         f"  ANTHROPIC_BASE_URL=http://{config.host}:{config.port} claude"
     )
@@ -291,32 +283,6 @@ def _stop_background() -> None:
     print(f"claudex-gateway stopped (pid {detail})")
 
 
-def _login_kimi(config: GatewayConfig) -> None:
-    """Run the Kimi OAuth device flow in the foreground and persist the tokens.
-
-    A running daemon needs no restart afterwards: its auth manager re-reads
-    the credential file on every request.
-    """
-
-    async def flow() -> dict[str, Any]:
-        async with httpx.AsyncClient(timeout=30.0) as http_client:
-            authorization = await request_device_authorization(http_client)
-            print(
-                f"open {authorization.verification_uri_complete or authorization.verification_uri}\n"
-                f"and enter the code: {authorization.user_code}\n"
-                f"waiting for approval..."
-            )
-            return await poll_device_token(http_client, authorization)
-
-    try:
-        auth_data = asyncio.run(flow())
-    except KimiAuthError as exc:
-        print(f"kimi login failed: {exc}", file=sys.stderr)
-        raise SystemExit(1) from exc
-    write_auth_file(config.kimi_auth_file, auth_data)
-    print(f"kimi login complete; credentials saved to {config.kimi_auth_file}")
-
-
 def main() -> None:
     arguments = sys.argv[1:]
     # stop must work even when the current configuration is broken.
@@ -331,11 +297,8 @@ def main() -> None:
     if arguments == ["--foreground"]:
         _run_foreground(config)
         return
-    if arguments == ["login", "kimi"]:
-        _login_kimi(config)
-        return
 
-    print("usage: claudex-gateway [--foreground|stop|login kimi]", file=sys.stderr)
+    print("usage: claudex-gateway [--foreground|stop]", file=sys.stderr)
     raise SystemExit(2)
 
 

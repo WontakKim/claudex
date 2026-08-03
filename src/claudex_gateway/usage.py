@@ -31,6 +31,7 @@ import httpx
 
 from claudex_gateway.codex_auth import CodexAuthManager, CodexCredentials
 from claudex_gateway.kimi_auth import KimiAuthManager
+from claudex_gateway.xai_auth import XAIAuthManager, XAICredentials
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +71,7 @@ def _provider_result(
     plan_type: str | None = None,
     reset_credits_available: int | None = None,
     fable_weekly: dict[str, Any] | None = None,
+    monthly: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     return {
         "provider": provider,
@@ -80,6 +82,7 @@ def _provider_result(
         "plan_type": plan_type,
         "reset_credits_available": reset_credits_available,
         "fable_weekly": fable_weekly,
+        "monthly": monthly,
         "updated_at": time.time(),
     }
 
@@ -586,7 +589,7 @@ async def fetch_kimi_usage(
         return _provider_result(
             "kimi",
             status="error",
-            error="Kimi access token rejected (401); run `claudex-gateway login kimi` again",
+            error="Kimi access token rejected (401); run `kimi login` again",
         )
     if response.status_code != 200:
         return _provider_result(
@@ -627,4 +630,162 @@ async def fetch_kimi_usage(
         session=session,
         weekly=weekly,
         plan_type=plan_type,
+    )
+
+
+# --- xAI (Grok) ------------------------------------------------------------
+# Mirrors Orca's grok-fetcher: the chat-proxy billing endpoint is read with
+# the Grok CLI's OAuth session; the credits view carries the weekly window,
+# and the default view is the monthly-budget fallback for unified-billing
+# accounts whose credits view omits creditUsagePercent.
+
+_XAI_BILLING_URL = "https://cli-chat-proxy.grok.com/v1/billing"
+_XAI_BILLING_CREDITS_URL = _XAI_BILLING_URL + "?format=credits"
+_XAI_TOKEN_AUTH_VALUE = "xai-grok-cli"
+_MONTHLY_WINDOW_MINUTES = 43200
+
+
+def _xai_billing_headers(credentials: XAICredentials) -> dict[str, str]:
+    # The header set must match the Grok CLI or xAI rejects the request.
+    headers = {
+        "Authorization": f"Bearer {credentials.access_token}",
+        "X-XAI-Token-Auth": _XAI_TOKEN_AUTH_VALUE,
+        "Accept": "application/json",
+    }
+    if credentials.user_id:
+        headers["x-userid"] = credentials.user_id
+    return headers
+
+
+def _xai_plan_tier(config: dict[str, Any]) -> str | None:
+    tier = config.get("subscriptionTier")
+    return tier.strip().lower() if isinstance(tier, str) and tier.strip() else None
+
+
+def _xai_period_end(config: dict[str, Any]) -> Any:
+    period = config.get("currentPeriod")
+    end = period.get("end") if isinstance(period, dict) else None
+    return end or config.get("billingPeriodEnd")
+
+
+def _xai_has_confirmed_weekly_period(config: dict[str, Any]) -> bool:
+    """True when the period bounds prove a weekly window exists.
+
+    Monthly unified-billing responses can also carry a weekly currentPeriod;
+    matching billing bounds identify Grok's omitted protobuf zero
+    unambiguously (mirrors Orca).
+    """
+    period = config.get("currentPeriod")
+    if not isinstance(period, dict) or period.get("type") != "USAGE_PERIOD_TYPE_WEEKLY":
+        return False
+    start, end = period.get("start"), period.get("end")
+    return bool(
+        start
+        and end
+        and start == config.get("billingPeriodStart")
+        and end == config.get("billingPeriodEnd")
+    )
+
+
+def _map_xai_weekly_credits(config: dict[str, Any]) -> dict[str, Any] | None:
+    used_percent = _to_float(config.get("creditUsagePercent"))
+    if used_percent is None and _xai_has_confirmed_weekly_period(config):
+        used_percent = 0.0
+    if used_percent is None:
+        return None
+    return {
+        "used_percent": min(100.0, max(0.0, used_percent)),
+        "window_minutes": _WEEKLY_WINDOW_MINUTES,
+        "resets_at": _reset_epoch_seconds(_xai_period_end(config)),
+    }
+
+
+def _parse_money_val(value: Any) -> float | None:
+    # Grok money fields travel as {"val": "12.34"} wrappers.
+    raw = value.get("val") if isinstance(value, dict) else None
+    return _to_float(raw)
+
+
+def _map_xai_monthly(config: dict[str, Any]) -> dict[str, Any] | None:
+    limit = _parse_money_val(config.get("monthlyLimit"))
+    used = _parse_money_val(config.get("used"))
+    if limit is None or used is None or limit <= 0:
+        return None
+    return {
+        "used_percent": min(100.0, max(0.0, used / limit * 100)),
+        "window_minutes": _MONTHLY_WINDOW_MINUTES,
+        "resets_at": _reset_epoch_seconds(_xai_period_end(config)),
+    }
+
+
+async def _fetch_xai_billing(
+    http_client: httpx.AsyncClient, credentials: XAICredentials, url: str
+) -> dict[str, Any]:
+    """GET a billing view; the result dict is a config payload or an error marker."""
+    try:
+        response = await http_client.get(
+            url, headers=_xai_billing_headers(credentials), timeout=_USAGE_TIMEOUT
+        )
+    except httpx.HTTPError as exc:
+        return {"_error": f"failed to reach the xAI billing API: {exc}"}
+    if response.status_code in (401, 403):
+        return {
+            "_error": f"xAI access token rejected ({response.status_code}); run `grok login` again"
+        }
+    if response.status_code != 200:
+        return {
+            "_error": f"billing API returned {response.status_code}: {response.text[:200]}"
+        }
+    try:
+        data = response.json()
+    except json.JSONDecodeError:
+        return {"_error": "billing API returned a non-JSON body"}
+    if not isinstance(data, dict):
+        return {"_error": "billing API returned an unexpected payload"}
+    return data
+
+
+async def fetch_xai_usage(
+    http_client: httpx.AsyncClient, auth_manager: XAIAuthManager
+) -> dict[str, Any]:
+    """Fetch xAI quota via the Grok chat-proxy billing endpoint (mirrors Orca)."""
+    try:
+        credentials = await auth_manager.get_credentials()
+    except Exception as exc:  # XAIAuthError and anything the file layer raises
+        return _provider_result("xai", status="unavailable", error=str(exc))
+
+    data = await _fetch_xai_billing(http_client, credentials, _XAI_BILLING_CREDITS_URL)
+    error = data.pop("_error", None)
+    if error is not None:
+        return _provider_result("xai", status="error", error=error)
+    config = data.get("config") if isinstance(data.get("config"), dict) else data
+    weekly = _map_xai_weekly_credits(config)
+    if weekly is not None:
+        return _provider_result(
+            "xai",
+            status="ok",
+            error=None,
+            weekly=weekly,
+            plan_type=_xai_plan_tier(config),
+        )
+
+    fallback = await _fetch_xai_billing(http_client, credentials, _XAI_BILLING_URL)
+    error = fallback.pop("_error", None)
+    if error is not None:
+        return _provider_result("xai", status="error", error=error)
+    fallback_config = fallback.get("config") if isinstance(fallback.get("config"), dict) else fallback
+    monthly = _map_xai_monthly(fallback_config)
+    if monthly is not None:
+        return _provider_result(
+            "xai",
+            status="ok",
+            error=None,
+            monthly=monthly,
+            # The tier rides the credits view's config, like Orca's fetcher.
+            plan_type=_xai_plan_tier(config) or _xai_plan_tier(fallback_config),
+        )
+    # A signed-in account whose billing views expose no quota has no bar to
+    # show — 'unavailable' hides the card body instead of painting an alert.
+    return _provider_result(
+        "xai", status="unavailable", error="billing response did not include credit usage"
     )

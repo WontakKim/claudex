@@ -50,7 +50,10 @@ from claudex_gateway.usage import (
     fetch_claude_usage,
     fetch_codex_usage,
     fetch_kimi_usage,
+    fetch_xai_usage,
 )
+from claudex_gateway.xai_auth import XAIAuthError, XAIAuthManager
+from claudex_gateway.xai_client import XAIClient, XAIUpstreamError, sanitize_xai_payload
 
 logger = logging.getLogger(__name__)
 
@@ -143,9 +146,13 @@ def _upstream_error_code(body: str) -> str | None:
     return None
 
 
-def _upstream_error_to_claude(exc: CodexUpstreamError) -> tuple[int, dict[str, Any]]:
+def _upstream_error_to_claude(
+    exc: CodexUpstreamError | XAIUpstreamError,
+) -> tuple[int, dict[str, Any]]:
     error_type = _STATUS_TO_CLAUDE_ERROR_TYPE.get(exc.status_code, "api_error")
     message = _upstream_error_message(exc.body)
+    # The overflow rewrite keys on the Codex backend's specific error code, so
+    # it stays a no-op for xAI errors.
     rewritten = rewrite_context_overflow_message(_upstream_error_code(exc.body), message)
     if rewritten is not None:
         # Anthropic reports context overflow as 400 invalid_request_error.
@@ -302,7 +309,21 @@ async def _handle_messages(request: Request) -> JSONResponse | StreamingResponse
         return await _passthrough_to_anthropic(request, raw_body)
     if route.provider == "kimi":
         return await _relay_to_kimi(request, claude_request, route.model)
-    codex_model = route.model
+    return await _relay_via_responses_backend(request, claude_request, route)
+
+
+async def _relay_via_responses_backend(
+    request: Request, claude_request: dict[str, Any], route: RouteTarget
+) -> JSONResponse | StreamingResponse:
+    """Relay a Messages request to a Responses-API backend (Codex or xAI).
+
+    Both providers consume the same translated payload and produce the same
+    SSE event family, so one path serves both; the xAI direction only adds
+    its payload sanitizer on the way out.
+    """
+    config: GatewayConfig = request.app.state.config
+    provider = route.provider
+    upstream_model = route.model
 
     validation_error = _validate_mapped_claude_request(claude_request)
     if validation_error is not None:
@@ -310,44 +331,51 @@ async def _handle_messages(request: Request) -> JSONResponse | StreamingResponse
             _claude_error_body("invalid_request_error", validation_error), status_code=400
         )
 
-    codex_client: CodexClient = request.app.state.codex_client
     try:
         payload = translate_claude_request_to_codex(
-            claude_request, codex_model, config.reasoning_effort_override
+            claude_request, upstream_model, config.reasoning_effort_override
         )
     except TranslationError as exc:
         return JSONResponse(
             _claude_error_body("invalid_request_error", str(exc)), status_code=400
         )
+    if provider == "xai":
+        client: CodexClient | XAIClient = request.app.state.xai_client
+        payload = sanitize_xai_payload(payload, upstream_model)
+    else:
+        client = request.app.state.codex_client
     session_id = payload["prompt_cache_key"]
     logger.info(
-        "%s -> %s (stream=%s, effort=%s, messages=%d, tools=%d)",
+        "%s -> %s:%s (stream=%s, effort=%s, messages=%d, tools=%d)",
         claude_request.get("model", "?"),
-        codex_model,
+        provider,
+        upstream_model,
         bool(claude_request.get("stream")),
-        payload["reasoning"]["effort"],
+        (payload.get("reasoning") or {}).get("effort", "-"),
         len(claude_request.get("messages") or []),
         len(payload.get("tools") or []),
     )
 
-    event_stream = codex_client.stream_responses(payload, session_id)
+    event_stream = client.stream_responses(payload, session_id)
     try:
         first_event = await anext(event_stream, None)
         if first_event is None:
             return JSONResponse(
-                _claude_error_body("api_error", "codex stream ended without any events"),
+                _claude_error_body("api_error", f"{provider} stream ended without any events"),
                 status_code=502,
             )
-    except CodexUpstreamError as exc:
+    except (CodexUpstreamError, XAIUpstreamError) as exc:
         status_code, body = _upstream_error_to_claude(exc)
-        logger.warning("codex upstream error %s: %s", exc.status_code, body["error"]["message"])
+        logger.warning(
+            "%s upstream error %s: %s", provider, exc.status_code, body["error"]["message"]
+        )
         return JSONResponse(body, status_code=status_code)
-    except CodexAuthError as exc:
+    except (CodexAuthError, XAIAuthError) as exc:
         return JSONResponse(_claude_error_body("authentication_error", str(exc)), status_code=401)
     except httpx.HTTPError as exc:
-        logger.warning("codex backend unreachable: %r", exc)
+        logger.warning("%s backend unreachable: %r", provider, exc)
         return JSONResponse(
-            _claude_error_body("api_error", f"failed to reach the Codex backend: {exc!r}"),
+            _claude_error_body("api_error", f"failed to reach the {provider} backend: {exc!r}"),
             status_code=502,
         )
 
@@ -380,12 +408,16 @@ async def _translate_claude_sse(
         async for event in upstream_events:
             for event_name, payload in translator.translate_event(event):
                 yield _format_sse(event_name, payload)
-    except CodexUpstreamError as exc:
+    except (CodexUpstreamError, XAIUpstreamError) as exc:
         _, body = _upstream_error_to_claude(exc)
         yield _format_sse("error", body)
-    except (CodexAuthError, httpx.HTTPError) as exc:
-        logger.warning("codex stream aborted: %s", exc)
-        error_type = "authentication_error" if isinstance(exc, CodexAuthError) else "api_error"
+    except (CodexAuthError, XAIAuthError, httpx.HTTPError) as exc:
+        logger.warning("responses stream aborted: %s", exc)
+        error_type = (
+            "authentication_error"
+            if isinstance(exc, (CodexAuthError, XAIAuthError))
+            else "api_error"
+        )
         yield _format_sse("error", _claude_error_body(error_type, str(exc)))
     finally:
         await upstream_events.aclose()
@@ -405,15 +437,15 @@ async def _aggregate_claude_response(
                     status_code = 400 if error_type == "invalid_request_error" else 502
                     return JSONResponse(payload, status_code=status_code)
                 claude_events.append(translated)
-    except CodexUpstreamError as exc:
+    except (CodexUpstreamError, XAIUpstreamError) as exc:
         status_code, body = _upstream_error_to_claude(exc)
         return JSONResponse(body, status_code=status_code)
-    except CodexAuthError as exc:
+    except (CodexAuthError, XAIAuthError) as exc:
         return JSONResponse(_claude_error_body("authentication_error", str(exc)), status_code=401)
     except httpx.HTTPError as exc:
-        logger.warning("codex stream aborted: %r", exc)
+        logger.warning("responses stream aborted: %r", exc)
         return JSONResponse(
-            _claude_error_body("api_error", f"failed to reach the Codex backend: {exc!r}"),
+            _claude_error_body("api_error", f"failed to reach the upstream backend: {exc!r}"),
             status_code=502,
         )
     finally:
@@ -456,7 +488,7 @@ def _kimi_upstream_error_to_claude(exc: KimiUpstreamError) -> tuple[int, dict[st
         return 401, _claude_error_body(
             "authentication_error",
             f"Kimi rejected the gateway credentials: {_upstream_error_message(exc.body)}; "
-            "run `claudex-gateway login kimi` again",
+            "run `kimi login` again",
         )
     with contextlib.suppress(json.JSONDecodeError):
         parsed = json.loads(exc.body)
@@ -669,6 +701,7 @@ async def _handle_health(request: Request) -> JSONResponse:
     config: GatewayConfig = request.app.state.config
     codex_auth_manager: CodexAuthManager = request.app.state.codex_auth_manager
     kimi_auth_manager: KimiAuthManager = request.app.state.kimi_auth_manager
+    xai_auth_manager: XAIAuthManager = request.app.state.xai_auth_manager
     providers: dict[str, dict[str, Any]] = {}
 
     try:
@@ -677,22 +710,42 @@ async def _handle_health(request: Request) -> JSONResponse:
             "status": "ok",
             "auth_mode": "api_key" if credentials.is_api_key else "chatgpt",
             "account": credentials.account_id,
+            "email": credentials.email,
         }
     except CodexAuthError as exc:
         providers["codex"] = {"status": "error", "detail": str(exc)}
 
-    # A missing Kimi login only degrades readiness when the map routes to it,
-    # so codex-only setups keep reporting healthy. The flag is exposed so the
-    # dashboard can render an unused Kimi login failure as neutral, not error.
+    # A missing OAuth login only degrades readiness when the map routes to
+    # that provider, so setups not using it keep reporting healthy. The flag
+    # is exposed so the dashboard can render an unused login failure as
+    # neutral, not error.
     kimi_required = config.maps_to_provider("kimi")
     try:
-        await kimi_auth_manager.get_credentials()
-        providers["kimi"] = {"status": "ok", "required": kimi_required}
+        kimi_credentials = await kimi_auth_manager.get_credentials()
+        providers["kimi"] = {
+            "status": "ok",
+            "required": kimi_required,
+            "account": kimi_credentials.account,
+        }
     except KimiAuthError as exc:
         providers["kimi"] = {"status": "error", "detail": str(exc), "required": kimi_required}
 
-    is_ready = providers["codex"]["status"] == "ok" and (
-        providers["kimi"]["status"] == "ok" or not kimi_required
+    xai_required = config.maps_to_provider("xai")
+    try:
+        xai_credentials = await xai_auth_manager.get_credentials()
+        providers["xai"] = {
+            "status": "ok",
+            "required": xai_required,
+            "auth_mode": "api_key" if xai_credentials.is_api_key else "oauth",
+            "account": xai_credentials.email,
+        }
+    except XAIAuthError as exc:
+        providers["xai"] = {"status": "error", "detail": str(exc), "required": xai_required}
+
+    is_ready = (
+        providers["codex"]["status"] == "ok"
+        and (providers["kimi"]["status"] == "ok" or not kimi_required)
+        and (providers["xai"]["status"] == "ok" or not xai_required)
     )
     return JSONResponse(
         {"status": "ok" if is_ready else "error", "providers": providers},
@@ -739,7 +792,8 @@ def _mapping_payload(config: GatewayConfig) -> dict[str, Any]:
             for key in _ADMIN_MAP_KEYS
         },
         "codex_home": str(config.codex_home),
-        "kimi_auth_file": str(config.kimi_auth_file),
+        "grok_home": str(config.grok_home),
+        "kimi_code_home": str(config.kimi_code_home),
     }
 
 
@@ -883,16 +937,16 @@ async def _handle_admin_usage(request: Request) -> JSONResponse:
 
     Each provider answers from its own usage endpoint with the local CLI
     credentials (see usage.py); a failure on one side never masks the other.
-    ?provider=claude|codex|kimi refreshes a single card; without it all run.
+    ?provider=claude|codex|kimi|xai refreshes a single card; without it all run.
     """
     denied = _admin_guard(request)
     if denied is not None:
         return denied
     provider = request.query_params.get("provider")
-    if provider not in (None, "claude", "codex", "kimi"):
+    if provider not in (None, "claude", "codex", "kimi", "xai"):
         return JSONResponse(
             _openai_error_body(
-                "invalid_request_error", "provider must be one of: claude, codex, kimi"
+                "invalid_request_error", "provider must be one of: claude, codex, kimi, xai"
             ),
             status_code=400,
         )
@@ -906,6 +960,10 @@ async def _handle_admin_usage(request: Request) -> JSONResponse:
     if provider in (None, "kimi"):
         probes["kimi"] = fetch_kimi_usage(
             request.app.state.http_client, request.app.state.kimi_auth_manager
+        )
+    if provider in (None, "xai"):
+        probes["xai"] = fetch_xai_usage(
+            request.app.state.http_client, request.app.state.xai_auth_manager
         )
     results = await asyncio.gather(*probes.values())
     payload = dict(zip(probes, results))
@@ -1052,6 +1110,37 @@ async def _handle_admin_codex_models(request: Request) -> JSONResponse:
     return JSONResponse({"models": models})
 
 
+async def _handle_admin_xai_models(request: Request) -> JSONResponse:
+    """Relay xAI's live model catalog (IDs only) for model_map authoring.
+
+    Same convenience role as the Codex/Kimi catalog endpoints: the gateway
+    never validates map targets against the list, so this only feeds the
+    dashboard's add-node suggestions.
+    """
+    denied = _admin_guard(request)
+    if denied is not None:
+        return denied
+    xai_client: XAIClient = request.app.state.xai_client
+    try:
+        models = await xai_client.list_models()
+    except XAIAuthError as exc:
+        return JSONResponse(
+            _openai_error_body("authentication_error", str(exc)), status_code=401
+        )
+    except XAIUpstreamError as exc:
+        error_type = _STATUS_TO_OPENAI_ERROR_TYPE.get(exc.status_code, "server_error")
+        return JSONResponse(
+            _openai_error_body(error_type, _upstream_error_message(exc.body)),
+            status_code=exc.status_code,
+        )
+    except httpx.HTTPError as exc:
+        return JSONResponse(
+            _openai_error_body("server_error", f"failed to reach the xAI backend: {exc}"),
+            status_code=502,
+        )
+    return JSONResponse({"models": models})
+
+
 async def _handle_admin_kimi_models(request: Request) -> JSONResponse:
     """Relay Kimi's live model catalog verbatim for model_map authoring.
 
@@ -1101,6 +1190,26 @@ async def _probe_codex_route(codex_client: CodexClient, source: str, target: str
         await events.aclose()
     if first_event is None:
         raise CodexUpstreamError(502, "codex stream ended without any events")
+    response = first_event.get("response") if isinstance(first_event, dict) else None
+    model = response.get("model") if isinstance(response, dict) else None
+    return model if isinstance(model, str) else target
+
+
+async def _probe_xai_route(xai_client: XAIClient, source: str, target: str) -> str:
+    claude_request = {
+        "model": source,
+        "max_tokens": 16,
+        "messages": [{"role": "user", "content": "ping"}],
+    }
+    payload = translate_claude_request_to_codex(claude_request, target, "low")
+    payload = sanitize_xai_payload(payload, target)
+    events = xai_client.stream_responses(payload, payload["prompt_cache_key"])
+    try:
+        first_event = await anext(events, None)
+    finally:
+        await events.aclose()
+    if first_event is None:
+        raise XAIUpstreamError(502, "xai stream ended without any events")
     response = first_event.get("response") if isinstance(first_event, dict) else None
     model = response.get("model") if isinstance(response, dict) else None
     return model if isinstance(model, str) else target
@@ -1182,12 +1291,14 @@ async def _handle_admin_connection_test(request: Request) -> JSONResponse:
     try:
         if route.provider == "kimi":
             probe = _probe_kimi_route(request.app.state.kimi_client, route.model)
+        elif route.provider == "xai":
+            probe = _probe_xai_route(request.app.state.xai_client, source, route.model)
         else:
             probe = _probe_codex_route(request.app.state.codex_client, source, route.model)
         response_model = await asyncio.wait_for(probe, _CONNECTION_TEST_TIMEOUT)
-    except (CodexUpstreamError, KimiUpstreamError) as exc:
+    except (CodexUpstreamError, KimiUpstreamError, XAIUpstreamError) as exc:
         return result(False, exc.status_code, _upstream_error_message(exc.body))
-    except (CodexAuthError, KimiAuthError) as exc:
+    except (CodexAuthError, KimiAuthError, XAIAuthError) as exc:
         return result(False, 401, str(exc))
     except TimeoutError:
         return result(False, None, f"no response within {_CONNECTION_TEST_TIMEOUT:.0f}s")
@@ -1205,7 +1316,8 @@ def create_app(config: GatewayConfig, daemon_nonce: str | None = None) -> Starle
         try:
             async with httpx.AsyncClient(timeout=_UPSTREAM_TIMEOUT) as http_client:
                 codex_auth_manager = CodexAuthManager(config.codex_home / "auth.json", http_client)
-                kimi_auth_manager = KimiAuthManager(config.kimi_auth_file, http_client)
+                kimi_auth_manager = KimiAuthManager(config.kimi_code_home, http_client)
+                xai_auth_manager = XAIAuthManager(config.grok_home / "auth.json", http_client)
                 app.state.config = config
                 app.state.admin_lock = asyncio.Lock()
                 # Redeem key of a reset attempt whose outcome never came back.
@@ -1214,6 +1326,8 @@ def create_app(config: GatewayConfig, daemon_nonce: str | None = None) -> Starle
                 app.state.codex_client = CodexClient(codex_auth_manager, http_client)
                 app.state.kimi_auth_manager = kimi_auth_manager
                 app.state.kimi_client = KimiClient(kimi_auth_manager, http_client)
+                app.state.xai_auth_manager = xai_auth_manager
+                app.state.xai_client = XAIClient(xai_auth_manager, http_client)
                 app.state.http_client = http_client
 
                 try:
@@ -1232,6 +1346,13 @@ def create_app(config: GatewayConfig, daemon_nonce: str | None = None) -> Starle
                         logger.info("kimi credentials ready")
                     except KimiAuthError as exc:
                         logger.warning("kimi direction unavailable: %s", exc)
+
+                if config.maps_to_provider("xai"):
+                    try:
+                        await xai_auth_manager.get_credentials()
+                        logger.info("xai credentials ready")
+                    except XAIAuthError as exc:
+                        logger.warning("xai direction unavailable: %s", exc)
 
                 yield
         finally:
@@ -1257,6 +1378,7 @@ def create_app(config: GatewayConfig, daemon_nonce: str | None = None) -> Starle
             ),
             Route("/admin/codex/models", _handle_admin_codex_models, methods=["GET"]),
             Route("/admin/kimi/models", _handle_admin_kimi_models, methods=["GET"]),
+            Route("/admin/xai/models", _handle_admin_xai_models, methods=["GET"]),
             Route("/admin/test", _handle_admin_connection_test, methods=["POST"]),
         ],
         lifespan=lifespan,

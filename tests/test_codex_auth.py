@@ -20,6 +20,11 @@ def _fake_jwt(exp: float) -> str:
     return f"header.{payload}.signature"
 
 
+def _fake_jwt_with_claims(claims: dict[str, Any]) -> str:
+    payload = base64.urlsafe_b64encode(json.dumps(claims).encode()).decode().rstrip("=")
+    return f"header.{payload}.signature"
+
+
 def _write_auth_file(path: Path, access_token: str) -> None:
     path.write_text(
         json.dumps(
@@ -153,6 +158,67 @@ def test_api_key_auth_bypasses_refresh(tmp_path: Path) -> None:
     assert counter["posts"] == 0
     assert credentials.is_api_key is True
     assert credentials.access_token == "sk-test"
+
+
+def test_email_is_decoded_from_the_id_token(tmp_path: Path) -> None:
+    auth_file = tmp_path / "auth.json"
+    id_token = _fake_jwt_with_claims({"email": "codex@example.com"})
+    auth_file.write_text(
+        json.dumps(
+            {
+                "tokens": {
+                    "access_token": _fake_jwt(time.time() + 3600),
+                    "refresh_token": "refresh-1",
+                    "account_id": "acct-1",
+                    "id_token": id_token,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    async def scenario() -> Any:
+        async with httpx.AsyncClient() as http_client:
+            return await CodexAuthManager(auth_file, http_client).get_credentials()
+
+    assert _run(scenario()).email == "codex@example.com"
+
+
+def test_email_falls_back_to_the_profile_claim(tmp_path: Path) -> None:
+    auth_file = tmp_path / "auth.json"
+    id_token = _fake_jwt_with_claims({"profile": {"email": "profile@example.com"}})
+    auth_file.write_text(
+        json.dumps(
+            {
+                "tokens": {
+                    "access_token": _fake_jwt(time.time() + 3600),
+                    "refresh_token": "refresh-1",
+                    "id_token": id_token,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    async def scenario() -> Any:
+        async with httpx.AsyncClient() as http_client:
+            return await CodexAuthManager(auth_file, http_client).get_credentials()
+
+    credentials = _run(scenario())
+
+    assert credentials.email == "profile@example.com"
+    assert credentials.account_id is None  # no account claim anywhere in this fixture
+
+
+def test_email_is_none_without_an_id_token(tmp_path: Path) -> None:
+    auth_file = tmp_path / "auth.json"
+    _write_auth_file(auth_file, _fake_jwt(time.time() + 3600))
+
+    async def scenario() -> Any:
+        async with httpx.AsyncClient() as http_client:
+            return await CodexAuthManager(auth_file, http_client).get_credentials()
+
+    assert _run(scenario()).email is None
 
 
 def test_missing_auth_file_raises_with_guidance(tmp_path: Path) -> None:
