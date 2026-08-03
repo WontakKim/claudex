@@ -433,6 +433,19 @@ def test_tool_choice_mapping() -> None:
     assert disabled_parallel["parallel_tool_calls"] is False
 
 
+def test_empty_tools_emit_no_tool_fields() -> None:
+    # tools: [] means "no tools"; emitting tool_choice alongside an empty list
+    # is a 400 on xAI ("tool_choice set but no tools specified").
+    for extra in ({}, {"tool_choice": {"type": "auto"}}):
+        payload = translate_claude_request_to_codex(
+            {"messages": [{"role": "user", "content": "hi"}], "tools": [], **extra},
+            codex_model="gpt-5.5",
+        )
+        assert "tools" not in payload
+        assert "tool_choice" not in payload
+        assert "parallel_tool_calls" not in payload
+
+
 def test_thinking_budget_to_reasoning_effort() -> None:
     def effort_for(thinking: dict) -> str:
         payload = translate_claude_request_to_codex(

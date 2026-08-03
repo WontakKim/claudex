@@ -445,7 +445,10 @@ def translate_claude_request_to_codex(
     }
 
     tools = _translate_tools(claude_request, name_map)
-    if tools is not None:
+    # An empty tools list means "no tools": neither field may go out, since
+    # xAI 400s on tool_choice without tools and Codex rejects
+    # parallel_tool_calls without tools.
+    if tools:
         payload["tools"] = tools
         payload["tool_choice"] = _translate_tool_choice(
             claude_request.get("tool_choice"), name_map, web_search_tool_names(claude_request)
