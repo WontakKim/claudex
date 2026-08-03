@@ -73,25 +73,6 @@ explicit choices, not bugs:
 The server starts even when a login is missing; `/health` reports the
 credential state per provider.
 
-## Install (in-house, zxcv)
-
-On the company network the gateway ships as a self-contained CLI through the
-[zxcv](https://github.wrtn.club/wrtn-tech/zxcv) Homebrew channel — no Python
-or uv required:
-
-```sh
-zxcv install claudex
-```
-
-Then use `claudex-gateway` wherever the examples below say
-`uv run claudex-gateway`. The install also puts a ready-made `claudex`
-command on PATH that starts the gateway when it is not already running and
-launches Claude Code through it; `claudex settings` opens the gateway
-dashboard in the browser instead, and every other argument is passed through
-to `claude` untouched (override the address with `CLAUDEX_HOST` /
-`CLAUDEX_PORT` if you changed the bind). The rest of this README covers
-running from a checkout with uv.
-
 ## Usage
 
 ### Start the gateway
@@ -139,8 +120,7 @@ there, so this setup needs a catch-all map entry — a substring key that every
 Claude model name contains, e.g. `{"claude": "codex:gpt-5.5"}` — to keep every
 request on Codex.
 
-zxcv installs ship this as the `claudex` command (which also starts the
-gateway first when needed); from a checkout, an alias covers the launch part:
+A shell alias covers the launch part:
 
 ```sh
 alias claudex='ANTHROPIC_BASE_URL=http://127.0.0.1:8787 claude'
@@ -268,8 +248,8 @@ itself, so foreign web pages cannot drive it from a browser.
 
 ### Dashboard
 
-Opening `http://127.0.0.1:8787/` in a browser (`claudex settings` on zxcv
-installs) serves a dashboard on top of the same admin API: the General tab
+Opening `http://127.0.0.1:8787/` in a browser serves a dashboard on top of
+the same admin API: the General tab
 shows the Codex upstream's health, the Log tab tails the gateway's recent
 log lines (`GET /admin/logs`) and holds the runtime log-level control
 (`PUT /admin/log-level`, applied immediately and persisted), and the Router
@@ -342,14 +322,3 @@ reaches the passthrough path.
 uv run pytest
 ```
 
-### Releasing
-
-Bump `version` in `pyproject.toml` and merge to `main`. The release workflow
-builds the self-contained darwin-arm64 tarball with
-`scripts/build-darwin-asset.sh` and attaches it to a GHE release
-`v<version>`; users get it once the central zxcv repo's
-`packages/claudex.json` points at that release (repo/tag/asset).
-
-To inspect the asset locally, run the same build script on a Mac — it packs
-`build/claudex-gateway-<version>-darwin-arm64.tar.gz` and smoke-tests the
-bundled runtime.
