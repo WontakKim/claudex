@@ -1,10 +1,7 @@
 name: Release
 
-# Builds a self-contained darwin-arm64 tarball for the zxcv Homebrew channel
-# and attaches it to a GitHub Release. This is the distribution channel for the
-# gateway — users install it with `zxcv install claudex` once the central
-# zxcv repo (wrtn-tech/zxcv) lists a packages/claudex.json pointing at a
-# release produced here.
+# Builds a self-contained darwin-arm64 tarball and attaches it to a GitHub
+# Release — the distribution channel for the gateway.
 #
 # Releasing is automatic and idempotent: on every push to main the
 # pyproject.toml version is checked, and if no release v<version> exists yet
@@ -12,7 +9,7 @@ name: Release
 # Merges that don't bump the version are skipped early, so they stay green.
 # Bump the version in pyproject.toml to ship a release.
 #
-# Contract with the central zxcv repo:
+# Tarball contract:
 #   - asset name:  claudex-gateway-<version>-darwin-arm64.tar.gz
 #   - tar root:    bin/claudex-gateway executable entrypoint
 #

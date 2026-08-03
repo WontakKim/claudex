@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# Builds the self-contained darwin-arm64 tarball for the zxcv Homebrew channel.
+# Builds the self-contained darwin-arm64 tarball attached to each GitHub release.
 #
-# Contract with the central zxcv repo (wrtn-tech/zxcv):
+# Tarball contract:
 #   - asset name:  claudex-gateway-<version>-darwin-arm64.tar.gz
 #   - tar root:    bin/claudex-gateway executable entrypoint
 #
 # The gateway is pure Python, so the tarball is assembled from parts instead
-# of compiled — the same model as wrtn-app-cli's Node tarball. This works on
-# any build host (the linux-arm64 CI runner or a developer Mac):
+# of compiled. This works on any build host (the linux-arm64 CI runner or a
+# developer Mac):
 #   bin/claudex-gateway   POSIX shell shim that execs the bundled runtime
 #   bin/claudex           launches Claude Code through the local gateway
 #   python/               python-build-standalone darwin-arm64 (checksum-pinned)
@@ -95,9 +95,9 @@ DIR="$(cd "$(dirname "$0")/.." && pwd)"
 exec "$DIR/python/bin/python3" -m claudex_gateway "$@"
 EOF
 chmod +x "${STAGE}/bin/${TOOL}"
-# The zxcv formula exposes every executable under bin/, so this ships a
-# ready-made `claudex` command that starts the gateway (idempotent background
-# start) and launches Claude Code through it; `claudex settings` (exactly that
+# The tarball also ships a ready-made `claudex` command that starts the
+# gateway (idempotent background start) and launches Claude Code through it;
+# `claudex settings` (exactly that
 # one argument) opens the dashboard instead — everything else passes through
 # to claude untouched. Success paths stay quiet (stdout dropped); startup
 # failures surface on stderr and abort.
@@ -148,7 +148,7 @@ esac
 echo "==> Packing ${ASSET}"
 # COPYFILE_DISABLE keeps macOS builds from adding ._* AppleDouble entries.
 (cd "${STAGE}" && COPYFILE_DISABLE=1 tar -czf "../${ASSET}" .)
-# Final structure check against the zxcv contract. The listing is grepped
+# Final structure check against the tarball contract. The listing is grepped
 # from a file: piping it into `grep -q` dies of SIGPIPE under pipefail when
 # grep exits on an early match, misreporting present entries as missing.
 LISTING_FILE="build/asset-listing.txt"
