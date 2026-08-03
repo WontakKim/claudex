@@ -811,8 +811,14 @@ document.getElementById("add-open").addEventListener("click",function(){
 });
 document.getElementById("add-prov").addEventListener("click",function(ev){
   var b=ev.target.closest("button");
-  if(!b)return;
-  addProvider=b.dataset.p;renderAddForm();document.getElementById("add-model").focus();
+  if(!b||b.dataset.p===addProvider)return;
+  addProvider=b.dataset.p;renderAddForm();
+  var input=document.getElementById("add-model");
+  /* The datalist filters its suggestions by the input's current value, so
+     keeping another provider's model id would hide every fresh option —
+     the dropdown looks dead until the text is deleted by hand. */
+  input.value="";
+  input.focus();
 });
 document.getElementById("add-go").addEventListener("click",addTargetNode);
 document.getElementById("add-model").addEventListener("keydown",function(ev){
