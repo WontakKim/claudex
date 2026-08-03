@@ -1212,16 +1212,29 @@ function restoreUsageButtons(providers){
 function fetchUsage(provider){
   var targets=provider?[provider]:["claude","codex","kimi","xai"];
   if(!provider)targets.forEach(function(p){renderUsageProvider(p,null)});
+  /* The skeleton only means "probe in flight": every failure path must still
+     settle each card into an error state, or the animation runs forever. */
+  var failAll=function(message){
+    targets.forEach(function(p){
+      renderUsageProvider(p,{status:"error",error:message,updated_at:Date.now()/1000});
+    });
+  };
   jfetch("/admin/usage"+(provider?"?provider="+provider:"")).then(function(r){
     if(!r.ok){
       showToast('<span class="chip chip-err">ERROR</span><span class="lat">'+r.status+
         '</span><br>GET /admin/usage<br><span class="dim">'+esc(errDetail(r.body))+"</span>",true);
+      failAll(errDetail(r.body));
       return;
     }
-    targets.forEach(function(p){renderUsageProvider(p,r.body[p])});
+    targets.forEach(function(p){
+      var data=r.body[p];
+      if(data)renderUsageProvider(p,data);
+      else renderUsageProvider(p,{status:"error",error:"usage response did not include this provider",updated_at:Date.now()/1000});
+    });
   }).catch(function(){
     showToast('<span class="chip chip-err">ERROR</span><br>GET /admin/usage'+
       '<br><span class="dim">gateway unreachable</span>',true);
+    failAll("gateway unreachable");
   }).finally(function(){restoreUsageButtons(targets)});
 }
 document.getElementById("tab-general").addEventListener("click",function(ev){
