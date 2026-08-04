@@ -184,7 +184,7 @@ svg#wires path.flow{fill:none;stroke:var(--ok);stroke-width:7;stroke-dasharray:6
 @keyframes liveping{0%{box-shadow:0 0 0 0 color-mix(in srgb,var(--ok) 55%,transparent)}70%,100%{box-shadow:0 0 0 9px transparent}}
 .node.live .port{border-color:var(--ok);background:var(--ok);animation:liveping 1.4s ease-out infinite}
 @media (prefers-reduced-motion: reduce){.node.live .port{animation:none}}
-.node.src{left:24px} .node.tgt{right:24px;background:var(--panel);border-color:var(--inset)}
+.node.src{left:24px;cursor:default} .node.tgt{right:24px;background:var(--panel);border-color:var(--inset)}
 .node.droppable{border-color:var(--ok);box-shadow:0 0 0 3px color-mix(in srgb,var(--ok) 30%,transparent)}
 .node.removed{opacity:.5}.node.removed .name{text-decoration:line-through}
 /* undo lives inline in the always-present status line so toggling it never changes the node height */
@@ -690,15 +690,13 @@ board.addEventListener("pointerdown",function(ev){
     if(k in DIR.LIVE)DIR.mapping[k]=DIR.LIVE[k];else delete DIR.mapping[k];
     render();return;
   }
-  var node=ev.target.closest(".node");
+  // Only target nodes move; source nodes stay fixed in their column.
+  var node=ev.target.closest(".node.tgt");
   if(node){
-    var isSrc=node.classList.contains("src");
-    var list=isSrc?DIR.sources:DIR.targets;
-    var item=list.find(function(x){return x.id===node.dataset.id});
+    var item=DIR.targets.find(function(x){return x.id===node.dataset.id});
     var rect=node.getBoundingClientRect(),brect=board.getBoundingClientRect();
-    // Target nodes move freely on both axes; source nodes stay column-locked.
-    if(!isSrc&&item.x==null)item.x=(rect.left-brect.left-pan.x)/zoom;
-    move={item:item,cls:isSrc?"src":"tgt",off:ev.clientY-rect.top,offX:ev.clientX-rect.left};
+    if(item.x==null)item.x=(rect.left-brect.left-pan.x)/zoom;
+    move={item:item,off:ev.clientY-rect.top,offX:ev.clientX-rect.left};
     ev.preventDefault();return;
   }
   if(ev.target===board||ev.target===svg){
@@ -726,13 +724,11 @@ document.addEventListener("pointermove",function(ev){
   }else if(move){
     var b=board.getBoundingClientRect();
     move.item.y=Math.max(-260,Math.min(860,(ev.clientY-b.top-move.off-pan.y)/zoom));
-    var el=nodeEl(move.item.id,move.cls);
+    var el=nodeEl(move.item.id,"tgt");
     if(el){
       el.style.top=move.item.y+"px";
-      if(move.cls==="tgt"){
-        move.item.x=Math.max(-300,Math.min(1600,(ev.clientX-b.left-move.offX-pan.x)/zoom));
-        el.style.left=move.item.x+"px";el.style.right="auto";
-      }
+      move.item.x=Math.max(-300,Math.min(1600,(ev.clientX-b.left-move.offX-pan.x)/zoom));
+      el.style.left=move.item.x+"px";el.style.right="auto";
       drawWires();
     }
   }else if(panning){
