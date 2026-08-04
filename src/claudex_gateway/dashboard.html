@@ -569,8 +569,9 @@ function render(){
       '<span class="name">'+esc(route.model)+'</span>'+
       '<span class="st">'+(wired?"WIRED":"UNWIRED")+
         (wired!==liveWired?' <span class="dr">(draft)</span>':"")+'</span>'+
-      // no wire is attached on either side, so the button drops the node itself
-      (wired||liveWired?"":'<button class="x" data-t="'+esc(t.id)+'" title="노드 제거">'+X_ICON+"</button>");
+      // A ghost node (live wire already cut in this draft) has nothing left
+      // to delete; every other target node gets the remove button.
+      (wired||!liveWired?'<button class="x" data-t="'+esc(t.id)+'" title="노드 제거">'+X_ICON+"</button>":"");
     layer.appendChild(el);
   });
   drawWires();
@@ -671,12 +672,15 @@ board.addEventListener("pointerdown",function(ev){
   var xbtn=ev.target.closest?ev.target.closest(".x"):null;
   if(xbtn){
     if(xbtn.dataset.t!=null){
-      // 타겟 노드는 양쪽 모두 연결이 없을 때만 x가 붙는다: 노드 자체를 보드에서 제거
-      addedTargets=addedTargets.filter(function(id){return id!==xbtn.dataset.t});
+      // Dropping a node cuts every wire feeding it: live ones stay as REMOVED
+      // drafts (ghost + undo), session wires just vanish.
+      var tid=xbtn.dataset.t;
+      Object.keys(DIR.mapping).forEach(function(k){if(DIR.mapping[k]===tid)delete DIR.mapping[k]});
+      addedTargets=addedTargets.filter(function(id){return id!==tid});
     }else{
       delete DIR.mapping[xbtn.dataset.k];   // 고정 키: 연결만 끊기 (LIVE였다면 REMOVED + undo)
-      if(DIR.sel&&!(DIR.sel in DIR.mapping))DIR.sel=null;
     }
+    if(DIR.sel&&!(DIR.sel in DIR.mapping))DIR.sel=null;
     document.getElementById("wdel").classList.remove("show");
     render();return;
   }
