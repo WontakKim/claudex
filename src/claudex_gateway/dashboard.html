@@ -867,13 +867,8 @@ function errDetail(body){
 function renderHealth(h){
   var box=document.getElementById("health");
   var overallClass={ok:"ok",degraded:"dg",error:"er"}[h.status]||"er";
-  var codex=(h.providers||{}).codex||{};
   var chips=[
-    {cls:overallClass,label:"Gateway "+String(h.status||"error").toUpperCase(),go:"map",title:""},
-    {cls:codex.status==="ok"?"ok":"er",
-     label:"Codex "+(codex.status==="ok"?"OK":"ERROR"),
-     go:"general",
-     title:codex.detail||""}
+    {cls:overallClass,label:"Gateway "+String(h.status||"error").toUpperCase(),go:"map",title:""}
   ];
   box.innerHTML=chips.map(function(c){
     return '<span class="'+c.cls+'" data-go="'+c.go+'" title="'+esc(c.title).replace(/"/g,"&quot;")+'">'+esc(c.label)+"</span>";
