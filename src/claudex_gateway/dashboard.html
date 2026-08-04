@@ -223,10 +223,9 @@ body.wiring .node .x{pointer-events:none}
 .ctrow{display:flex;gap:8px;align-items:center}
 .ctnode{display:flex;align-items:center;background:var(--inset);border-radius:8px;padding:10px 12px;width:222px;box-sizing:border-box}
 .ctnode.grow{flex:1;width:auto}
-.ctnode select,.ctnode input{flex:1;min-width:0;font:600 15px var(--mono);background:none;border:0;padding:0;color:var(--text)}
-.ctnode select:focus,.ctnode input:focus{outline:none}
+.ctnode input{flex:1;min-width:0;font:600 15px var(--mono);background:none;border:0;padding:0;color:var(--text)}
+.ctnode input:focus{outline:none}
 .ctnode:focus-within{outline:2px solid var(--accent)}
-.ctrow .arr{color:var(--muted);font:600 14px var(--mono)}
 .ctrow button{font:600 14px var(--sans);background:var(--accent);color:#fff;border:0;border-radius:6px;
   width:112px;flex:none;padding:11px 0;text-align:center;cursor:pointer}
 .ctrow button:disabled{opacity:.5;cursor:default}
@@ -297,9 +296,7 @@ body.env-locked .applybar{display:none!important}
         <div class="l">
           <label>모델 연결 테스트</label>
           <div class="ctrow">
-            <span class="ctnode"><span class="nicon" id="ct-src-icon"></span><select id="ct-src"></select></span>
-            <span class="arr">→</span>
-            <span class="ctnode grow"><span class="nicon" id="ct-in-icon"></span><input id="ct-in" spellcheck="false" placeholder="Codex 모델 ID…"></span>
+            <span class="ctnode grow"><span class="nicon" id="ct-in-icon"></span><input id="ct-in" spellcheck="false" placeholder="모델 ID…"></span>
             <button id="ct-btn">Test</button>
           </div>
           <div class="cthint">연결 전에 테스트 요청 한 건으로 모델 ID가 실제로 응답하는지 확인합니다</div>
@@ -584,9 +581,6 @@ function render(){
   document.getElementById("cnt").innerHTML=
     "<b>"+dirty+(dirty===1?" change":" changes")+"</b>"+
     (breakdown?'<span class="dim">'+breakdown+"</span>":"");
-  var cts=document.getElementById("ct-src"),prev=cts.value;
-  cts.innerHTML=DIR.sources.map(function(s){return"<option>"+esc(s.id)+"</option>"}).join("");
-  if(DIR.sources.some(function(s){return s.id===prev}))cts.value=prev;
 }
 /* rebuilt flow paths resume mid-cycle so redraws during drag do not freeze the animation */
 function flowPhase(){return (-(performance.now()/1000%1.4)).toFixed(3)+"s"}
@@ -1064,36 +1058,40 @@ document.getElementById("discardbtn").addEventListener("click",function(){
   render();
 });
 function runConnTest(){
-  var src=document.getElementById("ct-src").value;
   var n=document.getElementById("ct-in").value.trim();
   var btn=document.getElementById("ct-btn");
-  if(!src||!n||btn.disabled)return;
+  if(!n||btn.disabled)return;
   btn.disabled=true;btn.textContent="…";
-  var pair='"'+esc(src)+'" → "'+esc(n)+'"';
+  var label='"'+esc(n)+'"';
   jfetch("/admin/test",{
     method:"POST",
     headers:{"Content-Type":"application/json"},
-    body:JSON.stringify({source:src,target:n})
+    body:JSON.stringify({target:n})
   }).then(function(r){
     btn.disabled=false;btn.textContent="Test";
     var b=r.body||{};
     if(r.ok&&b.ok){
       showToast('<span class="chip chip-ok">OK</span><span class="lat">'+(b.latency_ms!=null?b.latency_ms+"ms":"")+
-        "</span><br>"+pair+' 응답 확인<br><span class="dim">request.model: '+esc(src)+
-        " · response.model: "+esc(b.response_model||n)+"</span>",false);
+        "</span><br>"+label+' 응답 확인<br><span class="dim">response.model: '+esc(b.response_model||n)+"</span>",false);
     }else{
       var code=b.status!=null?b.status:r.status;
-      showToast('<span class="chip chip-err">ERROR</span><span class="lat">'+esc(code)+"</span><br>"+pair+
+      showToast('<span class="chip chip-err">ERROR</span><span class="lat">'+esc(code)+"</span><br>"+label+
         '<br><span class="dim">'+esc(b.detail||errDetail(b))+"</span>",true);
     }
   }).catch(function(){
     btn.disabled=false;btn.textContent="Test";
-    showToast('<span class="chip chip-err">ERROR</span><br>'+pair+
+    showToast('<span class="chip chip-err">ERROR</span><br>'+label+
       '<br><span class="dim">gateway unreachable</span>',true);
   });
 }
 document.getElementById("ct-btn").addEventListener("click",runConnTest);
 document.getElementById("ct-in").addEventListener("keydown",function(ev){if(ev.key==="Enter")runConnTest()});
+/* Unrecognized or missing prefixes fall back to the Codex icon, matching
+   providerIcon's own default. */
+document.getElementById("ct-in").addEventListener("input",function(){
+  var m=new RegExp("^\\s*("+ROUTE_PROVIDERS.join("|")+"):").exec(this.value);
+  document.getElementById("ct-in-icon").innerHTML=providerIcon(m?m[1]:"codex",14);
+});
 window.addEventListener("resize",drawWires);
 function fitView(){
   var nodes=layer.querySelectorAll(".node");
@@ -1323,7 +1321,6 @@ function boot(){
   // would paint short and then grow, which is the jump the skeleton exists
   // to remove.
   ["claude","codex","kimi","xai"].forEach(function(p){renderUsageProvider(p,null)});
-  document.getElementById("ct-src-icon").innerHTML=claudeIcon(14);
   document.getElementById("ct-in-icon").innerHTML=codexIcon(14);
   jfetch("/api/hello").then(function(hello){
     authRequired=!!(hello.body&&hello.body.local_auth_required);

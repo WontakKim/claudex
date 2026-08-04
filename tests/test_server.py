@@ -1860,7 +1860,7 @@ class TestAdminDashboardApi:
         with self._client(monkeypatch, codex_client=ProbeCodexClient) as client:
             response = client.post(
                 "/admin/test",
-                json={"source": "haiku", "target": "codex:gpt-5.6-luna"},
+                json={"target": "codex:gpt-5.6-luna"},
             )
 
         assert response.status_code == 200
@@ -1876,7 +1876,7 @@ class TestAdminDashboardApi:
         with self._client(monkeypatch, codex_client=ProbeCodexClient) as client:
             response = client.post(
                 "/admin/test",
-                json={"source": "haiku", "target": "gpt-5.6-luna"},
+                json={"target": "gpt-5.6-luna"},
             )
 
         assert response.status_code == 400
@@ -1888,7 +1888,7 @@ class TestAdminDashboardApi:
         with self._client(monkeypatch, kimi_client=ProbeKimiClient) as client:
             response = client.post(
                 "/admin/test",
-                json={"source": "fable", "target": "kimi:k3"},
+                json={"target": "kimi:k3"},
             )
 
         assert response.status_code == 200
@@ -1903,7 +1903,7 @@ class TestAdminDashboardApi:
         with self._client(monkeypatch, kimi_client=RejectingKimiClient) as client:
             response = client.post(
                 "/admin/test",
-                json={"source": "fable", "target": "kimi:k3"},
+                json={"target": "kimi:k3"},
             )
 
         result = response.json()
@@ -1917,7 +1917,7 @@ class TestAdminDashboardApi:
         with self._client(monkeypatch, xai_client=ProbeXAIClient) as client:
             response = client.post(
                 "/admin/test",
-                json={"source": "fable", "target": "xai:grok-4.5"},
+                json={"target": "xai:grok-4.5"},
             )
 
         assert response.status_code == 200
@@ -1932,7 +1932,7 @@ class TestAdminDashboardApi:
         with self._client(monkeypatch, xai_client=RejectingXAIClient) as client:
             response = client.post(
                 "/admin/test",
-                json={"source": "fable", "target": "xai:grok-nope"},
+                json={"target": "xai:grok-nope"},
             )
 
         result = response.json()
@@ -1946,7 +1946,7 @@ class TestAdminDashboardApi:
         with self._client(monkeypatch) as client:
             response = client.post(
                 "/admin/test",
-                json={"source": "fable", "target": "kim:k3"},
+                json={"target": "kim:k3"},
             )
 
         assert response.status_code == 400
@@ -1958,7 +1958,7 @@ class TestAdminDashboardApi:
         with self._client(monkeypatch, codex_client=RejectingCodexClient) as client:
             response = client.post(
                 "/admin/test",
-                json={"source": "haiku", "target": "codex:gpt-nope"},
+                json={"target": "codex:gpt-nope"},
             )
 
         assert response.status_code == 200
@@ -1973,11 +1973,11 @@ class TestAdminDashboardApi:
         with self._client(monkeypatch) as client:
             empty_target = client.post(
                 "/admin/test",
-                json={"source": "a", "target": " "},
+                json={"target": " "},
             )
             wrong_content_type = client.post(
                 "/admin/test",
-                content='{"source": "a", "target": "b"}',
+                content='{"target": "codex:x"}',
                 headers={"content-type": "text/plain"},
             )
 

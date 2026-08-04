@@ -1176,9 +1176,8 @@ async def _handle_admin_kimi_models(request: Request) -> JSONResponse:
 _CONNECTION_TEST_TIMEOUT = 30.0
 
 
-async def _probe_codex_route(codex_client: CodexClient, source: str, target: str) -> str:
+async def _probe_codex_route(codex_client: CodexClient, target: str) -> str:
     claude_request = {
-        "model": source,
         "max_tokens": 16,
         "messages": [{"role": "user", "content": "ping"}],
     }
@@ -1195,9 +1194,8 @@ async def _probe_codex_route(codex_client: CodexClient, source: str, target: str
     return model if isinstance(model, str) else target
 
 
-async def _probe_xai_route(xai_client: XAIClient, source: str, target: str) -> str:
+async def _probe_xai_route(xai_client: XAIClient, target: str) -> str:
     claude_request = {
-        "model": source,
         "max_tokens": 16,
         "messages": [{"role": "user", "content": "ping"}],
     }
@@ -1240,7 +1238,7 @@ async def _probe_kimi_route(kimi_client: KimiClient, target_model: str) -> str:
 
 
 async def _handle_admin_connection_test(request: Request) -> JSONResponse:
-    """Send one minimal request through the gateway to verify a model pairing.
+    """Send one minimal request through the gateway to verify a target model id.
 
     The result — success or failure — is always a 200 with the outcome in the
     body; non-200 responses are reserved for invalid test requests themselves.
@@ -1251,16 +1249,15 @@ async def _handle_admin_connection_test(request: Request) -> JSONResponse:
     body, error = await _read_json_object(request, _openai_error_body)
     if error is not None or body is None:
         return error
-    source = body.get("source")
     target = body.get("target")
-    if not isinstance(source, str) or not source.strip() or not isinstance(target, str) or not target.strip():
+    if not isinstance(target, str) or not target.strip():
         return JSONResponse(
             _openai_error_body(
-                "invalid_request_error", "source and target must be non-empty strings"
+                "invalid_request_error", "target must be a non-empty string"
             ),
             status_code=400,
         )
-    source, target = source.strip(), target.strip()
+    target = target.strip()
 
     started_at = time.monotonic()
 
@@ -1272,7 +1269,6 @@ async def _handle_admin_connection_test(request: Request) -> JSONResponse:
                 "ok": ok,
                 "status": status,
                 "latency_ms": int((time.monotonic() - started_at) * 1000),
-                "source": source,
                 "target": target,
                 "response_model": response_model,
                 "detail": detail,
@@ -1292,9 +1288,9 @@ async def _handle_admin_connection_test(request: Request) -> JSONResponse:
         if route.provider == "kimi":
             probe = _probe_kimi_route(request.app.state.kimi_client, route.model)
         elif route.provider == "xai":
-            probe = _probe_xai_route(request.app.state.xai_client, source, route.model)
+            probe = _probe_xai_route(request.app.state.xai_client, route.model)
         else:
-            probe = _probe_codex_route(request.app.state.codex_client, source, route.model)
+            probe = _probe_codex_route(request.app.state.codex_client, route.model)
         response_model = await asyncio.wait_for(probe, _CONNECTION_TEST_TIMEOUT)
     except (CodexUpstreamError, KimiUpstreamError, XAIUpstreamError) as exc:
         return result(False, exc.status_code, _upstream_error_message(exc.body))
