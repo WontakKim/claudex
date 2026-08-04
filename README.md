@@ -108,17 +108,7 @@ ANTHROPIC_BASE_URL=http://127.0.0.1:8787 claude
 
 A logged-in Claude Code needs no token setup: it attaches its own credentials,
 which the Codex path never uses and the passthrough path forwards to Anthropic
-untouched. Only when there is no Claude login at all, satisfy Claude Code's
-startup check with a placeholder token:
-
-```sh
-ANTHROPIC_BASE_URL=http://127.0.0.1:8787 ANTHROPIC_AUTH_TOKEN=dummy claude
-```
-
-The placeholder is forwarded to Anthropic for unmapped models and rejected
-there, so this setup needs a catch-all map entry — a substring key that every
-Claude model name contains, e.g. `{"claude": "codex:gpt-5.5"}` — to keep every
-request on Codex.
+untouched.
 
 A shell alias covers the launch part:
 
