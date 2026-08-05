@@ -69,6 +69,21 @@ explicit choices, not bugs:
 - For Kimi targets: a logged-in Kimi Code CLI (`kimi login`)
 - For Grok targets: a logged-in [Grok CLI](https://github.com/xai-org/grok-build)
   (`grok login`)
+- For `claudex-gateway account add` (interactive): the `claude` CLI on
+  `PATH` and an interactive terminal — it launches `claude auth login
+  --claudeai` to capture a fresh login.
+  `account add --from <dir>` does not launch `claude`; it imports an
+  already-authenticated config directory instead.
+- On macOS, capture reads Claude's credentials from a Keychain item scoped
+  to the exact config-directory string, so `--from <dir>` must name the
+  exact string used at that login — no `~` expansion, trailing-slash
+  cleanup, or other path canonicalization.
+- Interactive capture is verified against Claude Code `2.1.222` exactly.
+  This is an allowlist of tested builds, not a minimum-supported version:
+  any other `claude` build is refused unless
+  `CLAUDEX_ALLOW_UNTESTED_CLAUDE=1` is set.
+- Interactive capture (`account add` without `--from`) is POSIX-only in
+  this version; on Windows, use `account add --from <dir>` instead.
 
 The server starts even when a login is missing; `/health` reports the
 credential state per provider.
@@ -180,6 +195,45 @@ drops the fields Grok rejects (`previous_response_id`, `stream_options`,
 reasoning config — sending one to a non-thinking model fails upstream.
 A newly released thinking model simply runs at its default effort until the
 gateway's list catches up.
+
+### Claude accounts
+
+`claudex-gateway account add` launches the `claude` CLI (`claude auth login
+--claudeai`) in a temporary config directory and captures the resulting
+login into the local account registry. `account add --from <dir>` does not
+launch `claude`: it instead imports an already-completed login from `<dir>`,
+which must be the exact config-directory string used at that login (on
+macOS this selects a Keychain item scoped to that exact string — no `~`
+expansion, trailing-slash cleanup, or other path canonicalization).
+Interactive capture only works with Claude Code `2.1.222` exactly; any
+other `claude` build is refused unless `CLAUDEX_ALLOW_UNTESTED_CLAUDE=1` is
+set. It is also POSIX-only in this version — on Windows, always use
+`--from <dir>` instead (the version-allowlist override does not lift the
+Windows restriction).
+
+```sh
+uv run claudex-gateway account add                 # interactive `claude` login
+uv run claudex-gateway account add --from <dir>    # import an existing login
+uv run claudex-gateway account list
+uv run claudex-gateway account remove <id>         # prompts for confirmation
+uv run claudex-gateway account remove <id> --yes   # skips the confirmation prompt
+```
+
+Captured credentials are stored under `~/.claudex/accounts/claude/`: one
+directory per account (mode `0700`, POSIX file permissions) holding
+`credentials.json` and `oauth-account.json` (mode `0600` each), plus a
+shared `registry.json` (also mode `0600`) that lists accounts without
+secrets. `claudex-gateway` never prints captured credential payloads.
+
+Duplicate detection is keyed on normalized email + `organizationUuid`,
+where missing matches missing: an account with no `organizationUuid`
+collides only with another account that also has none, never with one
+that has an `organizationUuid` set. `account remove <id>` deletes that
+account's local copy only — it does not revoke the OAuth grant at
+Anthropic, which stays valid until revoked from Anthropic's own account
+settings.
+
+Registered accounts are not yet used for gateway requests.
 
 ## Configuration
 
