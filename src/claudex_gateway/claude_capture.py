@@ -269,6 +269,11 @@ def _read_credentials_blob(config_dir: str, keychain: KeychainBackend) -> dict[s
                 f"Keychain service {service!r}; sign in with "
                 "`claude auth login --claudeai` first"
             )
+        if len(password.encode("utf-8")) > _SOURCE_FILE_BYTE_CAP:
+            raise CaptureError(
+                f"Keychain service {service!r} exceeds the "
+                f"{_SOURCE_FILE_BYTE_CAP}-byte read cap"
+            )
         return _parse_json_object(password, source=f"Keychain service {service!r}")
     credentials_path = Path(config_dir) / ".credentials.json"
     raw = _read_capped_text(credentials_path)
@@ -305,27 +310,39 @@ def _normalize_identity_value(value: str) -> str:
     return unicodedata.normalize("NFC", value).strip().casefold()
 
 
+def _clean_identity_value(value: Any) -> str | None:
+    """NFC-normalize and trim a candidate identity value; anything that is
+    not a string, or that is empty after trimming, counts as absent."""
+    if not isinstance(value, str):
+        return None
+    cleaned = unicodedata.normalize("NFC", value).strip()
+    return cleaned or None
+
+
 def _resolve_identity_field(
     field: str,
     oauth_account: dict[str, Any] | None,
     claude_ai_oauth: dict[str, Any] | None,
     oauth_account_key: str,
     claude_ai_oauth_key: str,
+    *,
+    reject_conflict: bool = True,
 ) -> str | None:
     """Resolve one identity field: `oauthAccount` wins, `claudeAiOauth` is the
-    fallback; a conflicting value from both sources fails closed."""
-    from_oauth_account = oauth_account.get(oauth_account_key) if oauth_account else None
-    from_claude_ai_oauth = claude_ai_oauth.get(claude_ai_oauth_key) if claude_ai_oauth else None
-    from_oauth_account = (
-        from_oauth_account if isinstance(from_oauth_account, str) and from_oauth_account else None
+    fallback. Presence is decided on the normalized, trimmed value, so a
+    whitespace-only entry counts as absent rather than shadowing (or falsely
+    conflicting with) the other source. With `reject_conflict`, differing
+    values from both sources fail closed; without it (organizationName, per
+    spec) plain precedence applies."""
+    from_oauth_account = _clean_identity_value(
+        oauth_account.get(oauth_account_key) if oauth_account else None
     )
-    from_claude_ai_oauth = (
-        from_claude_ai_oauth
-        if isinstance(from_claude_ai_oauth, str) and from_claude_ai_oauth
-        else None
+    from_claude_ai_oauth = _clean_identity_value(
+        claude_ai_oauth.get(claude_ai_oauth_key) if claude_ai_oauth else None
     )
     if (
-        from_oauth_account is not None
+        reject_conflict
+        and from_oauth_account is not None
         and from_claude_ai_oauth is not None
         and _normalize_identity_value(from_oauth_account)
         != _normalize_identity_value(from_claude_ai_oauth)
@@ -367,6 +384,7 @@ def _resolve_identity(
         claude_ai_oauth,
         "organizationName",
         "organizationName",
+        reject_conflict=False,
     )
     return email, organization_uuid, organization_name
 
@@ -406,7 +424,10 @@ def _resolve_claude_executable() -> str:
     resolved = shutil.which("claude")
     if resolved is None:
         raise CaptureError("the `claude` CLI was not found on PATH; install Claude Code first")
-    return resolved
+    # A relative PATH entry yields a relative result; absolutize so the
+    # version check and the login spawn are guaranteed to run the same file
+    # regardless of any working-directory change between them.
+    return os.path.abspath(resolved)
 
 
 def _stat_identity(path: str) -> tuple[int, int, int, int]:
@@ -444,6 +465,8 @@ def _check_claude_version(claude_path: str) -> None:
     except OSError as exc:
         raise CaptureError(f"failed to run `claude --version`: {exc}") from exc
 
+    if result.returncode != 0:
+        raise CaptureError(f"`claude --version` exited with status {result.returncode}")
     version = _parse_claude_version(result.stdout, result.stderr)
     if version is None:
         raise CaptureError("could not parse a version from `claude --version` output")
@@ -510,24 +533,20 @@ def _run_login(claude_path: str, config_dir: str, timeout_secs: int) -> None:
     """Spawn `claude auth login --claudeai` and wait for it to finish.
 
     stdin/stdout/stderr are inherited untouched — no output is piped or
-    scanned. A nonzero exit is treated as a login denial/failure. On
-    timeout, SIGTERM/SIGHUP delivered to this process, or KeyboardInterrupt
-    (SIGINT), the login's process group is torn down before this function
-    returns; timeout re-raises as a plain `CaptureError`, the others as
+    scanned. A nonzero exit is treated as a login denial/failure. The caller
+    (`capture_interactive`) owns the SIGTERM/SIGHUP handlers, which raise
+    `_LoginSignalReceived`; this function's job is to guarantee the login's
+    process group is torn down whenever cancellation or timeout lands after
+    the spawn. Timeout raises a plain `CaptureError`; cancellation raises
     `CaptureCancelled`.
     """
-    process = subprocess.Popen(
-        [claude_path, "auth", "login", "--claudeai"],
-        env=_child_process_env(config_dir),
-        start_new_session=True,
-    )
-
-    def _raise_on_signal(signal_number: int, _frame: Any) -> None:
-        raise _LoginSignalReceived(signal_number)
-
-    previous_sigterm = signal.signal(signal.SIGTERM, _raise_on_signal)
-    previous_sighup = signal.signal(signal.SIGHUP, _raise_on_signal)
+    process: subprocess.Popen[Any] | None = None
     try:
+        process = subprocess.Popen(
+            [claude_path, "auth", "login", "--claudeai"],
+            env=_child_process_env(config_dir),
+            start_new_session=True,
+        )
         returncode = process.wait(timeout=timeout_secs)
     except subprocess.TimeoutExpired:
         _terminate_process_group(process)
@@ -535,11 +554,9 @@ def _run_login(claude_path: str, config_dir: str, timeout_secs: int) -> None:
             f"`claude auth login --claudeai` timed out after {timeout_secs}s"
         ) from None
     except (_LoginSignalReceived, KeyboardInterrupt) as exc:
-        _terminate_process_group(process)
+        if process is not None:
+            _terminate_process_group(process)
         raise CaptureCancelled("Claude login was cancelled") from exc
-    finally:
-        signal.signal(signal.SIGTERM, previous_sigterm)
-        signal.signal(signal.SIGHUP, previous_sighup)
 
     if returncode != 0:
         raise CaptureError(f"`claude auth login --claudeai` exited with status {returncode}")
@@ -557,8 +574,15 @@ def _mint_temp_config_dir(keychain: KeychainBackend) -> str:
         candidate = tempfile.mkdtemp(prefix=_TEMP_DIR_PREFIX)
         if sys.platform != "darwin":
             return candidate
-        service = _scoped_keychain_service(candidate)
-        if keychain.read(service, _keychain_account()) is None:
+        try:
+            service = _scoped_keychain_service(candidate)
+            existing = keychain.read(service, _keychain_account())
+        except BaseException:
+            # The collision precheck failed: do not leak the freshly minted
+            # empty directory alongside the propagating error.
+            os.rmdir(candidate)
+            raise
+        if existing is None:
             return candidate
         os.rmdir(candidate)
     raise CaptureError(
@@ -615,13 +639,46 @@ def capture_interactive(timeout_secs: int = 180) -> CapturedAccount:
 
         keychain = _default_keychain_backend()
         config_dir = _mint_temp_config_dir(keychain)
+
+        # Cancellation scope: SIGTERM/SIGHUP handlers are installed BEFORE
+        # the login child is spawned and stay installed until credential
+        # capture *and* cleanup have finished, so no signal in that window
+        # can terminate the gateway while the login child, the temp
+        # credentials, or the scoped Keychain item still exist. During
+        # cleanup the handlers defer instead of raising, so Keychain
+        # deletion and directory removal are never interrupted; a deferred
+        # cancellation surfaces as `CaptureCancelled` after cleanup.
+        signal_state = {"deferring": False, "deferred": False}
+
+        def _on_cancel_signal(signal_number: int, _frame: Any) -> None:
+            if signal_state["deferring"]:
+                signal_state["deferred"] = True
+                return
+            raise _LoginSignalReceived(signal_number)
+
+        previous_sigterm = signal.signal(signal.SIGTERM, _on_cancel_signal)
+        previous_sighup = signal.signal(signal.SIGHUP, _on_cancel_signal)
         try:
-            if _stat_identity(claude_path) != identity:
-                raise CaptureError(
-                    f"the resolved `claude` executable at {claude_path} changed "
-                    "between the version check and the login spawn; aborting"
-                )
-            _run_login(claude_path, config_dir, timeout_secs)
-            return _capture_from_config_dir_impl(config_dir, keychain)
+            try:
+                if _stat_identity(claude_path) != identity:
+                    raise CaptureError(
+                        f"the resolved `claude` executable at {claude_path} changed "
+                        "between the version check and the login spawn; aborting"
+                    )
+                _run_login(claude_path, config_dir, timeout_secs)
+                captured = _capture_from_config_dir_impl(config_dir, keychain)
+            except (_LoginSignalReceived, KeyboardInterrupt) as exc:
+                # Cancellation outside `_run_login`'s own window (e.g. while
+                # reading the captured credentials) still cleans up fully —
+                # via the finally below — and reports `CaptureCancelled`.
+                raise CaptureCancelled("Claude login was cancelled") from exc
         finally:
-            _cleanup_temp_config_dir(config_dir, keychain)
+            signal_state["deferring"] = True
+            try:
+                _cleanup_temp_config_dir(config_dir, keychain)
+            finally:
+                signal.signal(signal.SIGTERM, previous_sigterm)
+                signal.signal(signal.SIGHUP, previous_sighup)
+        if signal_state["deferred"]:
+            raise CaptureCancelled("Claude login was cancelled")
+        return captured

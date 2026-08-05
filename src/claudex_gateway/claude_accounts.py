@@ -275,10 +275,24 @@ def remove_account(account_id: str) -> None:
         directory_present = _verify_removable_directory(final_dir, accounts_root)
 
         if directory_present:
+            tombstoned = False
             try:
                 os.rename(final_dir, tombstone_dir)
+                tombstoned = True
                 _fsync_directory(accounts_root)
             except OSError as exc:
+                if tombstoned:
+                    # The pre-commit durability barrier failed while the
+                    # registry still references the account: restore the
+                    # canonical directory so registry and disk stay in step.
+                    try:
+                        os.rename(tombstone_dir, final_dir)
+                        _fsync_directory(accounts_root)
+                    except OSError as restore_exc:
+                        raise AccountRegistryError(
+                            f"failed to restore {final_dir} after a tombstone "
+                            "durability failure"
+                        ) from restore_exc
                 raise AccountRegistryError(
                     f"failed to tombstone account directory {final_dir}"
                 ) from exc
@@ -477,12 +491,14 @@ def _now_millis() -> int:
 
 class _PostCommitFsyncError(Exception):
     """Internal signal from `_write_json_atomic`: `os.replace` succeeded but
-    the following containing-directory fsync failed. Every *other* exception
-    raised by `_write_json_atomic` means the replace itself never happened —
-    callers must treat this type, and only this type, as "committed, but
-    durability is uncertain"."""
+    something raised afterwards (the containing-directory fsync failing, or
+    any interruption such as `KeyboardInterrupt` landing in the post-replace
+    window). Every *other* exception raised by `_write_json_atomic` means the
+    replace itself never happened — callers must treat this type, and only
+    this type, as "committed, but durability is uncertain", and must never
+    run destructive rollback for it."""
 
-    def __init__(self, directory: Path, cause: OSError) -> None:
+    def __init__(self, directory: Path, cause: BaseException) -> None:
         super().__init__(f"replace into {directory} succeeded but its directory fsync failed")
         self.directory = directory
 
@@ -502,6 +518,7 @@ def _write_json_atomic(path: Path, data: Any) -> None:
     staging_path = path.with_name(f".{path.name}.tmp-{uuid.uuid4().hex}")
     payload = json.dumps(data, indent=2, ensure_ascii=False).encode("utf-8") + b"\n"
 
+    replaced = False
     fd = os.open(staging_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
     try:
         try:
@@ -515,13 +532,18 @@ def _write_json_atomic(path: Path, data: Any) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(staging_path, path)
-    except BaseException:
+        replaced = True
+    except BaseException as exc:
         _remove_path_if_exists(staging_path)
+        if replaced:
+            # The replace committed before the interruption landed; callers
+            # must not mistake this for a pre-commit failure and roll back.
+            raise _PostCommitFsyncError(path.parent, exc) from exc
         raise
 
     try:
         _fsync_directory(path.parent)
-    except OSError as exc:
+    except BaseException as exc:
         raise _PostCommitFsyncError(path.parent, exc) from exc
 
 

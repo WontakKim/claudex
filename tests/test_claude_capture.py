@@ -14,6 +14,7 @@ import threading
 import time
 import unicodedata
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -77,6 +78,24 @@ class _FakeKeychainBackend:
         if self.delete_failure is not None:
             raise self.delete_failure
         self.store.pop((service, account), None)
+
+
+@contextmanager
+def _login_cancellation_handlers() -> Any:
+    """Install SIGTERM/SIGHUP handlers raising `_LoginSignalReceived`,
+    mirroring the cancellation scope `capture_interactive` owns in
+    production, for tests that drive `_run_login` directly."""
+
+    def _raise_on_signal(signal_number: int, _frame: Any) -> None:
+        raise claude_capture._LoginSignalReceived(signal_number)
+
+    previous_sigterm = signal.signal(signal.SIGTERM, _raise_on_signal)
+    previous_sighup = signal.signal(signal.SIGHUP, _raise_on_signal)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGTERM, previous_sigterm)
+        signal.signal(signal.SIGHUP, previous_sighup)
 
 
 def _sequential_mkdtemp(root: Path) -> Any:
@@ -836,11 +855,14 @@ def test_sigterm_during_login_wait_translates_to_capture_cancelled(
 
     signaler = threading.Thread(target=_deliver_sigterm, daemon=True)
     signaler.start()
-    try:
-        with pytest.raises(CaptureCancelled):
-            claude_capture._run_login(str(claude_path), str(config_dir), timeout_secs=30)
-    finally:
-        signaler.join(timeout=5)
+    # `capture_interactive` owns the SIGTERM/SIGHUP handlers in production;
+    # mirror its contract when driving `_run_login` directly.
+    with _login_cancellation_handlers():
+        try:
+            with pytest.raises(CaptureCancelled):
+                claude_capture._run_login(str(claude_path), str(config_dir), timeout_secs=30)
+        finally:
+            signaler.join(timeout=5)
 
     leader_pid = int(_wait_for_file(config_dir / "leader.pid"))
     _assert_process_gone(leader_pid)
@@ -863,11 +885,14 @@ def test_sighup_during_login_wait_translates_to_capture_cancelled(
 
     signaler = threading.Thread(target=_deliver_sighup, daemon=True)
     signaler.start()
-    try:
-        with pytest.raises(CaptureCancelled):
-            claude_capture._run_login(str(claude_path), str(config_dir), timeout_secs=30)
-    finally:
-        signaler.join(timeout=5)
+    # `capture_interactive` owns the SIGTERM/SIGHUP handlers in production;
+    # mirror its contract when driving `_run_login` directly.
+    with _login_cancellation_handlers():
+        try:
+            with pytest.raises(CaptureCancelled):
+                claude_capture._run_login(str(claude_path), str(config_dir), timeout_secs=30)
+        finally:
+            signaler.join(timeout=5)
 
     leader_pid = int(_wait_for_file(config_dir / "leader.pid"))
     _assert_process_gone(leader_pid)
@@ -1021,6 +1046,176 @@ def test_capture_interactive_succeeds_end_to_end_with_fake_keychain(
     assert not Path(predicted_config_dir).exists()
     assert backend.store == {}
     assert [call.op for call in backend.calls] == ["read", "read", "delete"]
+
+
+# ---------------------------------------------------------------------------
+# Cancellation scope: signals outside the login wait itself
+# ---------------------------------------------------------------------------
+
+
+def _interactive_fixture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[_FakeKeychainBackend, str, str]:
+    """Shared arrangement for cancellation-scope tests: TTY stdin, fake
+    `claude` on PATH, deterministic mkdtemp, fake Keychain, and a
+    `_run_login` stand-in that deposits credentials like a real login."""
+    _make_stdin_a_tty(monkeypatch)
+    monkeypatch.setenv("USER", "tester")
+    monkeypatch.delenv("USERNAME", raising=False)
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _write_fake_claude(bin_dir, version="2.1.222")
+    _prepend_path(monkeypatch, bin_dir)
+
+    mkdtemp_root = tmp_path / "mkdtemp-root"
+    mkdtemp_root.mkdir()
+    monkeypatch.setattr(claude_capture.tempfile, "mkdtemp", _sequential_mkdtemp(mkdtemp_root))
+    predicted_config_dir = str(mkdtemp_root / f"{claude_capture._TEMP_DIR_PREFIX}1")
+    service = claude_capture._scoped_keychain_service(predicted_config_dir)
+
+    backend = _FakeKeychainBackend()
+    monkeypatch.setattr(claude_capture, "_default_keychain_backend", lambda: backend)
+
+    def _fake_run_login(claude_path: str, config_dir: str, timeout_secs: int) -> None:
+        backend.store[(service, "tester")] = json.dumps(
+            {"claudeAiOauth": {"accessToken": "fake-access-token", "email": "fixture@example.com"}}
+        )
+        Path(config_dir, ".claude.json").write_text(
+            json.dumps({"oauthAccount": {"emailAddress": "fixture@example.com"}})
+        )
+
+    monkeypatch.setattr(claude_capture, "_run_login", _fake_run_login)
+    return backend, predicted_config_dir, service
+
+
+def test_sigterm_during_credential_capture_cancels_after_full_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    backend, predicted_config_dir, _service = _interactive_fixture(tmp_path, monkeypatch)
+
+    real_capture_impl = claude_capture._capture_from_config_dir_impl
+
+    def _signalled_capture_impl(config_dir: str, keychain: Any) -> CapturedAccount:
+        # The login child has already exited; the cancel lands while the
+        # gateway is reading the captured credentials.
+        os.kill(os.getpid(), signal.SIGTERM)
+        return real_capture_impl(config_dir, keychain)
+
+    monkeypatch.setattr(claude_capture, "_capture_from_config_dir_impl", _signalled_capture_impl)
+
+    with pytest.raises(CaptureCancelled):
+        claude_capture.capture_interactive(timeout_secs=10)
+
+    # Cleanup ran to completion before the cancellation surfaced.
+    assert not Path(predicted_config_dir).exists()
+    assert backend.store == {}
+
+
+def test_sigterm_during_cleanup_is_deferred_until_cleanup_completes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    backend, predicted_config_dir, _service = _interactive_fixture(tmp_path, monkeypatch)
+
+    real_delete = _FakeKeychainBackend.delete
+
+    def _signalling_delete(self: _FakeKeychainBackend, service: str, account: str) -> None:
+        # The cancel lands mid-cleanup: it must be deferred, not allowed to
+        # interrupt the Keychain deletion or the directory removal.
+        os.kill(os.getpid(), signal.SIGTERM)
+        real_delete(self, service, account)
+
+    monkeypatch.setattr(_FakeKeychainBackend, "delete", _signalling_delete)
+
+    with pytest.raises(CaptureCancelled):
+        claude_capture.capture_interactive(timeout_secs=10)
+
+    # Both cleanup actions completed despite the mid-cleanup signal.
+    assert not Path(predicted_config_dir).exists()
+    assert backend.store == {}
+
+
+# ---------------------------------------------------------------------------
+# Version gate: nonzero probe exit; resolved path is always absolute
+# ---------------------------------------------------------------------------
+
+
+def test_version_gate_rejects_nonzero_version_probe_exit(tmp_path: Path) -> None:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    claude_path = bin_dir / "claude"
+    # Prints an allowlisted version but fails: the probe result must not be
+    # trusted just because its output happens to parse.
+    claude_path.write_text(f"#!{sys.executable}\nprint('2.1.222 (Claude Code)')\nraise SystemExit(3)\n")
+    claude_path.chmod(0o755)
+
+    with pytest.raises(CaptureError, match="exited with status 3"):
+        claude_capture._check_claude_version(str(claude_path))
+
+
+def test_resolve_claude_executable_absolutizes_a_relative_path_entry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _write_fake_claude(bin_dir)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("PATH", "bin")  # relative PATH entry
+
+    resolved = claude_capture._resolve_claude_executable()
+
+    assert os.path.isabs(resolved)
+    assert Path(resolved) == bin_dir / "claude"
+
+
+# ---------------------------------------------------------------------------
+# Identity resolution: whitespace presence and organizationName precedence
+# ---------------------------------------------------------------------------
+
+
+def test_identity_whitespace_only_email_in_both_sources_is_missing() -> None:
+    with pytest.raises(CaptureError, match="nonempty"):
+        claude_capture._resolve_identity(
+            {"claudeAiOauth": {"email": " "}}, {"emailAddress": "   "}
+        )
+
+
+def test_identity_whitespace_primary_email_falls_back_without_conflict() -> None:
+    email, _org_uuid, _org_name = claude_capture._resolve_identity(
+        {"claudeAiOauth": {"email": "real@example.com"}},
+        {"emailAddress": "   "},
+    )
+    assert email == "real@example.com"
+
+
+def test_identity_organization_name_difference_is_precedence_not_conflict() -> None:
+    _email, _org_uuid, org_name = claude_capture._resolve_identity(
+        {"claudeAiOauth": {"email": "a@example.com", "organizationName": "Blob Name"}},
+        {"emailAddress": "a@example.com", "organizationName": "Account Name"},
+    )
+    assert org_name == "Account Name"  # oauthAccount wins by precedence
+
+
+# ---------------------------------------------------------------------------
+# Keychain blob byte cap
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="the Keychain read path is macOS-only")
+def test_keychain_credentials_blob_over_byte_cap_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("USER", "tester")
+    config_dir = str(tmp_path / "config")
+    Path(config_dir).mkdir()
+    service = claude_capture._scoped_keychain_service(config_dir)
+
+    backend = _FakeKeychainBackend()
+    oversized = '{"pad": "' + "x" * (claude_capture._SOURCE_FILE_BYTE_CAP + 1) + '"}'
+    backend.store[(service, "tester")] = oversized
+
+    with pytest.raises(CaptureError, match="byte"):
+        claude_capture._read_credentials_blob(config_dir, backend)
 
 
 # ---------------------------------------------------------------------------

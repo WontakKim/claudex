@@ -110,6 +110,7 @@ def _child_env(tmp_path: Path) -> dict[str, str]:
 
 def _fsync_directory_failing_on_nth_root_call(
     fail_on_call: int,
+    exception_factory: Callable[[], BaseException] = lambda: OSError("injected fsync failure"),
 ) -> tuple[Callable[[Path], None], dict[str, int]]:
     """Wrap `_fsync_directory` so it raises on the `fail_on_call`-th call
     whose argument is `accounts/claude/` itself, and behaves normally
@@ -118,6 +119,8 @@ def _fsync_directory_failing_on_nth_root_call(
     indiscriminately would target the wrong step; only `accounts/claude/`
     calls are the pre-commit barrier / post-replace / tombstone-purge
     fsyncs this module documents as its commit boundaries.
+    `exception_factory` lets a test inject a non-`OSError` interruption
+    (e.g. `KeyboardInterrupt`) at the same boundaries.
     """
     real = claude_accounts._fsync_directory
     accounts_root = _accounts_root()
@@ -128,7 +131,7 @@ def _fsync_directory_failing_on_nth_root_call(
         if is_root_call:
             call_count["n"] += 1
             if call_count["n"] == fail_on_call:
-                raise OSError("injected fsync failure")
+                raise exception_factory()
         real(directory)
 
     return _wrapped, call_count
@@ -506,6 +509,63 @@ def test_remove_post_commit_fsync_failure_leaves_the_tombstone_in_place(
     other = _add("other@example.com")
     assert not tombstone.exists()
     assert {r.id for r in claude_accounts.list_accounts()} == {other.id}
+
+
+def test_add_interrupt_after_registry_replace_never_rolls_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A non-OSError interruption (KeyboardInterrupt) landing after the
+    # registry os.replace() must be classified as post-commit: the account
+    # directory stays, the committed registry row stays.
+    wrapped, _call_count = _fsync_directory_failing_on_nth_root_call(
+        fail_on_call=2, exception_factory=KeyboardInterrupt
+    )
+    monkeypatch.setattr(claude_accounts, "_fsync_directory", wrapped)
+
+    with pytest.raises(claude_accounts.AccountRegistryError, match="durability"):
+        _add()
+
+    [listed] = claude_accounts.list_accounts()
+    assert listed.email == "user@example.com"
+    assert (_accounts_root() / listed.id).is_dir()
+
+
+def test_remove_interrupt_after_registry_replace_keeps_the_tombstone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    record = _add()
+    wrapped, _call_count = _fsync_directory_failing_on_nth_root_call(
+        fail_on_call=2, exception_factory=KeyboardInterrupt
+    )
+    monkeypatch.setattr(claude_accounts, "_fsync_directory", wrapped)
+
+    with pytest.raises(claude_accounts.AccountRegistryError, match="durability"):
+        claude_accounts.remove_account(record.id)
+
+    # Post-commit: the tombstone is neither restored nor purged, and the
+    # registry no longer contains the row.
+    assert (_accounts_root() / f"{record.id}.tombstone").is_dir()
+    assert not (_accounts_root() / record.id).exists()
+    assert claude_accounts.load_registry() == []
+
+
+def test_remove_precommit_tombstone_fsync_failure_restores_the_directory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    record = _add()
+    # The 1st `accounts/claude/` fsync during remove is the pre-commit
+    # tombstone durability barrier: the registry still references the
+    # account, so a failure here must rename the tombstone back.
+    wrapped, _call_count = _fsync_directory_failing_on_nth_root_call(fail_on_call=1)
+    monkeypatch.setattr(claude_accounts, "_fsync_directory", wrapped)
+
+    with pytest.raises(claude_accounts.AccountRegistryError, match="failed to tombstone"):
+        claude_accounts.remove_account(record.id)
+
+    assert (_accounts_root() / record.id).is_dir()
+    assert not (_accounts_root() / f"{record.id}.tombstone").exists()
+    [listed] = claude_accounts.list_accounts()
+    assert listed.id == record.id
 
 
 def test_tombstone_purge_failure_surfaces_an_error_while_the_row_stays_removed(
