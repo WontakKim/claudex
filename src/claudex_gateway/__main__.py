@@ -18,6 +18,7 @@ from typing import Any
 import uvicorn
 
 import claudex_gateway
+from claudex_gateway import paths
 from claudex_gateway.config import ConfigError, GatewayConfig
 from claudex_gateway.server import create_app
 
@@ -27,21 +28,6 @@ _STOP_TIMEOUT = 10.0
 # Carries the launcher-generated daemon nonce into the spawned foreground
 # process so /api/hello can prove which daemon a record refers to.
 _DAEMON_NONCE_ENV = "CLAUDEX_DAEMON_NONCE"
-
-
-def _runtime_dir() -> Path:
-    return Path.home() / ".claudex"
-
-
-def _daemon_record_file() -> Path:
-    # The historical gateway.pid path now holds a JSON identity record
-    # (pid/host/port/nonce); the name is kept so pre-0.4 installs are
-    # detected as legacy records instead of being silently ignored.
-    return _runtime_dir() / "gateway.pid"
-
-
-def _log_file() -> Path:
-    return _runtime_dir() / "gateway.log"
 
 
 def _load_config() -> GatewayConfig:
@@ -129,8 +115,8 @@ def _start_background(config: GatewayConfig) -> None:
         while time.monotonic() < deadline and _is_listening(probe_host, config.port):
             time.sleep(0.1)
 
-    _runtime_dir().mkdir(parents=True, exist_ok=True)
-    log_file = _log_file()
+    paths.runtime_dir().mkdir(parents=True, exist_ok=True)
+    log_file = paths.log_file()
     daemon_nonce = secrets.token_hex(16)
     child_env = dict(os.environ)
     child_env[_DAEMON_NONCE_ENV] = daemon_nonce
@@ -148,7 +134,7 @@ def _start_background(config: GatewayConfig) -> None:
     deadline = time.monotonic() + _READY_TIMEOUT
     while time.monotonic() < deadline:
         if process.poll() is not None:
-            _daemon_record_file().unlink(missing_ok=True)
+            paths.daemon_record_file().unlink(missing_ok=True)
             print(
                 f"claudex-gateway exited during startup; last log lines from {log_file}:\n"
                 f"{_log_tail(log_file)}",
@@ -171,7 +157,7 @@ def _start_background(config: GatewayConfig) -> None:
         time.sleep(0.1)
 
     process.terminate()
-    _daemon_record_file().unlink(missing_ok=True)
+    paths.daemon_record_file().unlink(missing_ok=True)
     print(
         f"claudex-gateway did not become ready within {_READY_TIMEOUT:.0f}s; "
         f"check {log_file}",
@@ -188,7 +174,7 @@ def _log_tail(log_file: Path, lines: int = 10) -> str:
 
 
 def _write_daemon_record(pid: int, host: str, port: int, nonce: str) -> None:
-    _daemon_record_file().write_text(
+    paths.daemon_record_file().write_text(
         json.dumps({"pid": pid, "host": host, "port": port, "nonce": nonce}) + "\n",
         encoding="utf-8",
     )
@@ -200,7 +186,7 @@ def _read_daemon_record() -> tuple[dict[str, Any] | None, str]:
     Legacy bare-pid files and corrupt content are unusable on purpose: a pid
     alone cannot prove which process it belongs to, so signaling from it
     could kill an unrelated process after pid reuse."""
-    record_file = _daemon_record_file()
+    record_file = paths.daemon_record_file()
     try:
         raw = record_file.read_text(encoding="utf-8")
     except FileNotFoundError:
@@ -246,7 +232,7 @@ def _stop_recorded_daemon() -> tuple[bool, str]:
         try:
             os.kill(pid, 0)
         except ProcessLookupError:
-            _daemon_record_file().unlink(missing_ok=True)
+            paths.daemon_record_file().unlink(missing_ok=True)
             return False, "not running (stale daemon record removed)"
         return False, (
             f"pid {pid} is alive but no gateway answers on "
@@ -261,7 +247,7 @@ def _stop_recorded_daemon() -> tuple[bool, str]:
     try:
         os.kill(pid, signal.SIGTERM)
     except ProcessLookupError:
-        _daemon_record_file().unlink(missing_ok=True)
+        paths.daemon_record_file().unlink(missing_ok=True)
         return False, "not running (stale daemon record removed)"
 
     deadline = time.monotonic() + _STOP_TIMEOUT
@@ -269,7 +255,7 @@ def _stop_recorded_daemon() -> tuple[bool, str]:
         try:
             os.kill(pid, 0)
         except ProcessLookupError:
-            _daemon_record_file().unlink(missing_ok=True)
+            paths.daemon_record_file().unlink(missing_ok=True)
             return True, str(pid)
         time.sleep(0.1)
     return False, f"pid {pid} did not exit within {_STOP_TIMEOUT:.0f}s"

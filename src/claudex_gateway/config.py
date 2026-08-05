@@ -8,6 +8,8 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from claudex_gateway import paths
+
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8787
 
@@ -80,10 +82,6 @@ def parse_route_target(value: str) -> RouteTarget:
     return RouteTarget(provider=prefix, model=model)
 
 
-def _default_settings_file() -> Path:
-    return Path.home() / ".claudex" / "settings.json"
-
-
 def _default_kimi_code_home() -> Path:
     return Path.home() / ".kimi-code"
 
@@ -109,12 +107,12 @@ class GatewayConfig:
     local_token: str | None = None
     log_level: str = "info"
     # Where settings are read from and where runtime changes are persisted.
-    settings_file: Path = field(default_factory=_default_settings_file)
+    settings_file: Path = field(default_factory=paths.settings_file)
 
     @classmethod
     def from_env(cls) -> "GatewayConfig":
         """Build from environment variables only, ignoring any settings file."""
-        return cls._from_sources({}, _default_settings_file())
+        return cls._from_sources({}, paths.settings_file())
 
     @classmethod
     def load(cls, settings_file: Path | None = None) -> "GatewayConfig":
@@ -126,7 +124,7 @@ class GatewayConfig:
         optional — a missing file behaves like an empty one.
         """
         if settings_file is None:
-            settings_file = _default_settings_file()
+            settings_file = paths.settings_file()
         return cls._from_sources(_read_settings_file(settings_file), settings_file)
 
     @classmethod
