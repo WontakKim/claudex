@@ -1,4 +1,4 @@
-"""xAI credential management backed by the Grok CLI's auth.json.
+"""Grok credential management backed by the Grok CLI's auth.json.
 
 The gateway reuses the login produced by ``grok login``: the store lives at
 ``$GROK_HOME/auth.json`` (default ``~/.grok/auth.json``) keyed by
@@ -28,12 +28,12 @@ XAI_ISSUER = "https://auth.x.ai"
 _EXPIRY_SKEW_SECONDS = 300
 
 
-class XAIAuthError(Exception):
-    """Raised when xAI credentials are missing or cannot be refreshed."""
+class GrokAuthError(Exception):
+    """Raised when Grok credentials are missing or cannot be refreshed."""
 
 
 @dataclass(frozen=True)
-class XAICredentials:
+class GrokCredentials:
     access_token: str
     email: str | None
     is_api_key: bool = False
@@ -58,7 +58,7 @@ def _rfc3339_in(seconds: float) -> str:
     return expiry.isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
-class XAIAuthManager:
+class GrokAuthManager:
     """Loads, refreshes, and persists the Grok CLI's credentials."""
 
     def __init__(self, auth_file: Path, http_client: httpx.AsyncClient) -> None:
@@ -66,12 +66,12 @@ class XAIAuthManager:
         self._http_client = http_client
         self._refresh_lock = asyncio.Lock()
 
-    async def get_credentials(self, force_refresh: bool = False) -> XAICredentials:
+    async def get_credentials(self, force_refresh: bool = False) -> GrokCredentials:
         store = self._load_auth_file()
         scope, entry = _select_entry(store, self._auth_file)
 
         if entry.get("auth_mode") == "api_key":
-            return XAICredentials(
+            return GrokCredentials(
                 access_token=entry["key"],
                 email=entry.get("email"),
                 is_api_key=True,
@@ -102,7 +102,7 @@ class XAIAuthManager:
                 ):
                     store, entry = await self._refresh_tokens(store, scope, entry)
 
-        return XAICredentials(
+        return GrokCredentials(
             access_token=entry["key"],
             email=entry.get("email"),
             user_id=entry.get("user_id"),
@@ -112,15 +112,15 @@ class XAIAuthManager:
         try:
             raw = self._auth_file.read_text(encoding="utf-8")
         except FileNotFoundError as exc:
-            raise XAIAuthError(
+            raise GrokAuthError(
                 f"{self._auth_file} not found; install the Grok CLI and run `grok login`"
             ) from exc
         try:
             store = json.loads(raw)
         except json.JSONDecodeError as exc:
-            raise XAIAuthError(f"{self._auth_file} is not valid JSON: {exc}") from exc
+            raise GrokAuthError(f"{self._auth_file} is not valid JSON: {exc}") from exc
         if not isinstance(store, dict):
-            raise XAIAuthError(f"{self._auth_file} has an unexpected format")
+            raise GrokAuthError(f"{self._auth_file} has an unexpected format")
         return store
 
     async def _refresh_tokens(
@@ -128,14 +128,14 @@ class XAIAuthManager:
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         refresh_token = entry.get("refresh_token")
         if not refresh_token:
-            raise XAIAuthError(
+            raise GrokAuthError(
                 f"access token expired and no refresh token in {self._auth_file}; "
                 "run `grok login` again"
             )
         issuer = entry.get("oidc_issuer") or scope.partition("::")[0] or XAI_ISSUER
         client_id = entry.get("oidc_client_id") or scope.partition("::")[2]
         if not client_id:
-            raise XAIAuthError(
+            raise GrokAuthError(
                 f"entry {scope!r} in {self._auth_file} names no OAuth client; "
                 "run `grok login` again"
             )
@@ -156,19 +156,19 @@ class XAIAuthManager:
                 token_endpoint, data=form, headers={"Accept": "application/json"}
             )
         except httpx.HTTPError as exc:
-            raise XAIAuthError(f"token refresh request failed: {exc}") from exc
+            raise GrokAuthError(f"token refresh request failed: {exc}") from exc
         if response.status_code != 200:
-            raise XAIAuthError(
+            raise GrokAuthError(
                 f"token refresh failed with status {response.status_code}: {response.text}"
             )
         try:
             refreshed = response.json()
         except ValueError as exc:
-            raise XAIAuthError("token refresh response is not valid JSON") from exc
+            raise GrokAuthError("token refresh response is not valid JSON") from exc
 
         access_token = refreshed.get("access_token")
         if not access_token:
-            raise XAIAuthError(f"token refresh returned no access token: {refreshed!r}")
+            raise GrokAuthError(f"token refresh returned no access token: {refreshed!r}")
         new_entry = dict(entry)
         new_entry["key"] = access_token
         if refreshed.get("refresh_token"):
@@ -187,18 +187,18 @@ class XAIAuthManager:
         try:
             response = await self._http_client.get(url, headers={"Accept": "application/json"})
         except httpx.HTTPError as exc:
-            raise XAIAuthError(f"OIDC discovery request failed: {exc}") from exc
+            raise GrokAuthError(f"OIDC discovery request failed: {exc}") from exc
         if response.status_code != 200:
-            raise XAIAuthError(
+            raise GrokAuthError(
                 f"OIDC discovery failed with status {response.status_code}: {response.text}"
             )
         try:
             payload = response.json()
         except ValueError as exc:
-            raise XAIAuthError("OIDC discovery response is not valid JSON") from exc
+            raise GrokAuthError("OIDC discovery response is not valid JSON") from exc
         token_endpoint = payload.get("token_endpoint")
         if not isinstance(token_endpoint, str) or not token_endpoint:
-            raise XAIAuthError(f"OIDC discovery response has no token_endpoint: {payload!r}")
+            raise GrokAuthError(f"OIDC discovery response has no token_endpoint: {payload!r}")
         return token_endpoint
 
     def _persist_auth_file(self, store: dict[str, Any]) -> None:
@@ -209,7 +209,7 @@ class XAIAuthManager:
 
 
 def _select_entry(store: dict[str, Any], auth_file: Path) -> tuple[str, dict[str, Any]]:
-    """Pick the credential entry: the first-party xAI OAuth entry, then any
+    """Pick the credential entry: the first-party Grok OAuth entry, then any
     API-key entry. Legacy web-login entries are skipped like the CLI does."""
     fallback: tuple[str, dict[str, Any]] | None = None
     for scope, entry in store.items():
@@ -223,4 +223,4 @@ def _select_entry(store: dict[str, Any], auth_file: Path) -> tuple[str, dict[str
             fallback = scope, entry
     if fallback is not None:
         return fallback
-    raise XAIAuthError(f"no usable xAI credentials in {auth_file}; run `grok login` first")
+    raise GrokAuthError(f"no usable Grok credentials in {auth_file}; run `grok login` first")

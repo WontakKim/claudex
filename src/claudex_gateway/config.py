@@ -14,7 +14,7 @@ DEFAULT_PORT = 8787
 # Providers a model_map value may target. Every value must name one via a
 # "provider:" prefix — bare model names are rejected so a map entry always
 # says which backend serves it.
-KNOWN_ROUTE_PROVIDERS = ("codex", "kimi", "xai")
+KNOWN_ROUTE_PROVIDERS = ("codex", "kimi", "grok")
 
 VALID_REASONING_EFFORTS = ("minimal", "low", "medium", "high", "xhigh", "max")
 

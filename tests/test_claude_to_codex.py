@@ -435,7 +435,7 @@ def test_tool_choice_mapping() -> None:
 
 def test_empty_tools_emit_no_tool_fields() -> None:
     # tools: [] means "no tools"; emitting tool_choice alongside an empty list
-    # is a 400 on xAI ("tool_choice set but no tools specified").
+    # is a 400 on Grok ("tool_choice set but no tools specified").
     for extra in ({}, {"tool_choice": {"type": "auto"}}):
         payload = translate_claude_request_to_codex(
             {"messages": [{"role": "user", "content": "hi"}], "tools": [], **extra},

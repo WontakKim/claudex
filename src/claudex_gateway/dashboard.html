@@ -348,19 +348,19 @@ body.env-locked .applybar{display:none!important}
       </div>
       <div class="card">
         <div class="ucard-h">
-          <h2>xAI Status</h2>
-          <button class="urefresh" data-provider="xai">갱신</button>
+          <h2>Grok Status</h2>
+          <button class="urefresh" data-provider="grok">갱신</button>
         </div>
-        <div class="sub">게이트웨이가 사용하는 xAI(Grok) 로그인 상태와 자격증명 위치입니다. 사용량은 로컬 자격증명으로 직접 조회하며 게이트웨이 트래픽과 무관합니다.</div>
-        <div class="stat" id="xai-stat">
-          <div class="cardplan" id="usage-plan-xai"><b class="sk">STANDARD</b></div>
-          <div class="statline" id="xai-statline"><span class="sk">OK · 계정으로 로그인됨</span><div class="codeblock"><span class="sk">account-placeholder</span></div></div>
+        <div class="sub">게이트웨이가 사용하는 Grok 로그인 상태와 자격증명 위치입니다. 사용량은 로컬 자격증명으로 직접 조회하며 게이트웨이 트래픽과 무관합니다.</div>
+        <div class="stat" id="grok-stat">
+          <div class="cardplan" id="usage-plan-grok"><b class="sk">STANDARD</b></div>
+          <div class="statline" id="grok-statline"><span class="sk">OK · 계정으로 로그인됨</span><div class="codeblock"><span class="sk">account-placeholder</span></div></div>
         </div>
         <div class="kv">
           <span class="kvh">ENV</span><span class="kvh">VALUE</span>
           <span class="k"><code>GROK_HOME</code></span><span class="v" id="kv-grok-home">—</span>
         </div>
-        <div class="ubody" id="usage-body-xai"></div>
+        <div class="ubody" id="usage-body-grok"></div>
       </div>
     </section>
 
@@ -405,12 +405,12 @@ body.env-locked .applybar{display:none!important}
 <script>
 var CLAUDE_KEYS=["fable","opus","sonnet","haiku"];
 /* Mirrors config.KNOWN_ROUTE_PROVIDERS: every target value names its provider
-   with a "codex:"/"kimi:"/"xai:" style prefix; bare model names are invalid. */
-var ROUTE_PROVIDERS=["codex","kimi","xai"];
+   with a "codex:"/"kimi:"/"grok:" style prefix; bare model names are invalid. */
+var ROUTE_PROVIDERS=["codex","kimi","grok"];
 /* Live model IDs per provider. Purely autocomplete for the add-node box —
    the gateway never validates map values against a catalog, so an
    unreachable one only costs suggestions. */
-var CATALOG={codex:[],kimi:[],xai:[]};
+var CATALOG={codex:[],kimi:[],grok:[]};
 /* Reads config.parse_route_target's shape: only the first colon splits the
    prefix, so upstream names containing colons survive. A bare or unknown-
    prefixed value (e.g. a pre-prefix settings file) still renders as Codex so
@@ -477,11 +477,11 @@ function kimiIcon(s){return '<svg viewBox="0 0 24 24" width="'+s+'" height="'+s+
   '<rect x="2" y="2" width="20" height="20" rx="5" fill="var(--text)"/>'+
   '<path transform="translate(4.5 4.5) scale(.625)" fill="var(--canvas)" '+
   'd="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>'}
-function xaiIcon(s){return '<svg viewBox="0 0 24 24" width="'+s+'" height="'+s+'" aria-hidden="true">'+
+function grokIcon(s){return '<svg viewBox="0 0 24 24" width="'+s+'" height="'+s+'" aria-hidden="true">'+
   '<rect x="2" y="2" width="20" height="20" rx="5" fill="var(--text)"/>'+
   '<g stroke="var(--canvas)" stroke-width="2.4" stroke-linecap="round">'+
   '<line x1="7" y1="7" x2="17" y2="17"/><line x1="17" y1="7" x2="7" y2="17"/></g></svg>'}
-function providerIcon(provider,s){return provider==="kimi"?kimiIcon(s):provider==="xai"?xaiIcon(s):codexIcon(s)}
+function providerIcon(provider,s){return provider==="kimi"?kimiIcon(s):provider==="grok"?grokIcon(s):codexIcon(s)}
 var X_ICON='<svg viewBox="0 0 24 24" width="10" height="10" fill="none" stroke="#fff" stroke-width="3.5" '+
   'stroke-linecap="round" aria-hidden="true"><line x1="6" y1="6" x2="18" y2="18"/><line x1="18" y1="6" x2="6" y2="18"/></svg>';
 var drag=null,move=null,panning=null,pan={x:0,y:0},zoom=1;
@@ -932,25 +932,25 @@ function renderProviderCards(h){
       '<button class="cp" id="kimi-login-copy" title="복사"></button></div>');
     wireCopy(document.getElementById("kimi-login-copy"),"kimi login");
   }
-  var xai=(h.providers||{}).xai||{};
-  if(xai.status==="ok"){
-    renderStatLine("xai","okv",null,'● OK <span class="detail">'+
-      (xai.auth_mode==="api_key"?"API 키로 인증됨":"Grok 계정으로 로그인됨")+"</span>"+
-      (xai.auth_mode!=="api_key"&&xai.account
-        ?'<div class="codeblock">'+esc(String(xai.account))+"</div>":""));
-  }else if(xai.required===false){
-    // xai: 라우트가 없으면 로그인 여부가 readiness와 무관하므로 에러가 아닌 중립으로.
-    renderStatLine("xai","",xai.detail||"",
-      '● 미사용 <span class="detail">모델 맵에 xai: 타겟이 없어 로그인하지 않아도 됩니다</span>'+
+  var grok=(h.providers||{}).grok||{};
+  if(grok.status==="ok"){
+    renderStatLine("grok","okv",null,'● OK <span class="detail">'+
+      (grok.auth_mode==="api_key"?"API 키로 인증됨":"Grok 계정으로 로그인됨")+"</span>"+
+      (grok.auth_mode!=="api_key"&&grok.account
+        ?'<div class="codeblock">'+esc(String(grok.account))+"</div>":""));
+  }else if(grok.required===false){
+    // grok: 라우트가 없으면 로그인 여부가 readiness와 무관하므로 에러가 아닌 중립으로.
+    renderStatLine("grok","",grok.detail||"",
+      '● 미사용 <span class="detail">모델 맵에 grok: 타겟이 없어 로그인하지 않아도 됩니다</span>'+
       '<div class="codeblock"><span class="tx">$ grok login</span>'+
-      '<button class="cp" id="xai-login-copy" title="복사"></button></div>');
-    wireCopy(document.getElementById("xai-login-copy"),"grok login");
+      '<button class="cp" id="grok-login-copy" title="복사"></button></div>');
+    wireCopy(document.getElementById("grok-login-copy"),"grok login");
   }else{
-    renderStatLine("xai","err",xai.detail||"",
+    renderStatLine("grok","err",grok.detail||"",
       '● ERROR <span class="detail">Grok 로그인이 필요합니다</span>'+
       '<div class="codeblock"><span class="tx">$ grok login</span>'+
-      '<button class="cp" id="xai-login-copy" title="복사"></button></div>');
-    wireCopy(document.getElementById("xai-login-copy"),"grok login");
+      '<button class="cp" id="grok-login-copy" title="복사"></button></div>');
+    wireCopy(document.getElementById("grok-login-copy"),"grok login");
   }
 }
 function renderFacts(p){
@@ -1209,7 +1209,7 @@ function restoreUsageButtons(providers){
 }
 /* provider 없이 호출하면 네 카드 일괄 갱신(탭 진입 시), 있으면 해당 카드만. */
 function fetchUsage(provider){
-  var targets=provider?[provider]:["claude","codex","kimi","xai"];
+  var targets=provider?[provider]:["claude","codex","kimi","grok"];
   if(!provider)targets.forEach(function(p){renderUsageProvider(p,null)});
   /* The skeleton only means "probe in flight": every failure path must still
      settle each card into an error state, or the animation runs forever. */
@@ -1315,7 +1315,7 @@ function boot(){
   // Fill the usage bodies before the first request goes out: an empty body
   // would paint short and then grow, which is the jump the skeleton exists
   // to remove.
-  ["claude","codex","kimi","xai"].forEach(function(p){renderUsageProvider(p,null)});
+  ["claude","codex","kimi","grok"].forEach(function(p){renderUsageProvider(p,null)});
   document.getElementById("ct-in-icon").innerHTML=codexIcon(14);
   jfetch("/api/hello").then(function(hello){
     authRequired=!!(hello.body&&hello.body.local_auth_required);
@@ -1325,12 +1325,12 @@ function boot(){
       jfetch("/health"),
       jfetch("/admin/codex/models"),
       jfetch("/admin/kimi/models"),
-      jfetch("/admin/xai/models"),
+      jfetch("/admin/grok/models"),
       jfetch("/admin/log-level")
     ]);
   }).then(function(results){
     var mapping=results[0],health=results[1];
-    var codexCatalog=results[2],kimiCatalog=results[3],xaiCatalog=results[4],loglevel=results[5];
+    var codexCatalog=results[2],kimiCatalog=results[3],grokCatalog=results[4],loglevel=results[5];
     if(loglevel.ok)renderLogLevel(loglevel.body);
     if(mapping.ok){
       DIR.LIVE=mapping.body.model_map||{};
@@ -1344,7 +1344,7 @@ function boot(){
     // when the gateway has no Kimi login, so failures stay silent here.
     if(codexCatalog.ok)CATALOG.codex=catalogIds(codexCatalog.body);
     if(kimiCatalog.ok)CATALOG.kimi=catalogIds(kimiCatalog.body);
-    if(xaiCatalog.ok)CATALOG.xai=catalogIds(xaiCatalog.body);
+    if(grokCatalog.ok)CATALOG.grok=catalogIds(grokCatalog.body);
     DIR.mapping=Object.assign({},DIR.LIVE);
     if(health.body&&health.body.providers){
       renderHealth(health.body);

@@ -446,7 +446,7 @@ def translate_claude_request_to_codex(
 
     tools = _translate_tools(claude_request, name_map)
     # An empty tools list means "no tools": neither field may go out, since
-    # xAI 400s on tool_choice without tools and Codex rejects
+    # Grok 400s on tool_choice without tools and Codex rejects
     # parallel_tool_calls without tools.
     if tools:
         payload["tools"] = tools

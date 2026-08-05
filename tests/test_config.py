@@ -153,10 +153,10 @@ class TestMappedRoute:
         config = GatewayConfig(model_map={"opus": "kimi:k2.5"})
         assert config.mapped_route("claude-opus-5") == RouteTarget("kimi", "k2.5")
 
-    def test_xai_prefix_routes_to_xai(self) -> None:
-        config = GatewayConfig(model_map={"opus": "xai:grok-4.5"})
-        assert config.mapped_route("claude-opus-5") == RouteTarget("xai", "grok-4.5")
-        assert config.maps_to_provider("xai")
+    def test_grok_prefix_routes_to_grok(self) -> None:
+        config = GatewayConfig(model_map={"opus": "grok:grok-4.5"})
+        assert config.mapped_route("claude-opus-5") == RouteTarget("grok", "grok-4.5")
+        assert config.maps_to_provider("grok")
 
     def test_substring_match(self) -> None:
         config = GatewayConfig(model_map={"haiku": "codex:gpt-5.6-luna"})

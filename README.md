@@ -1,16 +1,16 @@
 # claudex-gateway
 
 A lightweight local gateway that runs mapped Claude Code models on the OpenAI
-Codex, Kimi, or xAI backend and relays everything else to Anthropic untouched.
+Codex, Kimi, or Grok backend and relays everything else to Anthropic untouched.
 
 ```text
 Claude Code ── "codex:" mapped ───▶ claudex-gateway ── Codex Responses API ─▶ Codex
 Claude Code ── "kimi:" mapped ────▶ claudex-gateway ── near-verbatim relay ─▶ Kimi coding API
-Claude Code ── "xai:" mapped ─────▶ claudex-gateway ── xAI Responses API ───▶ Grok
+Claude Code ── "grok:" mapped ────▶ claudex-gateway ── Grok Responses API ──▶ Grok
 Claude Code ── unmapped model ────▶ claudex-gateway ── verbatim relay ──────▶ Anthropic API
 ```
 
-Mapped models run on Codex, Kimi, or xAI; everything else goes to Anthropic
+Mapped models run on Codex, Kimi, or Grok; everything else goes to Anthropic
 untouched.
 
 ## What it does
@@ -31,14 +31,14 @@ untouched.
   no schema translation, only the model name is rewritten out and restored,
   and the client's credentials are replaced with the Kimi Code CLI's OAuth
   token.
-- Routes models mapped with an `xai:` prefix to xAI's Grok Responses backend
+- Routes models mapped with a `grok:` prefix to the Grok Responses backend
   (`cli-chat-proxy.grok.com`) through the same translation layer as Codex,
-  minus the payload fields xAI rejects and with reasoning effort clamped to
+  minus the payload fields Grok rejects and with reasoning effort clamped to
   the model's supported levels.
-- Answers as the Claude model the client requested — the Codex, Kimi, or xAI
+- Answers as the Claude model the client requested — the Codex, Kimi, or Grok
   target model never appears on the Anthropic wire, so Claude Code heuristics
   keyed on model names keep working.
-- Serves `GET /health` with the readiness state of the Codex, Kimi, and xAI
+- Serves `GET /health` with the readiness state of the Codex, Kimi, and Grok
   upstreams.
 - Serves a runtime dashboard at `GET /` for editing the model map, checking
   provider health, and testing model connections before wiring them.
@@ -67,7 +67,7 @@ explicit choices, not bugs:
 - For Codex targets: a logged-in [Codex CLI](https://github.com/openai/codex)
   (`codex login`)
 - For Kimi targets: a logged-in Kimi Code CLI (`kimi login`)
-- For xAI targets: a logged-in [Grok CLI](https://github.com/xai-org/grok-build)
+- For Grok targets: a logged-in [Grok CLI](https://github.com/xai-org/grok-build)
   (`grok login`)
 
 The server starts even when a login is missing; `/health` reports the
@@ -133,7 +133,7 @@ With the CLI logged in (`kimi login`, tokens at
 }
 ```
 
-Every value names its provider (`codex:`, `kimi:`, or `xai:`); a bare model
+Every value names its provider (`codex:`, `kimi:`, or `grok:`); a bare model
 name is rejected at boot and on `PUT`, so an entry always says which backend
 serves it. Kimi's coding endpoint speaks the
 Anthropic Messages API natively, so requests and responses — streaming and
@@ -156,26 +156,26 @@ is Kimi's catalog verbatim, unshaped by the gateway. Copy the `id` exactly —
 the catalog mixes naming styles (e.g. `kimi-for-coding` next to `k3`), which
 is precisely why the gateway refuses to normalize them.
 
-### Claude Code → xAI
+### Claude Code → Grok
 
 The gateway reuses the Grok CLI login — no gateway-side login step. With the
 CLI logged in (`grok login`, tokens at `~/.grok/auth.json`, or
-`grok login --api-key` for a plain xAI API key), route models to Grok with an
-`xai:` prefix in the map:
+`grok login --api-key` for a plain Grok API key), route models to Grok with a
+`grok:` prefix in the map:
 
 ```json
 {
-  "model_map": {"opus": "xai:grok-4.5", "haiku": "codex:gpt-5.6-luna"}
+  "model_map": {"opus": "grok:grok-4.5", "haiku": "codex:gpt-5.6-luna"}
 }
 ```
 
-xAI speaks the same Responses API family as the Codex backend, so requests
+Grok speaks the same Responses API family as the Codex backend, so requests
 reuse the full Claude → Responses translation (streaming and non-streaming,
 thinking, tool use); only the wire quirks differ. On the way out the gateway
-drops the fields xAI rejects (`previous_response_id`, `stream_options`,
+drops the fields Grok rejects (`previous_response_id`, `stream_options`,
 `stop`, …) and adapts reasoning: models with thinking levels
 (`grok-4.5`, `grok-4.3`, `grok-3-mini`, `grok-3-mini-fast`,
-`grok-4.20-multi-agent-0309`) keep the effort, clamped to xAI's
+`grok-4.20-multi-agent-0309`) keep the effort, clamped to Grok's
 `low`/`medium`/`high` vocabulary, while every other model runs without a
 reasoning config — sending one to a non-thinking model fails upstream.
 A newly released thinking model simply runs at its default effort until the
@@ -192,7 +192,7 @@ stays available for one-off overrides.
 | --- | --- | --- |
 | `CLAUDEX_HOST` | `127.0.0.1` | Bind address |
 | `CLAUDEX_PORT` | `8787` | Bind port |
-| `CLAUDEX_MODEL_MAP` | empty | JSON mapping of Claude names, exact or substring, to provider-prefixed target models — `codex:`-prefixed values run on Codex, `kimi:`-prefixed values on Kimi, `xai:`-prefixed values on xAI; unmapped models are relayed verbatim to Anthropic |
+| `CLAUDEX_MODEL_MAP` | empty | JSON mapping of Claude names, exact or substring, to provider-prefixed target models — `codex:`-prefixed values run on Codex, `kimi:`-prefixed values on Kimi, `grok:`-prefixed values on Grok; unmapped models are relayed verbatim to Anthropic |
 | `CLAUDEX_REASONING_EFFORT` | derived | Force `minimal`, `low`, `medium`, `high`, `xhigh`, or `max` on Codex requests |
 | `CODEX_HOME` | `~/.codex` | Directory containing Codex `auth.json` |
 | `GROK_HOME` | `~/.grok` | Directory containing the Grok CLI's `auth.json` |
@@ -261,10 +261,10 @@ URL, browser storage, or logs. A wrong token triggers exactly one re-prompt.
 
 ### Model mapping examples
 
-Route Claude Code model names to Codex, Kimi, and xAI models:
+Route Claude Code model names to Codex, Kimi, and Grok models:
 
 ```sh
-CLAUDEX_MODEL_MAP='{"fable":"xai:grok-4.5","opus":"kimi:k3","sonnet":"codex:gpt-5.6-terra","haiku":"codex:gpt-5.6-luna"}' \
+CLAUDEX_MODEL_MAP='{"fable":"grok:grok-4.5","opus":"kimi:k3","sonnet":"codex:gpt-5.6-terra","haiku":"codex:gpt-5.6-luna"}' \
   uv run claudex-gateway
 ```
 

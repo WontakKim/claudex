@@ -50,10 +50,10 @@ from claudex_gateway.usage import (
     fetch_claude_usage,
     fetch_codex_usage,
     fetch_kimi_usage,
-    fetch_xai_usage,
+    fetch_grok_usage,
 )
-from claudex_gateway.xai_auth import XAIAuthError, XAIAuthManager
-from claudex_gateway.xai_client import XAIClient, XAIUpstreamError, sanitize_xai_payload
+from claudex_gateway.grok_auth import GrokAuthError, GrokAuthManager
+from claudex_gateway.grok_client import GrokClient, GrokUpstreamError, sanitize_grok_payload
 
 logger = logging.getLogger(__name__)
 
@@ -147,12 +147,12 @@ def _upstream_error_code(body: str) -> str | None:
 
 
 def _upstream_error_to_claude(
-    exc: CodexUpstreamError | XAIUpstreamError,
+    exc: CodexUpstreamError | GrokUpstreamError,
 ) -> tuple[int, dict[str, Any]]:
     error_type = _STATUS_TO_CLAUDE_ERROR_TYPE.get(exc.status_code, "api_error")
     message = _upstream_error_message(exc.body)
     # The overflow rewrite keys on the Codex backend's specific error code, so
-    # it stays a no-op for xAI errors.
+    # it stays a no-op for Grok errors.
     rewritten = rewrite_context_overflow_message(_upstream_error_code(exc.body), message)
     if rewritten is not None:
         # Anthropic reports context overflow as 400 invalid_request_error.
@@ -315,10 +315,10 @@ async def _handle_messages(request: Request) -> JSONResponse | StreamingResponse
 async def _relay_via_responses_backend(
     request: Request, claude_request: dict[str, Any], route: RouteTarget
 ) -> JSONResponse | StreamingResponse:
-    """Relay a Messages request to a Responses-API backend (Codex or xAI).
+    """Relay a Messages request to a Responses-API backend (Codex or Grok).
 
     Both providers consume the same translated payload and produce the same
-    SSE event family, so one path serves both; the xAI direction only adds
+    SSE event family, so one path serves both; the Grok direction only adds
     its payload sanitizer on the way out.
     """
     config: GatewayConfig = request.app.state.config
@@ -339,9 +339,9 @@ async def _relay_via_responses_backend(
         return JSONResponse(
             _claude_error_body("invalid_request_error", str(exc)), status_code=400
         )
-    if provider == "xai":
-        client: CodexClient | XAIClient = request.app.state.xai_client
-        payload = sanitize_xai_payload(payload, upstream_model)
+    if provider == "grok":
+        client: CodexClient | GrokClient = request.app.state.grok_client
+        payload = sanitize_grok_payload(payload, upstream_model)
     else:
         client = request.app.state.codex_client
     session_id = payload["prompt_cache_key"]
@@ -364,13 +364,13 @@ async def _relay_via_responses_backend(
                 _claude_error_body("api_error", f"{provider} stream ended without any events"),
                 status_code=502,
             )
-    except (CodexUpstreamError, XAIUpstreamError) as exc:
+    except (CodexUpstreamError, GrokUpstreamError) as exc:
         status_code, body = _upstream_error_to_claude(exc)
         logger.warning(
             "%s upstream error %s: %s", provider, exc.status_code, body["error"]["message"]
         )
         return JSONResponse(body, status_code=status_code)
-    except (CodexAuthError, XAIAuthError) as exc:
+    except (CodexAuthError, GrokAuthError) as exc:
         return JSONResponse(_claude_error_body("authentication_error", str(exc)), status_code=401)
     except httpx.HTTPError as exc:
         logger.warning("%s backend unreachable: %r", provider, exc)
@@ -408,14 +408,14 @@ async def _translate_claude_sse(
         async for event in upstream_events:
             for event_name, payload in translator.translate_event(event):
                 yield _format_sse(event_name, payload)
-    except (CodexUpstreamError, XAIUpstreamError) as exc:
+    except (CodexUpstreamError, GrokUpstreamError) as exc:
         _, body = _upstream_error_to_claude(exc)
         yield _format_sse("error", body)
-    except (CodexAuthError, XAIAuthError, httpx.HTTPError) as exc:
+    except (CodexAuthError, GrokAuthError, httpx.HTTPError) as exc:
         logger.warning("responses stream aborted: %s", exc)
         error_type = (
             "authentication_error"
-            if isinstance(exc, (CodexAuthError, XAIAuthError))
+            if isinstance(exc, (CodexAuthError, GrokAuthError))
             else "api_error"
         )
         yield _format_sse("error", _claude_error_body(error_type, str(exc)))
@@ -437,10 +437,10 @@ async def _aggregate_claude_response(
                     status_code = 400 if error_type == "invalid_request_error" else 502
                     return JSONResponse(payload, status_code=status_code)
                 claude_events.append(translated)
-    except (CodexUpstreamError, XAIUpstreamError) as exc:
+    except (CodexUpstreamError, GrokUpstreamError) as exc:
         status_code, body = _upstream_error_to_claude(exc)
         return JSONResponse(body, status_code=status_code)
-    except (CodexAuthError, XAIAuthError) as exc:
+    except (CodexAuthError, GrokAuthError) as exc:
         return JSONResponse(_claude_error_body("authentication_error", str(exc)), status_code=401)
     except httpx.HTTPError as exc:
         logger.warning("responses stream aborted: %r", exc)
@@ -701,7 +701,7 @@ async def _handle_health(request: Request) -> JSONResponse:
     config: GatewayConfig = request.app.state.config
     codex_auth_manager: CodexAuthManager = request.app.state.codex_auth_manager
     kimi_auth_manager: KimiAuthManager = request.app.state.kimi_auth_manager
-    xai_auth_manager: XAIAuthManager = request.app.state.xai_auth_manager
+    grok_auth_manager: GrokAuthManager = request.app.state.grok_auth_manager
     providers: dict[str, dict[str, Any]] = {}
 
     try:
@@ -730,22 +730,22 @@ async def _handle_health(request: Request) -> JSONResponse:
     except KimiAuthError as exc:
         providers["kimi"] = {"status": "error", "detail": str(exc), "required": kimi_required}
 
-    xai_required = config.maps_to_provider("xai")
+    grok_required = config.maps_to_provider("grok")
     try:
-        xai_credentials = await xai_auth_manager.get_credentials()
-        providers["xai"] = {
+        grok_credentials = await grok_auth_manager.get_credentials()
+        providers["grok"] = {
             "status": "ok",
-            "required": xai_required,
-            "auth_mode": "api_key" if xai_credentials.is_api_key else "oauth",
-            "account": xai_credentials.email,
+            "required": grok_required,
+            "auth_mode": "api_key" if grok_credentials.is_api_key else "oauth",
+            "account": grok_credentials.email,
         }
-    except XAIAuthError as exc:
-        providers["xai"] = {"status": "error", "detail": str(exc), "required": xai_required}
+    except GrokAuthError as exc:
+        providers["grok"] = {"status": "error", "detail": str(exc), "required": grok_required}
 
     is_ready = (
         providers["codex"]["status"] == "ok"
         and (providers["kimi"]["status"] == "ok" or not kimi_required)
-        and (providers["xai"]["status"] == "ok" or not xai_required)
+        and (providers["grok"]["status"] == "ok" or not grok_required)
     )
     return JSONResponse(
         {"status": "ok" if is_ready else "error", "providers": providers},
@@ -937,16 +937,16 @@ async def _handle_admin_usage(request: Request) -> JSONResponse:
 
     Each provider answers from its own usage endpoint with the local CLI
     credentials (see usage.py); a failure on one side never masks the other.
-    ?provider=claude|codex|kimi|xai refreshes a single card; without it all run.
+    ?provider=claude|codex|kimi|grok refreshes a single card; without it all run.
     """
     denied = _admin_guard(request)
     if denied is not None:
         return denied
     provider = request.query_params.get("provider")
-    if provider not in (None, "claude", "codex", "kimi", "xai"):
+    if provider not in (None, "claude", "codex", "kimi", "grok"):
         return JSONResponse(
             _openai_error_body(
-                "invalid_request_error", "provider must be one of: claude, codex, kimi, xai"
+                "invalid_request_error", "provider must be one of: claude, codex, kimi, grok"
             ),
             status_code=400,
         )
@@ -961,9 +961,9 @@ async def _handle_admin_usage(request: Request) -> JSONResponse:
         probes["kimi"] = fetch_kimi_usage(
             request.app.state.http_client, request.app.state.kimi_auth_manager
         )
-    if provider in (None, "xai"):
-        probes["xai"] = fetch_xai_usage(
-            request.app.state.http_client, request.app.state.xai_auth_manager
+    if provider in (None, "grok"):
+        probes["grok"] = fetch_grok_usage(
+            request.app.state.http_client, request.app.state.grok_auth_manager
         )
     results = await asyncio.gather(*probes.values())
     payload = dict(zip(probes, results))
@@ -1110,8 +1110,8 @@ async def _handle_admin_codex_models(request: Request) -> JSONResponse:
     return JSONResponse({"models": models})
 
 
-async def _handle_admin_xai_models(request: Request) -> JSONResponse:
-    """Relay xAI's live model catalog (IDs only) for model_map authoring.
+async def _handle_admin_grok_models(request: Request) -> JSONResponse:
+    """Relay Grok's live model catalog (IDs only) for model_map authoring.
 
     Same convenience role as the Codex/Kimi catalog endpoints: the gateway
     never validates map targets against the list, so this only feeds the
@@ -1120,14 +1120,14 @@ async def _handle_admin_xai_models(request: Request) -> JSONResponse:
     denied = _admin_guard(request)
     if denied is not None:
         return denied
-    xai_client: XAIClient = request.app.state.xai_client
+    grok_client: GrokClient = request.app.state.grok_client
     try:
-        models = await xai_client.list_models()
-    except XAIAuthError as exc:
+        models = await grok_client.list_models()
+    except GrokAuthError as exc:
         return JSONResponse(
             _openai_error_body("authentication_error", str(exc)), status_code=401
         )
-    except XAIUpstreamError as exc:
+    except GrokUpstreamError as exc:
         error_type = _STATUS_TO_OPENAI_ERROR_TYPE.get(exc.status_code, "server_error")
         return JSONResponse(
             _openai_error_body(error_type, _upstream_error_message(exc.body)),
@@ -1135,7 +1135,7 @@ async def _handle_admin_xai_models(request: Request) -> JSONResponse:
         )
     except httpx.HTTPError as exc:
         return JSONResponse(
-            _openai_error_body("server_error", f"failed to reach the xAI backend: {exc}"),
+            _openai_error_body("server_error", f"failed to reach the Grok backend: {exc}"),
             status_code=502,
         )
     return JSONResponse({"models": models})
@@ -1194,20 +1194,20 @@ async def _probe_codex_route(codex_client: CodexClient, target: str) -> str:
     return model if isinstance(model, str) else target
 
 
-async def _probe_xai_route(xai_client: XAIClient, target: str) -> str:
+async def _probe_grok_route(grok_client: GrokClient, target: str) -> str:
     claude_request = {
         "max_tokens": 16,
         "messages": [{"role": "user", "content": "ping"}],
     }
     payload = translate_claude_request_to_codex(claude_request, target, "low")
-    payload = sanitize_xai_payload(payload, target)
-    events = xai_client.stream_responses(payload, payload["prompt_cache_key"])
+    payload = sanitize_grok_payload(payload, target)
+    events = grok_client.stream_responses(payload, payload["prompt_cache_key"])
     try:
         first_event = await anext(events, None)
     finally:
         await events.aclose()
     if first_event is None:
-        raise XAIUpstreamError(502, "xai stream ended without any events")
+        raise GrokUpstreamError(502, "grok stream ended without any events")
     response = first_event.get("response") if isinstance(first_event, dict) else None
     model = response.get("model") if isinstance(response, dict) else None
     return model if isinstance(model, str) else target
@@ -1287,14 +1287,14 @@ async def _handle_admin_connection_test(request: Request) -> JSONResponse:
     try:
         if route.provider == "kimi":
             probe = _probe_kimi_route(request.app.state.kimi_client, route.model)
-        elif route.provider == "xai":
-            probe = _probe_xai_route(request.app.state.xai_client, route.model)
+        elif route.provider == "grok":
+            probe = _probe_grok_route(request.app.state.grok_client, route.model)
         else:
             probe = _probe_codex_route(request.app.state.codex_client, route.model)
         response_model = await asyncio.wait_for(probe, _CONNECTION_TEST_TIMEOUT)
-    except (CodexUpstreamError, KimiUpstreamError, XAIUpstreamError) as exc:
+    except (CodexUpstreamError, KimiUpstreamError, GrokUpstreamError) as exc:
         return result(False, exc.status_code, _upstream_error_message(exc.body))
-    except (CodexAuthError, KimiAuthError, XAIAuthError) as exc:
+    except (CodexAuthError, KimiAuthError, GrokAuthError) as exc:
         return result(False, 401, str(exc))
     except TimeoutError:
         return result(False, None, f"no response within {_CONNECTION_TEST_TIMEOUT:.0f}s")
@@ -1313,7 +1313,7 @@ def create_app(config: GatewayConfig, daemon_nonce: str | None = None) -> Starle
             async with httpx.AsyncClient(timeout=_UPSTREAM_TIMEOUT) as http_client:
                 codex_auth_manager = CodexAuthManager(config.codex_home / "auth.json", http_client)
                 kimi_auth_manager = KimiAuthManager(config.kimi_code_home, http_client)
-                xai_auth_manager = XAIAuthManager(config.grok_home / "auth.json", http_client)
+                grok_auth_manager = GrokAuthManager(config.grok_home / "auth.json", http_client)
                 app.state.config = config
                 app.state.admin_lock = asyncio.Lock()
                 # Redeem key of a reset attempt whose outcome never came back.
@@ -1322,8 +1322,8 @@ def create_app(config: GatewayConfig, daemon_nonce: str | None = None) -> Starle
                 app.state.codex_client = CodexClient(codex_auth_manager, http_client)
                 app.state.kimi_auth_manager = kimi_auth_manager
                 app.state.kimi_client = KimiClient(kimi_auth_manager, http_client)
-                app.state.xai_auth_manager = xai_auth_manager
-                app.state.xai_client = XAIClient(xai_auth_manager, http_client)
+                app.state.grok_auth_manager = grok_auth_manager
+                app.state.grok_client = GrokClient(grok_auth_manager, http_client)
                 app.state.http_client = http_client
 
                 try:
@@ -1343,12 +1343,12 @@ def create_app(config: GatewayConfig, daemon_nonce: str | None = None) -> Starle
                     except KimiAuthError as exc:
                         logger.warning("kimi direction unavailable: %s", exc)
 
-                if config.maps_to_provider("xai"):
+                if config.maps_to_provider("grok"):
                     try:
-                        await xai_auth_manager.get_credentials()
-                        logger.info("xai credentials ready")
-                    except XAIAuthError as exc:
-                        logger.warning("xai direction unavailable: %s", exc)
+                        await grok_auth_manager.get_credentials()
+                        logger.info("grok credentials ready")
+                    except GrokAuthError as exc:
+                        logger.warning("grok direction unavailable: %s", exc)
 
                 yield
         finally:
@@ -1374,7 +1374,7 @@ def create_app(config: GatewayConfig, daemon_nonce: str | None = None) -> Starle
             ),
             Route("/admin/codex/models", _handle_admin_codex_models, methods=["GET"]),
             Route("/admin/kimi/models", _handle_admin_kimi_models, methods=["GET"]),
-            Route("/admin/xai/models", _handle_admin_xai_models, methods=["GET"]),
+            Route("/admin/grok/models", _handle_admin_grok_models, methods=["GET"]),
             Route("/admin/test", _handle_admin_connection_test, methods=["POST"]),
         ],
         lifespan=lifespan,

@@ -14,7 +14,7 @@ import pytest
 from claudex_gateway import usage
 from claudex_gateway.codex_auth import CodexAuthError, CodexCredentials
 from claudex_gateway.kimi_auth import KimiAuthError, KimiCredentials
-from claudex_gateway.xai_auth import XAIAuthError, XAICredentials
+from claudex_gateway.grok_auth import GrokAuthError, GrokCredentials
 
 
 def _run(coroutine: Coroutine[Any, Any, Any]) -> Any:
@@ -542,26 +542,26 @@ def test_reset_epoch_seconds_normalizes_units() -> None:
 
 
 # ---------------------------------------------------------------------------
-# xAI usage probe (Grok chat-proxy billing endpoint)
+# Grok usage probe (Grok chat-proxy billing endpoint)
 # ---------------------------------------------------------------------------
 
 
-class XAICredentialsStore:
-    def __init__(self, access_token: str = "xai-tok") -> None:
-        self._credentials = XAICredentials(
+class GrokCredentialsStore:
+    def __init__(self, access_token: str = "grok-tok") -> None:
+        self._credentials = GrokCredentials(
             access_token=access_token, email=None, user_id="user-1"
         )
 
-    async def get_credentials(self, force_refresh: bool = False) -> XAICredentials:
+    async def get_credentials(self, force_refresh: bool = False) -> GrokCredentials:
         return self._credentials
 
 
-class MissingXAICredentials:
-    async def get_credentials(self, force_refresh: bool = False) -> XAICredentials:
-        raise XAIAuthError("missing xAI credentials")
+class MissingGrokCredentials:
+    async def get_credentials(self, force_refresh: bool = False) -> GrokCredentials:
+        raise GrokAuthError("missing Grok credentials")
 
 
-def test_fetch_xai_usage_maps_weekly_credits_and_tier() -> None:
+def test_fetch_grok_usage_maps_weekly_credits_and_tier() -> None:
     seen: dict[str, Any] = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -584,10 +584,10 @@ def test_fetch_xai_usage_maps_weekly_credits_and_tier() -> None:
             },
         )
 
-    result = _run(usage.fetch_xai_usage(_mock_client(handler), XAICredentialsStore()))
+    result = _run(usage.fetch_grok_usage(_mock_client(handler), GrokCredentialsStore()))
 
     assert seen["url"].endswith("/v1/billing?format=credits")
-    assert seen["authorization"] == "Bearer xai-tok"
+    assert seen["authorization"] == "Bearer grok-tok"
     assert seen["token_auth"] == "xai-grok-cli"
     assert seen["userid"] == "user-1"
     assert result["status"] == "ok"
@@ -599,17 +599,17 @@ def test_fetch_xai_usage_maps_weekly_credits_and_tier() -> None:
     assert result["monthly"] is None
 
 
-def test_fetch_xai_usage_accepts_top_level_config() -> None:
+def test_fetch_grok_usage_accepts_top_level_config() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"creditUsagePercent": 10})
 
-    result = _run(usage.fetch_xai_usage(_mock_client(handler), XAICredentialsStore()))
+    result = _run(usage.fetch_grok_usage(_mock_client(handler), GrokCredentialsStore()))
 
     assert result["status"] == "ok"
     assert result["weekly"]["used_percent"] == 10.0
 
 
-def test_fetch_xai_usage_confirmed_weekly_period_means_zero_used() -> None:
+def test_fetch_grok_usage_confirmed_weekly_period_means_zero_used() -> None:
     # Grok omits the protobuf zero, so a missing percent with matching billing
     # bounds is a full weekly budget, not absent data (mirrors Orca).
     def handler(request: httpx.Request) -> httpx.Response:
@@ -628,13 +628,13 @@ def test_fetch_xai_usage_confirmed_weekly_period_means_zero_used() -> None:
             },
         )
 
-    result = _run(usage.fetch_xai_usage(_mock_client(handler), XAICredentialsStore()))
+    result = _run(usage.fetch_grok_usage(_mock_client(handler), GrokCredentialsStore()))
 
     assert result["status"] == "ok"
     assert result["weekly"]["used_percent"] == 0.0
 
 
-def test_fetch_xai_usage_falls_back_to_monthly_budget() -> None:
+def test_fetch_grok_usage_falls_back_to_monthly_budget() -> None:
     urls: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -653,7 +653,7 @@ def test_fetch_xai_usage_falls_back_to_monthly_budget() -> None:
             },
         )
 
-    result = _run(usage.fetch_xai_usage(_mock_client(handler), XAICredentialsStore()))
+    result = _run(usage.fetch_grok_usage(_mock_client(handler), GrokCredentialsStore()))
 
     assert len(urls) == 2
     assert result["status"] == "ok"
@@ -663,25 +663,25 @@ def test_fetch_xai_usage_falls_back_to_monthly_budget() -> None:
     assert result["plan_type"] == "premium"
 
 
-def test_fetch_xai_usage_without_credit_usage_is_unavailable() -> None:
+def test_fetch_grok_usage_without_credit_usage_is_unavailable() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"config": {}})
 
-    result = _run(usage.fetch_xai_usage(_mock_client(handler), XAICredentialsStore()))
+    result = _run(usage.fetch_grok_usage(_mock_client(handler), GrokCredentialsStore()))
 
     assert result["status"] == "unavailable"
 
 
-def test_fetch_xai_usage_missing_credentials_is_unavailable() -> None:
-    result = _run(usage.fetch_xai_usage(_unused_client(), MissingXAICredentials()))
+def test_fetch_grok_usage_missing_credentials_is_unavailable() -> None:
+    result = _run(usage.fetch_grok_usage(_unused_client(), MissingGrokCredentials()))
     assert result["status"] == "unavailable"
-    assert "missing xAI credentials" in result["error"]
+    assert "missing Grok credentials" in result["error"]
 
 
-def test_fetch_xai_usage_401_is_an_error() -> None:
+def test_fetch_grok_usage_401_is_an_error() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(401, json={"error": "invalid token"})
 
-    result = _run(usage.fetch_xai_usage(_mock_client(handler), XAICredentialsStore()))
+    result = _run(usage.fetch_grok_usage(_mock_client(handler), GrokCredentialsStore()))
     assert result["status"] == "error"
     assert "401" in result["error"]

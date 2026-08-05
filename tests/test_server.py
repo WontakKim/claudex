@@ -24,8 +24,8 @@ from claudex_gateway.codex_client import CodexClient, CodexUpstreamError
 from claudex_gateway.config import GatewayConfig
 from claudex_gateway.kimi_auth import KimiCredentials
 from claudex_gateway.kimi_client import KimiClient, KimiUpstreamError
-from claudex_gateway.xai_auth import XAICredentials
-from claudex_gateway.xai_client import XAIClient, XAIUpstreamError
+from claudex_gateway.grok_auth import GrokCredentials
+from claudex_gateway.grok_client import GrokClient, GrokUpstreamError
 
 
 class AvailableCodexAuthManager:
@@ -71,20 +71,20 @@ class FakeKimiClient:
         pass
 
 
-class AvailableXAIAuthManager:
+class AvailableGrokAuthManager:
     def __init__(self, *_args: Any, **_kwargs: Any) -> None:
         pass
 
-    async def get_credentials(self, force_refresh: bool = False) -> XAICredentials:
-        return XAICredentials(access_token="xai-token", email="user@example.com")
+    async def get_credentials(self, force_refresh: bool = False) -> GrokCredentials:
+        return GrokCredentials(access_token="grok-token", email="user@example.com")
 
 
-class MissingXAIAuthManager(AvailableXAIAuthManager):
-    async def get_credentials(self, force_refresh: bool = False) -> XAICredentials:
-        raise server.XAIAuthError("no xAI credentials; run `grok login` first")
+class MissingGrokAuthManager(AvailableGrokAuthManager):
+    async def get_credentials(self, force_refresh: bool = False) -> GrokCredentials:
+        raise server.GrokAuthError("no Grok credentials; run `grok login` first")
 
 
-class FakeXAIClient:
+class FakeGrokClient:
     def __init__(self, *_args: Any, **_kwargs: Any) -> None:
         pass
 
@@ -97,16 +97,16 @@ def _create_test_client(
     codex_client: type = FakeCodexClient,
     kimi_auth: type = AvailableKimiAuthManager,
     kimi_client: type = FakeKimiClient,
-    xai_auth: type = AvailableXAIAuthManager,
-    xai_client: type = FakeXAIClient,
+    grok_auth: type = AvailableGrokAuthManager,
+    grok_client: type = FakeGrokClient,
     base_url: str = "http://testserver",
 ) -> TestClient:
     monkeypatch.setattr(server, "CodexAuthManager", codex_auth)
     monkeypatch.setattr(server, "CodexClient", codex_client)
     monkeypatch.setattr(server, "KimiAuthManager", kimi_auth)
     monkeypatch.setattr(server, "KimiClient", kimi_client)
-    monkeypatch.setattr(server, "XAIAuthManager", xai_auth)
-    monkeypatch.setattr(server, "XAIClient", xai_client)
+    monkeypatch.setattr(server, "GrokAuthManager", grok_auth)
+    monkeypatch.setattr(server, "GrokClient", grok_client)
     return TestClient(server.create_app(config or GatewayConfig()), base_url=base_url)
 
 
@@ -149,7 +149,7 @@ def test_health_reports_ok_with_codex_credentials(
                 "email": "codex@example.com",
             },
             "kimi": {"status": "ok", "required": False, "account": "kimi-user-1"},
-            "xai": {
+            "grok": {
                 "status": "ok",
                 "required": False,
                 "auth_mode": "oauth",
@@ -197,31 +197,31 @@ def test_health_reports_error_without_kimi_credentials_when_map_routes_to_kimi(
     assert health.json()["providers"]["kimi"]["required"] is True
 
 
-def test_health_stays_ok_without_xai_credentials_when_map_has_no_xai_route(
+def test_health_stays_ok_without_grok_credentials_when_map_has_no_grok_route(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    with _create_test_client(monkeypatch, xai_auth=MissingXAIAuthManager) as client:
+    with _create_test_client(monkeypatch, grok_auth=MissingGrokAuthManager) as client:
         health = client.get("/health")
 
     assert health.status_code == 200
     assert health.json()["status"] == "ok"
-    assert health.json()["providers"]["xai"]["status"] == "error"
-    assert health.json()["providers"]["xai"]["required"] is False
+    assert health.json()["providers"]["grok"]["status"] == "error"
+    assert health.json()["providers"]["grok"]["required"] is False
 
 
-def test_health_reports_error_without_xai_credentials_when_map_routes_to_xai(
+def test_health_reports_error_without_grok_credentials_when_map_routes_to_grok(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    config = GatewayConfig(model_map={"opus": "xai:grok-4.5"})
+    config = GatewayConfig(model_map={"opus": "grok:grok-4.5"})
     with _create_test_client(
-        monkeypatch, config=config, xai_auth=MissingXAIAuthManager
+        monkeypatch, config=config, grok_auth=MissingGrokAuthManager
     ) as client:
         health = client.get("/health")
 
     assert health.status_code == 503
     assert health.json()["status"] == "error"
-    assert health.json()["providers"]["xai"]["status"] == "error"
-    assert health.json()["providers"]["xai"]["required"] is True
+    assert health.json()["providers"]["grok"]["status"] == "error"
+    assert health.json()["providers"]["grok"]["required"] is True
 
 
 def _upstream_error(status_code: int, error: dict) -> CodexUpstreamError:
@@ -283,7 +283,7 @@ def _gateway(
     anthropic_handler,
     kimi_handler=None,
     kimi_auth: Any | None = None,
-    xai_client: Any | None = None,
+    grok_client: Any | None = None,
 ) -> tuple[TestClient, StubCodexClient]:
     app = server.create_app(config)
     # The lifespan requires real Codex credentials, so set the state directly
@@ -303,8 +303,8 @@ def _gateway(
                 )
             ),
         )
-    if xai_client is not None:
-        app.state.xai_client = xai_client
+    if grok_client is not None:
+        app.state.grok_client = grok_client
     return TestClient(app), stub
 
 
@@ -878,10 +878,10 @@ def test_count_tokens_falls_back_to_estimate_when_kimi_fails() -> None:
     assert response.json()["input_tokens"] > 0
 
 
-# --- /v1/messages routing: xai-mapped models go to the xAI Responses backend ---
+# --- /v1/messages routing: grok-mapped models go to the Grok Responses backend ---
 
 
-class StubXAIClient:
+class StubGrokClient:
     """Records translated payloads and replays a scripted Responses stream."""
 
     def __init__(self, events: list[dict[str, Any]] | None = None) -> None:
@@ -891,17 +891,17 @@ class StubXAIClient:
     async def stream_responses(self, payload: dict[str, Any], session_id: str):
         self.payloads.append(payload)
         if self.events is None:
-            raise XAIUpstreamError(503, "stub xai upstream")
+            raise GrokUpstreamError(503, "stub grok upstream")
         for event in self.events:
             yield event
 
 
-def _xai_config(target: str = "grok-4.5", **kwargs: Any) -> GatewayConfig:
-    return GatewayConfig(model_map={"opus": f"xai:{target}"}, **kwargs)
+def _grok_config(target: str = "grok-4.5", **kwargs: Any) -> GatewayConfig:
+    return GatewayConfig(model_map={"opus": f"grok:{target}"}, **kwargs)
 
 
-def test_xai_mapped_model_streams_translated_response() -> None:
-    stub = StubXAIClient(
+def test_grok_mapped_model_streams_translated_response() -> None:
+    stub = StubGrokClient(
         [
             {"type": "response.created", "response": {"id": "resp_1", "model": "grok-4.5"}},
             {"type": "response.output_text.delta", "delta": "hello"},
@@ -911,12 +911,12 @@ def test_xai_mapped_model_streams_translated_response() -> None:
             },
         ]
     )
-    client, codex_stub = _gateway(_xai_config(), _failing_anthropic_handler, xai_client=stub)
+    client, codex_stub = _gateway(_grok_config(), _failing_anthropic_handler, grok_client=stub)
 
     response = client.post("/v1/messages", json=_message_body("claude-opus-4-6"))
 
     assert response.status_code == 200
-    # The gateway reports the requested Claude model, not the xAI target.
+    # The gateway reports the requested Claude model, not the Grok target.
     assert response.json()["model"] == "claude-opus-4-6"
     assert codex_stub.payloads == []
     (payload,) = stub.payloads
@@ -925,10 +925,10 @@ def test_xai_mapped_model_streams_translated_response() -> None:
     assert payload["reasoning"]["effort"] == "medium"
 
 
-def test_xai_route_strips_reasoning_for_non_thinking_model() -> None:
-    stub = StubXAIClient()
+def test_grok_route_strips_reasoning_for_non_thinking_model() -> None:
+    stub = StubGrokClient()
     client, _ = _gateway(
-        _xai_config("grok-composer-2.5-fast"), _failing_anthropic_handler, xai_client=stub
+        _grok_config("grok-composer-2.5-fast"), _failing_anthropic_handler, grok_client=stub
     )
 
     response = client.post("/v1/messages", json=_message_body("claude-opus-4-6"))
@@ -938,10 +938,10 @@ def test_xai_route_strips_reasoning_for_non_thinking_model() -> None:
     assert "reasoning" not in payload
 
 
-def test_xai_route_clamps_effort_for_thinking_model() -> None:
-    stub = StubXAIClient()
-    config = _xai_config("grok-4.5", reasoning_effort_override="max")
-    client, _ = _gateway(config, _failing_anthropic_handler, xai_client=stub)
+def test_grok_route_clamps_effort_for_thinking_model() -> None:
+    stub = StubGrokClient()
+    config = _grok_config("grok-4.5", reasoning_effort_override="max")
+    client, _ = _gateway(config, _failing_anthropic_handler, grok_client=stub)
 
     client.post("/v1/messages", json=_message_body("claude-opus-4-6"))
 
@@ -1357,13 +1357,13 @@ def test_admin_usage_returns_all_providers(monkeypatch: pytest.MonkeyPatch) -> N
     async def fake_kimi(http_client: Any, auth_manager: Any) -> dict[str, Any]:
         return {"provider": "kimi", "status": "ok", "error": None}
 
-    async def fake_xai(http_client: Any, auth_manager: Any) -> dict[str, Any]:
-        return {"provider": "xai", "status": "ok", "error": None}
+    async def fake_grok(http_client: Any, auth_manager: Any) -> dict[str, Any]:
+        return {"provider": "grok", "status": "ok", "error": None}
 
     monkeypatch.setattr(server, "fetch_claude_usage", fake_claude)
     monkeypatch.setattr(server, "fetch_codex_usage", fake_codex)
     monkeypatch.setattr(server, "fetch_kimi_usage", fake_kimi)
-    monkeypatch.setattr(server, "fetch_xai_usage", fake_xai)
+    monkeypatch.setattr(server, "fetch_grok_usage", fake_grok)
     with _create_test_client(monkeypatch, base_url="http://127.0.0.1:8787") as client:
         response = client.get("/admin/usage")
 
@@ -1372,7 +1372,7 @@ def test_admin_usage_returns_all_providers(monkeypatch: pytest.MonkeyPatch) -> N
     assert body["claude"]["status"] == "ok"
     assert body["codex"]["status"] == "unavailable"
     assert body["kimi"]["status"] == "ok"
-    assert body["xai"]["status"] == "ok"
+    assert body["grok"]["status"] == "ok"
     assert body["fetched_at"] > 0
 
 
@@ -1393,13 +1393,13 @@ def test_admin_usage_single_provider_skips_the_others(
     async def kimi_must_not_run(http_client: Any, auth_manager: Any) -> dict[str, Any]:
         raise AssertionError("kimi probe ran for ?provider=claude")
 
-    async def xai_must_not_run(http_client: Any, auth_manager: Any) -> dict[str, Any]:
-        raise AssertionError("xai probe ran for ?provider=claude")
+    async def grok_must_not_run(http_client: Any, auth_manager: Any) -> dict[str, Any]:
+        raise AssertionError("grok probe ran for ?provider=claude")
 
     monkeypatch.setattr(server, "fetch_claude_usage", fake_claude)
     monkeypatch.setattr(server, "fetch_codex_usage", codex_must_not_run)
     monkeypatch.setattr(server, "fetch_kimi_usage", kimi_must_not_run)
-    monkeypatch.setattr(server, "fetch_xai_usage", xai_must_not_run)
+    monkeypatch.setattr(server, "fetch_grok_usage", grok_must_not_run)
     with _create_test_client(monkeypatch, base_url="http://127.0.0.1:8787") as client:
         response = client.get("/admin/usage", params={"provider": "claude"})
 
@@ -1408,7 +1408,7 @@ def test_admin_usage_single_provider_skips_the_others(
     assert body["claude"]["status"] == "ok"
     assert "codex" not in body
     assert "kimi" not in body
-    assert "xai" not in body
+    assert "grok" not in body
 
 
 def test_admin_usage_rejects_unknown_provider(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1655,7 +1655,7 @@ def test_dashboard_has_no_hardcoded_codex_model_snapshot(
     # via buildColumns.
     assert "CODEX_FALLBACK" not in page
     assert "gpt-5" not in page
-    assert "CATALOG={codex:[],kimi:[],xai:[]}" in page
+    assert "CATALOG={codex:[],kimi:[],grok:[]}" in page
 
 
 def test_dashboard_board_shows_only_referenced_targets(
@@ -1670,9 +1670,9 @@ def test_dashboard_board_shows_only_referenced_targets(
     assert "concat(Object.values(DIR.mapping),addedTargets)" in page
     assert 'list="add-catalog"' in page
     # All provider catalogs feed it, so the dashboard depends on the Kimi
-    # and xAI endpoints too — not just the Codex one.
+    # and Grok endpoints too — not just the Codex one.
     assert '"/admin/kimi/models"' in page
-    assert '"/admin/xai/models"' in page
+    assert '"/admin/grok/models"' in page
 
 
 class CatalogCodexClient(FakeCodexClient):
@@ -1725,30 +1725,30 @@ class RejectingKimiClient(FakeKimiClient):
         )
 
 
-class ProbeXAIClient(FakeXAIClient):
+class ProbeGrokClient(FakeGrokClient):
     async def stream_responses(
         self, payload: dict[str, Any], session_id: str
     ) -> AsyncIterator[dict[str, Any]]:
         yield {"type": "response.created", "response": {"model": payload["model"]}}
 
 
-class CatalogXAIClient(FakeXAIClient):
+class CatalogGrokClient(FakeGrokClient):
     async def list_models(self) -> list[str]:
         return ["grok-4.5", "grok-4.3"]
 
 
-class FailingCatalogXAIClient(FakeXAIClient):
+class FailingCatalogGrokClient(FakeGrokClient):
     async def list_models(self) -> list[str]:
-        raise XAIUpstreamError(401, '{"error":{"message":"token expired"}}')
+        raise GrokUpstreamError(401, '{"error":{"message":"token expired"}}')
 
 
-class RejectingXAIClient(FakeXAIClient):
+class RejectingGrokClient(FakeGrokClient):
     async def stream_responses(
         self, payload: dict[str, Any], session_id: str
     ) -> AsyncIterator[dict[str, Any]]:
         if False:
             yield {}
-        raise XAIUpstreamError(400, '{"error":{"message":"model_not_found"}}')
+        raise GrokUpstreamError(400, '{"error":{"message":"model_not_found"}}')
 
 
 def test_codex_client_list_models_filters_hidden_models() -> None:
@@ -1832,29 +1832,29 @@ class TestAdminDashboardApi:
         with _create_test_client(monkeypatch, kimi_client=CatalogKimiClient) as client:
             assert client.get("/admin/kimi/models").status_code == 403
 
-    def test_xai_models_returns_catalog_ids(
+    def test_grok_models_returns_catalog_ids(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        with self._client(monkeypatch, xai_client=CatalogXAIClient) as client:
-            response = client.get("/admin/xai/models")
+        with self._client(monkeypatch, grok_client=CatalogGrokClient) as client:
+            response = client.get("/admin/grok/models")
 
         assert response.status_code == 200
         assert response.json() == {"models": ["grok-4.5", "grok-4.3"]}
 
-    def test_xai_models_relays_upstream_error(
+    def test_grok_models_relays_upstream_error(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        with self._client(monkeypatch, xai_client=FailingCatalogXAIClient) as client:
-            response = client.get("/admin/xai/models")
+        with self._client(monkeypatch, grok_client=FailingCatalogGrokClient) as client:
+            response = client.get("/admin/grok/models")
 
         assert response.status_code == 401
         assert response.json()["error"]["message"] == "token expired"
 
-    def test_xai_models_refuses_foreign_host(
+    def test_grok_models_refuses_foreign_host(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        with _create_test_client(monkeypatch, xai_client=CatalogXAIClient) as client:
-            assert client.get("/admin/xai/models").status_code == 403
+        with _create_test_client(monkeypatch, grok_client=CatalogGrokClient) as client:
+            assert client.get("/admin/grok/models").status_code == 403
 
     def test_connection_test_ok(self, monkeypatch: pytest.MonkeyPatch) -> None:
         with self._client(monkeypatch, codex_client=ProbeCodexClient) as client:
@@ -1911,13 +1911,13 @@ class TestAdminDashboardApi:
         assert result["status"] == 404
         assert "model not found" in result["detail"]
 
-    def test_connection_test_xai_target_probes_xai(
+    def test_connection_test_grok_target_probes_grok(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        with self._client(monkeypatch, xai_client=ProbeXAIClient) as client:
+        with self._client(monkeypatch, grok_client=ProbeGrokClient) as client:
             response = client.post(
                 "/admin/test",
-                json={"target": "xai:grok-4.5"},
+                json={"target": "grok:grok-4.5"},
             )
 
         assert response.status_code == 200
@@ -1926,13 +1926,13 @@ class TestAdminDashboardApi:
         assert result["status"] == 200
         assert result["response_model"] == "grok-4.5"
 
-    def test_connection_test_reports_xai_error(
+    def test_connection_test_reports_grok_error(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        with self._client(monkeypatch, xai_client=RejectingXAIClient) as client:
+        with self._client(monkeypatch, grok_client=RejectingGrokClient) as client:
             response = client.post(
                 "/admin/test",
-                json={"target": "xai:grok-nope"},
+                json={"target": "grok:grok-nope"},
             )
 
         result = response.json()

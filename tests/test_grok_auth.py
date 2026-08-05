@@ -13,7 +13,7 @@ from typing import Any
 import httpx
 import pytest
 
-from claudex_gateway.xai_auth import XAI_ISSUER, XAIAuthError, XAIAuthManager
+from claudex_gateway.grok_auth import XAI_ISSUER, GrokAuthError, GrokAuthManager
 
 _SCOPE = f"{XAI_ISSUER}::client-1"
 _TOKEN_ENDPOINT = "https://auth.x.ai/oauth/token"
@@ -85,7 +85,7 @@ def test_valid_token_is_returned_without_refresh(tmp_path: Path) -> None:
         async with httpx.AsyncClient(
             transport=_refresh_transport(counter, "unused")
         ) as http_client:
-            return await XAIAuthManager(auth_file, http_client).get_credentials()
+            return await GrokAuthManager(auth_file, http_client).get_credentials()
 
     credentials = _run(scenario())
 
@@ -104,7 +104,7 @@ def test_expiring_token_is_refreshed_and_persisted(tmp_path: Path) -> None:
         async with httpx.AsyncClient(
             transport=_refresh_transport(counter, "rotated-token")
         ) as http_client:
-            return await XAIAuthManager(auth_file, http_client).get_credentials()
+            return await GrokAuthManager(auth_file, http_client).get_credentials()
 
     credentials = _run(scenario())
 
@@ -128,7 +128,7 @@ def test_concurrent_forced_refreshes_rotate_only_once(tmp_path: Path) -> None:
         async with httpx.AsyncClient(
             transport=_refresh_transport(counter, "rotated-token")
         ) as http_client:
-            manager = XAIAuthManager(auth_file, http_client)
+            manager = GrokAuthManager(auth_file, http_client)
             # Two requests saw a 401 with the same stale token and retry.
             return list(
                 await asyncio.gather(
@@ -147,16 +147,16 @@ def test_concurrent_forced_refreshes_rotate_only_once(tmp_path: Path) -> None:
 def test_missing_auth_file_raises_with_guidance(tmp_path: Path) -> None:
     async def scenario() -> None:
         async with httpx.AsyncClient() as http_client:
-            await XAIAuthManager(tmp_path / "auth.json", http_client).get_credentials()
+            await GrokAuthManager(tmp_path / "auth.json", http_client).get_credentials()
 
-    with pytest.raises(XAIAuthError, match="grok login"):
+    with pytest.raises(GrokAuthError, match="grok login"):
         _run(scenario())
 
 
 def test_api_key_entry_is_used_without_refresh(tmp_path: Path) -> None:
     auth_file = tmp_path / "auth.json"
     auth_file.write_text(
-        json.dumps({"xai::api_key": {"key": "xai-api-key", "auth_mode": "api_key"}}),
+        json.dumps({"grok::api_key": {"key": "grok-api-key", "auth_mode": "api_key"}}),
         encoding="utf-8",
     )
 
@@ -165,11 +165,11 @@ def test_api_key_entry_is_used_without_refresh(tmp_path: Path) -> None:
 
     async def scenario() -> Any:
         async with httpx.AsyncClient(transport=httpx.MockTransport(failing_handler)) as http_client:
-            return await XAIAuthManager(auth_file, http_client).get_credentials()
+            return await GrokAuthManager(auth_file, http_client).get_credentials()
 
     credentials = _run(scenario())
 
-    assert credentials.access_token == "xai-api-key"
+    assert credentials.access_token == "grok-api-key"
     assert credentials.is_api_key is True
     assert credentials.email is None
 
@@ -185,9 +185,9 @@ def test_legacy_web_login_entry_is_rejected(tmp_path: Path) -> None:
 
     async def scenario() -> None:
         async with httpx.AsyncClient() as http_client:
-            await XAIAuthManager(auth_file, http_client).get_credentials()
+            await GrokAuthManager(auth_file, http_client).get_credentials()
 
-    with pytest.raises(XAIAuthError, match="grok login"):
+    with pytest.raises(GrokAuthError, match="grok login"):
         _run(scenario())
 
 
@@ -200,9 +200,9 @@ def test_expired_entry_without_refresh_token_raises_with_guidance(tmp_path: Path
 
     async def scenario() -> None:
         async with httpx.AsyncClient() as http_client:
-            await XAIAuthManager(auth_file, http_client).get_credentials()
+            await GrokAuthManager(auth_file, http_client).get_credentials()
 
-    with pytest.raises(XAIAuthError, match="grok login"):
+    with pytest.raises(GrokAuthError, match="grok login"):
         _run(scenario())
 
 
@@ -217,9 +217,9 @@ def test_refresh_failure_surfaces_status_and_body(tmp_path: Path) -> None:
 
     async def scenario() -> None:
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
-            await XAIAuthManager(auth_file, http_client).get_credentials()
+            await GrokAuthManager(auth_file, http_client).get_credentials()
 
-    with pytest.raises(XAIAuthError, match="status 400.*invalid_grant"):
+    with pytest.raises(GrokAuthError, match="status 400.*invalid_grant"):
         _run(scenario())
 
 
@@ -232,7 +232,7 @@ def test_persisted_store_is_owner_only(tmp_path: Path) -> None:
         async with httpx.AsyncClient(
             transport=_refresh_transport(counter, "rotated-token")
         ) as http_client:
-            await XAIAuthManager(auth_file, http_client).get_credentials()
+            await GrokAuthManager(auth_file, http_client).get_credentials()
 
     _run(scenario())
 

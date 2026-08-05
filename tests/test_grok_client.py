@@ -1,4 +1,4 @@
-"""Tests for the xAI Responses client and its payload sanitizer."""
+"""Tests for the Grok Responses client and its payload sanitizer."""
 
 from __future__ import annotations
 
@@ -9,13 +9,13 @@ from typing import Any
 import httpx
 import pytest
 
-from claudex_gateway.xai_auth import XAICredentials
-from claudex_gateway.xai_client import (
-    XAI_MODELS_URL,
-    XAI_RESPONSES_URL,
-    XAIClient,
-    XAIUpstreamError,
-    sanitize_xai_payload,
+from claudex_gateway.grok_auth import GrokCredentials
+from claudex_gateway.grok_client import (
+    GROK_MODELS_URL,
+    GROK_RESPONSES_URL,
+    GrokClient,
+    GrokUpstreamError,
+    sanitize_grok_payload,
 )
 
 
@@ -34,7 +34,7 @@ def _payload(**overrides: Any) -> dict[str, Any]:
     return payload
 
 
-class TestSanitizeXaiPayload:
+class TestSanitizeGrokPayload:
     def test_drops_unsupported_fields(self) -> None:
         payload = _payload(
             previous_response_id="resp_1",
@@ -44,7 +44,7 @@ class TestSanitizeXaiPayload:
             stop=["END"],
         )
 
-        sanitized = sanitize_xai_payload(payload, "grok-4.5")
+        sanitized = sanitize_grok_payload(payload, "grok-4.5")
 
         for field in (
             "previous_response_id",
@@ -71,7 +71,7 @@ class TestSanitizeXaiPayload:
         ],
     )
     def test_thinking_model_keeps_clamped_effort(self, effort: str, expected: str) -> None:
-        sanitized = sanitize_xai_payload(
+        sanitized = sanitize_grok_payload(
             _payload(reasoning={"effort": effort, "summary": "auto"}), "grok-4.5"
         )
         assert sanitized["reasoning"] == {"effort": expected, "summary": "auto"}
@@ -80,24 +80,24 @@ class TestSanitizeXaiPayload:
         "model", ["grok-composer-2.5-fast", "grok-build-0.1", "grok-9-unreleased"]
     )
     def test_non_thinking_model_drops_reasoning(self, model: str) -> None:
-        assert "reasoning" not in sanitize_xai_payload(_payload(), model)
+        assert "reasoning" not in sanitize_grok_payload(_payload(), model)
 
     @pytest.mark.parametrize(
         "model",
         ["grok-4.5", "grok-4.3", "grok-3-mini", "grok-3-mini-fast", "grok-4.20-multi-agent-0309"],
     )
     def test_registry_thinking_models_keep_reasoning(self, model: str) -> None:
-        assert "reasoning" in sanitize_xai_payload(_payload(), model)
+        assert "reasoning" in sanitize_grok_payload(_payload(), model)
 
 
 class _FakeAuthManager:
     def __init__(self) -> None:
         self.force_refresh_calls = 0
 
-    async def get_credentials(self, force_refresh: bool = False) -> XAICredentials:
+    async def get_credentials(self, force_refresh: bool = False) -> GrokCredentials:
         if force_refresh:
             self.force_refresh_calls += 1
-        return XAICredentials(access_token="xai-token-1", email=None)
+        return GrokCredentials(access_token="grok-token-1", email=None)
 
 
 def _sse(events: list[dict[str, Any]]) -> bytes:
@@ -105,11 +105,11 @@ def _sse(events: list[dict[str, Any]]) -> bytes:
     return chunks + b"data: [DONE]\n\n"
 
 
-async def _collect(client: XAIClient, payload: dict[str, Any]) -> list[dict[str, Any]]:
+async def _collect(client: GrokClient, payload: dict[str, Any]) -> list[dict[str, Any]]:
     return [event async for event in client.stream_responses(payload, "session-1")]
 
 
-def test_stream_responses_sends_xai_headers_and_parses_events() -> None:
+def test_stream_responses_sends_grok_headers_and_parses_events() -> None:
     captured: list[httpx.Request] = []
 
     async def handler(request: httpx.Request) -> httpx.Response:
@@ -123,14 +123,14 @@ def test_stream_responses_sends_xai_headers_and_parses_events() -> None:
 
     async def scenario() -> list[dict[str, Any]]:
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
-            return await _collect(XAIClient(_FakeAuthManager(), http_client), {"model": "grok-4.5"})
+            return await _collect(GrokClient(_FakeAuthManager(), http_client), {"model": "grok-4.5"})
 
     events = asyncio.run(scenario())
 
     assert events == [{"type": "response.created", "response": {"id": "r1"}}]
     (request,) = captured
-    assert str(request.url) == XAI_RESPONSES_URL
-    assert request.headers["authorization"] == "Bearer xai-token-1"
+    assert str(request.url) == GROK_RESPONSES_URL
+    assert request.headers["authorization"] == "Bearer grok-token-1"
     assert request.headers["x-xai-token-auth"] == "xai-grok-cli"
     assert request.headers["x-grok-client-version"]
     assert request.headers["user-agent"].startswith("xai-grok-workspace/")
@@ -151,7 +151,7 @@ def test_stream_responses_retries_once_with_fresh_credentials_on_401() -> None:
 
     async def scenario() -> list[dict[str, Any]]:
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
-            return await _collect(XAIClient(auth_manager, http_client), {})
+            return await _collect(GrokClient(auth_manager, http_client), {})
 
     events = asyncio.run(scenario())
 
@@ -166,11 +166,11 @@ def test_stream_responses_raises_upstream_error_on_non_401() -> None:
 
     async def scenario() -> None:
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
-            client = XAIClient(_FakeAuthManager(), http_client)
+            client = GrokClient(_FakeAuthManager(), http_client)
             async for _event in client.stream_responses({}, "session-1"):
                 pass
 
-    with pytest.raises(XAIUpstreamError) as exc_info:
+    with pytest.raises(GrokUpstreamError) as exc_info:
         asyncio.run(scenario())
     assert exc_info.value.status_code == 500
     assert exc_info.value.body == "boom"
@@ -178,9 +178,9 @@ def test_stream_responses_raises_upstream_error_on_non_401() -> None:
 
 def test_list_models_returns_catalog_ids() -> None:
     async def handler(request: httpx.Request) -> httpx.Response:
-        assert str(request.url) == XAI_MODELS_URL
+        assert str(request.url) == GROK_MODELS_URL
         assert request.headers["accept"] == "application/json"
-        assert request.headers["authorization"] == "Bearer xai-token-1"
+        assert request.headers["authorization"] == "Bearer grok-token-1"
         return httpx.Response(
             200,
             json={
@@ -195,7 +195,7 @@ def test_list_models_returns_catalog_ids() -> None:
 
     async def scenario() -> list[str]:
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
-            return await XAIClient(_FakeAuthManager(), http_client).list_models()
+            return await GrokClient(_FakeAuthManager(), http_client).list_models()
 
     assert asyncio.run(scenario()) == ["grok-4.5", "grok-4.3"]
 
@@ -206,8 +206,8 @@ def test_list_models_raises_on_upstream_error() -> None:
 
     async def scenario() -> None:
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
-            await XAIClient(_FakeAuthManager(), http_client).list_models()
+            await GrokClient(_FakeAuthManager(), http_client).list_models()
 
-    with pytest.raises(XAIUpstreamError) as exc_info:
+    with pytest.raises(GrokUpstreamError) as exc_info:
         asyncio.run(scenario())
     assert exc_info.value.status_code == 401

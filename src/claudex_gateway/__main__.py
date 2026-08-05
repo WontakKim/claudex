@@ -84,7 +84,7 @@ def _run_foreground(config: GatewayConfig) -> None:
     )
     print(
         f"claudex-gateway listening on http://{config.host}:{config.port}\n"
-        f"Claude Code -> mapped models -> Codex, Kimi, or xAI, others -> Anthropic passthrough\n"
+        f"Claude Code -> mapped models -> Codex, Kimi, or Grok, others -> Anthropic passthrough\n"
         f"point Claude Code at it with:\n"
         f"  ANTHROPIC_BASE_URL=http://{config.host}:{config.port} claude"
     )
