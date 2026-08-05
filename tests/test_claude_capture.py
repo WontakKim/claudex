@@ -1232,34 +1232,21 @@ def test_second_signal_during_process_group_grace_is_deferred(
     _assert_process_gone(pids["descendant"])
 
 
-def test_pending_cancellation_during_spawn_publication_is_delivered_after_tracking() -> None:
-    # A cancellation landing while the spawn-publication window is masked
-    # must NOT interrupt mid-window; it is delivered as the first
-    # cancellation right after the mask is restored — when the child would
-    # already be fully tracked.
-    scope = claude_capture._CancellationScope()
-    reached_end_of_window = False
-    with scope:
-        with pytest.raises(claude_capture._LoginSignalReceived):
-            with claude_capture._blocked_cancel_signals():
-                os.kill(os.getpid(), signal.SIGTERM)
-                reached_end_of_window = True  # the masked window is never interrupted
-    assert reached_end_of_window
-    assert scope.deferred is False
-
-
-def test_pending_cancellation_during_deferred_mode_entry_defers_instead_of_raising() -> None:
-    # A cancellation landing while deferred mode is being switched on (the
-    # cleanup entry transition) must observe the completed transition and
-    # defer rather than raise.
+def test_signals_inside_the_scope_record_and_never_raise() -> None:
+    # The scope's handlers are record-only: a cancellation signal delivered
+    # at ANY instruction boundary inside the scope — spawn publication,
+    # teardown entry, cleanup entry — sets the flag and never raises into
+    # the flow.
     scope = claude_capture._CancellationScope()
     with scope:
-        with claude_capture._blocked_cancel_signals():
-            os.kill(os.getpid(), signal.SIGTERM)
-            scope.enter_deferred_mode()
-        # Mask restored: the pending SIGTERM is delivered here, sees
-        # deferring=True, and only records itself.
-        assert scope.deferred is True
+        for signal_number in claude_capture._CANCEL_SIGNALS:
+            scope.deferred = False
+            os.kill(os.getpid(), signal_number)
+            deadline = time.monotonic() + 2.0
+            while not scope.deferred and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert scope.deferred is True  # recorded, and no exception reached us
+    assert scope._previous == {}  # handlers restored on exit
 
 
 def test_teardown_kills_descendant_when_leader_already_exited(
