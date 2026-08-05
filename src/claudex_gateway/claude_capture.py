@@ -495,18 +495,45 @@ class _LoginSignalReceived(Exception):
         self.signal_number = signal_number
 
 
+# SIGHUP does not exist on Windows; guard the constant so importing this
+# module (needed for the supported Windows `--from` path) never fails.
+_CANCEL_SIGNALS = (
+    signal.SIGINT,
+    signal.SIGTERM,
+    *((signal.SIGHUP,) if hasattr(signal, "SIGHUP") else ()),
+)
+
+
+@contextmanager
+def _blocked_cancel_signals() -> Any:
+    """Block the cancellation signals for the enclosed statements (POSIX).
+
+    Used around the non-atomic transitions the cancellation contract must
+    protect — flipping the deferring flag and publishing a freshly spawned
+    login child — so a signal can never observe them mid-flight; a signal
+    arriving inside the block is delivered when the mask is restored."""
+    if sys.platform == "win32":
+        yield
+        return
+    previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set(_CANCEL_SIGNALS))
+    try:
+        yield
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+
+
 class _CancellationScope:
     """Owns SIGINT, SIGTERM, and SIGHUP for one interactive capture.
 
     Handlers are installed on entry — before the temp config dir is minted or
     the login child spawned — and restored only on exit, after credential
-    capture and cleanup have finished. Outside `defer()` the handler raises
-    `_LoginSignalReceived` (the first cancellation); inside `defer()` — which
-    wraps process-group teardown and credential cleanup — any further signal
-    only sets `deferred` and returns, so those critical sections can never be
-    interrupted by a repeated Ctrl-C or SIGTERM/SIGHUP."""
-
-    _SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+    capture and cleanup have finished. Outside deferred mode the handler
+    raises `_LoginSignalReceived` (the first cancellation); in deferred mode —
+    active around process-group teardown and credential cleanup — any further
+    signal only sets `deferred` and returns, so those critical sections can
+    never be interrupted by a repeated Ctrl-C or SIGTERM/SIGHUP. Mode
+    transitions happen under a blocked signal mask, so no signal can observe
+    a transition mid-flight."""
 
     def __init__(self) -> None:
         self.deferring = False
@@ -520,7 +547,7 @@ class _CancellationScope:
         raise _LoginSignalReceived(signal_number)
 
     def __enter__(self) -> "_CancellationScope":
-        for signal_number in self._SIGNALS:
+        for signal_number in _CANCEL_SIGNALS:
             self._previous[signal_number] = signal.signal(signal_number, self._handle)
         return self
 
@@ -529,14 +556,23 @@ class _CancellationScope:
             signal.signal(signal_number, previous)
         self._previous.clear()
 
+    def enter_deferred_mode(self) -> None:
+        """One-way switch used before the final cleanup: from here on,
+        cancellation signals only set `deferred` — never raise."""
+        with _blocked_cancel_signals():
+            self.deferring = True
+
     @contextmanager
     def defer(self) -> Any:
-        previous = self.deferring
-        self.deferring = True
+        previous_deferring = False
+        with _blocked_cancel_signals():
+            previous_deferring = self.deferring
+            self.deferring = True
         try:
             yield
         finally:
-            self.deferring = previous
+            with _blocked_cancel_signals():
+                self.deferring = previous_deferring
 
 
 def _child_process_env(config_dir: str) -> dict[str, str]:
@@ -621,15 +657,21 @@ def _run_login(
     """
     process: subprocess.Popen[Any] | None = None
     try:
-        process = subprocess.Popen(
-            [claude_path, "auth", "login", "--claudeai"],
-            env=_child_process_env(config_dir),
-            start_new_session=True,
-        )
-        # start_new_session makes the child the leader of a fresh group
-        # numbered by its own pid; capture it now so teardown never has to
-        # ask a possibly-already-exited leader for it.
-        login_pgid = process.pid
+        # Publish the child and its group id under a blocked signal mask: a
+        # cancellation landing between Popen returning and the assignment
+        # would otherwise leave a live, untracked login group behind. A
+        # signal arriving inside the block is delivered right after it, when
+        # the child is fully tracked and teardown can reach it.
+        with _blocked_cancel_signals():
+            process = subprocess.Popen(
+                [claude_path, "auth", "login", "--claudeai"],
+                env=_child_process_env(config_dir),
+                start_new_session=True,
+            )
+            # start_new_session makes the child the leader of a fresh group
+            # numbered by its own pid; capture it now so teardown never has
+            # to ask a possibly-already-exited leader for it.
+            login_pgid = process.pid
         returncode = process.wait(timeout=timeout_secs)
     except subprocess.TimeoutExpired:
         with scope.defer() if scope is not None else nullcontext():
@@ -753,9 +795,12 @@ def capture_interactive(timeout_secs: int = 180) -> CapturedAccount:
                     # below — and reports `CaptureCancelled`.
                     raise CaptureCancelled("Claude login was cancelled") from exc
             finally:
-                with scope.defer():
-                    if config_dir is not None:
-                        _cleanup_temp_config_dir(config_dir, keychain)
+                # One-way: cleanup is the operation's last act, so deferred
+                # mode simply stays on until the scope exits and the
+                # original handlers return.
+                scope.enter_deferred_mode()
+                if config_dir is not None:
+                    _cleanup_temp_config_dir(config_dir, keychain)
         if scope.deferred:
             raise CaptureCancelled("Claude login was cancelled")
         return captured
