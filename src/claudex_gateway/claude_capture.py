@@ -35,6 +35,7 @@ import sys
 import tempfile
 import time
 import unicodedata
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
@@ -486,11 +487,56 @@ def _check_claude_version(claude_path: str) -> None:
 
 
 class _LoginSignalReceived(Exception):
-    """Internal marker raised from a SIGTERM/SIGHUP handler during login wait."""
+    """Internal marker raised from a SIGINT/SIGTERM/SIGHUP handler during the
+    interactive-capture cancellation scope."""
 
     def __init__(self, signal_number: int) -> None:
         super().__init__(signal_number)
         self.signal_number = signal_number
+
+
+class _CancellationScope:
+    """Owns SIGINT, SIGTERM, and SIGHUP for one interactive capture.
+
+    Handlers are installed on entry — before the temp config dir is minted or
+    the login child spawned — and restored only on exit, after credential
+    capture and cleanup have finished. Outside `defer()` the handler raises
+    `_LoginSignalReceived` (the first cancellation); inside `defer()` — which
+    wraps process-group teardown and credential cleanup — any further signal
+    only sets `deferred` and returns, so those critical sections can never be
+    interrupted by a repeated Ctrl-C or SIGTERM/SIGHUP."""
+
+    _SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+
+    def __init__(self) -> None:
+        self.deferring = False
+        self.deferred = False
+        self._previous: dict[int, Any] = {}
+
+    def _handle(self, signal_number: int, _frame: Any) -> None:
+        if self.deferring:
+            self.deferred = True
+            return
+        raise _LoginSignalReceived(signal_number)
+
+    def __enter__(self) -> "_CancellationScope":
+        for signal_number in self._SIGNALS:
+            self._previous[signal_number] = signal.signal(signal_number, self._handle)
+        return self
+
+    def __exit__(self, *_exc_info: Any) -> None:
+        for signal_number, previous in self._previous.items():
+            signal.signal(signal_number, previous)
+        self._previous.clear()
+
+    @contextmanager
+    def defer(self) -> Any:
+        previous = self.deferring
+        self.deferring = True
+        try:
+            yield
+        finally:
+            self.deferring = previous
 
 
 def _child_process_env(config_dir: str) -> dict[str, str]:
@@ -519,19 +565,22 @@ def _process_group_alive(pgid: int) -> bool:
     return True
 
 
-def _terminate_process_group(process: subprocess.Popen[Any]) -> None:
+def _terminate_process_group(pgid: int, process: subprocess.Popen[Any]) -> None:
     """SIGTERM the login process group, wait a bounded grace period keyed on
     GROUP extinction (not leader exit — a descendant that ignores SIGTERM
     must not outlive cleanup), then SIGKILL the whole group, always reaping
-    the leader."""
-    try:
-        pgid = os.getpgid(process.pid)
-    except ProcessLookupError:
-        process.wait()
-        return
+    the leader.
+
+    `pgid` is the group id captured at spawn time (`start_new_session=True`
+    makes the child the leader of a group numbered by its own pid); it is
+    passed in rather than looked up here so that a leader that already
+    exited cannot race `getpgid` into skipping the group teardown while a
+    descendant survives."""
     try:
         os.killpg(pgid, signal.SIGTERM)
-    except ProcessLookupError:
+    except (ProcessLookupError, PermissionError):
+        # ESRCH: the whole group is gone. EPERM (macOS): only unsignalable
+        # zombies remain. Nothing left to tear down either way.
         process.wait()
         return
     deadline = time.monotonic() + _PROCESS_GROUP_GRACE_SECONDS
@@ -553,16 +602,22 @@ def _terminate_process_group(process: subprocess.Popen[Any]) -> None:
     process.wait()
 
 
-def _run_login(claude_path: str, config_dir: str, timeout_secs: int) -> None:
+def _run_login(
+    claude_path: str,
+    config_dir: str,
+    timeout_secs: int,
+    scope: _CancellationScope | None = None,
+) -> None:
     """Spawn `claude auth login --claudeai` and wait for it to finish.
 
     stdin/stdout/stderr are inherited untouched — no output is piped or
     scanned. A nonzero exit is treated as a login denial/failure. The caller
-    (`capture_interactive`) owns the SIGTERM/SIGHUP handlers, which raise
-    `_LoginSignalReceived`; this function's job is to guarantee the login's
-    process group is torn down whenever cancellation or timeout lands after
-    the spawn. Timeout raises a plain `CaptureError`; cancellation raises
-    `CaptureCancelled`.
+    (`capture_interactive`) owns the SIGINT/SIGTERM/SIGHUP handlers through
+    `scope`, which raise `_LoginSignalReceived`; this function's job is to
+    guarantee the login's process group is torn down whenever cancellation or
+    timeout lands after the spawn — with further signals deferred through
+    `scope.defer()` so teardown itself can never be interrupted. Timeout
+    raises a plain `CaptureError`; cancellation raises `CaptureCancelled`.
     """
     process: subprocess.Popen[Any] | None = None
     try:
@@ -571,15 +626,21 @@ def _run_login(claude_path: str, config_dir: str, timeout_secs: int) -> None:
             env=_child_process_env(config_dir),
             start_new_session=True,
         )
+        # start_new_session makes the child the leader of a fresh group
+        # numbered by its own pid; capture it now so teardown never has to
+        # ask a possibly-already-exited leader for it.
+        login_pgid = process.pid
         returncode = process.wait(timeout=timeout_secs)
     except subprocess.TimeoutExpired:
-        _terminate_process_group(process)
+        with scope.defer() if scope is not None else nullcontext():
+            _terminate_process_group(login_pgid, process)
         raise CaptureError(
             f"`claude auth login --claudeai` timed out after {timeout_secs}s"
         ) from None
     except (_LoginSignalReceived, KeyboardInterrupt) as exc:
         if process is not None:
-            _terminate_process_group(process)
+            with scope.defer() if scope is not None else nullcontext():
+                _terminate_process_group(process.pid, process)
         raise CaptureCancelled("Claude login was cancelled") from exc
 
     if returncode != 0:
@@ -663,53 +724,38 @@ def capture_interactive(timeout_secs: int = 180) -> CapturedAccount:
 
         keychain = _default_keychain_backend()
 
-        # Cancellation scope: SIGTERM/SIGHUP handlers are installed BEFORE
-        # the temp config dir is minted or the login child is spawned, and
-        # stay installed until credential capture *and* cleanup have
-        # finished, so no signal in that window can terminate the gateway
-        # while the login child, the temp credentials, or the scoped
-        # Keychain item still exist. During cleanup the handlers defer
-        # instead of raising — and SIGINT is deferred as well, so a second
-        # Ctrl-C cannot interrupt Keychain deletion or directory removal; a
-        # deferred cancellation surfaces as `CaptureCancelled` after
-        # cleanup.
-        signal_state = {"deferring": False, "deferred": False}
-
-        def _on_cancel_signal(signal_number: int, _frame: Any) -> None:
-            if signal_state["deferring"]:
-                signal_state["deferred"] = True
-                return
-            raise _LoginSignalReceived(signal_number)
-
-        previous_sigterm = signal.signal(signal.SIGTERM, _on_cancel_signal)
-        previous_sighup = signal.signal(signal.SIGHUP, _on_cancel_signal)
+        # Cancellation scope: SIGINT/SIGTERM/SIGHUP are owned by the scope
+        # from BEFORE the temp config dir is minted until credential capture
+        # *and* cleanup have finished, so no signal in that window can
+        # terminate the gateway while the login child, the temp credentials,
+        # or the scoped Keychain item still exist. The first signal raises
+        # the cancellation marker; during process-group teardown (inside
+        # `_run_login`) and during cleanup the scope defers, so a repeated
+        # Ctrl-C or SIGTERM/SIGHUP can never interrupt either critical
+        # section. A deferred cancellation surfaces as `CaptureCancelled`
+        # after cleanup.
         config_dir: str | None = None
-        try:
+        with _CancellationScope() as scope:
             try:
-                config_dir = _mint_temp_config_dir(keychain)
-                if _stat_identity(claude_path) != identity:
-                    raise CaptureError(
-                        f"the resolved `claude` executable at {claude_path} changed "
-                        "between the version check and the login spawn; aborting"
-                    )
-                _run_login(claude_path, config_dir, timeout_secs)
-                captured = _capture_from_config_dir_impl(config_dir, keychain)
-            except (_LoginSignalReceived, KeyboardInterrupt) as exc:
-                # Cancellation outside `_run_login`'s own window (e.g. while
-                # minting the temp dir or reading the captured credentials)
-                # still cleans up fully — via the finally below — and
-                # reports `CaptureCancelled`.
-                raise CaptureCancelled("Claude login was cancelled") from exc
-        finally:
-            signal_state["deferring"] = True
-            previous_sigint = signal.signal(signal.SIGINT, _on_cancel_signal)
-            try:
-                if config_dir is not None:
-                    _cleanup_temp_config_dir(config_dir, keychain)
+                try:
+                    config_dir = _mint_temp_config_dir(keychain)
+                    if _stat_identity(claude_path) != identity:
+                        raise CaptureError(
+                            f"the resolved `claude` executable at {claude_path} changed "
+                            "between the version check and the login spawn; aborting"
+                        )
+                    _run_login(claude_path, config_dir, timeout_secs, scope)
+                    captured = _capture_from_config_dir_impl(config_dir, keychain)
+                except (_LoginSignalReceived, KeyboardInterrupt) as exc:
+                    # Cancellation outside `_run_login`'s own window (e.g.
+                    # while minting the temp dir or reading the captured
+                    # credentials) still cleans up fully — via the finally
+                    # below — and reports `CaptureCancelled`.
+                    raise CaptureCancelled("Claude login was cancelled") from exc
             finally:
-                signal.signal(signal.SIGINT, previous_sigint)
-                signal.signal(signal.SIGTERM, previous_sigterm)
-                signal.signal(signal.SIGHUP, previous_sighup)
-        if signal_state["deferred"]:
+                with scope.defer():
+                    if config_dir is not None:
+                        _cleanup_temp_config_dir(config_dir, keychain)
+        if scope.deferred:
             raise CaptureCancelled("Claude login was cancelled")
         return captured

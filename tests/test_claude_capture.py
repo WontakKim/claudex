@@ -1068,7 +1068,9 @@ def test_capture_interactive_succeeds_end_to_end_with_fake_keychain(
     backend = _FakeKeychainBackend()
     monkeypatch.setattr(claude_capture, "_default_keychain_backend", lambda: backend)
 
-    def _fake_run_login(claude_path: str, config_dir: str, timeout_secs: int) -> None:
+    def _fake_run_login(
+        claude_path: str, config_dir: str, timeout_secs: int, scope: Any = None
+    ) -> None:
         assert config_dir == predicted_config_dir
         # Stand in for the real `claude auth login` writing its own scoped
         # Keychain item; this module never performs a Keychain write itself.
@@ -1118,7 +1120,9 @@ def _interactive_fixture(
     backend = _FakeKeychainBackend()
     monkeypatch.setattr(claude_capture, "_default_keychain_backend", lambda: backend)
 
-    def _fake_run_login(claude_path: str, config_dir: str, timeout_secs: int) -> None:
+    def _fake_run_login(
+        claude_path: str, config_dir: str, timeout_secs: int, scope: Any = None
+    ) -> None:
         backend.store[(service, "tester")] = json.dumps(
             {"claudeAiOauth": {"accessToken": "fake-access-token", "email": "fixture@example.com"}}
         )
@@ -1174,6 +1178,86 @@ def test_sigterm_during_cleanup_is_deferred_until_cleanup_completes(
     # Both cleanup actions completed despite the mid-cleanup signal.
     assert not Path(predicted_config_dir).exists()
     assert backend.store == {}
+
+
+def test_second_signal_during_process_group_grace_is_deferred(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # First SIGTERM cancels the login; the leader dies promptly but a
+    # SIGTERM-ignoring descendant holds the process group through the grace
+    # period. A second SIGTERM landing DURING that grace period must be
+    # deferred — teardown must still escalate to the group SIGKILL and the
+    # outer cleanup must still run to completion.
+    _make_stdin_a_tty(monkeypatch)
+    monkeypatch.setenv("USER", "tester")
+    monkeypatch.delenv("USERNAME", raising=False)
+    monkeypatch.setenv("CLAUDEX_FAKE_CLAUDE_MODE", "hang_with_sigterm_ignoring_descendant")
+    monkeypatch.setattr(claude_capture, "_PROCESS_GROUP_GRACE_SECONDS", 1.5)
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _write_fake_claude(bin_dir, version="2.1.222")
+    _prepend_path(monkeypatch, bin_dir)
+
+    mkdtemp_root = tmp_path / "mkdtemp-root"
+    mkdtemp_root.mkdir()
+    monkeypatch.setattr(claude_capture.tempfile, "mkdtemp", _sequential_mkdtemp(mkdtemp_root))
+    predicted_config_dir = Path(mkdtemp_root / f"{claude_capture._TEMP_DIR_PREFIX}1")
+
+    backend = _FakeKeychainBackend()
+    monkeypatch.setattr(claude_capture, "_default_keychain_backend", lambda: backend)
+
+    pids: dict[str, int] = {}
+
+    def _deliver_two_sigterms() -> None:
+        # Capture the pids before cleanup removes the temp config dir.
+        pids["descendant"] = int(_wait_for_file(predicted_config_dir / "descendant.pid"))
+        pids["leader"] = int(_wait_for_file(predicted_config_dir / "leader.pid"))
+        time.sleep(0.2)
+        os.kill(os.getpid(), signal.SIGTERM)  # first cancel -> teardown begins
+        time.sleep(0.5)  # well inside the 1.5s grace period
+        os.kill(os.getpid(), signal.SIGTERM)  # must be deferred, not raised
+
+    signaler = threading.Thread(target=_deliver_two_sigterms, daemon=True)
+    signaler.start()
+    try:
+        with pytest.raises(CaptureCancelled):
+            claude_capture.capture_interactive(timeout_secs=30)
+    finally:
+        signaler.join(timeout=10)
+
+    assert not predicted_config_dir.exists()
+    assert backend.store == {}
+    _assert_process_gone(pids["leader"])
+    _assert_process_gone(pids["descendant"])
+
+
+def test_teardown_kills_descendant_when_leader_already_exited(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The leader exits before teardown begins while its SIGTERM-ignoring
+    # descendant lives on in the group: teardown must still signal the group
+    # via the spawn-time pgid instead of racing getpgid on the dead leader.
+    monkeypatch.setattr(claude_capture, "_PROCESS_GROUP_GRACE_SECONDS", 0.5)
+    descendant_pid_file = tmp_path / "descendant.pid"
+    leader_script = (
+        "import subprocess, sys\n"
+        "descendant = subprocess.Popen([sys.executable, '-c', "
+        "\"import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(120)\"])\n"
+        f"open({str(descendant_pid_file)!r}, 'w').write(str(descendant.pid))\n"
+    )
+    process = subprocess.Popen([sys.executable, "-c", leader_script], start_new_session=True)
+    login_pgid = process.pid
+    descendant_pid = int(_wait_for_file(descendant_pid_file))
+    # Let the leader exit fully before teardown starts.
+    deadline = time.monotonic() + 5
+    while process.poll() is None and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert process.poll() is not None
+
+    claude_capture._terminate_process_group(login_pgid, process)
+
+    _assert_process_gone(descendant_pid)
 
 
 def test_second_sigint_during_cleanup_is_deferred_and_both_actions_complete(
