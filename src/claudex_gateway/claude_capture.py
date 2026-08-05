@@ -33,6 +33,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
@@ -504,9 +505,25 @@ def _child_process_env(config_dir: str) -> dict[str, str]:
     return env
 
 
+def _process_group_alive(pgid: int) -> bool:
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # macOS returns EPERM when the group's only remnants are zombies we
+        # can no longer signal. Every live descendant of the login child runs
+        # under our own uid (kill-0 succeeds for those), so EPERM here means
+        # nothing actionable is left in the group.
+        return False
+    return True
+
+
 def _terminate_process_group(process: subprocess.Popen[Any]) -> None:
-    """SIGTERM the login process group, wait a bounded grace period, then
-    SIGKILL, always reaping the leader afterward."""
+    """SIGTERM the login process group, wait a bounded grace period keyed on
+    GROUP extinction (not leader exit — a descendant that ignores SIGTERM
+    must not outlive cleanup), then SIGKILL the whole group, always reaping
+    the leader."""
     try:
         pgid = os.getpgid(process.pid)
     except ProcessLookupError:
@@ -517,14 +534,21 @@ def _terminate_process_group(process: subprocess.Popen[Any]) -> None:
     except ProcessLookupError:
         process.wait()
         return
-    try:
-        process.wait(timeout=_PROCESS_GROUP_GRACE_SECONDS)
-        return
-    except subprocess.TimeoutExpired:
-        pass
+    deadline = time.monotonic() + _PROCESS_GROUP_GRACE_SECONDS
+    while time.monotonic() < deadline:
+        # Reap the leader as soon as it exits: an unreaped zombie keeps the
+        # process group alive and would otherwise pin the grace loop.
+        process.poll()
+        if not _process_group_alive(pgid):
+            process.wait()
+            return
+        time.sleep(0.05)
+    # Grace expired with the group still alive: SIGKILL the group even when
+    # the leader has already exited; a group that vanished (ESRCH) or holds
+    # only unsignalable zombies (EPERM, macOS) is fine.
     try:
         os.killpg(pgid, signal.SIGKILL)
-    except ProcessLookupError:
+    except (ProcessLookupError, PermissionError):
         pass
     process.wait()
 
@@ -638,16 +662,17 @@ def capture_interactive(timeout_secs: int = 180) -> CapturedAccount:
         _check_claude_version(claude_path)
 
         keychain = _default_keychain_backend()
-        config_dir = _mint_temp_config_dir(keychain)
 
         # Cancellation scope: SIGTERM/SIGHUP handlers are installed BEFORE
-        # the login child is spawned and stay installed until credential
-        # capture *and* cleanup have finished, so no signal in that window
-        # can terminate the gateway while the login child, the temp
-        # credentials, or the scoped Keychain item still exist. During
-        # cleanup the handlers defer instead of raising, so Keychain
-        # deletion and directory removal are never interrupted; a deferred
-        # cancellation surfaces as `CaptureCancelled` after cleanup.
+        # the temp config dir is minted or the login child is spawned, and
+        # stay installed until credential capture *and* cleanup have
+        # finished, so no signal in that window can terminate the gateway
+        # while the login child, the temp credentials, or the scoped
+        # Keychain item still exist. During cleanup the handlers defer
+        # instead of raising — and SIGINT is deferred as well, so a second
+        # Ctrl-C cannot interrupt Keychain deletion or directory removal; a
+        # deferred cancellation surfaces as `CaptureCancelled` after
+        # cleanup.
         signal_state = {"deferring": False, "deferred": False}
 
         def _on_cancel_signal(signal_number: int, _frame: Any) -> None:
@@ -658,8 +683,10 @@ def capture_interactive(timeout_secs: int = 180) -> CapturedAccount:
 
         previous_sigterm = signal.signal(signal.SIGTERM, _on_cancel_signal)
         previous_sighup = signal.signal(signal.SIGHUP, _on_cancel_signal)
+        config_dir: str | None = None
         try:
             try:
+                config_dir = _mint_temp_config_dir(keychain)
                 if _stat_identity(claude_path) != identity:
                     raise CaptureError(
                         f"the resolved `claude` executable at {claude_path} changed "
@@ -669,14 +696,18 @@ def capture_interactive(timeout_secs: int = 180) -> CapturedAccount:
                 captured = _capture_from_config_dir_impl(config_dir, keychain)
             except (_LoginSignalReceived, KeyboardInterrupt) as exc:
                 # Cancellation outside `_run_login`'s own window (e.g. while
-                # reading the captured credentials) still cleans up fully —
-                # via the finally below — and reports `CaptureCancelled`.
+                # minting the temp dir or reading the captured credentials)
+                # still cleans up fully — via the finally below — and
+                # reports `CaptureCancelled`.
                 raise CaptureCancelled("Claude login was cancelled") from exc
         finally:
             signal_state["deferring"] = True
+            previous_sigint = signal.signal(signal.SIGINT, _on_cancel_signal)
             try:
-                _cleanup_temp_config_dir(config_dir, keychain)
+                if config_dir is not None:
+                    _cleanup_temp_config_dir(config_dir, keychain)
             finally:
+                signal.signal(signal.SIGINT, previous_sigint)
                 signal.signal(signal.SIGTERM, previous_sigterm)
                 signal.signal(signal.SIGHUP, previous_sighup)
         if signal_state["deferred"]:

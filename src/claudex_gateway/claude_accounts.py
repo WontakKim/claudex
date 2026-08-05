@@ -490,16 +490,20 @@ def _now_millis() -> int:
 
 
 class _PostCommitFsyncError(Exception):
-    """Internal signal from `_write_json_atomic`: `os.replace` succeeded but
-    something raised afterwards (the containing-directory fsync failing, or
-    any interruption such as `KeyboardInterrupt` landing in the post-replace
-    window). Every *other* exception raised by `_write_json_atomic` means the
-    replace itself never happened — callers must treat this type, and only
-    this type, as "committed, but durability is uncertain", and must never
-    run destructive rollback for it."""
+    """Internal signal from `_write_json_atomic`: the commit either succeeded
+    with a later failure (post-replace directory fsync), or its outcome is
+    UNKNOWN because an interruption such as `KeyboardInterrupt` landed at the
+    replacement boundary itself. Every *other* exception raised by
+    `_write_json_atomic` means the replace conclusively never happened —
+    callers may run destructive rollback only for those, and must treat this
+    type as "committed or outcome unknown": never remove a canonical account
+    directory, never restore a tombstone; leave crash recovery to reconcile."""
 
     def __init__(self, directory: Path, cause: BaseException) -> None:
-        super().__init__(f"replace into {directory} succeeded but its directory fsync failed")
+        super().__init__(
+            f"replace into {directory} committed with uncertain durability, "
+            "or its outcome is unknown"
+        )
         self.directory = directory
 
 
@@ -518,7 +522,6 @@ def _write_json_atomic(path: Path, data: Any) -> None:
     staging_path = path.with_name(f".{path.name}.tmp-{uuid.uuid4().hex}")
     payload = json.dumps(data, indent=2, ensure_ascii=False).encode("utf-8") + b"\n"
 
-    replaced = False
     fd = os.open(staging_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
     try:
         try:
@@ -531,15 +534,26 @@ def _write_json_atomic(path: Path, data: Any) -> None:
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
+    except BaseException:
+        # Strictly before the replacement boundary: the commit conclusively
+        # never happened, so the staging file may be removed and callers may
+        # roll back.
+        _remove_path_if_exists(staging_path)
+        raise
+
+    # Replacement boundary. From here on, destructive rollback is forbidden:
+    # only a synchronous OSError from os.replace proves the commit did not
+    # happen. Any other interruption (KeyboardInterrupt, SystemExit) leaves
+    # the outcome UNKNOWN — the syscall may or may not have completed — so it
+    # is classified with the post-commit marker and crash recovery reconciles.
+    try:
         os.replace(staging_path, path)
-        replaced = True
+    except OSError:
+        _remove_path_if_exists(staging_path)
+        raise
     except BaseException as exc:
         _remove_path_if_exists(staging_path)
-        if replaced:
-            # The replace committed before the interruption landed; callers
-            # must not mistake this for a pre-commit failure and roll back.
-            raise _PostCommitFsyncError(path.parent, exc) from exc
-        raise
+        raise _PostCommitFsyncError(path.parent, exc) from exc
 
     try:
         _fsync_directory(path.parent)

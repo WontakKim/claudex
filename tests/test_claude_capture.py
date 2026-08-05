@@ -176,6 +176,24 @@ if argv[:3] == ["auth", "login", "--claudeai"]:
         descendant.wait()
         sys.exit(0)
 
+    if mode == "hang_with_sigterm_ignoring_descendant":
+        # The leader keeps default SIGTERM disposition (dies promptly) while
+        # its descendant explicitly ignores SIGTERM — only a group SIGKILL
+        # can remove it.
+        with open(os.path.join(config_dir, "leader.pid"), "w") as handle:
+            handle.write(str(os.getpid()))
+        descendant = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(120)",
+            ]
+        )
+        with open(os.path.join(config_dir, "descendant.pid"), "w") as handle:
+            handle.write(str(descendant.pid))
+        descendant.wait()
+        sys.exit(0)
+
     sys.exit(1)
 
 sys.exit(1)
@@ -809,6 +827,29 @@ def test_timeout_kills_process_group_and_reaps_descendant(
     _assert_process_gone(descendant_pid)
 
 
+def test_timeout_kills_sigterm_ignoring_descendant_after_leader_exits(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The leader dies promptly on the group SIGTERM while its descendant
+    # ignores SIGTERM: the escalation ladder must still SIGKILL the group at
+    # the grace deadline instead of returning when the leader exits.
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    claude_path = _write_fake_claude(bin_dir)
+    monkeypatch.setenv("CLAUDEX_FAKE_CLAUDE_MODE", "hang_with_sigterm_ignoring_descendant")
+    monkeypatch.setattr(claude_capture, "_PROCESS_GROUP_GRACE_SECONDS", 1.0)
+
+    with pytest.raises(CaptureError, match="timed out"):
+        claude_capture._run_login(str(claude_path), str(config_dir), timeout_secs=1)
+
+    leader_pid = int(_wait_for_file(config_dir / "leader.pid"))
+    descendant_pid = int(_wait_for_file(config_dir / "descendant.pid"))
+    _assert_process_gone(leader_pid)
+    _assert_process_gone(descendant_pid)
+
+
 def test_timeout_kills_process_group_on_sigint_and_reaps_descendant(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1131,6 +1172,36 @@ def test_sigterm_during_cleanup_is_deferred_until_cleanup_completes(
         claude_capture.capture_interactive(timeout_secs=10)
 
     # Both cleanup actions completed despite the mid-cleanup signal.
+    assert not Path(predicted_config_dir).exists()
+    assert backend.store == {}
+
+
+def test_second_sigint_during_cleanup_is_deferred_and_both_actions_complete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # First Ctrl-C cancels the capture; an impatient second Ctrl-C lands
+    # inside the Keychain delete during cleanup. The second SIGINT must be
+    # deferred so both cleanup actions still complete before exit.
+    backend, predicted_config_dir, _service = _interactive_fixture(tmp_path, monkeypatch)
+
+    def _interrupted_capture_impl(config_dir: str, keychain: Any) -> CapturedAccount:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(claude_capture, "_capture_from_config_dir_impl", _interrupted_capture_impl)
+
+    real_delete = _FakeKeychainBackend.delete
+
+    def _second_sigint_delete(self: _FakeKeychainBackend, service: str, account: str) -> None:
+        os.kill(os.getpid(), signal.SIGINT)
+        real_delete(self, service, account)
+
+    monkeypatch.setattr(_FakeKeychainBackend, "delete", _second_sigint_delete)
+
+    with pytest.raises(CaptureCancelled):
+        claude_capture.capture_interactive(timeout_secs=10)
+
+    # The second SIGINT did not abort cleanup: the Keychain item is gone and
+    # the temp directory was removed.
     assert not Path(predicted_config_dir).exists()
     assert backend.store == {}
 

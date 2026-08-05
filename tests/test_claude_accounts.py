@@ -568,6 +568,53 @@ def test_remove_precommit_tombstone_fsync_failure_restores_the_directory(
     assert listed.id == record.id
 
 
+def _interrupt_registry_replace_after_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Patch os.replace so the REGISTRY replacement really happens and then
+    raises KeyboardInterrupt — modeling an async interrupt landing at the
+    replacement boundary where the commit outcome is unknowable."""
+    real_replace = os.replace
+
+    def _replace_then_interrupt(src: object, dst: object, **kwargs: object) -> None:
+        real_replace(src, dst, **kwargs)  # type: ignore[arg-type]
+        if Path(str(dst)).name == "registry.json":
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(os, "replace", _replace_then_interrupt)
+
+
+def test_add_interrupt_at_the_replace_boundary_never_rolls_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _interrupt_registry_replace_after_success(monkeypatch)
+
+    with pytest.raises(claude_accounts.AccountRegistryError, match="uncertain|unknown"):
+        _add()
+
+    # The replace completed before the interrupt: the account directory and
+    # the committed registry row must both survive.
+    [listed] = claude_accounts.list_accounts()
+    assert listed.email == "user@example.com"
+    assert (_accounts_root() / listed.id).is_dir()
+
+
+def test_remove_interrupt_at_the_replace_boundary_keeps_the_tombstone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    record = _add()
+    _interrupt_registry_replace_after_success(monkeypatch)
+
+    with pytest.raises(claude_accounts.AccountRegistryError, match="uncertain|unknown"):
+        claude_accounts.remove_account(record.id)
+
+    # Outcome-unknown at the boundary: the tombstone is neither restored nor
+    # purged, and the replaced registry no longer contains the row.
+    assert (_accounts_root() / f"{record.id}.tombstone").is_dir()
+    assert not (_accounts_root() / record.id).exists()
+    assert claude_accounts.load_registry() == []
+
+
 def test_tombstone_purge_failure_surfaces_an_error_while_the_row_stays_removed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
