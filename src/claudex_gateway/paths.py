@@ -7,7 +7,7 @@ effects or import cycles. This module must import only the standard library.
 
 from __future__ import annotations
 
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 
 def runtime_dir() -> Path:
@@ -33,9 +33,16 @@ def accounts_dir(provider: str) -> Path:
     """Return the accounts directory for `provider`.
 
     `provider` must be exactly one path component: nonempty, containing no
-    `/` or `\\` separator, and not `.` or `..`. This keeps a provider string
-    from ever escaping the accounts root.
+    `/` or `\\` separator, no Windows drive prefix such as `C:`, and not `.`
+    or `..`. This keeps a provider string from ever escaping the accounts
+    root on any platform.
     """
-    if not provider or "/" in provider or "\\" in provider or provider in (".", ".."):
+    if (
+        not provider
+        or "/" in provider
+        or "\\" in provider
+        or provider in (".", "..")
+        or PureWindowsPath(provider).drive
+    ):
         raise ValueError(f"invalid provider name: {provider!r}")
     return runtime_dir() / "accounts" / provider

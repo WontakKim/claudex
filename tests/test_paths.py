@@ -35,7 +35,9 @@ def test_accounts_dir_is_under_the_accounts_root(tmp_path: Path) -> None:
     assert paths.accounts_dir("claude") == tmp_path / ".claudex" / "accounts" / "claude"
 
 
-@pytest.mark.parametrize("provider", ["", ".", "..", "a/b", "a\\b"])
+@pytest.mark.parametrize(
+    "provider", ["", ".", "..", "a/b", "a\\b", "C:", "C:claude", "D:claude"]
+)
 def test_provider_rejects_unsafe_names(provider: str) -> None:
     with pytest.raises(ValueError):
         paths.accounts_dir(provider)
@@ -51,15 +53,15 @@ def test_do_not_create_the_runtime_directory(tmp_path: Path) -> None:
 
 
 def test_imports_only_stdlib() -> None:
+    allowed_modules = {"__future__", "pathlib"}
     source = (_PACKAGE_DIR / "paths.py").read_text(encoding="utf-8")
     tree = ast.parse(source)
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
-                assert not alias.name.startswith("claudex_gateway")
+                assert alias.name in allowed_modules
         elif isinstance(node, ast.ImportFrom):
-            module = node.module or ""
-            assert not module.startswith("claudex_gateway")
+            assert node.module in allowed_modules
 
 
 @pytest.mark.parametrize("module_name", ["__main__.py", "config.py"])
