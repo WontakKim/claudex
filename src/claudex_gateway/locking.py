@@ -1,0 +1,79 @@
+"""Cross-process, blocking, stdlib-only file lock shared by every module
+that persists state under ``~/.claudex``.
+
+`file_lock` wraps `fcntl.flock` on POSIX and `msvcrt.locking` on Windows
+behind one context manager, so callers on both platforms get identical
+blocking-acquire semantics: the lock is held for the duration of the
+caller's `with` block and is always released, even when the caller raises.
+"""
+
+from __future__ import annotations
+
+import errno
+import os
+import sys
+from collections.abc import Iterator
+from contextlib import contextmanager
+from pathlib import Path
+
+if sys.platform == "win32":
+    import msvcrt
+else:
+    import fcntl
+
+
+@contextmanager
+def file_lock(path: Path) -> Iterator[None]:
+    """Acquire an exclusive lock on `path`, blocking until it is available.
+
+    Creates `path`'s parent directory (mode 0700, owner-only) and `path`
+    itself if either is missing, and chmods `path` to 0600 so the lock file
+    is never group- or world-readable. The lock is released, and the file
+    descriptor closed, on every exit from the `with` block, including when
+    the caller raises.
+    """
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        os.chmod(path, 0o600)
+        _acquire(fd)
+        try:
+            yield
+        finally:
+            _release(fd)
+    finally:
+        os.close(fd)
+
+
+def _acquire(fd: int) -> None:
+    """Block until `fd` is exclusively locked, retrying transient failures."""
+    if sys.platform == "win32":
+        while True:
+            try:
+                os.lseek(fd, 0, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
+                return
+            except OSError as exc:
+                # A single LK_LOCK call gives up after ~10s of contention and
+                # raises instead of blocking indefinitely like POSIX flock;
+                # retry that case (EACCES/EDEADLK) and EINTR until acquired,
+                # so the caller still sees a blocking acquire.
+                if exc.errno not in (errno.EINTR, errno.EACCES, errno.EDEADLK):
+                    raise
+    else:
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX)
+                return
+            except OSError as exc:
+                if exc.errno != errno.EINTR:
+                    raise
+
+
+def _release(fd: int) -> None:
+    """Release the lock held on `fd`."""
+    if sys.platform == "win32":
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+    else:
+        fcntl.flock(fd, fcntl.LOCK_UN)
