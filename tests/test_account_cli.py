@@ -1,0 +1,596 @@
+"""Tests for the `claudex-gateway account {add,list,remove}` CLI subcommands.
+
+Two testing strategies are used, matching the conventions already
+established by `test_claude_capture.py` and `test_main.py`:
+
+- Scenarios that need a real process boundary (signal delivery, a `pty` for
+  an interactive prompt, top-level argv routing) spawn
+  `python -m claudex_gateway ...` via `subprocess`, with `HOME` isolated to
+  `tmp_path` and every `CLAUDEX_*`/`CLAUDE_CONFIG_DIR` variable scrubbed from
+  the child's environment.
+- Scenarios that need a successful Claude credential capture call
+  `claudex_gateway.__main__._account_main(...)` in-process, so a real macOS
+  Keychain is never touched: either `sys.platform` is forced to `"linux"`
+  (capture then reads plain `.credentials.json`/`.claude.json` files, exactly
+  as `test_claude_capture.py`'s own version-gate tests do), or the login
+  child never reaches credential capture at all (e.g. it is killed by SIGINT
+  while still hanging).
+"""
+
+from __future__ import annotations
+
+import contextlib
+import json
+import os
+import pty
+import re
+import select
+import signal
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import uuid
+from pathlib import Path
+
+import pytest
+
+from claudex_gateway import __main__ as gateway_main
+from claudex_gateway import claude_accounts, claude_capture, paths
+
+# ---------------------------------------------------------------------------
+# Shared fixtures
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _isolated_home(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Keep every test's `~/.claudex` under a throwaway directory, shared by
+    both in-process calls and any subprocess spawned with `_clean_env()`."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+
+class _FakeTTYStdin:
+    def isatty(self) -> bool:
+        return True
+
+
+def _make_stdin_a_tty(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sys, "stdin", _FakeTTYStdin())
+
+
+def _add_record(email: str = "user@example.com", **overrides: object) -> claude_accounts.AccountRecord:
+    """Seed the registry directly through the storage layer, bypassing any
+    capture flow, for tests that only need an existing account to act on."""
+    kwargs: dict[str, object] = {
+        "organization_uuid": None,
+        "organization_name": None,
+        "credentials_json": {"accessToken": "at-1"},
+        "oauth_account_json": None,
+    }
+    kwargs.update(overrides)
+    return claude_accounts.add_account(email, **kwargs)  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
+# Subprocess helpers
+# ---------------------------------------------------------------------------
+
+
+def _clean_env() -> dict[str, str]:
+    """`os.environ` with every `CLAUDEX_*`/`CLAUDE_CONFIG_DIR` variable
+    scrubbed; `HOME` is already isolated by the autouse fixture above."""
+    return {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith("CLAUDEX_") and key != "CLAUDE_CONFIG_DIR"
+    }
+
+
+def _run_cli(
+    env: dict[str, str],
+    *args: str,
+    stdin: int | None = None,
+    input_text: str | None = None,
+    timeout: float = 30,
+) -> subprocess.CompletedProcess[str]:
+    kwargs: dict[str, object] = {}
+    if input_text is not None:
+        kwargs["input"] = input_text
+    else:
+        kwargs["stdin"] = stdin
+    return subprocess.run(
+        [sys.executable, "-m", "claudex_gateway", *args],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        **kwargs,
+    )
+
+
+def _write_broken_settings(tmp_path: Path) -> None:
+    runtime_dir = tmp_path / ".claudex"
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    (runtime_dir / "settings.json").write_text("{not valid json", encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Fake `claude` CLI (PATH-prepended, not in-process) -- silent by default so
+# gateway-output assertions never mistake the child's own output for the
+# gateway's (Step 7).
+# ---------------------------------------------------------------------------
+
+_FAKE_CLAUDE_SCRIPT = r"""
+import json
+import os
+import sys
+import time
+
+argv = sys.argv[1:]
+
+if argv == ["--version"]:
+    print("2.1.222")
+    sys.exit(0)
+
+if argv[:3] == ["auth", "login", "--claudeai"]:
+    config_dir = os.environ.get("CLAUDE_CONFIG_DIR", "")
+    mode = os.environ.get("CLAUDEX_FAKE_CLAUDE_MODE", "success")
+    leader_pid_file = os.environ.get("CLAUDEX_TEST_LEADER_PID_FILE")
+    if leader_pid_file:
+        with open(leader_pid_file, "w") as handle:
+            handle.write(str(os.getpid()))
+
+    if mode == "success":
+        with open(os.path.join(config_dir, ".credentials.json"), "w") as handle:
+            json.dump(
+                {"claudeAiOauth": {"accessToken": "fake-token", "email": "fixture@example.com"}},
+                handle,
+            )
+        with open(os.path.join(config_dir, ".claude.json"), "w") as handle:
+            json.dump({"oauthAccount": {"emailAddress": "fixture@example.com"}}, handle)
+        sys.exit(0)
+
+    if mode == "hang":
+        time.sleep(120)
+        sys.exit(0)
+
+    sys.exit(1)
+
+sys.exit(1)
+"""
+
+
+def _write_fake_claude(bin_dir: Path) -> Path:
+    claude_path = bin_dir / "claude"
+    claude_path.write_text(f"#!{sys.executable}\n{_FAKE_CLAUDE_SCRIPT}")
+    claude_path.chmod(0o755)
+    return claude_path
+
+
+def _prepend_fake_claude(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    _write_fake_claude(bin_dir)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
+
+
+def _wait_for_file(path: Path, timeout: float = 5.0) -> str:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if path.exists():
+            content = path.read_text().strip()
+            if content:
+                return content
+        time.sleep(0.02)
+    raise AssertionError(f"{path} did not appear within {timeout}s")
+
+
+def _assert_process_gone(pid: int, timeout: float = 5.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return
+        time.sleep(0.02)
+    raise AssertionError(f"pid {pid} is still alive after {timeout}s")
+
+
+# ---------------------------------------------------------------------------
+# pty helpers for the interactive `remove` confirmation prompt
+# ---------------------------------------------------------------------------
+
+
+def _spawn_pty_cli(env: dict[str, str], *args: str) -> tuple[int, int]:
+    """Fork a `python -m claudex_gateway <args>` child on a fresh pty.
+
+    Uses `os.forkpty()` rather than `subprocess.Popen` dup'ing an
+    already-open fd: only a real `open()` of the pty slave -- which
+    `forkpty()` performs in the child -- makes it that child's controlling
+    terminal, and a controlling terminal is required for the line discipline
+    to turn Ctrl-C into a real `SIGINT` delivered to the child.
+    """
+    pid, controller_fd = os.forkpty()
+    if pid == 0:
+        try:
+            os.execvpe(sys.executable, [sys.executable, "-m", "claudex_gateway", *args], env)
+        except OSError:
+            pass
+        os._exit(127)
+    return pid, controller_fd
+
+
+def _wait_exit_code(pid: int, timeout: float = 10.0) -> int:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        finished_pid, status = os.waitpid(pid, os.WNOHANG)
+        if finished_pid == pid:
+            if os.WIFEXITED(status):
+                return os.WEXITSTATUS(status)
+            if os.WIFSIGNALED(status):
+                return -os.WTERMSIG(status)
+            raise AssertionError(f"child {pid} left an unexpected wait status {status}")
+        time.sleep(0.05)
+    raise AssertionError(f"child {pid} did not exit within {timeout}s")
+
+
+def _read_pty_until(fd: int, marker: str, timeout: float = 5.0) -> str:
+    deadline = time.monotonic() + timeout
+    collected = b""
+    while time.monotonic() < deadline:
+        ready, _, _ = select.select([fd], [], [], 0.2)
+        if not ready:
+            continue
+        try:
+            chunk = os.read(fd, 4096)
+        except OSError:
+            break
+        if not chunk:
+            break
+        collected += chunk
+        if marker.encode() in collected:
+            break
+    return collected.decode(errors="replace")
+
+
+# ---------------------------------------------------------------------------
+# Routing: top-level argv order is preserved exactly (routing)
+# ---------------------------------------------------------------------------
+
+
+def test_routing_stop_bypasses_broken_config(tmp_path: Path) -> None:
+    _write_broken_settings(tmp_path)
+    result = _run_cli(_clean_env(), "stop", timeout=10)
+    assert result.returncode == 1
+    assert "configuration error" not in result.stderr
+
+
+def test_routing_account_list_bypasses_broken_config_exit_code_0(tmp_path: Path) -> None:
+    _write_broken_settings(tmp_path)
+    result = _run_cli(_clean_env(), "account", "list", timeout=10)
+    assert result.returncode == 0
+    assert result.stdout.strip() == "no accounts registered"
+
+
+def test_routing_unknown_account_syntax_exits_2(tmp_path: Path) -> None:
+    result = _run_cli(_clean_env(), "account", "frobnicate", timeout=10)
+    assert result.returncode == 2
+
+
+@pytest.mark.parametrize(
+    "argv", [[], ["--foreground"], ["unknown-top-level-arg"]], ids=["empty", "foreground", "unknown-arg"]
+)
+def test_routing_broken_config_regression_matrix(tmp_path: Path, argv: list[str]) -> None:
+    _write_broken_settings(tmp_path)
+    result = _run_cli(_clean_env(), *argv, timeout=10)
+    assert result.returncode == 1
+    assert "configuration error" in result.stderr
+
+
+# ---------------------------------------------------------------------------
+# non-TTY guards on `add` and `remove` (non_tty, exit_code)
+# ---------------------------------------------------------------------------
+
+
+def test_non_tty_add_without_from_exit_code_2(tmp_path: Path) -> None:
+    result = _run_cli(_clean_env(), "account", "add", stdin=subprocess.DEVNULL, timeout=10)
+    assert result.returncode == 2
+    assert "usage: claudex-gateway account add" in result.stderr
+
+
+def test_non_tty_piped_y_without_yes_exit_code_2_retains_account(tmp_path: Path) -> None:
+    record = _add_record()
+    result = _run_cli(_clean_env(), "account", "remove", record.id, input_text="y\n", timeout=10)
+    assert result.returncode == 2
+    assert "usage: claudex-gateway account remove" in result.stderr
+    assert [r.id for r in claude_accounts.list_accounts()] == [record.id]
+
+
+def test_yes_flag_with_stdin_devnull_exit_code_0(tmp_path: Path) -> None:
+    record = _add_record()
+    result = _run_cli(
+        _clean_env(), "account", "remove", record.id, "--yes", stdin=subprocess.DEVNULL, timeout=10
+    )
+    assert result.returncode == 0
+    assert result.stdout.strip() == f"removed account {record.email} ({record.id})"
+    assert claude_accounts.list_accounts() == []
+
+
+# ---------------------------------------------------------------------------
+# Interactive `remove` prompt through a real pty: accept/decline (decline)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="pty is POSIX-only")
+@pytest.mark.parametrize(
+    ("answer", "expect_removed"), [("n\n", False), ("y\n", True)], ids=["decline", "accept"]
+)
+def test_remove_prompt_pty_response(tmp_path: Path, answer: str, expect_removed: bool) -> None:
+    record = _add_record()
+    pid, controller_fd = _spawn_pty_cli(_clean_env(), "account", "remove", record.id)
+    try:
+        output = _read_pty_until(controller_fd, "[y/N]")
+        assert f"Remove account {record.email} ({record.id})? [y/N]" in output
+        os.write(controller_fd, answer.encode())
+        returncode = _wait_exit_code(pid)
+    finally:
+        with contextlib.suppress(OSError):
+            os.close(controller_fd)
+    assert returncode == 0
+    remaining = [r.id for r in claude_accounts.list_accounts()]
+    assert remaining == ([] if expect_removed else [record.id])
+
+
+# ---------------------------------------------------------------------------
+# Cancellation: SIGINT/Ctrl-C never leaves a mutation behind (interrupt)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="pty/SIGINT are POSIX-only")
+def test_interrupt_ctrl_c_during_remove_prompt_exit_code_130_no_mutation(tmp_path: Path) -> None:
+    record = _add_record()
+    pid, controller_fd = _spawn_pty_cli(_clean_env(), "account", "remove", record.id)
+    try:
+        _read_pty_until(controller_fd, "[y/N]")
+        os.write(controller_fd, b"\x03")  # Ctrl-C: the pty line discipline raises SIGINT
+        returncode = _wait_exit_code(pid)
+    finally:
+        with contextlib.suppress(OSError):
+            os.close(controller_fd)
+    assert returncode == 130
+    assert [r.id for r in claude_accounts.list_accounts()] == [record.id]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="interactive Claude login is POSIX-only")
+def test_interrupt_sigint_during_interactive_login_exit_code_130_no_account_registered(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _make_stdin_a_tty(monkeypatch)
+    _prepend_fake_claude(monkeypatch, tmp_path)
+    monkeypatch.setenv("CLAUDEX_FAKE_CLAUDE_MODE", "hang")
+    leader_pid_file = tmp_path / "leader.pid"
+    monkeypatch.setenv("CLAUDEX_TEST_LEADER_PID_FILE", str(leader_pid_file))
+
+    def _deliver_sigint() -> None:
+        _wait_for_file(leader_pid_file)
+        time.sleep(0.2)
+        os.kill(os.getpid(), signal.SIGINT)
+
+    signaler = threading.Thread(target=_deliver_sigint, daemon=True)
+    signaler.start()
+    try:
+        exit_code = gateway_main._account_main(["add"])
+    finally:
+        signaler.join(timeout=5)
+
+    assert exit_code == 130
+    assert claude_accounts.list_accounts() == []
+    leader_pid = int(leader_pid_file.read_text().strip())
+    _assert_process_gone(leader_pid)
+    # Cleanup ran to completion: no leftover temp Claude config dir.
+    assert not list(Path(tempfile.gettempdir()).glob(f"{claude_capture._TEMP_DIR_PREFIX}*"))
+
+
+# ---------------------------------------------------------------------------
+# add: interactive round trip, --from import, duplicates (all in-process,
+# with sys.platform forced to "linux" so capture reads plain files instead
+# of touching the real macOS Keychain -- mirrors test_claude_capture.py)
+# ---------------------------------------------------------------------------
+
+
+def test_interactive_add_list_remove_round_trip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _make_stdin_a_tty(monkeypatch)
+    monkeypatch.setattr(sys, "platform", "linux")
+    _prepend_fake_claude(monkeypatch, tmp_path)
+    monkeypatch.setenv("CLAUDEX_FAKE_CLAUDE_MODE", "success")
+
+    add_exit_code = gateway_main._account_main(["add"])
+    added_out = capsys.readouterr().out
+    assert add_exit_code == 0
+    assert re.fullmatch(
+        r"added account fixture@example\.com \([0-9a-f-]{36}\)\n", added_out
+    )
+
+    list_exit_code = gateway_main._account_main(["list"])
+    list_out = capsys.readouterr().out
+    assert list_exit_code == 0
+    assert "fixture@example.com" in list_out
+
+    [record] = claude_accounts.list_accounts()
+    remove_exit_code = gateway_main._account_main(["remove", record.id, "--yes"])
+    removed_out = capsys.readouterr().out
+    assert remove_exit_code == 0
+    assert removed_out.strip() == f"removed account {record.email} ({record.id})"
+    assert claude_accounts.list_accounts() == []
+
+
+def _write_fixture_config_dir(config_dir: Path, *, email: str = "import@example.com") -> None:
+    config_dir.mkdir(parents=True, exist_ok=True)
+    (config_dir / ".credentials.json").write_text(
+        json.dumps({"claudeAiOauth": {"accessToken": "at-import", "email": email}}),
+        encoding="utf-8",
+    )
+    (config_dir / ".claude.json").write_text(
+        json.dumps(
+            {
+                "oauthAccount": {
+                    "emailAddress": email,
+                    "organizationUuid": "org-import",
+                    "organizationName": "Import Org",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_from_import_uses_fixture_config_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(sys, "platform", "linux")
+    config_dir = tmp_path / "fixture-config"
+    _write_fixture_config_dir(config_dir)
+
+    exit_code = gateway_main._account_main(["add", "--from", str(config_dir)])
+    out = capsys.readouterr().out
+    assert exit_code == 0
+
+    [record] = claude_accounts.list_accounts()
+    assert record.email == "import@example.com"
+    assert record.organization_name == "Import Org"
+    assert out.strip() == f"added account {record.email} ({record.id})"
+
+
+def test_duplicate_add_exit_code_1(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(sys, "platform", "linux")
+    config_dir = tmp_path / "fixture-config"
+    _write_fixture_config_dir(config_dir)
+
+    first_exit_code = gateway_main._account_main(["add", "--from", str(config_dir)])
+    capsys.readouterr()
+    second_exit_code = gateway_main._account_main(["add", "--from", str(config_dir)])
+    err = capsys.readouterr().err
+
+    assert first_exit_code == 0
+    assert second_exit_code == 1
+    assert "account add failed" in err
+    assert "Traceback" not in err
+    assert len(claude_accounts.list_accounts()) == 1
+
+
+# ---------------------------------------------------------------------------
+# remove: unknown id, malformed registry (exit_code, traceback)
+# ---------------------------------------------------------------------------
+
+
+def test_unknown_remove_id_exit_code_1(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    exit_code = gateway_main._account_main(["remove", str(uuid.uuid4()), "--yes"])
+    err = capsys.readouterr().err
+    assert exit_code == 1
+    assert "account remove failed" in err
+    assert "Traceback" not in err
+
+
+def test_malformed_registry_exit_code_1_no_traceback(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    accounts_root = paths.accounts_dir("claude")
+    accounts_root.mkdir(parents=True)
+    (accounts_root / "registry.json").write_text("{not valid json", encoding="utf-8")
+
+    exit_code = gateway_main._account_main(["list"])
+    err = capsys.readouterr().err
+    assert exit_code == 1
+    assert "account list failed" in err
+    assert "Traceback" not in err
+
+
+# ---------------------------------------------------------------------------
+# list: empty output, table shape, and reading only registry.json
+# (does_not_read_credentials, corrupt)
+# ---------------------------------------------------------------------------
+
+
+def test_empty_list_output_exit_code_0(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    exit_code = gateway_main._account_main(["list"])
+    out = capsys.readouterr().out
+    assert exit_code == 0
+    assert out.strip() == "no accounts registered"
+
+
+def test_list_table_headers_and_date_format(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    record = _add_record("user@example.com", organization_name="Acme")
+    exit_code = gateway_main._account_main(["list"])
+    out = capsys.readouterr().out
+    lines = out.splitlines()
+
+    assert exit_code == 0
+    assert lines[0].split() == ["ID", "EMAIL", "ORGANIZATION", "ADDED"]
+    assert record.id in lines[1]
+    assert "user@example.com" in lines[1]
+    assert "Acme" in lines[1]
+    assert re.search(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", lines[1])
+
+
+def test_list_does_not_read_credentials_files_even_when_corrupt(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`account list` reads only registry.json: corrupt, missing per-account
+    credential files must never affect it (does_not_read_credentials)."""
+    record = _add_record()
+    account_dir = paths.accounts_dir("claude") / record.id
+    (account_dir / "credentials.json").write_text("{not valid json at all", encoding="utf-8")
+    (account_dir / "oauth-account.json").unlink()
+
+    exit_code = gateway_main._account_main(["list"])
+    out = capsys.readouterr().out
+    assert exit_code == 0
+    assert record.email in out
+
+
+# ---------------------------------------------------------------------------
+# No credential material ever leaves the gateway's own stdout/stderr
+# (no_secret_output, sentinel)
+# ---------------------------------------------------------------------------
+
+
+def test_no_secret_output_sentinel_absent_on_success_and_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(sys, "platform", "linux")
+    sentinel = "sk-ant-oat-sentinel-must-never-leak"
+    config_dir = tmp_path / "fixture-config"
+    config_dir.mkdir()
+    (config_dir / ".credentials.json").write_text(
+        json.dumps({"claudeAiOauth": {"accessToken": sentinel, "email": "user@example.com"}}),
+        encoding="utf-8",
+    )
+
+    add_exit_code = gateway_main._account_main(["add", "--from", str(config_dir)])
+    added = capsys.readouterr()
+    assert add_exit_code == 0
+    assert sentinel not in added.out
+    assert sentinel not in added.err
+
+    gateway_main._account_main(["list"])
+    listed = capsys.readouterr()
+    assert sentinel not in listed.out
+    assert sentinel not in listed.err
+
+    failure_exit_code = gateway_main._account_main(["remove", str(uuid.uuid4()), "--yes"])
+    failed = capsys.readouterr()
+    assert failure_exit_code == 1
+    assert sentinel not in failed.out
+    assert sentinel not in failed.err
