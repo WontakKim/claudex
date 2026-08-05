@@ -401,7 +401,7 @@ def _account_remove(account_id: str, assume_yes: bool) -> int:
 
     if not assume_yes:
         try:
-            answer = input(f"Remove account {record.email} ({record.id})? [y/N] ")
+            answer = input(f"Remove account {record.email} ({record.id})? [y/N]")
         except EOFError:
             return 0
         if answer.strip().lower() not in ("y", "yes"):
