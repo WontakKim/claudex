@@ -3,6 +3,9 @@
 import json
 import re
 
+import pytest
+
+import claudex_gateway.translate.codex_to_claude as codex_to_claude
 from claudex_gateway.translate.codex_to_claude import (
     CodexToClaudeStreamTranslator,
     assemble_claude_message,
@@ -25,6 +28,24 @@ def _run_stream(
     for codex_event in codex_events:
         events.extend(translator.translate_event(codex_event))
     return events
+
+
+def _count_estimate_calls(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    """Monkeypatch estimate_overflow_prompt_tokens with a call-counting wrapper.
+
+    Output-only assertions cannot distinguish lazy estimation (only called
+    for an overflow error with a configured context_window) from an eager
+    implementation that always estimates; only a call count can.
+    """
+    calls: list[int] = []
+    original = codex_to_claude.estimate_overflow_prompt_tokens
+
+    def counting_wrapper(claude_request: dict) -> int:
+        calls.append(1)
+        return original(claude_request)
+
+    monkeypatch.setattr(codex_to_claude, "estimate_overflow_prompt_tokens", counting_wrapper)
+    return calls
 
 
 def test_full_stream_with_thinking_text_and_tool_call() -> None:
@@ -346,6 +367,80 @@ def test_context_overflow_failed_event_synthesizes_numeric_pair_with_context_win
     assert match is not None
     assert int(match.group(1)) > int(match.group(2))
     assert "Backend refused: maximum context length exceeded." in message
+
+
+def test_estimate_overflow_prompt_tokens_is_not_called_for_successful_events(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = _count_estimate_calls(monkeypatch)
+    _run_stream(
+        {"model": "claude-opus-4-6"},
+        [
+            {"type": "response.created", "response": {"id": "resp_1", "model": "gpt-5.5"}},
+            {"type": "response.output_text.delta", "delta": "hi"},
+            {
+                "type": "response.completed",
+                "response": {"id": "resp_1", "usage": {}, "output": []},
+            },
+        ],
+        context_window=272000,
+    )
+    assert calls == []
+
+
+def test_estimate_overflow_prompt_tokens_is_not_called_for_non_overflow_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = _count_estimate_calls(monkeypatch)
+    _run_stream(
+        {},
+        [{"type": "error", "error": {"type": "rate_limit_error", "message": "slow down"}}],
+        context_window=272000,
+    )
+    assert calls == []
+
+
+def test_estimate_overflow_prompt_tokens_is_called_once_for_overflow_error_event(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = _count_estimate_calls(monkeypatch)
+    _run_stream(
+        {},
+        [
+            {
+                "type": "error",
+                "error": {
+                    "type": "invalid_request_error",
+                    "code": "context_length_exceeded",
+                    "message": "Your input exceeds the context window of this model.",
+                },
+            }
+        ],
+        context_window=272000,
+    )
+    assert len(calls) == 1
+
+
+def test_estimate_overflow_prompt_tokens_is_called_once_for_overflow_failed_event(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = _count_estimate_calls(monkeypatch)
+    _run_stream(
+        {},
+        [
+            {
+                "type": "response.failed",
+                "response": {
+                    "error": {
+                        "code": "context_length_exceeded",
+                        "message": "Backend refused: maximum context length exceeded.",
+                    }
+                },
+            }
+        ],
+        context_window=272000,
+    )
+    assert len(calls) == 1
 
 
 def test_context_overflow_clamp_applies_floor_for_small_request() -> None:

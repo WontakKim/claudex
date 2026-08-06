@@ -21,7 +21,12 @@ import uvicorn
 from starlette.testclient import TestClient
 
 import claudex_gateway.server as server
-from claudex_gateway.codex_client import CodexClient, CodexUpstreamError
+from claudex_gateway.codex_client import (
+    CODEX_MODELS_URL,
+    CODEX_RESPONSES_URL,
+    CodexClient,
+    CodexUpstreamError,
+)
 from claudex_gateway.config import GatewayConfig
 from claudex_gateway.kimi_auth import KimiCredentials
 from claudex_gateway.kimi_client import KimiClient, KimiUpstreamError
@@ -562,6 +567,109 @@ def test_mid_stream_overflow_error_carries_catalog_numbers(
     actual, limit = int(match.group(1)), int(match.group(2))
     assert limit == 272000
     assert actual > limit
+
+
+class RecordingMidStreamOverflowCodexClient(FakeCodexClient):
+    """Yields one event, then fails with an overflow-shaped upstream error.
+
+    Also records every model passed to `context_window`, so callers can
+    prove it was resolved from the mapped `RouteTarget.model`.
+    """
+
+    def __init__(self) -> None:
+        self.context_window_calls: list[str] = []
+
+    async def context_window(self, model: str) -> int | None:
+        self.context_window_calls.append(model)
+        return 272000
+
+    async def stream_responses(
+        self, payload: dict[str, Any], session_id: str
+    ) -> AsyncIterator[dict[str, Any]]:
+        yield {"type": "response.created", "response": {"id": "resp_1", "model": payload["model"]}}
+        raise CodexUpstreamError(
+            400,
+            _overflow_error_body("Your input exceeds the context window of this model."),
+        )
+
+
+def test_non_streaming_mid_stream_overflow_reports_numbers() -> None:
+    # T-5's mid-stream overflow coverage only exercised the streaming
+    # translation path (_translate_claude_sse); a non-streaming mapped
+    # request goes through _aggregate_claude_response's own exception
+    # handler instead, which must synthesize the same numeric pair.
+    config = GatewayConfig(model_map={"opus": "codex:gpt-5.6-sol"})
+    app = server.create_app(config)
+    # The lifespan requires real Codex credentials, so set the state
+    # directly instead of entering the TestClient context manager.
+    app.state.config = config
+    stub = RecordingMidStreamOverflowCodexClient()
+    app.state.codex_client = stub
+    app.state.http_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(_failing_anthropic_handler)
+    )
+    client = TestClient(app)
+
+    response = client.post("/v1/messages", json=_message_body("claude-opus-4-6"))
+
+    assert response.status_code == 400
+    payload = response.json()
+    assert payload["type"] == "error"
+    assert payload["error"]["type"] == "invalid_request_error"
+    match = _CLIENT_OVERFLOW_NUMBERS_RE.search(payload["error"]["message"])
+    assert match is not None
+    actual, limit = int(match.group(1)), int(match.group(2))
+    assert limit == 272000
+    assert actual > limit
+    assert stub.context_window_calls == ["gpt-5.6-sol"]
+
+
+def test_context_window_cache_is_reused_across_requests() -> None:
+    # Proves the relay reuses the lifespan-owned client and its
+    # ContextWindowCache instead of constructing a fresh one per request:
+    # two mapped requests through the same app fetch the catalog exactly
+    # once (within the cache's TTL) while still hitting the upstream model
+    # endpoint once per request.
+    calls = {"catalog": 0, "responses": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url).startswith(CODEX_MODELS_URL):
+            calls["catalog"] += 1
+            return httpx.Response(
+                200, json={"models": [{"slug": "gpt-5.6-sol", "context_window": 272000}]}
+            )
+        if str(request.url) == CODEX_RESPONSES_URL:
+            calls["responses"] += 1
+            return httpx.Response(
+                200,
+                content=(
+                    b'data: {"type": "response.created", "response": {"id": "resp_1"}}\n\n'
+                    b'data: {"type": "response.completed", '
+                    b'"response": {"id": "resp_1", "usage": {}, "output": []}}\n\n'
+                    b"data: [DONE]\n\n"
+                ),
+                headers={"content-type": "text/event-stream"},
+            )
+        raise AssertionError(f"unexpected request to {request.url}")
+
+    config = GatewayConfig(model_map={"opus": "codex:gpt-5.6-sol"})
+    app = server.create_app(config)
+    app.state.config = config
+    app.state.codex_client = CodexClient(
+        AvailableCodexAuthManager(), httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    )
+    app.state.http_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(_failing_anthropic_handler)
+    )
+    client = TestClient(app)
+
+    first = client.post("/v1/messages", json=_message_body("claude-opus-4-6"))
+    second = client.post("/v1/messages", json=_message_body("claude-opus-4-6"))
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert calls["catalog"] == 1
+    assert calls["responses"] == 2
 
 
 def test_mapped_request_without_max_tokens_is_rejected() -> None:

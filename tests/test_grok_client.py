@@ -9,7 +9,8 @@ from typing import Any
 import httpx
 import pytest
 
-from claudex_gateway.grok_auth import GrokCredentials
+from claudex_gateway.context_window_cache import ContextWindowCache
+from claudex_gateway.grok_auth import GrokAuthError, GrokCredentials
 from claudex_gateway.grok_client import (
     GROK_MODELS_URL,
     GROK_RESPONSES_URL,
@@ -98,6 +99,25 @@ class _FakeAuthManager:
         if force_refresh:
             self.force_refresh_calls += 1
         return GrokCredentials(access_token="grok-token-1", email=None)
+
+
+class _FakeClock:
+    """A controllable stand-in for `time.monotonic`, advanced explicitly.
+
+    GrokClient exposes no public clock-injection parameter, so forcing the
+    cache's 900s TTL to expire without a real sleep requires replacing the
+    client's private `_context_windows` cache with one built from this fake
+    clock (see `TestContextWindow._client_with_fake_clock` below).
+    """
+
+    def __init__(self) -> None:
+        self._now = 0.0
+
+    def __call__(self) -> float:
+        return self._now
+
+    def advance(self, seconds: float) -> None:
+        self._now += seconds
 
 
 def _sse(events: list[dict[str, Any]]) -> bytes:
@@ -218,6 +238,29 @@ class TestContextWindow:
     def _catalog_response(data: list[Any]) -> httpx.Response:
         return httpx.Response(200, json={"object": "list", "data": data})
 
+    @staticmethod
+    def _malformed_catalog_response(kind: str) -> httpx.Response:
+        """Build a response for each structural catalog-failure variant."""
+        if kind == "non_200":
+            return httpx.Response(500, text="boom")
+        if kind == "invalid_json":
+            return httpx.Response(200, content=b"not valid json{")
+        if kind == "missing_data_key":
+            return httpx.Response(200, json={"object": "list"})
+        if kind == "non_list_data":
+            return httpx.Response(200, json={"object": "list", "data": {"not": "a-list"}})
+        raise ValueError(f"unknown malformed-catalog kind: {kind}")
+
+    @staticmethod
+    def _client_with_fake_clock(http_client: httpx.AsyncClient, clock: _FakeClock) -> GrokClient:
+        client = GrokClient(_FakeAuthManager(), http_client)
+        client._context_windows = ContextWindowCache(
+            client._fetch_context_windows,
+            expected_errors=(GrokAuthError, GrokUpstreamError, httpx.HTTPError),
+            clock=clock,
+        )
+        return client
+
     def test_resolves_exact_id_and_ignores_sibling_field(self) -> None:
         async def handler(request: httpx.Request) -> httpx.Response:
             return self._catalog_response(
@@ -335,6 +378,53 @@ class TestContextWindow:
         assert warm == 500000
         assert stale == 500000
         assert calls["n"] == 3
+
+    @pytest.mark.parametrize(
+        "kind", ["non_200", "invalid_json", "missing_data_key", "non_list_data"]
+    )
+    def test_stale_window_served_after_failed_refresh(self, kind: str) -> None:
+        # A stale-on-structural-error test run immediately after a successful
+        # fetch stays inside the 900s TTL and never exercises a failed
+        # refresh, so a fake clock forces the snapshot past its TTL before
+        # the second lookup, across every structural catalog-failure variant.
+        calls = {"n": 0}
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return self._catalog_response([{"id": "grok-4.5", "context_window": 500000}])
+            return self._malformed_catalog_response(kind)
+
+        async def scenario() -> tuple[int | None, int | None]:
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+                clock = _FakeClock()
+                client = self._client_with_fake_clock(http_client, clock)
+                first = await client.context_window("grok-4.5")
+                clock.advance(901.0)  # past the cache's 900s TTL
+                second = await client.context_window("grok-4.5")
+                return first, second
+
+        first, second = asyncio.run(scenario())
+        assert first == 500000
+        assert second == 500000
+        assert calls["n"] == 2
+
+    @pytest.mark.parametrize(
+        "kind", ["non_200", "invalid_json", "missing_data_key", "non_list_data"]
+    )
+    def test_cold_cache_malformed_catalog_returns_none(self, kind: str) -> None:
+        calls = {"n": 0}
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            calls["n"] += 1
+            return self._malformed_catalog_response(kind)
+
+        async def scenario() -> int | None:
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+                return await GrokClient(_FakeAuthManager(), http_client).context_window("grok-4.5")
+
+        assert asyncio.run(scenario()) is None
+        assert calls["n"] == 1
 
     def test_list_models_still_fetches_fresh_after_context_window_populates_cache(self) -> None:
         calls = {"n": 0}

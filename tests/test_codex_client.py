@@ -8,8 +8,9 @@ from typing import Any
 import httpx
 import pytest
 
-from claudex_gateway.codex_auth import CodexCredentials
+from claudex_gateway.codex_auth import CodexAuthError, CodexCredentials
 from claudex_gateway.codex_client import CODEX_MODELS_URL, CodexClient, CodexUpstreamError
+from claudex_gateway.context_window_cache import ContextWindowCache
 
 
 class _FakeAuthManager:
@@ -45,6 +46,48 @@ def _catalog_handler(calls: dict[str, int]) -> Any:
         return httpx.Response(200, json={"models": _CATALOG_MODELS})
 
     return handler
+
+
+class _FakeClock:
+    """A controllable stand-in for `time.monotonic`, advanced explicitly.
+
+    CodexClient exposes no public clock-injection parameter, so forcing the
+    cache's 900s TTL to expire without a real sleep requires replacing the
+    client's private `_context_windows` cache with one built from this fake
+    clock (see `_codex_client_with_fake_clock` below).
+    """
+
+    def __init__(self) -> None:
+        self._now = 0.0
+
+    def __call__(self) -> float:
+        return self._now
+
+    def advance(self, seconds: float) -> None:
+        self._now += seconds
+
+
+def _codex_client_with_fake_clock(http_client: httpx.AsyncClient, clock: _FakeClock) -> CodexClient:
+    client = CodexClient(_FakeAuthManager(), http_client)
+    client._context_windows = ContextWindowCache(
+        client._fetch_context_windows,
+        expected_errors=(CodexAuthError, CodexUpstreamError, httpx.HTTPError),
+        clock=clock,
+    )
+    return client
+
+
+def _malformed_catalog_response(kind: str) -> httpx.Response:
+    """Build a response for each structural catalog-failure variant."""
+    if kind == "non_200":
+        return httpx.Response(500, text="boom")
+    if kind == "invalid_json":
+        return httpx.Response(200, content=b"not valid json{")
+    if kind == "missing_models_key":
+        return httpx.Response(200, json={"unexpected": []})
+    if kind == "non_list_models":
+        return httpx.Response(200, json={"models": {"not": "a-list"}})
+    raise ValueError(f"unknown malformed-catalog kind: {kind}")
 
 
 def test_context_window_returns_window_for_exact_slug_match() -> None:
@@ -195,6 +238,57 @@ def test_non_json_decode_failure_degrades_like_structural_failure() -> None:
     assert warm == 272000
     assert stale == 272000
     assert calls["n"] == 3
+
+
+@pytest.mark.parametrize(
+    "kind", ["non_200", "invalid_json", "missing_models_key", "non_list_models"]
+)
+def test_codex_stale_window_served_after_failed_refresh(kind: str) -> None:
+    # A stale-on-structural-error test run immediately after a successful
+    # fetch stays inside the 900s TTL and never exercises a failed refresh,
+    # so a fake clock forces the snapshot past its TTL before the second
+    # lookup, across every structural catalog-failure variant.
+    calls = {"n": 0}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return httpx.Response(200, json={"models": _CATALOG_MODELS})
+        return _malformed_catalog_response(kind)
+
+    async def scenario() -> tuple[int | None, int | None]:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+            clock = _FakeClock()
+            client = _codex_client_with_fake_clock(http_client, clock)
+            first = await client.context_window("gpt-5.6-sol")
+            clock.advance(901.0)  # past the cache's 900s TTL
+            second = await client.context_window("gpt-5.6-sol")
+            return first, second
+
+    first, second = asyncio.run(scenario())
+
+    assert first == 272000
+    assert second == 272000
+    assert calls["n"] == 2
+
+
+@pytest.mark.parametrize(
+    "kind", ["non_200", "invalid_json", "missing_models_key", "non_list_models"]
+)
+def test_codex_cold_cache_malformed_catalog_returns_none(kind: str) -> None:
+    calls = {"n": 0}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return _malformed_catalog_response(kind)
+
+    async def scenario() -> int | None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+            client = CodexClient(_FakeAuthManager(), http_client)
+            return await client.context_window("gpt-5.6-sol")
+
+    assert asyncio.run(scenario()) is None
+    assert calls["n"] == 1
 
 
 def test_list_models_fetches_fresh_after_context_window_populated_cache() -> None:
