@@ -102,7 +102,7 @@ _KEYCHAIN_SERVICE_FORMAT = "Claude Code-credentials-{suffix}"
 # The tested-version allowlist is exact, not a `>=` range: an unlisted build
 # may have moved the Keychain item's scoping or format in a way this module
 # does not yet account for, so it is refused unless the caller opts in.
-_SUPPORTED_CLAUDE_VERSIONS = frozenset({"2.1.222"})
+_SUPPORTED_CLAUDE_VERSIONS = frozenset({"2.1.222", "2.1.223"})
 _ALLOW_UNTESTED_CLAUDE_ENV = "CLAUDEX_ALLOW_UNTESTED_CLAUDE"
 _VERSION_RE = re.compile(r"(\d+\.\d+\.\d+)")
 _VERSION_CHECK_TIMEOUT_SECONDS = 10.0

@@ -1414,14 +1414,37 @@ def _security_add_generic_password(service: str, account: str, password: str) ->
     )
 
 
+def _security_item_metadata(service: str, account: str) -> str | None:
+    """Fetch a Keychain item's attribute block WITHOUT its secret (`-w` is
+    deliberately absent — reading a foreign item's secret triggers a macOS
+    authorization dialog, which both hangs a headless run and is exactly the
+    kind of access this suite must never perform on the user's real legacy
+    item). Returns None when the item does not exist."""
+    result = subprocess.run(
+        ["/usr/bin/security", "find-generic-password", "-s", service, "-a", account],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    if result.returncode != 0:
+        return None
+    return result.stdout
+
+
 @pytest.mark.skipif(sys.platform != "darwin", reason="real Keychain integration is macOS-only")
 @pytest.mark.skipif(
     os.environ.get("CLAUDEX_TEST_REAL_KEYCHAIN") != "1",
     reason="set CLAUDEX_TEST_REAL_KEYCHAIN=1 to exercise the real macOS Keychain",
 )
 def test_real_keychain_integration_found_missing_and_legacy_item_untouched(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # This test exercises the REAL login Keychain, so undo the suite-wide
+    # HOME isolation: with HOME pointing at a bare tmp dir, `security` cannot
+    # locate the login keychain and its write operations hang until timeout.
+    import pwd
+
+    monkeypatch.setenv("HOME", pwd.getpwuid(os.getuid()).pw_dir)
     backend = claude_capture._SecurityKeychainBackend()
     account = os.environ.get("USER") or os.environ.get("USERNAME")
     assert account, "USER/USERNAME must be set to run the real-Keychain integration test"
@@ -1430,7 +1453,8 @@ def test_real_keychain_integration_found_missing_and_legacy_item_untouched(
     service = claude_capture._scoped_keychain_service(config_dir)
 
     legacy_service = "Claude Code-credentials"
-    legacy_before = backend.read(legacy_service, account)
+    # Metadata only: never read the real legacy item's secret (see helper).
+    legacy_before = _security_item_metadata(legacy_service, account)
 
     # Conclusively missing before anything is added: a failed capture.
     assert backend.read(service, account) is None
@@ -1454,7 +1478,7 @@ def test_real_keychain_integration_found_missing_and_legacy_item_untouched(
     # Deleting an already-missing item is still success (tri-state contract).
     backend.delete(service, account)
 
-    assert backend.read(legacy_service, account) == legacy_before
+    assert _security_item_metadata(legacy_service, account) == legacy_before
 
     temp_dir = tempfile.mkdtemp(prefix=claude_capture._TEMP_DIR_PREFIX)
     try:

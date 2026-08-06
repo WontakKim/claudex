@@ -78,9 +78,9 @@ explicit choices, not bugs:
   to the exact config-directory string, so `--from <dir>` must name the
   exact string used at that login — no `~` expansion, trailing-slash
   cleanup, or other path canonicalization.
-- Interactive capture is verified against Claude Code `2.1.222` exactly.
-  This is an allowlist of tested builds, not a minimum-supported version:
-  any other `claude` build is refused unless
+- Interactive capture is verified against Claude Code `2.1.222` and
+  `2.1.223` exactly. This is an allowlist of tested builds, not a
+  minimum-supported version: any other `claude` build is refused unless
   `CLAUDEX_ALLOW_UNTESTED_CLAUDE=1` is set.
 - Interactive capture (`account add` without `--from`) is POSIX-only in
   this version; on Windows, use `account add --from <dir>` instead.
@@ -205,9 +205,9 @@ launch `claude`: it instead imports an already-completed login from `<dir>`,
 which must be the exact config-directory string used at that login (on
 macOS this selects a Keychain item scoped to that exact string — no `~`
 expansion, trailing-slash cleanup, or other path canonicalization).
-Interactive capture only works with Claude Code `2.1.222` exactly; any
-other `claude` build is refused unless `CLAUDEX_ALLOW_UNTESTED_CLAUDE=1` is
-set. It is also POSIX-only in this version — on Windows, always use
+Interactive capture only works with the allowlisted Claude Code builds
+(`2.1.222`, `2.1.223`); any other `claude` build is refused unless
+`CLAUDEX_ALLOW_UNTESTED_CLAUDE=1` is set. It is also POSIX-only in this version — on Windows, always use
 `--from <dir>` instead (the version-allowlist override does not lift the
 Windows restriction).
 
