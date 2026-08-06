@@ -384,6 +384,58 @@ def test_passthrough_returns_502_when_anthropic_is_unreachable() -> None:
     assert response.json()["error"]["type"] == "api_error"
 
 
+class _AbortingByteStream(httpx.AsyncByteStream):
+    """Yields one chunk, then dies like a reset upstream connection."""
+
+    def __init__(self, first_chunk: bytes) -> None:
+        self._first_chunk = first_chunk
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        yield self._first_chunk
+        raise httpx.ReadError("connection reset")
+
+
+def test_passthrough_sse_abort_emits_error_event() -> None:
+    first_event = b'event: message_start\ndata: {"type": "message_start"}\n\n'
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            stream=_AbortingByteStream(first_event),
+            headers={"content-type": "text/event-stream"},
+        )
+
+    client, _ = _gateway(GatewayConfig(), handler)
+
+    response = client.post("/v1/messages", json=_message_body("claude-fable-5"))
+
+    assert response.status_code == 200
+    assert response.content.startswith(first_event)
+    tail = response.content[len(first_event) :].decode()
+    assert "event: error" in tail
+    payload = json.loads(tail.rsplit("data: ", 1)[1].strip())
+    assert payload["error"]["type"] == "api_error"
+    assert "connection reset" in payload["error"]["message"]
+
+
+def test_passthrough_json_abort_truncates_without_error_event() -> None:
+    partial_body = b'{"id": "msg_1", '
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            stream=_AbortingByteStream(partial_body),
+            headers={"content-type": "application/json"},
+        )
+
+    client, _ = _gateway(GatewayConfig(), handler)
+
+    response = client.post("/v1/messages", json=_message_body("claude-fable-5"))
+
+    assert response.status_code == 200
+    assert response.content == partial_body
+
+
 def test_mapped_model_routes_to_codex() -> None:
     captured: list[httpx.Request] = []
 

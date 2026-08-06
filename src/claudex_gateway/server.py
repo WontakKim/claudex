@@ -279,6 +279,19 @@ async def _passthrough_to_anthropic(
         try:
             async for chunk in upstream_response.aiter_bytes():
                 yield chunk
+        except httpx.HTTPError as exc:
+            # The status line is already sent, so a mid-stream failure can only
+            # be reported in-band: SSE responses get a terminal error event,
+            # anything else is simply truncated.
+            logger.warning("anthropic passthrough stream aborted: %r", exc)
+            content_type = upstream_response.headers.get("content-type", "")
+            if content_type.lower().startswith("text/event-stream"):
+                # The abort may have cut the stream mid-line, so force an event
+                # boundary first to keep the injected event parseable.
+                yield b"\n\n" + _format_sse(
+                    "error",
+                    _claude_error_body("api_error", f"anthropic stream aborted: {exc!r}"),
+                ).encode()
         finally:
             await upstream_response.aclose()
 
