@@ -2838,6 +2838,393 @@ class TestAdminLogLevel:
             assert client.put("/admin/log-level", json={}).status_code == 400
 
 
+class TestAdminCompactionApi:
+    """GET/PUT /admin/compaction — compaction reroute target, mirroring /admin/mapping."""
+
+    @staticmethod
+    def _admin_client(
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        **config_kwargs: Any,
+    ) -> TestClient:
+        monkeypatch.delenv("CLAUDEX_COMPACTION_MODEL", raising=False)
+        config = GatewayConfig(settings_file=tmp_path / "settings.json", **config_kwargs)
+        return _create_test_client(
+            monkeypatch, config=config, base_url="http://127.0.0.1:8787"
+        )
+
+    # --- GET: fresh/configured state, diagnostics schema -------------------
+
+    def test_get_returns_fresh_state_when_unconfigured(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        with self._admin_client(monkeypatch, tmp_path) as client:
+            payload = client.get("/admin/compaction").json()
+
+        assert payload == {"model": None, "env_locked": False, "last_reroute": None}
+
+    def test_get_returns_configured_model(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        with self._admin_client(
+            monkeypatch, tmp_path, compaction_model="claude:claude-opus-5"
+        ) as client:
+            payload = client.get("/admin/compaction").json()
+
+        assert payload == {
+            "model": "claude:claude-opus-5",
+            "env_locked": False,
+            "last_reroute": None,
+        }
+
+    def test_get_reports_last_reroute_with_exact_pinned_schema(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        with self._admin_client(monkeypatch, tmp_path) as client:
+            server._assign_compaction_reroute(
+                client.app.state,
+                outcome="rerouted",
+                target_model="claude-opus-5",
+                mapped_model="codex:gpt-5.1-codex-max",
+                estimated_prompt_tokens=4096,
+                context_window=4000,
+                detail=None,
+            )
+            payload = client.get("/admin/compaction").json()
+
+        last_reroute = payload["last_reroute"]
+        assert set(last_reroute) == _pinned_reroute_record_keys()
+        assert "sequence" not in last_reroute
+        assert last_reroute["outcome"] == "rerouted"
+        assert last_reroute["target_model"] == "claude-opus-5"
+        assert last_reroute["mapped_model"] == "codex:gpt-5.1-codex-max"
+        assert last_reroute["estimated_prompt_tokens"] == 4096
+        assert last_reroute["context_window"] == 4000
+        assert last_reroute["detail"] is None
+        assert isinstance(last_reroute["timestamp"], str) and last_reroute["timestamp"]
+
+    def test_get_reports_env_locked_true_for_nonempty_override(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setenv("CLAUDEX_COMPACTION_MODEL", "claude:claude-env-5")
+        config = GatewayConfig(settings_file=tmp_path / "settings.json")
+        with _create_test_client(
+            monkeypatch, config=config, base_url="http://127.0.0.1:8787"
+        ) as client:
+            payload = client.get("/admin/compaction").json()
+
+        assert payload["env_locked"] is True
+
+    def test_get_reports_env_locked_true_for_empty_override(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setenv("CLAUDEX_COMPACTION_MODEL", "")
+        config = GatewayConfig(settings_file=tmp_path / "settings.json")
+        with _create_test_client(
+            monkeypatch, config=config, base_url="http://127.0.0.1:8787"
+        ) as client:
+            payload = client.get("/admin/compaction").json()
+
+        assert payload["env_locked"] is True
+
+    # --- PUT: persistence, hot-swap, disable, enable/disable trigger -------
+
+    def test_put_persists_without_clobbering_unrelated_keys(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        settings_file = tmp_path / "settings.json"
+        settings_file.write_text('{"port": 9317}', encoding="utf-8")
+        with self._admin_client(monkeypatch, tmp_path) as client:
+            response = client.put(
+                "/admin/compaction", json={"model": "claude:claude-opus-5"}
+            )
+            reread = client.get("/admin/compaction")
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "model": "claude:claude-opus-5",
+            "env_locked": False,
+            "last_reroute": None,
+        }
+        assert reread.json()["model"] == "claude:claude-opus-5"
+        saved = json.loads(settings_file.read_text(encoding="utf-8"))
+        assert saved == {"port": 9317, "compaction.model": "claude:claude-opus-5"}
+
+    def test_put_hot_swaps_live_config_for_subsequent_requests(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        with self._admin_client(monkeypatch, tmp_path) as client:
+            client.put("/admin/compaction", json={"model": "claude:claude-opus-5"})
+            assert client.app.state.config.compaction_model == "claude:claude-opus-5"
+            reread = client.get("/admin/compaction")
+
+        assert reread.json()["model"] == "claude:claude-opus-5"
+
+    def test_put_disables_and_removes_the_settings_key(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        settings_file = tmp_path / "settings.json"
+        settings_file.write_text(
+            json.dumps({"compaction.model": "claude:claude-old-5", "port": 1234}),
+            encoding="utf-8",
+        )
+        with self._admin_client(
+            monkeypatch, tmp_path, compaction_model="claude:claude-old-5"
+        ) as client:
+            response = client.put("/admin/compaction", json={"model": None})
+            reread = client.get("/admin/compaction")
+
+        assert response.status_code == 200
+        assert response.json() == {"model": None, "env_locked": False, "last_reroute": None}
+        assert reread.json()["model"] is None
+        saved = json.loads(settings_file.read_text(encoding="utf-8"))
+        assert saved == {"port": 1234}
+        assert "compaction.model" not in saved
+
+    def test_put_enable_then_disable_changes_the_live_reroute_trigger(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        body = _compaction_body("claude-opus-4-6")
+        window = estimate_overflow_prompt_tokens(body) - 1
+        captured: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured.append(request)
+            return httpx.Response(
+                200,
+                json={"id": "msg_1", "type": "message", "model": "claude-opus-5"},
+            )
+
+        config = GatewayConfig(
+            settings_file=tmp_path / "settings.json",
+            model_map={"opus": "codex:gpt-5.1-codex-max"},
+        )
+        client, stub = _gateway(config, handler, codex_context_window=window)
+        client.app.state.admin_lock = asyncio.Lock()
+        client.base_url = "http://127.0.0.1:8787"
+
+        enable = client.put("/admin/compaction", json={"model": "claude:claude-opus-5"})
+        assert enable.status_code == 200
+
+        rerouted = client.post(
+            "/v1/messages", json=body, headers=_ANTHROPIC_CREDENTIAL_HEADERS
+        )
+        assert rerouted.status_code == 200
+        assert len(captured) == 1
+        assert stub.payloads == []
+
+        disable = client.put("/admin/compaction", json={"model": None})
+        assert disable.status_code == 200
+
+        not_rerouted = client.post(
+            "/v1/messages", json=body, headers=_ANTHROPIC_CREDENTIAL_HEADERS
+        )
+        # Reroute is now off: falls through to the mapped Codex backend
+        # (the stub, which always fails), never a second Anthropic attempt.
+        assert not_rerouted.status_code == 503
+        assert len(captured) == 1
+        assert len(stub.payloads) == 1
+
+    # --- PUT: request-shape validation --------------------------------------
+
+    def test_put_requires_json_content_type(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        with self._admin_client(monkeypatch, tmp_path) as client:
+            response = client.put(
+                "/admin/compaction",
+                content='{"model": null}',
+                headers={"content-type": "text/plain"},
+            )
+        assert response.status_code == 415
+
+    def test_put_rejects_missing_key(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        with self._admin_client(monkeypatch, tmp_path) as client:
+            response = client.put("/admin/compaction", json={})
+        assert response.status_code == 400
+
+    def test_put_rejects_unknown_key(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        with self._admin_client(monkeypatch, tmp_path) as client:
+            response = client.put(
+                "/admin/compaction",
+                json={"model": "claude:claude-opus-5", "bogus": True},
+            )
+        assert response.status_code == 400
+        assert "bogus" in response.json()["error"]["message"]
+
+    def test_put_rejects_invalid_string(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        settings_file = tmp_path / "settings.json"
+        with self._admin_client(monkeypatch, tmp_path) as client:
+            response = client.put("/admin/compaction", json={"model": "gpt-5"})
+            config_after = client.app.state.config
+
+        assert response.status_code == 400
+        assert "claude:" in response.json()["error"]["message"]
+        assert not settings_file.exists()
+        assert config_after.compaction_model is None
+
+    @pytest.mark.parametrize(
+        "value", [True, False, 5, 1.5, ["claude:claude-opus-5"], {"model": "claude:x"}]
+    )
+    def test_put_rejects_every_non_string_non_null_type(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, value: Any
+    ) -> None:
+        with self._admin_client(monkeypatch, tmp_path) as client:
+            response = client.put("/admin/compaction", json={"model": value})
+        assert response.status_code == 400
+
+    # --- Security/lock: bearer + Host, for both GET and PUT ----------------
+
+    def test_get_requires_local_token_when_configured(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        with self._admin_client(monkeypatch, tmp_path, local_token="secret") as client:
+            assert client.get("/admin/compaction").status_code == 401
+
+    def test_get_rejects_wrong_bearer_token(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        with self._admin_client(monkeypatch, tmp_path, local_token="secret") as client:
+            response = client.get(
+                "/admin/compaction", headers={"Authorization": "Bearer wrong"}
+            )
+        assert response.status_code == 401
+
+    def test_get_succeeds_with_correct_bearer_on_allowed_host(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        with self._admin_client(monkeypatch, tmp_path, local_token="secret") as client:
+            response = client.get(
+                "/admin/compaction", headers={"Authorization": "Bearer secret"}
+            )
+        assert response.status_code == 200
+
+    def test_get_refuses_foreign_host_even_with_correct_bearer(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        config = GatewayConfig(settings_file=tmp_path / "settings.json", local_token="secret")
+        # Default base_url keeps the Host header at "testserver".
+        with _create_test_client(monkeypatch, config=config) as client:
+            response = client.get(
+                "/admin/compaction", headers={"Authorization": "Bearer secret"}
+            )
+        assert response.status_code == 403
+
+    def test_put_requires_local_token_when_configured(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        with self._admin_client(monkeypatch, tmp_path, local_token="secret") as client:
+            response = client.put("/admin/compaction", json={"model": None})
+            config_after = client.app.state.config
+        assert response.status_code == 401
+        assert not (tmp_path / "settings.json").exists()
+        assert config_after.compaction_model is None
+
+    def test_put_rejects_wrong_bearer_token(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        with self._admin_client(monkeypatch, tmp_path, local_token="secret") as client:
+            response = client.put(
+                "/admin/compaction",
+                json={"model": "claude:claude-opus-5"},
+                headers={"Authorization": "Bearer wrong"},
+            )
+            config_after = client.app.state.config
+        assert response.status_code == 401
+        assert not (tmp_path / "settings.json").exists()
+        assert config_after.compaction_model is None
+
+    def test_put_succeeds_with_correct_bearer_on_allowed_host(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        with self._admin_client(monkeypatch, tmp_path, local_token="secret") as client:
+            response = client.put(
+                "/admin/compaction",
+                json={"model": "claude:claude-opus-5"},
+                headers={"Authorization": "Bearer secret"},
+            )
+        assert response.status_code == 200
+
+    def test_put_refuses_foreign_host_even_with_correct_bearer(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        config = GatewayConfig(settings_file=tmp_path / "settings.json", local_token="secret")
+        with _create_test_client(monkeypatch, config=config) as client:
+            response = client.put(
+                "/admin/compaction",
+                json={"model": "claude:claude-opus-5"},
+                headers={"Authorization": "Bearer secret"},
+            )
+            config_after = client.app.state.config
+        assert response.status_code == 403
+        assert not (tmp_path / "settings.json").exists()
+        assert config_after.compaction_model is None
+
+    # --- Environment lock: 409 before the lock, empty value still locks ----
+
+    def test_put_rejected_when_env_locked_with_nonempty_value(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setenv("CLAUDEX_COMPACTION_MODEL", "claude:claude-env-5")
+        config = GatewayConfig(settings_file=tmp_path / "settings.json")
+        with _create_test_client(
+            monkeypatch, config=config, base_url="http://127.0.0.1:8787"
+        ) as client:
+            response = client.put(
+                "/admin/compaction", json={"model": "claude:claude-opus-5"}
+            )
+            config_after = client.app.state.config
+
+        assert response.status_code == 409
+        assert "CLAUDEX_COMPACTION_MODEL" in response.json()["error"]["message"]
+        assert not (tmp_path / "settings.json").exists()
+        assert config_after.compaction_model is None
+
+    def test_put_rejected_when_env_locked_with_empty_value(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setenv("CLAUDEX_COMPACTION_MODEL", "")
+        config = GatewayConfig(settings_file=tmp_path / "settings.json")
+        with _create_test_client(
+            monkeypatch, config=config, base_url="http://127.0.0.1:8787"
+        ) as client:
+            response = client.put("/admin/compaction", json={"model": None})
+            config_after = client.app.state.config
+
+        assert response.status_code == 409
+        assert "CLAUDEX_COMPACTION_MODEL" in response.json()["error"]["message"]
+        assert not (tmp_path / "settings.json").exists()
+        assert config_after.compaction_model is None
+
+    # --- Persistence failure: 500, no hot-swap, no false success envelope --
+
+    def test_put_persistence_failure_returns_500_without_mutating_runtime(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        def boom(*_args: Any, **_kwargs: Any) -> None:
+            raise server.ConfigError("disk full")
+
+        with self._admin_client(monkeypatch, tmp_path) as client:
+            monkeypatch.setattr(server, "update_settings_file", boom)
+            response = client.put(
+                "/admin/compaction", json={"model": "claude:claude-opus-5"}
+            )
+            config_after = client.app.state.config
+
+        assert response.status_code == 500
+        body = response.json()
+        assert "error" in body
+        assert "last_reroute" not in body
+        assert config_after.compaction_model is None
+        assert not (tmp_path / "settings.json").exists()
+
+
 def test_admin_logs_returns_recent_records(monkeypatch: pytest.MonkeyPatch) -> None:
     with _create_test_client(monkeypatch, base_url="http://127.0.0.1:8787") as client:
         logging.getLogger("claudex_gateway.test").warning("hello %s", "world")

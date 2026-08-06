@@ -1441,6 +1441,125 @@ async def _handle_admin_log_level_put(request: Request) -> JSONResponse:
     return JSONResponse(_log_level_payload(new_config))
 
 
+# The single runtime-editable field on the compaction admin surface.
+_COMPACTION_KEYS = ("model",)
+
+
+def _compaction_payload(config: GatewayConfig, app_state: Any) -> dict[str, Any]:
+    """Pinned {model, env_locked, last_reroute} envelope for /admin/compaction.
+
+    `model` is the raw "claude:<id>" value (or None), so a GET/PUT round-trip
+    is loss-free. `env_locked` is a plain boolean — true whenever
+    CLAUDEX_COMPACTION_MODEL is present in the environment, including an
+    empty value, mirroring _resolve's own "present even if empty" env
+    precedence. `last_reroute` is exactly the pinned seven-key diagnostics
+    record from _assign_compaction_reroute (or None before any reroute has
+    been attempted); its internal sequence counter is never part of the
+    record and so never serialized here.
+    """
+    env_name = SETTINGS_KEYS["compaction.model"]
+    return {
+        "model": config.compaction_model,
+        "env_locked": os.environ.get(env_name) is not None,
+        "last_reroute": app_state.compaction_last_reroute,
+    }
+
+
+async def _handle_admin_compaction_get(request: Request) -> JSONResponse:
+    denied = _admin_guard(request)
+    if denied is not None:
+        return denied
+    return JSONResponse(_compaction_payload(request.app.state.config, request.app.state))
+
+
+async def _handle_admin_compaction_put(request: Request) -> JSONResponse:
+    """Set or clear the compaction reroute target.
+
+    Only a successful PUT returns the state envelope; the 409 (env-locked)
+    path uses the existing admin error envelope, so a caller needing current
+    state issues a GET afterward.
+    """
+    denied = _admin_guard(request) or _require_json_content_type(request)
+    if denied is not None:
+        return denied
+
+    body, error = await _read_json_object(request, _openai_error_body)
+    if error is not None or body is None:
+        return error
+    unknown = sorted(set(body) - set(_COMPACTION_KEYS))
+    if unknown:
+        return JSONResponse(
+            _openai_error_body(
+                "invalid_request_error",
+                f"unknown keys: {', '.join(unknown)}; "
+                f"supported: {', '.join(_COMPACTION_KEYS)}",
+            ),
+            status_code=400,
+        )
+    if "model" not in body:
+        return JSONResponse(
+            _openai_error_body(
+                "invalid_request_error", "provide 'model' (a string or null)"
+            ),
+            status_code=400,
+        )
+
+    value = body["model"]
+    if value is not None:
+        if not isinstance(value, str):
+            return JSONResponse(
+                _openai_error_body(
+                    "invalid_request_error", "model must be a string or null"
+                ),
+                status_code=400,
+            )
+        try:
+            parse_compaction_model(value)
+        except ConfigError as exc:
+            return JSONResponse(
+                _openai_error_body("invalid_request_error", str(exc)),
+                status_code=400,
+            )
+
+    # An environment variable outranks settings.json at every boot (even set
+    # to an empty string), so a persisted change would silently vanish on
+    # restart — refuse before the lock or any file/config read.
+    env_name = SETTINGS_KEYS["compaction.model"]
+    if os.environ.get(env_name) is not None:
+        return JSONResponse(
+            _openai_error_body(
+                "invalid_request_error",
+                f"{env_name} is set in the gateway's environment and overrides "
+                f"compaction.model; unset it to manage the setting at runtime",
+            ),
+            status_code=409,
+        )
+
+    async with request.app.state.admin_lock:
+        config: GatewayConfig = request.app.state.config
+        try:
+            if value is None:
+                # A disabled setting is represented by the key's absence, so
+                # a JSON null is never persisted.
+                update_settings_file(
+                    config.settings_file, {}, deletions=("compaction.model",)
+                )
+            else:
+                update_settings_file(config.settings_file, {"compaction.model": value})
+        except (ConfigError, OSError) as exc:
+            return JSONResponse(
+                _openai_error_body(
+                    "server_error", f"could not persist settings: {exc}"
+                ),
+                status_code=500,
+            )
+        # Swap only after the file write succeeded, atomically; in-flight
+        # requests keep their config snapshot.
+        new_config = replace(config, compaction_model=value)
+        request.app.state.config = new_config
+    return JSONResponse(_compaction_payload(new_config, request.app.state))
+
+
 async def _handle_dashboard(request: Request) -> Response:
     """Serve the runtime dashboard, embedded in the package as dashboard.html."""
     try:
@@ -1770,6 +1889,8 @@ def create_app(config: GatewayConfig, daemon_nonce: str | None = None) -> Starle
             Route("/admin/mapping", _handle_admin_mapping_put, methods=["PUT"]),
             Route("/admin/log-level", _handle_admin_log_level_get, methods=["GET"]),
             Route("/admin/log-level", _handle_admin_log_level_put, methods=["PUT"]),
+            Route("/admin/compaction", _handle_admin_compaction_get, methods=["GET"]),
+            Route("/admin/compaction", _handle_admin_compaction_put, methods=["PUT"]),
             Route("/admin/logs", _handle_admin_logs, methods=["GET"]),
             Route("/admin/usage", _handle_admin_usage, methods=["GET"]),
             Route(
