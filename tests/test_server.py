@@ -3030,31 +3030,55 @@ class TestAdminCompactionApi:
     def test_put_requires_json_content_type(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        with self._admin_client(monkeypatch, tmp_path) as client:
+        settings_file = tmp_path / "settings.json"
+        configured = {"compaction.model": "claude:claude-opus-5", "port": 9317}
+        settings_file.write_text(json.dumps(configured), encoding="utf-8")
+        with self._admin_client(
+            monkeypatch, tmp_path, compaction_model="claude:claude-opus-5"
+        ) as client:
             response = client.put(
                 "/admin/compaction",
                 content='{"model": null}',
                 headers={"content-type": "text/plain"},
             )
+            config_after = client.app.state.config
         assert response.status_code == 415
+        assert json.loads(settings_file.read_text(encoding="utf-8")) == configured
+        assert config_after.compaction_model == "claude:claude-opus-5"
 
     def test_put_rejects_missing_key(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        with self._admin_client(monkeypatch, tmp_path) as client:
+        settings_file = tmp_path / "settings.json"
+        configured = {"compaction.model": "claude:claude-opus-5", "port": 9317}
+        settings_file.write_text(json.dumps(configured), encoding="utf-8")
+        with self._admin_client(
+            monkeypatch, tmp_path, compaction_model="claude:claude-opus-5"
+        ) as client:
             response = client.put("/admin/compaction", json={})
+            config_after = client.app.state.config
         assert response.status_code == 400
+        assert json.loads(settings_file.read_text(encoding="utf-8")) == configured
+        assert config_after.compaction_model == "claude:claude-opus-5"
 
     def test_put_rejects_unknown_key(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        with self._admin_client(monkeypatch, tmp_path) as client:
+        settings_file = tmp_path / "settings.json"
+        configured = {"compaction.model": "claude:claude-opus-5", "port": 9317}
+        settings_file.write_text(json.dumps(configured), encoding="utf-8")
+        with self._admin_client(
+            monkeypatch, tmp_path, compaction_model="claude:claude-opus-5"
+        ) as client:
             response = client.put(
                 "/admin/compaction",
                 json={"model": "claude:claude-opus-5", "bogus": True},
             )
+            config_after = client.app.state.config
         assert response.status_code == 400
         assert "bogus" in response.json()["error"]["message"]
+        assert json.loads(settings_file.read_text(encoding="utf-8")) == configured
+        assert config_after.compaction_model == "claude:claude-opus-5"
 
     def test_put_rejects_invalid_string(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -3075,9 +3099,17 @@ class TestAdminCompactionApi:
     def test_put_rejects_every_non_string_non_null_type(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, value: Any
     ) -> None:
-        with self._admin_client(monkeypatch, tmp_path) as client:
+        settings_file = tmp_path / "settings.json"
+        configured = {"compaction.model": "claude:claude-opus-5", "port": 9317}
+        settings_file.write_text(json.dumps(configured), encoding="utf-8")
+        with self._admin_client(
+            monkeypatch, tmp_path, compaction_model="claude:claude-opus-5"
+        ) as client:
             response = client.put("/admin/compaction", json={"model": value})
+            config_after = client.app.state.config
         assert response.status_code == 400
+        assert json.loads(settings_file.read_text(encoding="utf-8")) == configured
+        assert config_after.compaction_model == "claude:claude-opus-5"
 
     # --- Security/lock: bearer + Host, for both GET and PUT ----------------
 
