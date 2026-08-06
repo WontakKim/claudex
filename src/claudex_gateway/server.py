@@ -1097,6 +1097,30 @@ async def _handle_dashboard(request: Request) -> Response:
     return Response(page, media_type="text/html; charset=utf-8")
 
 
+# Inline SVG so the package ships no binary asset; the glyph is a two-way
+# relay in the dashboard's accent color.
+_FAVICON_SVG = (
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16">'
+    '<rect width="16" height="16" rx="3" fill="#1d5fbf"/>'
+    '<path d="M10.2 3.6 12.6 6l-2.4 2.4M12.2 6H3.4M5.8 12.4 3.4 10l2.4-2.4M3.8 10h8.8"'
+    ' fill="none" stroke="#fff" stroke-width="1.5" stroke-linecap="round"'
+    ' stroke-linejoin="round"/>'
+    "</svg>"
+)
+
+
+async def _handle_favicon(request: Request) -> Response:
+    """Answer the browser's automatic /favicon.ico probe for the dashboard.
+
+    Without this route every dashboard visit logs a 404 in the access log.
+    """
+    return Response(
+        _FAVICON_SVG,
+        media_type="image/svg+xml",
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
+
+
 async def _handle_admin_codex_models(request: Request) -> JSONResponse:
     """Proxy the live Codex model catalog for the dashboard's model columns."""
     denied = _admin_guard(request)
@@ -1370,6 +1394,7 @@ def create_app(config: GatewayConfig, daemon_nonce: str | None = None) -> Starle
     app = Starlette(
         routes=[
             Route("/", _handle_dashboard, methods=["GET"]),
+            Route("/favicon.ico", _handle_favicon, methods=["GET"]),
             Route("/v1/messages", _handle_messages, methods=["POST"]),
             Route("/v1/messages/count_tokens", _handle_count_tokens, methods=["POST"]),
             Route("/api/hello", _handle_hello, methods=["GET"]),

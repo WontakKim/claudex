@@ -1647,6 +1647,16 @@ def test_dashboard_served_at_root(monkeypatch: pytest.MonkeyPatch) -> None:
     assert "/admin/mapping" in response.text
 
 
+def test_favicon_served_for_browser_probe(monkeypatch: pytest.MonkeyPatch) -> None:
+    with _create_test_client(monkeypatch) as client:
+        response = client.get("/favicon.ico")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("image/svg+xml")
+    assert "max-age" in response.headers["cache-control"]
+    assert response.text.startswith("<svg")
+
+
 def test_dashboard_port_has_an_enlarged_invisible_hit_zone(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
