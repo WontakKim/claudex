@@ -98,6 +98,21 @@ def estimate_overflow_prompt_tokens(claude_request: dict[str, Any]) -> int:
     return (chars * 5 + 15) // 16
 
 
+def _neutralize_client_pairs(text: str) -> str:
+    """Break every client-regex match by replacing its `>` separator with `/`.
+
+    Claude Code parses the first matching pair, so any pair the gateway did
+    not vouch for must be made unparseable rather than left in place.
+    """
+    neutralized = text
+    while True:
+        match = _PROMPT_TOO_LONG_NUMBERS_RE.search(neutralized)
+        if match is None:
+            return neutralized
+        start, end = match.span()
+        neutralized = neutralized[:start] + neutralized[start:end].replace(">", "/", 1) + neutralized[end:]
+
+
 def rewrite_context_overflow_message(
     code: Any,
     message: Any,
@@ -118,7 +133,10 @@ def rewrite_context_overflow_message(
         floor = (context_window * 110 + 99) // 100
         reported = max(estimated_tokens, floor)
         rewritten = f"{_CLAUDE_PROMPT_TOO_LONG}: {reported} tokens > {context_window}"
-        return f"{rewritten} ({text})" if text else rewritten
+        # Neutralize any pair inside the appended original text so the
+        # synthesized message carries exactly one parseable pair — the one
+        # the gateway vouches for.
+        return f"{rewritten} ({_neutralize_client_pairs(text)})" if text else rewritten
 
     if _CLAUDE_PROMPT_TOO_LONG in text.lower():
         candidate = text
@@ -131,16 +149,9 @@ def rewrite_context_overflow_message(
 
     # The legacy prefix minted an unverified/invalid numeric pair (e.g. the
     # original message already had one, or contained a phrase-less "X tokens
-    # > Y" sequence). Neutralize every such pair by breaking its `>`
-    # separator so Claude Code's client regex can't misparse it and instead
-    # falls back to its conservative 20%-per-retry trimming.
-    neutralized = candidate
-    while True:
-        poison_match = _PROMPT_TOO_LONG_NUMBERS_RE.search(neutralized)
-        if poison_match is None:
-            break
-        start, end = poison_match.span()
-        neutralized = neutralized[:start] + neutralized[start:end].replace(">", "/", 1) + neutralized[end:]
+    # > Y" sequence). Neutralize so Claude Code's client regex can't misparse
+    # it and instead falls back to its conservative 20%-per-retry trimming.
+    neutralized = _neutralize_client_pairs(candidate)
     logger.warning("Neutralized invalid overflow token pair in message: %s", text[:200])
     return neutralized
 

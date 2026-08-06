@@ -540,6 +540,23 @@ def test_invalid_numeric_pair_with_enrichment_synthesizes_valid_pair() -> None:
     assert int(match.group(1)) > int(match.group(2))
 
 
+def test_enriched_message_contains_exactly_one_parseable_pair() -> None:
+    # The appended original text is neutralized, so the synthesized pair is
+    # the only one any regex-match strategy (first, last, all) can extract.
+    claude_request = {"model": "m"}
+    message = rewrite_context_overflow_message(
+        "context_length_exceeded",
+        "prompt is too long: 100 tokens > 200",
+        estimated_tokens=estimate_overflow_prompt_tokens(claude_request),
+        context_window=272000,
+    )
+    matches = list(_CLIENT_OVERFLOW_RE.finditer(message))
+    assert len(matches) == 1
+    assert int(matches[0].group(1)) > int(matches[0].group(2)) == 272000
+    # The original numbers stay visible for observability, just unparseable.
+    assert "100 tokens / 200" in message
+
+
 def test_invalid_numeric_pair_without_enrichment_is_neutralized() -> None:
     message = rewrite_context_overflow_message(
         "context_length_exceeded", "prompt is too long: 100 tokens > 200"
