@@ -3579,6 +3579,186 @@ def test_dashboard_board_shows_only_referenced_targets(
     assert '"/admin/grok/models"' in page
 
 
+def _compaction_section(page: str) -> str:
+    """Slice out only the Compaction card's own markup, by its own markers.
+
+    `claude-haiku` must never appear as a curated compaction option, but the
+    Router tab's `CLAUDE_KEYS` array legitimately mentions bare "haiku"
+    elsewhere in the same document — so absence has to be asserted against
+    this scoped slice, never the whole page.
+    """
+    start = page.index("<!-- compaction-section:start -->")
+    end = page.index("<!-- compaction-section:end -->")
+    return page[start:end]
+
+
+def _compaction_apply_fn(page: str) -> str:
+    start = page.index("function applyCompaction(){")
+    end = page.index(
+        'document.getElementById("comp-select").addEventListener("change"', start
+    )
+    return page[start:end]
+
+
+def test_dashboard_compaction_section_marker_and_endpoint_present(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with _create_test_client(monkeypatch) as client:
+        page = client.get("/").text
+
+    assert "<!-- compaction-section:start -->" in page
+    assert "<!-- compaction-section:end -->" in page
+    section = _compaction_section(page)
+    assert 'id="compaction-card"' in section
+    assert "/admin/compaction" in page
+
+
+def test_dashboard_compaction_options_in_pinned_order_without_haiku(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with _create_test_client(monkeypatch) as client:
+        page = client.get("/").text
+
+    section = _compaction_section(page)
+    assert (
+        section.index(">Disabled<")
+        < section.index("claude-sonnet-5 (recommended)")
+        < section.index(">claude-opus-5<")
+        < section.index(">claude-fable-5<")
+        < section.index(">Custom<")
+    )
+    assert "claude-haiku" not in section
+    # The literal string still exists elsewhere in the document (see
+    # compactionDraftFromModel's own comment), proving this is a scoped
+    # assertion and not a whole-page absence check.
+    assert "claude-haiku" in page
+
+
+def test_dashboard_compaction_custom_input_labeled_unverified(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with _create_test_client(monkeypatch) as client:
+        page = client.get("/").text
+
+    section = _compaction_section(page)
+    assert "unverified until first use" in section
+    assert 'id="comp-custom-input"' in section
+
+
+def test_dashboard_compaction_billing_disclosure_present(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with _create_test_client(monkeypatch) as client:
+        page = client.get("/").text
+
+    section = _compaction_section(page)
+    assert "Anthropic" in section
+    assert "billed" in section.lower()
+    assert "credentials" in section.lower()
+
+
+def test_dashboard_compaction_fetched_in_parallel_boot_sequence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with _create_test_client(monkeypatch) as client:
+        page = client.get("/").text
+
+    boot_start = page.index("function boot(){")
+    promise_all = page.index("Promise.all([", boot_start)
+    promise_all_end = page.index("]);", promise_all)
+    parallel_calls = page[promise_all:promise_all_end]
+    assert 'jfetch("/admin/compaction")' in parallel_calls
+
+
+def test_dashboard_compaction_keeps_configured_custom_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with _create_test_client(monkeypatch) as client:
+        page = client.get("/").text
+
+    # A configured model that is not one of the three curated ids renders as
+    # Custom with its raw id filled in, instead of being dropped.
+    assert "COMPACTION_CURATED_MODELS.indexOf(id)>=0" in page
+    assert '{kind:"custom",custom:id}' in page
+
+
+def test_dashboard_compaction_diagnostics_render_pinned_schema_with_escaping(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with _create_test_client(monkeypatch) as client:
+        page = client.get("/").text
+
+    diag_start = page.index("function renderCompactionDiagnostics(rec){")
+    diag_end = page.index("function renderCompaction(){", diag_start)
+    diag_fn = page[diag_start:diag_end]
+
+    for field in (
+        "outcome",
+        "timestamp",
+        "target_model",
+        "mapped_model",
+        "estimated_prompt_tokens",
+        "context_window",
+    ):
+        assert f">{field}<" in diag_fn
+        assert f"esc(rec.{field})" in diag_fn
+
+    # `detail` only renders when non-null, and a null last_reroute gets a
+    # clear placeholder instead of any of the fields above.
+    assert "rec.detail!=null" in diag_fn
+    assert "esc(rec.detail)" in diag_fn
+    assert "if(!rec){" in diag_fn
+
+
+def test_dashboard_compaction_apply_body_matches_pinned_shape(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with _create_test_client(monkeypatch) as client:
+        page = client.get("/").text
+
+    assert "JSON.stringify({model:model})" in page
+    apply_fn = _compaction_apply_fn(page)
+    # Disabled sends exactly {"model": null}; curated/custom selections carry
+    # the "claude:" prefix parse_compaction_model expects.
+    assert "model=null" in apply_fn
+    assert '"claude:"+raw' in apply_fn
+    assert '"claude:"+COMP.draftKind' in apply_fn
+
+
+def test_dashboard_compaction_custom_submission_is_trimmed_and_guarded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with _create_test_client(monkeypatch) as client:
+        page = client.get("/").text
+
+    apply_fn = _compaction_apply_fn(page)
+    assert "input.value.trim()" in apply_fn
+    assert "if(!raw)return;" in apply_fn
+
+
+def test_dashboard_compaction_409_branch_refreshes_via_get_not_error_body(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with _create_test_client(monkeypatch) as client:
+        page = client.get("/").text
+
+    apply_fn = _compaction_apply_fn(page)
+    branch_start = apply_fn.index("r.status===409")
+    branch_end = apply_fn.index("if(!r.ok){", branch_start)
+    locked_branch = apply_fn[branch_start:branch_end]
+
+    # Controls lock and the admin error renders before any GET is issued.
+    assert "COMP.locked=true" in locked_branch
+    assert "errDetail(r.body)" in locked_branch
+    # Current state is only ever adopted from a fresh, authenticated GET —
+    # never from the 409 response body itself.
+    assert 'jfetch("/admin/compaction")' in locked_branch
+    assert "renderCompactionState(g.body)" in locked_branch
+    assert "r.body.model" not in locked_branch
+    assert "r.body.env_locked" not in locked_branch
+    assert "r.body.last_reroute" not in locked_branch
+
+
 class CatalogCodexClient(FakeCodexClient):
     async def list_models(self) -> list[str]:
         return ["gpt-5.6-sol", "gpt-5.5"]

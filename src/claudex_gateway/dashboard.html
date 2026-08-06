@@ -252,6 +252,15 @@ body[data-tab="map"] .applybar.dirty{display:block}
 body.env-locked .lockband{display:block}
 body.env-locked .board{pointer-events:none;opacity:.75}
 body.env-locked .applybar{display:none!important}
+/* The compaction card locks independently of the Claude → Codex map above,
+   so it carries its own lock indicator rather than reusing .lockband, which
+   is wired to body.env-locked (the map's own env-lock flag). */
+.complock{display:none;margin-bottom:14px;border:1px solid var(--err);border-radius:8px;color:var(--err);padding:10px 14px;font-size:14px}
+#compaction-card.locked .complock{display:block}
+#comp-select{font:600 14px var(--sans);background:var(--inset);border:1.5px solid transparent;border-radius:6px;padding:9px 10px;color:var(--text)}
+#comp-select:disabled{opacity:.55;cursor:default}
+.comp-custom{display:none;margin-top:10px}
+.comp-custom.show{display:block}
 </style>
 </head>
 <body data-tab="general">
@@ -362,6 +371,29 @@ body.env-locked .applybar{display:none!important}
         </div>
         <div class="ubody" id="usage-body-grok"></div>
       </div>
+      <!-- compaction-section:start -->
+      <div class="card" id="compaction-card">
+        <h2>Compaction Reroute</h2>
+        <div class="sub">Claude Code가 보내는 컴팩션(긴 컨텍스트 정리) 요청을 지정한 Claude 모델로 재라우팅합니다.</div>
+        <div class="cthint">Rerouted compaction requests are sent to Anthropic using your own Claude credentials and are billed separately by Anthropic — never through this gateway.</div>
+        <div class="complock" id="comp-lockband"><b>LOCKED</b> — <code id="comp-lock-env"></code> 환경변수가 우선합니다. 재라우팅 대상은 열람 전용입니다.</div>
+        <div class="ctrow">
+          <select id="comp-select">
+            <option value="disabled">Disabled</option>
+            <option value="claude-sonnet-5">claude-sonnet-5 (recommended)</option>
+            <option value="claude-opus-5">claude-opus-5</option>
+            <option value="claude-fable-5">claude-fable-5</option>
+            <option value="custom">Custom</option>
+          </select>
+          <button id="comp-apply">Apply</button>
+        </div>
+        <div class="comp-custom" id="comp-custom-wrap">
+          <div class="ctnode grow"><input id="comp-custom-input" spellcheck="false" placeholder="claude-…"></div>
+          <div class="cthint">unverified until first use</div>
+        </div>
+        <div class="kv" id="comp-diagnostics"></div>
+      </div>
+      <!-- compaction-section:end -->
     </section>
 
     <section id="tab-log">
@@ -411,6 +443,9 @@ var ROUTE_PROVIDERS=["codex","kimi","grok"];
    the gateway never validates map values against a catalog, so an
    unreachable one only costs suggestions. */
 var CATALOG={codex:[],kimi:[],grok:[]};
+/* Curated compaction reroute targets, in the dashboard's <select> order.
+   "claude-haiku" is deliberately never a curated choice here. */
+var COMPACTION_CURATED_MODELS=["claude-sonnet-5","claude-opus-5","claude-fable-5"];
 /* Reads config.parse_route_target's shape: only the first colon splits the
    prefix, so upstream names containing colons survive. A bare or unknown-
    prefixed value (e.g. a pre-prefix settings file) still renders as Codex so
@@ -1014,6 +1049,128 @@ function setLogLevel(level){
     showToast('<span class="chip chip-err">ERROR</span><br>log level<br><span class="dim">gateway unreachable</span>',true);
   });
 }
+/* --- compaction reroute (Claude Code's own compaction requests, sent
+   directly to Anthropic instead of the mapped provider) ------------------ */
+var COMP={
+  envName:"CLAUDEX_COMPACTION_MODEL",
+  locked:false,
+  LIVE:{model:null,lastReroute:null},
+  // draftKind: "disabled" | one of COMPACTION_CURATED_MODELS | "custom"
+  draftKind:"disabled",
+  draftCustom:""   // raw id typed into the custom input, untrimmed
+};
+/* Strips the pinned "claude:" prefix parse_compaction_model expects; a bare
+   or unprefixed value (should never reach here from the server) still
+   renders as its own id rather than throwing. */
+function compactionModelId(model){
+  var at=String(model).indexOf(":");
+  return at<0?model:model.slice(at+1);
+}
+function compactionDraftFromModel(model){
+  if(model==null)return{kind:"disabled",custom:""};
+  var id=compactionModelId(model);
+  return COMPACTION_CURATED_MODELS.indexOf(id)>=0
+    ?{kind:id,custom:""}
+    // Not one of the three curated ids: still render it, as Custom with the
+    // raw id filled in, rather than silently dropping it.
+    :{kind:"custom",custom:id};
+}
+function renderCompactionDiagnostics(rec){
+  var box=document.getElementById("comp-diagnostics");
+  if(!rec){
+    box.innerHTML='<span class="k">last_reroute</span><span class="v">아직 재라우팅이 시도되지 않았습니다</span>';
+    return;
+  }
+  box.innerHTML=
+    '<span class="k">outcome</span><span class="v">'+esc(rec.outcome)+'</span>'+
+    '<span class="k">timestamp</span><span class="v">'+esc(rec.timestamp)+'</span>'+
+    '<span class="k">target_model</span><span class="v">'+esc(rec.target_model)+'</span>'+
+    '<span class="k">mapped_model</span><span class="v">'+esc(rec.mapped_model)+'</span>'+
+    '<span class="k">estimated_prompt_tokens</span><span class="v">'+esc(rec.estimated_prompt_tokens)+'</span>'+
+    '<span class="k">context_window</span><span class="v">'+esc(rec.context_window)+'</span>'+
+    (rec.detail!=null?'<span class="k">detail</span><span class="v">'+esc(rec.detail)+'</span>':"");
+}
+function renderCompaction(){
+  document.getElementById("compaction-card").classList.toggle("locked",COMP.locked);
+  document.getElementById("comp-lock-env").textContent=COMP.envName;
+  var select=document.getElementById("comp-select");
+  select.value=COMP.draftKind;
+  select.disabled=COMP.locked;
+  document.getElementById("comp-custom-wrap").classList.toggle("show",COMP.draftKind==="custom");
+  var input=document.getElementById("comp-custom-input");
+  input.value=COMP.draftCustom;
+  input.disabled=COMP.locked;
+  var btn=document.getElementById("comp-apply");
+  btn.disabled=COMP.locked;
+  btn.textContent="Apply";
+  renderCompactionDiagnostics(COMP.LIVE.lastReroute);
+}
+/* Adopts a fresh /admin/compaction GET/PUT envelope as the new live state
+   and re-derives the draft selection from it. */
+function renderCompactionState(body){
+  COMP.LIVE.model=body.model;
+  COMP.LIVE.lastReroute=body.last_reroute;
+  COMP.locked=!!body.env_locked;
+  var draft=compactionDraftFromModel(body.model);
+  COMP.draftKind=draft.kind;
+  COMP.draftCustom=draft.custom;
+  renderCompaction();
+}
+function applyCompaction(){
+  var btn=document.getElementById("comp-apply");
+  if(COMP.locked||btn.disabled)return;
+  var model;
+  if(COMP.draftKind==="disabled"){
+    model=null;
+  }else if(COMP.draftKind==="custom"){
+    var input=document.getElementById("comp-custom-input");
+    var raw=input.value.trim();
+    if(!raw)return;
+    model="claude:"+raw;
+  }else{
+    model="claude:"+COMP.draftKind;
+  }
+  btn.disabled=true;btn.textContent="…";
+  jfetch("/admin/compaction",{
+    method:"PUT",
+    headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({model:model})
+  }).then(function(r){
+    if(r.status===409){
+      COMP.locked=true;
+      renderCompaction();
+      showToast('<span class="chip chip-err">LOCKED</span><span class="lat">409</span><br>'+esc(COMP.envName)+
+        '<br><span class="dim">'+esc(errDetail(r.body))+"</span>",true);
+      // The 409 body is only the admin error envelope, never state: model,
+      // env_locked and last_reroute are only ever read from this fresh GET,
+      // never from r.body above.
+      jfetch("/admin/compaction").then(function(g){
+        if(g.ok)renderCompactionState(g.body);
+      });
+      return;
+    }
+    if(!r.ok){
+      renderCompaction();
+      showToast('<span class="chip chip-err">ERROR</span><span class="lat">'+r.status+"</span><br>Compaction"+
+        '<br><span class="dim">'+esc(errDetail(r.body))+"</span>",true);
+      return;
+    }
+    renderCompactionState(r.body);
+    showToast('<span class="chip chip-ok">APPLIED</span><br>Compaction → '+esc(r.body.model||"Disabled"),false);
+  }).catch(function(){
+    renderCompaction();
+    showToast('<span class="chip chip-err">ERROR</span><br>Compaction<br><span class="dim">gateway unreachable</span>',true);
+  });
+}
+document.getElementById("comp-select").addEventListener("change",function(){
+  COMP.draftKind=this.value;
+  COMP.draftCustom="";
+  renderCompaction();
+});
+document.getElementById("comp-custom-input").addEventListener("input",function(){
+  COMP.draftCustom=this.value;
+});
+document.getElementById("comp-apply").addEventListener("click",applyCompaction);
 function apply(){
   if(DIR.locked)return;
   var count=dirtyCount();
@@ -1326,12 +1483,20 @@ function boot(){
       jfetch("/admin/codex/models"),
       jfetch("/admin/kimi/models"),
       jfetch("/admin/grok/models"),
-      jfetch("/admin/log-level")
+      jfetch("/admin/log-level"),
+      jfetch("/admin/compaction")
     ]);
   }).then(function(results){
     var mapping=results[0],health=results[1];
     var codexCatalog=results[2],kimiCatalog=results[3],grokCatalog=results[4],loglevel=results[5];
+    var compactionResp=results[6];
     if(loglevel.ok)renderLogLevel(loglevel.body);
+    if(compactionResp.ok){
+      renderCompactionState(compactionResp.body);
+    }else{
+      showToast('<span class="chip chip-err">ERROR</span><span class="lat">'+compactionResp.status+
+        '</span><br>GET /admin/compaction<br><span class="dim">'+esc(errDetail(compactionResp.body))+"</span>",true);
+    }
     if(mapping.ok){
       DIR.LIVE=mapping.body.model_map||{};
       DIR.locked=!!(mapping.body.env_locked||{}).model_map;
