@@ -1937,10 +1937,10 @@ def test_compaction_reroute_never_reenters_the_model_map_via_the_canonical_targe
 # --- /v1/messages routing: compaction reroute trigger, stream:true (T-6) --
 # stream:true shares every pre-commit step with stream:false (T-5 above): an
 # HTTP 2xx response is the sole commit boundary, not the first relayed byte.
-# Once committed, `_relay_compaction_stream` owns the upstream response and
+# Once committed, `_CompactionStreamRelay` owns the upstream response and
 # relays `aiter_bytes()` unchanged; these tests exercise both the full
 # `/v1/messages` round trip (via `_gateway`/`_TrackedByteStream`) and, for
-# the ownership/closure properties, `_relay_compaction_stream` directly --
+# the ownership/closure properties, `_CompactionStreamRelay` directly --
 # the same style already used above for `_translate_claude_sse`.
 
 
@@ -2235,7 +2235,7 @@ def test_relay_compaction_stream_explicit_close_closes_upstream_response() -> No
     )
 
     async def scenario() -> None:
-        relay = server._relay_compaction_stream(upstream_response, app_state, sequence)
+        relay = server._CompactionStreamRelay(upstream_response, app_state, sequence)
         first = await anext(relay)
         assert first == b"event: a\ndata: {}\n\n"
         await relay.aclose()
@@ -2280,7 +2280,7 @@ def test_relay_compaction_stream_cancellation_closes_upstream_response() -> None
     first_chunk_seen = asyncio.Event()
 
     async def consume() -> None:
-        async for _chunk in server._relay_compaction_stream(upstream_response, app_state, sequence):
+        async for _chunk in server._CompactionStreamRelay(upstream_response, app_state, sequence):
             first_chunk_seen.set()
 
     async def scenario() -> None:
@@ -2332,7 +2332,7 @@ def test_relay_compaction_stream_stale_failure_does_not_clobber_newer_record() -
     )
 
     async def drain() -> None:
-        async for _chunk in server._relay_compaction_stream(
+        async for _chunk in server._CompactionStreamRelay(
             upstream_response, app_state, sequence_a
         ):
             pass
@@ -2341,6 +2341,119 @@ def test_relay_compaction_stream_stale_failure_does_not_clobber_newer_record() -
 
     # Stale request A's failure must never clobber request B's newer record.
     assert app_state.compaction_last_reroute == record_b
+
+
+def _committed_relay_state() -> SimpleNamespace:
+    app_state = SimpleNamespace(compaction_last_reroute=None, compaction_reroute_sequence=0)
+    return app_state
+
+
+def test_relay_compaction_stream_records_midstream_error_before_terminal_chunk_is_consumed() -> None:
+    # The diagnostics upgrade must not depend on the consumer requesting
+    # another item after the terminal error chunk: a client that closes right
+    # after receiving it must still leave midstream_error behind.
+    stream = _TrackedByteStream(
+        [b"event: message_start\ndata: {}\n\n"], httpx.ReadError("connection reset")
+    )
+    upstream_response = httpx.Response(
+        200, stream=stream, headers={"content-type": "text/event-stream"}
+    )
+    app_state = _committed_relay_state()
+    sequence = server._assign_compaction_reroute(
+        app_state,
+        outcome="rerouted",
+        target_model=_COMPACTION_CANONICAL_TARGET,
+        mapped_model="codex:gpt-5.1-codex-max",
+        estimated_prompt_tokens=10,
+        context_window=5,
+        detail=None,
+    )
+
+    async def scenario() -> None:
+        relay = server._CompactionStreamRelay(upstream_response, app_state, sequence)
+        assert await anext(relay) == b"event: message_start\ndata: {}\n\n"
+        terminal = await anext(relay)
+        assert terminal.startswith(b"\n\nevent: error\n")
+        # No further __anext__: the record must already be upgraded and the
+        # upstream response already released.
+        assert app_state.compaction_last_reroute["outcome"] == "midstream_error"
+        assert app_state.compaction_last_reroute["detail"] == "read_error"
+        assert stream.closed is True
+        await relay.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_relay_compaction_stream_aclose_before_first_iteration_closes_upstream() -> None:
+    # A generator's finally would never run in this case; the owning
+    # iterator must release the upstream response anyway.
+    stream = _TrackedByteStream([b"event: a\ndata: {}\n\n"])
+    upstream_response = httpx.Response(
+        200, stream=stream, headers={"content-type": "text/event-stream"}
+    )
+    app_state = _committed_relay_state()
+    sequence = server._assign_compaction_reroute(
+        app_state,
+        outcome="rerouted",
+        target_model=_COMPACTION_CANONICAL_TARGET,
+        mapped_model="codex:gpt-5.1-codex-max",
+        estimated_prompt_tokens=10,
+        context_window=5,
+        detail=None,
+    )
+
+    async def scenario() -> None:
+        relay = server._CompactionStreamRelay(upstream_response, app_state, sequence)
+        await relay.aclose()
+
+    asyncio.run(scenario())
+
+    assert stream.closed is True
+    assert app_state.compaction_last_reroute["outcome"] == "rerouted"
+
+
+def test_owned_streaming_response_closes_iterator_when_send_fails_mid_stream() -> None:
+    # A send failure while the iterator sits between chunks must still close
+    # the upstream response: Starlette itself never acloses body iterators,
+    # so _OwnedStreamingResponse's finally is what releases the stream.
+    stream = _TrackedByteStream(
+        [b"event: a\ndata: {}\n\n", b"event: b\ndata: {}\n\n"]
+    )
+    upstream_response = httpx.Response(
+        200, stream=stream, headers={"content-type": "text/event-stream"}
+    )
+    app_state = _committed_relay_state()
+    sequence = server._assign_compaction_reroute(
+        app_state,
+        outcome="rerouted",
+        target_model=_COMPACTION_CANONICAL_TARGET,
+        mapped_model="codex:gpt-5.1-codex-max",
+        estimated_prompt_tokens=10,
+        context_window=5,
+        detail=None,
+    )
+    relay = server._CompactionStreamRelay(upstream_response, app_state, sequence)
+    response = server._OwnedStreamingResponse(relay, media_type="text/event-stream")
+
+    body_messages_sent = 0
+
+    async def failing_send(message: dict[str, Any]) -> None:
+        nonlocal body_messages_sent
+        if message["type"] == "http.response.body":
+            body_messages_sent += 1
+            if body_messages_sent == 2:
+                raise RuntimeError("client went away mid-send")
+
+    async def scenario() -> None:
+        with pytest.raises(RuntimeError, match="client went away mid-send"):
+            await response.stream_response(failing_send)
+
+    asyncio.run(scenario())
+
+    assert stream.closed is True
+    # A send failure is not an upstream read failure: the committed record
+    # must remain rerouted.
+    assert app_state.compaction_last_reroute["outcome"] == "rerouted"
 
 
 # --- upstream stream ownership -------------------------------------------

@@ -632,11 +632,11 @@ async def _reroute_compaction(
 
     if claude_request.get("stream"):
         # Commit point: HTTP 2xx acceptance, not the first relayed byte.
-        # From here on, _relay_compaction_stream owns upstream_response; it
-        # is never closed in this function again.
+        # From here on, the relay owns upstream_response; it is never
+        # closed in this function again.
         sequence = record("rerouted", None)
-        return StreamingResponse(
-            _relay_compaction_stream(upstream_response, request.app.state, sequence),
+        return _OwnedStreamingResponse(
+            _CompactionStreamRelay(upstream_response, request.app.state, sequence),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache"},
         )
@@ -674,40 +674,96 @@ async def _reroute_compaction(
         await upstream_response.aclose()
 
 
-async def _relay_compaction_stream(
-    upstream_response: httpx.Response,
-    app_state: Any,
-    sequence: int,
-) -> AsyncIterator[bytes]:
-    """Relay `upstream_response.aiter_bytes()` unchanged; owns `upstream_response`.
+class _CompactionStreamRelay:
+    """Relay a committed Anthropic stream unchanged; owns `upstream_response`.
 
-    Starlette never closes body iterators, so every exit here — normal
-    exhaustion, a mid-stream `httpx.HTTPError`, cancellation, or an explicit
-    iterator close — must release the Anthropic HTTP stream via `finally`.
+    This is a hand-written async iterator rather than an async generator
+    because a generator cannot honor the closure contract: `aclose()` before
+    the first iteration never enters the body (so `finally` never runs), and
+    code placed after a `yield` only executes if the consumer requests
+    another item. Here `aclose()` releases the upstream response no matter
+    when it is called, and every terminal path — exhaustion, mid-stream
+    failure, cancellation — closes it inside `__anext__` itself.
 
-    The reroute already committed (`rerouted`) before this generator starts,
-    so a mid-stream `httpx.HTTPError` can only be reported in-band: an event
+    The reroute already committed (`rerouted`) before iteration starts, so a
+    mid-stream `httpx.HTTPError` can only be reported in-band: an event
     boundary followed by a parseable `event: error` using the existing
-    Claude error envelope, with no raw exception text. That failure also
-    upgrades this request's diagnostics record to `midstream_error`/
-    `read_error` via the compare-and-swap helper, but only while `sequence`
-    is still current — a stale failure must never clobber a newer request's
-    own record.
+    Claude error envelope, with no raw exception text. The diagnostics
+    upgrade to `midstream_error`/`read_error` happens BEFORE the terminal
+    chunk is handed out, so it does not depend on the consumer ever
+    requesting another item, and it goes through the compare-and-swap helper
+    so a stale failure never clobbers a newer request's record.
     """
-    try:
-        async for chunk in upstream_response.aiter_bytes():
-            yield chunk
-    except httpx.HTTPError as exc:
-        logger.warning("compaction reroute stream aborted: %r", exc)
-        yield b"\n\n" + _format_sse(
-            "error",
-            _claude_error_body("api_error", "compaction reroute stream aborted"),
-        ).encode()
-        _replace_compaction_reroute_if_current(
-            app_state, sequence, outcome="midstream_error", detail="read_error"
-        )
-    finally:
-        await upstream_response.aclose()
+
+    def __init__(self, upstream_response: httpx.Response, app_state: Any, sequence: int) -> None:
+        self._upstream_response = upstream_response
+        self._app_state = app_state
+        self._sequence = sequence
+        self._chunks = upstream_response.aiter_bytes()
+        self._finished = False
+
+    def __aiter__(self) -> _CompactionStreamRelay:
+        return self
+
+    async def _close_upstream(self) -> None:
+        # Best-effort, idempotent release of the Anthropic HTTP stream; a
+        # secondary transport error during cleanup must not mask the
+        # original outcome.
+        with contextlib.suppress(Exception):
+            await self._upstream_response.aclose()
+
+    async def __anext__(self) -> bytes:
+        if self._finished:
+            raise StopAsyncIteration
+        try:
+            return await self._chunks.__anext__()
+        except StopAsyncIteration:
+            self._finished = True
+            await self._close_upstream()
+            raise
+        except httpx.HTTPError as exc:
+            logger.warning("compaction reroute stream aborted: %r", exc)
+            self._finished = True
+            _replace_compaction_reroute_if_current(
+                self._app_state,
+                self._sequence,
+                outcome="midstream_error",
+                detail="read_error",
+            )
+            await self._close_upstream()
+            return b"\n\n" + _format_sse(
+                "error",
+                _claude_error_body("api_error", "compaction reroute stream aborted"),
+            ).encode()
+        except BaseException:
+            # Cancellation (or any unexpected failure) while waiting on the
+            # upstream read: release the stream, then let it propagate.
+            self._finished = True
+            await self._close_upstream()
+            raise
+
+    async def aclose(self) -> None:
+        self._finished = True
+        await self._close_upstream()
+
+
+class _OwnedStreamingResponse(StreamingResponse):
+    """StreamingResponse that always `aclose()`s its body iterator.
+
+    Starlette's `stream_response` never closes the body iterator, so a
+    client disconnect or send failure while the iterator sits between
+    chunks would otherwise leak the upstream HTTP stream. The iterator's
+    `aclose()` is idempotent and safe at any point, including before the
+    first chunk was ever requested.
+    """
+
+    async def stream_response(self, send: Any) -> None:
+        try:
+            await super().stream_response(send)
+        finally:
+            aclose = getattr(self.body_iterator, "aclose", None)
+            if aclose is not None:
+                await aclose()
 
 
 async def _translate_claude_sse(
