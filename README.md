@@ -246,11 +246,17 @@ uv run claudex-gateway compact set claude:<model-id>  # enable, target <model-id
 uv run claudex-gateway compact off                    # disable
 ```
 
-Each subcommand prefers a live daemon's admin API (`GET`/`PUT
-/admin/compaction`), so an enabled/disabled state or target change on a
-running gateway takes effect immediately with no restart; when no daemon
-can be confirmed running, it falls back to reading or writing
-`settings.json` directly (picked up the next time the gateway starts).
+When a compatible daemon is identified, the command uses its authenticated
+`GET`/`PUT /admin/compaction` API, so successful changes take effect
+immediately with no restart. An identified older daemon returning `404` or
+`405` falls back to the settings file and warns that a restart is
+required. With no listener, or a confirmed foreign process on the port,
+the command reads or writes `settings.json` directly (picked up the next
+time the gateway starts). Ambiguous reachability fails closed for `set`
+and `off` and shows settings-file state with an unreachable warning for
+the read-only form. Any other failure from an identified daemon — an
+error status such as the environment-lock `409`, a malformed response, or
+a transport failure — exits non-zero without touching the settings file.
 
 ## Configuration
 
