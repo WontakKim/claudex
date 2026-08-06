@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import enum
+import ipaddress
 import json
 import logging
 import os
@@ -12,7 +14,9 @@ import socket
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.request
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -21,7 +25,12 @@ import uvicorn
 
 import claudex_gateway
 from claudex_gateway import claude_accounts, claude_capture, paths
-from claudex_gateway.config import ConfigError, GatewayConfig
+from claudex_gateway.config import (
+    ConfigError,
+    GatewayConfig,
+    parse_compaction_model,
+    update_settings_file,
+)
 from claudex_gateway.server import create_app
 
 _READY_TIMEOUT = 15.0
@@ -437,6 +446,365 @@ def _account_main(argv: list[str]) -> int:
         return 1
 
 
+# ---------------------------------------------------------------------------
+# `compact` subcommands: show/set/disable the compaction reroute target
+# (settings.json's "compaction.model") through whichever daemon-aware channel
+# is safe. A running daemon is preferred (the admin API keeps its in-memory
+# config and the settings file in sync); a settings-file write is only used
+# when no live daemon can be confirmed, or when the confirmed daemon predates
+# the admin compaction API.
+# ---------------------------------------------------------------------------
+
+_ADMIN_COMPACTION_PATH = "/admin/compaction"
+_PROBE_TIMEOUT = 2.0
+_ADMIN_TIMEOUT = 5.0
+
+_COMPACT_USAGE = "usage: claudex-gateway compact [set claude:<id>|off]"
+
+
+class ProbeOutcome(enum.Enum):
+    """The four-way result of probing GET /api/hello for a compact command.
+
+    IDENTIFIED means a claudex-gateway answered; NO_LISTENER means nothing is
+    listening at all; FOREIGN means something answered but is not
+    claudex-gateway (wrong port occupant, or an HTTP error status); AMBIGUOUS
+    covers everything else (timeout, DNS failure, connection reset before a
+    response) where liveness genuinely cannot be determined.
+    """
+
+    IDENTIFIED = "identified"
+    NO_LISTENER = "no_listener"
+    FOREIGN = "foreign"
+    AMBIGUOUS = "ambiguous"
+
+
+def _bracket_host(host: str) -> str:
+    """Bracket an IPv6 literal for URL use; IPv4 addresses/hostnames pass through."""
+    try:
+        parsed = ipaddress.ip_address(host)
+    except ValueError:
+        return host
+    return f"[{host}]" if parsed.version == 6 else host
+
+
+def _http_url(host: str, port: int, path: str) -> str:
+    return f"http://{_bracket_host(host)}:{port}{path}"
+
+
+def _probe_endpoint(config: GatewayConfig) -> tuple[str, int]:
+    """Resolve the host/port to probe for a compact command.
+
+    A structurally valid daemon record wins over the config: it names the
+    process the launcher itself started, which the config's host/port need
+    not match (e.g. CLAUDEX_HOST changed after the daemon started). Absent a
+    valid record, the resolved config host/port keeps a foreground daemon
+    that never wrote a record file discoverable.
+    """
+    record, _ = _read_daemon_record()
+    if record is not None:
+        return _connect_host(record["host"]), record["port"]
+    return _connect_host(config.host), config.port
+
+
+def _classify_daemon(host: str, port: int) -> ProbeOutcome:
+    """Probe GET /api/hello and classify the occupant.
+
+    Read-only: this never signals a process (no os.kill), it only issues one
+    GET request with a short timeout.
+    """
+    try:
+        with urllib.request.urlopen(
+            _http_url(host, port, "/api/hello"), timeout=_PROBE_TIMEOUT
+        ) as response:
+            raw = response.read()
+    except urllib.error.HTTPError:
+        # A completed HTTP response, but an error status: not a valid hello.
+        return ProbeOutcome.FOREIGN
+    except urllib.error.URLError as exc:
+        if isinstance(exc.reason, ConnectionRefusedError):
+            return ProbeOutcome.NO_LISTENER
+        # Timeout, DNS failure, connection reset before a response, etc.
+        return ProbeOutcome.AMBIGUOUS
+    except OSError:
+        # e.g. a connection reset while reading the body, after the connect
+        # itself succeeded (so it never went through URLError above).
+        return ProbeOutcome.AMBIGUOUS
+
+    try:
+        payload = json.loads(raw)
+    except ValueError:
+        return ProbeOutcome.FOREIGN
+    if isinstance(payload, dict) and payload.get("hello") == "claudex-gateway":
+        return ProbeOutcome.IDENTIFIED
+    return ProbeOutcome.FOREIGN
+
+
+class _AdminTransportError(Exception):
+    """The admin request never got an HTTP response (DNS, reset, timeout, ...)."""
+
+
+@dataclass(frozen=True)
+class _AdminHttpResponse:
+    status: int
+    body: Any  # parsed JSON value when the body decodes, else None
+    detail: str  # bounded diagnostic text: an error message, or raw body text
+
+
+def _parse_admin_body(raw: bytes) -> tuple[Any, str]:
+    """Decode an admin response body; never raises on non-JSON content."""
+    text = raw.decode("utf-8", errors="replace")
+    bounded = text[:500]
+    try:
+        body = json.loads(text)
+    except ValueError:
+        return None, bounded
+    detail = bounded
+    if isinstance(body, dict):
+        error = body.get("error")
+        if isinstance(error, dict) and isinstance(error.get("message"), str):
+            detail = error["message"]
+        elif isinstance(body.get("detail"), str):
+            detail = body["detail"]
+    return body, detail
+
+
+def _admin_request(
+    host: str,
+    port: int,
+    method: str,
+    path: str,
+    *,
+    local_token: str | None,
+    json_body: dict[str, Any] | None = None,
+) -> _AdminHttpResponse:
+    """GET/PUT an admin endpoint; raises only for a transport-level failure.
+
+    An HTTP error status is a completed response, not a transport failure:
+    urllib.error.HTTPError is caught here and turned into a normal
+    _AdminHttpResponse so the caller can inspect a 4xx/5xx body (JSON or
+    not) instead of it propagating as an exception.
+    """
+    data = None
+    headers = {"Accept": "application/json"}
+    if json_body is not None:
+        data = json.dumps(json_body).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    if local_token:
+        headers["Authorization"] = f"Bearer {local_token}"
+    request = urllib.request.Request(
+        _http_url(host, port, path), data=data, headers=headers, method=method
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=_ADMIN_TIMEOUT) as response:
+            body, detail = _parse_admin_body(response.read())
+            return _AdminHttpResponse(status=response.status, body=body, detail=detail)
+    except urllib.error.HTTPError as exc:
+        body, detail = _parse_admin_body(exc.read())
+        return _AdminHttpResponse(status=exc.code, body=body, detail=detail)
+    except (urllib.error.URLError, OSError) as exc:
+        raise _AdminTransportError(str(exc)) from exc
+
+
+def _parse_compaction_envelope(body: Any) -> dict[str, Any] | None:
+    """Validate the pinned {model, env_locked, last_reroute} envelope.
+
+    Returns the body unchanged when every required field is present and
+    correctly typed (model: str|None, env_locked: bool, last_reroute:
+    dict|None); otherwise None, so the caller treats a malformed 2xx body as
+    an admin failure rather than trusting it.
+    """
+    if not isinstance(body, dict):
+        return None
+    if not {"model", "env_locked", "last_reroute"} <= set(body):
+        return None
+    model = body["model"]
+    if model is not None and not isinstance(model, str):
+        return None
+    if not isinstance(body["env_locked"], bool):
+        return None
+    last_reroute = body["last_reroute"]
+    if last_reroute is not None and not isinstance(last_reroute, dict):
+        return None
+    return body
+
+
+class _CompactionAdminOutcome(enum.Enum):
+    SUCCESS = "success"
+    OLDER_DAEMON = "older_daemon"  # 404/405: no admin compaction API
+    FAILURE = "failure"
+
+
+def _run_admin_compaction(
+    host: str,
+    port: int,
+    method: str,
+    local_token: str | None,
+    json_body: dict[str, Any] | None,
+) -> tuple[_CompactionAdminOutcome, dict[str, Any] | None, str]:
+    """Run one GET/PUT /admin/compaction call and classify the result.
+
+    Returns (outcome, envelope, detail): envelope is the validated body only
+    on SUCCESS; detail is diagnostic text for FAILURE (including a malformed
+    2xx envelope, any non-404/405 error status, or a transport failure).
+    """
+    try:
+        response = _admin_request(
+            host,
+            port,
+            method,
+            _ADMIN_COMPACTION_PATH,
+            local_token=local_token,
+            json_body=json_body,
+        )
+    except _AdminTransportError as exc:
+        return _CompactionAdminOutcome.FAILURE, None, f"admin request failed: {exc}"
+
+    if response.status in (404, 405):
+        return _CompactionAdminOutcome.OLDER_DAEMON, None, ""
+    if 200 <= response.status < 300:
+        envelope = _parse_compaction_envelope(response.body)
+        if envelope is not None:
+            return _CompactionAdminOutcome.SUCCESS, envelope, ""
+        return (
+            _CompactionAdminOutcome.FAILURE,
+            None,
+            f"admin returned a malformed response (status {response.status})",
+        )
+    return (
+        _CompactionAdminOutcome.FAILURE,
+        None,
+        f"admin request failed (status {response.status}): {response.detail}",
+    )
+
+
+def _print_compact_state(model: str | None, diagnostics: dict[str, Any] | None) -> None:
+    if model is None:
+        print("compaction: disabled")
+    else:
+        print(f"compaction: enabled (target {model})")
+    if diagnostics is None:
+        print("last reroute: none")
+        return
+    print(
+        "last reroute: "
+        f"outcome={diagnostics.get('outcome')} "
+        f"timestamp={diagnostics.get('timestamp')} "
+        f"target_model={diagnostics.get('target_model')} "
+        f"mapped_model={diagnostics.get('mapped_model')} "
+        f"estimated_prompt_tokens={diagnostics.get('estimated_prompt_tokens')} "
+        f"context_window={diagnostics.get('context_window')} "
+        f"detail={diagnostics.get('detail')}"
+    )
+
+
+def _write_compact_settings(config: GatewayConfig, value: str | None) -> int:
+    try:
+        if value is None:
+            # A disabled setting is represented by the key's absence, so a
+            # JSON null is never persisted.
+            update_settings_file(config.settings_file, {}, deletions=("compaction.model",))
+        else:
+            update_settings_file(config.settings_file, {"compaction.model": value})
+    except ConfigError as exc:
+        print(f"compact: could not persist settings: {exc}", file=sys.stderr)
+        return 1
+    _print_compact_state(value, None)
+    return 0
+
+
+def _compact_show() -> int:
+    config = _load_config()
+    host, port = _probe_endpoint(config)
+    outcome = _classify_daemon(host, port)
+
+    if outcome is ProbeOutcome.IDENTIFIED:
+        admin_outcome, envelope, detail = _run_admin_compaction(
+            host, port, "GET", config.local_token, None
+        )
+        if admin_outcome is _CompactionAdminOutcome.SUCCESS:
+            _print_compact_state(envelope["model"], envelope["last_reroute"])
+            return 0
+        if admin_outcome is _CompactionAdminOutcome.OLDER_DAEMON:
+            print(
+                "compact: the running daemon predates the admin compaction API; "
+                "showing settings-file state, which may differ from live runtime state",
+                file=sys.stderr,
+            )
+            _print_compact_state(config.compaction_model, None)
+            return 0
+        print(f"compact: {detail}", file=sys.stderr)
+        return 1
+
+    if outcome in (ProbeOutcome.NO_LISTENER, ProbeOutcome.FOREIGN):
+        _print_compact_state(config.compaction_model, None)
+        return 0
+
+    # AMBIGUOUS: liveness could not be confirmed either way, but a read is
+    # harmless, so show the best-known (settings-file) state with a note.
+    print(
+        "compact: could not reach claudex-gateway to confirm live runtime state "
+        "(unreachable); showing settings-file state",
+        file=sys.stderr,
+    )
+    _print_compact_state(config.compaction_model, None)
+    return 0
+
+
+def _compact_apply(value: str | None) -> int:
+    config = _load_config()
+    host, port = _probe_endpoint(config)
+    outcome = _classify_daemon(host, port)
+
+    if outcome is ProbeOutcome.IDENTIFIED:
+        admin_outcome, envelope, detail = _run_admin_compaction(
+            host, port, "PUT", config.local_token, {"model": value}
+        )
+        if admin_outcome is _CompactionAdminOutcome.SUCCESS:
+            _print_compact_state(envelope["model"], None)
+            return 0
+        if admin_outcome is _CompactionAdminOutcome.OLDER_DAEMON:
+            print(
+                "compact: the running daemon predates the admin compaction API; "
+                "writing the settings file directly. Restart claudex-gateway for "
+                "the change to take effect.",
+                file=sys.stderr,
+            )
+            return _write_compact_settings(config, value)
+        print(f"compact: {detail}", file=sys.stderr)
+        return 1
+
+    if outcome in (ProbeOutcome.NO_LISTENER, ProbeOutcome.FOREIGN):
+        return _write_compact_settings(config, value)
+
+    # AMBIGUOUS: fail closed. Writing here risks clobbering a live daemon's
+    # settings behind its back, or racing a daemon that is actually up.
+    print(
+        "compact: could not confirm whether claudex-gateway is running "
+        "(unreachable); refusing to modify settings without a live daemon",
+        file=sys.stderr,
+    )
+    return 1
+
+
+def _compact_main(arguments: list[str]) -> int:
+    # Argument validation happens before any config load, daemon-record
+    # read, network request, or settings-file read: an invalid `compact set`
+    # argument must fail on syntax alone, with no other side effect.
+    if not arguments:
+        return _compact_show()
+    if arguments == ["off"]:
+        return _compact_apply(None)
+    if len(arguments) == 2 and arguments[0] == "set":
+        try:
+            parse_compaction_model(arguments[1])
+        except ConfigError as exc:
+            print(f"compact set failed: {exc}", file=sys.stderr)
+            return 2
+        return _compact_apply(arguments[1])
+    print(_COMPACT_USAGE, file=sys.stderr)
+    return 2
+
+
 def main() -> None:
     arguments = sys.argv[1:]
     # stop must work even when the current configuration is broken.
@@ -448,6 +816,15 @@ def main() -> None:
     # work even when the current gateway configuration is broken.
     if arguments and arguments[0] == "account":
         result = _account_main(arguments[1:])
+        if result != 0:
+            raise SystemExit(result)
+        return
+
+    # compact validates its own argument (compact set claude:<id>) before
+    # touching configuration, a daemon record, the network, or the settings
+    # file, so it is dispatched ahead of the ordinary _load_config() below.
+    if arguments and arguments[0] == "compact":
+        result = _compact_main(arguments[1:])
         if result != 0:
             raise SystemExit(result)
         return
