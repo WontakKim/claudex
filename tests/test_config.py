@@ -11,6 +11,7 @@ from claudex_gateway.config import (
     RouteTarget,
     parse_compaction_model,
     parse_route_target,
+    update_settings_file,
 )
 
 
@@ -304,3 +305,59 @@ class TestCompactionModelSetting:
         monkeypatch.setenv("CLAUDEX_COMPACTION_MODEL", value)
         with pytest.raises(ConfigError, match="CLAUDEX_COMPACTION_MODEL"):
             GatewayConfig.from_env()
+
+
+class TestUpdateSettingsFile:
+    @staticmethod
+    def _write(tmp_path: Path, payload: object) -> Path:
+        settings_file = tmp_path / "settings.json"
+        settings_file.write_text(json.dumps(payload), encoding="utf-8")
+        return settings_file
+
+    def test_deleting_an_existing_key_removes_it(self, tmp_path: Path) -> None:
+        settings_file = self._write(
+            tmp_path, {"compaction.model": "claude:claude-opus-5"}
+        )
+        update_settings_file(settings_file, {}, deletions=("compaction.model",))
+        written = json.loads(settings_file.read_text(encoding="utf-8"))
+        assert "compaction.model" not in written
+
+    def test_deleting_the_last_key_leaves_a_valid_empty_object(
+        self, tmp_path: Path
+    ) -> None:
+        settings_file = self._write(
+            tmp_path, {"compaction.model": "claude:claude-opus-5"}
+        )
+        update_settings_file(settings_file, {}, deletions=("compaction.model",))
+        assert json.loads(settings_file.read_text(encoding="utf-8")) == {}
+
+    def test_deleting_an_absent_key_is_a_no_op(self, tmp_path: Path) -> None:
+        settings_file = self._write(tmp_path, {"port": 9090})
+        update_settings_file(settings_file, {}, deletions=("compaction.model",))
+        assert json.loads(settings_file.read_text(encoding="utf-8")) == {"port": 9090}
+
+    def test_unknown_deletion_key_raises(self, tmp_path: Path) -> None:
+        settings_file = self._write(tmp_path, {"port": 9090})
+        with pytest.raises(ConfigError, match="unknown settings keys"):
+            update_settings_file(settings_file, {}, deletions=("not_a_key",))
+
+    def test_combined_updates_and_deletions_apply_both(self, tmp_path: Path) -> None:
+        settings_file = self._write(
+            tmp_path, {"compaction.model": "claude:claude-opus-5"}
+        )
+        update_settings_file(
+            settings_file,
+            {"port": 9317},
+            deletions=("compaction.model",),
+        )
+        written = json.loads(settings_file.read_text(encoding="utf-8"))
+        assert written == {"port": 9317}
+
+    def test_unrelated_keys_survive_a_deletion(self, tmp_path: Path) -> None:
+        settings_file = self._write(
+            tmp_path,
+            {"compaction.model": "claude:claude-opus-5", "port": 9090},
+        )
+        update_settings_file(settings_file, {}, deletions=("compaction.model",))
+        written = json.loads(settings_file.read_text(encoding="utf-8"))
+        assert written == {"port": 9090}

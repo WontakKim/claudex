@@ -292,18 +292,34 @@ def _read_settings_file(path: Path) -> dict[str, object]:
     return parsed
 
 
-def update_settings_file(path: Path, updates: dict[str, object]) -> None:
+def update_settings_file(
+    path: Path,
+    updates: dict[str, object],
+    deletions: tuple[str, ...] = (),
+) -> None:
     """Merge updates into the settings file, creating it if missing.
 
     The existing file is validated first so a corrupt or unknown-key file
     fails loudly instead of being silently overwritten, and the write is
     atomic so a crash cannot leave a half-written file behind.
+
+    `deletions` removes keys from the settings dict before it is written, so
+    a disabled feature is represented by the key's absence rather than a
+    persisted JSON `null`. Deleting a key that is not present in the file is
+    a no-op, not an error.
     """
     unknown = sorted(set(updates) - set(SETTINGS_KEYS))
     if unknown:
         raise ConfigError(f"cannot persist unknown settings keys: {', '.join(unknown)}")
+    unknown_deletions = sorted(set(deletions) - set(SETTINGS_KEYS))
+    if unknown_deletions:
+        raise ConfigError(
+            f"cannot delete unknown settings keys: {', '.join(unknown_deletions)}"
+        )
     settings = _read_settings_file(path)
     settings.update(updates)
+    for key in deletions:
+        settings.pop(key, None)
     path.parent.mkdir(parents=True, exist_ok=True)
     staging_file = path.with_name(path.name + ".tmp")
     staging_file.write_text(
