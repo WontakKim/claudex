@@ -479,6 +479,44 @@ def test_estimate_overflow_prompt_tokens_matches_ceil_chars_over_3_2() -> None:
     assert estimate_overflow_prompt_tokens(claude_request) == (chars * 5 + 15) // 16
 
 
+def test_overlong_numeric_capture_with_enrichment_synthesizes_valid_pair() -> None:
+    # A capture beyond sys.get_int_max_str_digits() must not raise; the pair
+    # is treated as invalid and the authoritative numbers are synthesized.
+    huge = "9" * 5000
+    message = rewrite_context_overflow_message(
+        "context_length_exceeded",
+        f"prompt is too long: {huge} tokens > 200",
+        estimated_tokens=10,
+        context_window=272_000,
+    )
+    match = _CLIENT_OVERFLOW_RE.search(message)
+    assert match is not None
+    assert int(match.group(1)) > int(match.group(2)) == 272_000
+
+
+def test_overlong_numeric_capture_without_enrichment_is_neutralized() -> None:
+    huge = "9" * 5000
+    message = rewrite_context_overflow_message(
+        "context_length_exceeded", f"prompt is too long: {huge} tokens > 200"
+    )
+    assert _CLIENT_OVERFLOW_RE.search(message) is None
+    assert "prompt is too long" in message.lower()
+
+
+def test_unicode_numerals_are_not_treated_as_client_parseable() -> None:
+    # JavaScript's \d matches ASCII digits only; a pair written with Unicode
+    # decimal digits must not be preserved as if the client could parse it.
+    message = rewrite_context_overflow_message(
+        "context_length_exceeded",
+        "prompt is too long: ٩٩٩ tokens > ١٠",
+        estimated_tokens=10,
+        context_window=272_000,
+    )
+    match = _CLIENT_OVERFLOW_RE.search(message)
+    assert match is not None
+    assert int(match.group(2)) == 272_000
+
+
 def test_tool_names_are_restored_from_shortened_form() -> None:
     long_name = "mcp__really-long-server-name-that-goes-on-forever__" + "t" * 40
     claude_request = {"tools": [{"name": long_name}]}
