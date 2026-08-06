@@ -1567,6 +1567,30 @@ def test_compaction_reroute_falls_back_on_invalid_json() -> None:
     assert stream.closed is True
 
 
+def test_compaction_reroute_falls_back_on_nonfinite_json_constants() -> None:
+    # json.loads would happily parse NaN into a dict, but Starlette's
+    # JSONResponse refuses to serialize it; the reroute must classify such a
+    # body as invalid_json and fall back rather than record "rerouted" and
+    # then fail the request.
+    body = _compaction_body("claude-opus-4-6")
+    window = estimate_overflow_prompt_tokens(body) - 1
+    stream = _TrackedByteStream([b'{"value": NaN}'])
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, stream=stream)
+
+    config = _compaction_config({"opus": "codex:gpt-5.1-codex-max"})
+    client, stub = _gateway(config, handler, codex_context_window=window)
+
+    response = client.post("/v1/messages", json=body, headers=_ANTHROPIC_CREDENTIAL_HEADERS)
+
+    assert response.status_code == 503
+    record = client.app.state.compaction_last_reroute
+    assert record["outcome"] == "fallback_mapped"
+    assert record["detail"] == "invalid_json"
+    assert stream.closed is True
+
+
 def test_compaction_reroute_falls_back_on_json_scalar_body() -> None:
     body = _compaction_body("claude-opus-4-6")
     window = estimate_overflow_prompt_tokens(body) - 1

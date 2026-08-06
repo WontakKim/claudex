@@ -494,6 +494,11 @@ def _rfc3339_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
 
 
+def _reject_nonfinite_json(constant: str) -> Any:
+    """`json.loads` parse_constant hook: refuse NaN/Infinity/-Infinity."""
+    raise ValueError(f"non-finite JSON constant {constant!r} in reroute response")
+
+
 def _assign_compaction_reroute(
     app_state: Any,
     *,
@@ -628,15 +633,27 @@ async def _reroute_compaction(
             record("fallback_mapped", "read_error")
             return None
         try:
-            parsed = json.loads(body)
-        except (json.JSONDecodeError, UnicodeDecodeError):
+            # json.loads accepts the non-standard NaN/Infinity constants that
+            # a strict Anthropic response can never contain and that Starlette
+            # would refuse to serialize; reject them at parse time so a
+            # malformed body falls back instead of escaping as a 500.
+            parsed = json.loads(body, parse_constant=_reject_nonfinite_json)
+        except (ValueError, RecursionError):
             record("fallback_mapped", "invalid_json")
             return None
         if not isinstance(parsed, dict):
             record("fallback_mapped", "invalid_json")
             return None
+        try:
+            # Built before the record is written: if serialization fails
+            # (lone surrogates, pathological nesting), the outcome must be
+            # fallback, never a request failure logged as "rerouted".
+            reroute_response = JSONResponse(parsed, status_code=200)
+        except (ValueError, TypeError, RecursionError):
+            record("fallback_mapped", "invalid_json")
+            return None
         record("rerouted", None)
-        return JSONResponse(parsed, status_code=200)
+        return reroute_response
     finally:
         await upstream_response.aclose()
 
