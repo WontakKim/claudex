@@ -8,7 +8,8 @@ from typing import Any
 
 import httpx
 
-from claudex_gateway.codex_auth import CodexAuthManager, CodexCredentials
+from claudex_gateway.codex_auth import CodexAuthError, CodexAuthManager, CodexCredentials
+from claudex_gateway.context_window_cache import ContextWindowCache
 
 CODEX_RESPONSES_URL = "https://chatgpt.com/backend-api/codex/responses"
 CODEX_MODELS_URL = "https://chatgpt.com/backend-api/codex/models"
@@ -34,6 +35,10 @@ class CodexClient:
     def __init__(self, auth_manager: CodexAuthManager, http_client: httpx.AsyncClient) -> None:
         self._auth_manager = auth_manager
         self._http_client = http_client
+        self._context_windows = ContextWindowCache(
+            self._fetch_context_windows,
+            expected_errors=(CodexAuthError, CodexUpstreamError, httpx.HTTPError),
+        )
 
     async def stream_responses(
         self, payload: dict[str, Any], session_id: str
@@ -57,6 +62,42 @@ class CodexClient:
 
     async def list_models(self) -> list[str]:
         """Return the visible Codex model slugs from the live catalog."""
+        models = await self._fetch_model_entries()
+        return [
+            model["slug"]
+            for model in models
+            if isinstance(model, dict)
+            and isinstance(model.get("slug"), str)
+            and model.get("visibility") != "hide"
+        ]
+
+    async def context_window(self, model: str) -> int | None:
+        """Return the cached context-window size for ``model``, or ``None``."""
+        return await self._context_windows.get(model)
+
+    async def _fetch_context_windows(self) -> dict[str, int]:
+        """Resolve a slug -> context-window map from the raw, unfiltered catalog."""
+        models = await self._fetch_model_entries()
+        windows: dict[str, int] = {}
+        for model in models:
+            if not isinstance(model, dict):
+                continue
+            slug = model.get("slug")
+            if not isinstance(slug, str) or not slug:
+                continue
+            window = self._coerce_context_window(model.get("context_window"))
+            if window is None:
+                continue
+            windows[slug] = window
+        return windows
+
+    async def _fetch_model_entries(self) -> list[Any]:
+        """GET the Codex model catalog and return its raw ``models`` list.
+
+        Raises ``CodexUpstreamError`` on any structural failure: a non-200
+        response, a non-JSON body, a non-object JSON root, or a missing/
+        non-list ``models`` field.
+        """
         credentials = await self._auth_manager.get_credentials()
         headers = self._base_headers(credentials)
         headers["Accept"] = "application/json"
@@ -71,16 +112,23 @@ class CodexClient:
             parsed = response.json()
         except json.JSONDecodeError as exc:
             raise CodexUpstreamError(502, "codex models response is not valid JSON") from exc
-        models = parsed.get("models") if isinstance(parsed, dict) else None
+        if not isinstance(parsed, dict):
+            raise CodexUpstreamError(502, "codex models response is not a JSON object")
+        models = parsed.get("models")
         if not isinstance(models, list):
             raise CodexUpstreamError(502, "codex models response has no models list")
-        return [
-            model["slug"]
-            for model in models
-            if isinstance(model, dict)
-            and isinstance(model.get("slug"), str)
-            and model.get("visibility") != "hide"
-        ]
+        return models
+
+    @staticmethod
+    def _coerce_context_window(value: Any) -> int | None:
+        """Apply the accepted-type policy for a raw ``context_window`` value."""
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, int):
+            return value if value > 0 else None
+        if isinstance(value, float) and value.is_integer():
+            return int(value) if value > 0 else None
+        return None
 
     @staticmethod
     def _base_headers(credentials: CodexCredentials) -> dict[str, str]:
