@@ -1,15 +1,26 @@
 """Tests for the Codex Responses -> Anthropic Messages response translation."""
 
 import json
+import re
 
 from claudex_gateway.translate.codex_to_claude import (
     CodexToClaudeStreamTranslator,
     assemble_claude_message,
+    estimate_overflow_prompt_tokens,
+    rewrite_context_overflow_message,
+)
+
+# Mirrors the Claude Code client's contract regex: without a match it falls
+# back to trimming 20% per retry instead of the exact actual/limit overflow.
+_CLIENT_OVERFLOW_RE = re.compile(
+    r"prompt is too long[^0-9]*(\d+)\s*tokens?\s*>\s*(\d+)", re.IGNORECASE
 )
 
 
-def _run_stream(claude_request: dict, codex_events: list[dict]) -> list[tuple[str, dict]]:
-    translator = CodexToClaudeStreamTranslator(claude_request)
+def _run_stream(
+    claude_request: dict, codex_events: list[dict], *, context_window: int | None = None
+) -> list[tuple[str, dict]]:
+    translator = CodexToClaudeStreamTranslator(claude_request, context_window=context_window)
     events: list[tuple[str, dict]] = []
     for codex_event in codex_events:
         events.extend(translator.translate_event(codex_event))
@@ -286,6 +297,186 @@ def test_prompt_too_long_message_is_not_double_prefixed() -> None:
     )
     [(_, payload)] = events
     assert payload["error"]["message"] == "prompt is too long: 300000 tokens > 272000 maximum"
+
+
+def test_context_overflow_error_event_synthesizes_numeric_pair_with_context_window() -> None:
+    claude_request = {"model": "claude-opus-4-6", "messages": [{"role": "user", "content": "hi"}]}
+    events = _run_stream(
+        claude_request,
+        [
+            {
+                "type": "error",
+                "error": {
+                    "type": "invalid_request_error",
+                    "code": "context_length_exceeded",
+                    "message": "Your input exceeds the context window of this model.",
+                },
+            }
+        ],
+        context_window=272000,
+    )
+    [(_, payload)] = events
+    message = payload["error"]["message"]
+    match = _CLIENT_OVERFLOW_RE.search(message)
+    assert match is not None
+    assert int(match.group(1)) > int(match.group(2))
+    assert "Your input exceeds the context window of this model." in message
+
+
+def test_context_overflow_failed_event_synthesizes_numeric_pair_with_context_window() -> None:
+    claude_request = {"model": "claude-opus-4-6", "messages": [{"role": "user", "content": "hi"}]}
+    events = _run_stream(
+        claude_request,
+        [
+            {
+                "type": "response.failed",
+                "response": {
+                    "error": {
+                        "code": "context_length_exceeded",
+                        "message": "Backend refused: maximum context length exceeded.",
+                    }
+                },
+            }
+        ],
+        context_window=272000,
+    )
+    [(_, payload)] = events
+    message = payload["error"]["message"]
+    match = _CLIENT_OVERFLOW_RE.search(message)
+    assert match is not None
+    assert int(match.group(1)) > int(match.group(2))
+    assert "Backend refused: maximum context length exceeded." in message
+
+
+def test_context_overflow_clamp_applies_floor_for_small_request() -> None:
+    claude_request = {"model": "m"}
+    events = _run_stream(
+        claude_request,
+        [
+            {
+                "type": "error",
+                "error": {"code": "context_length_exceeded", "message": "too many tokens"},
+            }
+        ],
+        context_window=272000,
+    )
+    [(_, payload)] = events
+    match = _CLIENT_OVERFLOW_RE.search(payload["error"]["message"])
+    assert match is not None
+    assert int(match.group(1)) == (272000 * 110 + 99) // 100
+
+
+def test_context_overflow_reports_char_based_estimate_above_floor() -> None:
+    claude_request = {"model": "m", "messages": [{"role": "user", "content": "x" * 2_000_000}]}
+    floor = (272000 * 110 + 99) // 100
+    expected = estimate_overflow_prompt_tokens(claude_request)
+    assert expected > floor  # sanity check that this fixture exercises the char-based branch
+
+    events = _run_stream(
+        claude_request,
+        [
+            {
+                "type": "error",
+                "error": {"code": "context_length_exceeded", "message": "too many tokens"},
+            }
+        ],
+        context_window=272000,
+    )
+    [(_, payload)] = events
+    match = _CLIENT_OVERFLOW_RE.search(payload["error"]["message"])
+    assert match is not None
+    assert int(match.group(1)) == expected
+
+
+def test_context_overflow_without_context_window_matches_legacy_behavior() -> None:
+    message = rewrite_context_overflow_message(
+        "context_length_exceeded", "Your input exceeds the context window of this model."
+    )
+    assert message == "prompt is too long: Your input exceeds the context window of this model."
+
+
+def test_non_overflow_error_with_context_window_is_unaffected() -> None:
+    events = _run_stream(
+        {"model": "m"},
+        [{"type": "error", "error": {"type": "rate_limit_error", "message": "slow down"}}],
+        context_window=272000,
+    )
+    assert events == [
+        ("error", {"type": "error", "error": {"type": "rate_limit_error", "message": "slow down"}})
+    ]
+
+
+def test_rewrite_context_overflow_message_is_idempotent_with_enrichment() -> None:
+    claude_request = {"model": "m"}
+    estimated_tokens = estimate_overflow_prompt_tokens(claude_request)
+    first = rewrite_context_overflow_message(
+        "context_length_exceeded",
+        "too many tokens",
+        estimated_tokens=estimated_tokens,
+        context_window=272000,
+    )
+    second = rewrite_context_overflow_message(
+        "context_length_exceeded",
+        first,
+        estimated_tokens=estimated_tokens,
+        context_window=272000,
+    )
+    assert second == first
+
+
+def test_rewrite_context_overflow_message_is_idempotent_after_neutralization() -> None:
+    first = rewrite_context_overflow_message("context_length_exceeded", "100 tokens > 200")
+    second = rewrite_context_overflow_message("context_length_exceeded", first)
+    assert second == first
+    assert _CLIENT_OVERFLOW_RE.search(first) is None
+
+
+def test_invalid_numeric_pair_with_enrichment_synthesizes_valid_pair() -> None:
+    claude_request = {"model": "m"}
+    estimated_tokens = estimate_overflow_prompt_tokens(claude_request)
+    message = rewrite_context_overflow_message(
+        "context_length_exceeded",
+        "prompt is too long: 100 tokens > 200",
+        estimated_tokens=estimated_tokens,
+        context_window=272000,
+    )
+    match = _CLIENT_OVERFLOW_RE.search(message)
+    assert match is not None
+    assert int(match.group(1)) > int(match.group(2))
+
+
+def test_invalid_numeric_pair_without_enrichment_is_neutralized() -> None:
+    message = rewrite_context_overflow_message(
+        "context_length_exceeded", "prompt is too long: 100 tokens > 200"
+    )
+    assert _CLIENT_OVERFLOW_RE.search(message) is None
+    assert "prompt is too long" in message.lower()
+
+
+def test_phraseless_invalid_pair_does_not_mint_a_poison_pair() -> None:
+    message = rewrite_context_overflow_message("context_length_exceeded", "100 tokens > 200")
+    assert "prompt is too long" in message.lower()
+    assert _CLIENT_OVERFLOW_RE.search(message) is None
+
+
+def test_phraseless_valid_pair_is_preserved_after_legacy_prefix() -> None:
+    message = rewrite_context_overflow_message("context_length_exceeded", "300 tokens > 200")
+    match = _CLIENT_OVERFLOW_RE.search(message)
+    assert match is not None
+    assert int(match.group(1)) > int(match.group(2))
+
+
+def test_invalid_pair_followed_by_second_numeric_phrase_has_no_match() -> None:
+    message = rewrite_context_overflow_message(
+        "context_length_exceeded", "100 tokens > 200 then retried with 300 tokens > 400"
+    )
+    assert _CLIENT_OVERFLOW_RE.search(message) is None
+
+
+def test_estimate_overflow_prompt_tokens_matches_ceil_chars_over_3_2() -> None:
+    claude_request = {"model": "m", "messages": [{"role": "user", "content": "x" * 100}]}
+    chars = len(json.dumps(claude_request, ensure_ascii=False))
+    assert estimate_overflow_prompt_tokens(claude_request) == (chars * 5 + 15) // 16
 
 
 def test_tool_names_are_restored_from_shortened_form() -> None:

@@ -17,11 +17,14 @@ from __future__ import annotations
 
 import itertools
 import json
+import logging
 import re
 from dataclasses import dataclass, field
 from typing import Any
 
 from claudex_gateway.translate.claude_to_codex import build_tool_name_shortening_map, shorten_call_id
+
+logger = logging.getLogger(__name__)
 
 # Claude tool_use ids only allow this alphabet.
 _TOOL_ID_SANITIZER = re.compile(r"[^a-zA-Z0-9_-]")
@@ -45,6 +48,16 @@ _CONTEXT_OVERFLOW_PHRASES = (
 )
 _CLAUDE_PROMPT_TOO_LONG = "prompt is too long"
 
+# Claude Code client parsing contract: it extracts the actual/limit token
+# counts from a matching error message and trims exactly `actual - limit`
+# leading tokens before retrying compaction. Without a match it falls back to
+# trimming 20% per retry with a 3-retry budget, which dead-ends long
+# conversations, so any numeric pair the gateway emits must satisfy this
+# pattern and be semantically valid (actual > limit >= 1).
+_PROMPT_TOO_LONG_NUMBERS_RE = re.compile(
+    r"prompt is too long[^0-9]*(\d+)\s*tokens?\s*>\s*(\d+)", re.IGNORECASE
+)
+
 ClaudeEvent = tuple[str, dict[str, Any]]
 
 
@@ -58,14 +71,64 @@ def is_context_overflow_error(code: Any, message: Any) -> bool:
     )
 
 
-def rewrite_context_overflow_message(code: Any, message: Any) -> str | None:
+def estimate_overflow_prompt_tokens(claude_request: dict[str, Any]) -> int:
+    """Estimate the actual prompt token count to report for overflow recovery.
+
+    This is the recovery-biased reporting divisor (ceil(chars / 3.2), based on
+    observed code-heavy payloads and deliberately safer than the display-path
+    /4 estimate, though not a mathematical worst-case bound). It exists solely
+    to synthesize a numeric ``prompt is too long`` pair for overflow recovery
+    and is unrelated to the count_tokens display estimate.
+    """
+    chars = len(json.dumps(claude_request, ensure_ascii=False))
+    return (chars * 5 + 15) // 16
+
+
+def rewrite_context_overflow_message(
+    code: Any,
+    message: Any,
+    *,
+    estimated_tokens: int | None = None,
+    context_window: int | None = None,
+) -> str | None:
     """Return a Claude-compatible message if the error is a context overflow, else None."""
     text = message if isinstance(message, str) else ""
     if not is_context_overflow_error(code, text):
         return None
-    if _CLAUDE_PROMPT_TOO_LONG in text.lower():
+
+    match = _PROMPT_TOO_LONG_NUMBERS_RE.search(text)
+    if match is not None and int(match.group(1)) > int(match.group(2)) >= 1:
         return text
-    return f"{_CLAUDE_PROMPT_TOO_LONG}: {text}" if text else _CLAUDE_PROMPT_TOO_LONG
+
+    if estimated_tokens is not None and context_window is not None and context_window >= 1:
+        floor = (context_window * 110 + 99) // 100
+        reported = max(estimated_tokens, floor)
+        rewritten = f"{_CLAUDE_PROMPT_TOO_LONG}: {reported} tokens > {context_window}"
+        return f"{rewritten} ({text})" if text else rewritten
+
+    if _CLAUDE_PROMPT_TOO_LONG in text.lower():
+        candidate = text
+    else:
+        candidate = f"{_CLAUDE_PROMPT_TOO_LONG}: {text}" if text else _CLAUDE_PROMPT_TOO_LONG
+
+    candidate_match = _PROMPT_TOO_LONG_NUMBERS_RE.search(candidate)
+    if candidate_match is None or int(candidate_match.group(1)) > int(candidate_match.group(2)) >= 1:
+        return candidate
+
+    # The legacy prefix minted an unverified/invalid numeric pair (e.g. the
+    # original message already had one, or contained a phrase-less "X tokens
+    # > Y" sequence). Neutralize every such pair by breaking its `>`
+    # separator so Claude Code's client regex can't misparse it and instead
+    # falls back to its conservative 20%-per-retry trimming.
+    neutralized = candidate
+    while True:
+        poison_match = _PROMPT_TOO_LONG_NUMBERS_RE.search(neutralized)
+        if poison_match is None:
+            break
+        start, end = poison_match.span()
+        neutralized = neutralized[:start] + neutralized[start:end].replace(">", "/", 1) + neutralized[end:]
+    logger.warning("Neutralized invalid overflow token pair in message: %s", text[:200])
+    return neutralized
 
 
 def sanitize_claude_tool_id(tool_id: str) -> str:
@@ -134,6 +197,7 @@ class CodexToClaudeStreamTranslator:
     """Stateful translator; feed it Codex SSE data payloads in stream order."""
 
     claude_request: dict[str, Any]
+    context_window: int | None = None
 
     _short_to_original: dict[str, str] = field(init=False)
     _block_index: int = 0
@@ -197,7 +261,7 @@ class CodexToClaudeStreamTranslator:
         message = error.get("message") or event.get("message") or error.get("code") or error_type
         if error.get("code") == "cyber_policy" or error_type == "invalid_request":
             error_type = "invalid_request_error"
-        rewritten = rewrite_context_overflow_message(error.get("code"), message)
+        rewritten = self._rewrite_overflow_message(error.get("code"), message)
         if rewritten is not None:
             error_type = "invalid_request_error"
             message = rewritten
@@ -208,11 +272,28 @@ class CodexToClaudeStreamTranslator:
         error = response.get("error") or {}
         message = error.get("message") or "Codex response failed"
         error_type = "api_error"
-        rewritten = rewrite_context_overflow_message(error.get("code"), message)
+        rewritten = self._rewrite_overflow_message(error.get("code"), message)
         if rewritten is not None:
             error_type = "invalid_request_error"
             message = rewritten
         return [("error", {"type": "error", "error": {"type": error_type, "message": message}})]
+
+    def _rewrite_overflow_message(self, code: Any, message: Any) -> str | None:
+        """Rewrite an overflow error message, enriching it with a numeric pair.
+
+        Estimation only runs for context-overflow errors, and only when this
+        translator carries a `context_window`; non-overflow errors and
+        translators without a configured window are untouched.
+        """
+        text = message if isinstance(message, str) else ""
+        if not is_context_overflow_error(code, text):
+            return None
+        if self.context_window is None:
+            return rewrite_context_overflow_message(code, text)
+        estimated_tokens = estimate_overflow_prompt_tokens(self.claude_request)
+        return rewrite_context_overflow_message(
+            code, text, estimated_tokens=estimated_tokens, context_window=self.context_window
+        )
 
     def _on_completed(self, event: dict[str, Any]) -> list[ClaudeEvent]:
         response = event.get("response") or {}
