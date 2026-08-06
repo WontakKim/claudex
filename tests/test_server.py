@@ -1360,6 +1360,14 @@ def _pinned_reroute_record_keys() -> set[str]:
     }
 
 
+def _parse_sse_error(raw: bytes) -> dict[str, Any]:
+    """Parse the JSON payload out of a single, parseable `event: error` frame."""
+    text = raw.decode()
+    assert "event: error" in text
+    data_line = next(line for line in text.splitlines() if line.startswith("data:"))
+    return json.loads(data_line[len("data:") :].strip())
+
+
 def test_compaction_reroute_success_returns_anthropic_response_and_records_diagnostics() -> None:
     body = _compaction_body("claude-opus-4-6")
     expected_estimate = estimate_overflow_prompt_tokens(body)
@@ -1926,28 +1934,413 @@ def test_compaction_reroute_never_reenters_the_model_map_via_the_canonical_targe
     assert stub.payloads == []
 
 
-def test_compaction_stream_true_over_window_stays_on_mapped_path_without_diagnostics() -> None:
-    # Temporary T-5 carve-out: stream:true over-window requests are not
-    # rerouted and write no diagnostics record until T-6 completes the
-    # commit-once streaming relay semantics.
+# --- /v1/messages routing: compaction reroute trigger, stream:true (T-6) --
+# stream:true shares every pre-commit step with stream:false (T-5 above): an
+# HTTP 2xx response is the sole commit boundary, not the first relayed byte.
+# Once committed, `_relay_compaction_stream` owns the upstream response and
+# relays `aiter_bytes()` unchanged; these tests exercise both the full
+# `/v1/messages` round trip (via `_gateway`/`_TrackedByteStream`) and, for
+# the ownership/closure properties, `_relay_compaction_stream` directly --
+# the same style already used above for `_translate_claude_sse`.
+
+
+def test_compaction_stream_reroute_success_relays_sse_bytes_and_headers() -> None:
+    body = _compaction_body("claude-opus-4-6")
+    body["stream"] = True
+    expected_estimate = estimate_overflow_prompt_tokens(body)
+    window = expected_estimate - 1
+    captured: list[httpx.Request] = []
+    chunks = [
+        b'event: message_start\ndata: {"type": "message_start"}\n\n',
+        b'event: content_block_delta\ndata: {"type": "content_block_delta"}\n\n',
+        b'event: message_stop\ndata: {"type": "message_stop"}\n\n',
+    ]
+    stream = _TrackedByteStream(chunks)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(
+            200,
+            stream=stream,
+            headers={
+                "content-type": "text/event-stream",
+                # Deliberately upstream-only headers: none of these may leak
+                # into the client-facing response.
+                "content-length": "999",
+                "transfer-encoding": "chunked",
+                "connection": "keep-alive",
+                "set-cookie": "sid=abc",
+                "content-encoding": "identity",
+            },
+        )
+
+    config = _compaction_config({"opus": "codex:gpt-5.1-codex-max"})
+    client, stub = _gateway(config, handler, codex_context_window=window)
+
+    response = client.post("/v1/messages", json=body, headers=_ANTHROPIC_CREDENTIAL_HEADERS)
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/event-stream")
+    assert response.headers["cache-control"] == "no-cache"
+    assert response.content == b"".join(chunks)  # exact byte ordering, unmodified
+    assert stub.payloads == []  # translation never ran; the 2xx already committed
+    assert len(captured) == 1
+    assert stream.closed is True
+
+    for forbidden in (
+        "content-length",
+        "content-encoding",
+        "transfer-encoding",
+        "connection",
+        "set-cookie",
+    ):
+        assert forbidden not in response.headers
+
+    record = client.app.state.compaction_last_reroute
+    assert set(record) == _pinned_reroute_record_keys()
+    assert record["outcome"] == "rerouted"
+    assert record["detail"] is None
+    assert record["target_model"] == _COMPACTION_CANONICAL_TARGET
+    assert record["mapped_model"] == "codex:gpt-5.1-codex-max"
+    assert record["context_window"] == window
+    assert record["estimated_prompt_tokens"] == expected_estimate
+
+
+def test_compaction_stream_reroute_falls_back_on_non_2xx_status_and_closes_response() -> None:
     body = _compaction_body("claude-opus-4-6")
     body["stream"] = True
     window = estimate_overflow_prompt_tokens(body) - 1
     captured: list[httpx.Request] = []
+    stream = _TrackedByteStream([b'{"error": {"message": "invalid x-api-key"}}'])
 
     def handler(request: httpx.Request) -> httpx.Response:
         captured.append(request)
-        return httpx.Response(500, json={"error": "unexpected anthropic call"})
+        return httpx.Response(401, stream=stream)
 
-    config = _compaction_config({"opus": "codex:gpt-5.6-sol"})
+    config = _compaction_config({"opus": "codex:gpt-5.1-codex-max"})
     client, stub = _gateway(config, handler, codex_context_window=window)
 
     response = client.post("/v1/messages", json=body, headers=_ANTHROPIC_CREDENTIAL_HEADERS)
 
     assert response.status_code == 503
-    assert captured == []
-    assert stub.payloads  # the mapped path ran normally
-    assert client.app.state.compaction_last_reroute is None
+    assert len(captured) == 1  # exactly one Anthropic attempt, no retry
+    assert stub.payloads  # fallback ran translation against the mapped backend
+
+    record = client.app.state.compaction_last_reroute
+    assert record["outcome"] == "fallback_mapped"
+    assert record["detail"] == "http_401"
+    assert stream.closed is True
+
+
+def test_compaction_stream_reroute_falls_back_on_3xx_without_following_redirect() -> None:
+    body = _compaction_body("claude-opus-4-6")
+    body["stream"] = True
+    window = estimate_overflow_prompt_tokens(body) - 1
+    captured: list[httpx.Request] = []
+    stream = _TrackedByteStream([b""])
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(
+            307, headers={"location": "https://api.anthropic.com/v1/messages"}, stream=stream
+        )
+
+    config = _compaction_config({"opus": "codex:gpt-5.1-codex-max"})
+    client, stub = _gateway(config, handler, codex_context_window=window)
+
+    response = client.post("/v1/messages", json=body, headers=_ANTHROPIC_CREDENTIAL_HEADERS)
+
+    assert response.status_code == 503
+    # The redirect target is never followed: exactly one outbound request.
+    assert len(captured) == 1
+    record = client.app.state.compaction_last_reroute
+    assert record["outcome"] == "fallback_mapped"
+    assert record["detail"] == "http_307"
+    assert stream.closed is True
+
+
+def test_compaction_stream_reroute_falls_back_on_connect_error() -> None:
+    body = _compaction_body("claude-opus-4-6")
+    body["stream"] = True
+    window = estimate_overflow_prompt_tokens(body) - 1
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused")
+
+    config = _compaction_config({"opus": "codex:gpt-5.1-codex-max"})
+    client, stub = _gateway(config, handler, codex_context_window=window)
+
+    response = client.post("/v1/messages", json=body, headers=_ANTHROPIC_CREDENTIAL_HEADERS)
+
+    assert response.status_code == 503
+    record = client.app.state.compaction_last_reroute
+    assert record["outcome"] == "fallback_mapped"
+    assert record["detail"] == "connect_error"
+
+
+def test_compaction_stream_reroute_fallback_translates_untouched_original_body_with_thinking_block(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    received: list[dict[str, Any]] = []
+
+    def recording_translate(
+        claude_request: dict[str, Any], upstream_model: str, reasoning_effort_override: str | None
+    ) -> dict[str, Any]:
+        # A deep, JSON-round-tripped copy: proves equality without ever
+        # aliasing the mutable dict the caller still holds.
+        received.append(json.loads(json.dumps(claude_request)))
+        return translate_claude_request_to_codex(
+            claude_request, upstream_model, reasoning_effort_override
+        )
+
+    monkeypatch.setattr(server, "translate_claude_request_to_codex", recording_translate)
+
+    body = _compaction_body("claude-opus-4-6", thinking_block=True)
+    body["stream"] = True
+    window = estimate_overflow_prompt_tokens(body) - 1
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(401, json={"error": {"message": "bad key"}})
+
+    config = _compaction_config({"opus": "codex:gpt-5.1-codex-max"})
+    client, stub = _gateway(config, handler, codex_context_window=window)
+
+    response = client.post("/v1/messages", json=body, headers=_ANTHROPIC_CREDENTIAL_HEADERS)
+
+    assert response.status_code == 503
+    assert len(received) == 1
+    assert received[0] == body  # untouched original body: stream:true, thinking block included
+    assert any(
+        block.get("type") == "thinking"
+        for message in received[0]["messages"]
+        if isinstance(message.get("content"), list)
+        for block in message["content"]
+    )
+    # One catalog lookup total: the trigger's own lookup is reused by the
+    # mapped fallback instead of being repeated.
+    assert stub.context_window_calls == ["gpt-5.1-codex-max"]
+
+
+def test_compaction_stream_reroute_read_failure_after_first_byte_emits_error_event_and_records_midstream_error() -> None:
+    body = _compaction_body("claude-opus-4-6")
+    body["stream"] = True
+    window = estimate_overflow_prompt_tokens(body) - 1
+    first_chunk = b'event: message_start\ndata: {"type": "message_start"}\n\n'
+    stream = _TrackedByteStream([first_chunk], httpx.ReadError("connection reset"))
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, stream=stream, headers={"content-type": "text/event-stream"})
+
+    config = _compaction_config({"opus": "codex:gpt-5.1-codex-max"})
+    client, stub = _gateway(config, handler, codex_context_window=window)
+
+    response = client.post("/v1/messages", json=body, headers=_ANTHROPIC_CREDENTIAL_HEADERS)
+
+    # The status line already committed the response; a mid-stream failure
+    # can only be reported in-band, never by falling back to the mapped path.
+    assert response.status_code == 200
+    assert response.content.startswith(first_chunk)
+    assert stub.payloads == []
+    tail = response.content[len(first_chunk) :]
+    assert tail.startswith(b"\n\n")  # forced event boundary before the injected event
+    error_payload = _parse_sse_error(tail)
+    assert error_payload["type"] == "error"
+    assert error_payload["error"]["type"] == "api_error"
+    assert isinstance(error_payload["error"]["message"], str)
+    assert "connection reset" not in response.content.decode()  # no raw exception text
+    assert stream.closed is True
+
+    record = client.app.state.compaction_last_reroute
+    assert record["outcome"] == "midstream_error"
+    assert record["detail"] == "read_error"
+    # Every other pinned field from the original "rerouted" record survives.
+    assert record["target_model"] == _COMPACTION_CANONICAL_TARGET
+    assert record["mapped_model"] == "codex:gpt-5.1-codex-max"
+    assert record["context_window"] == window
+
+
+def test_compaction_stream_reroute_read_failure_before_first_byte_never_invokes_mapped_backend() -> None:
+    body = _compaction_body("claude-opus-4-6")
+    body["stream"] = True
+    window = estimate_overflow_prompt_tokens(body) - 1
+    stream = _TrackedByteStream([], httpx.ReadError("connection reset before any byte"))
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, stream=stream, headers={"content-type": "text/event-stream"})
+
+    config = _compaction_config({"opus": "codex:gpt-5.1-codex-max"})
+    client, stub = _gateway(config, handler, codex_context_window=window)
+
+    response = client.post("/v1/messages", json=body, headers=_ANTHROPIC_CREDENTIAL_HEADERS)
+
+    # Locks the commit-point ruling: HTTP 2xx acceptance -- not the first
+    # relayed byte -- is the boundary, so the mapped backend must never run
+    # even though no chunk ever reached the client.
+    assert response.status_code == 200
+    assert stub.payloads == []
+    error_payload = _parse_sse_error(response.content)
+    assert error_payload["type"] == "error"
+    assert error_payload["error"]["type"] == "api_error"
+    assert stream.closed is True
+
+    record = client.app.state.compaction_last_reroute
+    assert record["outcome"] == "midstream_error"
+    assert record["detail"] == "read_error"
+
+
+def test_compaction_stream_reroute_first_sse_event_is_error_relayed_unchanged_without_fallback() -> None:
+    body = _compaction_body("claude-opus-4-6")
+    body["stream"] = True
+    window = estimate_overflow_prompt_tokens(body) - 1
+    error_chunk = (
+        b"event: error\n"
+        b'data: {"type": "error", "error": {"type": "overloaded_error", "message": "busy"}}\n\n'
+    )
+    stream = _TrackedByteStream([error_chunk])
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, stream=stream, headers={"content-type": "text/event-stream"})
+
+    config = _compaction_config({"opus": "codex:gpt-5.1-codex-max"})
+    client, stub = _gateway(config, handler, codex_context_window=window)
+
+    response = client.post("/v1/messages", json=body, headers=_ANTHROPIC_CREDENTIAL_HEADERS)
+
+    # A 2xx status line already commits the reroute; the gateway never peeks
+    # at or special-cases the first event to decide whether to fall back.
+    assert response.status_code == 200
+    assert response.content == error_chunk  # relayed byte-for-byte, unmodified
+    assert stub.payloads == []
+
+    record = client.app.state.compaction_last_reroute
+    assert record["outcome"] == "rerouted"
+    assert record["detail"] is None
+    assert stream.closed is True
+
+
+def test_relay_compaction_stream_explicit_close_closes_upstream_response() -> None:
+    stream = _TrackedByteStream([b"event: a\ndata: {}\n\n", b"event: b\ndata: {}\n\n"])
+    upstream_response = httpx.Response(
+        200, stream=stream, headers={"content-type": "text/event-stream"}
+    )
+    app_state = SimpleNamespace(compaction_last_reroute=None, compaction_reroute_sequence=0)
+    sequence = server._assign_compaction_reroute(
+        app_state,
+        outcome="rerouted",
+        target_model=_COMPACTION_CANONICAL_TARGET,
+        mapped_model="codex:gpt-5.1-codex-max",
+        estimated_prompt_tokens=10,
+        context_window=5,
+        detail=None,
+    )
+
+    async def scenario() -> None:
+        relay = server._relay_compaction_stream(upstream_response, app_state, sequence)
+        first = await anext(relay)
+        assert first == b"event: a\ndata: {}\n\n"
+        await relay.aclose()
+
+    asyncio.run(scenario())
+
+    assert stream.closed is True
+    # An explicit close is neither an httpx.HTTPError nor a cancellation, so
+    # the already-committed "rerouted" record is left untouched.
+    assert app_state.compaction_last_reroute["outcome"] == "rerouted"
+
+
+def test_relay_compaction_stream_cancellation_closes_upstream_response() -> None:
+    class _HangingByteStream(httpx.AsyncByteStream):
+        """Yields one chunk, then hangs until cancelled; records aclose()."""
+
+        def __init__(self, first_chunk: bytes) -> None:
+            self._first_chunk = first_chunk
+            self.closed = False
+
+        async def __aiter__(self) -> AsyncIterator[bytes]:
+            yield self._first_chunk
+            await asyncio.Event().wait()
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    stream = _HangingByteStream(b"event: ping\ndata: {}\n\n")
+    upstream_response = httpx.Response(
+        200, stream=stream, headers={"content-type": "text/event-stream"}
+    )
+    app_state = SimpleNamespace(compaction_last_reroute=None, compaction_reroute_sequence=0)
+    sequence = server._assign_compaction_reroute(
+        app_state,
+        outcome="rerouted",
+        target_model=_COMPACTION_CANONICAL_TARGET,
+        mapped_model="codex:gpt-5.1-codex-max",
+        estimated_prompt_tokens=10,
+        context_window=5,
+        detail=None,
+    )
+    first_chunk_seen = asyncio.Event()
+
+    async def consume() -> None:
+        async for _chunk in server._relay_compaction_stream(upstream_response, app_state, sequence):
+            first_chunk_seen.set()
+
+    async def scenario() -> None:
+        task = asyncio.create_task(consume())
+        await first_chunk_seen.wait()
+        await asyncio.sleep(0)  # let the consumer block awaiting the next chunk
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(scenario())
+
+    assert stream.closed is True
+    # asyncio.CancelledError is not an httpx.HTTPError: it must propagate
+    # instead of being swallowed, and must not upgrade the diagnostics record.
+    assert app_state.compaction_last_reroute["outcome"] == "rerouted"
+
+
+def test_relay_compaction_stream_stale_failure_does_not_clobber_newer_record() -> None:
+    # Request A commits (sequence N); request B then writes its own fresh
+    # record (sequence N+1); only afterward does request A's stream fail.
+    app_state = SimpleNamespace(compaction_last_reroute=None, compaction_reroute_sequence=0)
+
+    sequence_a = server._assign_compaction_reroute(
+        app_state,
+        outcome="rerouted",
+        target_model=_COMPACTION_CANONICAL_TARGET,
+        mapped_model="codex:gpt-5.1-codex-max",
+        estimated_prompt_tokens=100,
+        context_window=50,
+        detail=None,
+    )
+    server._assign_compaction_reroute(
+        app_state,
+        outcome="rerouted",
+        target_model=_COMPACTION_CANONICAL_TARGET,
+        mapped_model="codex:gpt-5.2-codex-max",
+        estimated_prompt_tokens=200,
+        context_window=90,
+        detail=None,
+    )
+    record_b = dict(app_state.compaction_last_reroute)
+
+    stream = _TrackedByteStream(
+        [b"event: message_start\ndata: {}\n\n"], httpx.ReadError("connection reset")
+    )
+    upstream_response = httpx.Response(
+        200, stream=stream, headers={"content-type": "text/event-stream"}
+    )
+
+    async def drain() -> None:
+        async for _chunk in server._relay_compaction_stream(
+            upstream_response, app_state, sequence_a
+        ):
+            pass
+
+    asyncio.run(drain())
+
+    # Stale request A's failure must never clobber request B's newer record.
+    assert app_state.compaction_last_reroute == record_b
 
 
 # --- upstream stream ownership -------------------------------------------

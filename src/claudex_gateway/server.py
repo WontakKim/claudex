@@ -563,7 +563,7 @@ async def _reroute_compaction(
     mapped_model: str,
     estimated_prompt_tokens: int,
     context_window: int,
-) -> JSONResponse | None:
+) -> JSONResponse | StreamingResponse | None:
     """Attempt the compaction reroute call to Anthropic; `None` means fall back.
 
     Builds a direct, credential-scoped `POST` to
@@ -577,16 +577,19 @@ async def _reroute_compaction(
     triggered request, and every 3xx response is treated as a non-2xx
     outcome rather than a followed redirect.
 
-    Only the `stream:false` branch is implemented here; a `stream:true`
-    request is a temporary carve-out that stays on the mapped path without a
-    reroute attempt or a diagnostics record until T-6 implements the
-    commit-once streaming relay.
+    `stream:false` and `stream:true` share every step through the HTTP
+    response: only an HTTP 2xx status commits the reroute, and any transport
+    failure or non-2xx status before that point falls back to the mapped
+    path with the untouched original body, closing the response without
+    reading or logging it. Once 2xx is accepted, `stream:false` reads and
+    re-serves the whole JSON body here; `stream:true` hands the still-open
+    response to `_relay_compaction_stream`, which owns it from that point on
+    and relays `aiter_bytes()` unchanged as the returned `StreamingResponse`
+    body.
     """
-    if claude_request.get("stream"):
-        return None
 
-    def record(outcome: str, detail: str | None) -> None:
-        _assign_compaction_reroute(
+    def record(outcome: str, detail: str | None) -> int:
+        return _assign_compaction_reroute(
             request.app.state,
             outcome=outcome,
             target_model=target_model,
@@ -619,13 +622,26 @@ async def _reroute_compaction(
         record("fallback_mapped", "connect_error")
         return None
 
+    if not 200 <= upstream_response.status_code < 300:
+        logger.warning(
+            "compaction reroute upstream returned %s", upstream_response.status_code
+        )
+        record("fallback_mapped", f"http_{upstream_response.status_code}")
+        await upstream_response.aclose()
+        return None
+
+    if claude_request.get("stream"):
+        # Commit point: HTTP 2xx acceptance, not the first relayed byte.
+        # From here on, _relay_compaction_stream owns upstream_response; it
+        # is never closed in this function again.
+        sequence = record("rerouted", None)
+        return StreamingResponse(
+            _relay_compaction_stream(upstream_response, request.app.state, sequence),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache"},
+        )
+
     try:
-        if not 200 <= upstream_response.status_code < 300:
-            logger.warning(
-                "compaction reroute upstream returned %s", upstream_response.status_code
-            )
-            record("fallback_mapped", f"http_{upstream_response.status_code}")
-            return None
         try:
             body = await upstream_response.aread()
         except httpx.HTTPError as exc:
@@ -654,6 +670,42 @@ async def _reroute_compaction(
             return None
         record("rerouted", None)
         return reroute_response
+    finally:
+        await upstream_response.aclose()
+
+
+async def _relay_compaction_stream(
+    upstream_response: httpx.Response,
+    app_state: Any,
+    sequence: int,
+) -> AsyncIterator[bytes]:
+    """Relay `upstream_response.aiter_bytes()` unchanged; owns `upstream_response`.
+
+    Starlette never closes body iterators, so every exit here — normal
+    exhaustion, a mid-stream `httpx.HTTPError`, cancellation, or an explicit
+    iterator close — must release the Anthropic HTTP stream via `finally`.
+
+    The reroute already committed (`rerouted`) before this generator starts,
+    so a mid-stream `httpx.HTTPError` can only be reported in-band: an event
+    boundary followed by a parseable `event: error` using the existing
+    Claude error envelope, with no raw exception text. That failure also
+    upgrades this request's diagnostics record to `midstream_error`/
+    `read_error` via the compare-and-swap helper, but only while `sequence`
+    is still current — a stale failure must never clobber a newer request's
+    own record.
+    """
+    try:
+        async for chunk in upstream_response.aiter_bytes():
+            yield chunk
+    except httpx.HTTPError as exc:
+        logger.warning("compaction reroute stream aborted: %r", exc)
+        yield b"\n\n" + _format_sse(
+            "error",
+            _claude_error_body("api_error", "compaction reroute stream aborted"),
+        ).encode()
+        _replace_compaction_reroute_if_current(
+            app_state, sequence, outcome="midstream_error", detail="read_error"
+        )
     finally:
         await upstream_response.aclose()
 
