@@ -173,7 +173,11 @@ class GrokClient:
             raise GrokUpstreamError(response.status_code, response.text)
         try:
             parsed = response.json()
-        except json.JSONDecodeError as exc:
+        except ValueError as exc:
+            # ValueError covers JSONDecodeError, UnicodeDecodeError, and the
+            # int-conversion digit limit — every decode failure must surface
+            # as a structural catalog failure the context-window cache can
+            # treat as a failed refresh.
             raise GrokUpstreamError(502, "grok models response is not valid JSON") from exc
         data = parsed.get("data") if isinstance(parsed, dict) else None
         if not isinstance(data, list):

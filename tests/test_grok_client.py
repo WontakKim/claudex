@@ -306,6 +306,36 @@ class TestContextWindow:
         assert second == 500000
         assert calls["n"] == 2
 
+    def test_non_json_decode_failure_degrades_like_structural_failure(self) -> None:
+        # A 200 response whose body raises a non-JSONDecodeError ValueError
+        # (undecodable bytes -> UnicodeDecodeError) must degrade like any
+        # structural failure: cold cache -> None, warm cache -> stale value.
+        calls = {"n": 0}
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            calls["n"] += 1
+            if calls["n"] == 2:
+                return self._catalog_response([{"id": "grok-4.5", "context_window": 500000}])
+            return httpx.Response(
+                200, content=b"\xff\xfe\xff", headers={"Content-Type": "application/json"}
+            )
+
+        async def scenario() -> tuple[int | None, int | None, int | None]:
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+                client = GrokClient(_FakeAuthManager(), http_client)
+                cold = await client.context_window("grok-4.5")
+                client._context_windows._failure_time = None
+                warm = await client.context_window("grok-4.5")
+                client._context_windows._snapshot_time = 0.0
+                stale = await client.context_window("grok-4.5")
+                return cold, warm, stale
+
+        cold, warm, stale = asyncio.run(scenario())
+        assert cold is None
+        assert warm == 500000
+        assert stale == 500000
+        assert calls["n"] == 3
+
     def test_list_models_still_fetches_fresh_after_context_window_populates_cache(self) -> None:
         calls = {"n": 0}
 

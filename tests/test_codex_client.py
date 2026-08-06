@@ -163,6 +163,40 @@ def test_cold_cache_structural_failure_returns_none() -> None:
     assert asyncio.run(scenario()) is None
 
 
+def test_non_json_decode_failure_degrades_like_structural_failure() -> None:
+    # A 200 response whose body fails to decode with a non-JSONDecodeError
+    # ValueError (here: undecodable bytes -> UnicodeDecodeError) must behave
+    # exactly like any structural catalog failure: cold cache -> None, warm
+    # cache -> stale value served.
+    calls = {"n": 0}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] == 2:
+            return httpx.Response(200, json={"models": _CATALOG_MODELS})
+        return httpx.Response(
+            200, content=b"\xff\xfe\xff", headers={"Content-Type": "application/json"}
+        )
+
+    async def scenario() -> tuple[int | None, int | None, int | None]:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+            client = CodexClient(_FakeAuthManager(), http_client)
+            cold = await client.context_window("gpt-5.6-sol")
+            # Clear the failure backoff so the next lookup refreshes.
+            client._context_windows._failure_time = None
+            warm = await client.context_window("gpt-5.6-sol")
+            client._context_windows._snapshot_time = 0.0
+            stale = await client.context_window("gpt-5.6-sol")
+            return cold, warm, stale
+
+    cold, warm, stale = asyncio.run(scenario())
+
+    assert cold is None
+    assert warm == 272000
+    assert stale == 272000
+    assert calls["n"] == 3
+
+
 def test_list_models_fetches_fresh_after_context_window_populated_cache() -> None:
     calls = {"n": 0}
 
