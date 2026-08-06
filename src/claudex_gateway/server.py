@@ -44,7 +44,11 @@ from claudex_gateway.translate import (
     assemble_claude_message,
     translate_claude_request_to_codex,
 )
-from claudex_gateway.translate.codex_to_claude import rewrite_context_overflow_message
+from claudex_gateway.translate.codex_to_claude import (
+    estimate_overflow_prompt_tokens,
+    is_context_overflow_error,
+    rewrite_context_overflow_message,
+)
 from claudex_gateway.usage import (
     consume_codex_reset_credit,
     fetch_claude_usage,
@@ -148,12 +152,28 @@ def _upstream_error_code(body: str) -> str | None:
 
 def _upstream_error_to_claude(
     exc: CodexUpstreamError | GrokUpstreamError,
+    *,
+    claude_request: dict[str, Any] | None = None,
+    context_window: int | None = None,
 ) -> tuple[int, dict[str, Any]]:
     error_type = _STATUS_TO_CLAUDE_ERROR_TYPE.get(exc.status_code, "api_error")
     message = _upstream_error_message(exc.body)
-    # The overflow rewrite keys on the Codex backend's specific error code, so
-    # it stays a no-op for Grok errors.
-    rewritten = rewrite_context_overflow_message(_upstream_error_code(exc.body), message)
+    code = _upstream_error_code(exc.body)
+    # Overflow classification is provider-neutral (shared error-code and
+    # phrase matching in translate.codex_to_claude), so it applies to both
+    # Codex and Grok errors alike; when the caller supplies both the request
+    # and a catalog-resolved context window, the rewrite is enriched with the
+    # `<actual> tokens > <limit>` pair Claude Code's client needs to compact.
+    estimated_tokens = None
+    if (
+        claude_request is not None
+        and context_window is not None
+        and is_context_overflow_error(code, message)
+    ):
+        estimated_tokens = estimate_overflow_prompt_tokens(claude_request)
+    rewritten = rewrite_context_overflow_message(
+        code, message, estimated_tokens=estimated_tokens, context_window=context_window
+    )
     if rewritten is not None:
         # Anthropic reports context overflow as 400 invalid_request_error.
         return 400, _claude_error_body("invalid_request_error", rewritten)
@@ -369,6 +389,11 @@ async def _relay_via_responses_backend(
         len(payload.get("tools") or []),
     )
 
+    # Resolved once per request from the provider's own catalog cache (the
+    # client instance is long-lived on request.app.state), so a successful
+    # request pays only this cached lookup, never a catalog roundtrip here.
+    context_window = await client.context_window(upstream_model)
+
     event_stream = client.stream_responses(payload, session_id)
     try:
         first_event = await anext(event_stream, None)
@@ -378,7 +403,9 @@ async def _relay_via_responses_backend(
                 status_code=502,
             )
     except (CodexUpstreamError, GrokUpstreamError) as exc:
-        status_code, body = _upstream_error_to_claude(exc)
+        status_code, body = _upstream_error_to_claude(
+            exc, claude_request=claude_request, context_window=context_window
+        )
         logger.warning(
             "%s upstream error %s: %s", provider, exc.status_code, body["error"]["message"]
         )
@@ -406,23 +433,27 @@ async def _relay_via_responses_backend(
 
     if claude_request.get("stream"):
         return StreamingResponse(
-            _translate_claude_sse(claude_request, upstream_events()),
+            _translate_claude_sse(claude_request, upstream_events(), context_window),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache"},
         )
-    return await _aggregate_claude_response(claude_request, upstream_events())
+    return await _aggregate_claude_response(claude_request, upstream_events(), context_window)
 
 
 async def _translate_claude_sse(
-    claude_request: dict[str, Any], upstream_events: AsyncGenerator[dict[str, Any], None]
+    claude_request: dict[str, Any],
+    upstream_events: AsyncGenerator[dict[str, Any], None],
+    context_window: int | None = None,
 ) -> AsyncIterator[str]:
-    translator = CodexToClaudeStreamTranslator(claude_request)
+    translator = CodexToClaudeStreamTranslator(claude_request, context_window=context_window)
     try:
         async for event in upstream_events:
             for event_name, payload in translator.translate_event(event):
                 yield _format_sse(event_name, payload)
     except (CodexUpstreamError, GrokUpstreamError) as exc:
-        _, body = _upstream_error_to_claude(exc)
+        _, body = _upstream_error_to_claude(
+            exc, claude_request=claude_request, context_window=context_window
+        )
         yield _format_sse("error", body)
     except (CodexAuthError, GrokAuthError, httpx.HTTPError) as exc:
         logger.warning("responses stream aborted: %s", exc)
@@ -437,9 +468,11 @@ async def _translate_claude_sse(
 
 
 async def _aggregate_claude_response(
-    claude_request: dict[str, Any], upstream_events: AsyncGenerator[dict[str, Any], None]
+    claude_request: dict[str, Any],
+    upstream_events: AsyncGenerator[dict[str, Any], None],
+    context_window: int | None = None,
 ) -> JSONResponse:
-    translator = CodexToClaudeStreamTranslator(claude_request)
+    translator = CodexToClaudeStreamTranslator(claude_request, context_window=context_window)
     claude_events: list[tuple[str, dict[str, Any]]] = []
     try:
         async for event in upstream_events:
@@ -451,7 +484,9 @@ async def _aggregate_claude_response(
                     return JSONResponse(payload, status_code=status_code)
                 claude_events.append(translated)
     except (CodexUpstreamError, GrokUpstreamError) as exc:
-        status_code, body = _upstream_error_to_claude(exc)
+        status_code, body = _upstream_error_to_claude(
+            exc, claude_request=claude_request, context_window=context_window
+        )
         return JSONResponse(body, status_code=status_code)
     except (CodexAuthError, GrokAuthError) as exc:
         return JSONResponse(_claude_error_body("authentication_error", str(exc)), status_code=401)

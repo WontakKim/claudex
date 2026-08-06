@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import socket
 import struct
 import threading
@@ -50,6 +51,9 @@ class FakeCodexClient:
     def __init__(self, *_args: Any, **_kwargs: Any) -> None:
         pass
 
+    async def context_window(self, model: str) -> int | None:
+        return None
+
 
 class AvailableKimiAuthManager:
     def __init__(self, *_args: Any, **_kwargs: Any) -> None:
@@ -87,6 +91,9 @@ class MissingGrokAuthManager(AvailableGrokAuthManager):
 class FakeGrokClient:
     def __init__(self, *_args: Any, **_kwargs: Any) -> None:
         pass
+
+    async def context_window(self, model: str) -> int | None:
+        return None
 
 
 def _create_test_client(
@@ -228,6 +235,18 @@ def _upstream_error(status_code: int, error: dict) -> CodexUpstreamError:
     return CodexUpstreamError(status_code, json.dumps({"error": error}))
 
 
+# Mirrors the Claude Code client's own overflow-message parser: it extracts
+# the actual/limit token counts and trims exactly `actual - limit` leading
+# tokens before retrying compaction.
+_CLIENT_OVERFLOW_NUMBERS_RE = re.compile(
+    r"prompt is too long[^0-9]*(\d+)\s*tokens?\s*>\s*(\d+)", re.IGNORECASE
+)
+
+
+def _overflow_error_body(message: str) -> str:
+    return json.dumps({"error": {"code": "context_length_exceeded", "message": message}})
+
+
 def test_context_overflow_http_error_is_rewritten_for_claude_compaction() -> None:
     status_code, body = server._upstream_error_to_claude(
         _upstream_error(
@@ -269,12 +288,21 @@ def test_non_overflow_error_passes_through_unchanged() -> None:
 class StubCodexClient:
     """Records translated payloads, then fails with a recognizable error."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        context_window: int | None = None,
+        error: CodexUpstreamError | None = None,
+    ) -> None:
         self.payloads: list[dict[str, Any]] = []
+        self._context_window = context_window
+        self._error = error or CodexUpstreamError(503, "stub codex upstream")
+
+    async def context_window(self, model: str) -> int | None:
+        return self._context_window
 
     async def stream_responses(self, payload: dict[str, Any], session_id: str):
         self.payloads.append(payload)
-        raise CodexUpstreamError(503, "stub codex upstream")
+        raise self._error
         yield  # unreachable; makes this an async generator like the real client
 
 
@@ -284,12 +312,14 @@ def _gateway(
     kimi_handler=None,
     kimi_auth: Any | None = None,
     grok_client: Any | None = None,
+    codex_context_window: int | None = None,
+    codex_error: CodexUpstreamError | None = None,
 ) -> tuple[TestClient, StubCodexClient]:
     app = server.create_app(config)
     # The lifespan requires real Codex credentials, so set the state directly
     # instead of entering the TestClient context manager.
     app.state.config = config
-    stub = StubCodexClient()
+    stub = StubCodexClient(codex_context_window, codex_error)
     app.state.codex_client = stub
     app.state.http_client = httpx.AsyncClient(
         transport=httpx.MockTransport(anthropic_handler)
@@ -452,6 +482,86 @@ def test_mapped_model_routes_to_codex() -> None:
     assert response.json()["error"]["message"] == "stub codex upstream"
     assert stub.payloads[0]["model"] == "gpt-5.6-sol"
     assert captured == []
+
+
+def test_codex_pre_stream_overflow_uses_catalog_context_window() -> None:
+    config = GatewayConfig(model_map={"opus": "codex:gpt-5.6-sol"})
+    client, _ = _gateway(
+        config,
+        _failing_anthropic_handler,
+        codex_context_window=272000,
+        codex_error=CodexUpstreamError(
+            400,
+            _overflow_error_body("Your input exceeds the context window of this model."),
+        ),
+    )
+
+    response = client.post("/v1/messages", json=_message_body("claude-opus-4-6"))
+
+    assert response.status_code == 400
+    match = _CLIENT_OVERFLOW_NUMBERS_RE.search(response.json()["error"]["message"])
+    assert match is not None
+    actual, limit = int(match.group(1)), int(match.group(2))
+    assert limit == 272000
+    assert actual > limit
+
+
+def test_pre_stream_overflow_without_catalog_window_falls_back_to_legacy_message() -> None:
+    config = GatewayConfig(model_map={"opus": "codex:gpt-5.6-sol"})
+    client, _ = _gateway(
+        config,
+        _failing_anthropic_handler,
+        codex_error=CodexUpstreamError(
+            400,
+            _overflow_error_body("Your input exceeds the context window of this model."),
+        ),
+    )
+
+    response = client.post("/v1/messages", json=_message_body("claude-opus-4-6"))
+
+    assert response.status_code == 400
+    assert response.json()["error"]["message"] == (
+        "prompt is too long: Your input exceeds the context window of this model."
+    )
+    assert _CLIENT_OVERFLOW_NUMBERS_RE.search(response.json()["error"]["message"]) is None
+
+
+class MidStreamOverflowCodexClient(FakeCodexClient):
+    """Yields one event, then fails with an overflow-shaped upstream error."""
+
+    async def context_window(self, model: str) -> int | None:
+        return 272000
+
+    async def stream_responses(
+        self, payload: dict[str, Any], session_id: str
+    ) -> AsyncIterator[dict[str, Any]]:
+        yield {"type": "response.created", "response": {"id": "resp_1", "model": payload["model"]}}
+        raise CodexUpstreamError(
+            400,
+            _overflow_error_body("Your input exceeds the context window of this model."),
+        )
+
+
+def test_mid_stream_overflow_error_carries_catalog_numbers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = GatewayConfig(model_map={"opus": "codex:gpt-5.6-sol"})
+    body = _message_body("claude-opus-4-6")
+    body["stream"] = True
+    with _create_test_client(
+        monkeypatch, config=config, codex_client=MidStreamOverflowCodexClient
+    ) as client:
+        response = client.post("/v1/messages", json=body)
+
+    assert response.status_code == 200
+    events = [event for event in response.text.split("\n\n") if event]
+    error_event = next(event for event in events if event.startswith("event: error"))
+    payload = json.loads(error_event.split("data: ", 1)[1])
+    match = _CLIENT_OVERFLOW_NUMBERS_RE.search(payload["error"]["message"])
+    assert match is not None
+    actual, limit = int(match.group(1)), int(match.group(2))
+    assert limit == 272000
+    assert actual > limit
 
 
 def test_mapped_request_without_max_tokens_is_rejected() -> None:
@@ -842,6 +952,28 @@ def test_kimi_anthropic_shaped_error_is_relayed_with_status() -> None:
     assert response.json() == error_body
 
 
+def test_kimi_overflow_shaped_error_is_forwarded_verbatim() -> None:
+    """Kimi's relay is untouched by design: no numeric overflow rewrite applies."""
+    error_body = {
+        "type": "error",
+        "error": {
+            "type": "invalid_request_error",
+            "message": "Your input exceeds the context window of this model.",
+        },
+    }
+
+    def kimi_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(400, json=error_body)
+
+    client, _ = _gateway(_kimi_config(), _failing_anthropic_handler, kimi_handler)
+
+    response = client.post("/v1/messages", json=_message_body("claude-opus-4-6"))
+
+    assert response.status_code == 400
+    assert response.json() == error_body
+    assert "prompt is too long" not in response.json()["error"]["message"]
+
+
 def test_kimi_persistent_401_blames_gateway_credentials() -> None:
     attempts: list[str] = []
 
@@ -936,14 +1068,24 @@ def test_count_tokens_falls_back_to_estimate_when_kimi_fails() -> None:
 class StubGrokClient:
     """Records translated payloads and replays a scripted Responses stream."""
 
-    def __init__(self, events: list[dict[str, Any]] | None = None) -> None:
+    def __init__(
+        self,
+        events: list[dict[str, Any]] | None = None,
+        context_window: int | None = None,
+        error: GrokUpstreamError | None = None,
+    ) -> None:
         self.payloads: list[dict[str, Any]] = []
         self.events = events
+        self._context_window = context_window
+        self._error = error or GrokUpstreamError(503, "stub grok upstream")
+
+    async def context_window(self, model: str) -> int | None:
+        return self._context_window
 
     async def stream_responses(self, payload: dict[str, Any], session_id: str):
         self.payloads.append(payload)
         if self.events is None:
-            raise GrokUpstreamError(503, "stub grok upstream")
+            raise self._error
         for event in self.events:
             yield event
 
@@ -999,6 +1141,28 @@ def test_grok_route_clamps_effort_for_thinking_model() -> None:
 
     (payload,) = stub.payloads
     assert payload["reasoning"]["effort"] == "high"
+
+
+def test_grok_pre_stream_overflow_uses_catalog_context_window() -> None:
+    # Each provider resolves its overflow limit from its own catalog: Codex's
+    # 272000 test elsewhere must not leak into Grok's 500000 expectation.
+    stub = StubGrokClient(
+        context_window=500000,
+        error=GrokUpstreamError(
+            400,
+            _overflow_error_body("Your input exceeds the context window of this model."),
+        ),
+    )
+    client, _ = _gateway(_grok_config(), _failing_anthropic_handler, grok_client=stub)
+
+    response = client.post("/v1/messages", json=_message_body("claude-opus-4-6"))
+
+    assert response.status_code == 400
+    match = _CLIENT_OVERFLOW_NUMBERS_RE.search(response.json()["error"]["message"])
+    assert match is not None
+    actual, limit = int(match.group(1)), int(match.group(2))
+    assert limit == 500000
+    assert actual > limit
 
 
 # --- upstream stream ownership -------------------------------------------
