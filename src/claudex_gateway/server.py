@@ -390,8 +390,9 @@ async def _relay_via_responses_backend(
     )
 
     # Resolved once per request from the provider's own catalog cache (the
-    # client instance is long-lived on request.app.state), so a successful
-    # request pays only this cached lookup, never a catalog roundtrip here.
+    # client instance is long-lived on request.app.state). Fresh-cache
+    # lookups are memory-only; a cold or expired cache may synchronously
+    # refresh the catalog once before falling back to stale data or None.
     context_window = await client.context_window(upstream_model)
 
     event_stream = client.stream_responses(payload, session_id)
