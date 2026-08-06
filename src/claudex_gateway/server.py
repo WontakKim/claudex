@@ -15,6 +15,7 @@ import uuid
 from collections import deque
 from collections.abc import AsyncGenerator, AsyncIterator
 from dataclasses import replace
+from datetime import datetime, timezone
 from typing import Any
 
 import httpx
@@ -26,12 +27,18 @@ from starlette.routing import Route
 import claudex_gateway
 from claudex_gateway.codex_auth import CodexAuthError, CodexAuthManager
 from claudex_gateway.codex_client import CodexClient, CodexUpstreamError
+from claudex_gateway.compaction import (
+    build_reroute_headers,
+    build_reroute_payload,
+    is_compaction_request,
+)
 from claudex_gateway.config import (
     SETTINGS_KEYS,
     VALID_LOG_LEVELS,
     ConfigError,
     GatewayConfig,
     RouteTarget,
+    parse_compaction_model,
     parse_route_target,
     update_settings_file,
     validate_model_map,
@@ -353,6 +360,18 @@ async def _relay_via_responses_backend(
     Both providers consume the same translated payload and produce the same
     SSE event family, so one path serves both; the Grok direction only adds
     its payload sanitizer on the way out.
+
+    Before translation, a Codex/Grok mapped request also carries the
+    compaction reroute trigger: when `config.compaction_model` is set, the
+    body is a detected Claude Code compaction request (Signal A), and the
+    mapped model's catalog context window is a real (non-bool) integer the
+    estimated prompt overflows, the request is diverted to
+    `_reroute_compaction` before `translate_claude_request_to_codex` or
+    `sanitize_grok_payload` ever run. A `None` return from that helper means
+    "fall back": translation then runs against the untouched original body
+    exactly as an ordinary mapped request would, and the context window
+    already resolved for the trigger check is reused rather than looked up
+    again.
     """
     config: GatewayConfig = request.app.state.config
     provider = route.provider
@@ -364,6 +383,35 @@ async def _relay_via_responses_backend(
             _claude_error_body("invalid_request_error", validation_error), status_code=400
         )
 
+    if provider == "grok":
+        client: CodexClient | GrokClient = request.app.state.grok_client
+    else:
+        client = request.app.state.codex_client
+
+    context_window: int | None = None
+    context_window_resolved = False
+    if config.compaction_model is not None and is_compaction_request(claude_request):
+        context_window = await client.context_window(upstream_model)
+        context_window_resolved = True
+        # Booleans are `int` subclasses; a catalog entry that is literally
+        # `True`/`False` (e.g. a stubbed or malformed provider response) must
+        # never be treated as a real window, so the bool case is excluded
+        # explicitly rather than trusting `isinstance(x, int)` alone.
+        if isinstance(context_window, int) and not isinstance(context_window, bool):
+            estimated_prompt_tokens = estimate_overflow_prompt_tokens(claude_request)
+            if estimated_prompt_tokens > context_window:
+                target_model = parse_compaction_model(config.compaction_model)
+                reroute_response = await _reroute_compaction(
+                    request,
+                    claude_request,
+                    target_model=target_model,
+                    mapped_model=f"{provider}:{upstream_model}",
+                    estimated_prompt_tokens=estimated_prompt_tokens,
+                    context_window=context_window,
+                )
+                if reroute_response is not None:
+                    return reroute_response
+
     try:
         payload = translate_claude_request_to_codex(
             claude_request, upstream_model, config.reasoning_effort_override
@@ -373,10 +421,7 @@ async def _relay_via_responses_backend(
             _claude_error_body("invalid_request_error", str(exc)), status_code=400
         )
     if provider == "grok":
-        client: CodexClient | GrokClient = request.app.state.grok_client
         payload = sanitize_grok_payload(payload, upstream_model)
-    else:
-        client = request.app.state.codex_client
     session_id = payload["prompt_cache_key"]
     logger.info(
         "%s -> %s:%s (stream=%s, effort=%s, messages=%d, tools=%d)",
@@ -393,7 +438,10 @@ async def _relay_via_responses_backend(
     # client instance is long-lived on request.app.state). Fresh-cache
     # lookups are memory-only; a cold or expired cache may synchronously
     # refresh the catalog once before falling back to stale data or None.
-    context_window = await client.context_window(upstream_model)
+    # The compaction trigger above already resolved this for a detected
+    # compaction request, so that lookup is reused here instead of repeated.
+    if not context_window_resolved:
+        context_window = await client.context_window(upstream_model)
 
     event_stream = client.stream_responses(payload, session_id)
     try:
@@ -439,6 +487,158 @@ async def _relay_via_responses_backend(
             headers={"Cache-Control": "no-cache"},
         )
     return await _aggregate_claude_response(claude_request, upstream_events(), context_window)
+
+
+def _rfc3339_now() -> str:
+    """Return the current UTC time as an RFC 3339 string for diagnostics records."""
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+
+
+def _assign_compaction_reroute(
+    app_state: Any,
+    *,
+    outcome: str,
+    target_model: str | None,
+    mapped_model: str,
+    estimated_prompt_tokens: int | None,
+    context_window: int | None,
+    detail: str | None,
+) -> int:
+    """Write a fresh `compaction_last_reroute` record and return its sequence.
+
+    The record matches the pinned seven-key schema exactly: `outcome`,
+    `timestamp`, `target_model`, `mapped_model`, `estimated_prompt_tokens`,
+    `context_window`, and `detail`. `detail` must be one of the pinned
+    grammar's values (`None`, `"connect_error"`, `"read_error"`,
+    `"invalid_json"`, or `"http_<status>"`) — never an exception, a
+    credential, a header, or an upstream body. The returned sequence is an
+    internal monotonic counter that `_replace_compaction_reroute_if_current`
+    uses to guard against a stale write clobbering a newer record; it is
+    never part of the serialized record itself.
+    """
+    app_state.compaction_reroute_sequence += 1
+    sequence = app_state.compaction_reroute_sequence
+    app_state.compaction_last_reroute = {
+        "outcome": outcome,
+        "timestamp": _rfc3339_now(),
+        "target_model": target_model,
+        "mapped_model": mapped_model,
+        "estimated_prompt_tokens": estimated_prompt_tokens,
+        "context_window": context_window,
+        "detail": detail,
+    }
+    return sequence
+
+
+def _replace_compaction_reroute_if_current(
+    app_state: Any, sequence: int, *, outcome: str, detail: str
+) -> None:
+    """Upgrade the record captured at `sequence`, unless a newer one exists.
+
+    Only `outcome`, `timestamp`, and `detail` change; every other pinned
+    field of the existing record is preserved untouched. This lets a later
+    mid-stream failure upgrade its own committed `rerouted` record to
+    `midstream_error` without a stale failure ever overwriting a
+    subsequent, unrelated request's own record.
+    """
+    if app_state.compaction_reroute_sequence != sequence:
+        return
+    record = dict(app_state.compaction_last_reroute)
+    record["outcome"] = outcome
+    record["timestamp"] = _rfc3339_now()
+    record["detail"] = detail
+    app_state.compaction_last_reroute = record
+
+
+async def _reroute_compaction(
+    request: Request,
+    claude_request: dict[str, Any],
+    *,
+    target_model: str,
+    mapped_model: str,
+    estimated_prompt_tokens: int,
+    context_window: int,
+) -> JSONResponse | None:
+    """Attempt the compaction reroute call to Anthropic; `None` means fall back.
+
+    Builds a direct, credential-scoped `POST` to
+    `https://api.anthropic.com/v1/messages` on the lifespan-owned
+    `httpx.AsyncClient`, from `build_reroute_payload`/`build_reroute_headers`
+    and the already-canonical `target_model`. This never calls
+    `_route_for_request` or `_passthrough_to_anthropic`, so the canonical
+    target can never re-enter the model map and recurse, no matter how it
+    might substring-match a map key. Redirects are never followed and there
+    is no application-level retry: exactly one Anthropic attempt per
+    triggered request, and every 3xx response is treated as a non-2xx
+    outcome rather than a followed redirect.
+
+    Only the `stream:false` branch is implemented here; a `stream:true`
+    request is a temporary carve-out that stays on the mapped path without a
+    reroute attempt or a diagnostics record until T-6 implements the
+    commit-once streaming relay.
+    """
+    if claude_request.get("stream"):
+        return None
+
+    def record(outcome: str, detail: str | None) -> None:
+        _assign_compaction_reroute(
+            request.app.state,
+            outcome=outcome,
+            target_model=target_model,
+            mapped_model=mapped_model,
+            estimated_prompt_tokens=estimated_prompt_tokens,
+            context_window=context_window,
+            detail=detail,
+        )
+
+    config: GatewayConfig = request.app.state.config
+    headers = build_reroute_headers(request.headers, config.local_token)
+    if headers is None:
+        record("skipped_no_credentials", None)
+        return None
+
+    payload = build_reroute_payload(claude_request, target_model)
+    http_client: httpx.AsyncClient = request.app.state.http_client
+    upstream_request = http_client.build_request(
+        "POST",
+        f"{_ANTHROPIC_API_BASE}/v1/messages",
+        headers=headers,
+        content=json.dumps(payload, ensure_ascii=False).encode(),
+    )
+    try:
+        upstream_response = await http_client.send(
+            upstream_request, stream=True, follow_redirects=False
+        )
+    except httpx.HTTPError as exc:
+        logger.warning("compaction reroute unreachable: %r", exc)
+        record("fallback_mapped", "connect_error")
+        return None
+
+    try:
+        if not 200 <= upstream_response.status_code < 300:
+            logger.warning(
+                "compaction reroute upstream returned %s", upstream_response.status_code
+            )
+            record("fallback_mapped", f"http_{upstream_response.status_code}")
+            return None
+        try:
+            body = await upstream_response.aread()
+        except httpx.HTTPError as exc:
+            logger.warning("compaction reroute response read failed: %r", exc)
+            record("fallback_mapped", "read_error")
+            return None
+        try:
+            parsed = json.loads(body)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            record("fallback_mapped", "invalid_json")
+            return None
+        if not isinstance(parsed, dict):
+            record("fallback_mapped", "invalid_json")
+            return None
+        record("rerouted", None)
+        return JSONResponse(parsed, status_code=200)
+    finally:
+        await upstream_response.aclose()
 
 
 async def _translate_claude_sse(
@@ -1391,6 +1591,12 @@ def create_app(config: GatewayConfig, daemon_nonce: str | None = None) -> Starle
                 app.state.admin_lock = asyncio.Lock()
                 # Redeem key of a reset attempt whose outcome never came back.
                 app.state.codex_reset_key = None
+                # Diagnostics for the compaction reroute (see
+                # _assign_compaction_reroute): no reroute has been attempted
+                # yet, and the sequence counter starts a fresh count for this
+                # process's lifetime.
+                app.state.compaction_last_reroute = None
+                app.state.compaction_reroute_sequence = 0
                 app.state.codex_auth_manager = codex_auth_manager
                 app.state.codex_client = CodexClient(codex_auth_manager, http_client)
                 app.state.kimi_auth_manager = kimi_auth_manager

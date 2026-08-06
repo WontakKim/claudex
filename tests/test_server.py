@@ -21,6 +21,7 @@ import uvicorn
 from starlette.testclient import TestClient
 
 import claudex_gateway.server as server
+from claudex_gateway import compaction
 from claudex_gateway.codex_client import (
     CODEX_MODELS_URL,
     CODEX_RESPONSES_URL,
@@ -32,6 +33,8 @@ from claudex_gateway.kimi_auth import KimiCredentials
 from claudex_gateway.kimi_client import KimiClient, KimiUpstreamError
 from claudex_gateway.grok_auth import GrokCredentials
 from claudex_gateway.grok_client import GrokClient, GrokUpstreamError
+from claudex_gateway.translate import translate_claude_request_to_codex
+from claudex_gateway.translate.codex_to_claude import estimate_overflow_prompt_tokens
 
 
 class AvailableCodexAuthManager:
@@ -299,10 +302,12 @@ class StubCodexClient:
         error: CodexUpstreamError | None = None,
     ) -> None:
         self.payloads: list[dict[str, Any]] = []
+        self.context_window_calls: list[str] = []
         self._context_window = context_window
         self._error = error or CodexUpstreamError(503, "stub codex upstream")
 
     async def context_window(self, model: str) -> int | None:
+        self.context_window_calls.append(model)
         return self._context_window
 
     async def stream_responses(self, payload: dict[str, Any], session_id: str):
@@ -324,6 +329,8 @@ def _gateway(
     # The lifespan requires real Codex credentials, so set the state directly
     # instead of entering the TestClient context manager.
     app.state.config = config
+    app.state.compaction_last_reroute = None
+    app.state.compaction_reroute_sequence = 0
     stub = StubCodexClient(codex_context_window, codex_error)
     app.state.codex_client = stub
     app.state.http_client = httpx.AsyncClient(
@@ -603,6 +610,8 @@ def test_non_streaming_mid_stream_overflow_reports_numbers() -> None:
     # The lifespan requires real Codex credentials, so set the state
     # directly instead of entering the TestClient context manager.
     app.state.config = config
+    app.state.compaction_last_reroute = None
+    app.state.compaction_reroute_sequence = 0
     stub = RecordingMidStreamOverflowCodexClient()
     app.state.codex_client = stub
     app.state.http_client = httpx.AsyncClient(
@@ -655,6 +664,8 @@ def test_context_window_cache_is_reused_across_requests() -> None:
     config = GatewayConfig(model_map={"opus": "codex:gpt-5.6-sol"})
     app = server.create_app(config)
     app.state.config = config
+    app.state.compaction_last_reroute = None
+    app.state.compaction_reroute_sequence = 0
     app.state.codex_client = CodexClient(
         AvailableCodexAuthManager(), httpx.AsyncClient(transport=httpx.MockTransport(handler))
     )
@@ -974,6 +985,8 @@ def test_kimi_stream_client_reset_stops_closed_socket_writes(
     config = GatewayConfig(model_map={"fable": "kimi:k3"})
     app = server.create_app(config)
     app.state.config = config
+    app.state.compaction_last_reroute = None
+    app.state.compaction_reroute_sequence = 0
     app.state.kimi_client = BurstKimiClient()
 
     listener = socket.socket()
@@ -1271,6 +1284,646 @@ def test_grok_pre_stream_overflow_uses_catalog_context_window() -> None:
     actual, limit = int(match.group(1)), int(match.group(2))
     assert limit == 500000
     assert actual > limit
+
+
+# --- /v1/messages routing: compaction reroute trigger (T-5) ---------------
+
+_COMPACTION_RAW_TARGET = "claude:claude-sonnet-5"
+_COMPACTION_CANONICAL_TARGET = "claude-sonnet-5"
+
+# A genuine Anthropic credential, so build_reroute_headers has something to
+# forward; local_token is unset on every config below, so it never collides
+# with _require_local_token's own check.
+_ANTHROPIC_CREDENTIAL_HEADERS = {"x-api-key": "sk-ant-real-key"}
+
+
+class _TrackedByteStream(httpx.AsyncByteStream):
+    """Yields `chunks`, optionally raising `error` afterward; records aclose()."""
+
+    def __init__(self, chunks: list[bytes], error: Exception | None = None) -> None:
+        self._chunks = chunks
+        self._error = error
+        self.closed = False
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        for chunk in self._chunks:
+            yield chunk
+        if self._error is not None:
+            raise self._error
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+def _compaction_signal_text() -> str:
+    return (
+        f"{compaction.SIGNAL_A_PREFIX} Some filler context so the message resembles a "
+        f"real conversation. {compaction.SIGNAL_A_MARKER} some more filler detail."
+    )
+
+
+def _compaction_body(
+    model: str, *, max_tokens: int = 16, thinking_block: bool = False
+) -> dict[str, Any]:
+    messages: list[dict[str, Any]] = []
+    if thinking_block:
+        messages.append(
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "thinking",
+                        "thinking": "internal reasoning that must never reach Anthropic",
+                        "signature": "sig-from-a-different-backend",
+                    },
+                    {"type": "text", "text": "visible reply"},
+                ],
+            }
+        )
+    messages.append({"role": "user", "content": _compaction_signal_text()})
+    return {"model": model, "max_tokens": max_tokens, "messages": messages}
+
+
+def _compaction_config(model_map: dict[str, str], **kwargs: Any) -> GatewayConfig:
+    return GatewayConfig(model_map=model_map, compaction_model=_COMPACTION_RAW_TARGET, **kwargs)
+
+
+def _pinned_reroute_record_keys() -> set[str]:
+    return {
+        "outcome",
+        "timestamp",
+        "target_model",
+        "mapped_model",
+        "estimated_prompt_tokens",
+        "context_window",
+        "detail",
+    }
+
+
+def test_compaction_reroute_success_returns_anthropic_response_and_records_diagnostics() -> None:
+    body = _compaction_body("claude-opus-4-6")
+    expected_estimate = estimate_overflow_prompt_tokens(body)
+    window = expected_estimate - 1
+    captured: list[httpx.Request] = []
+    stream = _TrackedByteStream(
+        [
+            json.dumps(
+                {"id": "msg_1", "type": "message", "model": _COMPACTION_CANONICAL_TARGET}
+            ).encode()
+        ]
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(200, stream=stream, headers={"content-type": "application/json"})
+
+    config = _compaction_config({"opus": "codex:gpt-5.1-codex-max"})
+    client, stub = _gateway(config, handler, codex_context_window=window)
+
+    response = client.post("/v1/messages", json=body, headers=_ANTHROPIC_CREDENTIAL_HEADERS)
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "id": "msg_1",
+        "type": "message",
+        "model": _COMPACTION_CANONICAL_TARGET,
+    }
+    assert stub.payloads == []  # translation never ran; the reroute short-circuited it
+    assert len(captured) == 1
+    (upstream,) = captured
+    assert str(upstream.url) == "https://api.anthropic.com/v1/messages"
+    assert json.loads(upstream.content)["model"] == _COMPACTION_CANONICAL_TARGET
+    assert stream.closed is True
+
+    record = client.app.state.compaction_last_reroute
+    assert set(record) == _pinned_reroute_record_keys()
+    assert record["outcome"] == "rerouted"
+    assert record["detail"] is None
+    assert record["target_model"] == _COMPACTION_CANONICAL_TARGET
+    assert record["mapped_model"] == "codex:gpt-5.1-codex-max"
+    assert record["context_window"] == window
+    assert record["estimated_prompt_tokens"] == expected_estimate
+    assert isinstance(record["timestamp"], str) and record["timestamp"]
+
+
+def test_compaction_reroute_skipped_without_credentials_falls_back_to_mapped_path() -> None:
+    body = _compaction_body("claude-opus-4-6")
+    window = estimate_overflow_prompt_tokens(body) - 1
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(200, json={"unexpected": True})
+
+    config = _compaction_config({"opus": "codex:gpt-5.1-codex-max"})
+    client, stub = _gateway(config, handler, codex_context_window=window)
+
+    response = client.post("/v1/messages", json=body)  # no x-api-key, no authorization
+
+    assert response.status_code == 503
+    assert response.json()["error"]["message"] == "stub codex upstream"
+    # No credential to forward means no Anthropic attempt at all -- there is
+    # no httpx.Response to close on this branch, so nothing can leak.
+    assert captured == []
+    (payload,) = stub.payloads
+    assert payload["model"] == "gpt-5.1-codex-max"
+
+    record = client.app.state.compaction_last_reroute
+    assert set(record) == _pinned_reroute_record_keys()
+    assert record["outcome"] == "skipped_no_credentials"
+    assert record["detail"] is None
+    assert record["mapped_model"] == "codex:gpt-5.1-codex-max"
+    assert record["target_model"] == _COMPACTION_CANONICAL_TARGET
+    assert record["context_window"] == window
+    assert stub.context_window_calls == ["gpt-5.1-codex-max"]
+
+
+def test_compaction_reroute_falls_back_on_non_2xx_status() -> None:
+    body = _compaction_body("claude-opus-4-6")
+    window = estimate_overflow_prompt_tokens(body) - 1
+    captured: list[httpx.Request] = []
+    stream = _TrackedByteStream([b'{"error": {"message": "invalid x-api-key"}}'])
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(401, stream=stream)
+
+    config = _compaction_config({"opus": "codex:gpt-5.1-codex-max"})
+    client, stub = _gateway(config, handler, codex_context_window=window)
+
+    response = client.post("/v1/messages", json=body, headers=_ANTHROPIC_CREDENTIAL_HEADERS)
+
+    assert response.status_code == 503
+    assert len(captured) == 1  # exactly one Anthropic attempt, no retry
+    assert stub.payloads  # fallback ran translation against the mapped backend
+
+    record = client.app.state.compaction_last_reroute
+    assert record["outcome"] == "fallback_mapped"
+    assert record["detail"] == "http_401"
+    assert stream.closed is True
+
+
+def test_compaction_reroute_falls_back_on_3xx_without_following_redirect() -> None:
+    body = _compaction_body("claude-opus-4-6")
+    window = estimate_overflow_prompt_tokens(body) - 1
+    captured: list[httpx.Request] = []
+    stream = _TrackedByteStream([b""])
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(
+            307, headers={"location": "https://api.anthropic.com/v1/messages"}, stream=stream
+        )
+
+    config = _compaction_config({"opus": "codex:gpt-5.1-codex-max"})
+    client, stub = _gateway(config, handler, codex_context_window=window)
+
+    response = client.post("/v1/messages", json=body, headers=_ANTHROPIC_CREDENTIAL_HEADERS)
+
+    assert response.status_code == 503
+    # The redirect target is never followed: exactly one outbound request.
+    assert len(captured) == 1
+    record = client.app.state.compaction_last_reroute
+    assert record["outcome"] == "fallback_mapped"
+    assert record["detail"] == "http_307"
+    assert stream.closed is True
+
+
+def test_compaction_reroute_falls_back_on_connect_error() -> None:
+    body = _compaction_body("claude-opus-4-6")
+    window = estimate_overflow_prompt_tokens(body) - 1
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused")
+
+    config = _compaction_config({"opus": "codex:gpt-5.1-codex-max"})
+    client, stub = _gateway(config, handler, codex_context_window=window)
+
+    response = client.post("/v1/messages", json=body, headers=_ANTHROPIC_CREDENTIAL_HEADERS)
+
+    assert response.status_code == 503
+    record = client.app.state.compaction_last_reroute
+    assert record["outcome"] == "fallback_mapped"
+    assert record["detail"] == "connect_error"
+
+
+def test_compaction_reroute_falls_back_on_non_connect_transport_error() -> None:
+    # httpx.HTTPError is not narrowed to ConnectError: any pre-response
+    # transport failure must fall back the same way.
+    body = _compaction_body("claude-opus-4-6")
+    window = estimate_overflow_prompt_tokens(body) - 1
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.WriteError("connection reset while writing the request")
+
+    config = _compaction_config({"opus": "codex:gpt-5.1-codex-max"})
+    client, stub = _gateway(config, handler, codex_context_window=window)
+
+    response = client.post("/v1/messages", json=body, headers=_ANTHROPIC_CREDENTIAL_HEADERS)
+
+    assert response.status_code == 503
+    record = client.app.state.compaction_last_reroute
+    assert record["outcome"] == "fallback_mapped"
+    assert record["detail"] == "connect_error"
+
+
+def test_compaction_reroute_falls_back_on_read_error() -> None:
+    body = _compaction_body("claude-opus-4-6")
+    window = estimate_overflow_prompt_tokens(body) - 1
+    stream = _TrackedByteStream([b'{"partial": '], httpx.ReadError("connection reset"))
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, stream=stream)
+
+    config = _compaction_config({"opus": "codex:gpt-5.1-codex-max"})
+    client, stub = _gateway(config, handler, codex_context_window=window)
+
+    response = client.post("/v1/messages", json=body, headers=_ANTHROPIC_CREDENTIAL_HEADERS)
+
+    assert response.status_code == 503
+    record = client.app.state.compaction_last_reroute
+    assert record["outcome"] == "fallback_mapped"
+    assert record["detail"] == "read_error"
+    assert stream.closed is True
+
+
+def test_compaction_reroute_falls_back_on_invalid_json() -> None:
+    body = _compaction_body("claude-opus-4-6")
+    window = estimate_overflow_prompt_tokens(body) - 1
+    stream = _TrackedByteStream([b"not valid json"])
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, stream=stream)
+
+    config = _compaction_config({"opus": "codex:gpt-5.1-codex-max"})
+    client, stub = _gateway(config, handler, codex_context_window=window)
+
+    response = client.post("/v1/messages", json=body, headers=_ANTHROPIC_CREDENTIAL_HEADERS)
+
+    assert response.status_code == 503
+    record = client.app.state.compaction_last_reroute
+    assert record["outcome"] == "fallback_mapped"
+    assert record["detail"] == "invalid_json"
+    assert stream.closed is True
+
+
+def test_compaction_reroute_falls_back_on_json_scalar_body() -> None:
+    body = _compaction_body("claude-opus-4-6")
+    window = estimate_overflow_prompt_tokens(body) - 1
+    stream = _TrackedByteStream([b"42"])
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, stream=stream)
+
+    config = _compaction_config({"opus": "codex:gpt-5.1-codex-max"})
+    client, stub = _gateway(config, handler, codex_context_window=window)
+
+    response = client.post("/v1/messages", json=body, headers=_ANTHROPIC_CREDENTIAL_HEADERS)
+
+    assert response.status_code == 503
+    record = client.app.state.compaction_last_reroute
+    assert record["outcome"] == "fallback_mapped"
+    assert record["detail"] == "invalid_json"
+    assert stream.closed is True
+
+
+def test_compaction_reroute_success_never_calls_translation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _boom(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("translation must not run when the reroute succeeds")
+
+    monkeypatch.setattr(server, "translate_claude_request_to_codex", _boom)
+
+    body = _compaction_body("claude-opus-4-6")
+    window = estimate_overflow_prompt_tokens(body) - 1
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(
+            200, json={"id": "msg_1", "type": "message", "model": _COMPACTION_CANONICAL_TARGET}
+        )
+
+    config = _compaction_config({"opus": "codex:gpt-5.1-codex-max"})
+    client, stub = _gateway(config, handler, codex_context_window=window)
+
+    response = client.post("/v1/messages", json=body, headers=_ANTHROPIC_CREDENTIAL_HEADERS)
+
+    assert response.status_code == 200
+    assert len(captured) == 1
+    assert stub.payloads == []
+
+
+def test_compaction_reroute_fallback_translates_untouched_original_body_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    received: list[dict[str, Any]] = []
+
+    def recording_translate(
+        claude_request: dict[str, Any], upstream_model: str, reasoning_effort_override: str | None
+    ) -> dict[str, Any]:
+        # A deep, JSON-round-tripped copy: proves equality without ever
+        # aliasing the mutable dict the caller still holds.
+        received.append(json.loads(json.dumps(claude_request)))
+        return translate_claude_request_to_codex(
+            claude_request, upstream_model, reasoning_effort_override
+        )
+
+    monkeypatch.setattr(server, "translate_claude_request_to_codex", recording_translate)
+
+    body = _compaction_body("claude-opus-4-6", thinking_block=True)
+    window = estimate_overflow_prompt_tokens(body) - 1
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(401, json={"error": {"message": "bad key"}})
+
+    config = _compaction_config({"opus": "codex:gpt-5.1-codex-max"})
+    client, stub = _gateway(config, handler, codex_context_window=window)
+
+    response = client.post("/v1/messages", json=body, headers=_ANTHROPIC_CREDENTIAL_HEADERS)
+
+    assert response.status_code == 503
+    assert len(received) == 1
+    assert received[0] == body  # the untouched original body, thinking block included
+    assert any(
+        block.get("type") == "thinking"
+        for message in received[0]["messages"]
+        if isinstance(message.get("content"), list)
+        for block in message["content"]
+    )
+    # One catalog lookup total: the trigger's own lookup is reused by the
+    # mapped fallback instead of being repeated.
+    assert stub.context_window_calls == ["gpt-5.1-codex-max"]
+
+
+def test_compaction_trigger_reroutes_grok_mapped_request() -> None:
+    body = _compaction_body("claude-opus-4-6")
+    window = estimate_overflow_prompt_tokens(body) - 1
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(
+            200, json={"id": "msg_1", "type": "message", "model": _COMPACTION_CANONICAL_TARGET}
+        )
+
+    grok_stub = StubGrokClient(context_window=window)
+    config = _compaction_config({"opus": "grok:grok-4.5"})
+    client, codex_stub = _gateway(config, handler, grok_client=grok_stub)
+
+    response = client.post("/v1/messages", json=body, headers=_ANTHROPIC_CREDENTIAL_HEADERS)
+
+    assert response.status_code == 200
+    assert len(captured) == 1
+    assert grok_stub.payloads == []
+    assert codex_stub.payloads == []
+    record = client.app.state.compaction_last_reroute
+    assert record["outcome"] == "rerouted"
+    assert record["mapped_model"] == "grok:grok-4.5"
+    assert record["target_model"] == _COMPACTION_CANONICAL_TARGET
+
+
+def test_compaction_trigger_never_engages_for_kimi_mapped_requests() -> None:
+    body = _compaction_body("claude-opus-4-6")
+    captured: list[httpx.Request] = []
+
+    def anthropic_handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(500, json={"error": "unexpected anthropic call"})
+
+    kimi_calls: list[httpx.Request] = []
+
+    def kimi_handler(request: httpx.Request) -> httpx.Response:
+        kimi_calls.append(request)
+        return httpx.Response(
+            200, json={"id": "msg_1", "type": "message", "model": "k2.5", "content": []}
+        )
+
+    config = _compaction_config({"opus": "kimi:k2.5"})
+    client, _ = _gateway(config, anthropic_handler, kimi_handler)
+
+    response = client.post("/v1/messages", json=body, headers=_ANTHROPIC_CREDENTIAL_HEADERS)
+
+    assert response.status_code == 200
+    assert captured == []
+    assert len(kimi_calls) == 1
+    assert client.app.state.compaction_last_reroute is None
+
+
+def test_compaction_trigger_never_engages_for_unmapped_passthrough() -> None:
+    body = _compaction_body("claude-fable-5")
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(200, json={"id": "msg_1", "model": "claude-fable-5"})
+
+    config = _compaction_config({"opus": "codex:gpt-5.1-codex-max"})
+    client, stub = _gateway(config, handler)
+
+    response = client.post("/v1/messages", json=body, headers=_ANTHROPIC_CREDENTIAL_HEADERS)
+
+    assert response.status_code == 200
+    assert len(captured) == 1  # the ordinary passthrough call, not a reroute
+    assert stub.payloads == []
+    assert client.app.state.compaction_last_reroute is None
+
+
+def test_compaction_trigger_absent_setting_never_runs_signal_a_or_estimator(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    signal_calls = {"count": 0}
+    estimate_calls = {"count": 0}
+    real_is_compaction_request = server.is_compaction_request
+    real_estimate = server.estimate_overflow_prompt_tokens
+
+    def counting_is_compaction_request(*args: Any, **kwargs: Any) -> bool:
+        signal_calls["count"] += 1
+        return real_is_compaction_request(*args, **kwargs)
+
+    def counting_estimate(*args: Any, **kwargs: Any) -> int:
+        estimate_calls["count"] += 1
+        return real_estimate(*args, **kwargs)
+
+    monkeypatch.setattr(server, "is_compaction_request", counting_is_compaction_request)
+    monkeypatch.setattr(server, "estimate_overflow_prompt_tokens", counting_estimate)
+
+    body = _compaction_body("claude-opus-4-6")
+    config = GatewayConfig(model_map={"opus": "codex:gpt-5.1-codex-max"})  # compaction_model unset
+    client, stub = _gateway(config, _failing_anthropic_handler, codex_context_window=10)
+
+    response = client.post("/v1/messages", json=body, headers=_ANTHROPIC_CREDENTIAL_HEADERS)
+
+    assert response.status_code == 503
+    assert signal_calls["count"] == 0
+    assert estimate_calls["count"] == 0
+    assert client.app.state.compaction_last_reroute is None
+
+
+def test_compaction_trigger_non_signal_body_never_runs_estimator(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    estimate_calls = {"count": 0}
+    real_estimate = server.estimate_overflow_prompt_tokens
+
+    def counting_estimate(*args: Any, **kwargs: Any) -> int:
+        estimate_calls["count"] += 1
+        return real_estimate(*args, **kwargs)
+
+    monkeypatch.setattr(server, "estimate_overflow_prompt_tokens", counting_estimate)
+
+    config = _compaction_config({"opus": "codex:gpt-5.1-codex-max"})
+    client, stub = _gateway(config, _failing_anthropic_handler, codex_context_window=10)
+
+    response = client.post(
+        "/v1/messages",
+        json=_message_body("claude-opus-4-6"),
+        headers=_ANTHROPIC_CREDENTIAL_HEADERS,
+    )
+
+    assert response.status_code == 503
+    assert estimate_calls["count"] == 0
+    assert client.app.state.compaction_last_reroute is None
+
+
+def test_compaction_trigger_under_window_does_not_reroute() -> None:
+    body = _compaction_body("claude-opus-4-6")
+    window = estimate_overflow_prompt_tokens(body) + 1
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(500, json={"error": "unexpected"})
+
+    config = _compaction_config({"opus": "codex:gpt-5.1-codex-max"})
+    client, stub = _gateway(config, handler, codex_context_window=window)
+
+    response = client.post("/v1/messages", json=body, headers=_ANTHROPIC_CREDENTIAL_HEADERS)
+
+    assert response.status_code == 503
+    assert captured == []
+    assert stub.payloads
+    assert client.app.state.compaction_last_reroute is None
+
+
+def test_compaction_trigger_equal_window_does_not_reroute() -> None:
+    body = _compaction_body("claude-opus-4-6")
+    window = estimate_overflow_prompt_tokens(body)
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(500, json={"error": "unexpected"})
+
+    config = _compaction_config({"opus": "codex:gpt-5.1-codex-max"})
+    client, stub = _gateway(config, handler, codex_context_window=window)
+
+    response = client.post("/v1/messages", json=body, headers=_ANTHROPIC_CREDENTIAL_HEADERS)
+
+    assert response.status_code == 503
+    assert captured == []
+    assert client.app.state.compaction_last_reroute is None
+
+
+def test_compaction_trigger_none_window_does_not_reroute() -> None:
+    body = _compaction_body("claude-opus-4-6")
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(500, json={"error": "unexpected"})
+
+    config = _compaction_config({"opus": "codex:gpt-5.1-codex-max"})
+    client, stub = _gateway(config, handler)  # codex_context_window defaults to None
+
+    response = client.post("/v1/messages", json=body, headers=_ANTHROPIC_CREDENTIAL_HEADERS)
+
+    assert response.status_code == 503
+    assert captured == []
+    assert client.app.state.compaction_last_reroute is None
+
+
+@pytest.mark.parametrize("bogus_window", [True, False])
+def test_compaction_trigger_rejects_boolean_catalog_window(
+    monkeypatch: pytest.MonkeyPatch, bogus_window: bool
+) -> None:
+    # bool is an int subclass; the trigger's window check must exclude it
+    # explicitly rather than trusting a bare isinstance(x, int).
+    estimate_calls = {"count": 0}
+    real_estimate = server.estimate_overflow_prompt_tokens
+
+    def counting_estimate(*args: Any, **kwargs: Any) -> int:
+        estimate_calls["count"] += 1
+        return real_estimate(*args, **kwargs)
+
+    monkeypatch.setattr(server, "estimate_overflow_prompt_tokens", counting_estimate)
+
+    body = _compaction_body("claude-opus-4-6")
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(500, json={"error": "unexpected"})
+
+    config = _compaction_config({"opus": "codex:gpt-5.1-codex-max"})
+    client, stub = _gateway(config, handler, codex_context_window=bogus_window)
+
+    response = client.post("/v1/messages", json=body, headers=_ANTHROPIC_CREDENTIAL_HEADERS)
+
+    assert response.status_code == 503
+    assert captured == []
+    assert estimate_calls["count"] == 0
+    assert client.app.state.compaction_last_reroute is None
+
+
+def test_compaction_reroute_never_reenters_the_model_map_via_the_canonical_target() -> None:
+    # The canonical reroute target ("claude-sonnet-5") substring-matches this
+    # very map key; the reroute must never re-enter model_map resolution and
+    # loop back into the mapped Codex path for its own output.
+    body = _compaction_body("claude-sonnet-4-6")
+    window = estimate_overflow_prompt_tokens(body) - 1
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(
+            200, json={"id": "msg_1", "type": "message", "model": _COMPACTION_CANONICAL_TARGET}
+        )
+
+    config = _compaction_config({"sonnet": "codex:gpt-5.1-codex-max"})
+    client, stub = _gateway(config, handler, codex_context_window=window)
+
+    response = client.post("/v1/messages", json=body, headers=_ANTHROPIC_CREDENTIAL_HEADERS)
+
+    assert response.status_code == 200
+    assert response.json()["model"] == _COMPACTION_CANONICAL_TARGET
+    assert len(captured) == 1
+    assert stub.payloads == []
+
+
+def test_compaction_stream_true_over_window_stays_on_mapped_path_without_diagnostics() -> None:
+    # Temporary T-5 carve-out: stream:true over-window requests are not
+    # rerouted and write no diagnostics record until T-6 completes the
+    # commit-once streaming relay semantics.
+    body = _compaction_body("claude-opus-4-6")
+    body["stream"] = True
+    window = estimate_overflow_prompt_tokens(body) - 1
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(500, json={"error": "unexpected anthropic call"})
+
+    config = _compaction_config({"opus": "codex:gpt-5.6-sol"})
+    client, stub = _gateway(config, handler, codex_context_window=window)
+
+    response = client.post("/v1/messages", json=body, headers=_ANTHROPIC_CREDENTIAL_HEADERS)
+
+    assert response.status_code == 503
+    assert captured == []
+    assert stub.payloads  # the mapped path ran normally
+    assert client.app.state.compaction_last_reroute is None
 
 
 # --- upstream stream ownership -------------------------------------------
