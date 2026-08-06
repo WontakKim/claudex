@@ -59,6 +59,10 @@ class ContextWindowCache:
 
             try:
                 fetched = await self._fetch()
+            except asyncio.CancelledError:
+                # Cancellation always propagates, even when the caller's
+                # expected_errors tuple would otherwise catch it.
+                raise
             except self._expected_errors:
                 self._failure_time = self._clock()
                 return self._snapshot.get(model) if self._snapshot is not None else None

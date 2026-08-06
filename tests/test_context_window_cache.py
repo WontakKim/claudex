@@ -222,3 +222,19 @@ def test_absent_model_returns_none() -> None:
 
     assert result is None
     assert fetch.calls == 1
+
+
+def test_cancellation_propagates_even_when_expected_errors_would_catch_it() -> None:
+    clock = FakeClock()
+    fetch = FakeFetch()
+    fetch.queue_error(asyncio.CancelledError())
+    fetch.queue_result({"model-a": 128_000})
+    cache = ContextWindowCache(fetch, expected_errors=(BaseException,), clock=clock)
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(cache.get("model-a"))
+
+    # Cancellation must not establish refresh backoff: the next lookup
+    # fetches immediately instead of being suppressed for the backoff window.
+    assert asyncio.run(cache.get("model-a")) == 128_000
+    assert fetch.calls == 2
