@@ -211,3 +211,128 @@ def test_list_models_raises_on_upstream_error() -> None:
     with pytest.raises(GrokUpstreamError) as exc_info:
         asyncio.run(scenario())
     assert exc_info.value.status_code == 401
+
+
+class TestContextWindow:
+    @staticmethod
+    def _catalog_response(data: list[Any]) -> httpx.Response:
+        return httpx.Response(200, json={"object": "list", "data": data})
+
+    def test_resolves_exact_id_and_ignores_sibling_field(self) -> None:
+        async def handler(request: httpx.Request) -> httpx.Response:
+            return self._catalog_response(
+                [{"id": "grok-4.5", "context_window": 500000, "auto_compact_threshold_percent": 80}]
+            )
+
+        async def scenario() -> int | None:
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+                return await GrokClient(_FakeAuthManager(), http_client).context_window("grok-4.5")
+
+        assert asyncio.run(scenario()) == 500000
+
+    @pytest.mark.parametrize(
+        "entry",
+        [
+            {"id": "grok-4.5"},
+            {"id": "grok-4.5", "context_window": "500000"},
+            {"id": "grok-4.5", "context_window": True},
+            {"id": "grok-4.5", "context_window": 0},
+            {"id": "grok-4.5", "context_window": -1},
+            {"id": "grok-4.5", "context_window": 500000.5},
+        ],
+    )
+    def test_invalid_context_window_resolves_to_none(self, entry: dict[str, Any]) -> None:
+        async def handler(request: httpx.Request) -> httpx.Response:
+            return self._catalog_response([entry])
+
+        async def scenario() -> int | None:
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+                return await GrokClient(_FakeAuthManager(), http_client).context_window("grok-4.5")
+
+        assert asyncio.run(scenario()) is None
+
+    def test_positive_integral_float_is_coerced_to_int(self) -> None:
+        async def handler(request: httpx.Request) -> httpx.Response:
+            return self._catalog_response([{"id": "grok-4.5", "context_window": 500000.0}])
+
+        async def scenario() -> int | None:
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+                return await GrokClient(_FakeAuthManager(), http_client).context_window("grok-4.5")
+
+        result = asyncio.run(scenario())
+        assert result == 500000
+        assert isinstance(result, int)
+
+    def test_unknown_id_resolves_to_none(self) -> None:
+        async def handler(request: httpx.Request) -> httpx.Response:
+            return self._catalog_response([{"id": "grok-4.5", "context_window": 500000}])
+
+        async def scenario() -> int | None:
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+                return await GrokClient(_FakeAuthManager(), http_client).context_window("grok-unknown")
+
+        assert asyncio.run(scenario()) is None
+
+    def test_cold_cache_structural_failure_returns_none(self) -> None:
+        async def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(500, text="boom")
+
+        async def scenario() -> int | None:
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+                return await GrokClient(_FakeAuthManager(), http_client).context_window("grok-4.5")
+
+        assert asyncio.run(scenario()) is None
+
+    def test_stale_value_served_after_structural_refresh_failure(self) -> None:
+        calls = {"n": 0}
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return self._catalog_response([{"id": "grok-4.5", "context_window": 500000}])
+            return httpx.Response(500, text="boom")
+
+        async def scenario() -> tuple[int | None, int | None]:
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+                client = GrokClient(_FakeAuthManager(), http_client)
+                first = await client.context_window("grok-4.5")
+                # Force the snapshot stale without waiting out the real TTL.
+                client._context_windows._snapshot_time = 0.0
+                second = await client.context_window("grok-4.5")
+                return first, second
+
+        first, second = asyncio.run(scenario())
+        assert first == 500000
+        assert second == 500000
+        assert calls["n"] == 2
+
+    def test_list_models_still_fetches_fresh_after_context_window_populates_cache(self) -> None:
+        calls = {"n": 0}
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            calls["n"] += 1
+            return self._catalog_response([{"id": "grok-4.5", "context_window": 500000}])
+
+        async def scenario() -> tuple[int | None, list[str]]:
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+                client = GrokClient(_FakeAuthManager(), http_client)
+                window = await client.context_window("grok-4.5")
+                models = await client.list_models()
+                return window, models
+
+        window, models = asyncio.run(scenario())
+        assert window == 500000
+        assert models == ["grok-4.5"]
+        assert calls["n"] == 2
+
+    def test_list_models_still_raises_on_upstream_error(self) -> None:
+        async def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(500, text="boom")
+
+        async def scenario() -> None:
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+                await GrokClient(_FakeAuthManager(), http_client).list_models()
+
+        with pytest.raises(GrokUpstreamError) as exc_info:
+            asyncio.run(scenario())
+        assert exc_info.value.status_code == 500

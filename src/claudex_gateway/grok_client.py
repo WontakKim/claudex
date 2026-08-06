@@ -14,7 +14,8 @@ from typing import Any
 
 import httpx
 
-from claudex_gateway.grok_auth import GrokAuthManager, GrokCredentials
+from claudex_gateway.context_window_cache import ContextWindowCache
+from claudex_gateway.grok_auth import GrokAuthError, GrokAuthManager, GrokCredentials
 
 GROK_RESPONSES_URL = "https://cli-chat-proxy.grok.com/v1/responses"
 GROK_MODELS_URL = "https://cli-chat-proxy.grok.com/v1/models"
@@ -69,6 +70,23 @@ class GrokUpstreamError(Exception):
         self.body = body
 
 
+def _coerce_context_window(value: Any) -> int | None:
+    """Apply the catalog's context-window type policy.
+
+    Accepts a positive `int` (excluding `bool`, which is technically an
+    `int` subclass) or a positive, integral `float` coerced to `int`.
+    Everything else — missing, non-numeric, zero, negative, or fractional —
+    yields `None`.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value > 0 else None
+    if isinstance(value, float) and value.is_integer():
+        return int(value) if value > 0 else None
+    return None
+
+
 def sanitize_grok_payload(payload: dict[str, Any], model: str) -> dict[str, Any]:
     """Adapt a Codex-shaped Responses payload to what Grok's backend accepts."""
     sanitized = {key: value for key, value in payload.items() if key not in _GROK_UNSUPPORTED_FIELDS}
@@ -87,6 +105,10 @@ class GrokClient:
     def __init__(self, auth_manager: GrokAuthManager, http_client: httpx.AsyncClient) -> None:
         self._auth_manager = auth_manager
         self._http_client = http_client
+        self._context_windows = ContextWindowCache(
+            self._fetch_context_windows,
+            expected_errors=(GrokAuthError, GrokUpstreamError, httpx.HTTPError),
+        )
 
     async def stream_responses(
         self, payload: dict[str, Any], session_id: str
@@ -110,6 +132,39 @@ class GrokClient:
 
     async def list_models(self) -> list[str]:
         """Return the model IDs from the live catalog (OpenAI list shape)."""
+        data = await self._fetch_catalog_entries()
+        return [
+            model["id"]
+            for model in data
+            if isinstance(model, dict) and isinstance(model.get("id"), str)
+        ]
+
+    async def context_window(self, model: str) -> int | None:
+        """Return the model's context window size from the cached catalog."""
+        return await self._context_windows.get(model)
+
+    async def _fetch_context_windows(self) -> dict[str, int]:
+        """Fetch the catalog and map each valid entry's id to its context window."""
+        data = await self._fetch_catalog_entries()
+        windows: dict[str, int] = {}
+        for entry in data:
+            if not isinstance(entry, dict):
+                continue
+            model_id = entry.get("id")
+            if not isinstance(model_id, str) or not model_id:
+                continue
+            window = _coerce_context_window(entry.get("context_window"))
+            if window is not None:
+                windows[model_id] = window
+        return windows
+
+    async def _fetch_catalog_entries(self) -> list[Any]:
+        """GET the live model catalog and return its `data` list.
+
+        Raises `GrokUpstreamError` on any structural failure: a non-200
+        response, invalid JSON, a non-object JSON root, or a missing/
+        non-list `data` field.
+        """
         credentials = await self._auth_manager.get_credentials()
         headers = self._base_headers(credentials)
         headers["Accept"] = "application/json"
@@ -123,11 +178,7 @@ class GrokClient:
         data = parsed.get("data") if isinstance(parsed, dict) else None
         if not isinstance(data, list):
             raise GrokUpstreamError(502, "grok models response has no data list")
-        return [
-            model["id"]
-            for model in data
-            if isinstance(model, dict) and isinstance(model.get("id"), str)
-        ]
+        return data
 
     @staticmethod
     def _base_headers(credentials: GrokCredentials) -> dict[str, str]:
