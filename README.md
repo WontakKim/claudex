@@ -235,6 +235,23 @@ settings.
 
 Registered accounts are not yet used for gateway requests.
 
+### Compact command
+
+Manage the opt-in compaction reroute (see [Compaction
+reroute](#compaction-reroute) below) from the command line:
+
+```sh
+uv run claudex-gateway compact                       # show current state
+uv run claudex-gateway compact set claude:<model-id>  # enable, target <model-id>
+uv run claudex-gateway compact off                    # disable
+```
+
+Each subcommand prefers a live daemon's admin API (`GET`/`PUT
+/admin/compaction`), so an enabled/disabled state or target change on a
+running gateway takes effect immediately with no restart; when no daemon
+can be confirmed running, it falls back to reading or writing
+`settings.json` directly (picked up the next time the gateway starts).
+
 ## Configuration
 
 Every variable can be set in `~/.claudex/settings.json` or as an
@@ -253,6 +270,7 @@ stays available for one-off overrides.
 | `KIMI_CODE_HOME` | `~/.kimi-code` | Directory containing the Kimi Code CLI's credential store |
 | `CLAUDEX_LOG_LEVEL` | `info` | Process log verbosity: `debug`, `info`, `warning`, or `error`; editable at runtime from the dashboard |
 | `CLAUDEX_LOCAL_TOKEN` | unset | Bearer token required by the model request routes and the admin/dashboard routes when set; mandatory for non-loopback binds. See [the passthrough interaction](#mixing-claude-and-codex-models) |
+| `CLAUDEX_COMPACTION_MODEL` | unset | `compaction.model` setting: opt-in `claude:<model-id>` reroute target for oversized Claude Code compaction requests; unset (default) disables the reroute entirely. See [Compaction reroute](#compaction-reroute) |
 
 ### settings.json
 
@@ -289,6 +307,40 @@ persists it to `settings.json` (other keys in the file are preserved). When
 environment would silently win again on restart. The endpoint honors
 `CLAUDEX_LOCAL_TOKEN` and only answers requests whose `Host` is the gateway
 itself, so foreign web pages cannot drive it from a browser.
+
+### Compaction reroute
+
+The compaction reroute is opt-in and disabled by default (unset
+`compaction.model`); once configured to a `claude:<model-id>` target, it
+triggers only for a detected Claude Code compaction request whose estimated
+size exceeds the mapped backend's context window, and makes a single
+Anthropic attempt using the client's own credentials, billed by Anthropic
+separately from the mapped backend. Its failure semantics: missing eligible
+Anthropic credentials skip the reroute entirely; connection failures and
+non-2xx responses before a streaming HTTP 2xx commit fall back silently to
+the mapped backend; failures after that commit surface as in-band SSE
+errors without fallback; non-streaming requests fall back on any failure
+before a complete, valid JSON response is obtained. The literals used to
+detect a compaction request are a versioned contract with Claude Code
+`2.1.223` — re-verified against the client binary before ever being
+changed, never guessed.
+
+```sh
+curl http://127.0.0.1:8787/admin/compaction
+curl -X PUT http://127.0.0.1:8787/admin/compaction \
+  -H 'Content-Type: application/json' \
+  -d '{"model": "claude:claude-opus-5"}'
+curl -X PUT http://127.0.0.1:8787/admin/compaction \
+  -H 'Content-Type: application/json' \
+  -d '{"model": null}'
+```
+
+`GET`/`PUT /admin/compaction` read and change the same `compaction.model`
+setting on a running gateway, honoring the same `CLAUDEX_LOCAL_TOKEN` and
+Host guard as the other admin routes; a `PUT` persists the change to
+`settings.json` and, like the mapping API, is refused with `409` when
+`CLAUDEX_COMPACTION_MODEL` is set in the environment. The [`compact`
+command](#compact-command) is a CLI front end for this same API.
 
 ### Dashboard
 
