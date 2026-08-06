@@ -38,6 +38,10 @@ SETTINGS_KEYS: dict[str, str] = {
     "kimi_code_home": "KIMI_CODE_HOME",
     "local_token": "CLAUDEX_LOCAL_TOKEN",
     "log_level": "CLAUDEX_LOG_LEVEL",
+    # Opt-in: which Claude model oversized compaction requests are rerouted
+    # to. Absence of the key (or a resolved empty string) means the feature
+    # is disabled — there is no separate "enabled" flag.
+    "compaction.model": "CLAUDEX_COMPACTION_MODEL",
 }
 
 
@@ -82,6 +86,29 @@ def parse_route_target(value: str) -> RouteTarget:
     return RouteTarget(provider=prefix, model=model)
 
 
+def parse_compaction_model(value: str) -> str:
+    """Parse a compaction.model value like "claude:claude-opus-5".
+
+    Only the "claude:" prefix is accepted. This is deliberately independent
+    of parse_route_target/KNOWN_ROUTE_PROVIDERS: compaction requests are
+    rerouted to a Claude model, not to a model_map upstream, and "claude"
+    must never become a valid model_map route provider. Returns the
+    canonical model id with the prefix stripped.
+    """
+    prefix, sep, model_id = value.partition(":")
+    if not sep or prefix != "claude":
+        raise ConfigError(
+            f"compaction model {value!r} must be prefixed with 'claude:', "
+            f"e.g. 'claude:claude-opus-5'"
+        )
+    if not model_id or any(char.isspace() for char in model_id):
+        raise ConfigError(
+            f"compaction model {value!r} names no valid model after the "
+            f"'claude:' prefix"
+        )
+    return model_id
+
+
 def _default_kimi_code_home() -> Path:
     return Path.home() / ".kimi-code"
 
@@ -106,6 +133,10 @@ class GatewayConfig:
     kimi_code_home: Path = field(default_factory=_default_kimi_code_home)
     local_token: str | None = None
     log_level: str = "info"
+    # Raw "claude:<canonical-model-id>" value naming the Claude model to
+    # reroute oversized compaction requests to. None means the feature is
+    # disabled — there is no separate "enabled" flag.
+    compaction_model: str | None = None
     # Where settings are read from and where runtime changes are persisted.
     settings_file: Path = field(default_factory=paths.settings_file)
 
@@ -192,6 +223,25 @@ class GatewayConfig:
                 f"{label} must be one of {', '.join(VALID_LOG_LEVELS)}, got {log_level!r}"
             )
 
+        value, label = _resolve("compaction.model", settings)
+        env_name = SETTINGS_KEYS["compaction.model"]
+        if value is None:
+            if label == env_name:
+                compaction_model = None
+            else:
+                # The key is present in the settings file (e.g. JSON null) —
+                # that must not be conflated with "not configured".
+                raise ConfigError(f"{label} must be a string, got {value!r}")
+        elif not isinstance(value, str):
+            raise ConfigError(f"{label} must be a string, got {value!r}")
+        else:
+            compaction_model = value or None
+            if compaction_model is not None:
+                try:
+                    parse_compaction_model(compaction_model)
+                except ConfigError as exc:
+                    raise ConfigError(f"{label}: {exc}") from exc
+
         return cls(
             host=host,
             port=port,
@@ -202,6 +252,7 @@ class GatewayConfig:
             kimi_code_home=kimi_code_home,
             local_token=local_token,
             log_level=log_level,
+            compaction_model=compaction_model,
             settings_file=settings_file,
         )
 

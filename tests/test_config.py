@@ -5,7 +5,13 @@ from pathlib import Path
 
 import pytest
 
-from claudex_gateway.config import ConfigError, GatewayConfig, RouteTarget
+from claudex_gateway.config import (
+    ConfigError,
+    GatewayConfig,
+    RouteTarget,
+    parse_compaction_model,
+    parse_route_target,
+)
 
 
 def test_max_reasoning_effort_is_accepted(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -220,3 +226,81 @@ class TestRouteTargetValidation:
     def test_kimi_code_home_env_override(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("KIMI_CODE_HOME", "~/kimi-code-alt")
         assert GatewayConfig.from_env().kimi_code_home == Path.home() / "kimi-code-alt"
+
+
+class TestParseCompactionModel:
+    def test_returns_canonical_model_id(self) -> None:
+        assert parse_compaction_model("claude:claude-opus-5") == "claude-opus-5"
+
+    @pytest.mark.parametrize(
+        "value",
+        ["sonnet-5", "codex:x", "claude:", "claude: ", "anthropic:claude-sonnet-5"],
+    )
+    def test_invalid_values_are_rejected(self, value: str) -> None:
+        with pytest.raises(ConfigError):
+            parse_compaction_model(value)
+
+    def test_claude_prefix_is_still_rejected_as_a_route_target(self) -> None:
+        # Locked contract: "claude" must never become a valid model_map route
+        # provider, so parse_route_target keeps rejecting it.
+        with pytest.raises(ConfigError, match="unknown provider prefix 'claude'"):
+            parse_route_target("claude:claude-opus-5")
+
+
+class TestCompactionModelSetting:
+    @staticmethod
+    def _write(tmp_path: Path, payload: object) -> Path:
+        settings_file = tmp_path / "settings.json"
+        settings_file.write_text(json.dumps(payload), encoding="utf-8")
+        return settings_file
+
+    def test_valid_value_populates_the_raw_field(self, tmp_path: Path) -> None:
+        settings_file = self._write(
+            tmp_path, {"compaction.model": "claude:claude-opus-5"}
+        )
+        config = GatewayConfig.load(settings_file)
+        # The field holds the raw "claude:<id>" value, not the canonical id
+        # returned by parse_compaction_model.
+        assert config.compaction_model == "claude:claude-opus-5"
+
+    def test_absent_key_disables_the_feature(self, tmp_path: Path) -> None:
+        settings_file = self._write(tmp_path, {})
+        assert GatewayConfig.load(settings_file).compaction_model is None
+
+    def test_env_overrides_settings_file(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        settings_file = self._write(
+            tmp_path, {"compaction.model": "claude:claude-opus-5"}
+        )
+        monkeypatch.setenv("CLAUDEX_COMPACTION_MODEL", "claude:claude-sonnet-6")
+        config = GatewayConfig.load(settings_file)
+        assert config.compaction_model == "claude:claude-sonnet-6"
+
+    def test_empty_env_forces_disabled_even_with_file_value(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        settings_file = self._write(
+            tmp_path, {"compaction.model": "claude:claude-opus-5"}
+        )
+        monkeypatch.setenv("CLAUDEX_COMPACTION_MODEL", "")
+        assert GatewayConfig.load(settings_file).compaction_model is None
+
+    @pytest.mark.parametrize("value", [None, True, 1, [], {}])
+    def test_non_string_file_value_fails_to_load(
+        self, tmp_path: Path, value: object
+    ) -> None:
+        settings_file = self._write(tmp_path, {"compaction.model": value})
+        with pytest.raises(ConfigError, match='compaction.model" must be a string'):
+            GatewayConfig.load(settings_file)
+
+    @pytest.mark.parametrize(
+        "value",
+        ["sonnet-5", "codex:x", "claude:", "claude: ", "anthropic:claude-sonnet-5"],
+    )
+    def test_invalid_string_value_fails_to_load(
+        self, monkeypatch: pytest.MonkeyPatch, value: str
+    ) -> None:
+        monkeypatch.setenv("CLAUDEX_COMPACTION_MODEL", value)
+        with pytest.raises(ConfigError, match="CLAUDEX_COMPACTION_MODEL"):
+            GatewayConfig.from_env()
