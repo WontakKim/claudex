@@ -1143,9 +1143,17 @@ function applyCompaction(){
         '<br><span class="dim">'+esc(errDetail(r.body))+"</span>",true);
       // The 409 body is only the admin error envelope, never state: model,
       // env_locked and last_reroute are only ever read from this fresh GET,
-      // never from r.body above.
+      // never from r.body above. And if that refresh GET itself fails or
+      // returns a malformed envelope, its body must not be rendered as
+      // state either — the card stays locked with its previous live state.
       jfetch("/admin/compaction").then(function(g){
-        if(g.ok)renderCompactionState(g.body);
+        if(g.ok&&g.body&&typeof g.body.env_locked==="boolean"&&"model" in g.body&&"last_reroute" in g.body){
+          renderCompactionState(g.body);
+        }else{
+          COMP.locked=true;
+          renderCompaction();
+          showToast('<span class="chip chip-err">ERROR</span><br>Compaction refresh<br><span class="dim">could not load current state</span>',true);
+        }
       });
       return;
     }

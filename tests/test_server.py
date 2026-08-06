@@ -3753,6 +3753,32 @@ def test_dashboard_compaction_409_branch_refreshes_via_get_not_error_body(
     # Current state is only ever adopted from a fresh, authenticated GET —
     # never from the 409 response body itself.
     assert 'jfetch("/admin/compaction")' in locked_branch
+
+
+def test_dashboard_compaction_409_refresh_failure_stays_locked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # If the post-409 refresh GET itself fails or returns a malformed
+    # envelope, its body must not be rendered as state and the card must
+    # remain locked.
+    with _create_test_client(monkeypatch) as client:
+        page = client.get("/").text
+
+    apply_fn = _compaction_apply_fn(page)
+    branch_start = apply_fn.index("r.status===409")
+    branch_end = apply_fn.index("if(!r.ok){", branch_start)
+    locked_branch = apply_fn[branch_start:branch_end]
+
+    refresh_start = locked_branch.index('jfetch("/admin/compaction")')
+    refresh_branch = locked_branch[refresh_start:]
+    # renderCompactionState is guarded on a successful, well-formed envelope.
+    guard_at = refresh_branch.index('typeof g.body.env_locked==="boolean"')
+    render_at = refresh_branch.index("renderCompactionState(g.body)")
+    assert guard_at < render_at
+    assert "g.ok" in refresh_branch[:render_at]
+    # The failure arm keeps the card locked instead of adopting the body.
+    else_arm = refresh_branch[render_at:]
+    assert "COMP.locked=true" in else_arm
     assert "renderCompactionState(g.body)" in locked_branch
     assert "r.body.model" not in locked_branch
     assert "r.body.env_locked" not in locked_branch

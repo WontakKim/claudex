@@ -357,7 +357,7 @@ def _stub_urlopen(
             raise exception
         return response
 
-    monkeypatch.setattr(urllib.request, "urlopen", _fake)
+    monkeypatch.setattr(gateway_main, "_urlopen_no_redirect", _fake)
 
 
 class _RecordingOpener:
@@ -389,7 +389,7 @@ def _stub_full_stack_urlopen(
             return _FakeResponse(200, _HELLO_BODY)
         raise urllib.error.HTTPError(url, admin_status, "error", None, io.BytesIO(admin_body))
 
-    monkeypatch.setattr(urllib.request, "urlopen", _fake)
+    monkeypatch.setattr(gateway_main, "_urlopen_no_redirect", _fake)
 
 
 # --- URL bracketing (IPv6-safe URL construction) ---------------------------
@@ -563,7 +563,7 @@ def test_admin_request_attaches_bearer_header_when_local_token_configured(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     opener = _RecordingOpener(_FakeResponse(200, b"{}"))
-    monkeypatch.setattr(urllib.request, "urlopen", opener)
+    monkeypatch.setattr(gateway_main, "_urlopen_no_redirect", opener)
 
     gateway_main._admin_request(
         "127.0.0.1", 8787, "GET", "/admin/compaction", local_token="local_token-value"
@@ -577,7 +577,7 @@ def test_admin_request_omits_bearer_header_when_no_local_token_configured(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     opener = _RecordingOpener(_FakeResponse(200, b"{}"))
-    monkeypatch.setattr(urllib.request, "urlopen", opener)
+    monkeypatch.setattr(gateway_main, "_urlopen_no_redirect", opener)
 
     gateway_main._admin_request(
         "127.0.0.1", 8787, "GET", "/admin/compaction", local_token=None
@@ -591,7 +591,7 @@ def test_admin_request_sets_json_content_type_on_put_but_not_get(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     opener = _RecordingOpener(_FakeResponse(200, b"{}"))
-    monkeypatch.setattr(urllib.request, "urlopen", opener)
+    monkeypatch.setattr(gateway_main, "_urlopen_no_redirect", opener)
 
     gateway_main._admin_request(
         "127.0.0.1",
@@ -1175,3 +1175,205 @@ def test_compact_off_identified_transport_failure_after_probe_leaves_settings_un
     assert exit_code != 0
     saved = json.loads(settings_file.read_text(encoding="utf-8"))
     assert saved == {"compaction.model": "claude:claude-old-5"}
+
+
+def _malformed_reroute_envelope() -> "gateway_main._AdminHttpResponse":
+    # Envelope-level fields are fine, but the nested last_reroute is not the
+    # pinned seven-key record — this must be an admin failure, not success.
+    return gateway_main._AdminHttpResponse(
+        status=200,
+        body={"model": None, "env_locked": False, "last_reroute": {}},
+        detail="",
+    )
+
+
+def test_parse_compaction_envelope_rejects_malformed_nested_reroute_record() -> None:
+    assert (
+        gateway_main._parse_compaction_envelope(
+            {"model": None, "env_locked": False, "last_reroute": {}}
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    "record_override",
+    [
+        {"outcome": "exploded"},
+        {"timestamp": 12345},
+        {"estimated_prompt_tokens": True},
+        {"context_window": "big"},
+        {"detail": "sql_injection"},
+        {"detail": "http_50x"},
+        {"outcome": "rerouted", "detail": "read_error"},
+        {"outcome": "midstream_error", "detail": "connect_error"},
+        {"outcome": "fallback_mapped", "detail": None},
+        {"sequence": 7},
+    ],
+)
+def test_parse_reroute_record_rejects_schema_violations(
+    record_override: dict[str, object],
+) -> None:
+    record: dict[str, object] = {
+        "outcome": "fallback_mapped",
+        "timestamp": "2026-08-07T00:00:00.000+00:00",
+        "target_model": "claude-opus-5",
+        "mapped_model": "codex:gpt-5.1-codex-max",
+        "estimated_prompt_tokens": 250000,
+        "context_window": 200000,
+        "detail": "http_401",
+    }
+    record.update(record_override)
+    assert gateway_main._parse_reroute_record(record) is None
+
+
+def test_parse_reroute_record_accepts_each_valid_outcome_shape() -> None:
+    base = {
+        "timestamp": "2026-08-07T00:00:00.000+00:00",
+        "target_model": "claude-opus-5",
+        "mapped_model": "grok:grok-code-fast",
+        "estimated_prompt_tokens": 250000,
+        "context_window": 200000,
+    }
+    for outcome, detail in [
+        ("rerouted", None),
+        ("skipped_no_credentials", None),
+        ("fallback_mapped", "connect_error"),
+        ("fallback_mapped", "http_503"),
+        ("midstream_error", "read_error"),
+    ]:
+        record = dict(base, outcome=outcome, detail=detail)
+        assert gateway_main._parse_reroute_record(record) == record
+
+
+def test_compact_show_malformed_nested_record_exits_nonzero(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _compact_env(monkeypatch, tmp_path, gateway_main.ProbeOutcome.IDENTIFIED)
+    _stub_admin_request(monkeypatch, response=_malformed_reroute_envelope())
+
+    exit_code = gateway_main._compact_main([])
+
+    assert exit_code != 0
+    assert "malformed" in capsys.readouterr().err
+
+
+def test_compact_set_malformed_nested_record_exits_nonzero_without_write(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config = _compact_env(monkeypatch, tmp_path, gateway_main.ProbeOutcome.IDENTIFIED)
+    _stub_admin_request(monkeypatch, response=_malformed_reroute_envelope())
+
+    exit_code = gateway_main._compact_main(["set", "claude:claude-opus-5"])
+
+    assert exit_code != 0
+    assert not config.settings_file.exists()
+
+
+def test_compact_off_malformed_nested_record_exits_nonzero_without_write(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    settings_file = tmp_path / "settings.json"
+    settings_file.write_text(
+        json.dumps({"compaction.model": "claude:claude-old-5"}), encoding="utf-8"
+    )
+    _compact_env(
+        monkeypatch,
+        tmp_path,
+        gateway_main.ProbeOutcome.IDENTIFIED,
+        compaction_model="claude:claude-old-5",
+    )
+    _stub_admin_request(monkeypatch, response=_malformed_reroute_envelope())
+
+    exit_code = gateway_main._compact_main(["off"])
+
+    assert exit_code != 0
+    saved = json.loads(settings_file.read_text(encoding="utf-8"))
+    assert saved == {"compaction.model": "claude:claude-old-5"}
+
+
+class _RedirectTarget:
+    """Second endpoint that records whether it was ever contacted."""
+
+    def __init__(self) -> None:
+        self.requests: list[tuple[str, dict[str, str]]] = []
+
+
+def _serve_redirect_pair() -> "tuple[object, object, int, _RedirectTarget]":
+    """Start server A (redirects everything to server B) and recording server B."""
+    import http.server
+
+    target = _RedirectTarget()
+
+    class TargetHandler(http.server.BaseHTTPRequestHandler):
+        def _record(self) -> None:
+            target.requests.append((self.path, dict(self.headers)))
+            body = b'{"hello": "claudex-gateway"}'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        do_GET = _record
+        do_PUT = _record
+
+        def log_message(self, *args: object) -> None:
+            pass
+
+    target_server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), TargetHandler)
+    target_port = target_server.server_address[1]
+
+    class RedirectHandler(http.server.BaseHTTPRequestHandler):
+        def _redirect(self) -> None:
+            self.send_response(302)
+            self.send_header(
+                "Location", f"http://127.0.0.1:{target_port}{self.path}"
+            )
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        do_GET = _redirect
+        do_PUT = _redirect
+
+        def log_message(self, *args: object) -> None:
+            pass
+
+    redirect_server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), RedirectHandler)
+    redirect_port = redirect_server.server_address[1]
+
+    for server in (target_server, redirect_server):
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+    return redirect_server, target_server, redirect_port, target
+
+
+def test_probe_and_admin_never_follow_redirects_or_leak_the_bearer() -> None:
+    redirect_server, target_server, redirect_port, target = _serve_redirect_pair()
+    try:
+        # Probe: the 3xx is the final answer from the port occupant — FOREIGN,
+        # never classified from the redirect target.
+        outcome = gateway_main._classify_daemon("127.0.0.1", redirect_port)
+        assert outcome is gateway_main.ProbeOutcome.FOREIGN
+
+        # Admin: the 3xx is a completed non-2xx response — FAILURE, and the
+        # bearer-carrying request must never reach the redirect target.
+        admin_outcome, envelope, detail = gateway_main._run_admin_compaction(
+            "127.0.0.1",
+            redirect_port,
+            "GET",
+            "secret-local-token",
+            None,
+        )
+        assert admin_outcome is gateway_main._CompactionAdminOutcome.FAILURE
+        assert envelope is None
+        assert "302" in detail
+
+        assert target.requests == []
+    finally:
+        redirect_server.shutdown()
+        target_server.shutdown()
+        redirect_server.server_close()
+        target_server.server_close()

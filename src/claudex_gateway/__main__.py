@@ -462,6 +462,27 @@ _ADMIN_TIMEOUT = 5.0
 _COMPACT_USAGE = "usage: claudex-gateway compact [set claude:<id>|off]"
 
 
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Refuse to follow any redirect: the 3xx surfaces as an HTTPError.
+
+    Following a redirect would re-send the request headers — including the
+    local bearer token on admin calls — to whatever host the Location header
+    names, and would classify the probe from the redirect target instead of
+    the actual port occupant.
+    """
+
+    def redirect_request(self, *args: Any, **kwargs: Any) -> None:
+        return None
+
+
+_NO_REDIRECT_OPENER = urllib.request.build_opener(_NoRedirectHandler)
+
+
+def _urlopen_no_redirect(request: urllib.request.Request | str, timeout: float) -> Any:
+    """`urlopen` for probe/admin calls; every 3xx is a final response."""
+    return _NO_REDIRECT_OPENER.open(request, timeout=timeout)
+
+
 class ProbeOutcome(enum.Enum):
     """The four-way result of probing GET /api/hello for a compact command.
 
@@ -513,12 +534,13 @@ def _classify_daemon(host: str, port: int) -> ProbeOutcome:
     GET request with a short timeout.
     """
     try:
-        with urllib.request.urlopen(
+        with _urlopen_no_redirect(
             _http_url(host, port, "/api/hello"), timeout=_PROBE_TIMEOUT
         ) as response:
             raw = response.read()
     except urllib.error.HTTPError:
-        # A completed HTTP response, but an error status: not a valid hello.
+        # A completed HTTP response, but an error or redirect status: not a
+        # valid hello (redirects are never followed, so a 3xx lands here).
         return ProbeOutcome.FOREIGN
     except urllib.error.URLError as exc:
         if isinstance(exc.reason, ConnectionRefusedError):
@@ -595,7 +617,7 @@ def _admin_request(
         _http_url(host, port, path), data=data, headers=headers, method=method
     )
     try:
-        with urllib.request.urlopen(request, timeout=_ADMIN_TIMEOUT) as response:
+        with _urlopen_no_redirect(request, timeout=_ADMIN_TIMEOUT) as response:
             body, detail = _parse_admin_body(response.read())
             return _AdminHttpResponse(status=response.status, body=body, detail=detail)
     except urllib.error.HTTPError as exc:
@@ -605,13 +627,78 @@ def _admin_request(
         raise _AdminTransportError(str(exc)) from exc
 
 
+# The pinned seven-key last_reroute record (see server's
+# _assign_compaction_reroute) and its detail grammar/outcome constraints.
+_REROUTE_RECORD_KEYS = frozenset(
+    {
+        "outcome",
+        "timestamp",
+        "target_model",
+        "mapped_model",
+        "estimated_prompt_tokens",
+        "context_window",
+        "detail",
+    }
+)
+_REROUTE_OUTCOMES = frozenset(
+    {"rerouted", "fallback_mapped", "skipped_no_credentials", "midstream_error"}
+)
+_REROUTE_SIMPLE_DETAILS = frozenset({"connect_error", "read_error", "invalid_json"})
+
+
+def _is_real_int(value: Any) -> bool:
+    # bool is an int subclass; True/False must not pass as token counts.
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _is_valid_reroute_detail(detail: Any) -> bool:
+    if detail is None:
+        return True
+    if not isinstance(detail, str):
+        return False
+    if detail in _REROUTE_SIMPLE_DETAILS:
+        return True
+    return (
+        detail.startswith("http_")
+        and len(detail) == len("http_") + 3
+        and all(char in "0123456789" for char in detail[len("http_"):])
+    )
+
+
+def _parse_reroute_record(record: Any) -> dict[str, Any] | None:
+    """Validate a non-null last_reroute against the pinned record schema."""
+    if not isinstance(record, dict) or set(record) != _REROUTE_RECORD_KEYS:
+        return None
+    outcome = record["outcome"]
+    if outcome not in _REROUTE_OUTCOMES:
+        return None
+    for key in ("timestamp", "target_model", "mapped_model"):
+        if not isinstance(record[key], str):
+            return None
+    if not _is_real_int(record["estimated_prompt_tokens"]):
+        return None
+    if not _is_real_int(record["context_window"]):
+        return None
+    detail = record["detail"]
+    if not _is_valid_reroute_detail(detail):
+        return None
+    if outcome in ("rerouted", "skipped_no_credentials") and detail is not None:
+        return None
+    if outcome == "midstream_error" and detail != "read_error":
+        return None
+    if outcome == "fallback_mapped" and detail is None:
+        return None
+    return record
+
+
 def _parse_compaction_envelope(body: Any) -> dict[str, Any] | None:
     """Validate the pinned {model, env_locked, last_reroute} envelope.
 
     Returns the body unchanged when every required field is present and
-    correctly typed (model: str|None, env_locked: bool, last_reroute:
-    dict|None); otherwise None, so the caller treats a malformed 2xx body as
-    an admin failure rather than trusting it.
+    correctly typed (model: str|None, env_locked: bool, last_reroute: None or
+    a record matching the pinned seven-key schema, detail grammar, and
+    outcome constraints); otherwise None, so the caller treats a malformed
+    2xx body as an admin failure rather than trusting it.
     """
     if not isinstance(body, dict):
         return None
@@ -623,7 +710,7 @@ def _parse_compaction_envelope(body: Any) -> dict[str, Any] | None:
     if not isinstance(body["env_locked"], bool):
         return None
     last_reroute = body["last_reroute"]
-    if last_reroute is not None and not isinstance(last_reroute, dict):
+    if last_reroute is not None and _parse_reroute_record(last_reroute) is None:
         return None
     return body
 
