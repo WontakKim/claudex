@@ -25,6 +25,9 @@ from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
 import claudex_gateway
+from claudex_gateway import paths
+from claudex_gateway.claude_accounts import AccountRegistryError, load_registry
+from claudex_gateway.claude_auth import ClaudeAccountAuthError, ClaudeAccountAuthManager
 from claudex_gateway.codex_auth import CodexAuthError, CodexAuthManager
 from claudex_gateway.codex_client import CodexClient, CodexUpstreamError
 from claudex_gateway.compaction import (
@@ -83,14 +86,18 @@ _PASSTHROUGH_SKIP_RESPONSE_HEADERS = frozenset(
     {"content-length", "content-encoding", "transfer-encoding", "connection"}
 )
 
-# The Kimi relay replaces the client's Anthropic credentials with the
-# gateway's own Bearer token, so both credential header forms are dropped.
-_KIMI_SKIP_REQUEST_HEADERS = _PASSTHROUGH_SKIP_REQUEST_HEADERS | {"authorization", "x-api-key"}
+# A managed relay (Kimi, or a registered Claude account) replaces the
+# client's Anthropic credentials with the gateway's own Bearer token, so both
+# credential header forms are dropped.
+_MANAGED_RELAY_SKIP_REQUEST_HEADERS = _PASSTHROUGH_SKIP_REQUEST_HEADERS | {
+    "authorization",
+    "x-api-key",
+}
 
-# The gateway's Kimi token comes from an OAuth login, so the upstream request
+# A managed relay's token comes from an OAuth login, so the upstream request
 # must advertise the OAuth beta even when the client authenticated some other
 # way; ported from CLIProxyAPI's Claude-header handling.
-_KIMI_OAUTH_BETA = "oauth-2025-04-20"
+_OAUTH_BETA = "oauth-2025-04-20"
 
 _STATUS_TO_CLAUDE_ERROR_TYPE = {
     400: "invalid_request_error",
@@ -270,32 +277,56 @@ def _route_for_request(config: GatewayConfig, parsed: Any) -> RouteTarget | None
 
 
 async def _passthrough_to_anthropic(
-    request: Request, raw_body: bytes
+    request: Request, raw_body: bytes, parsed_body: Any
 ) -> JSONResponse | StreamingResponse:
     """Forward the request to the real Anthropic API and relay the response verbatim.
 
-    The client's own credentials and beta headers are forwarded untouched, so
-    passthrough traffic behaves exactly as if Claude Code talked to Anthropic
-    directly.
+    With no claude_account.id configured, the client's own credentials and
+    beta headers are forwarded untouched, so passthrough traffic behaves
+    exactly as if Claude Code talked to Anthropic directly. With one
+    configured, the request is served with that registered account's
+    credentials instead (see `_passthrough_with_claude_account`).
     """
-    http_client: httpx.AsyncClient = request.app.state.http_client
-    url = f"{_ANTHROPIC_API_BASE}{request.url.path}"
-    if request.url.query:
-        url = f"{url}?{request.url.query}"
+    config: GatewayConfig = request.app.state.config
+    if config.claude_account_id is not None:
+        return await _passthrough_with_claude_account(
+            request, raw_body, parsed_body, config.claude_account_id
+        )
     headers = {
         key: value
         for key, value in request.headers.items()
         if key.lower() not in _PASSTHROUGH_SKIP_REQUEST_HEADERS
     }
-    upstream_request = http_client.build_request("POST", url, headers=headers, content=raw_body)
     try:
-        upstream_response = await http_client.send(upstream_request, stream=True)
+        upstream_response = await _send_to_anthropic(request, headers, raw_body)
     except httpx.HTTPError as exc:
         logger.warning("anthropic passthrough failed: %s", exc)
         return JSONResponse(
             _claude_error_body("api_error", f"failed to reach the Anthropic API: {exc}"),
             status_code=502,
         )
+    return _relay_anthropic_response(upstream_response)
+
+
+async def _send_to_anthropic(
+    request: Request, headers: dict[str, str], content: bytes
+) -> httpx.Response:
+    """POST the body to the Anthropic API path the client requested.
+
+    Returns the open streaming response regardless of status; raises
+    httpx.HTTPError on transport failure. Ownership of the response
+    transfers to the caller.
+    """
+    http_client: httpx.AsyncClient = request.app.state.http_client
+    url = f"{_ANTHROPIC_API_BASE}{request.url.path}"
+    if request.url.query:
+        url = f"{url}?{request.url.query}"
+    upstream_request = http_client.build_request("POST", url, headers=headers, content=content)
+    return await http_client.send(upstream_request, stream=True)
+
+
+def _relay_anthropic_response(upstream_response: httpx.Response) -> StreamingResponse:
+    """Relay an open Anthropic response verbatim, owning its lifetime."""
     response_headers = {
         key: value
         for key, value in upstream_response.headers.items()
@@ -329,6 +360,167 @@ async def _passthrough_to_anthropic(
     )
 
 
+def _claude_account_unavailable(message: str) -> JSONResponse:
+    # A misconfigured or broken serving account is the gateway's fault, never
+    # the client's, and silently falling back to the client's own credentials
+    # (usually a dummy token by now) would serve confusing 401s — fail loudly.
+    return JSONResponse(_claude_error_body("api_error", message), status_code=503)
+
+
+def _claude_account_auth_manager(app_state: Any, account_id: str) -> ClaudeAccountAuthManager:
+    """Return the cached per-account manager, creating it on first use.
+
+    Managers are keyed by account id so a `use`-switch mid-flight gets a
+    fresh manager for the new directory while requests still draining on the
+    old account keep theirs. No lock is needed: there is no await between
+    the lookup and the insert.
+    """
+    managers: dict[str, ClaudeAccountAuthManager] = app_state.claude_account_auth_managers
+    manager = managers.get(account_id)
+    if manager is None:
+        manager = ClaudeAccountAuthManager(
+            paths.accounts_dir("claude") / account_id, app_state.http_client
+        )
+        managers[account_id] = manager
+    return manager
+
+
+def _claude_account_request_headers(request: Request, access_token: str) -> dict[str, str]:
+    """Forward the client's headers with the registered account's identity.
+
+    The caller is real Claude Code, so its own fingerprint and beta headers
+    are kept; only credentials are replaced and the OAuth beta is guaranteed
+    to be present (the client may have authenticated with the gateway-local
+    token instead of an OAuth login of its own).
+    """
+    headers = {
+        key: value
+        for key, value in request.headers.items()
+        if key.lower() not in _MANAGED_RELAY_SKIP_REQUEST_HEADERS
+    }
+    headers["authorization"] = f"Bearer {access_token}"
+    headers.setdefault("anthropic-version", "2023-06-01")
+    betas = [beta.strip() for beta in headers.get("anthropic-beta", "").split(",") if beta.strip()]
+    if _OAUTH_BETA not in betas:
+        betas.append(_OAUTH_BETA)
+    headers["anthropic-beta"] = ",".join(betas)
+    return headers
+
+
+def _rewrite_metadata_account_uuid(
+    raw_body: bytes, parsed_body: Any, account_uuid: str | None
+) -> bytes:
+    """Return the body to forward, renaming metadata.user_id to the serving account.
+
+    Claude Code's `metadata.user_id` is a JSON string embedding the client's
+    own `account_uuid`; a request served with a registered account's token
+    must not name a different account, so the uuid is replaced with the
+    serving account's (or stripped when the capture recorded none). Bodies
+    that don't match that shape are forwarded unchanged — passthrough stays
+    transparent for anything that isn't the known Claude Code wire form.
+    """
+    if not isinstance(parsed_body, dict):
+        return raw_body
+    metadata = parsed_body.get("metadata")
+    if not isinstance(metadata, dict):
+        return raw_body
+    user_id = metadata.get("user_id")
+    if not isinstance(user_id, str):
+        return raw_body
+    try:
+        parsed_user_id = json.loads(user_id)
+    except json.JSONDecodeError:
+        return raw_body
+    if not isinstance(parsed_user_id, dict) or "account_uuid" not in parsed_user_id:
+        return raw_body
+    if account_uuid:
+        parsed_user_id["account_uuid"] = account_uuid
+    else:
+        del parsed_user_id["account_uuid"]
+    rewritten_body = dict(parsed_body)
+    rewritten_metadata = dict(metadata)
+    # Claude Code serializes user_id compactly; match it rather than
+    # introducing a gateway-shaped variant of the same string.
+    rewritten_metadata["user_id"] = json.dumps(
+        parsed_user_id, ensure_ascii=False, separators=(",", ":")
+    )
+    rewritten_body["metadata"] = rewritten_metadata
+    return json.dumps(rewritten_body, ensure_ascii=False).encode()
+
+
+async def _passthrough_with_claude_account(
+    request: Request, raw_body: bytes, parsed_body: Any, account_id: str
+) -> JSONResponse | StreamingResponse:
+    """Serve an Anthropic passthrough request with a registered account's token.
+
+    The account is re-resolved from the registry on every request (read-
+    through, no cache) so CLI-side `account add`/`remove` take effect
+    without a daemon restart. Retries exactly once with force-refreshed
+    credentials on HTTP 401 — safe because no response byte has been
+    relayed yet; a post-retry 401 means the registered account itself was
+    rejected, which is reported as such rather than relayed verbatim (a raw
+    401 would send the client into a pointless re-login of its own).
+    """
+    try:
+        records = load_registry()
+    except AccountRegistryError as exc:
+        return _claude_account_unavailable(f"cannot read the claude account registry: {exc}")
+    record = next((record for record in records if record.id == account_id), None)
+    if record is None:
+        return _claude_account_unavailable(
+            f"configured claude account {account_id} is not registered; "
+            "pick another with `claudex-gateway account use` or disable it "
+            "with `claudex-gateway account use off`"
+        )
+    if record.state != "ready":
+        return _claude_account_unavailable(
+            f"configured claude account {account_id} is in state {record.state!r}, not ready"
+        )
+
+    manager = _claude_account_auth_manager(request.app.state, account_id)
+    try:
+        credentials = await manager.get_credentials()
+    except ClaudeAccountAuthError as exc:
+        return _claude_account_unavailable(f"claude account {account_id} is unusable: {exc}")
+
+    content = _rewrite_metadata_account_uuid(raw_body, parsed_body, credentials.account_uuid)
+    try:
+        upstream_response = await _send_to_anthropic(
+            request, _claude_account_request_headers(request, credentials.access_token), content
+        )
+        if upstream_response.status_code == 401:
+            await upstream_response.aclose()
+            try:
+                credentials = await manager.get_credentials(force_refresh=True)
+            except ClaudeAccountAuthError as exc:
+                return _claude_account_unavailable(
+                    f"claude account {account_id} was rejected and could not be "
+                    f"refreshed: {exc}"
+                )
+            upstream_response = await _send_to_anthropic(
+                request,
+                _claude_account_request_headers(request, credentials.access_token),
+                content,
+            )
+    except httpx.HTTPError as exc:
+        logger.warning("anthropic passthrough failed: %s", exc)
+        return JSONResponse(
+            _claude_error_body("api_error", f"failed to reach the Anthropic API: {exc}"),
+            status_code=502,
+        )
+    if upstream_response.status_code == 401:
+        await upstream_response.aclose()
+        return JSONResponse(
+            _claude_error_body(
+                "authentication_error",
+                f"Anthropic rejected the registered claude account {account_id} "
+                "after a token refresh; re-add it with `claudex-gateway account add`",
+            ),
+            status_code=401,
+        )
+    return _relay_anthropic_response(upstream_response)
+
+
 async def _handle_messages(request: Request) -> JSONResponse | StreamingResponse:
     unauthorized = _require_local_token(request, claude_error=True)
     if unauthorized is not None:
@@ -346,7 +538,7 @@ async def _handle_messages(request: Request) -> JSONResponse | StreamingResponse
     route = _route_for_request(config, claude_request)
     if route is None:
         logger.info("%s -> anthropic passthrough", model or "?")
-        return await _passthrough_to_anthropic(request, raw_body)
+        return await _passthrough_to_anthropic(request, raw_body, claude_request)
     if route.provider == "kimi":
         return await _relay_to_kimi(request, claude_request, route.model)
     return await _relay_via_responses_backend(request, claude_request, route)
@@ -845,12 +1037,12 @@ def _kimi_request_headers(request: Request) -> dict[str, str]:
     headers = {
         key: value
         for key, value in request.headers.items()
-        if key.lower() not in _KIMI_SKIP_REQUEST_HEADERS
+        if key.lower() not in _MANAGED_RELAY_SKIP_REQUEST_HEADERS
     }
     headers.setdefault("anthropic-version", "2023-06-01")
     betas = [beta.strip() for beta in headers.get("anthropic-beta", "").split(",") if beta.strip()]
-    if _KIMI_OAUTH_BETA not in betas:
-        betas.append(_KIMI_OAUTH_BETA)
+    if _OAUTH_BETA not in betas:
+        betas.append(_OAUTH_BETA)
     headers["anthropic-beta"] = ",".join(betas)
     return headers
 
@@ -1038,7 +1230,7 @@ async def _handle_count_tokens(request: Request) -> JSONResponse | StreamingResp
 
     route = _route_for_request(config, body)
     if route is None:
-        return await _passthrough_to_anthropic(request, raw_body)
+        return await _passthrough_to_anthropic(request, raw_body, body)
     if route.provider == "kimi":
         counted = await _count_tokens_via_kimi(request, body, route.model)
         if counted is not None:
@@ -1739,7 +1931,7 @@ async def _probe_kimi_route(kimi_client: KimiClient, target_model: str) -> str:
     headers = {
         "content-type": "application/json",
         "anthropic-version": "2023-06-01",
-        "anthropic-beta": _KIMI_OAUTH_BETA,
+        "anthropic-beta": _OAUTH_BETA,
     }
     response = await kimi_client.send_messages(json.dumps(claude_request).encode(), headers)
     try:
@@ -1906,4 +2098,8 @@ def create_app(config: GatewayConfig, daemon_nonce: str | None = None) -> Starle
         lifespan=lifespan,
     )
     app.state.daemon_nonce = daemon_nonce
+    # Lazily-created ClaudeAccountAuthManager per registered account id.
+    # Initialized here (not in the lifespan) so the dict exists even when a
+    # test drives the app without entering the lifespan context.
+    app.state.claude_account_auth_managers = {}
     return app

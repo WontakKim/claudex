@@ -21,7 +21,8 @@ import uvicorn
 from starlette.testclient import TestClient
 
 import claudex_gateway.server as server
-from claudex_gateway import compaction
+from claudex_gateway import claude_accounts, compaction
+from claudex_gateway.claude_auth import CLAUDE_TOKEN_URL
 from claudex_gateway.codex_client import (
     CODEX_MODELS_URL,
     CODEX_RESPONSES_URL,
@@ -4167,3 +4168,298 @@ class TestAdminDashboardApi:
 
         assert empty_target.status_code == 400
         assert wrong_content_type.status_code == 415
+
+
+# ---------------------------------------------------------------------------
+# Anthropic passthrough served with a registered Claude account
+# ---------------------------------------------------------------------------
+
+
+def _register_serving_account(
+    *,
+    account_uuid: str | None = "serving-account-uuid",
+    expires_in_seconds: float = 3600,
+) -> str:
+    """Register one ready account under the (HOME-isolated) registry."""
+    oauth_account: dict[str, Any] = {"emailAddress": "pool@example.com"}
+    if account_uuid is not None:
+        oauth_account["accountUuid"] = account_uuid
+    record = claude_accounts.add_account(
+        email="pool@example.com",
+        organization_uuid="org-1",
+        organization_name="Example Org",
+        credentials_json={
+            "claudeAiOauth": {
+                "accessToken": "pool-access-1",
+                "refreshToken": "pool-refresh-1",
+                "expiresAt": (time.time() + expires_in_seconds) * 1000,
+                "scopes": ["user:inference", "user:profile"],
+            }
+        },
+        oauth_account_json=oauth_account,
+    )
+    return record.id
+
+
+def _claude_code_user_id(account_uuid: str = "client-account-uuid") -> str:
+    return json.dumps(
+        {
+            "device_id": "d" * 64,
+            "account_uuid": account_uuid,
+            "session_id": "11111111-2222-4333-8444-555555555555",
+        },
+        separators=(",", ":"),
+    )
+
+
+def _account_body(model: str = "claude-fable-5") -> dict[str, Any]:
+    body = _message_body(model)
+    body["metadata"] = {"user_id": _claude_code_user_id()}
+    return body
+
+
+def test_account_passthrough_swaps_credentials_and_rewrites_metadata(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    account_id = _register_serving_account()
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(200, json={"id": "msg_1"}, headers={"request-id": "req_1"})
+
+    client, _ = _gateway(GatewayConfig(claude_account_id=account_id), handler)
+
+    response = client.post(
+        "/v1/messages",
+        content=json.dumps(_account_body()),
+        headers={
+            "content-type": "application/json",
+            "authorization": "Bearer sk-ant-oat01-client",
+            "x-api-key": "client-api-key",
+            "anthropic-beta": "claude-code-20250219",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.headers["request-id"] == "req_1"
+    (upstream,) = captured
+    assert upstream.headers["authorization"] == "Bearer pool-access-1"
+    assert "x-api-key" not in upstream.headers
+    betas = [beta.strip() for beta in upstream.headers["anthropic-beta"].split(",")]
+    assert "claude-code-20250219" in betas
+    assert "oauth-2025-04-20" in betas
+    forwarded = json.loads(upstream.content)
+    forwarded_user_id = json.loads(forwarded["metadata"]["user_id"])
+    assert forwarded_user_id["account_uuid"] == "serving-account-uuid"
+    assert forwarded_user_id["session_id"] == "11111111-2222-4333-8444-555555555555"
+    assert forwarded_user_id["device_id"] == "d" * 64
+    # Everything except the metadata rewrite is byte-for-byte the client's body.
+    assert forwarded["model"] == "claude-fable-5"
+    assert forwarded["messages"] == _account_body()["messages"]
+
+
+def test_account_passthrough_strips_account_uuid_when_capture_recorded_none(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    account_id = _register_serving_account(account_uuid=None)
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(200, json={"id": "msg_1"})
+
+    client, _ = _gateway(GatewayConfig(claude_account_id=account_id), handler)
+
+    response = client.post("/v1/messages", json=_account_body())
+
+    assert response.status_code == 200
+    (upstream,) = captured
+    forwarded_user_id = json.loads(json.loads(upstream.content)["metadata"]["user_id"])
+    # Forwarding the client's own uuid with a pool token would name another
+    # account; with no recorded serving uuid the field is stripped instead.
+    assert "account_uuid" not in forwarded_user_id
+    assert forwarded_user_id["session_id"] == "11111111-2222-4333-8444-555555555555"
+
+
+def test_account_passthrough_forwards_non_claude_code_metadata_unchanged(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    account_id = _register_serving_account()
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(200, json={"id": "msg_1"})
+
+    client, _ = _gateway(GatewayConfig(claude_account_id=account_id), handler)
+    body = _message_body("claude-fable-5")
+    body["metadata"] = {"user_id": "not-a-json-string"}
+    raw = json.dumps(body)
+
+    response = client.post(
+        "/v1/messages", content=raw, headers={"content-type": "application/json"}
+    )
+
+    assert response.status_code == 200
+    (upstream,) = captured
+    assert upstream.content == raw.encode()
+    assert upstream.headers["authorization"] == "Bearer pool-access-1"
+
+
+def test_account_passthrough_refreshes_and_retries_once_on_401(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    account_id = _register_serving_account()
+    api_calls: list[str] = []
+    token_calls: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == CLAUDE_TOKEN_URL:
+            token_calls.append(json.loads(request.content))
+            return httpx.Response(
+                200,
+                json={
+                    "access_token": "rotated-access",
+                    "refresh_token": "rotated-refresh",
+                    "expires_in": 900,
+                },
+            )
+        api_calls.append(request.headers["authorization"])
+        if len(api_calls) == 1:
+            return httpx.Response(401, json={"type": "error"})
+        return httpx.Response(200, json={"id": "msg_1"})
+
+    client, _ = _gateway(GatewayConfig(claude_account_id=account_id), handler)
+
+    response = client.post("/v1/messages", json=_account_body())
+
+    assert response.status_code == 200
+    assert api_calls == ["Bearer pool-access-1", "Bearer rotated-access"]
+    assert len(token_calls) == 1
+    assert token_calls[0]["refresh_token"] == "pool-refresh-1"
+    # The rotated single-use refresh token is persisted for the next request.
+    persisted = json.loads(
+        (
+            claude_accounts.paths.accounts_dir("claude") / account_id / "credentials.json"
+        ).read_text()
+    )["claudeAiOauth"]
+    assert persisted["refreshToken"] == "rotated-refresh"
+
+
+def test_account_passthrough_post_retry_401_reports_the_account(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    account_id = _register_serving_account()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == CLAUDE_TOKEN_URL:
+            return httpx.Response(
+                200, json={"access_token": "rotated-access", "expires_in": 900}
+            )
+        return httpx.Response(401, json={"type": "error"})
+
+    client, _ = _gateway(GatewayConfig(claude_account_id=account_id), handler)
+
+    response = client.post("/v1/messages", json=_account_body())
+
+    assert response.status_code == 401
+    error = response.json()["error"]
+    assert error["type"] == "authentication_error"
+    assert "account add" in error["message"]
+
+
+def test_account_passthrough_unregistered_account_returns_503(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("no upstream call may happen without an account")
+
+    client, _ = _gateway(
+        GatewayConfig(claude_account_id="0a1b2c3d-4e5f-4678-9abc-def012345678"), handler
+    )
+
+    response = client.post("/v1/messages", json=_account_body())
+
+    assert response.status_code == 503
+    assert "not registered" in response.json()["error"]["message"]
+
+
+def test_account_passthrough_refresh_failure_returns_503(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    # An already-expired token forces the proactive refresh before any
+    # Anthropic call, and that refresh fails.
+    account_id = _register_serving_account(expires_in_seconds=-60)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert str(request.url) == CLAUDE_TOKEN_URL
+        return httpx.Response(400, json={"error": "invalid_grant"})
+
+    client, _ = _gateway(GatewayConfig(claude_account_id=account_id), handler)
+
+    response = client.post("/v1/messages", json=_account_body())
+
+    assert response.status_code == 503
+    assert "unusable" in response.json()["error"]["message"]
+
+
+def test_account_passthrough_serves_count_tokens_too(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    account_id = _register_serving_account()
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(200, json={"input_tokens": 42})
+
+    client, _ = _gateway(GatewayConfig(claude_account_id=account_id), handler)
+
+    response = client.post("/v1/messages/count_tokens", json=_account_body())
+
+    assert response.status_code == 200
+    assert response.json() == {"input_tokens": 42}
+    (upstream,) = captured
+    assert str(upstream.url) == "https://api.anthropic.com/v1/messages/count_tokens"
+    assert upstream.headers["authorization"] == "Bearer pool-access-1"
+
+
+def test_unset_account_keeps_passthrough_forwarding_client_credentials(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # A registered account alone must change nothing: only claude_account.id
+    # switches the passthrough into managed relay.
+    monkeypatch.setenv("HOME", str(tmp_path))
+    _register_serving_account()
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(200, json={"id": "msg_1"})
+
+    client, _ = _gateway(GatewayConfig(), handler)
+
+    response = client.post(
+        "/v1/messages",
+        content=json.dumps(_account_body()),
+        headers={
+            "content-type": "application/json",
+            "authorization": "Bearer sk-ant-oat01-client",
+        },
+    )
+
+    assert response.status_code == 200
+    (upstream,) = captured
+    assert upstream.headers["authorization"] == "Bearer sk-ant-oat01-client"
+    forwarded_user_id = json.loads(json.loads(upstream.content)["metadata"]["user_id"])
+    assert forwarded_user_id["account_uuid"] == "client-account-uuid"
