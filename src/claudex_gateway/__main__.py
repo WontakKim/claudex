@@ -281,10 +281,14 @@ def _stop_background() -> None:
 
 
 # ---------------------------------------------------------------------------
-# `account` subcommands: manage ~/.claudex account files only, never touching
-# GatewayConfig. Every mutation stays inside claude_accounts/claude_capture;
-# this module only parses argv, prints outcomes, and maps exceptions to exit
-# codes.
+# `account` subcommands. add/list/remove manage ~/.claudex account files
+# only, never touching GatewayConfig, so they work even with a broken
+# configuration. `use` selects which registered account serves Anthropic
+# passthrough — that is a settings change, so it loads the config and goes
+# through the same daemon-aware channel selection as `compact` (see the
+# account-use section below). Every registry mutation stays inside
+# claude_accounts/claude_capture; this module only parses argv, prints
+# outcomes, and maps exceptions to exit codes.
 # ---------------------------------------------------------------------------
 
 _ACCOUNT_ADD_USAGE = "usage: claudex-gateway account add [--from <dir>]"
@@ -303,6 +307,9 @@ def _build_account_parser() -> argparse.ArgumentParser:
     remove_parser = subparsers.add_parser("remove")
     remove_parser.add_argument("account_id", metavar="<account-id>")
     remove_parser.add_argument("--yes", action="store_true")
+
+    use_parser = subparsers.add_parser("use")
+    use_parser.add_argument("target", nargs="?", default=None, metavar="<id|email|off>")
 
     return parser
 
@@ -438,6 +445,8 @@ def _account_main(argv: list[str]) -> int:
             return _account_add(args.from_dir)
         if args.command == "list":
             return _account_list()
+        if args.command == "use":
+            return _account_use(args.target)
         return _account_remove(args.account_id, args.yes)
     except KeyboardInterrupt:
         return 130
@@ -715,10 +724,56 @@ def _parse_compaction_envelope(body: Any) -> dict[str, Any] | None:
     return body
 
 
-class _CompactionAdminOutcome(enum.Enum):
+class _AdminCallOutcome(enum.Enum):
     SUCCESS = "success"
-    OLDER_DAEMON = "older_daemon"  # 404/405: no admin compaction API
+    OLDER_DAEMON = "older_daemon"  # 404/405: the daemon predates the endpoint
     FAILURE = "failure"
+
+
+def _run_admin_envelope(
+    host: str,
+    port: int,
+    method: str,
+    path: str,
+    parse_envelope: Any,
+    local_token: str | None,
+    json_body: dict[str, Any] | None,
+) -> tuple[_AdminCallOutcome, dict[str, Any] | None, str]:
+    """Run one GET/PUT admin call and classify the result.
+
+    Returns (outcome, envelope, detail): envelope is the parse_envelope-
+    validated body only on SUCCESS; detail is diagnostic text for FAILURE
+    (including a malformed 2xx envelope, any non-404/405 error status, or a
+    transport failure).
+    """
+    try:
+        response = _admin_request(
+            host,
+            port,
+            method,
+            path,
+            local_token=local_token,
+            json_body=json_body,
+        )
+    except _AdminTransportError as exc:
+        return _AdminCallOutcome.FAILURE, None, f"admin request failed: {exc}"
+
+    if response.status in (404, 405):
+        return _AdminCallOutcome.OLDER_DAEMON, None, ""
+    if 200 <= response.status < 300:
+        envelope = parse_envelope(response.body)
+        if envelope is not None:
+            return _AdminCallOutcome.SUCCESS, envelope, ""
+        return (
+            _AdminCallOutcome.FAILURE,
+            None,
+            f"admin returned a malformed response (status {response.status})",
+        )
+    return (
+        _AdminCallOutcome.FAILURE,
+        None,
+        f"admin request failed (status {response.status}): {response.detail}",
+    )
 
 
 def _run_admin_compaction(
@@ -727,40 +782,15 @@ def _run_admin_compaction(
     method: str,
     local_token: str | None,
     json_body: dict[str, Any] | None,
-) -> tuple[_CompactionAdminOutcome, dict[str, Any] | None, str]:
-    """Run one GET/PUT /admin/compaction call and classify the result.
-
-    Returns (outcome, envelope, detail): envelope is the validated body only
-    on SUCCESS; detail is diagnostic text for FAILURE (including a malformed
-    2xx envelope, any non-404/405 error status, or a transport failure).
-    """
-    try:
-        response = _admin_request(
-            host,
-            port,
-            method,
-            _ADMIN_COMPACTION_PATH,
-            local_token=local_token,
-            json_body=json_body,
-        )
-    except _AdminTransportError as exc:
-        return _CompactionAdminOutcome.FAILURE, None, f"admin request failed: {exc}"
-
-    if response.status in (404, 405):
-        return _CompactionAdminOutcome.OLDER_DAEMON, None, ""
-    if 200 <= response.status < 300:
-        envelope = _parse_compaction_envelope(response.body)
-        if envelope is not None:
-            return _CompactionAdminOutcome.SUCCESS, envelope, ""
-        return (
-            _CompactionAdminOutcome.FAILURE,
-            None,
-            f"admin returned a malformed response (status {response.status})",
-        )
-    return (
-        _CompactionAdminOutcome.FAILURE,
-        None,
-        f"admin request failed (status {response.status}): {response.detail}",
+) -> tuple[_AdminCallOutcome, dict[str, Any] | None, str]:
+    return _run_admin_envelope(
+        host,
+        port,
+        method,
+        _ADMIN_COMPACTION_PATH,
+        _parse_compaction_envelope,
+        local_token,
+        json_body,
     )
 
 
@@ -808,10 +838,10 @@ def _compact_show() -> int:
         admin_outcome, envelope, detail = _run_admin_compaction(
             host, port, "GET", config.local_token, None
         )
-        if admin_outcome is _CompactionAdminOutcome.SUCCESS:
+        if admin_outcome is _AdminCallOutcome.SUCCESS:
             _print_compact_state(envelope["model"], envelope["last_reroute"])
             return 0
-        if admin_outcome is _CompactionAdminOutcome.OLDER_DAEMON:
+        if admin_outcome is _AdminCallOutcome.OLDER_DAEMON:
             print(
                 "compact: the running daemon predates the admin compaction API; "
                 "showing settings-file state, which may differ from live runtime state",
@@ -846,10 +876,10 @@ def _compact_apply(value: str | None) -> int:
         admin_outcome, envelope, detail = _run_admin_compaction(
             host, port, "PUT", config.local_token, {"model": value}
         )
-        if admin_outcome is _CompactionAdminOutcome.SUCCESS:
+        if admin_outcome is _AdminCallOutcome.SUCCESS:
             _print_compact_state(envelope["model"], None)
             return 0
-        if admin_outcome is _CompactionAdminOutcome.OLDER_DAEMON:
+        if admin_outcome is _AdminCallOutcome.OLDER_DAEMON:
             print(
                 "compact: the running daemon predates the admin compaction API; "
                 "writing the settings file directly. Restart claudex-gateway for "
@@ -890,6 +920,217 @@ def _compact_main(arguments: list[str]) -> int:
         return _compact_apply(arguments[1])
     print(_COMPACT_USAGE, file=sys.stderr)
     return 2
+
+
+# ---------------------------------------------------------------------------
+# `account use`: show/select/clear the registered account serving Anthropic
+# passthrough (settings.json's "claude_account.id"), through the same
+# daemon-aware channel selection as `compact`: a confirmed daemon is managed
+# via the admin API, a settings-file write is only used when no live daemon
+# can be confirmed (or the confirmed daemon predates the endpoint), and an
+# ambiguous probe refuses to write.
+# ---------------------------------------------------------------------------
+
+_ADMIN_CLAUDE_ACCOUNT_PATH = "/admin/claude-account"
+
+_ACCOUNT_USE_USAGE = "usage: claudex-gateway account use [<id|email>|off]"
+
+
+def _parse_claude_account_envelope(body: Any) -> dict[str, Any] | None:
+    """Validate the pinned {account_id, env_locked} envelope; None if malformed."""
+    if not isinstance(body, dict):
+        return None
+    if not {"account_id", "env_locked"} <= set(body):
+        return None
+    account_id = body["account_id"]
+    if account_id is not None and not isinstance(account_id, str):
+        return None
+    if not isinstance(body["env_locked"], bool):
+        return None
+    return body
+
+
+def _run_admin_claude_account(
+    host: str,
+    port: int,
+    method: str,
+    local_token: str | None,
+    json_body: dict[str, Any] | None,
+) -> tuple[_AdminCallOutcome, dict[str, Any] | None, str]:
+    return _run_admin_envelope(
+        host,
+        port,
+        method,
+        _ADMIN_CLAUDE_ACCOUNT_PATH,
+        _parse_claude_account_envelope,
+        local_token,
+        json_body,
+    )
+
+
+def _account_email_for(account_id: str) -> str | None:
+    """Best-effort local-registry lookup for display; None on any failure."""
+    try:
+        records = claude_accounts.list_accounts()
+    except claude_accounts.AccountRegistryError:
+        return None
+    record = next((candidate for candidate in records if candidate.id == account_id), None)
+    return record.email if record is not None else None
+
+
+def _print_account_use_state(account_id: str | None) -> None:
+    if account_id is None:
+        print("account use: off (passthrough forwards client credentials)")
+        return
+    email = _account_email_for(account_id)
+    if email is None:
+        print(f"account use: {account_id}")
+        print(
+            f"warning: account {account_id} is not in the local registry; "
+            "passthrough requests will fail until it is registered or deselected",
+            file=sys.stderr,
+        )
+        return
+    print(f"account use: {email} ({account_id})")
+
+
+def _write_account_use_settings(config: GatewayConfig, value: str | None) -> int:
+    try:
+        if value is None:
+            # A disabled setting is represented by the key's absence, so a
+            # JSON null is never persisted.
+            update_settings_file(
+                config.settings_file, {}, deletions=("claude_account.id",)
+            )
+        else:
+            update_settings_file(config.settings_file, {"claude_account.id": value})
+    except ConfigError as exc:
+        print(f"account use: could not persist settings: {exc}", file=sys.stderr)
+        return 1
+    _print_account_use_state(value)
+    return 0
+
+
+def _account_use_show() -> int:
+    config = _load_config()
+    host, port = _probe_endpoint(config)
+    outcome = _classify_daemon(host, port)
+
+    if outcome is ProbeOutcome.IDENTIFIED:
+        admin_outcome, envelope, detail = _run_admin_claude_account(
+            host, port, "GET", config.local_token, None
+        )
+        if admin_outcome is _AdminCallOutcome.SUCCESS:
+            _print_account_use_state(envelope["account_id"])
+            return 0
+        if admin_outcome is _AdminCallOutcome.OLDER_DAEMON:
+            print(
+                "account use: the running daemon predates the admin claude-account "
+                "API; showing settings-file state, which may differ from live "
+                "runtime state",
+                file=sys.stderr,
+            )
+            _print_account_use_state(config.claude_account_id)
+            return 0
+        print(f"account use: {detail}", file=sys.stderr)
+        return 1
+
+    if outcome in (ProbeOutcome.NO_LISTENER, ProbeOutcome.FOREIGN):
+        _print_account_use_state(config.claude_account_id)
+        return 0
+
+    # AMBIGUOUS: liveness could not be confirmed either way, but a read is
+    # harmless, so show the best-known (settings-file) state with a note.
+    print(
+        "account use: could not reach claudex-gateway to confirm live runtime "
+        "state (unreachable); showing settings-file state",
+        file=sys.stderr,
+    )
+    _print_account_use_state(config.claude_account_id)
+    return 0
+
+
+def _account_use_apply(value: str | None) -> int:
+    config = _load_config()
+    host, port = _probe_endpoint(config)
+    outcome = _classify_daemon(host, port)
+
+    if outcome is ProbeOutcome.IDENTIFIED:
+        admin_outcome, envelope, detail = _run_admin_claude_account(
+            host, port, "PUT", config.local_token, {"account_id": value}
+        )
+        if admin_outcome is _AdminCallOutcome.SUCCESS:
+            _print_account_use_state(envelope["account_id"])
+            return 0
+        if admin_outcome is _AdminCallOutcome.OLDER_DAEMON:
+            print(
+                "account use: the running daemon predates the admin claude-account "
+                "API; writing the settings file directly. Restart claudex-gateway "
+                "for the change to take effect.",
+                file=sys.stderr,
+            )
+            return _write_account_use_settings(config, value)
+        print(f"account use: {detail}", file=sys.stderr)
+        return 1
+
+    if outcome in (ProbeOutcome.NO_LISTENER, ProbeOutcome.FOREIGN):
+        return _write_account_use_settings(config, value)
+
+    # AMBIGUOUS: fail closed. Writing here risks clobbering a live daemon's
+    # settings behind its back, or racing a daemon that is actually up.
+    print(
+        "account use: could not confirm whether claudex-gateway is running "
+        "(unreachable); refusing to modify settings without a live daemon",
+        file=sys.stderr,
+    )
+    return 1
+
+
+def _resolve_account_use_target(target: str) -> str | None:
+    """Resolve an id-or-email target to a registered account id.
+
+    Prints the failure reason and returns None when nothing (or more than
+    one email match) resolves; ids win over emails so a uuid-shaped email
+    can never shadow a real account id."""
+    try:
+        records = claude_accounts.list_accounts()
+    except claude_accounts.AccountRegistryError as exc:
+        print(f"account use failed: {exc}", file=sys.stderr)
+        return None
+
+    by_id = next((candidate for candidate in records if candidate.id == target), None)
+    if by_id is not None:
+        return by_id.id
+    # The registry stores emails trimmed and lowercased; match likewise.
+    email = target.strip().lower()
+    email_matches = [candidate for candidate in records if candidate.email == email]
+    if len(email_matches) == 1:
+        return email_matches[0].id
+    if len(email_matches) > 1:
+        ids = ", ".join(candidate.id for candidate in email_matches)
+        print(
+            f"account use failed: email {target!r} matches multiple accounts "
+            f"({ids}); pass an account id instead",
+            file=sys.stderr,
+        )
+        return None
+    print(
+        f"account use failed: no account registered with id or email {target!r}; "
+        "see `claudex-gateway account list`",
+        file=sys.stderr,
+    )
+    return None
+
+
+def _account_use(target: str | None) -> int:
+    if target is None:
+        return _account_use_show()
+    if target == "off":
+        return _account_use_apply(None)
+    account_id = _resolve_account_use_target(target)
+    if account_id is None:
+        return 1
+    return _account_use_apply(account_id)
 
 
 def main() -> None:

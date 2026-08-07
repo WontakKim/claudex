@@ -3258,6 +3258,154 @@ class TestAdminCompactionApi:
         assert not (tmp_path / "settings.json").exists()
 
 
+class TestAdminClaudeAccountApi:
+    """GET/PUT /admin/claude-account — serving-account selection, mirroring
+    /admin/compaction. The shared bearer/Host guard paths are exhaustively
+    covered by the compaction tests; here one auth check pins the guard is
+    wired at all, and the rest exercises the account-specific logic."""
+
+    _ACCOUNT_ID = "0a1b2c3d-4e5f-4678-9abc-def012345678"
+
+    @staticmethod
+    def _admin_client(
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        **config_kwargs: Any,
+    ) -> TestClient:
+        monkeypatch.delenv("CLAUDEX_CLAUDE_ACCOUNT_ID", raising=False)
+        monkeypatch.setenv("HOME", str(tmp_path / "home"))
+        config = GatewayConfig(settings_file=tmp_path / "settings.json", **config_kwargs)
+        return _create_test_client(
+            monkeypatch, config=config, base_url="http://127.0.0.1:8787"
+        )
+
+    def test_get_returns_fresh_state_when_unconfigured(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        with self._admin_client(monkeypatch, tmp_path) as client:
+            payload = client.get("/admin/claude-account").json()
+
+        assert payload == {"account_id": None, "env_locked": False}
+
+    def test_get_returns_configured_account(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        with self._admin_client(
+            monkeypatch, tmp_path, claude_account_id=self._ACCOUNT_ID
+        ) as client:
+            payload = client.get("/admin/claude-account").json()
+
+        assert payload == {"account_id": self._ACCOUNT_ID, "env_locked": False}
+
+    def test_get_reports_env_locked_even_for_empty_override(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        with self._admin_client(monkeypatch, tmp_path) as client:
+            monkeypatch.setenv("CLAUDEX_CLAUDE_ACCOUNT_ID", "")
+            payload = client.get("/admin/claude-account").json()
+
+        assert payload["env_locked"] is True
+
+    def test_put_registered_account_persists_and_hot_swaps(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        settings_file = tmp_path / "settings.json"
+        settings_file.write_text('{"port": 9317}', encoding="utf-8")
+        with self._admin_client(monkeypatch, tmp_path) as client:
+            account_id = _register_serving_account()
+            response = client.put(
+                "/admin/claude-account", json={"account_id": account_id}
+            )
+            reread = client.get("/admin/claude-account")
+            config_after = client.app.state.config
+
+        assert response.status_code == 200
+        assert response.json() == {"account_id": account_id, "env_locked": False}
+        assert reread.json()["account_id"] == account_id
+        assert config_after.claude_account_id == account_id
+        saved = json.loads(settings_file.read_text(encoding="utf-8"))
+        assert saved == {"port": 9317, "claude_account.id": account_id}
+
+    def test_put_null_clears_the_setting_key(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        settings_file = tmp_path / "settings.json"
+        settings_file.write_text(
+            json.dumps({"claude_account.id": self._ACCOUNT_ID}), encoding="utf-8"
+        )
+        with self._admin_client(
+            monkeypatch, tmp_path, claude_account_id=self._ACCOUNT_ID
+        ) as client:
+            response = client.put("/admin/claude-account", json={"account_id": None})
+            config_after = client.app.state.config
+
+        assert response.status_code == 200
+        assert response.json()["account_id"] is None
+        assert config_after.claude_account_id is None
+        assert "claude_account.id" not in json.loads(settings_file.read_text())
+
+    def test_put_unregistered_account_is_rejected(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        with self._admin_client(monkeypatch, tmp_path) as client:
+            response = client.put(
+                "/admin/claude-account", json={"account_id": self._ACCOUNT_ID}
+            )
+            config_after = client.app.state.config
+
+        assert response.status_code == 400
+        assert "no account registered" in response.json()["error"]["message"]
+        assert config_after.claude_account_id is None
+        assert not (tmp_path / "settings.json").exists()
+
+    @pytest.mark.parametrize(
+        "value", ["not-a-uuid", "0A1B2C3D-4E5F-4678-9ABC-DEF012345678", 1, True, [], {}]
+    )
+    def test_put_invalid_account_id_is_rejected(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, value: Any
+    ) -> None:
+        with self._admin_client(monkeypatch, tmp_path) as client:
+            response = client.put("/admin/claude-account", json={"account_id": value})
+
+        assert response.status_code == 400
+
+    def test_put_rejects_unknown_and_missing_keys(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        with self._admin_client(monkeypatch, tmp_path) as client:
+            unknown = client.put("/admin/claude-account", json={"account": "x"})
+            missing = client.put("/admin/claude-account", json={})
+
+        assert unknown.status_code == 400
+        assert missing.status_code == 400
+
+    def test_put_rejected_when_env_locked(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        with self._admin_client(monkeypatch, tmp_path) as client:
+            monkeypatch.setenv("CLAUDEX_CLAUDE_ACCOUNT_ID", self._ACCOUNT_ID)
+            response = client.put("/admin/claude-account", json={"account_id": None})
+            config_after = client.app.state.config
+
+        assert response.status_code == 409
+        assert "CLAUDEX_CLAUDE_ACCOUNT_ID" in response.json()["error"]["message"]
+        assert not (tmp_path / "settings.json").exists()
+        assert config_after.claude_account_id is None
+
+    def test_endpoints_require_local_token_when_configured(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        with self._admin_client(monkeypatch, tmp_path, local_token="secret") as client:
+            get_response = client.get("/admin/claude-account")
+            put_response = client.put(
+                "/admin/claude-account", json={"account_id": None}
+            )
+
+        assert get_response.status_code == 401
+        assert put_response.status_code == 401
+        assert not (tmp_path / "settings.json").exists()
+
+
 def test_admin_logs_returns_recent_records(monkeypatch: pytest.MonkeyPatch) -> None:
     with _create_test_client(monkeypatch, base_url="http://127.0.0.1:8787") as client:
         logging.getLogger("claudex_gateway.test").warning("hello %s", "world")

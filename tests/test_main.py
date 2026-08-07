@@ -1367,7 +1367,7 @@ def test_probe_and_admin_never_follow_redirects_or_leak_the_bearer() -> None:
             "secret-local-token",
             None,
         )
-        assert admin_outcome is gateway_main._CompactionAdminOutcome.FAILURE
+        assert admin_outcome is gateway_main._AdminCallOutcome.FAILURE
         assert envelope is None
         assert "302" in detail
 

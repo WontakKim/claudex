@@ -594,3 +594,200 @@ def test_no_secret_output_sentinel_absent_on_success_and_failure(
     assert failure_exit_code == 1
     assert sentinel not in failed.out
     assert sentinel not in failed.err
+
+
+# ---------------------------------------------------------------------------
+# `account use` — serving-account selection through the compact-style
+# daemon-aware channel. The probe and admin transport are stubbed exactly as
+# test_main.py's compact tests do; settings writes go to the isolated HOME.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _unlocked_account_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("CLAUDEX_CLAUDE_ACCOUNT_ID", raising=False)
+
+
+def _stub_probe(
+    monkeypatch: pytest.MonkeyPatch, outcome: "gateway_main.ProbeOutcome"
+) -> None:
+    monkeypatch.setattr(gateway_main, "_read_daemon_record", lambda: (None, "not running"))
+    monkeypatch.setattr(gateway_main, "_classify_daemon", lambda host, port: outcome)
+
+
+def _settings_path() -> Path:
+    return paths.settings_file()
+
+
+def test_account_use_show_prints_off_by_default(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _stub_probe(monkeypatch, gateway_main.ProbeOutcome.NO_LISTENER)
+
+    exit_code = gateway_main._account_main(["use"])
+
+    assert exit_code == 0
+    assert "account use: off" in capsys.readouterr().out
+
+
+def test_account_use_writes_settings_when_no_daemon(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    record = _add_record()
+    _stub_probe(monkeypatch, gateway_main.ProbeOutcome.NO_LISTENER)
+
+    exit_code = gateway_main._account_main(["use", record.id])
+
+    assert exit_code == 0
+    output = capsys.readouterr().out
+    assert f"account use: user@example.com ({record.id})" in output
+    saved = json.loads(_settings_path().read_text(encoding="utf-8"))
+    assert saved["claude_account.id"] == record.id
+
+
+def test_account_use_resolves_email_to_id(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    record = _add_record(email="pool@example.com")
+    _stub_probe(monkeypatch, gateway_main.ProbeOutcome.NO_LISTENER)
+
+    exit_code = gateway_main._account_main(["use", "Pool@Example.com"])
+
+    assert exit_code == 0
+    saved = json.loads(_settings_path().read_text(encoding="utf-8"))
+    assert saved["claude_account.id"] == record.id
+
+
+def test_account_use_off_removes_the_settings_key(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    record = _add_record()
+    _stub_probe(monkeypatch, gateway_main.ProbeOutcome.NO_LISTENER)
+    assert gateway_main._account_main(["use", record.id]) == 0
+
+    exit_code = gateway_main._account_main(["use", "off"])
+
+    assert exit_code == 0
+    assert "account use: off" in capsys.readouterr().out
+    saved = json.loads(_settings_path().read_text(encoding="utf-8"))
+    assert "claude_account.id" not in saved
+
+
+def test_account_use_unknown_target_fails_without_touching_settings(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _stub_probe(monkeypatch, gateway_main.ProbeOutcome.NO_LISTENER)
+
+    exit_code = gateway_main._account_main(["use", "nobody@example.com"])
+
+    assert exit_code == 1
+    assert "no account registered" in capsys.readouterr().err
+    assert not _settings_path().exists()
+
+
+def test_account_use_ambiguous_email_requires_an_id(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    first = _add_record(email="shared@example.com", organization_uuid="org-1")
+    second = _add_record(email="shared@example.com", organization_uuid="org-2")
+    _stub_probe(monkeypatch, gateway_main.ProbeOutcome.NO_LISTENER)
+
+    exit_code = gateway_main._account_main(["use", "shared@example.com"])
+
+    assert exit_code == 1
+    error = capsys.readouterr().err
+    assert "matches multiple accounts" in error
+    assert first.id in error and second.id in error
+    assert not _settings_path().exists()
+
+
+def test_account_use_identified_daemon_puts_through_admin_api(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    record = _add_record()
+    _stub_probe(monkeypatch, gateway_main.ProbeOutcome.IDENTIFIED)
+    calls: list[dict[str, object]] = []
+
+    def fake_admin_request(
+        host: str,
+        port: int,
+        method: str,
+        path: str,
+        *,
+        local_token: str | None,
+        json_body: dict[str, object] | None = None,
+    ) -> "gateway_main._AdminHttpResponse":
+        calls.append({"method": method, "path": path, "json_body": json_body})
+        return gateway_main._AdminHttpResponse(
+            status=200,
+            body={"account_id": record.id, "env_locked": False},
+            detail="",
+        )
+
+    monkeypatch.setattr(gateway_main, "_admin_request", fake_admin_request)
+
+    exit_code = gateway_main._account_main(["use", record.id])
+
+    assert exit_code == 0
+    assert calls == [
+        {
+            "method": "PUT",
+            "path": "/admin/claude-account",
+            "json_body": {"account_id": record.id},
+        }
+    ]
+    assert f"({record.id})" in capsys.readouterr().out
+    # The daemon persisted the change through the admin API; the CLI must
+    # not also write the settings file behind its back.
+    assert not _settings_path().exists()
+
+
+def test_account_use_show_identified_reads_admin_api(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    record = _add_record()
+    _stub_probe(monkeypatch, gateway_main.ProbeOutcome.IDENTIFIED)
+
+    def fake_admin_request(*args: object, **kwargs: object) -> "gateway_main._AdminHttpResponse":
+        return gateway_main._AdminHttpResponse(
+            status=200,
+            body={"account_id": record.id, "env_locked": False},
+            detail="",
+        )
+
+    monkeypatch.setattr(gateway_main, "_admin_request", fake_admin_request)
+
+    exit_code = gateway_main._account_main(["use"])
+
+    assert exit_code == 0
+    assert f"user@example.com ({record.id})" in capsys.readouterr().out
+
+
+def test_account_use_ambiguous_probe_refuses_to_write(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    record = _add_record()
+    _stub_probe(monkeypatch, gateway_main.ProbeOutcome.AMBIGUOUS)
+
+    exit_code = gateway_main._account_main(["use", record.id])
+
+    assert exit_code == 1
+    assert "refusing to modify settings" in capsys.readouterr().err
+    assert not _settings_path().exists()
+
+
+def test_account_use_show_warns_about_an_unregistered_configured_account(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    orphan_id = str(uuid.uuid4())
+    gateway_main.update_settings_file(
+        _settings_path(), {"claude_account.id": orphan_id}
+    )
+    _stub_probe(monkeypatch, gateway_main.ProbeOutcome.NO_LISTENER)
+
+    exit_code = gateway_main._account_main(["use"])
+
+    assert exit_code == 0
+    captured = capsys.readouterr()
+    assert orphan_id in captured.out
+    assert "not in the local registry" in captured.err
