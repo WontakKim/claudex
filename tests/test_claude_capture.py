@@ -589,54 +589,11 @@ def test_windows_platform_is_unsupported_for_interactive_capture(
 
 
 # ---------------------------------------------------------------------------
-# Version gate (version_gate)
+# No version probe (any installed build is spawned directly)
 # ---------------------------------------------------------------------------
 
 
-def test_version_gate_rejects_unparseable_version_before_any_login_spawn(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    _make_stdin_a_tty(monkeypatch)
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
-    _write_fake_claude(bin_dir, version="not-a-version")
-    _prepend_path(monkeypatch, bin_dir)
-
-    with pytest.raises(CaptureError, match="parse"):
-        claude_capture.capture_interactive(timeout_secs=5)
-
-    assert not list(Path(tempfile.gettempdir()).glob(f"{claude_capture._TEMP_DIR_PREFIX}*"))
-
-
-def test_version_gate_rejects_old_version_before_any_login_spawn(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    _make_stdin_a_tty(monkeypatch)
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
-    _write_fake_claude(bin_dir, version="2.1.100")
-    _prepend_path(monkeypatch, bin_dir)
-    monkeypatch.delenv("CLAUDEX_ALLOW_UNTESTED_CLAUDE", raising=False)
-
-    with pytest.raises(CaptureError, match="2.1.100"):
-        claude_capture.capture_interactive(timeout_secs=5)
-
-    assert not list(Path(tempfile.gettempdir()).glob(f"{claude_capture._TEMP_DIR_PREFIX}*"))
-
-
-def test_version_gate_rejects_unlisted_version_without_opt_in(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
-    claude_path = _write_fake_claude(bin_dir, version="1.0.0")
-    monkeypatch.delenv("CLAUDEX_ALLOW_UNTESTED_CLAUDE", raising=False)
-
-    with pytest.raises(CaptureError, match="1.0.0"):
-        claude_capture._check_claude_version(str(claude_path))
-
-
-def test_version_gate_opt_in_override_allows_untested_version_and_uses_same_path(
+def test_capture_interactive_never_probes_claude_version(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _make_stdin_a_tty(monkeypatch)
@@ -648,7 +605,6 @@ def test_version_gate_opt_in_override_allows_untested_version_and_uses_same_path
     bin_dir.mkdir()
     claude_path = _write_fake_claude(bin_dir, version="9.9.9")
     _prepend_path(monkeypatch, bin_dir)
-    monkeypatch.setenv("CLAUDEX_ALLOW_UNTESTED_CLAUDE", "1")
     monkeypatch.setenv("CLAUDEX_TEST_RECORD_DIR", str(record_dir))
     monkeypatch.setenv("CLAUDEX_FAKE_CLAUDE_MODE", "success")
 
@@ -656,13 +612,9 @@ def test_version_gate_opt_in_override_allows_untested_version_and_uses_same_path
 
     assert account.email == "fixture@example.com"
 
-    version_calls = [
-        json.loads(line)
-        for line in (record_dir / "version-invocation.jsonl").read_text().splitlines()
-    ]
-    assert len(version_calls) == 1
-    assert version_calls[0]["path"] == str(claude_path)
-    assert version_calls[0]["env"]["DISABLE_UPDATES"] == "1"
+    # No `claude --version` spawn happened: capture goes straight to the
+    # login and relies on the behavioral credential check instead.
+    assert not (record_dir / "version-invocation.jsonl").exists()
 
     login_record = json.loads((record_dir / "login-invocation.json").read_text())
     assert login_record["path"] == str(claude_path)
@@ -670,35 +622,6 @@ def test_version_gate_opt_in_override_allows_untested_version_and_uses_same_path
 
     # Cleanup ran: no leftover temp config dir.
     assert not list(Path(tempfile.gettempdir()).glob(f"{claude_capture._TEMP_DIR_PREFIX}*"))
-
-
-def test_version_gate_aborts_if_the_resolved_executable_changes_before_spawn(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    _make_stdin_a_tty(monkeypatch)
-    monkeypatch.setattr(claude_capture.sys, "platform", "linux")
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
-    claude_path = _write_fake_claude(bin_dir, version="2.1.222")
-
-    call_count = {"n": 0}
-    real_stat_identity = claude_capture._stat_identity
-
-    def _flaky_stat_identity(path: str) -> tuple[int, int, int, int]:
-        call_count["n"] += 1
-        if call_count["n"] >= 2:
-            # Pretend the binary changed underneath us between the version
-            # check and the login spawn.
-            return (999999, 999999, 0, 0)
-        return real_stat_identity(path)
-
-    monkeypatch.setattr(claude_capture, "_stat_identity", _flaky_stat_identity)
-    _prepend_path(monkeypatch, bin_dir)
-
-    with pytest.raises(CaptureError, match="changed"):
-        claude_capture.capture_interactive(timeout_secs=5)
-
-    assert claude_path.exists()  # sanity: the fake binary itself was untouched
 
 
 # ---------------------------------------------------------------------------
@@ -1088,7 +1011,141 @@ def test_capture_interactive_succeeds_end_to_end_with_fake_keychain(
     assert account.email == "fixture@example.com"
     assert not Path(predicted_config_dir).exists()
     assert backend.store == {}
-    assert [call.op for call in backend.calls] == ["read", "read", "delete"]
+    # Legacy-baseline fingerprint read, mint collision precheck read, capture
+    # read, cleanup delete — and no failure-path legacy recheck on success.
+    assert [call.op for call in backend.calls] == ["read", "read", "read", "delete"]
+    assert backend.calls[0].service == claude_capture._LEGACY_KEYCHAIN_SERVICE
+
+
+# ---------------------------------------------------------------------------
+# Legacy sign-in change detection (read-only, failure path)
+# ---------------------------------------------------------------------------
+
+
+def _legacy_detection_fixture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> _FakeKeychainBackend:
+    """Arrangement for legacy-detection tests: TTY stdin, fake `claude` on
+    PATH, deterministic mkdtemp, fake Keychain. `_run_login` is left for each
+    test to stub with the write behavior under test."""
+    _make_stdin_a_tty(monkeypatch)
+    monkeypatch.setenv("USER", "tester")
+    monkeypatch.delenv("USERNAME", raising=False)
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _write_fake_claude(bin_dir)
+    _prepend_path(monkeypatch, bin_dir)
+
+    mkdtemp_root = tmp_path / "mkdtemp-root"
+    mkdtemp_root.mkdir()
+    monkeypatch.setattr(claude_capture.tempfile, "mkdtemp", _sequential_mkdtemp(mkdtemp_root))
+
+    backend = _FakeKeychainBackend()
+    monkeypatch.setattr(claude_capture, "_default_keychain_backend", lambda: backend)
+    return backend
+
+
+_LEGACY_KEY = (claude_capture._LEGACY_KEYCHAIN_SERVICE, "tester")
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="legacy Keychain detection is macOS-only")
+def test_failed_capture_warns_when_login_wrote_the_legacy_item(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    backend = _legacy_detection_fixture(tmp_path, monkeypatch)
+
+    def _login_writes_legacy_item(
+        claude_path: str, config_dir: str, timeout_secs: int, scope: Any = None
+    ) -> None:
+        backend.store[_LEGACY_KEY] = "credentials-in-the-wrong-place"
+
+    monkeypatch.setattr(claude_capture, "_run_login", _login_writes_legacy_item)
+
+    with pytest.raises(CaptureError, match="expected scoped"):
+        claude_capture.capture_interactive(timeout_secs=5)
+
+    err = capsys.readouterr().err
+    assert "WARNING" in err
+    assert claude_capture._LEGACY_KEYCHAIN_SERVICE in err
+    # Detection is strictly read-only: the mis-scoped legacy write is
+    # reported, never deleted or overwritten.
+    assert backend.store == {_LEGACY_KEY: "credentials-in-the-wrong-place"}
+    assert not any(
+        call.op == "delete" and call.service == claude_capture._LEGACY_KEYCHAIN_SERVICE
+        for call in backend.calls
+    )
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="legacy Keychain detection is macOS-only")
+def test_failed_capture_warns_when_login_replaced_an_existing_legacy_item(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    backend = _legacy_detection_fixture(tmp_path, monkeypatch)
+    backend.store[_LEGACY_KEY] = "the-users-own-sign-in"
+
+    def _login_replaces_legacy_item(
+        claude_path: str, config_dir: str, timeout_secs: int, scope: Any = None
+    ) -> None:
+        backend.store[_LEGACY_KEY] = "a-different-sign-in"
+
+    monkeypatch.setattr(claude_capture, "_run_login", _login_replaces_legacy_item)
+
+    with pytest.raises(CaptureError, match="expected scoped"):
+        claude_capture.capture_interactive(timeout_secs=5)
+
+    assert "WARNING" in capsys.readouterr().err
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="legacy Keychain detection is macOS-only")
+def test_failed_capture_without_legacy_change_does_not_warn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    backend = _legacy_detection_fixture(tmp_path, monkeypatch)
+    backend.store[_LEGACY_KEY] = "the-users-own-sign-in"
+
+    def _login_writes_nothing(
+        claude_path: str, config_dir: str, timeout_secs: int, scope: Any = None
+    ) -> None:
+        pass
+
+    monkeypatch.setattr(claude_capture, "_run_login", _login_writes_nothing)
+
+    with pytest.raises(CaptureError, match="expected scoped"):
+        claude_capture.capture_interactive(timeout_secs=5)
+
+    assert "WARNING" not in capsys.readouterr().err
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="legacy Keychain detection is macOS-only")
+def test_unreadable_legacy_item_disables_detection_without_blocking_capture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    class _LegacyFailingBackend(_FakeKeychainBackend):
+        def read(self, service: str, account: str) -> str | None:
+            if service == claude_capture._LEGACY_KEYCHAIN_SERVICE:
+                self.calls.append(_KeychainCall("read", service, account))
+                raise CaptureError("keychain unavailable")
+            return super().read(service, account)
+
+    _legacy_detection_fixture(tmp_path, monkeypatch)
+    failing_backend = _LegacyFailingBackend()
+    monkeypatch.setattr(claude_capture, "_default_keychain_backend", lambda: failing_backend)
+
+    def _login_writes_legacy_item(
+        claude_path: str, config_dir: str, timeout_secs: int, scope: Any = None
+    ) -> None:
+        failing_backend.store[_LEGACY_KEY] = "credentials-in-the-wrong-place"
+
+    monkeypatch.setattr(claude_capture, "_run_login", _login_writes_legacy_item)
+
+    # The unreadable legacy item never blocks the capture flow itself; the
+    # capture still fails on its own terms (scoped item absent) and the
+    # unavailable baseline just suppresses the change warning.
+    with pytest.raises(CaptureError, match="expected scoped"):
+        claude_capture.capture_interactive(timeout_secs=5)
+
+    assert "WARNING" not in capsys.readouterr().err
 
 
 # ---------------------------------------------------------------------------
@@ -1308,21 +1365,8 @@ def test_second_sigint_during_cleanup_is_deferred_and_both_actions_complete(
 
 
 # ---------------------------------------------------------------------------
-# Version gate: nonzero probe exit; resolved path is always absolute
+# Resolved path is always absolute
 # ---------------------------------------------------------------------------
-
-
-def test_version_gate_rejects_nonzero_version_probe_exit(tmp_path: Path) -> None:
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
-    claude_path = bin_dir / "claude"
-    # Prints an allowlisted version but fails: the probe result must not be
-    # trusted just because its output happens to parse.
-    claude_path.write_text(f"#!{sys.executable}\nprint('2.1.222 (Claude Code)')\nraise SystemExit(3)\n")
-    claude_path.chmod(0o755)
-
-    with pytest.raises(CaptureError, match="exited with status 3"):
-        claude_capture._check_claude_version(str(claude_path))
 
 
 def test_resolve_claude_executable_absolutizes_a_relative_path_entry(

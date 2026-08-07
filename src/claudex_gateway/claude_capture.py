@@ -14,12 +14,13 @@ Neither entry point writes the account registry; both return a
 
 Only Claude Code builds that store credentials in a *scoped* macOS Keychain
 item (`Claude Code-credentials-<hex[:8]>`, see `_scoped_keychain_service`)
-are supported. There is no legacy unscoped Keychain item, no read/write
-fallback, and no other recovery path: when the expected scoped item is
+are supported. The legacy unscoped Keychain item is never a credential
+source, never written, and never deleted: when the expected scoped item is
 absent, capture fails closed with a `CaptureError` naming the expected
-service. A version gate pins the exact `claude` builds this module has been
-verified against and runs before any login spawn, so an unverified binary
-never reaches a login that could touch the user's Keychain.
+service. Interactive capture does fingerprint the legacy item (read-only,
+sha256) around the login spawn, so a failed capture can warn when an
+unexpected `claude` build wrote the machine-level sign-in instead of the
+scoped item.
 """
 
 from __future__ import annotations
@@ -27,7 +28,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import re
 import shutil
 import signal
 import subprocess
@@ -94,18 +94,12 @@ _SECURITY_BIN = "/usr/bin/security"
 _KEYCHAIN_ITEM_NOT_FOUND_STATUS = 44
 _KEYCHAIN_TIMEOUT_SECONDS = 5.0
 
-# The base Keychain service name is deliberately never spelled as a standalone
-# quoted literal: this module only ever addresses the scoped form below, and
-# there is no unscoped/legacy service to fall back to.
+# Capture only ever addresses the scoped service form below as a credential
+# source. The legacy unscoped service name exists solely for read-only change
+# detection (`_read_legacy_login_fingerprint`): it is never captured from,
+# never written, and never deleted.
 _KEYCHAIN_SERVICE_FORMAT = "Claude Code-credentials-{suffix}"
-
-# The tested-version allowlist is exact, not a `>=` range: an unlisted build
-# may have moved the Keychain item's scoping or format in a way this module
-# does not yet account for, so it is refused unless the caller opts in.
-_SUPPORTED_CLAUDE_VERSIONS = frozenset({"2.1.222", "2.1.223"})
-_ALLOW_UNTESTED_CLAUDE_ENV = "CLAUDEX_ALLOW_UNTESTED_CLAUDE"
-_VERSION_RE = re.compile(r"(\d+\.\d+\.\d+)")
-_VERSION_CHECK_TIMEOUT_SECONDS = 10.0
+_LEGACY_KEYCHAIN_SERVICE = "Claude Code-credentials"
 
 _LOGIN_LOCK_FILENAME = "claude-capture.lock"
 _TEMP_DIR_PREFIX = "claudex-claude-login-"
@@ -417,7 +411,7 @@ def capture_from_config_dir(config_dir: str) -> CapturedAccount:
 
 
 # ---------------------------------------------------------------------------
-# Pre-spawn version gate
+# Claude executable resolution & legacy sign-in change detection
 # ---------------------------------------------------------------------------
 
 
@@ -425,59 +419,61 @@ def _resolve_claude_executable() -> str:
     resolved = shutil.which("claude")
     if resolved is None:
         raise CaptureError("the `claude` CLI was not found on PATH; install Claude Code first")
-    # A relative PATH entry yields a relative result; absolutize so the
-    # version check and the login spawn are guaranteed to run the same file
-    # regardless of any working-directory change between them.
+    # A relative PATH entry yields a relative result; absolutize so the login
+    # spawn runs the same file regardless of any later working-directory change.
     return os.path.abspath(resolved)
 
 
-def _stat_identity(path: str) -> tuple[int, int, int, int]:
-    info = os.stat(path)
-    return (info.st_dev, info.st_ino, info.st_mtime_ns, info.st_size)
+# Distinguishes "the legacy item conclusively does not exist" (None) from "the
+# legacy item could not be read at all" — comparing the latter against a later
+# read would fabricate a change warning.
+_LEGACY_STATE_UNAVAILABLE = object()
 
 
-def _parse_claude_version(stdout: str, stderr: str) -> str | None:
-    match = _VERSION_RE.search(stdout) or _VERSION_RE.search(stderr)
-    return match.group(1) if match else None
+def _read_legacy_login_fingerprint(keychain: KeychainBackend) -> object:
+    """Fingerprint the machine-level legacy Keychain sign-in, read-only.
 
-
-def _check_claude_version(claude_path: str) -> None:
-    """Run `claude --version` and enforce the tested-version allowlist.
-
-    Runs before any login spawn: an unparseable version, or one outside the
-    allowlist without the opt-in override, aborts before the same resolved
-    `claude` path is ever used to spawn a login that could mutate the user's
-    Keychain.
+    Returns the sha256 hex digest of the legacy item's value, `None` when the
+    item conclusively does not exist, or `_LEGACY_STATE_UNAVAILABLE` when the
+    read failed or the platform has no Keychain. Never raises and never keeps
+    the raw value: detection is best-effort and must not block or outlive a
+    capture.
     """
-    version_env = dict(os.environ)
-    version_env["DISABLE_UPDATES"] = "1"
+    if sys.platform != "darwin":
+        return _LEGACY_STATE_UNAVAILABLE
     try:
-        result = subprocess.run(
-            [claude_path, "--version"],
-            capture_output=True,
-            text=True,
-            timeout=_VERSION_CHECK_TIMEOUT_SECONDS,
-            env=version_env,
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise CaptureError(
-            f"`claude --version` timed out after {_VERSION_CHECK_TIMEOUT_SECONDS}s"
-        ) from exc
-    except OSError as exc:
-        raise CaptureError(f"failed to run `claude --version`: {exc}") from exc
+        value = keychain.read(_LEGACY_KEYCHAIN_SERVICE, _keychain_account())
+    except CaptureError:
+        return _LEGACY_STATE_UNAVAILABLE
+    if value is None:
+        return None
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
-    if result.returncode != 0:
-        raise CaptureError(f"`claude --version` exited with status {result.returncode}")
-    version = _parse_claude_version(result.stdout, result.stderr)
-    if version is None:
-        raise CaptureError("could not parse a version from `claude --version` output")
-    opted_in = os.environ.get(_ALLOW_UNTESTED_CLAUDE_ENV) == "1"
-    if version not in _SUPPORTED_CLAUDE_VERSIONS and not opted_in:
-        allowed = ", ".join(sorted(_SUPPORTED_CLAUDE_VERSIONS))
-        raise CaptureError(
-            f"claude {version} is not in the tested version allowlist ({allowed}); "
-            f"set {_ALLOW_UNTESTED_CLAUDE_ENV}=1 to proceed at your own risk"
-        )
+
+def _warn_if_legacy_login_changed(keychain: KeychainBackend, baseline: object) -> None:
+    """After a failed capture, warn when the legacy sign-in changed under it.
+
+    The scoped-only contract means a `claude` build that writes the
+    machine-level legacy Keychain item instead of the scoped one fails
+    capture — but has silently replaced the user's own `claude` CLI sign-in.
+    This turns that silent replacement into an explicit stderr warning with
+    recovery guidance. Read-only and best-effort: any comparison gap
+    (unavailable baseline or recheck) skips the warning rather than raising
+    over the original capture error.
+    """
+    if baseline is _LEGACY_STATE_UNAVAILABLE:
+        return
+    current = _read_legacy_login_fingerprint(keychain)
+    if current is _LEGACY_STATE_UNAVAILABLE or current == baseline:
+        return
+    print(
+        "WARNING: this machine's Claude Code sign-in (Keychain item "
+        f"{_LEGACY_KEYCHAIN_SERVICE!r}) changed during the Claude login "
+        "capture. The login that just failed to capture may have replaced "
+        "your existing `claude` CLI sign-in; run `claude` in a terminal and "
+        "sign in again if so.",
+        file=sys.stderr,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -712,10 +708,11 @@ def capture_interactive(timeout_secs: int = 180) -> CapturedAccount:
     login --claudeai` prompt.
 
     POSIX-only; requires a TTY on stdin. Holds a cross-process lock over the
-    whole operation, runs the pre-spawn version gate, logs in inside a
-    gateway-created temp `CLAUDE_CONFIG_DIR`, captures the result, then
-    always deletes the temp dir's scoped Keychain item and removes the temp
-    dir.
+    whole operation, logs in inside a gateway-created temp
+    `CLAUDE_CONFIG_DIR`, captures the result, then always deletes the temp
+    dir's scoped Keychain item and removes the temp dir. On a failed capture
+    it additionally warns when the machine-level legacy Keychain sign-in
+    changed during the login (see `_warn_if_legacy_login_changed`).
     """
     if sys.platform == "win32":
         raise CaptureError(
@@ -730,10 +727,8 @@ def capture_interactive(timeout_secs: int = 180) -> CapturedAccount:
 
     with locking.file_lock(paths.runtime_dir() / _LOGIN_LOCK_FILENAME):
         claude_path = _resolve_claude_executable()
-        identity = _stat_identity(claude_path)
-        _check_claude_version(claude_path)
-
         keychain = _default_keychain_backend()
+        legacy_baseline = _read_legacy_login_fingerprint(keychain)
 
         # Cancellation scope: SIGINT/SIGTERM/SIGHUP are owned by RECORD-ONLY
         # handlers from BEFORE the temp config dir is minted until credential
@@ -746,29 +741,30 @@ def capture_interactive(timeout_secs: int = 180) -> CapturedAccount:
         # `CaptureCancelled` after full cleanup. A signal BEFORE the scope
         # begins is safe: no resource exists yet.
         config_dir: str | None = None
-        with _CancellationScope() as scope:
-            try:
+        try:
+            with _CancellationScope() as scope:
                 try:
-                    config_dir = _mint_temp_config_dir(keychain)
-                    if scope.deferred:
-                        # Cancelled during minting: skip the interactive
-                        # login entirely; the finally still cleans up.
-                        raise CaptureCancelled("Claude login was cancelled")
-                    if _stat_identity(claude_path) != identity:
-                        raise CaptureError(
-                            f"the resolved `claude` executable at {claude_path} changed "
-                            "between the version check and the login spawn; aborting"
-                        )
-                    _run_login(claude_path, config_dir, timeout_secs, scope)
-                    captured = _capture_from_config_dir_impl(config_dir, keychain)
-                except (_LoginSignalReceived, KeyboardInterrupt) as exc:
-                    # Programmatic interrupts (and raising handlers from
-                    # scope-less callers) still clean up fully — via the
-                    # finally below — and report `CaptureCancelled`.
-                    raise CaptureCancelled("Claude login was cancelled") from exc
-            finally:
-                if config_dir is not None:
-                    _cleanup_temp_config_dir(config_dir, keychain)
-        if scope.deferred:
-            raise CaptureCancelled("Claude login was cancelled")
+                    try:
+                        config_dir = _mint_temp_config_dir(keychain)
+                        if scope.deferred:
+                            # Cancelled during minting: skip the interactive
+                            # login entirely; the finally still cleans up.
+                            raise CaptureCancelled("Claude login was cancelled")
+                        _run_login(claude_path, config_dir, timeout_secs, scope)
+                        captured = _capture_from_config_dir_impl(config_dir, keychain)
+                    except (_LoginSignalReceived, KeyboardInterrupt) as exc:
+                        # Programmatic interrupts (and raising handlers from
+                        # scope-less callers) still clean up fully — via the
+                        # finally below — and report `CaptureCancelled`.
+                        raise CaptureCancelled("Claude login was cancelled") from exc
+                finally:
+                    if config_dir is not None:
+                        _cleanup_temp_config_dir(config_dir, keychain)
+            if scope.deferred:
+                raise CaptureCancelled("Claude login was cancelled")
+        except CaptureError:
+            # Cleanup has already run (the finally above); a legacy-item
+            # change warning must never mask the capture error itself.
+            _warn_if_legacy_login_changed(keychain, legacy_baseline)
+            raise
         return captured
