@@ -9,6 +9,7 @@ from claudex_gateway.config import (
     ConfigError,
     GatewayConfig,
     RouteTarget,
+    parse_claude_account_id,
     parse_compaction_model,
     parse_route_target,
     update_settings_file,
@@ -304,6 +305,74 @@ class TestCompactionModelSetting:
     ) -> None:
         monkeypatch.setenv("CLAUDEX_COMPACTION_MODEL", value)
         with pytest.raises(ConfigError, match="CLAUDEX_COMPACTION_MODEL"):
+            GatewayConfig.from_env()
+
+
+_ACCOUNT_ID = "8f9c2a4e-1234-4a5b-9c6d-0e1f2a3b4c5d"
+
+
+class TestParseClaudeAccountId:
+    def test_canonical_uuid_is_returned_unchanged(self) -> None:
+        assert parse_claude_account_id(_ACCOUNT_ID) == _ACCOUNT_ID
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "not-a-uuid",
+            _ACCOUNT_ID.upper(),  # canonical form only, no case variants
+            "{" + _ACCOUNT_ID + "}",
+            _ACCOUNT_ID.replace("-", ""),
+            "user@example.com",  # email resolution belongs to the CLI
+        ],
+    )
+    def test_non_canonical_values_are_rejected(self, value: str) -> None:
+        with pytest.raises(ConfigError, match="canonical account UUID"):
+            parse_claude_account_id(value)
+
+
+class TestClaudeAccountIdSetting:
+    @staticmethod
+    def _write(tmp_path: Path, payload: object) -> Path:
+        settings_file = tmp_path / "settings.json"
+        settings_file.write_text(json.dumps(payload), encoding="utf-8")
+        return settings_file
+
+    def test_valid_value_populates_the_field(self, tmp_path: Path) -> None:
+        settings_file = self._write(tmp_path, {"claude_account.id": _ACCOUNT_ID})
+        assert GatewayConfig.load(settings_file).claude_account_id == _ACCOUNT_ID
+
+    def test_absent_key_disables_the_feature(self, tmp_path: Path) -> None:
+        settings_file = self._write(tmp_path, {})
+        assert GatewayConfig.load(settings_file).claude_account_id is None
+
+    def test_env_overrides_settings_file(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        other_id = "0a1b2c3d-4e5f-4678-9abc-def012345678"
+        settings_file = self._write(tmp_path, {"claude_account.id": _ACCOUNT_ID})
+        monkeypatch.setenv("CLAUDEX_CLAUDE_ACCOUNT_ID", other_id)
+        assert GatewayConfig.load(settings_file).claude_account_id == other_id
+
+    def test_empty_env_forces_disabled_even_with_file_value(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        settings_file = self._write(tmp_path, {"claude_account.id": _ACCOUNT_ID})
+        monkeypatch.setenv("CLAUDEX_CLAUDE_ACCOUNT_ID", "")
+        assert GatewayConfig.load(settings_file).claude_account_id is None
+
+    @pytest.mark.parametrize("value", [None, True, 1, [], {}])
+    def test_non_string_file_value_fails_to_load(
+        self, tmp_path: Path, value: object
+    ) -> None:
+        settings_file = self._write(tmp_path, {"claude_account.id": value})
+        with pytest.raises(ConfigError, match='claude_account.id" must be a string'):
+            GatewayConfig.load(settings_file)
+
+    def test_invalid_string_value_fails_to_load(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("CLAUDEX_CLAUDE_ACCOUNT_ID", "not-a-uuid")
+        with pytest.raises(ConfigError, match="CLAUDEX_CLAUDE_ACCOUNT_ID"):
             GatewayConfig.from_env()
 
 

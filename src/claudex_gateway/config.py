@@ -5,6 +5,7 @@ from __future__ import annotations
 import ipaddress
 import json
 import os
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -42,6 +43,10 @@ SETTINGS_KEYS: dict[str, str] = {
     # to. Absence of the key (or a resolved empty string) means the feature
     # is disabled — there is no separate "enabled" flag.
     "compaction.model": "CLAUDEX_COMPACTION_MODEL",
+    # Opt-in: which registered Claude account serves Anthropic passthrough
+    # traffic. Absence of the key (or a resolved empty string) means
+    # passthrough forwards the client's own credentials untouched.
+    "claude_account.id": "CLAUDEX_CLAUDE_ACCOUNT_ID",
 }
 
 
@@ -109,6 +114,26 @@ def parse_compaction_model(value: str) -> str:
     return model_id
 
 
+def parse_claude_account_id(value: str) -> str:
+    """Validate a claude_account.id value: a canonical account UUID.
+
+    Only the id form is accepted here — email resolution happens in the CLI,
+    where the registry is at hand. Registry membership is deliberately not
+    checked at boot: accounts can be added or removed by the CLI while the
+    daemon runs, so the serving path re-resolves the id on every request.
+    """
+    try:
+        parsed = uuid.UUID(value)
+    except (ValueError, AttributeError, TypeError):
+        parsed = None
+    if parsed is None or str(parsed) != value:
+        raise ConfigError(
+            f"claude account id {value!r} is not a canonical account UUID; "
+            "use `claudex-gateway account list` to see registered ids"
+        )
+    return value
+
+
 def _default_kimi_code_home() -> Path:
     return Path.home() / ".kimi-code"
 
@@ -137,6 +162,10 @@ class GatewayConfig:
     # reroute oversized compaction requests to. None means the feature is
     # disabled — there is no separate "enabled" flag.
     compaction_model: str | None = None
+    # Canonical id of the registered Claude account that serves Anthropic
+    # passthrough traffic. None means passthrough forwards the client's own
+    # credentials untouched — there is no separate "enabled" flag.
+    claude_account_id: str | None = None
     # Where settings are read from and where runtime changes are persisted.
     settings_file: Path = field(default_factory=paths.settings_file)
 
@@ -242,6 +271,25 @@ class GatewayConfig:
                 except ConfigError as exc:
                     raise ConfigError(f"{label}: {exc}") from exc
 
+        value, label = _resolve("claude_account.id", settings)
+        env_name = SETTINGS_KEYS["claude_account.id"]
+        if value is None:
+            if label == env_name:
+                claude_account_id = None
+            else:
+                # The key is present in the settings file (e.g. JSON null) —
+                # that must not be conflated with "not configured".
+                raise ConfigError(f"{label} must be a string, got {value!r}")
+        elif not isinstance(value, str):
+            raise ConfigError(f"{label} must be a string, got {value!r}")
+        else:
+            claude_account_id = value or None
+            if claude_account_id is not None:
+                try:
+                    parse_claude_account_id(claude_account_id)
+                except ConfigError as exc:
+                    raise ConfigError(f"{label}: {exc}") from exc
+
         return cls(
             host=host,
             port=port,
@@ -253,6 +301,7 @@ class GatewayConfig:
             local_token=local_token,
             log_level=log_level,
             compaction_model=compaction_model,
+            claude_account_id=claude_account_id,
             settings_file=settings_file,
         )
 
