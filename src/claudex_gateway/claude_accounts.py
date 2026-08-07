@@ -161,21 +161,14 @@ def add_account(
     returns (the writer's own post-replace directory fsync) never rolls the
     directory back, since the account may already be visible to readers.
     """
-    try:
-        normalized_email = _normalize_email(email)
-        normalized_organization_uuid = _normalize_optional_text(
-            organization_uuid, field="organizationUuid"
-        )
-        normalized_organization_name = _normalize_optional_text(
-            organization_name, field="organizationName"
-        )
-    except ValueError as exc:
-        raise AccountRegistryError(str(exc)) from exc
-    if not isinstance(credentials_json, dict):
-        raise AccountRegistryError("credentials_json must be a JSON object")
-    if oauth_account_json is not None and not isinstance(oauth_account_json, dict):
-        raise AccountRegistryError("oauth_account_json must be a JSON object or null")
-    oauth_payload: dict[str, Any] = oauth_account_json if oauth_account_json is not None else {}
+    (
+        normalized_email,
+        normalized_organization_uuid,
+        normalized_organization_name,
+        oauth_payload,
+    ) = _validate_account_inputs(
+        email, organization_uuid, organization_name, credentials_json, oauth_account_json
+    )
 
     accounts_root = paths.accounts_dir(_PROVIDER)
     _makedirs_0700(paths.runtime_dir())
@@ -238,6 +231,136 @@ def add_account(
             _rollback_new_account_directory(final_dir, accounts_root, exc)
 
         return record
+
+
+def _validate_account_inputs(
+    email: str,
+    organization_uuid: str | None,
+    organization_name: str | None,
+    credentials_json: dict[str, Any],
+    oauth_account_json: dict[str, Any] | None,
+) -> tuple[str, str | None, str | None, dict[str, Any]]:
+    """Normalize identity fields and validate payload shapes, strictly before
+    any filesystem write. Returns `(email, organizationUuid,
+    organizationName, oauth_payload)` with `oauth_payload` defaulted to `{}`
+    when `oauth_account_json` is `None`."""
+    try:
+        normalized_email = _normalize_email(email)
+        normalized_organization_uuid = _normalize_optional_text(
+            organization_uuid, field="organizationUuid"
+        )
+        normalized_organization_name = _normalize_optional_text(
+            organization_name, field="organizationName"
+        )
+    except ValueError as exc:
+        raise AccountRegistryError(str(exc)) from exc
+    if not isinstance(credentials_json, dict):
+        raise AccountRegistryError("credentials_json must be a JSON object")
+    if oauth_account_json is not None and not isinstance(oauth_account_json, dict):
+        raise AccountRegistryError("oauth_account_json must be a JSON object or null")
+    oauth_payload: dict[str, Any] = oauth_account_json if oauth_account_json is not None else {}
+    return (
+        normalized_email,
+        normalized_organization_uuid,
+        normalized_organization_name,
+        oauth_payload,
+    )
+
+
+def update_account_credentials(
+    email: str,
+    organization_uuid: str | None,
+    organization_name: str | None,
+    credentials_json: dict[str, Any],
+    oauth_account_json: dict[str, Any] | None,
+) -> AccountRecord:
+    """Replace a registered account's stored credentials in place (re-auth).
+
+    The account is addressed by the same `(email, organizationUuid)`
+    identity key that `add_account` refuses duplicates on; raises
+    `AccountNotFoundError` when no account matches. The row keeps its `id`
+    and `createdAt` — so a `claude_account.id` selection keeps working —
+    while `updatedAt` and `lastAuthenticatedAt` are bumped, `state` resets
+    to ready, and `organizationName` is refreshed from the new capture.
+
+    Both credential files are replaced (each atomically) strictly BEFORE the
+    registry row is rewritten: a crash between the two leaves fresh working
+    credentials under a stale row, never a bumped row over stale
+    credentials. A half-applied file pair is not rolled back — the freshly
+    captured credentials are strictly newer than what they replaced, and
+    re-running the same update reconverges.
+    """
+    (
+        normalized_email,
+        normalized_organization_uuid,
+        normalized_organization_name,
+        oauth_payload,
+    ) = _validate_account_inputs(
+        email, organization_uuid, organization_name, credentials_json, oauth_account_json
+    )
+
+    accounts_root = paths.accounts_dir(_PROVIDER)
+    _makedirs_0700(paths.runtime_dir())
+    _makedirs_0700(accounts_root)
+
+    with file_lock(_lock_path(accounts_root)):
+        records = _recover(accounts_root)
+        existing = next(
+            (
+                record
+                for record in records
+                if record.email == normalized_email
+                and record.organization_uuid == normalized_organization_uuid
+            ),
+            None,
+        )
+        if existing is None:
+            raise AccountNotFoundError(f"no account registered for {normalized_email!r}")
+
+        now = _now_millis()
+        updated = AccountRecord(
+            id=existing.id,
+            email=normalized_email,
+            organization_uuid=normalized_organization_uuid,
+            organization_name=normalized_organization_name,
+            created_at=existing.created_at,
+            updated_at=now,
+            last_authenticated_at=now,
+            state=_STATE_READY,
+        )
+
+        account_dir = accounts_root / existing.id
+        try:
+            _write_json_atomic(account_dir / _CREDENTIALS_FILENAME, credentials_json)
+            _write_json_atomic(account_dir / _OAUTH_ACCOUNT_FILENAME, oauth_payload)
+        except _PostCommitFsyncError as exc:
+            raise AccountRegistryError(
+                f"credentials for account {existing.id} were replaced with uncertain "
+                "durability; re-run `account add` to reconverge"
+            ) from exc
+        except OSError as exc:
+            raise AccountRegistryError(
+                f"failed to replace credentials for account {existing.id}"
+            ) from exc
+
+        registry_path = _registry_path(accounts_root)
+        rows = [
+            (updated if record.id == existing.id else record).to_row() for record in records
+        ]
+        try:
+            _write_json_atomic(registry_path, rows)
+        except _PostCommitFsyncError as exc:
+            raise AccountRegistryError(
+                f"account {existing.id} was updated in {registry_path} but durability "
+                "after commit is uncertain"
+            ) from exc
+        except BaseException as exc:
+            raise AccountRegistryError(
+                f"credentials for account {existing.id} were replaced but the registry "
+                f"row update failed; row metadata in {registry_path} is stale"
+            ) from exc
+
+        return updated
 
 
 def remove_account(account_id: str) -> None:

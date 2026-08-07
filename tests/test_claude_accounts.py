@@ -215,6 +215,89 @@ def test_list_accounts_sorted_by_created_at_then_id(monkeypatch: pytest.MonkeyPa
 
 
 # --------------------------------------------------------------------------
+# update_account_credentials: in-place credential replacement (re-auth)
+# --------------------------------------------------------------------------
+
+
+def test_update_account_credentials_replaces_files_and_bumps_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    timestamps = iter([1_000, 1_000, 2_000])
+    monkeypatch.setattr(claude_accounts, "_now_millis", lambda: next(timestamps))
+    original = _add(
+        organization_uuid="org-1",
+        organization_name="Old Org Name",
+        oauth_account_json={"accountUuid": "acct-old"},
+    )
+    untouched = _add("other@example.com")
+
+    updated = claude_accounts.update_account_credentials(
+        "user@example.com",
+        "org-1",
+        "New Org Name",
+        {"accessToken": "at-2", "refreshToken": "rt-2"},
+        {"accountUuid": "acct-new"},
+    )
+
+    assert updated.id == original.id
+    assert updated.created_at == original.created_at
+    assert updated.updated_at == updated.last_authenticated_at == 2_000
+    assert updated.state == "ready"
+    assert updated.organization_name == "New Org Name"
+
+    account_dir = _accounts_root() / original.id
+    assert json.loads((account_dir / "credentials.json").read_text()) == {
+        "accessToken": "at-2",
+        "refreshToken": "rt-2",
+    }
+    assert json.loads((account_dir / "oauth-account.json").read_text()) == {
+        "accountUuid": "acct-new"
+    }
+
+    listed = {record.id: record for record in claude_accounts.list_accounts()}
+    assert listed[original.id] == updated
+    assert listed[untouched.id] == untouched
+
+
+def test_update_account_credentials_normalizes_email_for_the_identity_lookup() -> None:
+    original = _add("user@example.com", organization_uuid="org-1")
+    updated = claude_accounts.update_account_credentials(
+        "  USER@Example.COM  ", "org-1", None, {"accessToken": "at-2"}, None
+    )
+    assert updated.id == original.id
+
+
+def test_update_account_credentials_unknown_identity_raises_without_writes() -> None:
+    original = _add(organization_uuid="org-1")
+    with pytest.raises(claude_accounts.AccountNotFoundError):
+        claude_accounts.update_account_credentials(
+            # Same email, different organization: the identity key is the
+            # (email, organizationUuid) pair, not the email alone.
+            "user@example.com",
+            "org-2",
+            None,
+            {"accessToken": "at-2"},
+            None,
+        )
+    account_dir = _accounts_root() / original.id
+    assert json.loads((account_dir / "credentials.json").read_text()) == _credentials_payload()
+    [listed] = claude_accounts.list_accounts()
+    assert listed == original
+
+
+def test_update_account_credentials_validates_inputs_before_any_write() -> None:
+    with pytest.raises(claude_accounts.AccountRegistryError):
+        claude_accounts.update_account_credentials(
+            "user@example.com",
+            None,
+            None,
+            "not-a-dict",  # type: ignore[arg-type]
+            None,
+        )
+    assert not paths.runtime_dir().exists()
+
+
+# --------------------------------------------------------------------------
 # Validation before any filesystem write
 # --------------------------------------------------------------------------
 

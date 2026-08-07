@@ -210,6 +210,13 @@ Interactive capture supports Claude Code builds that use scoped Keychain
 credential storage (2.1+) and fails cleanly otherwise. It is POSIX-only in
 this version — on Windows, always use `--from <dir>` instead.
 
+Adding an account whose `(email, organization)` identity is already
+registered replaces that account's stored credentials in place after a
+confirmation prompt — the account keeps its id, so a `account use`
+selection keeps working. This doubles as the re-auth flow for an account
+whose refresh token has gone stale. Non-interactive runs (piped stdin with
+`--from`) require `--yes` to confirm the replacement.
+
 ```sh
 uv run claudex-gateway account add                 # interactive `claude` login
 uv run claudex-gateway account add --from <dir>    # import an existing login

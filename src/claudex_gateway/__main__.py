@@ -291,7 +291,7 @@ def _stop_background() -> None:
 # outcomes, and maps exceptions to exit codes.
 # ---------------------------------------------------------------------------
 
-_ACCOUNT_ADD_USAGE = "usage: claudex-gateway account add [--from <dir>]"
+_ACCOUNT_ADD_USAGE = "usage: claudex-gateway account add [--from <dir>] [--yes]"
 _ACCOUNT_REMOVE_USAGE = "usage: claudex-gateway account remove <account-id> [--yes]"
 
 
@@ -301,6 +301,7 @@ def _build_account_parser() -> argparse.ArgumentParser:
 
     add_parser = subparsers.add_parser("add")
     add_parser.add_argument("--from", dest="from_dir", metavar="<dir>", default=None)
+    add_parser.add_argument("--yes", action="store_true")
 
     subparsers.add_parser("list")
 
@@ -314,7 +315,7 @@ def _build_account_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _account_add(from_dir: str | None) -> int:
+def _account_add(from_dir: str | None, assume_yes: bool) -> int:
     if from_dir is None and not sys.stdin.isatty():
         print(_ACCOUNT_ADD_USAGE, file=sys.stderr)
         print(
@@ -343,11 +344,58 @@ def _account_add(from_dir: str | None) -> int:
             captured.credentials_json,
             captured.oauth_account_json,
         )
+    except claude_accounts.DuplicateAccountError:
+        return _account_replace_credentials(captured, assume_yes)
     except claude_accounts.AccountRegistryError as exc:
         print(f"account add failed: {exc}", file=sys.stderr)
         return 1
 
     print(f"added account {record.email} ({record.id})")
+    return 0
+
+
+def _account_replace_credentials(
+    captured: claude_capture.CapturedAccount, assume_yes: bool
+) -> int:
+    """Upsert path for `account add`: the identity is already registered, so
+    replace that account's stored credentials in place (re-auth) after the
+    same confirmation protocol `account remove` uses. The freshly captured
+    credentials are already in memory — confirming never repeats the login.
+    """
+    if not assume_yes and not sys.stdin.isatty():
+        print(_ACCOUNT_ADD_USAGE, file=sys.stderr)
+        print(
+            f"an account is already registered for {captured.email}; replacing its "
+            "stored credentials without confirmation requires --yes when stdin is "
+            "not a terminal",
+            file=sys.stderr,
+        )
+        return 2
+
+    if not assume_yes:
+        try:
+            answer = input(
+                f"Account {captured.email} is already registered; replace its "
+                "stored credentials? [y/N]"
+            )
+        except EOFError:
+            return 0
+        if answer.strip().lower() not in ("y", "yes"):
+            return 0
+
+    try:
+        record = claude_accounts.update_account_credentials(
+            captured.email,
+            captured.organization_uuid,
+            captured.organization_name,
+            captured.credentials_json,
+            captured.oauth_account_json,
+        )
+    except claude_accounts.AccountRegistryError as exc:
+        print(f"account add failed: {exc}", file=sys.stderr)
+        return 1
+
+    print(f"updated account {record.email} ({record.id}): stored credentials replaced")
     return 0
 
 
@@ -442,7 +490,7 @@ def _account_main(argv: list[str]) -> int:
 
     try:
         if args.command == "add":
-            return _account_add(args.from_dir)
+            return _account_add(args.from_dir, args.yes)
         if args.command == "list":
             return _account_list()
         if args.command == "use":

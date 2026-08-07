@@ -428,10 +428,12 @@ def test_interactive_add_list_remove_round_trip(
     assert claude_accounts.list_accounts() == []
 
 
-def _write_fixture_config_dir(config_dir: Path, *, email: str = "import@example.com") -> None:
+def _write_fixture_config_dir(
+    config_dir: Path, *, email: str = "import@example.com", access_token: str = "at-import"
+) -> None:
     config_dir.mkdir(parents=True, exist_ok=True)
     (config_dir / ".credentials.json").write_text(
-        json.dumps({"claudeAiOauth": {"accessToken": "at-import", "email": email}}),
+        json.dumps({"claudeAiOauth": {"accessToken": access_token, "email": email}}),
         encoding="utf-8",
     )
     (config_dir / ".claude.json").write_text(
@@ -465,7 +467,12 @@ def test_from_import_uses_fixture_config_dir(
     assert out.strip() == f"added account {record.email} ({record.id})"
 
 
-def test_duplicate_add_exit_code_1(
+def _stored_access_token(record: claude_accounts.AccountRecord) -> str:
+    credentials_path = paths.accounts_dir("claude") / record.id / "credentials.json"
+    return json.loads(credentials_path.read_text())["claudeAiOauth"]["accessToken"]
+
+
+def test_duplicate_add_non_tty_without_yes_exit_code_2_keeps_stored_credentials(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     monkeypatch.setattr(sys, "platform", "linux")
@@ -474,14 +481,78 @@ def test_duplicate_add_exit_code_1(
 
     first_exit_code = gateway_main._account_main(["add", "--from", str(config_dir)])
     capsys.readouterr()
+    _write_fixture_config_dir(config_dir, access_token="at-import-2")
     second_exit_code = gateway_main._account_main(["add", "--from", str(config_dir)])
     err = capsys.readouterr().err
 
     assert first_exit_code == 0
-    assert second_exit_code == 1
-    assert "account add failed" in err
+    assert second_exit_code == 2
+    assert "already registered" in err
+    assert "--yes" in err
     assert "Traceback" not in err
-    assert len(claude_accounts.list_accounts()) == 1
+    [record] = claude_accounts.list_accounts()
+    assert _stored_access_token(record) == "at-import"
+
+
+def test_duplicate_add_with_yes_replaces_credentials_in_place(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(sys, "platform", "linux")
+    config_dir = tmp_path / "fixture-config"
+    _write_fixture_config_dir(config_dir)
+
+    assert gateway_main._account_main(["add", "--from", str(config_dir)]) == 0
+    capsys.readouterr()
+    [original] = claude_accounts.list_accounts()
+
+    _write_fixture_config_dir(config_dir, access_token="at-import-2")
+    exit_code = gateway_main._account_main(["add", "--from", str(config_dir), "--yes"])
+    out = capsys.readouterr().out
+
+    assert exit_code == 0
+    [record] = claude_accounts.list_accounts()
+    assert record.id == original.id  # same account, updated in place
+    assert record.created_at == original.created_at
+    assert _stored_access_token(record) == "at-import-2"
+    assert out.strip() == (
+        f"updated account {record.email} ({record.id}): stored credentials replaced"
+    )
+
+
+@pytest.mark.parametrize(
+    ("answer", "expect_replaced"), [("y", True), ("yes", True), ("n", False), ("", False)]
+)
+def test_duplicate_add_tty_prompt_response(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    answer: str,
+    expect_replaced: bool,
+) -> None:
+    monkeypatch.setattr(sys, "platform", "linux")
+    config_dir = tmp_path / "fixture-config"
+    _write_fixture_config_dir(config_dir)
+
+    assert gateway_main._account_main(["add", "--from", str(config_dir)]) == 0
+    capsys.readouterr()
+
+    _make_stdin_a_tty(monkeypatch)
+    prompts: list[str] = []
+
+    def _fake_input(prompt: str) -> str:
+        prompts.append(prompt)
+        return answer
+
+    monkeypatch.setattr("builtins.input", _fake_input)
+    _write_fixture_config_dir(config_dir, access_token="at-import-2")
+    exit_code = gateway_main._account_main(["add", "--from", str(config_dir)])
+
+    assert exit_code == 0
+    assert len(prompts) == 1
+    assert "already registered" in prompts[0]
+    [record] = claude_accounts.list_accounts()
+    expected_token = "at-import-2" if expect_replaced else "at-import"
+    assert _stored_access_token(record) == expected_token
 
 
 # ---------------------------------------------------------------------------
