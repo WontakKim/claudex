@@ -351,8 +351,10 @@ command](#compact-command) is a CLI front end for this same API.
 ### Dashboard
 
 Opening `http://127.0.0.1:8787/` in a browser serves a dashboard on top of
-the same admin API: the General tab
-shows the Codex upstream's health, the Log tab tails the gateway's recent
+the same admin API: the Settings tab holds gateway settings behind a
+category rail (currently a single General category with the
+[compaction reroute](#compaction-reroute) target), the Status tab shows each
+provider's login state and subscription usage, the Log tab tails the gateway's recent
 log lines (`GET /admin/logs`) and holds the runtime log-level control
 (`PUT /admin/log-level`, applied immediately and persisted), and the Router
 tab is a canvas editor — drag a port to wire a model, Apply to `PUT` the

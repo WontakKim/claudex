@@ -35,7 +35,7 @@ nav.tabs a:not(.on):hover{background:var(--inset)}
 nav.tabs .cnt{font:600 12px var(--mono);color:var(--accent);margin-left:6px}
 nav.tabs a.on .cnt{color:var(--canvas)}
 main>section{display:none;padding-top:20px}
-body[data-tab="map"] #tab-map,body[data-tab="general"] #tab-general,body[data-tab="log"] #tab-log{display:block}
+body[data-tab="settings"] #tab-settings,body[data-tab="status"] #tab-status,body[data-tab="map"] #tab-map,body[data-tab="log"] #tab-log{display:block}
 .card{background:var(--panel);border-radius:8px;padding:18px;box-shadow:0 1px 3px rgba(0,0,0,.07);margin-bottom:16px}
 .card h2{font-size:20px;font-weight:650;margin:0 0 4px}
 .card .sub{font-size:14px;color:var(--muted);margin-bottom:14px}
@@ -261,9 +261,28 @@ body.env-locked .applybar{display:none!important}
 #comp-select:disabled{opacity:.55;cursor:default}
 .comp-custom{display:none;margin-top:10px}
 .comp-custom.show{display:block}
+/* Settings tab (probe-final spec): a category rail on the left, a title-less
+   card of multi-line setting rows on the right. The rail lists setting
+   categories; General is the only one until more runtime settings ship. */
+.layout{display:grid;grid-template-columns:240px minmax(0,1fr);gap:20px;align-items:start}
+.rail{display:flex;flex-direction:column;gap:2px;position:sticky;top:16px}
+.rail-item{display:flex;align-items:center;gap:8px;font:600 14.5px var(--sans);color:var(--muted);text-decoration:none;
+  padding:9px 14px;border-left:3px solid transparent;border-radius:0 7px 7px 0}
+.rail-item:hover{background:var(--inset);color:var(--text)}
+.rail-item.on{border-left-color:var(--accent);background:var(--accent-soft);color:var(--accent)}
+.srow{padding:16px 0}
+.srow:first-child{padding-top:4px}
+.srow:last-child{padding-bottom:4px}
+.srow+.srow{border-top:1px solid var(--inset)}
+.srow>div+div{margin-top:12px}
+.srow .name{font:650 17.5px var(--sans)}
+.srow .desc{font-size:13.5px;color:var(--muted);margin-top:8px}
+.srow .ctrow select,.srow .ctrow .ctnode{flex:1;min-width:0}
+.srow .cthint{font-size:11px;color:color-mix(in srgb,var(--muted) 70%,transparent)}
+#compaction-card.locked{border-left:3px solid var(--err);padding-left:14px;margin-left:-17px}
 </style>
 </head>
-<body data-tab="general">
+<body data-tab="settings">
 <div class="doc">
   <header>
     <h1>Claudex Gateway</h1><span class="ep" id="ep"></span>
@@ -271,12 +290,49 @@ body.env-locked .applybar{display:none!important}
   </header>
 
   <nav class="tabs">
-    <a href="#general" data-t="general">General</a>
+    <a href="#settings" data-t="settings">Settings</a>
+    <a href="#status" data-t="status">Status</a>
     <a href="#map" data-t="map">Router</a>
     <a href="#log" data-t="log">Log</a>
   </nav>
 
   <main>
+    <section id="tab-settings">
+      <div class="layout">
+        <nav class="rail" aria-label="설정 종류">
+          <a class="rail-item on" href="#settings/general">General</a>
+        </nav>
+        <div class="card">
+          <!-- compaction-section:start -->
+          <div class="srow" id="compaction-card">
+            <div>
+              <div class="name">Compact Reroute</div>
+              <div class="desc">Claude Code가 보내는 긴 컨텍스트 정리 요청을 지정한 모델로 진행합니다.</div>
+            </div>
+            <div>
+              <div class="complock" id="comp-lockband"><b>LOCKED</b> — <code id="comp-lock-env"></code> 환경변수가 우선합니다. 재라우팅 대상은 열람 전용입니다.</div>
+              <div class="ctrow">
+                <select id="comp-select">
+                  <option value="disabled">Disabled</option>
+                  <option value="claude-sonnet-5">claude-sonnet-5 (recommended)</option>
+                  <option value="claude-opus-5">claude-opus-5</option>
+                  <option value="claude-fable-5">claude-fable-5</option>
+                  <option value="custom">Custom</option>
+                </select>
+                <button id="comp-apply">적용</button>
+              </div>
+              <div class="comp-custom" id="comp-custom-wrap">
+                <div class="ctnode grow"><input id="comp-custom-input" spellcheck="false" placeholder="claude-…"></div>
+                <div class="cthint">unverified until first use</div>
+              </div>
+              <div class="cthint">Compact 요청은 장치에 저장된 Claude 기본 자격증명으로 수행됩니다.</div>
+            </div>
+          </div>
+          <!-- compaction-section:end -->
+        </div>
+      </div>
+    </section>
+
     <section id="tab-map">
       <div class="lockband"><b>LOCKED</b> — <code id="lock-env"></code> 환경변수가 우선합니다. 보드는 열람 전용입니다.</div>
       <div class="board" id="board">
@@ -313,7 +369,7 @@ body.env-locked .applybar{display:none!important}
       </div>
     </section>
 
-    <section id="tab-general">
+    <section id="tab-status">
       <div class="card">
         <div class="ucard-h">
           <h2>Claude Status</h2>
@@ -371,29 +427,6 @@ body.env-locked .applybar{display:none!important}
         </div>
         <div class="ubody" id="usage-body-grok"></div>
       </div>
-      <!-- compaction-section:start -->
-      <div class="card" id="compaction-card">
-        <h2>Compaction Reroute</h2>
-        <div class="sub">Claude Code가 보내는 컴팩션(긴 컨텍스트 정리) 요청을 지정한 Claude 모델로 재라우팅합니다.</div>
-        <div class="cthint">Rerouted compaction requests are sent to Anthropic using your own Claude credentials and are billed separately by Anthropic — never through this gateway.</div>
-        <div class="complock" id="comp-lockband"><b>LOCKED</b> — <code id="comp-lock-env"></code> 환경변수가 우선합니다. 재라우팅 대상은 열람 전용입니다.</div>
-        <div class="ctrow">
-          <select id="comp-select">
-            <option value="disabled">Disabled</option>
-            <option value="claude-sonnet-5">claude-sonnet-5 (recommended)</option>
-            <option value="claude-opus-5">claude-opus-5</option>
-            <option value="claude-fable-5">claude-fable-5</option>
-            <option value="custom">Custom</option>
-          </select>
-          <button id="comp-apply">Apply</button>
-        </div>
-        <div class="comp-custom" id="comp-custom-wrap">
-          <div class="ctnode grow"><input id="comp-custom-input" spellcheck="false" placeholder="claude-…"></div>
-          <div class="cthint">unverified until first use</div>
-        </div>
-        <div class="kv" id="comp-diagnostics"></div>
-      </div>
-      <!-- compaction-section:end -->
     </section>
 
     <section id="tab-log">
@@ -1054,7 +1087,7 @@ function setLogLevel(level){
 var COMP={
   envName:"CLAUDEX_COMPACTION_MODEL",
   locked:false,
-  LIVE:{model:null,lastReroute:null},
+  LIVE:{model:null},
   // draftKind: "disabled" | one of COMPACTION_CURATED_MODELS | "custom"
   draftKind:"disabled",
   draftCustom:""   // raw id typed into the custom input, untrimmed
@@ -1075,21 +1108,6 @@ function compactionDraftFromModel(model){
     // raw id filled in, rather than silently dropping it.
     :{kind:"custom",custom:id};
 }
-function renderCompactionDiagnostics(rec){
-  var box=document.getElementById("comp-diagnostics");
-  if(!rec){
-    box.innerHTML='<span class="k">last_reroute</span><span class="v">아직 재라우팅이 시도되지 않았습니다</span>';
-    return;
-  }
-  box.innerHTML=
-    '<span class="k">outcome</span><span class="v">'+esc(rec.outcome)+'</span>'+
-    '<span class="k">timestamp</span><span class="v">'+esc(rec.timestamp)+'</span>'+
-    '<span class="k">target_model</span><span class="v">'+esc(rec.target_model)+'</span>'+
-    '<span class="k">mapped_model</span><span class="v">'+esc(rec.mapped_model)+'</span>'+
-    '<span class="k">estimated_prompt_tokens</span><span class="v">'+esc(rec.estimated_prompt_tokens)+'</span>'+
-    '<span class="k">context_window</span><span class="v">'+esc(rec.context_window)+'</span>'+
-    (rec.detail!=null?'<span class="k">detail</span><span class="v">'+esc(rec.detail)+'</span>':"");
-}
 function renderCompaction(){
   document.getElementById("compaction-card").classList.toggle("locked",COMP.locked);
   document.getElementById("comp-lock-env").textContent=COMP.envName;
@@ -1102,14 +1120,12 @@ function renderCompaction(){
   input.disabled=COMP.locked;
   var btn=document.getElementById("comp-apply");
   btn.disabled=COMP.locked;
-  btn.textContent="Apply";
-  renderCompactionDiagnostics(COMP.LIVE.lastReroute);
+  btn.textContent="적용";
 }
 /* Adopts a fresh /admin/compaction GET/PUT envelope as the new live state
    and re-derives the draft selection from it. */
 function renderCompactionState(body){
   COMP.LIVE.model=body.model;
-  COMP.LIVE.lastReroute=body.last_reroute;
   COMP.locked=!!body.env_locked;
   var draft=compactionDraftFromModel(body.model);
   COMP.draftKind=draft.kind;
@@ -1179,6 +1195,14 @@ document.getElementById("comp-custom-input").addEventListener("input",function()
   COMP.draftCustom=this.value;
 });
 document.getElementById("comp-apply").addEventListener("click",applyCompaction);
+/* The Settings rail has a single category today; clicking it only pins the
+   deep-linkable hash (no pane switching until a second category exists). */
+document.querySelectorAll("#tab-settings .rail-item").forEach(function(a){
+  a.addEventListener("click",function(ev){
+    ev.preventDefault();
+    history.replaceState(null,"","#settings/general");
+  });
+});
 function apply(){
   if(DIR.locked)return;
   var count=dirtyCount();
@@ -1277,12 +1301,12 @@ function setTab(t){
   document.querySelectorAll("nav.tabs a").forEach(function(a){a.classList.toggle("on",a.dataset.t===t)});
   if(location.hash!=="#"+t)history.replaceState(null,"","#"+t);
   if(t==="map"){drawWires();if(mapNeedsFit){mapNeedsFit=false;fitView()}}
-  if(t==="general")fetchUsage();
+  if(t==="status")fetchUsage();
   if(t==="log")fetchLogs();
   syncLogTimer();
 }
-var TAB_NAMES=["general","map","log"];
-/* --- subscription usage (merged into the General tab's provider cards) ----- */
+var TAB_NAMES=["settings","status","map","log"];
+/* --- subscription usage (merged into the Status tab's provider cards) ----- */
 function fmtPct(v){return (Math.round(v*10)/10)+"%"}
 function fmtReset(epochSec){
   if(!epochSec)return"리셋 시각 정보 없음";
@@ -1401,7 +1425,7 @@ function fetchUsage(provider){
     failAll("gateway unreachable");
   }).finally(function(){restoreUsageButtons(targets)});
 }
-document.getElementById("tab-general").addEventListener("click",function(ev){
+document.getElementById("tab-status").addEventListener("click",function(ev){
   var btn=ev.target.closest?ev.target.closest(".urefresh"):null;
   if(!btn||btn.disabled)return;
   btn.disabled=true;btn.textContent="…";
@@ -1419,7 +1443,7 @@ var RESET_OUTCOMES={
   already_redeemed:{spent:false,text:"이미 처리된 요청입니다"}
 };
 function closeResetModal(){document.getElementById("reset-modal").classList.remove("open")}
-document.getElementById("tab-general").addEventListener("click",function(ev){
+document.getElementById("tab-status").addEventListener("click",function(ev){
   var btn=ev.target.closest?ev.target.closest("#codex-reset-go"):null;
   if(!btn)return;
   document.getElementById("reset-modal-body").innerHTML=
@@ -1472,7 +1496,9 @@ document.querySelectorAll("nav.tabs a").forEach(function(a){
   a.addEventListener("click",function(ev){ev.preventDefault();setTab(this.dataset.t)});
 });
 window.addEventListener("hashchange",function(){
-  var h=location.hash.slice(1);
+  // "#settings/general" style deep links carry a category segment; the tab
+  // name is always the first segment.
+  var h=location.hash.slice(1).split("/")[0];
   if(TAB_NAMES.indexOf(h)>=0)setTab(h);
 });
 function boot(){
@@ -1524,7 +1550,8 @@ function boot(){
       renderProviderCards(health.body);
     }
     renderChrome();
-    setTab(TAB_NAMES.indexOf(location.hash.slice(1))>=0?location.hash.slice(1):"general");
+    var bootTab=location.hash.slice(1).split("/")[0];
+    setTab(TAB_NAMES.indexOf(bootTab)>=0?bootTab:"settings");
     render();
     if(document.body.dataset.tab==="map"){mapNeedsFit=false;fitView()}
   });

@@ -3433,8 +3433,8 @@ def test_admin_reset_credit_is_never_reachable_by_GET(
 
 
 def test_dashboard_usage_merged_into_status_cards(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Usage renders inside the General tab's provider cards: a per-provider
-    # body hook, the fetch on entering General, and no separate tab.
+    # Usage renders inside the Status tab's provider cards: a per-provider
+    # body hook, the fetch on entering Status, and no separate tab.
     with _create_test_client(monkeypatch) as client:
         page = client.get("/").text
 
@@ -3444,14 +3444,45 @@ def test_dashboard_usage_merged_into_status_cards(monkeypatch: pytest.MonkeyPatc
     assert 'id="usage-body-codex"' in page
     assert 'id="usage-body-kimi"' in page
     assert "/admin/usage" in page
-    # The usage hooks sit inside the General section, not a sibling tab.
-    assert page.index('id="tab-general"') < page.index('id="usage-body-codex"')
+    # The usage hooks sit inside the Status section, not a sibling tab.
+    assert page.index('id="tab-status"') < page.index('id="usage-body-codex"')
     assert page.index('id="usage-body-claude"') < page.index('id="tab-log"')
     # Claude leads the provider cards as a Status card like the others.
     assert "<h2>Claude Status" in page
     assert "<h2>Claude Usage" not in page
     assert page.index('id="usage-body-claude"') < page.index('id="codex-stat"')
 
+
+def test_dashboard_settings_tab_leads_and_holds_compaction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The Settings tab is the settings home: it leads the tab bar, opens by
+    # default, and holds the Compact Reroute row behind the category rail;
+    # the provider status cards live in the Status tab.
+    with _create_test_client(monkeypatch) as client:
+        page = client.get("/").text
+
+    assert (
+        page.index('data-t="settings"')
+        < page.index('data-t="status"')
+        < page.index('data-t="map"')
+        < page.index('data-t="log"')
+    )
+    assert '<body data-tab="settings">' in page
+    assert 'var TAB_NAMES=["settings","status","map","log"]' in page
+    # The category rail leads the pane and deep-links its single category.
+    assert 'href="#settings/general"' in page
+    assert (
+        page.index('class="rail-item on"')
+        < page.index('id="compaction-card"')
+    )
+    # The compaction row sits inside the Settings section (before the next
+    # sibling section), not in Status where it used to render.
+    assert (
+        page.index('id="tab-settings"')
+        < page.index('id="compaction-card"')
+        < page.index('id="tab-map"')
+    )
 
 def test_dashboard_plan_and_credits_read_inside_the_card(
     monkeypatch: pytest.MonkeyPatch,
@@ -3677,16 +3708,16 @@ def test_dashboard_compaction_custom_input_labeled_unverified(
     assert 'id="comp-custom-input"' in section
 
 
-def test_dashboard_compaction_billing_disclosure_present(
+def test_dashboard_compaction_credentials_disclosure_present(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # The card must state which credentials rerouted requests run on, so the
+    # user knows their own Claude account is being used.
     with _create_test_client(monkeypatch) as client:
         page = client.get("/").text
 
     section = _compaction_section(page)
-    assert "Anthropic" in section
-    assert "billed" in section.lower()
-    assert "credentials" in section.lower()
+    assert "장치에 저장된 Claude 기본 자격증명" in section
 
 
 def test_dashboard_compaction_fetched_in_parallel_boot_sequence(
@@ -3714,32 +3745,18 @@ def test_dashboard_compaction_keeps_configured_custom_model(
     assert '{kind:"custom",custom:id}' in page
 
 
-def test_dashboard_compaction_diagnostics_render_pinned_schema_with_escaping(
+def test_dashboard_compaction_diagnostics_ui_removed_by_design(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # The Settings redesign dropped the last-reroute record from the page:
+    # diagnostics stay reachable through GET /admin/compaction only. Guard
+    # against the UI quietly returning.
     with _create_test_client(monkeypatch) as client:
         page = client.get("/").text
 
-    diag_start = page.index("function renderCompactionDiagnostics(rec){")
-    diag_end = page.index("function renderCompaction(){", diag_start)
-    diag_fn = page[diag_start:diag_end]
-
-    for field in (
-        "outcome",
-        "timestamp",
-        "target_model",
-        "mapped_model",
-        "estimated_prompt_tokens",
-        "context_window",
-    ):
-        assert f">{field}<" in diag_fn
-        assert f"esc(rec.{field})" in diag_fn
-
-    # `detail` only renders when non-null, and a null last_reroute gets a
-    # clear placeholder instead of any of the fields above.
-    assert "rec.detail!=null" in diag_fn
-    assert "esc(rec.detail)" in diag_fn
-    assert "if(!rec){" in diag_fn
+    assert 'id="comp-diagnostics"' not in page
+    assert "renderCompactionDiagnostics" not in page
+    assert "아직 재라우팅이 시도되지 않았습니다" not in page
 
 
 def test_dashboard_compaction_apply_body_matches_pinned_shape(
