@@ -217,6 +217,9 @@ uv run claudex-gateway account add --from <dir>    # import an existing login
 uv run claudex-gateway account list
 uv run claudex-gateway account remove <id>         # prompts for confirmation
 uv run claudex-gateway account remove <id> --yes   # skips the confirmation prompt
+uv run claudex-gateway account use <id|email>      # serve passthrough with this account
+uv run claudex-gateway account use off             # back to forwarding client credentials
+uv run claudex-gateway account use                 # show the current selection
 ```
 
 Captured credentials are stored under `~/.claudex/accounts/claude/`: one
@@ -233,7 +236,58 @@ account's local copy only — it does not revoke the OAuth grant at
 Anthropic, which stays valid until revoked from Anthropic's own account
 settings.
 
-Registered accounts are not yet used for gateway requests.
+### Serving with a registered account (`account use`)
+
+`claudex-gateway account use <id|email>` selects one registered account to
+serve all Anthropic passthrough traffic (`/v1/messages` for unmapped models
+and `count_tokens`). With a selection active, the gateway consumes the
+client's `Authorization`/`x-api-key` headers and serves upstream with the
+selected account's OAuth token instead — Claude Code no longer needs a real
+Anthropic login of its own (`ANTHROPIC_AUTH_TOKEN` set to the gateway local
+token, or any placeholder when no local token is configured, is enough).
+The gateway owns the token lifecycle: access tokens are refreshed ~5
+minutes before expiry against the Claude Code token endpoint, rotated
+refresh tokens are persisted atomically before use, and a 401 triggers one
+refresh-and-retry before the error surfaces. `metadata.user_id`'s
+`account_uuid` is rewritten to the serving account so a request never names
+a different account than the one serving it.
+
+The selection is the flat `claude_account.id` settings key (env override:
+`CLAUDEX_CLAUDE_ACCOUNT_ID`). `account use` manages it through the same
+channel decision table as `compact`: a confirmed running daemon is updated
+live through `GET/PUT /admin/claude-account` (no restart needed), a
+settings-file write is used only when no live daemon can be confirmed, and
+an ambiguous probe refuses to apply changes. `account use off` returns to
+today's default: client credentials forwarded untouched.
+
+```sh
+curl http://127.0.0.1:8787/admin/claude-account
+curl -X PUT http://127.0.0.1:8787/admin/claude-account \
+  -H 'Content-Type: application/json' \
+  -d '{"account_id": "<registered-account-id>"}'
+curl -X PUT http://127.0.0.1:8787/admin/claude-account \
+  -H 'Content-Type: application/json' \
+  -d '{"account_id": null}'
+```
+
+The endpoint honors the same `CLAUDEX_LOCAL_TOKEN` and Host guard as the
+other admin routes; a `PUT` validates that the id is registered, persists
+the change to `settings.json`, and is refused with `409` when
+`CLAUDEX_CLAUDE_ACCOUNT_ID` is set in the environment.
+
+Caveats to accept consciously:
+
+- Quota and billing land on the selected account, not the client's own
+  subscription, and Anthropic's response rate-limit headers (and the CLI's
+  usage display) reflect the serving account.
+- If the selected account is removed or its refresh token becomes invalid,
+  passthrough fails with a clear gateway 503 — there is no silent fallback
+  to client credentials. Re-add the account or run `account use off`.
+- The [compaction reroute](#compaction-reroute) still uses the credentials
+  the client itself sent: with a credential-less client it records
+  `skipped_no_credentials` and falls back to the mapped model as usual.
+- Subscription OAuth tokens are licensed for the holder's own Claude Code
+  use; serving other clients with them is a gray zone.
 
 ### Compact command
 
@@ -277,6 +331,7 @@ stays available for one-off overrides.
 | `CLAUDEX_LOG_LEVEL` | `info` | Process log verbosity: `debug`, `info`, `warning`, or `error`; editable at runtime from the dashboard |
 | `CLAUDEX_LOCAL_TOKEN` | unset | Bearer token required by the model request routes and the admin/dashboard routes when set; mandatory for non-loopback binds. See [the passthrough interaction](#mixing-claude-and-codex-models) |
 | `CLAUDEX_COMPACTION_MODEL` | unset | `compaction.model` setting: opt-in `claude:<model-id>` reroute target for oversized Claude Code compaction requests; unset (default) disables the reroute entirely. See [Compaction reroute](#compaction-reroute) |
+| `CLAUDEX_CLAUDE_ACCOUNT_ID` | unset | `claude_account.id` setting: id of the registered Claude account that serves Anthropic passthrough traffic; unset (default) forwards client credentials untouched. See [Serving with a registered account](#serving-with-a-registered-account-account-use) |
 
 ### settings.json
 
@@ -410,10 +465,10 @@ uv run claudex-gateway
 ```
 
 Here `/model opus` and background haiku tasks run on Codex while fable and
-sonnet stay on Anthropic. Passthrough requires a real Claude login: Claude
-Code attaches its own OAuth token, and the gateway forwards it to Anthropic
-for unmapped models. `ANTHROPIC_AUTH_TOKEN=dummy` must not be set — the
-placeholder would be forwarded and rejected by Anthropic.
+sonnet stay on Anthropic. By default, passthrough requires a real Claude
+login: Claude Code attaches its own OAuth token, and the gateway forwards it
+to Anthropic for unmapped models. `ANTHROPIC_AUTH_TOKEN=dummy` must not be
+set — the placeholder would be forwarded and rejected by Anthropic.
 
 `CLAUDEX_LOCAL_TOKEN` shares that `Authorization` header: when the token is
 set, clients authenticate to the gateway with it, and the same header is what
@@ -422,6 +477,11 @@ auth error unless the token happens to be a credential Anthropic accepts. To
 run with a local token, add a catch-all map entry (a substring key every
 Claude model name contains, e.g. `{"claude": "codex:gpt-5.5"}`) so no request ever
 reaches the passthrough path.
+
+Both constraints disappear when a [registered account is
+selected](#serving-with-a-registered-account-account-use): the gateway then
+consumes client credentials instead of forwarding them, so a dummy token —
+or the local token itself — is exactly what the client should send.
 
 ## Development
 
