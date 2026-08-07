@@ -261,6 +261,10 @@ body.env-locked .applybar{display:none!important}
 #comp-select:disabled{opacity:.55;cursor:default}
 .comp-custom{display:none;margin-top:10px}
 .comp-custom.show{display:block}
+/* Optional providers (kimi/grok) ship hidden and are revealed by /health:
+   local auth detected, or the map already routes to them (a required login
+   failure must stay visible). Codex is built in and never hides. */
+.provider-hidden{display:none}
 /* Settings tab (probe-final spec): a category rail on the left, a title-less
    card of multi-line setting rows on the right. The rail lists setting
    categories; General is the only one until more runtime settings ship. */
@@ -395,7 +399,7 @@ body.env-locked .applybar{display:none!important}
         </div>
         <div class="ubody" id="usage-body-codex"></div>
       </div>
-      <div class="card">
+      <div class="card provider-hidden" id="card-kimi">
         <div class="ucard-h">
           <h2>Kimi Status</h2>
           <button class="urefresh" data-provider="kimi">갱신</button>
@@ -411,7 +415,7 @@ body.env-locked .applybar{display:none!important}
         </div>
         <div class="ubody" id="usage-body-kimi"></div>
       </div>
-      <div class="card">
+      <div class="card provider-hidden" id="card-grok">
         <div class="ucard-h">
           <h2>Grok Status</h2>
           <button class="urefresh" data-provider="grok">갱신</button>
@@ -842,7 +846,9 @@ board.addEventListener("wheel",function(ev){
 /* --- staging a target node ------------------------------------------------ */
 var addProvider="codex";
 document.getElementById("add-prov").innerHTML=ROUTE_PROVIDERS.map(function(p){
-  return'<button data-p="'+p+'">'+p+"</button>";
+  // Optional providers start hidden; setProviderVisibility reveals them
+  // once /health confirms a local login (or a map route that needs one).
+  return'<button data-p="'+p+'"'+(p==="codex"?"":' class="provider-hidden"')+">"+p+"</button>";
 }).join("");
 /* The provider buttons are built once and only toggled: re-rendering them
    would detach the clicked one mid-event, and the outside-click listener
@@ -967,6 +973,23 @@ function renderStatLine(provider,state,title,html){
   box.className="stat"+(state?" "+state:"");
   if(title)box.title=title;else box.removeAttribute("title");
   document.getElementById(provider+"-statline").innerHTML=html;
+}
+/* Purely cosmetic gating for first-run clarity: kimi/grok are extensions, so
+   their Status cards and Router add-node buttons only appear when /health
+   reports a detected local login — or when the map already routes to them,
+   where hiding a required-login error would mislead. Nothing functional
+   changes: routing, the admin API, and settings.json edits work regardless. */
+var PROVIDER_VISIBLE={kimi:false,grok:false};
+function setProviderVisibility(h){
+  ["kimi","grok"].forEach(function(p){
+    var info=((h||{}).providers||{})[p]||{};
+    var visible=info.status==="ok"||info.required===true;
+    PROVIDER_VISIBLE[p]=visible;
+    var card=document.getElementById("card-"+p);
+    if(card)card.classList.toggle("provider-hidden",!visible);
+    var btn=document.querySelector('#add-prov button[data-p="'+p+'"]');
+    if(btn)btn.classList.toggle("provider-hidden",!visible);
+  });
 }
 function renderProviderCards(h){
   var codex=(h.providers||{}).codex||{};
@@ -1396,9 +1419,11 @@ function restoreUsageButtons(providers){
     if(btn){btn.disabled=false;btn.textContent="갱신"}
   });
 }
-/* provider 없이 호출하면 네 카드 일괄 갱신(탭 진입 시), 있으면 해당 카드만. */
+/* provider 없이 호출하면 보이는 카드 일괄 갱신(탭 진입 시), 있으면 해당 카드만. */
 function fetchUsage(provider){
-  var targets=provider?[provider]:["claude","codex","kimi","grok"];
+  var targets=provider?[provider]:["claude","codex","kimi","grok"].filter(function(p){
+    return PROVIDER_VISIBLE[p]!==false;
+  });
   if(!provider)targets.forEach(function(p){renderUsageProvider(p,null)});
   /* The skeleton only means "probe in flight": every failure path must still
      settle each card into an error state, or the animation runs forever. */
@@ -1547,6 +1572,7 @@ function boot(){
     DIR.mapping=Object.assign({},DIR.LIVE);
     if(health.body&&health.body.providers){
       renderHealth(health.body);
+      setProviderVisibility(health.body);
       renderProviderCards(health.body);
     }
     renderChrome();

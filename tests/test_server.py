@@ -3484,6 +3484,31 @@ def test_dashboard_settings_tab_leads_and_holds_compaction(
         < page.index('id="tab-map"')
     )
 
+
+def test_dashboard_optional_providers_hidden_until_detected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Kimi and Grok are extensions: their Status cards and the Router
+    # add-node provider buttons ship hidden and are revealed from /health
+    # only when a local login is detected — or when the map already routes
+    # to them, where hiding a required-login error would mislead. The gating
+    # is cosmetic only; routing, settings.json, and the admin API are
+    # untouched.
+    with _create_test_client(monkeypatch) as client:
+        page = client.get("/").text
+
+    assert '<div class="card provider-hidden" id="card-kimi">' in page
+    assert '<div class="card provider-hidden" id="card-grok">' in page
+    # Codex is built in and never hides.
+    assert 'id="card-codex"' not in page
+    assert "function setProviderVisibility(" in page
+    assert 'info.status==="ok"||info.required===true' in page
+    # The Router provider picker builds optional providers hidden too.
+    assert '''(p==="codex"?"":' class="provider-hidden"')''' in page
+    # Bulk usage refresh only probes visible cards.
+    assert "PROVIDER_VISIBLE[p]!==false" in page
+
+
 def test_dashboard_plan_and_credits_read_inside_the_card(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
