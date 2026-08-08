@@ -8,6 +8,7 @@ import importlib.resources
 import json
 import logging
 import os
+import re
 import secrets
 import time
 import traceback
@@ -16,6 +17,7 @@ from collections import deque
 from collections.abc import AsyncGenerator, AsyncIterator
 from dataclasses import replace
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -26,8 +28,24 @@ from starlette.routing import Route
 
 import claudex_gateway
 from claudex_gateway import paths
-from claudex_gateway.claude_accounts import AccountRegistryError, load_registry
-from claudex_gateway.claude_auth import ClaudeAccountAuthError, ClaudeAccountAuthManager
+from claudex_gateway.account_usage_cache import ClaudeAccountUsageCache
+from claudex_gateway.claude_accounts import (
+    AccountRegistryError,
+    list_accounts,
+    load_registry,
+    mark_account_needs_reauth,
+)
+from claudex_gateway.claude_auth import (
+    ClaudeAccountAuthError,
+    ClaudeAccountAuthManager,
+    ClaudeAccountReauthRequiredError,
+)
+from claudex_gateway.claude_login_session import (
+    ClaudeLoginSession,
+    LoginSessionStateError,
+    capture_lock_path,
+)
+from claudex_gateway.locking import try_file_lock
 from claudex_gateway.codex_auth import CodexAuthError, CodexAuthManager
 from claudex_gateway.codex_client import CodexClient, CodexUpstreamError
 from claudex_gateway.compaction import (
@@ -61,7 +79,9 @@ from claudex_gateway.translate.codex_to_claude import (
     rewrite_context_overflow_message,
 )
 from claudex_gateway.usage import (
+    _provider_result,
     consume_codex_reset_credit,
+    fetch_claude_account_usage,
     fetch_claude_usage,
     fetch_codex_usage,
     fetch_kimi_usage,
@@ -368,6 +388,18 @@ def _claude_account_unavailable(message: str) -> JSONResponse:
     return JSONResponse(_claude_error_body("api_error", message), status_code=503)
 
 
+async def _mark_account_needs_reauth_best_effort(account_id: str) -> None:
+    """Persist needs-reauth for `account_id`, never failing the caller.
+
+    A concurrent `account remove` (AccountNotFoundError) or a registry I/O
+    problem must not mask the response the caller is about to return.
+    """
+    try:
+        await asyncio.to_thread(mark_account_needs_reauth, account_id)
+    except AccountRegistryError as exc:
+        logger.warning("could not mark claude account %s needs-reauth: %s", account_id, exc)
+
+
 def _claude_account_auth_manager(app_state: Any, account_id: str) -> ClaudeAccountAuthManager:
     """Return the cached per-account manager, creating it on first use.
 
@@ -481,6 +513,13 @@ async def _passthrough_with_claude_account(
     manager = _claude_account_auth_manager(request.app.state, account_id)
     try:
         credentials = await manager.get_credentials()
+    except ClaudeAccountReauthRequiredError as exc:
+        await _mark_account_needs_reauth_best_effort(account_id)
+        return _claude_account_unavailable(
+            f"claude account {account_id} needs re-authentication: {exc}; "
+            "log in again from the dashboard or re-add it with "
+            "`claudex-gateway account add`"
+        )
     except ClaudeAccountAuthError as exc:
         return _claude_account_unavailable(f"claude account {account_id} is unusable: {exc}")
 
@@ -493,6 +532,13 @@ async def _passthrough_with_claude_account(
             await upstream_response.aclose()
             try:
                 credentials = await manager.get_credentials(force_refresh=True)
+            except ClaudeAccountReauthRequiredError as exc:
+                await _mark_account_needs_reauth_best_effort(account_id)
+                return _claude_account_unavailable(
+                    f"claude account {account_id} needs re-authentication: {exc}; "
+                    "log in again from the dashboard or re-add it with "
+                    "`claudex-gateway account add`"
+                )
             except ClaudeAccountAuthError as exc:
                 return _claude_account_unavailable(
                     f"claude account {account_id} was rejected and could not be "
@@ -511,11 +557,16 @@ async def _passthrough_with_claude_account(
         )
     if upstream_response.status_code == 401:
         await upstream_response.aclose()
+        # A freshly refreshed token that Anthropic still rejects is durably
+        # dead — only a human re-login recovers it, which is what the
+        # needs-reauth state means.
+        await _mark_account_needs_reauth_best_effort(account_id)
         return JSONResponse(
             _claude_error_body(
                 "authentication_error",
                 f"Anthropic rejected the registered claude account {account_id} "
-                "after a token refresh; re-add it with `claudex-gateway account add`",
+                "after a token refresh; log in again from the dashboard or "
+                "re-add it with `claudex-gateway account add`",
             ),
             status_code=401,
         )
@@ -1889,6 +1940,336 @@ async def _handle_admin_claude_account_put(request: Request) -> JSONResponse:
     return JSONResponse(_claude_account_payload(new_config))
 
 
+# --------------------------------------------------------------------------
+# Admin claude-accounts surface (dashboard account management)
+# --------------------------------------------------------------------------
+
+_CLAUDE_LOGIN_CODE_KEYS = ("code",)
+_CLAUDE_LOGIN_CONFIRM_KEYS = ("replace",)
+_CONTROL_CHARACTER_PATTERN = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def _account_usage_fetch(app_state: Any) -> Any:
+    """The usage cache's fetch closure: account id -> (result, retry_after).
+
+    Resolves the per-account auth manager lazily and converts a conclusive
+    invalid_grant into a registry needs-reauth mark plus an "unavailable"
+    envelope — the cache itself must never see that exception.
+    """
+
+    async def fetch(account_id: str) -> tuple[dict[str, Any], float | None]:
+        manager = _claude_account_auth_manager(app_state, account_id)
+        try:
+            return await fetch_claude_account_usage(app_state.http_client, manager)
+        except ClaudeAccountReauthRequiredError:
+            await _mark_account_needs_reauth_best_effort(account_id)
+            return (
+                _provider_result(
+                    "claude",
+                    status="unavailable",
+                    error="account needs re-authentication; log in again from the dashboard",
+                ),
+                None,
+            )
+
+    return fetch
+
+
+def _local_claude_login_fields() -> dict[str, Any] | None:
+    """Identity snapshot of this machine's ambient Claude Code login.
+
+    Read from the CLI's own config file (`~/.claude.json`, or
+    `$CLAUDE_CONFIG_DIR/.claude.json` when the override is set): the same
+    `oauthAccount` block a capture snapshots — identity and plan metadata,
+    never secrets. The dashboard's accounts screen shows it as the "로컬
+    CLI 로그인" hero, which is informational only and unrelated to serving.
+    Missing or malformed files degrade to None (no local login).
+    """
+    override = os.environ.get("CLAUDE_CONFIG_DIR")
+    path = (
+        Path(override).expanduser() / ".claude.json"
+        if override
+        else Path.home() / ".claude.json"
+    )
+    try:
+        parsed = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    account = parsed.get("oauthAccount")
+    if not isinstance(account, dict):
+        return None
+
+    def _text_field(key: str) -> str | None:
+        value = account.get(key)
+        return value if isinstance(value, str) and value else None
+
+    email = _text_field("emailAddress")
+    if email is None:
+        return None
+    return {
+        "accountUuid": _text_field("accountUuid"),
+        "email": email,
+        "organizationName": _text_field("organizationName"),
+        "planType": _text_field("organizationType"),
+        "rateLimitTier": _text_field("organizationRateLimitTier"),
+    }
+
+
+def _account_plan_fields(account_id: str) -> dict[str, Any]:
+    """Plan metadata from the account's captured oauth-account.json.
+
+    `organizationType` (e.g. claude_max) and `organizationRateLimitTier`
+    (e.g. default_claude_max_20x) are login-time snapshots — refreshed only
+    by a re-login — and the file holds no secrets. Missing or malformed
+    files degrade to nulls; the account list never fails over plan info.
+    """
+    path = paths.accounts_dir("claude") / account_id / "oauth-account.json"
+    try:
+        parsed = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return {"planType": None, "rateLimitTier": None}
+    if not isinstance(parsed, dict):
+        return {"planType": None, "rateLimitTier": None}
+    organization_type = parsed.get("organizationType")
+    rate_limit_tier = parsed.get("organizationRateLimitTier")
+    return {
+        "planType": organization_type if isinstance(organization_type, str) else None,
+        "rateLimitTier": rate_limit_tier if isinstance(rate_limit_tier, str) else None,
+    }
+
+
+async def _handle_admin_claude_accounts_get(request: Request) -> JSONResponse:
+    """List every registered account (registry metadata only — never secrets)."""
+    denied = _admin_guard(request)
+    if denied is not None:
+        return denied
+    try:
+        records = list_accounts()
+    except AccountRegistryError as exc:
+        return JSONResponse(
+            _openai_error_body(
+                "server_error", f"cannot read the claude account registry: {exc}"
+            ),
+            status_code=500,
+        )
+    return JSONResponse(
+        {
+            "accounts": [
+                {**record.to_row(), **_account_plan_fields(record.id)}
+                for record in records
+            ],
+            "serving_account_id": request.app.state.config.claude_account_id,
+            "local": _local_claude_login_fields(),
+        }
+    )
+
+
+async def _handle_admin_claude_accounts_usage(request: Request) -> JSONResponse:
+    """Per-account usage, served through the TTL cache.
+
+    needs-reauth rows get a synthesized "unavailable" without touching the
+    network — a dead refresh token cannot succeed, and the usage API's rate
+    budget is precious. There is deliberately no force-refresh parameter;
+    the UI shows data age from each result's `updated_at` instead.
+    """
+    denied = _admin_guard(request)
+    if denied is not None:
+        return denied
+    try:
+        records = list_accounts()
+    except AccountRegistryError as exc:
+        return JSONResponse(
+            _openai_error_body(
+                "server_error", f"cannot read the claude account registry: {exc}"
+            ),
+            status_code=500,
+        )
+    account_param = request.query_params.get("account")
+    if account_param is not None:
+        records = [record for record in records if record.id == account_param]
+        if not records:
+            return JSONResponse(
+                _openai_error_body(
+                    "invalid_request_error",
+                    f"no account registered with id {account_param}",
+                ),
+                status_code=400,
+            )
+    ready_ids = [record.id for record in records if record.state == "ready"]
+    cache: ClaudeAccountUsageCache = request.app.state.claude_account_usage_cache
+    results = await cache.get(ready_ids)
+    for record in records:
+        if record.state != "ready":
+            results[record.id] = _provider_result(
+                "claude",
+                status="unavailable",
+                error="account needs re-authentication; log in again from the dashboard",
+            )
+    return JSONResponse({"accounts": results, "fetched_at": time.time()})
+
+
+async def _handle_admin_claude_login_get(request: Request) -> JSONResponse:
+    denied = _admin_guard(request)
+    if denied is not None:
+        return denied
+    session: ClaudeLoginSession | None = request.app.state.claude_login_session
+    if session is None:
+        return JSONResponse({"status": "idle"})
+    return JSONResponse(session.status())
+
+
+async def _handle_admin_claude_login_post(request: Request) -> JSONResponse:
+    """Start a dashboard login session (single concurrent session).
+
+    The slot check and assignment have no await between them, so two
+    concurrent POSTs cannot both create a session. The cross-process capture
+    lock additionally excludes a CLI `account add` running on this machine.
+    """
+    denied = _admin_guard(request) or _require_json_content_type(request)
+    if denied is not None:
+        return denied
+    body, error = await _read_json_object(request, _openai_error_body)
+    if error is not None or body is None:
+        return error
+    if body:
+        return JSONResponse(
+            _openai_error_body(
+                "invalid_request_error",
+                f"unexpected keys: {', '.join(sorted(body))}; POST an empty JSON object",
+            ),
+            status_code=400,
+        )
+
+    session: ClaudeLoginSession | None = request.app.state.claude_login_session
+    if session is not None and not session.is_terminal:
+        return JSONResponse(
+            _openai_error_body(
+                "invalid_request_error",
+                "a login session is already active; poll GET /admin/claude-accounts/login",
+                "login-active",
+            ),
+            status_code=409,
+        )
+    lock_handle = try_file_lock(capture_lock_path())
+    if lock_handle is None:
+        return JSONResponse(
+            _openai_error_body(
+                "invalid_request_error",
+                "another Claude login is in progress on this machine "
+                "(a CLI `account add`?); retry once it finishes",
+                "login-locked",
+            ),
+            status_code=409,
+        )
+    session = ClaudeLoginSession(lock_handle)
+    request.app.state.claude_login_session = session
+    session.start()
+    return JSONResponse({"status": "starting"}, status_code=201)
+
+
+async def _handle_admin_claude_login_code_post(request: Request) -> JSONResponse:
+    denied = _admin_guard(request) or _require_json_content_type(request)
+    if denied is not None:
+        return denied
+    body, error = await _read_json_object(request, _openai_error_body)
+    if error is not None or body is None:
+        return error
+    unknown = sorted(set(body) - set(_CLAUDE_LOGIN_CODE_KEYS))
+    if unknown:
+        return JSONResponse(
+            _openai_error_body(
+                "invalid_request_error",
+                f"unknown keys: {', '.join(unknown)}; supported: code",
+            ),
+            status_code=400,
+        )
+    code = body.get("code")
+    code = code.strip() if isinstance(code, str) else None
+    # A pasted code must be exactly one stdin line for the login child;
+    # control characters would smuggle extra lines or terminal noise.
+    if not code or _CONTROL_CHARACTER_PATTERN.search(code):
+        return JSONResponse(
+            _openai_error_body(
+                "invalid_request_error",
+                "provide 'code' as a non-empty single-line string",
+            ),
+            status_code=400,
+        )
+    session: ClaudeLoginSession | None = request.app.state.claude_login_session
+    if session is None:
+        return JSONResponse(
+            _openai_error_body(
+                "invalid_request_error", "no login session is active", "login-idle"
+            ),
+            status_code=409,
+        )
+    try:
+        await session.submit_code(code)
+    except LoginSessionStateError as exc:
+        return JSONResponse(
+            _openai_error_body("invalid_request_error", str(exc)),
+            status_code=409,
+        )
+    return JSONResponse({"status": session.status()["status"]})
+
+
+async def _handle_admin_claude_login_confirm_post(request: Request) -> JSONResponse:
+    denied = _admin_guard(request) or _require_json_content_type(request)
+    if denied is not None:
+        return denied
+    body, error = await _read_json_object(request, _openai_error_body)
+    if error is not None or body is None:
+        return error
+    unknown = sorted(set(body) - set(_CLAUDE_LOGIN_CONFIRM_KEYS))
+    if unknown:
+        return JSONResponse(
+            _openai_error_body(
+                "invalid_request_error",
+                f"unknown keys: {', '.join(unknown)}; supported: replace",
+            ),
+            status_code=400,
+        )
+    replace_choice = body.get("replace")
+    if not isinstance(replace_choice, bool):
+        return JSONResponse(
+            _openai_error_body(
+                "invalid_request_error", "provide 'replace' as a boolean"
+            ),
+            status_code=400,
+        )
+    session: ClaudeLoginSession | None = request.app.state.claude_login_session
+    if session is None:
+        return JSONResponse(
+            _openai_error_body(
+                "invalid_request_error", "no login session is active", "login-idle"
+            ),
+            status_code=409,
+        )
+    try:
+        session.confirm_replace(replace_choice)
+    except LoginSessionStateError as exc:
+        return JSONResponse(
+            _openai_error_body("invalid_request_error", str(exc)),
+            status_code=409,
+        )
+    return JSONResponse({"status": session.status()["status"]})
+
+
+async def _handle_admin_claude_login_delete(request: Request) -> JSONResponse:
+    """Cancel an active session, or clear a terminal one from the slot."""
+    denied = _admin_guard(request)
+    if denied is not None:
+        return denied
+    session: ClaudeLoginSession | None = request.app.state.claude_login_session
+    if session is None or session.is_terminal:
+        request.app.state.claude_login_session = None
+        return JSONResponse({"status": "idle"})
+    session.request_cancel()
+    return JSONResponse({"status": "cancelling"})
+
+
 async def _handle_dashboard(request: Request) -> Response:
     """Serve the runtime dashboard, embedded in the package as dashboard.html."""
     try:
@@ -2226,6 +2607,39 @@ def create_app(config: GatewayConfig, daemon_nonce: str | None = None) -> Starle
             Route(
                 "/admin/claude-account", _handle_admin_claude_account_put, methods=["PUT"]
             ),
+            Route(
+                "/admin/claude-accounts", _handle_admin_claude_accounts_get, methods=["GET"]
+            ),
+            Route(
+                "/admin/claude-accounts/usage",
+                _handle_admin_claude_accounts_usage,
+                methods=["GET"],
+            ),
+            Route(
+                "/admin/claude-accounts/login",
+                _handle_admin_claude_login_get,
+                methods=["GET"],
+            ),
+            Route(
+                "/admin/claude-accounts/login",
+                _handle_admin_claude_login_post,
+                methods=["POST"],
+            ),
+            Route(
+                "/admin/claude-accounts/login",
+                _handle_admin_claude_login_delete,
+                methods=["DELETE"],
+            ),
+            Route(
+                "/admin/claude-accounts/login/code",
+                _handle_admin_claude_login_code_post,
+                methods=["POST"],
+            ),
+            Route(
+                "/admin/claude-accounts/login/confirm",
+                _handle_admin_claude_login_confirm_post,
+                methods=["POST"],
+            ),
             Route("/admin/logs", _handle_admin_logs, methods=["GET"]),
             Route("/admin/usage", _handle_admin_usage, methods=["GET"]),
             Route(
@@ -2245,4 +2659,12 @@ def create_app(config: GatewayConfig, daemon_nonce: str | None = None) -> Starle
     # Initialized here (not in the lifespan) so the dict exists even when a
     # test drives the app without entering the lifespan context.
     app.state.claude_account_auth_managers = {}
+    # Dashboard login session slot (single concurrent session) and the
+    # per-account usage cache — the fetch closure resolves http_client from
+    # app.state at call time, so wiring here works with or without the
+    # lifespan having run.
+    app.state.claude_login_session = None
+    app.state.claude_account_usage_cache = ClaudeAccountUsageCache(
+        fetch=_account_usage_fetch(app.state)
+    )
     return app

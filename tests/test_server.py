@@ -4540,12 +4540,12 @@ def test_account_passthrough_unregistered_account_returns_503(
     assert "not registered" in response.json()["error"]["message"]
 
 
-def test_account_passthrough_refresh_failure_returns_503(
+def test_account_passthrough_invalid_grant_marks_needs_reauth(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
     # An already-expired token forces the proactive refresh before any
-    # Anthropic call, and that refresh fails.
+    # Anthropic call, and that refresh conclusively fails (invalid_grant).
     account_id = _register_serving_account(expires_in_seconds=-60)
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -4557,7 +4557,29 @@ def test_account_passthrough_refresh_failure_returns_503(
     response = client.post("/v1/messages", json=_account_body())
 
     assert response.status_code == 503
+    assert "needs re-authentication" in response.json()["error"]["message"]
+    [record] = claude_accounts.load_registry()
+    assert record.state == "needs-reauth"
+
+
+def test_account_passthrough_transient_refresh_failure_returns_503_without_marking(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    account_id = _register_serving_account(expires_in_seconds=-60)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert str(request.url) == CLAUDE_TOKEN_URL
+        return httpx.Response(500, text="token endpoint down")
+
+    client, _ = _gateway(GatewayConfig(claude_account_id=account_id), handler)
+
+    response = client.post("/v1/messages", json=_account_body())
+
+    assert response.status_code == 503
     assert "unusable" in response.json()["error"]["message"]
+    [record] = claude_accounts.load_registry()
+    assert record.state == "ready"
 
 
 def test_account_passthrough_serves_count_tokens_too(
@@ -4611,3 +4633,420 @@ def test_unset_account_keeps_passthrough_forwarding_client_credentials(
     assert upstream.headers["authorization"] == "Bearer sk-ant-oat01-client"
     forwarded_user_id = json.loads(json.loads(upstream.content)["metadata"]["user_id"])
     assert forwarded_user_id["account_uuid"] == "client-account-uuid"
+
+
+# ---------------------------------------------------------------------------
+# Admin claude-accounts surface (dashboard account management)
+# ---------------------------------------------------------------------------
+
+
+_ADMIN_BASE = "http://127.0.0.1:8787"
+
+
+class TestAdminClaudeAccountsApi:
+    @staticmethod
+    def _client(
+        monkeypatch: pytest.MonkeyPatch, tmp_path: Path, **config_kwargs: Any
+    ) -> TestClient:
+        monkeypatch.setenv("HOME", str(tmp_path / "home"))
+        monkeypatch.delenv("CLAUDEX_CLAUDE_ACCOUNT_ID", raising=False)
+        return _create_test_client(
+            monkeypatch,
+            config=GatewayConfig(
+                settings_file=tmp_path / "settings.json", **config_kwargs
+            ),
+            base_url=_ADMIN_BASE,
+        )
+
+    def test_list_returns_rows_and_serving_id_without_secrets(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        client = self._client(monkeypatch, tmp_path)
+        account_id = _register_serving_account()
+
+        with client:
+            response = client.get("/admin/claude-accounts")
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["serving_account_id"] is None
+        [row] = payload["accounts"]
+        assert set(row) == {
+            "id",
+            "email",
+            "organizationUuid",
+            "organizationName",
+            "createdAt",
+            "updatedAt",
+            "lastAuthenticatedAt",
+            "state",
+            "planType",
+            "rateLimitTier",
+        }
+        assert row["id"] == account_id
+        assert row["state"] == "ready"
+        # _register_serving_account's oauth-account fixture has no plan
+        # fields, so the derived plan metadata degrades to nulls.
+        assert row["planType"] is None
+        assert row["rateLimitTier"] is None
+        # The registry response must never leak credential material.
+        assert "accessToken" not in response.text
+        assert "refreshToken" not in response.text
+        assert "pool-access" not in response.text
+        assert "pool-refresh" not in response.text
+
+    def test_list_derives_plan_fields_from_the_captured_oauth_account(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        client = self._client(monkeypatch, tmp_path)
+        claude_accounts.add_account(
+            email="max@example.com",
+            organization_uuid="org-max",
+            organization_name="Max Org",
+            credentials_json={"claudeAiOauth": {"accessToken": "at"}},
+            oauth_account_json={
+                "emailAddress": "max@example.com",
+                "organizationType": "claude_max",
+                "organizationRateLimitTier": "default_claude_max_20x",
+            },
+        )
+
+        with client:
+            [row] = client.get("/admin/claude-accounts").json()["accounts"]
+
+        assert row["planType"] == "claude_max"
+        assert row["rateLimitTier"] == "default_claude_max_20x"
+
+    def test_list_reports_the_configured_serving_account(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setenv("HOME", str(tmp_path / "home"))
+        account_id = _register_serving_account()
+        client = self._client(monkeypatch, tmp_path, claude_account_id=account_id)
+
+        with client:
+            payload = client.get("/admin/claude-accounts").json()
+        assert payload["serving_account_id"] == account_id
+
+    def test_list_includes_the_local_ambient_login_identity(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        # The dashboard's 로컬 CLI 로그인 hero reads this block: identity and
+        # plan metadata from the CLI's own ~/.claude.json — never secrets.
+        monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+        client = self._client(monkeypatch, tmp_path)
+        home = tmp_path / "home"
+        home.mkdir(parents=True, exist_ok=True)
+        (home / ".claude.json").write_text(
+            json.dumps(
+                {
+                    "oauthAccount": {
+                        "accountUuid": "11111111-2222-3333-4444-555555555555",
+                        "emailAddress": "local@example.com",
+                        "organizationName": "Local Org",
+                        "organizationType": "claude_max",
+                        "organizationRateLimitTier": "default_claude_max_20x",
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with client:
+            payload = client.get("/admin/claude-accounts").json()
+
+        assert payload["local"] == {
+            "accountUuid": "11111111-2222-3333-4444-555555555555",
+            "email": "local@example.com",
+            "organizationName": "Local Org",
+            "planType": "claude_max",
+            "rateLimitTier": "default_claude_max_20x",
+        }
+
+    def test_list_local_block_degrades_to_null_without_a_login(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+        client = self._client(monkeypatch, tmp_path)
+
+        with client:
+            payload = client.get("/admin/claude-accounts").json()
+
+        assert payload["local"] is None
+
+    def test_usage_serves_from_the_cache_after_the_first_fetch(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        client = self._client(monkeypatch, tmp_path)
+        account_id = _register_serving_account()
+        calls: list[str] = []
+
+        async def fake_fetch(http_client: Any, manager: Any) -> tuple[dict[str, Any], None]:
+            calls.append(account_id)
+            return ({"provider": "claude", "status": "ok", "error": None}, None)
+
+        monkeypatch.setattr(server, "fetch_claude_account_usage", fake_fetch)
+
+        with client:
+            first = client.get("/admin/claude-accounts/usage")
+            second = client.get("/admin/claude-accounts/usage")
+
+        assert first.status_code == 200
+        assert first.json()["accounts"][account_id]["status"] == "ok"
+        assert second.json()["accounts"][account_id]["status"] == "ok"
+        assert calls == [account_id]
+
+    def test_usage_skips_needs_reauth_accounts_without_fetching(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        client = self._client(monkeypatch, tmp_path)
+        account_id = _register_serving_account()
+        claude_accounts.mark_account_needs_reauth(account_id)
+
+        async def fail_fetch(http_client: Any, manager: Any) -> None:
+            raise AssertionError("needs-reauth accounts must not fetch usage")
+
+        monkeypatch.setattr(server, "fetch_claude_account_usage", fail_fetch)
+
+        with client:
+            response = client.get("/admin/claude-accounts/usage")
+
+        assert response.status_code == 200
+        result = response.json()["accounts"][account_id]
+        assert result["status"] == "unavailable"
+        assert "re-authentication" in result["error"]
+
+    def test_usage_unknown_account_filter_is_a_400(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        client = self._client(monkeypatch, tmp_path)
+        _register_serving_account()
+        with client:
+            response = client.get(
+                "/admin/claude-accounts/usage",
+                params={"account": "99999999-9999-4999-8999-999999999999"},
+            )
+        assert response.status_code == 400
+
+    @pytest.mark.parametrize(
+        ("method", "path"),
+        [
+            ("GET", "/admin/claude-accounts"),
+            ("GET", "/admin/claude-accounts/usage"),
+            ("GET", "/admin/claude-accounts/login"),
+            ("POST", "/admin/claude-accounts/login"),
+            ("DELETE", "/admin/claude-accounts/login"),
+            ("POST", "/admin/claude-accounts/login/code"),
+            ("POST", "/admin/claude-accounts/login/confirm"),
+        ],
+    )
+    def test_foreign_host_is_rejected(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        method: str,
+        path: str,
+    ) -> None:
+        monkeypatch.setenv("HOME", str(tmp_path / "home"))
+        client = _create_test_client(
+            monkeypatch,
+            config=GatewayConfig(settings_file=tmp_path / "settings.json"),
+            base_url="http://evil.example",
+        )
+        with client:
+            response = client.request(method, path, json={})
+        assert response.status_code == 403
+
+    def test_login_endpoints_require_json_content_type(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        client = self._client(monkeypatch, tmp_path)
+        with client:
+            for path in (
+                "/admin/claude-accounts/login",
+                "/admin/claude-accounts/login/code",
+                "/admin/claude-accounts/login/confirm",
+            ):
+                response = client.post(
+                    path, content="{}", headers={"content-type": "text/plain"}
+                )
+                assert response.status_code == 415, path
+
+    def test_login_get_without_a_session_is_idle(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        client = self._client(monkeypatch, tmp_path)
+        with client:
+            assert client.get("/admin/claude-accounts/login").json() == {"status": "idle"}
+
+    def test_login_commands_without_a_session_are_409(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        client = self._client(monkeypatch, tmp_path)
+        with client:
+            code = client.post("/admin/claude-accounts/login/code", json={"code": "x"})
+            confirm = client.post(
+                "/admin/claude-accounts/login/confirm", json={"replace": True}
+            )
+        assert code.status_code == 409
+        assert confirm.status_code == 409
+
+    def test_login_code_validation(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        client = self._client(monkeypatch, tmp_path)
+        with client:
+            for bad_body in (
+                {},
+                {"code": ""},
+                {"code": "  "},
+                {"code": "line\nbreak"},
+                {"code": 7},
+                {"code": "ok", "extra": 1},
+            ):
+                response = client.post("/admin/claude-accounts/login/code", json=bad_body)
+                assert response.status_code == 400, bad_body
+
+    def test_login_post_rejects_a_non_empty_body(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        client = self._client(monkeypatch, tmp_path)
+        with client:
+            response = client.post("/admin/claude-accounts/login", json={"mode": "x"})
+        assert response.status_code == 400
+
+    def test_login_post_conflicts_with_a_held_capture_lock(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        client = self._client(monkeypatch, tmp_path)
+        from claudex_gateway.claude_login_session import capture_lock_path
+        from claudex_gateway.locking import try_file_lock as _try_lock
+
+        handle = _try_lock(capture_lock_path())
+        assert handle is not None
+        try:
+            with client:
+                response = client.post("/admin/claude-accounts/login", json={})
+        finally:
+            handle.release()
+        assert response.status_code == 409
+        assert response.json()["error"]["code"] == "login-locked"
+
+
+class TestAdminClaudeLoginLifecycle:
+    """End-to-end login sessions against the PATH-prepended fake claude.
+
+    Every test runs the client as a context manager: the login driver task
+    lives on the lifespan portal's event loop, which only exists while the
+    `with` block is open.
+    """
+
+    @staticmethod
+    def _client(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> TestClient:
+        import sys as _sys
+
+        from fake_claude import prepend_fake_claude
+
+        monkeypatch.setenv("HOME", str(tmp_path / "home"))
+        monkeypatch.delenv("CLAUDEX_CLAUDE_ACCOUNT_ID", raising=False)
+        monkeypatch.setattr(_sys, "platform", "linux")
+        prepend_fake_claude(monkeypatch, tmp_path)
+        return _create_test_client(
+            monkeypatch,
+            config=GatewayConfig(settings_file=tmp_path / "settings.json"),
+            base_url=_ADMIN_BASE,
+        )
+
+    @staticmethod
+    def _poll_until(client: TestClient, predicate: Any, timeout: float = 10.0) -> dict[str, Any]:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            status = client.get("/admin/claude-accounts/login").json()
+            if predicate(status):
+                return status
+            time.sleep(0.05)
+        raise AssertionError(f"login status never satisfied the predicate: {status}")
+
+    def test_full_login_flow_with_code_submission(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setenv("CLAUDEX_FAKE_CLAUDE_MODE", "piped-url-code")
+        client = self._client(monkeypatch, tmp_path)
+
+        with client:
+            started = client.post("/admin/claude-accounts/login", json={})
+            assert started.status_code == 201
+            assert started.json() == {"status": "starting"}
+
+            status = self._poll_until(
+                client, lambda s: s["status"] == "awaiting-browser"
+            )
+            assert status["url"].startswith("https://claude.com/cai/oauth/authorize")
+            assert status["code_prompt_detected"] is True
+            assert status["expires_at"] is not None
+
+            submitted = client.post(
+                "/admin/claude-accounts/login/code", json={"code": "good-code"}
+            )
+            assert submitted.status_code == 200
+
+            status = self._poll_until(client, lambda s: s["status"] == "succeeded")
+            assert status["account"]["email"] == "fixture@example.com"
+
+            rows = client.get("/admin/claude-accounts").json()["accounts"]
+            assert [row["email"] for row in rows] == ["fixture@example.com"]
+
+    def test_second_login_while_active_is_409_then_cancel_converges(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setenv("CLAUDEX_FAKE_CLAUDE_MODE", "hang")
+        client = self._client(monkeypatch, tmp_path)
+
+        with client:
+            assert client.post("/admin/claude-accounts/login", json={}).status_code == 201
+            conflict = client.post("/admin/claude-accounts/login", json={})
+            assert conflict.status_code == 409
+            assert conflict.json()["error"]["code"] == "login-active"
+
+            cancelled = client.delete("/admin/claude-accounts/login")
+            assert cancelled.json() == {"status": "cancelling"}
+            self._poll_until(client, lambda s: s["status"] == "cancelled")
+
+            # A terminal session clears on DELETE and frees the slot.
+            assert client.delete("/admin/claude-accounts/login").json() == {
+                "status": "idle"
+            }
+            assert client.get("/admin/claude-accounts/login").json() == {
+                "status": "idle"
+            }
+
+    def test_duplicate_login_confirm_replace_via_the_api(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setenv("CLAUDEX_FAKE_CLAUDE_MODE", "piped-autocomplete")
+        client = self._client(monkeypatch, tmp_path)
+        original = claude_accounts.add_account(
+            "fixture@example.com",
+            None,
+            None,
+            {"claudeAiOauth": {"accessToken": "old-token"}},
+            None,
+        )
+
+        with client:
+            assert client.post("/admin/claude-accounts/login", json={}).status_code == 201
+            status = self._poll_until(
+                client, lambda s: s["status"] == "awaiting-confirm-replace"
+            )
+            assert status["email"] == "fixture@example.com"
+
+            confirmed = client.post(
+                "/admin/claude-accounts/login/confirm", json={"replace": True}
+            )
+            assert confirmed.status_code == 200
+            status = self._poll_until(client, lambda s: s["status"] == "succeeded")
+            assert status["account"]["id"] == original.id
+
+        [record] = claude_accounts.load_registry()
+        assert record.id == original.id
+        assert record.state == "ready"
