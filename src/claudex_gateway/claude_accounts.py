@@ -41,7 +41,7 @@ import stat
 import sys
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, NoReturn
 
@@ -59,6 +59,8 @@ _TOMBSTONE_SUFFIX = ".tombstone"
 _STAGING_PREFIX = ".staging-"
 
 _STATE_READY = "ready"
+_STATE_NEEDS_REAUTH = "needs-reauth"
+_VALID_STATES = (_STATE_READY, _STATE_NEEDS_REAUTH)
 
 _ROW_KEYS = (
     "id",
@@ -363,6 +365,51 @@ def update_account_credentials(
         return updated
 
 
+def mark_account_needs_reauth(account_id: str) -> AccountRecord:
+    """Set a registered account's state to needs-reauth (durable fact: only a
+    fresh interactive login can recover the account).
+
+    This is the one state transition the daemon performs; recovery to ready
+    happens exclusively through `update_account_credentials`, which is why
+    this is not a generic state setter. Idempotent: an account already in
+    needs-reauth is returned unchanged without a registry write. Bumps
+    `updatedAt` only — `lastAuthenticatedAt` records logins, not failures.
+    Raises `AccountNotFoundError` for an unknown or non-canonical id.
+    """
+    canonical_id = _canonicalize_account_id(account_id)
+
+    accounts_root = paths.accounts_dir(_PROVIDER)
+    _makedirs_0700(paths.runtime_dir())
+    _makedirs_0700(accounts_root)
+
+    with file_lock(_lock_path(accounts_root)):
+        records = _recover(accounts_root)
+        existing = next((record for record in records if record.id == canonical_id), None)
+        if existing is None:
+            raise AccountNotFoundError(f"no account registered with id {canonical_id}")
+        if existing.state == _STATE_NEEDS_REAUTH:
+            return existing
+
+        updated = replace(existing, updated_at=_now_millis(), state=_STATE_NEEDS_REAUTH)
+        registry_path = _registry_path(accounts_root)
+        rows = [
+            (updated if record.id == canonical_id else record).to_row() for record in records
+        ]
+        try:
+            _write_json_atomic(registry_path, rows)
+        except _PostCommitFsyncError as exc:
+            raise AccountRegistryError(
+                f"account {canonical_id} was marked needs-reauth in {registry_path} "
+                "but durability after commit is uncertain"
+            ) from exc
+        except OSError as exc:
+            raise AccountRegistryError(
+                f"failed to mark account {canonical_id} needs-reauth in {registry_path}"
+            ) from exc
+
+        return updated
+
+
 def remove_account(account_id: str) -> None:
     """Remove a registered account by id (tombstone commit protocol).
 
@@ -567,9 +614,9 @@ def _validate_timestamp(raw: object, *, field: str) -> int:
 
 
 def _validate_state(raw: object) -> str:
-    if raw != _STATE_READY:
-        raise ValueError(f"state must be {_STATE_READY!r}")
-    return _STATE_READY
+    if raw not in _VALID_STATES:
+        raise ValueError(f"state must be one of {_VALID_STATES!r}")
+    return raw
 
 
 def _canonical_uuid_or_none(value: str) -> str | None:

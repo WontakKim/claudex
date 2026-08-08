@@ -52,6 +52,13 @@ class ClaudeAccountAuthError(Exception):
     description of what went wrong."""
 
 
+class ClaudeAccountReauthRequiredError(ClaudeAccountAuthError):
+    """The token endpoint conclusively rejected the refresh token
+    (invalid_grant): only a fresh interactive login can recover the account.
+    Callers use this to mark the registry row needs-reauth. The message
+    carries the status and error code only, never the response body."""
+
+
 @dataclass(frozen=True)
 class ClaudeAccountCredentials:
     access_token: str
@@ -159,6 +166,11 @@ class ClaudeAccountAuthManager:
         except httpx.HTTPError as exc:
             raise ClaudeAccountAuthError(f"token refresh request failed: {exc}") from exc
         if response.status_code != 200:
+            if response.status_code in (400, 401) and _is_invalid_grant(response):
+                raise ClaudeAccountReauthRequiredError(
+                    f"token refresh failed with status {response.status_code}: "
+                    "invalid_grant — only a fresh login can recover this account"
+                )
             raise ClaudeAccountAuthError(
                 f"token refresh failed with status {response.status_code}: {response.text}"
             )
@@ -194,6 +206,20 @@ class ClaudeAccountAuthManager:
         temp_file.write_text(json.dumps(file_data, indent=2) + "\n", encoding="utf-8")
         os.chmod(temp_file, 0o600)
         os.replace(temp_file, self._credentials_file)
+
+
+def _is_invalid_grant(response: httpx.Response) -> bool:
+    """True when the token endpoint's error body names invalid_grant.
+
+    The OAuth error shape is `{"error": "invalid_grant", ...}`; a substring
+    check covers non-JSON or wrapped bodies without ever surfacing them."""
+    try:
+        parsed = response.json()
+    except ValueError:
+        return "invalid_grant" in response.text
+    if isinstance(parsed, dict) and parsed.get("error") == "invalid_grant":
+        return True
+    return "invalid_grant" in response.text
 
 
 def _access_token(oauth_blob: dict[str, Any]) -> str:

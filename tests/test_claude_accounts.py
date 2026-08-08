@@ -298,6 +298,64 @@ def test_update_account_credentials_validates_inputs_before_any_write() -> None:
 
 
 # --------------------------------------------------------------------------
+# mark_account_needs_reauth
+# --------------------------------------------------------------------------
+
+
+def test_mark_needs_reauth_flips_state_and_bumps_updated_at_only() -> None:
+    original = _add()
+    marked = claude_accounts.mark_account_needs_reauth(original.id)
+
+    assert marked.state == "needs-reauth"
+    assert marked.updated_at >= original.updated_at
+    assert marked.last_authenticated_at == original.last_authenticated_at
+    assert marked.created_at == original.created_at
+    assert marked.id == original.id
+    [listed] = claude_accounts.list_accounts()
+    assert listed == marked
+
+
+def test_mark_needs_reauth_is_idempotent_without_a_registry_write() -> None:
+    original = _add()
+    first = claude_accounts.mark_account_needs_reauth(original.id)
+    mtime_after_first = _registry_path().stat().st_mtime_ns
+
+    second = claude_accounts.mark_account_needs_reauth(original.id)
+
+    assert second == first
+    assert _registry_path().stat().st_mtime_ns == mtime_after_first
+
+
+def test_mark_needs_reauth_unknown_id_raises_not_found() -> None:
+    _add()
+    with pytest.raises(claude_accounts.AccountNotFoundError):
+        claude_accounts.mark_account_needs_reauth(str(uuid.uuid4()))
+
+
+def test_mark_needs_reauth_rejects_non_canonical_id() -> None:
+    with pytest.raises(claude_accounts.AccountNotFoundError):
+        claude_accounts.mark_account_needs_reauth("../../etc/passwd")
+
+
+def test_load_registry_accepts_needs_reauth_state() -> None:
+    _write_raw_registry([_base_row(state="needs-reauth")])
+    [record] = claude_accounts.load_registry()
+    assert record.state == "needs-reauth"
+
+
+def test_update_account_credentials_resets_needs_reauth_to_ready() -> None:
+    original = _add(organization_uuid="org-1")
+    claude_accounts.mark_account_needs_reauth(original.id)
+
+    updated = claude_accounts.update_account_credentials(
+        "user@example.com", "org-1", None, {"accessToken": "at-2"}, None
+    )
+
+    assert updated.id == original.id
+    assert updated.state == "ready"
+
+
+# --------------------------------------------------------------------------
 # Validation before any filesystem write
 # --------------------------------------------------------------------------
 

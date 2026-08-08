@@ -16,6 +16,7 @@ from claudex_gateway.claude_auth import (
     CLAUDE_TOKEN_URL,
     ClaudeAccountAuthError,
     ClaudeAccountAuthManager,
+    ClaudeAccountReauthRequiredError,
 )
 
 
@@ -252,6 +253,38 @@ def test_refresh_failure_surfaces_status_and_body(tmp_path: Path) -> None:
 
     with pytest.raises(ClaudeAccountAuthError, match="status 400.*invalid_grant"):
         _run(scenario())
+
+
+def test_invalid_grant_raises_reauth_subtype_without_the_response_body(tmp_path: Path) -> None:
+    _write_account_dir(tmp_path, "stale-token", _in_ms(60))
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            400, json={"error": "invalid_grant", "error_description": "SECRET-BODY-DETAIL"}
+        )
+
+    async def scenario() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+            await ClaudeAccountAuthManager(tmp_path, http_client).get_credentials()
+
+    with pytest.raises(ClaudeAccountReauthRequiredError) as excinfo:
+        _run(scenario())
+    assert "SECRET-BODY-DETAIL" not in str(excinfo.value)
+
+
+def test_non_invalid_grant_refresh_failure_raises_the_base_class_only(tmp_path: Path) -> None:
+    _write_account_dir(tmp_path, "stale-token", _in_ms(60))
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, text="upstream exploded")
+
+    async def scenario() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+            await ClaudeAccountAuthManager(tmp_path, http_client).get_credentials()
+
+    with pytest.raises(ClaudeAccountAuthError) as excinfo:
+        _run(scenario())
+    assert not isinstance(excinfo.value, ClaudeAccountReauthRequiredError)
 
 
 def test_missing_refresh_token_raises_with_guidance(tmp_path: Path) -> None:
