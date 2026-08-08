@@ -122,58 +122,10 @@ def _write_broken_settings(tmp_path: Path) -> None:
 # gateway's (Step 7).
 # ---------------------------------------------------------------------------
 
-_FAKE_CLAUDE_SCRIPT = r"""
-import json
-import os
-import sys
-import time
-
-argv = sys.argv[1:]
-
-if argv == ["--version"]:
-    print("2.1.222")
-    sys.exit(0)
-
-if argv[:3] == ["auth", "login", "--claudeai"]:
-    config_dir = os.environ.get("CLAUDE_CONFIG_DIR", "")
-    mode = os.environ.get("CLAUDEX_FAKE_CLAUDE_MODE", "success")
-    leader_pid_file = os.environ.get("CLAUDEX_TEST_LEADER_PID_FILE")
-    if leader_pid_file:
-        with open(leader_pid_file, "w") as handle:
-            handle.write(str(os.getpid()))
-
-    if mode == "success":
-        with open(os.path.join(config_dir, ".credentials.json"), "w") as handle:
-            json.dump(
-                {"claudeAiOauth": {"accessToken": "fake-token", "email": "fixture@example.com"}},
-                handle,
-            )
-        with open(os.path.join(config_dir, ".claude.json"), "w") as handle:
-            json.dump({"oauthAccount": {"emailAddress": "fixture@example.com"}}, handle)
-        sys.exit(0)
-
-    if mode == "hang":
-        time.sleep(120)
-        sys.exit(0)
-
-    sys.exit(1)
-
-sys.exit(1)
-"""
-
-
-def _write_fake_claude(bin_dir: Path) -> Path:
-    claude_path = bin_dir / "claude"
-    claude_path.write_text(f"#!{sys.executable}\n{_FAKE_CLAUDE_SCRIPT}")
-    claude_path.chmod(0o755)
-    return claude_path
-
-
-def _prepend_fake_claude(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir(exist_ok=True)
-    _write_fake_claude(bin_dir)
-    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
+from fake_claude import (  # noqa: E402  (shared fixture module in tests/)
+    prepend_fake_claude as _prepend_fake_claude,
+    write_fake_claude as _write_fake_claude,
+)
 
 
 def _wait_for_file(path: Path, timeout: float = 5.0) -> str:
