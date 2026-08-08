@@ -4008,6 +4008,134 @@ def test_dashboard_compaction_409_refresh_failure_stays_locked(
     assert "r.body.last_reroute" not in locked_branch
 
 
+def test_dashboard_settings_rail_switches_categories(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The Settings rail is real category switching now: one .scard visible at
+    # a time, gated by data-cat on the section, deep-linkable per category.
+    with _create_test_client(monkeypatch) as client:
+        page = client.get("/").text
+
+    assert '<section id="tab-settings" data-cat="general">' in page
+    assert 'href="#settings/general"' in page
+    assert 'href="#settings/accounts"' in page
+    assert ".scard{display:none}" in page
+    assert 'id="scard-general"' in page
+    assert 'id="scard-accounts"' in page
+    assert "function setSettingsCat(" in page
+    # General leads the rail and the card order; the accounts card follows.
+    assert page.index('href="#settings/general"') < page.index(
+        'href="#settings/accounts"'
+    )
+    assert page.index('id="scard-general"') < page.index('id="scard-accounts"')
+    # A #settings/accounts deep link lands on the category at boot and on
+    # hash changes.
+    assert 'if(bootTab==="settings"&&bootParts[1])setSettingsCat(bootParts[1])' in page
+    assert 'if(parts[0]==="settings")setSettingsCat(parts[1]||"general")' in page
+
+
+def test_dashboard_accounts_card_mirrors_the_final_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Composition per _design-probes/_accounts-final.html: the local CLI hero
+    # leads (the only boxed area), then the 등록 계정 caption with the add
+    # button, then dense flat rows that expand independently.
+    with _create_test_client(monkeypatch) as client:
+        page = client.get("/").text
+
+    assert 'class="lhero"' in page
+    assert "로컬 CLI 로그인" in page
+    assert "게이트웨이 서빙과 무관" in page
+    assert 'id="btn-local-refresh"' in page
+    assert 'id="btn-add-account"' in page
+    assert (
+        page.index('id="local-sec"')
+        < page.index('id="acct-count"')
+        < page.index('id="acct-list"')
+    )
+    # Collapsed rows carry status text only (no chips, no mini bars); the
+    # right edge is the plan text.
+    assert "서빙 중" in page
+    assert "재로그인 필요" in page
+    assert 'class="plan-txt"' in page
+    # Expansion is independent per-row state, never an accordion.
+    assert "ACCT.open[id]=!ACCT.open[id]" in page
+    # Plan pill mapping: claude_max -> MAX, claude_pro -> PRO, null -> dash.
+    assert "function planLabel(" in page
+    assert 'replace(/^claude_/,"").toUpperCase()' in page
+
+
+def test_dashboard_accounts_fetch_paints_registry_before_usage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The registry GET paints rows immediately; the cache-backed usage GET
+    # and the local hero's ambient usage fill in async afterwards. No force
+    # parameter exists — the UI shows data age instead.
+    with _create_test_client(monkeypatch) as client:
+        page = client.get("/").text
+
+    assert 'jfetch("/admin/claude-accounts")' in page
+    assert 'jfetch("/admin/claude-accounts/usage")' in page
+    assert 'jfetch("/admin/usage?provider=claude")' in page
+    assert "force" not in page.split('jfetch("/admin/claude-accounts/usage")')[1][:200]
+    fetch_fn = page[page.index("function fetchAccounts(") :]
+    assert fetch_fn.index("renderAcctList()") < fetch_fn.index("fetchAccountUsage()")
+    # Data age renders from each result's updated_at.
+    assert "function fmtAgo(" in page
+    assert "기준" in page
+
+
+def test_dashboard_serving_selection_reuses_the_singular_admin_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # 사용/해제 go through the existing PUT /admin/claude-account; a 409
+    # env-lock renders the lockband and disables the buttons.
+    with _create_test_client(monkeypatch) as client:
+        page = client.get("/").text
+
+    assert 'jfetch("/admin/claude-account",{' in page
+    assert "JSON.stringify({account_id:accountId})" in page
+    assert "CLAUDEX_CLAUDE_ACCOUNT_ID" in page
+    assert 'id="acct-lockband"' in page
+    assert "#scard-accounts.locked .acctlock{display:block}" in page
+    assert "이 계정으로 서빙" in page
+    assert "서빙 해제" in page
+    # Removal stays CLI-only: the probe's danger button ships inert.
+    assert "claudex-gateway account remove" in page
+
+
+def test_dashboard_login_modal_drives_the_login_endpoints(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with _create_test_client(monkeypatch) as client:
+        page = client.get("/").text
+
+    # All five login endpoints are wired: start, poll, code, confirm, cancel.
+    assert 'jfetch("/admin/claude-accounts/login",{\n    method:"POST"' in page.replace(
+        "\r\n", "\n"
+    ) or 'method:"POST",headers:{"Content-Type":"application/json"},body:"{}"' in page
+    assert 'jfetch("/admin/claude-accounts/login")' in page
+    assert "/admin/claude-accounts/login/code" in page
+    assert "/admin/claude-accounts/login/confirm" in page
+    assert 'method:"DELETE"' in page
+    # 409 login-active attaches to the running session instead of erroring.
+    assert 'code==="login-active"' in page
+    # The replace confirmation shows exactly the CLI's two choices.
+    assert "교체 안 함" in page
+    assert 'data-lact="replace"' in page
+    assert 'data-lact="decline"' in page
+    # The URL opens in a new tab with rel=noopener and an https-only guard.
+    assert 'rel="noopener"' in page
+    assert "/^https:\\/\\//.test(st.url||" in page
+    # Anti-churn: the body re-renders only when the session state changes.
+    assert "if(key===LOGIN.lastKey)return" in page
+    # Explicit cancel only — neither a backdrop click nor Escape ever closes
+    # the login modal (a silent close would leak a live CLI login child).
+    assert "closeLoginModal()" in page
+    assert "target===this)closeLoginModal()" not in page
+    assert 'Escape")closeLoginModal()' not in page
+
+
 class CatalogCodexClient(FakeCodexClient):
     async def list_models(self) -> list[str]:
         return ["gpt-5.6-sol", "gpt-5.5"]

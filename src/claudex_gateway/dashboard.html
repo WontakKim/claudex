@@ -284,6 +284,90 @@ body.env-locked .applybar{display:none!important}
 .srow .ctrow select,.srow .ctrow .ctnode{flex:1;min-width:0}
 .srow .cthint{font-size:11px;color:color-mix(in srgb,var(--muted) 70%,transparent)}
 #compaction-card.locked{border-left:3px solid var(--err);padding-left:14px;margin-left:-17px}
+/* Settings categories: one .scard visible at a time, switched by the rail
+   (data-cat on the section). */
+.scard{display:none}
+#tab-settings[data-cat="general"] #scard-general,
+#tab-settings[data-cat="accounts"] #scard-accounts{display:block}
+/* Claude accounts (Settings > Claude 계정) — mirrors the confirmed probe
+   _design-probes/_accounts-final.html; deviations are bugs. */
+.acct-head{display:flex;align-items:flex-start;justify-content:space-between;gap:14px}
+.acct-head h2{margin:0}
+.acct-head .sub{margin:4px 0 0}
+.add{font:600 13.5px var(--sans);background:var(--accent);color:#fff;border:0;border-radius:6px;padding:8px 15px;cursor:pointer}
+.add:hover{background:color-mix(in srgb,var(--accent) 88%,var(--text))}
+.pill{display:inline-flex;align-items:center;gap:5px;height:20px;padding:0 9px;border-radius:999px;
+  font:700 11px var(--mono);letter-spacing:.02em;white-space:nowrap}
+.pill.same{background:var(--accent-soft);color:var(--accent);font-weight:600}
+.lhero{margin-top:16px;padding:18px 20px;border-radius:10px;background:var(--accent-soft);
+  border:1.5px solid color-mix(in srgb,var(--accent) 35%,transparent)}
+.lhero .ribbon{display:flex;align-items:center;gap:6px;font:700 11px var(--sans);
+  letter-spacing:.06em;text-transform:uppercase;color:var(--accent)}
+.lhero .ribbon::before{content:"";width:8px;height:8px;border-radius:50%;background:var(--accent);flex:none}
+.lhero .ribbon .urefresh{margin-left:auto;padding:4px 11px;font-size:12px;letter-spacing:0;text-transform:none}
+.lhero .who{margin-top:10px;display:flex;align-items:baseline;gap:10px;flex-wrap:wrap}
+.lhero .em{font:650 20px var(--mono);letter-spacing:-.01em}
+.lhero .plan-lg{font:700 12px var(--mono);letter-spacing:.06em;color:var(--muted);
+  background:var(--panel);padding:3px 10px;border-radius:999px}
+.lhero .org{font:400 13px var(--sans);color:var(--muted);margin-top:4px}
+.lhero .org b{color:var(--text);font-weight:600;font-family:var(--mono)}
+.chev{display:inline-block;width:12px;color:var(--muted);font-size:10px;transition:transform .15s ease;flex:none}
+.arow.open .chev{transform:rotate(90deg);color:var(--accent)}
+@media (prefers-reduced-motion:reduce){.chev{transition:none}}
+.tbl-cap{display:flex;align-items:center;gap:10px;margin:18px 0 2px}
+.tbl-cap .t{font:700 10.5px var(--sans);color:var(--muted);letter-spacing:.08em;text-transform:uppercase}
+.tbl-cap .n{font:600 11px var(--mono);color:var(--accent)}
+.tbl-cap .add{margin-left:auto}
+.arow{display:flex;align-items:center;gap:9px;padding:10px 0;cursor:pointer}
+.arow+.arow,.adetail+.arow{border-top:1px solid var(--inset)}
+.arow:hover .em{color:var(--accent)}
+.arow:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}
+.arow .em{font:600 13.5px var(--mono);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.arow .spacer{flex:1}
+.arow .plan-txt{font:700 11.5px var(--mono);color:var(--muted);letter-spacing:.05em}
+.arow .st{display:inline-flex;align-items:center;gap:6px;font:600 12px var(--sans);white-space:nowrap}
+.arow .st.serve{color:var(--accent)}
+.arow .st.serve::before{content:"";width:7px;height:7px;border-radius:50%;background:var(--accent);flex:none}
+.arow .st.reauth{color:var(--err)}
+.adetail{display:none;padding:0 0 16px 21px}
+.adetail.show{display:block}
+.adetail .uwin{margin-top:12px}
+.adetail .kv{margin-top:14px;grid-template-columns:96px 1fr;gap:6px 14px;font-size:13px}
+.adetail .kv .k{font-size:12.5px}
+.adetail .age{margin-top:12px;font:400 12px var(--sans);color:var(--muted)}
+.adetail .age b{color:var(--text);font-weight:600;font-family:var(--mono)}
+.adetail .actions{margin-top:16px;display:flex;gap:8px;align-items:center;
+  padding-top:12px;border-top:1px solid color-mix(in srgb,var(--inset) 70%,transparent)}
+.adetail .actions .spacer{flex:1}
+.unavail{margin-top:12px;padding:11px 13px;border-radius:6px;background:var(--err-soft);color:var(--err);font:600 13px var(--sans)}
+.unavail .hint{display:block;margin-top:3px;font:400 12px var(--sans);color:var(--muted)}
+button.ghost{font:600 13px var(--sans);border:1.5px solid var(--line);background:var(--panel);color:var(--text);border-radius:6px;padding:7px 14px;cursor:pointer}
+button.ghost:hover{background:var(--inset)}
+button.ghost.danger{border-color:color-mix(in srgb,var(--err) 55%,transparent);color:var(--err)}
+button.ghost.danger:hover{background:var(--err-soft)}
+button.ghost:disabled{opacity:.5;cursor:default}
+button.ghost:disabled:hover{background:var(--panel)}
+button.primary{font:600 13px var(--sans);border:0;background:var(--accent);color:#fff;border-radius:6px;padding:8px 15px;cursor:pointer}
+button.primary:hover{background:color-mix(in srgb,var(--accent) 88%,var(--text))}
+button.primary:disabled{opacity:.5;cursor:default}
+/* Accounts screens color the % readout to match its bar's state. */
+.upct.warn{color:var(--warn)} .upct.err{color:var(--err)}
+/* Serving-selection env lock: same banner pattern as the compaction card. */
+.acctlock{display:none;margin-top:14px;border:1px solid var(--err);border-radius:8px;color:var(--err);padding:10px 14px;font-size:14px}
+#scard-accounts.locked .acctlock{display:block}
+/* Login modal (계정 추가): wider than the confirm dialog, code input always
+   visible, no backdrop/Escape close — a silent close would leak a live
+   CLI login child. */
+.modal.wide{width:min(560px,100%)}
+.modal .lgurl{margin-top:12px;display:flex;align-items:center;gap:10px;background:var(--inset);border-radius:6px;padding:8px 12px;font:400 13px var(--mono)}
+.modal .lgurl .tx{flex:1;overflow-wrap:anywhere}
+.modal .lgopen{display:inline-block;margin-top:10px;font:600 13.5px var(--sans);color:var(--accent)}
+.modal .lgrow{margin-top:14px;display:flex;gap:8px}
+.modal .lgrow input{flex:1;min-width:0;font:600 13.5px var(--mono);background:var(--inset);
+  border:1.5px solid transparent;border-radius:6px;padding:8px 10px;color:var(--text)}
+.modal .lgrow input:focus{outline:none;border-color:var(--accent)}
+.modal .lghint{margin-top:12px;font:400 12.5px var(--sans);color:var(--muted)}
+.modal .lghint b{color:var(--text);font-weight:600;font-family:var(--mono)}
 </style>
 </head>
 <body data-tab="settings">
@@ -301,12 +385,13 @@ body.env-locked .applybar{display:none!important}
   </nav>
 
   <main>
-    <section id="tab-settings">
+    <section id="tab-settings" data-cat="general">
       <div class="layout">
         <nav class="rail" aria-label="설정 종류">
           <a class="rail-item on" href="#settings/general">General</a>
+          <a class="rail-item" href="#settings/accounts">Claude 계정</a>
         </nav>
-        <div class="card">
+        <div class="card scard" id="scard-general">
           <!-- compaction-section:start -->
           <div class="srow" id="compaction-card">
             <div>
@@ -333,6 +418,26 @@ body.env-locked .applybar{display:none!important}
             </div>
           </div>
           <!-- compaction-section:end -->
+        </div>
+        <div class="card scard" id="scard-accounts">
+          <div class="acct-head">
+            <div>
+              <h2>Claude 계정</h2>
+              <div class="sub">게이트웨이가 서빙에 쓰는 등록 계정과 이 머신의 로컬 Claude Code 로그인입니다.</div>
+            </div>
+          </div>
+          <div class="acctlock" id="acct-lockband"><b>LOCKED</b> — <code id="acct-lock-env"></code> 환경변수가 우선합니다. 서빙 계정 선택은 열람 전용입니다.</div>
+          <div class="lhero" id="local-sec">
+            <div class="ribbon">로컬 CLI 로그인
+              <button type="button" class="urefresh" id="btn-local-refresh">갱신</button>
+            </div>
+            <div id="local-body"></div>
+          </div>
+          <div class="tbl-cap">
+            <span class="t">등록 계정</span><span class="n" id="acct-count"></span>
+            <button type="button" class="add" id="btn-add-account">계정 추가</button>
+          </div>
+          <div id="acct-list"></div>
         </div>
       </div>
     </section>
@@ -461,6 +566,15 @@ body.env-locked .applybar{display:none!important}
       <button class="cancel" id="reset-cancel">취소</button>
       <button class="go" id="reset-confirm">사용</button>
     </div>
+  </div>
+</div>
+
+<div class="modalwrap" id="login-modal">
+  <div class="modal wide" role="dialog" aria-modal="true" aria-labelledby="login-modal-title">
+    <h3 id="login-modal-title">Claude 계정 추가</h3>
+    <div id="login-modal-body"></div>
+    <div class="lghint" id="login-reconnect"></div>
+    <div class="modal-actions" id="login-modal-actions"></div>
   </div>
 </div>
 
@@ -1218,13 +1332,398 @@ document.getElementById("comp-custom-input").addEventListener("input",function()
   COMP.draftCustom=this.value;
 });
 document.getElementById("comp-apply").addEventListener("click",applyCompaction);
-/* The Settings rail has a single category today; clicking it only pins the
-   deep-linkable hash (no pane switching until a second category exists). */
+/* The Settings rail switches the visible category card (.scard) and pins a
+   deep-linkable #settings/<cat> hash; entering the accounts category fetches
+   its data. */
+var SETTINGS_CATS=["general","accounts"];
+function setSettingsCat(cat){
+  if(SETTINGS_CATS.indexOf(cat)<0)cat="general";
+  var section=document.getElementById("tab-settings");
+  var changed=section.dataset.cat!==cat;
+  section.dataset.cat=cat;
+  document.querySelectorAll("#tab-settings .rail-item").forEach(function(a){
+    a.classList.toggle("on",a.getAttribute("href")==="#settings/"+cat);
+  });
+  if(document.body.dataset.tab==="settings"&&location.hash!=="#settings/"+cat)
+    history.replaceState(null,"","#settings/"+cat);
+  if(changed&&cat==="accounts")fetchAccounts();
+}
 document.querySelectorAll("#tab-settings .rail-item").forEach(function(a){
   a.addEventListener("click",function(ev){
     ev.preventDefault();
-    history.replaceState(null,"","#settings/general");
+    setSettingsCat((this.getAttribute("href")||"").split("/")[1]);
   });
+});
+/* --- Claude accounts (Settings > Claude 계정) -----------------------------
+   Mirrors _design-probes/_accounts-final.html. The registry GET paints the
+   rows immediately; per-account usage and the local hero's usage fill in
+   async. Rows expand independently — opening one never closes another — and
+   the open set survives re-renders. No interval polling: fetch on entry,
+   the hero's 갱신 button, and after a login succeeds. */
+var ACCT_ENV="CLAUDEX_CLAUDE_ACCOUNT_ID";
+var ACCT={rows:[],serving:null,local:null,locked:false,usage:{},open:{},localUsage:null};
+function attr(s){return esc(s).replace(/"/g,"&quot;")}
+function planLabel(planType){
+  // claude_max -> MAX, claude_pro -> PRO; an absent plan renders as a dash.
+  return planType?String(planType).replace(/^claude_/,"").toUpperCase():"—";
+}
+function fmtAcctDate(epochMs){
+  if(typeof epochMs!=="number")return"—";
+  var d=new Date(epochMs);
+  function pad(n){return(n<10?"0":"")+n}
+  return d.getFullYear()+"-"+pad(d.getMonth()+1)+"-"+pad(d.getDate());
+}
+function fmtAgo(epochSec){
+  if(!epochSec)return"—";
+  var m=Math.max(0,Math.round((Date.now()/1000-epochSec)/60));
+  return m<1?"방금":m<60?m+"분 전":Math.floor(m/60)+"시간 "+(m%60)+"분 전";
+}
+var ACCT_USAGE_SKELETON='<div class="uwin" aria-hidden="true"><div class="uwin-h"><span class="sk">세션 윈도우</span></div>'+
+  '<div class="ubar"></div><div class="ureset"><span class="sk">0요일 00:00 리셋 (0시간 0분 후)</span></div></div>';
+function usageWindowsHtml(u){
+  return(u.session?usageWindowHtml("세션 윈도우",u.session,true):"")+
+    (u.weekly?usageWindowHtml("주간 윈도우",u.weekly,true):"")+
+    (u.fable_weekly?usageWindowHtml("Fable 주간",u.fable_weekly,true):"")+
+    (u.monthly?usageWindowHtml("월간 윈도우",u.monthly,true):"");
+}
+function acctUsageHtml(row){
+  if(row.state!=="ready")
+    return'<div class="unavail">사용량을 불러올 수 없습니다.'+
+      '<span class="hint">토큰이 만료됐습니다. 다시 로그인하면 이 자리에서 갱신됩니다.</span></div>';
+  var u=ACCT.usage[row.id];
+  if(!u)return ACCT_USAGE_SKELETON+ACCT_USAGE_SKELETON;
+  if(u.status!=="ok")
+    return'<div class="unavail">사용량을 불러올 수 없습니다.'+
+      (u.error?'<span class="hint">'+esc(u.error)+"</span>":"")+"</div>";
+  var rows=usageWindowsHtml(u);
+  return(rows||'<div class="ureset">표시되는 윈도우가 없습니다</div>')+
+    '<div class="age">사용량 <b>'+esc(fmtAgo(u.updated_at))+'</b> 기준</div>';
+}
+function acctDetailHtml(row,serving){
+  var isLocalSame=!!(ACCT.local&&ACCT.local.accountUuid&&ACCT.local.accountUuid===row.id);
+  var kv='<div class="kv">'+
+    (row.planType?'<span class="k">플랜</span><span class="v">'+esc(planLabel(row.planType))+'</span>':"")+
+    '<span class="k">조직</span>'+(row.organizationName
+      ?'<span class="v">'+esc(row.organizationName)+'</span>'
+      :'<span class="v" style="color:var(--muted);font-style:italic">없음</span>')+
+    '<span class="k">추가</span><span class="v">'+fmtAcctDate(row.createdAt)+'</span>'+
+    '<span class="k">마지막 인증</span><span class="v">'+fmtAcctDate(row.lastAuthenticatedAt)+'</span>'+
+    (isLocalSame?'<span class="k">로컬 CLI</span><span class="v"><span class="pill same">동일 계정</span></span>':"")+
+    "</div>";
+  var primary=row.state!=="ready"
+    ?'<button type="button" class="primary" data-act="relogin">다시 로그인</button>'
+    :serving
+      ?'<button type="button" class="ghost" data-act="unserve"'+(ACCT.locked?" disabled":"")+'>서빙 해제</button>'
+      :'<button type="button" class="primary" data-act="serve"'+(ACCT.locked?" disabled":"")+'>이 계정으로 서빙</button>';
+  // Removal stays a CLI-only operation; the button mirrors the probe but is
+  // inert with the command it defers to.
+  return'<div class="ad-grid"><div>'+acctUsageHtml(row)+'</div><div>'+kv+'</div>'+
+    '<div class="actions">'+primary+'<span class="spacer"></span>'+
+    '<button type="button" class="ghost danger" disabled title="대시보드 제거는 지원하지 않습니다 — CLI: claudex-gateway account remove '+attr(row.id)+'">제거</button></div></div>';
+}
+function acctRowHtml(row){
+  var serving=row.id===ACCT.serving;
+  var open=!!ACCT.open[row.id];
+  var st=serving?'<span class="st serve">서빙 중</span>'
+    :row.state!=="ready"?'<span class="st reauth">⚠ 재로그인 필요</span>':"";
+  return'<div class="arow'+(open?" open":"")+'" data-id="'+attr(row.id)+'" tabindex="0" role="button" aria-expanded="'+(open?"true":"false")+'">'+
+    '<span class="chev" aria-hidden="true">▶</span>'+
+    '<span class="em">'+esc(row.email)+'</span>'+st+
+    '<span class="spacer"></span>'+
+    '<span class="plan-txt">'+esc(planLabel(row.planType))+'</span></div>'+
+    '<div class="adetail'+(open?" show":"")+'" data-for="'+attr(row.id)+'">'+acctDetailHtml(row,serving)+'</div>';
+}
+function renderAcctList(){
+  document.getElementById("acct-count").textContent=String(ACCT.rows.length);
+  document.getElementById("acct-lock-env").textContent=ACCT_ENV;
+  document.getElementById("scard-accounts").classList.toggle("locked",ACCT.locked);
+  var list=document.getElementById("acct-list");
+  if(!ACCT.rows.length){
+    list.innerHTML='<div class="ureset" style="padding:12px 0">등록된 계정이 없습니다. 계정 추가로 브라우저 로그인을 시작하세요.</div>';
+    return;
+  }
+  list.innerHTML=ACCT.rows.map(acctRowHtml).join("");
+}
+function renderLocalHero(){
+  var box=document.getElementById("local-body");
+  var local=ACCT.local;
+  if(!local){
+    box.innerHTML='<div class="org">로컬 Claude Code 로그인이 없습니다 · 게이트웨이 서빙과 무관</div>';
+    return;
+  }
+  var u=ACCT.localUsage,usage;
+  if(!u)usage=ACCT_USAGE_SKELETON+ACCT_USAGE_SKELETON;
+  else if(u.status!=="ok")
+    usage='<div class="unavail">사용량을 불러올 수 없습니다.'+
+      (u.error?'<span class="hint">'+esc(u.error)+"</span>":"")+"</div>";
+  else usage=usageWindowsHtml(u);
+  box.innerHTML='<div class="who"><span class="em">'+esc(local.email)+'</span>'+
+    '<span class="plan-lg">'+esc(planLabel(local.planType))+'</span></div>'+
+    '<div class="org">'+(local.organizationName?esc(local.organizationName)+" · ":"")+
+    "게이트웨이 서빙과 무관"+(u&&u.status==="ok"?' · <b>'+esc(fmtAgo(u.updated_at))+'</b> 기준':"")+"</div>"+usage;
+}
+function fetchLocalHeroUsage(){
+  return jfetch("/admin/usage?provider=claude").then(function(r){
+    ACCT.localUsage=r.ok&&r.body.claude?r.body.claude
+      :{status:"error",error:errDetail(r.body),updated_at:Date.now()/1000};
+    renderLocalHero();
+  }).catch(function(){
+    ACCT.localUsage={status:"error",error:"gateway unreachable",updated_at:Date.now()/1000};
+    renderLocalHero();
+  });
+}
+function fetchAccountUsage(){
+  if(!ACCT.rows.length)return;
+  var settle=function(message){
+    ACCT.rows.forEach(function(row){
+      if(row.state==="ready"&&!ACCT.usage[row.id])
+        ACCT.usage[row.id]={status:"error",error:message,updated_at:Date.now()/1000};
+    });
+    renderAcctList();
+  };
+  jfetch("/admin/claude-accounts/usage").then(function(r){
+    if(!r.ok){settle(errDetail(r.body));return}
+    ACCT.usage=r.body.accounts||{};
+    renderAcctList();
+  }).catch(function(){settle("gateway unreachable")});
+}
+function fetchAccounts(){
+  Promise.all([jfetch("/admin/claude-accounts"),jfetch("/admin/claude-account")]).then(function(rs){
+    var listResp=rs[0],servingResp=rs[1];
+    if(!listResp.ok){
+      showToast('<span class="chip chip-err">ERROR</span><span class="lat">'+listResp.status+
+        '</span><br>GET /admin/claude-accounts<br><span class="dim">'+esc(errDetail(listResp.body))+"</span>",true);
+      return;
+    }
+    ACCT.rows=listResp.body.accounts||[];
+    ACCT.local=listResp.body.local||null;
+    ACCT.serving=listResp.body.serving_account_id||null;
+    if(servingResp.ok)ACCT.locked=!!servingResp.body.env_locked;
+    renderAcctList();
+    renderLocalHero();
+    fetchAccountUsage();
+    fetchLocalHeroUsage();
+  }).catch(function(){
+    showToast('<span class="chip chip-err">ERROR</span><br>GET /admin/claude-accounts'+
+      '<br><span class="dim">gateway unreachable</span>',true);
+  });
+}
+function setServingAccount(accountId){
+  jfetch("/admin/claude-account",{
+    method:"PUT",
+    headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({account_id:accountId})
+  }).then(function(r){
+    if(r.status===409){
+      ACCT.locked=true;
+      renderAcctList();
+      showToast('<span class="chip chip-err">LOCKED</span><span class="lat">409</span><br>'+ACCT_ENV+
+        '<br><span class="dim">'+esc(errDetail(r.body))+"</span>",true);
+      return;
+    }
+    if(!r.ok){
+      showToast('<span class="chip chip-err">ERROR</span><span class="lat">'+r.status+"</span><br>서빙 계정 변경"+
+        '<br><span class="dim">'+esc(errDetail(r.body))+"</span>",true);
+      return;
+    }
+    ACCT.serving=r.body.account_id||null;
+    renderAcctList();
+    var servingRow=ACCT.rows.find(function(row){return row.id===ACCT.serving});
+    showToast('<span class="chip chip-ok">APPLIED</span><br>서빙 계정 → '+
+      (servingRow?esc(servingRow.email):"해제"),false);
+  }).catch(function(){
+    showToast('<span class="chip chip-err">ERROR</span><br>서빙 계정 변경<br><span class="dim">gateway unreachable</span>',true);
+  });
+}
+document.getElementById("acct-list").addEventListener("click",function(e){
+  var btn=e.target.closest("button");
+  if(btn){
+    var det=btn.closest(".adetail");
+    if(!det)return;
+    var id=det.getAttribute("data-for");
+    if(btn.dataset.act==="serve")setServingAccount(id);
+    else if(btn.dataset.act==="unserve")setServingAccount(null);
+    else if(btn.dataset.act==="relogin")openLoginModal();
+    return;
+  }
+  var row=e.target.closest(".arow");
+  if(!row)return;
+  // Each row's expansion is independent state — opening one never closes another.
+  var id=row.getAttribute("data-id");
+  ACCT.open[id]=!ACCT.open[id];
+  row.classList.toggle("open",!!ACCT.open[id]);
+  row.setAttribute("aria-expanded",ACCT.open[id]?"true":"false");
+  var det=this.querySelector('.adetail[data-for="'+CSS.escape(id)+'"]');
+  if(det)det.classList.toggle("show",!!ACCT.open[id]);
+});
+document.getElementById("acct-list").addEventListener("keydown",function(e){
+  if(e.key!=="Enter"&&e.key!==" ")return;
+  var row=e.target.closest(".arow");
+  if(!row)return;
+  e.preventDefault();row.click();
+});
+document.getElementById("btn-add-account").addEventListener("click",function(){openLoginModal()});
+document.getElementById("btn-local-refresh").addEventListener("click",function(){
+  var btn=this;
+  if(btn.disabled)return;
+  btn.disabled=true;btn.textContent="…";
+  ACCT.localUsage=null;renderLocalHero();
+  fetchLocalHeroUsage().finally(function(){btn.disabled=false;btn.textContent="갱신"});
+});
+/* --- dashboard login (browser OAuth through the gateway's claude CLI) -----
+   POST starts the session (or attaches to a running one on 409 login-active);
+   a 1s poll drives the modal. The body re-renders only when the session
+   status materially changes — an unconditional re-render would wipe the code
+   input every second; the countdown ticks via textContent. */
+var LOGIN={timer:null,lastKey:null,failures:0};
+function loginStateKey(st){
+  return[st.status,st.url||"",st.email||"",st.error||"",st.detail||"",st.code_prompt_detected?"1":"0"].join("|");
+}
+function stopLoginPolling(){
+  if(LOGIN.timer){clearInterval(LOGIN.timer);LOGIN.timer=null}
+}
+function closeLoginModal(){
+  stopLoginPolling();
+  document.getElementById("login-modal").classList.remove("open");
+}
+function openLoginModal(){
+  jfetch("/admin/claude-accounts/login",{
+    method:"POST",headers:{"Content-Type":"application/json"},body:"{}"
+  }).then(function(r){
+    var code=r.body&&r.body.error&&r.body.error.code;
+    // login-active: another dashboard tab (or this one) already runs a
+    // session — attach to it instead of erroring.
+    if(!r.ok&&!(r.status===409&&code==="login-active")){
+      showToast('<span class="chip chip-err">'+(r.status===409?"LOCKED":"ERROR")+'</span><span class="lat">'+r.status+
+        '</span><br>계정 추가<br><span class="dim">'+esc(errDetail(r.body))+"</span>",true);
+      return;
+    }
+    LOGIN.lastKey=null;LOGIN.failures=0;
+    document.getElementById("login-reconnect").textContent="";
+    document.getElementById("login-modal").classList.add("open");
+    renderLoginModal({status:"starting"});
+    stopLoginPolling();
+    LOGIN.timer=setInterval(pollLogin,1000);
+    pollLogin();
+  }).catch(function(){
+    showToast('<span class="chip chip-err">ERROR</span><br>계정 추가<br><span class="dim">gateway unreachable</span>',true);
+  });
+}
+function pollLogin(){
+  jfetch("/admin/claude-accounts/login").then(function(r){
+    if(!r.ok){loginPollFailed();return}
+    LOGIN.failures=0;
+    document.getElementById("login-reconnect").textContent="";
+    var st=r.body||{};
+    if(st.status==="succeeded"){
+      closeLoginModal();
+      showToast('<span class="chip chip-ok">ADDED</span><br>'+
+        esc((st.account&&st.account.email)||"계정")+" 등록됨",false);
+      fetchAccounts();
+      return;
+    }
+    if(st.status==="cancelled"||st.status==="idle"){closeLoginModal();return}
+    renderLoginModal(st);
+    if(st.status==="failed")stopLoginPolling();
+    updateLoginCountdown(st);
+  }).catch(loginPollFailed);
+}
+function loginPollFailed(){
+  LOGIN.failures++;
+  if(LOGIN.failures>=5)
+    document.getElementById("login-reconnect").textContent="게이트웨이 연결을 다시 시도하는 중…";
+}
+function renderLoginModal(st){
+  var key=loginStateKey(st);
+  if(key===LOGIN.lastKey)return;
+  LOGIN.lastKey=key;
+  var body=document.getElementById("login-modal-body");
+  var actions=document.getElementById("login-modal-actions");
+  var codeInput=document.getElementById("login-code-input");
+  var codeValue=codeInput?codeInput.value:"";
+  var cancelBtn='<button class="cancel" data-lact="cancel">취소</button>';
+  if(st.status==="awaiting-browser"){
+    var safeUrl=/^https:\/\//.test(st.url||"")?st.url:null;
+    body.innerHTML='<p>브라우저에서 Anthropic 로그인을 완료하세요. 로그인이 끝나면 이 창이 자동으로 진행됩니다.</p>'+
+      (safeUrl
+        ?'<div class="lgurl"><span class="tx">'+esc(safeUrl)+'</span><button class="cp" id="login-url-copy" title="복사"></button></div>'+
+          '<a class="lgopen" href="'+attr(safeUrl)+'" target="_blank" rel="noopener">브라우저에서 열기 ↗</a>'
+        :'<p><span class="sk">로그인 URL을 기다리는 중…</span></p>')+
+      '<div class="lgrow"><input id="login-code-input" spellcheck="false" placeholder="브라우저가 표시한 코드 붙여넣기">'+
+      '<button type="button" class="primary" data-lact="code">제출</button></div>'+
+      '<div class="lghint">브라우저가 자동으로 돌아오지 않으면 표시된 코드를 붙여넣으세요. <span id="login-countdown"></span></div>';
+    if(safeUrl)wireCopy(document.getElementById("login-url-copy"),safeUrl);
+    document.getElementById("login-code-input").value=codeValue;
+    actions.innerHTML=cancelBtn;
+  }else if(st.status==="completing"){
+    body.innerHTML='<p><span class="sk">로그인을 완료하는 중…</span></p>';
+    actions.innerHTML=cancelBtn;
+  }else if(st.status==="awaiting-confirm-replace"){
+    // Exactly two buttons, mirroring the CLI's [y/N] replace prompt.
+    body.innerHTML='<p><b>'+esc(st.email||"")+'</b> 계정이 이미 등록되어 있습니다.</p>'+
+      '<p class="warn">교체하면 기존 자격증명을 이번 로그인으로 덮어씁니다.</p>';
+    actions.innerHTML='<button class="cancel" data-lact="decline">교체 안 함</button>'+
+      '<button class="go" data-lact="replace">교체</button>';
+  }else if(st.status==="failed"){
+    body.innerHTML='<div class="unavail">로그인에 실패했습니다.'+
+      (st.error?'<span class="hint">'+esc(st.error)+"</span>":"")+"</div>";
+    actions.innerHTML='<button class="cancel" data-lact="close">닫기</button>';
+  }else{
+    // starting (server) or the optimistic local cancelling state.
+    body.innerHTML='<p><span class="sk">'+
+      (st.status==="cancelling"?"취소하는 중…":"로그인 세션을 시작하는 중…")+"</span></p>";
+    actions.innerHTML=st.status==="cancelling"?"":cancelBtn;
+  }
+}
+function updateLoginCountdown(st){
+  var el=document.getElementById("login-countdown");
+  if(!el)return;
+  if(!st.expires_at){el.textContent="";return}
+  var s=Math.max(0,Math.round(st.expires_at-Date.now()/1000));
+  el.textContent="남은 시간 "+Math.floor(s/60)+"분 "+(s%60)+"초";
+}
+function submitLoginCode(){
+  var input=document.getElementById("login-code-input");
+  if(!input)return;
+  var code=input.value.trim();
+  if(!code)return;
+  jfetch("/admin/claude-accounts/login/code",{
+    method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({code:code})
+  }).then(function(r){
+    if(!r.ok)
+      showToast('<span class="chip chip-err">ERROR</span><span class="lat">'+r.status+
+        '</span><br>코드 제출<br><span class="dim">'+esc(errDetail(r.body))+"</span>",true);
+  }).catch(function(){
+    showToast('<span class="chip chip-err">ERROR</span><br>코드 제출<br><span class="dim">gateway unreachable</span>',true);
+  });
+}
+document.getElementById("login-modal").addEventListener("click",function(e){
+  var btn=e.target.closest("button");
+  if(!btn||!btn.dataset.lact)return;
+  var act=btn.dataset.lact;
+  if(act==="close"){closeLoginModal();return}
+  if(act==="code"){submitLoginCode();return}
+  if(act==="cancel"){
+    // Explicit cancel only: backdrop/Escape never close a live login.
+    jfetch("/admin/claude-accounts/login",{method:"DELETE"}).then(function(){
+      renderLoginModal({status:"cancelling"});
+    }).catch(function(){});
+    return;
+  }
+  if(act==="replace"||act==="decline"){
+    jfetch("/admin/claude-accounts/login/confirm",{
+      method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({replace:act==="replace"})
+    }).then(function(r){
+      if(!r.ok)
+        showToast('<span class="chip chip-err">ERROR</span><span class="lat">'+r.status+
+          '</span><br>교체 확인<br><span class="dim">'+esc(errDetail(r.body))+"</span>",true);
+    }).catch(function(){});
+  }
+});
+document.getElementById("login-modal").addEventListener("keydown",function(e){
+  if(e.key==="Enter"&&e.target.id==="login-code-input"){e.preventDefault();submitLoginCode()}
 });
 function apply(){
   if(DIR.locked)return;
@@ -1322,7 +1821,12 @@ var mapNeedsFit=true;
 function setTab(t){
   document.body.dataset.tab=t;
   document.querySelectorAll("nav.tabs a").forEach(function(a){a.classList.toggle("on",a.dataset.t===t)});
-  if(location.hash!=="#"+t)history.replaceState(null,"","#"+t);
+  if(t==="settings"){
+    // Settings keeps its category in the hash so the deep link round-trips.
+    var cat=document.getElementById("tab-settings").dataset.cat||"general";
+    if(location.hash!=="#settings/"+cat)history.replaceState(null,"","#settings/"+cat);
+    if(cat==="accounts")fetchAccounts();
+  }else if(location.hash!=="#"+t){history.replaceState(null,"","#"+t)}
   if(t==="map"){drawWires();if(mapNeedsFit){mapNeedsFit=false;fitView()}}
   if(t==="status")fetchUsage();
   if(t==="log")fetchLogs();
@@ -1345,10 +1849,12 @@ function fmtReset(epochSec){
     :diffMin+"분 후";
   return abs+" 리셋 ("+rel+")";
 }
-function usageWindowHtml(label,win){
+/* colorPct (accounts screens only) mirrors the bar's state color onto the
+   % readout; the Status cards keep their original neutral readout. */
+function usageWindowHtml(label,win,colorPct){
   var pct=Math.round(win.used_percent*10)/10;
   var cls=pct>=90?"err":pct>=70?"warn":"";
-  return'<div class="uwin"><div class="uwin-h"><span>'+esc(label)+'</span><span class="upct">'+fmtPct(pct)+'</span></div>'+
+  return'<div class="uwin"><div class="uwin-h"><span>'+esc(label)+'</span><span class="upct'+(colorPct&&cls?" "+cls:"")+'">'+fmtPct(pct)+'</span></div>'+
     '<div class="ubar"><i class="'+cls+'" style="width:'+Math.min(100,Math.max(0,pct))+'%"></i></div>'+
     '<div class="ureset">'+fmtReset(win.resets_at)+'</div></div>';
 }
@@ -1521,10 +2027,11 @@ document.querySelectorAll("nav.tabs a").forEach(function(a){
   a.addEventListener("click",function(ev){ev.preventDefault();setTab(this.dataset.t)});
 });
 window.addEventListener("hashchange",function(){
-  // "#settings/general" style deep links carry a category segment; the tab
+  // "#settings/accounts" style deep links carry a category segment; the tab
   // name is always the first segment.
-  var h=location.hash.slice(1).split("/")[0];
-  if(TAB_NAMES.indexOf(h)>=0)setTab(h);
+  var parts=location.hash.slice(1).split("/");
+  if(TAB_NAMES.indexOf(parts[0])>=0)setTab(parts[0]);
+  if(parts[0]==="settings")setSettingsCat(parts[1]||"general");
 });
 function boot(){
   document.getElementById("ep").textContent=location.host;
@@ -1576,8 +2083,10 @@ function boot(){
       renderProviderCards(health.body);
     }
     renderChrome();
-    var bootTab=location.hash.slice(1).split("/")[0];
-    setTab(TAB_NAMES.indexOf(bootTab)>=0?bootTab:"settings");
+    var bootParts=location.hash.slice(1).split("/");
+    var bootTab=TAB_NAMES.indexOf(bootParts[0])>=0?bootParts[0]:"settings";
+    setTab(bootTab);
+    if(bootTab==="settings"&&bootParts[1])setSettingsCat(bootParts[1]);
     render();
     if(document.body.dataset.tab==="map"){mapNeedsFit=false;fitView()}
   });
