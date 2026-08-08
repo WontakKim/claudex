@@ -287,13 +287,56 @@ Caveats to accept consciously:
   subscription, and Anthropic's response rate-limit headers (and the CLI's
   usage display) reflect the serving account.
 - If the selected account is removed or its refresh token becomes invalid,
-  passthrough fails with a clear gateway 503 — there is no silent fallback
-  to client credentials. Re-add the account or run `account use off`.
+  the pool serves from the remaining ready accounts (see the next section);
+  only when nothing usable remains does passthrough fail with a clear
+  gateway 503 — there is never a silent fallback to client credentials.
+  Re-add the account or run `account use off`.
 - The [compaction reroute](#compaction-reroute) still uses the credentials
   the client itself sent: with a credential-less client it records
   `skipped_no_credentials` and falls back to the mapped model as usual.
 - Subscription OAuth tokens are licensed for the holder's own Claude Code
   use; serving other clients with them is a gray zone.
+
+### Ordered fallback across registered accounts
+
+With more than one registered account, the selection above becomes the head
+of a fallback chain instead of a hard single choice: every **ready** account
+is a pool member, ordered serving-account-first and then by registration
+time. When the account being served with answers `429`, the gateway puts it
+on an in-memory cooldown, transparently retries the same request with the
+next account in the chain, and fails back automatically once the cooldown
+expires — the client never has to handle the rate limit itself as long as
+any account has quota left.
+
+How long a rate-limited account sits out is taken from the best signal the
+429 offers: a `Retry-After` header or a reset timestamp when present,
+otherwise the account's cached usage window resets (as shown in the
+dashboard), otherwise a 60-second default — in practice Anthropic's OAuth
+quota rejections carry no machine-readable reset, so the cached usage data
+is what turns a blind minute into an accurate multi-hour cooldown. The
+cooldown state is visible as `coolingDownUntil` (epoch ms) in
+`GET /admin/claude-accounts` rows and lives in daemon memory only: a restart
+clears it, at worst costing one extra upstream probe.
+
+Boundaries to know:
+
+- Only `429` triggers failover. Auth failures durably mark the account
+  `needs-reauth` (excluded from the chain until a re-login); other upstream
+  errors and network failures are relayed as before — retrying a different
+  account would not help them.
+- When every account is rate-limited, the client sees a real `429`: the last
+  upstream rejection while probing, or a synthesized one with `Retry-After`
+  once everything is already cooling (upstream is then not contacted at all).
+- Failover only happens before any response byte is relayed; a stream that
+  dies midway is reported in-band, as before.
+- Rate limits are per account **per model tier** upstream, but the pool's
+  cooldown is per account: a Fable-scoped weekly limit cools the whole
+  account even for requests other models could still serve. Per-model
+  eligibility is a known follow-up.
+- The CLI's own usage display remains unreliable under pooling: its usage
+  query authenticates with the placeholder token and fails, and response
+  rate-limit headers reflect whichever account served. Use the dashboard's
+  per-account usage view instead.
 
 ### Compact command
 
