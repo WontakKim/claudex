@@ -24,11 +24,17 @@ import os
 import sys
 import time
 from datetime import datetime
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any
 
 import httpx
 
+from claudex_gateway.claude_auth import (
+    ClaudeAccountAuthError,
+    ClaudeAccountAuthManager,
+    ClaudeAccountReauthRequiredError,
+)
 from claudex_gateway.codex_auth import CodexAuthManager, CodexCredentials
 from claudex_gateway.kimi_auth import KimiAuthManager
 from claudex_gateway.grok_auth import GrokAuthManager, GrokCredentials
@@ -238,6 +244,35 @@ async def fetch_claude_usage(http_client: httpx.AsyncClient) -> dict[str, Any]:
             status="unavailable",
             error="no Claude Code OAuth credentials found; sign in with `claude` first",
         )
+    result, _retry_after, _status_code = await _fetch_claude_usage_with_token(http_client, token)
+    return result
+
+
+def _retry_after_seconds(response: httpx.Response) -> float | None:
+    """Parse a Retry-After header (delta seconds or HTTP-date) into seconds."""
+    raw = response.headers.get("Retry-After", "").strip()
+    if not raw:
+        return None
+    try:
+        seconds = float(raw)
+    except ValueError:
+        try:
+            seconds = parsedate_to_datetime(raw).timestamp() - time.time()
+        except (TypeError, ValueError):
+            return None
+    return max(0.0, seconds)
+
+
+async def _fetch_claude_usage_with_token(
+    http_client: httpx.AsyncClient, token: str
+) -> tuple[dict[str, Any], float | None, int | None]:
+    """One usage-API GET with `token`.
+
+    Returns `(result, retry_after_seconds, status_code)`: retry_after is only
+    populated from a 429's Retry-After header, and status_code is None when
+    the request never reached the API. Callers that don't care (the ambient
+    probe) discard the extra elements.
+    """
     try:
         response = await http_client.get(
             _CLAUDE_USAGE_URL,
@@ -250,45 +285,112 @@ async def fetch_claude_usage(http_client: httpx.AsyncClient) -> dict[str, Any]:
         )
     except httpx.HTTPError as exc:
         logger.warning("claude usage fetch failed: %s", exc)
-        return _provider_result(
-            "claude", status="error", error=f"failed to reach the Anthropic usage API: {exc}"
+        return (
+            _provider_result(
+                "claude", status="error", error=f"failed to reach the Anthropic usage API: {exc}"
+            ),
+            None,
+            None,
         )
-    if response.status_code == 401:
-        return _provider_result(
-            "claude",
-            status="error",
-            error="Claude OAuth token rejected (401); sign in again with `claude`",
+    status_code = response.status_code
+    if status_code == 401:
+        return (
+            _provider_result(
+                "claude",
+                status="error",
+                error="Claude OAuth token rejected (401); sign in again with `claude`",
+            ),
+            None,
+            status_code,
         )
-    if response.status_code == 429:
-        return _provider_result(
-            "claude",
-            status="error",
-            error="usage API rate-limited (429); try again shortly",
+    if status_code == 429:
+        return (
+            _provider_result(
+                "claude",
+                status="error",
+                error="usage API rate-limited (429); try again shortly",
+            ),
+            _retry_after_seconds(response),
+            status_code,
         )
-    if response.status_code != 200:
-        return _provider_result(
-            "claude",
-            status="error",
-            error=f"usage API returned {response.status_code}: {response.text[:200]}",
+    if status_code != 200:
+        return (
+            _provider_result(
+                "claude",
+                status="error",
+                error=f"usage API returned {status_code}: {response.text[:200]}",
+            ),
+            None,
+            status_code,
         )
     try:
         data = response.json()
     except json.JSONDecodeError:
-        return _provider_result(
-            "claude", status="error", error="usage API returned a non-JSON body"
+        return (
+            _provider_result("claude", status="error", error="usage API returned a non-JSON body"),
+            None,
+            status_code,
         )
     if not isinstance(data, dict):
-        return _provider_result(
-            "claude", status="error", error="usage API returned an unexpected payload"
+        return (
+            _provider_result(
+                "claude", status="error", error="usage API returned an unexpected payload"
+            ),
+            None,
+            status_code,
         )
-    return _provider_result(
-        "claude",
-        status="ok",
-        error=None,
-        session=_map_claude_window(data.get("five_hour"), _SESSION_WINDOW_MINUTES),
-        weekly=_map_claude_window(data.get("seven_day"), _WEEKLY_WINDOW_MINUTES),
-        fable_weekly=_map_fable_weekly_window(data),
+    return (
+        _provider_result(
+            "claude",
+            status="ok",
+            error=None,
+            session=_map_claude_window(data.get("five_hour"), _SESSION_WINDOW_MINUTES),
+            weekly=_map_claude_window(data.get("seven_day"), _WEEKLY_WINDOW_MINUTES),
+            fable_weekly=_map_fable_weekly_window(data),
+        ),
+        None,
+        status_code,
     )
+
+
+async def fetch_claude_account_usage(
+    http_client: httpx.AsyncClient, auth_manager: ClaudeAccountAuthManager
+) -> tuple[dict[str, Any], float | None]:
+    """Per-registered-account usage probe using the account's own bearer.
+
+    Documented deviation from this module's never-raise contract:
+    `ClaudeAccountReauthRequiredError` propagates so the caller can mark the
+    registry row needs-reauth. Every other failure returns a normal
+    `_provider_result` envelope. A 401 result gets one force-refresh retry,
+    mirroring the serving path.
+    """
+    try:
+        credentials = await auth_manager.get_credentials()
+    except ClaudeAccountReauthRequiredError:
+        raise
+    except ClaudeAccountAuthError as exc:
+        return (_provider_result("claude", status="unavailable", error=str(exc)), None)
+
+    result, retry_after, status_code = await _fetch_claude_usage_with_token(
+        http_client, credentials.access_token
+    )
+    if status_code == 401:
+        try:
+            credentials = await auth_manager.get_credentials(force_refresh=True)
+        except ClaudeAccountReauthRequiredError:
+            raise
+        except ClaudeAccountAuthError as exc:
+            return (_provider_result("claude", status="unavailable", error=str(exc)), None)
+        result, retry_after, status_code = await _fetch_claude_usage_with_token(
+            http_client, credentials.access_token
+        )
+        if status_code == 401:
+            result = _provider_result(
+                "claude",
+                status="error",
+                error="account token rejected (401) even after refresh",
+            )
+    return (result, retry_after)
 
 
 def _map_codex_window(raw: Any) -> dict[str, Any] | None:

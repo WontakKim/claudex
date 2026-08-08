@@ -12,6 +12,11 @@ import httpx
 import pytest
 
 from claudex_gateway import usage
+from claudex_gateway.claude_auth import (
+    ClaudeAccountAuthError,
+    ClaudeAccountCredentials,
+    ClaudeAccountReauthRequiredError,
+)
 from claudex_gateway.codex_auth import CodexAuthError, CodexCredentials
 from claudex_gateway.kimi_auth import KimiAuthError, KimiCredentials
 from claudex_gateway.grok_auth import GrokAuthError, GrokCredentials
@@ -223,6 +228,125 @@ def test_fetch_claude_usage_without_credentials_is_unavailable(
     result = _run(usage.fetch_claude_usage(_unused_client()))
     assert result["status"] == "unavailable"
     assert result["session"] is None
+
+
+# ---------------------------------------------------------------------------
+# Per-account Claude usage fetch
+# ---------------------------------------------------------------------------
+
+
+class _AccountCredentialsStub:
+    """Duck-typed ClaudeAccountAuthManager double handing out fixed tokens."""
+
+    def __init__(self, tokens: list[str]) -> None:
+        self._tokens = tokens
+        self.calls: list[bool] = []
+
+    async def get_credentials(self, force_refresh: bool = False) -> ClaudeAccountCredentials:
+        self.calls.append(force_refresh)
+        token = self._tokens[min(len(self.calls) - 1, len(self._tokens) - 1)]
+        return ClaudeAccountCredentials(access_token=token, account_uuid=None)
+
+
+class _FailingAccountCredentials:
+    def __init__(self, error: Exception) -> None:
+        self._error = error
+
+    async def get_credentials(self, force_refresh: bool = False) -> ClaudeAccountCredentials:
+        raise self._error
+
+
+def test_fetch_claude_account_usage_sends_the_account_bearer() -> None:
+    manager = _AccountCredentialsStub(["acct-tok"])
+    seen: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["authorization"] = request.headers.get("authorization")
+        seen["beta"] = request.headers.get("anthropic-beta")
+        seen["user_agent"] = request.headers.get("user-agent")
+        return httpx.Response(
+            200, json={"five_hour": {"utilization": 10, "resets_at": 1754500000}}
+        )
+
+    result, retry_after = _run(usage.fetch_claude_account_usage(_mock_client(handler), manager))
+
+    assert seen["authorization"] == "Bearer acct-tok"
+    assert seen["beta"] == "oauth-2025-04-20"
+    assert seen["user_agent"] == "claude-code/2.1.0"
+    assert result["status"] == "ok"
+    assert result["session"]["used_percent"] == 10.0
+    assert retry_after is None
+
+
+def test_fetch_claude_account_usage_429_returns_retry_after_seconds() -> None:
+    manager = _AccountCredentialsStub(["acct-tok"])
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(429, headers={"Retry-After": "30"})
+
+    result, retry_after = _run(usage.fetch_claude_account_usage(_mock_client(handler), manager))
+    assert result["status"] == "error"
+    assert "429" in result["error"]
+    assert retry_after == 30.0
+
+
+def test_fetch_claude_account_usage_429_parses_http_date_retry_after() -> None:
+    manager = _AccountCredentialsStub(["acct-tok"])
+    retry_at = datetime.now(timezone.utc).timestamp() + 120
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        http_date = datetime.fromtimestamp(retry_at, tz=timezone.utc).strftime(
+            "%a, %d %b %Y %H:%M:%S GMT"
+        )
+        return httpx.Response(429, headers={"Retry-After": http_date})
+
+    _result, retry_after = _run(usage.fetch_claude_account_usage(_mock_client(handler), manager))
+    assert retry_after is not None
+    assert 0 < retry_after <= 121
+
+
+def test_fetch_claude_account_usage_retries_once_with_a_forced_refresh() -> None:
+    manager = _AccountCredentialsStub(["stale-tok", "fresh-tok"])
+    tokens_seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        tokens_seen.append(request.headers.get("authorization", ""))
+        if len(tokens_seen) == 1:
+            return httpx.Response(401)
+        return httpx.Response(
+            200, json={"five_hour": {"utilization": 5, "resets_at": 1754500000}}
+        )
+
+    result, _retry_after = _run(usage.fetch_claude_account_usage(_mock_client(handler), manager))
+
+    assert tokens_seen == ["Bearer stale-tok", "Bearer fresh-tok"]
+    assert manager.calls == [False, True]
+    assert result["status"] == "ok"
+
+
+def test_fetch_claude_account_usage_persistent_401_is_an_error() -> None:
+    manager = _AccountCredentialsStub(["tok-1", "tok-2"])
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(401)
+
+    result, _retry_after = _run(usage.fetch_claude_account_usage(_mock_client(handler), manager))
+    assert result["status"] == "error"
+    assert "after refresh" in result["error"]
+
+
+def test_fetch_claude_account_usage_auth_error_is_unavailable() -> None:
+    manager = _FailingAccountCredentials(ClaudeAccountAuthError("no credentials file"))
+    result, retry_after = _run(usage.fetch_claude_account_usage(_unused_client(), manager))
+    assert result["status"] == "unavailable"
+    assert "no credentials file" in result["error"]
+    assert retry_after is None
+
+
+def test_fetch_claude_account_usage_reauth_required_propagates() -> None:
+    manager = _FailingAccountCredentials(ClaudeAccountReauthRequiredError("invalid_grant"))
+    with pytest.raises(ClaudeAccountReauthRequiredError):
+        _run(usage.fetch_claude_account_usage(_unused_client(), manager))
 
 
 # ---------------------------------------------------------------------------
