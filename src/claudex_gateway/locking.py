@@ -45,6 +45,71 @@ def file_lock(path: Path) -> Iterator[None]:
         os.close(fd)
 
 
+class FileLockHandle:
+    """An exclusively held file lock that outlives a `with` block.
+
+    `file_lock` scopes the hold to a context manager; a handle instead keeps
+    the lock across awaits and method calls (the daemon holds the capture
+    lock for a whole login session) until `release()` is called. The lock
+    lives on the open file description, so no thread affinity applies, and
+    the OS drops it if the process dies with the fd open.
+    """
+
+    def __init__(self, fd: int) -> None:
+        self._fd: int | None = fd
+
+    def release(self) -> None:
+        """Release the lock and close the fd. Safe to call more than once."""
+        if self._fd is None:
+            return
+        fd, self._fd = self._fd, None
+        try:
+            _release(fd)
+        finally:
+            os.close(fd)
+
+
+def try_file_lock(path: Path) -> FileLockHandle | None:
+    """Attempt a non-blocking exclusive lock on `path`.
+
+    Returns a `FileLockHandle` on success, or `None` when another process
+    (or another fd in this process) already holds the lock. Directory and
+    file creation follow `file_lock` exactly (0700 parent, 0600 lock file).
+    """
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        os.chmod(path, 0o600)
+        if not _try_acquire(fd):
+            os.close(fd)
+            return None
+    except BaseException:
+        os.close(fd)
+        raise
+    return FileLockHandle(fd)
+
+
+def _try_acquire(fd: int) -> bool:
+    """One non-blocking exclusive-lock attempt; False when contended."""
+    if sys.platform == "win32":
+        try:
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+            return True
+        except OSError as exc:
+            if exc.errno in (errno.EACCES, errno.EDEADLK):
+                return False
+            raise
+    else:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except OSError as exc:
+            if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                return False
+            raise
+
+
 def _acquire(fd: int) -> None:
     """Block until `fd` is exclusively locked, retrying transient failures."""
     if sys.platform == "win32":

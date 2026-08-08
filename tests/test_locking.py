@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from claudex_gateway.locking import file_lock
+from claudex_gateway.locking import file_lock, try_file_lock
 
 if sys.platform == "win32":
     import msvcrt
@@ -137,3 +137,52 @@ def test_parent_directory_is_created(tmp_path: Path) -> None:
 
     assert lock_dir.is_dir()
     assert lock_path.is_file()
+
+
+def test_try_file_lock_returns_none_while_another_process_holds(tmp_path: Path) -> None:
+    lock_path = tmp_path / "state" / "capture.lock"
+    holder = _spawn_lock_holder(lock_path, hold_seconds=1.0)
+    try:
+        assert try_file_lock(lock_path) is None
+    finally:
+        assert holder.wait(timeout=10) == 0
+
+    handle = try_file_lock(lock_path)
+    assert handle is not None
+    handle.release()
+
+
+def test_try_file_lock_handle_excludes_others_until_released(tmp_path: Path) -> None:
+    lock_path = tmp_path / "state" / "capture.lock"
+    handle = try_file_lock(lock_path)
+    assert handle is not None
+    try:
+        assert not _can_lock_without_blocking(lock_path)
+    finally:
+        handle.release()
+    assert _can_lock_without_blocking(lock_path)
+
+
+def test_try_file_lock_release_is_idempotent(tmp_path: Path) -> None:
+    lock_path = tmp_path / "state" / "capture.lock"
+    handle = try_file_lock(lock_path)
+    assert handle is not None
+    handle.release()
+    handle.release()
+    assert _can_lock_without_blocking(lock_path)
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="POSIX file mode bits are not meaningful on Windows"
+)
+def test_try_file_lock_creates_owner_only_file_and_parent(tmp_path: Path) -> None:
+    lock_dir = tmp_path / "nested" / "state"
+    lock_path = lock_dir / "capture.lock"
+    assert not lock_dir.exists()
+
+    handle = try_file_lock(lock_path)
+    assert handle is not None
+    handle.release()
+
+    assert lock_dir.is_dir()
+    assert stat.S_IMODE(lock_path.stat().st_mode) == 0o600
