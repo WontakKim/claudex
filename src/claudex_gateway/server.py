@@ -7,6 +7,7 @@ import contextlib
 import importlib.resources
 import json
 import logging
+import math
 import os
 import re
 import secrets
@@ -15,7 +16,7 @@ import traceback
 import uuid
 from collections import deque
 from collections.abc import AsyncGenerator, AsyncIterator
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -29,7 +30,14 @@ from starlette.routing import Route
 import claudex_gateway
 from claudex_gateway import paths
 from claudex_gateway.account_usage_cache import ClaudeAccountUsageCache
+from claudex_gateway.claude_account_pool import (
+    _DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS,
+    AccountCooldownTracker,
+    build_serving_chain,
+    rate_limit_cooldown_seconds,
+)
 from claudex_gateway.claude_accounts import (
+    AccountRecord,
     AccountRegistryError,
     list_accounts,
     load_registry,
@@ -305,12 +313,12 @@ async def _passthrough_to_anthropic(
     With no claude_account.id configured, the client's own credentials and
     beta headers are forwarded untouched, so passthrough traffic behaves
     exactly as if Claude Code talked to Anthropic directly. With one
-    configured, the request is served with that registered account's
-    credentials instead (see `_passthrough_with_claude_account`).
+    configured, the request is served with the registered accounts instead,
+    serving account first (see `_passthrough_with_claude_pool`).
     """
     config: GatewayConfig = request.app.state.config
     if config.claude_account_id is not None:
-        return await _passthrough_with_claude_account(
+        return await _passthrough_with_claude_pool(
             request, raw_body, parsed_body, config.claude_account_id
         )
     headers = {
@@ -481,47 +489,66 @@ def _rewrite_metadata_account_uuid(
     return json.dumps(rewritten_body, ensure_ascii=False).encode()
 
 
-async def _passthrough_with_claude_account(
-    request: Request, raw_body: bytes, parsed_body: Any, account_id: str
-) -> JSONResponse | StreamingResponse:
-    """Serve an Anthropic passthrough request with a registered account's token.
+@dataclass
+class _FailedAttempt:
+    """A per-account failure the pool may recover from by trying the next account.
 
-    The account is re-resolved from the registry on every request (read-
-    through, no cache) so CLI-side `account add`/`remove` take effect
-    without a daemon restart. Retries exactly once with force-refreshed
-    credentials on HTTP 401 — safe because no response byte has been
-    relayed yet; a post-retry 401 means the registered account itself was
-    rejected, which is reported as such rather than relayed verbatim (a raw
-    401 would send the client into a pointless re-login of its own).
+    `response` is exactly what single-account serving would have returned,
+    so a one-account pool — or the last surviving failure — reproduces the
+    pre-pool behavior.
     """
-    try:
-        records = load_registry()
-    except AccountRegistryError as exc:
-        return _claude_account_unavailable(f"cannot read the claude account registry: {exc}")
-    record = next((record for record in records if record.id == account_id), None)
-    if record is None:
-        return _claude_account_unavailable(
-            f"configured claude account {account_id} is not registered; "
-            "pick another with `claudex-gateway account use` or disable it "
-            "with `claudex-gateway account use off`"
-        )
-    if record.state != "ready":
-        return _claude_account_unavailable(
-            f"configured claude account {account_id} is in state {record.state!r}, not ready"
-        )
 
+    response: Response
+    rate_limited: bool = False
+
+
+def _replay_buffered_response(status_code: int, headers: dict[str, str], body: bytes) -> Response:
+    """Rebuild a fully-buffered upstream response for the client.
+
+    httpx already decoded the transfer (gzip etc.), so the encoding and
+    hop-by-hop headers must be dropped exactly as the streaming relay does.
+    """
+    filtered = {
+        key: value
+        for key, value in headers.items()
+        if key.lower() not in _PASSTHROUGH_SKIP_RESPONSE_HEADERS
+    }
+    return Response(content=body, status_code=status_code, headers=filtered)
+
+
+async def _attempt_with_account(
+    request: Request, raw_body: bytes, parsed_body: Any, record: AccountRecord
+) -> Response | _FailedAttempt:
+    """Serve an Anthropic passthrough request with one registered account's token.
+
+    Retries exactly once with force-refreshed credentials on HTTP 401 —
+    safe because no response byte has been relayed yet; a post-retry 401
+    means the registered account itself was rejected, which is reported as
+    such rather than relayed verbatim (a raw 401 would send the client into
+    a pointless re-login of its own).
+
+    Returns a `_FailedAttempt` for account-specific failures (auth problems,
+    a 429 that just started this account's cooldown) so the pool can try the
+    next account; every other outcome — success, other upstream statuses,
+    and transport errors, which are not account-specific — is terminal.
+    """
+    account_id = record.id
     manager = _claude_account_auth_manager(request.app.state, account_id)
     try:
         credentials = await manager.get_credentials()
     except ClaudeAccountReauthRequiredError as exc:
         await _mark_account_needs_reauth_best_effort(account_id)
-        return _claude_account_unavailable(
-            f"claude account {account_id} needs re-authentication: {exc}; "
-            "log in again from the dashboard or re-add it with "
-            "`claudex-gateway account add`"
+        return _FailedAttempt(
+            _claude_account_unavailable(
+                f"claude account {account_id} needs re-authentication: {exc}; "
+                "log in again from the dashboard or re-add it with "
+                "`claudex-gateway account add`"
+            )
         )
     except ClaudeAccountAuthError as exc:
-        return _claude_account_unavailable(f"claude account {account_id} is unusable: {exc}")
+        return _FailedAttempt(
+            _claude_account_unavailable(f"claude account {account_id} is unusable: {exc}")
+        )
 
     content = _rewrite_metadata_account_uuid(raw_body, parsed_body, credentials.account_uuid)
     try:
@@ -534,15 +561,19 @@ async def _passthrough_with_claude_account(
                 credentials = await manager.get_credentials(force_refresh=True)
             except ClaudeAccountReauthRequiredError as exc:
                 await _mark_account_needs_reauth_best_effort(account_id)
-                return _claude_account_unavailable(
-                    f"claude account {account_id} needs re-authentication: {exc}; "
-                    "log in again from the dashboard or re-add it with "
-                    "`claudex-gateway account add`"
+                return _FailedAttempt(
+                    _claude_account_unavailable(
+                        f"claude account {account_id} needs re-authentication: {exc}; "
+                        "log in again from the dashboard or re-add it with "
+                        "`claudex-gateway account add`"
+                    )
                 )
             except ClaudeAccountAuthError as exc:
-                return _claude_account_unavailable(
-                    f"claude account {account_id} was rejected and could not be "
-                    f"refreshed: {exc}"
+                return _FailedAttempt(
+                    _claude_account_unavailable(
+                        f"claude account {account_id} was rejected and could not be "
+                        f"refreshed: {exc}"
+                    )
                 )
             upstream_response = await _send_to_anthropic(
                 request,
@@ -561,16 +592,115 @@ async def _passthrough_with_claude_account(
         # dead — only a human re-login recovers it, which is what the
         # needs-reauth state means.
         await _mark_account_needs_reauth_best_effort(account_id)
-        return JSONResponse(
-            _claude_error_body(
-                "authentication_error",
-                f"Anthropic rejected the registered claude account {account_id} "
-                "after a token refresh; log in again from the dashboard or "
-                "re-add it with `claudex-gateway account add`",
-            ),
-            status_code=401,
+        return _FailedAttempt(
+            JSONResponse(
+                _claude_error_body(
+                    "authentication_error",
+                    f"Anthropic rejected the registered claude account {account_id} "
+                    "after a token refresh; log in again from the dashboard or "
+                    "re-add it with `claudex-gateway account add`",
+                ),
+                status_code=401,
+            )
+        )
+    if upstream_response.status_code == 429:
+        # Buffer the (small) error response and release the connection before
+        # any next attempt reuses the shared client. Quota 429s carry no
+        # machine-readable reset (.docs/research/claude-429-shape.md), so the
+        # deadline falls back to the cached usage envelope or a short default.
+        response_headers = dict(upstream_response.headers)
+        response_body = await upstream_response.aread()
+        await upstream_response.aclose()
+        cooldown_seconds = rate_limit_cooldown_seconds(
+            response_headers,
+            response_body,
+            request.app.state.claude_account_usage_cache.peek(account_id),
+        )
+        request.app.state.claude_account_cooldowns.mark(account_id, cooldown_seconds)
+        logger.warning(
+            "claude account %.8s rate-limited by Anthropic; cooling down for %.0fs",
+            account_id,
+            cooldown_seconds,
+        )
+        return _FailedAttempt(
+            _replay_buffered_response(429, response_headers, response_body),
+            rate_limited=True,
         )
     return _relay_anthropic_response(upstream_response)
+
+
+async def _passthrough_with_claude_pool(
+    request: Request, raw_body: bytes, parsed_body: Any, serving_account_id: str
+) -> Response:
+    """Serve a passthrough request from the account pool, ordered fallback.
+
+    The serving account goes first, the remaining ready accounts follow in
+    registration order, and accounts inside a rate-limit cooldown are
+    skipped — expiry readmits them, so traffic fails back automatically.
+    The registry is re-resolved on every request (read-through, no cache) so
+    CLI- and dashboard-side account changes take effect without a restart.
+
+    Failover happens strictly before any client byte: a streaming relay is
+    only constructed for terminal outcomes, and every failover branch fully
+    closed its upstream response first.
+    """
+    try:
+        records = load_registry()
+    except AccountRegistryError as exc:
+        return _claude_account_unavailable(f"cannot read the claude account registry: {exc}")
+    tracker: AccountCooldownTracker = request.app.state.claude_account_cooldowns
+    chain = build_serving_chain(serving_account_id, records, tracker)
+
+    if not chain.attempts:
+        if chain.cooling_ids:
+            remaining = tracker.min_remaining_seconds() or _DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS
+            return JSONResponse(
+                _claude_error_body(
+                    "rate_limit_error",
+                    "every registered claude account is rate-limited; "
+                    "retry after the cooldown",
+                ),
+                status_code=429,
+                headers={"retry-after": str(max(1, math.ceil(remaining)))},
+            )
+        if not chain.serving_registered:
+            return _claude_account_unavailable(
+                f"configured claude account {serving_account_id} is not registered; "
+                "pick another with `claudex-gateway account use` or disable it "
+                "with `claudex-gateway account use off`"
+            )
+        if chain.serving_state != "ready":
+            return _claude_account_unavailable(
+                f"configured claude account {serving_account_id} is in state "
+                f"{chain.serving_state!r}, not ready"
+            )
+        return _claude_account_unavailable("no usable claude account is registered")
+
+    first_failure: Response | None = None
+    last_rate_limited: Response | None = None
+    for position, record in enumerate(chain.attempts):
+        outcome = await _attempt_with_account(request, raw_body, parsed_body, record)
+        if not isinstance(outcome, _FailedAttempt):
+            if position:
+                logger.warning(
+                    "claude account failover: serving with %.8s after %d failed attempt(s)",
+                    record.id,
+                    position,
+                )
+            return outcome
+        if outcome.rate_limited:
+            last_rate_limited = outcome.response
+        elif first_failure is None:
+            first_failure = outcome.response
+
+    # Every account failed. A rate-limit reply is the most useful terminal
+    # answer (the pool recovers by itself and Claude Code renders Anthropic
+    # 429s natively); otherwise surface the highest-priority account's
+    # failure, which is the most actionable one.
+    if last_rate_limited is not None:
+        return last_rate_limited
+    assert first_failure is not None  # attempts was non-empty, so one branch recorded
+    return first_failure
 
 
 async def _handle_messages(request: Request) -> JSONResponse | StreamingResponse:
@@ -2054,16 +2184,29 @@ async def _handle_admin_claude_accounts_get(request: Request) -> JSONResponse:
             ),
             status_code=500,
         )
+    tracker: AccountCooldownTracker = request.app.state.claude_account_cooldowns
     return JSONResponse(
         {
             "accounts": [
-                {**record.to_row(), **_account_plan_fields(record.id)}
+                {
+                    **record.to_row(),
+                    **_account_plan_fields(record.id),
+                    "coolingDownUntil": _cooling_down_until_millis(tracker, record.id),
+                }
                 for record in records
             ],
             "serving_account_id": request.app.state.config.claude_account_id,
             "local": _local_claude_login_fields(),
         }
     )
+
+
+def _cooling_down_until_millis(tracker: AccountCooldownTracker, account_id: str) -> int | None:
+    """Epoch-ms cooldown deadline for the row overlay (registry-timestamp unit)."""
+    remaining = tracker.remaining_seconds(account_id)
+    if remaining <= 0.0:
+        return None
+    return int((time.time() + remaining) * 1000)
 
 
 async def _handle_admin_claude_accounts_usage(request: Request) -> JSONResponse:
@@ -2667,4 +2810,7 @@ def create_app(config: GatewayConfig, daemon_nonce: str | None = None) -> Starle
     app.state.claude_account_usage_cache = ClaudeAccountUsageCache(
         fetch=_account_usage_fetch(app.state)
     )
+    # Rate-limit cooldowns are ephemeral runtime state and live only in this
+    # process — the registry records exclusively durable facts (design §8).
+    app.state.claude_account_cooldowns = AccountCooldownTracker()
     return app

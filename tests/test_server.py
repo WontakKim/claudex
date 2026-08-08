@@ -22,6 +22,7 @@ from starlette.testclient import TestClient
 
 import claudex_gateway.server as server
 from claudex_gateway import claude_accounts, compaction
+from claudex_gateway.claude_account_pool import AccountCooldownTracker
 from claudex_gateway.claude_auth import CLAUDE_TOKEN_URL
 from claudex_gateway.codex_client import (
     CODEX_MODELS_URL,
@@ -4453,21 +4454,29 @@ class TestAdminDashboardApi:
 
 def _register_serving_account(
     *,
+    email: str = "pool@example.com",
     account_uuid: str | None = "serving-account-uuid",
+    access_token: str = "pool-access-1",
+    refresh_token: str = "pool-refresh-1",
     expires_in_seconds: float = 3600,
 ) -> str:
-    """Register one ready account under the (HOME-isolated) registry."""
-    oauth_account: dict[str, Any] = {"emailAddress": "pool@example.com"}
+    """Register one ready account under the (HOME-isolated) registry.
+
+    Distinct emails register distinct accounts (the registry deduplicates on
+    the (email, organizationUuid) pair), which is how pool tests build a
+    multi-account chain.
+    """
+    oauth_account: dict[str, Any] = {"emailAddress": email}
     if account_uuid is not None:
         oauth_account["accountUuid"] = account_uuid
     record = claude_accounts.add_account(
-        email="pool@example.com",
+        email=email,
         organization_uuid="org-1",
         organization_name="Example Org",
         credentials_json={
             "claudeAiOauth": {
-                "accessToken": "pool-access-1",
-                "refreshToken": "pool-refresh-1",
+                "accessToken": access_token,
+                "refreshToken": refresh_token,
                 "expiresAt": (time.time() + expires_in_seconds) * 1000,
                 "scopes": ["user:inference", "user:profile"],
             }
@@ -4764,6 +4773,383 @@ def test_unset_account_keeps_passthrough_forwarding_client_credentials(
 
 
 # ---------------------------------------------------------------------------
+# Account pool: ordered fallback on the managed relay
+# ---------------------------------------------------------------------------
+
+
+def _register_pool_accounts(
+    monkeypatch: pytest.MonkeyPatch, *, first_expires_in_seconds: float = 3600
+) -> tuple[str, str]:
+    """Register two ready accounts with deterministic registration order.
+
+    `_now_millis` is replaced with a counter because two registrations can
+    land in the same real millisecond, which would leave the createdAt chain
+    order to the random UUID tiebreak.
+    """
+    millis = iter(range(1_700_000_000_000, 1_700_000_000_100))
+    monkeypatch.setattr(claude_accounts, "_now_millis", lambda: next(millis))
+    first = _register_serving_account(expires_in_seconds=first_expires_in_seconds)
+    second = _register_serving_account(
+        email="pool2@example.com",
+        account_uuid="second-account-uuid",
+        access_token="pool-access-2",
+        refresh_token="pool-refresh-2",
+    )
+    return first, second
+
+
+def _quota_429(marker: str = "Error") -> httpx.Response:
+    """The empirically observed OAuth quota rejection: no reset signal at all."""
+    return httpx.Response(
+        429,
+        json={"type": "error", "error": {"type": "rate_limit_error", "message": marker}},
+        headers={"x-should-retry": "true"},
+    )
+
+
+def test_pool_fails_over_to_second_account_on_429(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    first, second = _register_pool_accounts(monkeypatch)
+    calls: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        if request.headers["authorization"] == "Bearer pool-access-1":
+            return _quota_429()
+        return httpx.Response(200, json={"id": "msg_1"})
+
+    client, _ = _gateway(GatewayConfig(claude_account_id=first), handler)
+
+    response = client.post("/v1/messages", json=_account_body())
+
+    assert response.status_code == 200
+    assert response.json() == {"id": "msg_1"}
+    assert [call.headers["authorization"] for call in calls] == [
+        "Bearer pool-access-1",
+        "Bearer pool-access-2",
+    ]
+    # The metadata rewrite names each attempt's own account, never a stale one.
+    for call, expected_uuid in zip(calls, ["serving-account-uuid", "second-account-uuid"]):
+        user_id = json.loads(json.loads(call.content)["metadata"]["user_id"])
+        assert user_id["account_uuid"] == expected_uuid
+
+
+def test_pool_cooldown_persists_across_requests(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    first, _second = _register_pool_accounts(monkeypatch)
+    calls: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        if request.headers["authorization"] == "Bearer pool-access-1":
+            return _quota_429()
+        return httpx.Response(200, json={"id": "msg_1"})
+
+    client, _ = _gateway(GatewayConfig(claude_account_id=first), handler)
+
+    assert client.post("/v1/messages", json=_account_body()).status_code == 200
+    calls.clear()
+
+    # The first account is cooling down now: the next request goes straight
+    # to the second account without probing the rate-limited one again.
+    assert client.post("/v1/messages", json=_account_body()).status_code == 200
+    assert [call.headers["authorization"] for call in calls] == ["Bearer pool-access-2"]
+
+
+def test_pool_fails_back_after_cooldown_expiry(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    first, _second = _register_pool_accounts(monkeypatch)
+    first_recovered = [False]
+    calls: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        if request.headers["authorization"] == "Bearer pool-access-1" and not first_recovered[0]:
+            return _quota_429()
+        return httpx.Response(200, json={"id": "msg_1"})
+
+    client, _ = _gateway(GatewayConfig(claude_account_id=first), handler)
+    now = [1_000.0]
+    client.app.state.claude_account_cooldowns = AccountCooldownTracker(clock=lambda: now[0])
+
+    assert client.post("/v1/messages", json=_account_body()).status_code == 200
+    calls.clear()
+    first_recovered[0] = True
+
+    # Once the cooldown (default 60s — the quota 429 carried no signal)
+    # expires, the serving account is preferred again.
+    now[0] += 61.0
+    assert client.post("/v1/messages", json=_account_body()).status_code == 200
+    assert [call.headers["authorization"] for call in calls] == ["Bearer pool-access-1"]
+
+
+def test_pool_exhausted_replays_final_upstream_429(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    first, _second = _register_pool_accounts(monkeypatch)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        marker = "first" if request.headers["authorization"] == "Bearer pool-access-1" else "second"
+        return _quota_429(marker)
+
+    client, _ = _gateway(GatewayConfig(claude_account_id=first), handler)
+
+    response = client.post("/v1/messages", json=_account_body())
+
+    # Every account 429'd: the client sees the last real Anthropic rejection,
+    # which Claude Code knows how to render.
+    assert response.status_code == 429
+    assert response.json()["error"]["message"] == "second"
+    assert response.headers["x-should-retry"] == "true"
+
+
+def test_all_cooling_returns_429_with_retry_after_without_contacting_upstream(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    first, _second = _register_pool_accounts(monkeypatch)
+    calls: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return _quota_429()
+
+    client, _ = _gateway(GatewayConfig(claude_account_id=first), handler)
+
+    assert client.post("/v1/messages", json=_account_body()).status_code == 429
+    upstream_probes = len(calls)
+    assert upstream_probes == 2
+
+    response = client.post("/v1/messages", json=_account_body())
+
+    assert response.status_code == 429
+    assert "rate-limited" in response.json()["error"]["message"]
+    assert int(response.headers["retry-after"]) >= 1
+    assert len(calls) == upstream_probes  # nothing touched upstream this time
+
+
+def test_pool_429_cooldown_uses_cached_usage_reset(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    first, _second = _register_pool_accounts(monkeypatch)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.headers["authorization"] == "Bearer pool-access-1":
+            return _quota_429()
+        return httpx.Response(200, json={"id": "msg_1"})
+
+    client, _ = _gateway(GatewayConfig(claude_account_id=first), handler)
+    envelope = {
+        "provider": "claude",
+        "status": "ok",
+        "fable_weekly": {
+            "used_percent": 100.0,
+            "window_minutes": 10_080,
+            "resets_at": time.time() + 7_200.0,
+        },
+    }
+    monkeypatch.setattr(
+        client.app.state.claude_account_usage_cache,
+        "peek",
+        lambda account_id: envelope if account_id == first else None,
+    )
+
+    assert client.post("/v1/messages", json=_account_body()).status_code == 200
+
+    remaining = client.app.state.claude_account_cooldowns.remaining_seconds(first)
+    assert 7_000.0 < remaining <= 7_200.0
+
+
+def test_pool_fails_over_when_refresh_requires_reauth(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    # The serving account's token is already expired, and its refresh
+    # conclusively fails — the pool marks it and serves from the next one.
+    first, second = _register_pool_accounts(monkeypatch, first_expires_in_seconds=-60)
+    api_calls: list[str] = []
+    token_calls: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == CLAUDE_TOKEN_URL:
+            token_calls.append(json.loads(request.content))
+            return httpx.Response(400, json={"error": "invalid_grant"})
+        api_calls.append(request.headers["authorization"])
+        return httpx.Response(200, json={"id": "msg_1"})
+
+    client, _ = _gateway(GatewayConfig(claude_account_id=first), handler)
+
+    response = client.post("/v1/messages", json=_account_body())
+
+    assert response.status_code == 200
+    assert api_calls == ["Bearer pool-access-2"]
+    assert [call["refresh_token"] for call in token_calls] == ["pool-refresh-1"]
+    states = {record.id: record.state for record in claude_accounts.load_registry()}
+    assert states == {first: "needs-reauth", second: "ready"}
+
+
+def test_pool_fails_over_on_post_retry_401_and_marks_reauth(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    first, second = _register_pool_accounts(monkeypatch)
+    api_calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == CLAUDE_TOKEN_URL:
+            return httpx.Response(
+                200,
+                json={
+                    "access_token": "rotated-access",
+                    "refresh_token": "rotated-refresh",
+                    "expires_in": 900,
+                },
+            )
+        api_calls.append(request.headers["authorization"])
+        if request.headers["authorization"] == "Bearer pool-access-2":
+            return httpx.Response(200, json={"id": "msg_1"})
+        return httpx.Response(401, json={"type": "error"})
+
+    client, _ = _gateway(GatewayConfig(claude_account_id=first), handler)
+
+    response = client.post("/v1/messages", json=_account_body())
+
+    # The serving account got its full 401 → refresh → retry-once treatment
+    # before the pool moved on and durably marked it.
+    assert response.status_code == 200
+    assert api_calls == ["Bearer pool-access-1", "Bearer rotated-access", "Bearer pool-access-2"]
+    states = {record.id: record.state for record in claude_accounts.load_registry()}
+    assert states == {first: "needs-reauth", second: "ready"}
+
+
+def test_pool_transport_error_returns_502_without_failover(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    first, _second = _register_pool_accounts(monkeypatch)
+    calls: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        raise httpx.ConnectError("network down", request=request)
+
+    client, _ = _gateway(GatewayConfig(claude_account_id=first), handler)
+
+    response = client.post("/v1/messages", json=_account_body())
+
+    # A transport failure is not account-specific: retrying the next account
+    # would double down on a dead network, so it stays terminal.
+    assert response.status_code == 502
+    assert len(calls) == 1
+
+
+def test_pool_serves_count_tokens_failover(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    first, _second = _register_pool_accounts(monkeypatch)
+    calls: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        if request.headers["authorization"] == "Bearer pool-access-1":
+            return _quota_429()
+        return httpx.Response(200, json={"input_tokens": 42})
+
+    client, _ = _gateway(GatewayConfig(claude_account_id=first), handler)
+
+    response = client.post("/v1/messages/count_tokens", json=_account_body())
+
+    assert response.status_code == 200
+    assert response.json() == {"input_tokens": 42}
+    assert [str(call.url) for call in calls] == [
+        "https://api.anthropic.com/v1/messages/count_tokens",
+        "https://api.anthropic.com/v1/messages/count_tokens",
+    ]
+
+
+def test_pool_single_account_429_replays_upstream_body_and_cools_down(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    account_id = _register_serving_account()
+    calls: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return _quota_429("single")
+
+    client, _ = _gateway(GatewayConfig(claude_account_id=account_id), handler)
+
+    first_response = client.post("/v1/messages", json=_account_body())
+    assert first_response.status_code == 429
+    assert first_response.json()["error"]["message"] == "single"
+    assert len(calls) == 1
+
+    # In-cooldown requests answer from the tracker without touching upstream.
+    second_response = client.post("/v1/messages", json=_account_body())
+    assert second_response.status_code == 429
+    assert int(second_response.headers["retry-after"]) >= 1
+    assert len(calls) == 1
+
+
+def test_pool_forwards_non_claude_code_body_unchanged_on_failover(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    first, _second = _register_pool_accounts(monkeypatch)
+    calls: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        if request.headers["authorization"] == "Bearer pool-access-1":
+            return _quota_429()
+        return httpx.Response(200, json={"id": "msg_1"})
+
+    client, _ = _gateway(GatewayConfig(claude_account_id=first), handler)
+    body = _message_body("claude-fable-5")
+    body["metadata"] = {"user_id": "not-a-json-string"}
+    raw = json.dumps(body)
+
+    response = client.post(
+        "/v1/messages", content=raw, headers={"content-type": "application/json"}
+    )
+
+    assert response.status_code == 200
+    assert [call.content for call in calls] == [raw.encode(), raw.encode()]
+
+
+def test_pool_skips_unregistered_serving_id_when_other_ready_accounts_exist(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    _register_serving_account()
+    calls: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(200, json={"id": "msg_1"})
+
+    client, _ = _gateway(
+        GatewayConfig(claude_account_id="0a1b2c3d-4e5f-4678-9abc-def012345678"), handler
+    )
+
+    response = client.post("/v1/messages", json=_account_body())
+
+    # A stale serving selection must not take the whole pool down.
+    assert response.status_code == 200
+    assert [call.headers["authorization"] for call in calls] == ["Bearer pool-access-1"]
+
+
+# ---------------------------------------------------------------------------
 # Admin claude-accounts surface (dashboard account management)
 # ---------------------------------------------------------------------------
 
@@ -4810,6 +5196,7 @@ class TestAdminClaudeAccountsApi:
             "state",
             "planType",
             "rateLimitTier",
+            "coolingDownUntil",
         }
         assert row["id"] == account_id
         assert row["state"] == "ready"
@@ -4817,11 +5204,27 @@ class TestAdminClaudeAccountsApi:
         # fields, so the derived plan metadata degrades to nulls.
         assert row["planType"] is None
         assert row["rateLimitTier"] is None
+        assert row["coolingDownUntil"] is None
         # The registry response must never leak credential material.
         assert "accessToken" not in response.text
         assert "refreshToken" not in response.text
         assert "pool-access" not in response.text
         assert "pool-refresh" not in response.text
+
+    def test_list_exposes_cooling_down_until_for_rate_limited_accounts(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        client = self._client(monkeypatch, tmp_path)
+        account_id = _register_serving_account()
+        client.app.state.claude_account_cooldowns.mark(account_id, 120.0)
+
+        with client:
+            [row] = client.get("/admin/claude-accounts").json()["accounts"]
+
+        # Epoch ms, like every other registry timestamp in the payload.
+        assert isinstance(row["coolingDownUntil"], int)
+        expected = (time.time() + 120.0) * 1000
+        assert abs(row["coolingDownUntil"] - expected) < 5_000
 
     def test_list_derives_plan_fields_from_the_captured_oauth_account(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
