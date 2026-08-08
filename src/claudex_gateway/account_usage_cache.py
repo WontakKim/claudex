@@ -94,6 +94,16 @@ class ClaudeAccountUsageCache:
                     results[account_id] = await self._refresh(account_id)
         return results
 
+    def peek(self, account_id: str) -> dict[str, Any] | None:
+        """Return the cached envelope for `account_id` without ever fetching.
+
+        Entry age is deliberately ignored: the consumer (the serve path's
+        429 cooldown derivation) only reads future `resets_at` values, which
+        a stale envelope still reports accurately.
+        """
+        entry = self._entries.get(account_id)
+        return entry.result if entry is not None else None
+
     async def _refresh(self, account_id: str) -> dict[str, Any]:
         # Re-check under the lock: a concurrent get() may have refreshed this
         # account, or started a cooldown, while we waited.

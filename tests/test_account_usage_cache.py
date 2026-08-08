@@ -197,3 +197,19 @@ def test_unexpected_fetch_exception_is_contained() -> None:
     clock.advance(30.0)
     assert asyncio.run(cache.get(["a"]))["a"]["status"] == "error"
     assert fetch.calls == ["a"]
+
+
+def test_peek_returns_cached_entry_without_fetching_and_none_when_absent() -> None:
+    clock = FakeClock()
+    fetch = FakeFetch()
+    fetch.queue("a", _ok("a"))
+    cache = _cache(fetch, clock)
+
+    assert cache.peek("a") is None
+    asyncio.run(cache.get(["a"]))
+
+    # Age is irrelevant: a long-expired entry is still peekable, fetch-free.
+    clock.advance(10_000.0)
+    assert cache.peek("a") == _ok("a")
+    assert cache.peek("never-fetched") is None
+    assert fetch.calls == ["a"]
