@@ -181,9 +181,13 @@ def test_structural_failure_after_success_serves_stale_value() -> None:
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
             client = CodexClient(_FakeAuthManager(), http_client)
             first = await client.context_window("gpt-5.6-sol")
-            # CodexClient doesn't expose a clock hook, so force the cache's
-            # 900s TTL to be considered expired without a real sleep.
-            client._context_windows._snapshot_time = 0.0
+            # CodexClient doesn't expose a clock hook, so rewind the snapshot
+            # past the TTL without a real sleep. (Setting it to absolute 0.0
+            # only reads as expired when monotonic uptime exceeds the TTL —
+            # false on a freshly booted CI runner.)
+            client._context_windows._snapshot_time -= (
+                client._context_windows._ttl_seconds + 1
+            )
             second = await client.context_window("gpt-5.6-sol")
             return first, second
 
@@ -228,7 +232,9 @@ def test_non_json_decode_failure_degrades_like_structural_failure() -> None:
             # Clear the failure backoff so the next lookup refreshes.
             client._context_windows._failure_time = None
             warm = await client.context_window("gpt-5.6-sol")
-            client._context_windows._snapshot_time = 0.0
+            client._context_windows._snapshot_time -= (
+                client._context_windows._ttl_seconds + 1
+            )
             stale = await client.context_window("gpt-5.6-sol")
             return cold, warm, stale
 

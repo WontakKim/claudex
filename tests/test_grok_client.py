@@ -339,8 +339,11 @@ class TestContextWindow:
             async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
                 client = GrokClient(_FakeAuthManager(), http_client)
                 first = await client.context_window("grok-4.5")
-                # Force the snapshot stale without waiting out the real TTL.
-                client._context_windows._snapshot_time = 0.0
+                # Rewind the snapshot past the TTL without a real sleep (an
+                # absolute 0.0 is not reliably expired on low-uptime hosts).
+                client._context_windows._snapshot_time -= (
+                    client._context_windows._ttl_seconds + 1
+                )
                 second = await client.context_window("grok-4.5")
                 return first, second
 
@@ -369,7 +372,9 @@ class TestContextWindow:
                 cold = await client.context_window("grok-4.5")
                 client._context_windows._failure_time = None
                 warm = await client.context_window("grok-4.5")
-                client._context_windows._snapshot_time = 0.0
+                client._context_windows._snapshot_time -= (
+                    client._context_windows._ttl_seconds + 1
+                )
                 stale = await client.context_window("grok-4.5")
                 return cold, warm, stale
 

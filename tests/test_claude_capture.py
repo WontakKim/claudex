@@ -374,6 +374,7 @@ def test_production_backend_classifies_security_exit_codes(
 def test_headless_read_only_reads_via_scoped_keychain_on_darwin(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.setattr(claude_capture.sys, "platform", "darwin")
     monkeypatch.setenv("USER", "tester")
     monkeypatch.delenv("USERNAME", raising=False)
     config_dir = str(tmp_path / "claude-config")
@@ -461,6 +462,7 @@ def test_missing_credentials_raises_on_non_darwin(
 def test_fail_closed_when_scoped_keychain_item_is_absent(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.setattr(claude_capture.sys, "platform", "darwin")
     monkeypatch.setenv("USER", "tester")
     backend = _FakeKeychainBackend()
     monkeypatch.setattr(claude_capture, "_default_keychain_backend", lambda: backend)
@@ -870,6 +872,7 @@ def test_sighup_during_login_wait_translates_to_capture_cancelled(
 def test_mint_temp_config_dir_retries_on_keychain_collision(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.setattr(claude_capture.sys, "platform", "darwin")
     monkeypatch.setenv("USER", "tester")
     backend = _FakeKeychainBackend()
     mkdtemp_root = tmp_path / "mkdtemp-root"
@@ -891,6 +894,7 @@ def test_mint_temp_config_dir_retries_on_keychain_collision(
 def test_mint_temp_config_dir_gives_up_after_max_attempts(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.setattr(claude_capture.sys, "platform", "darwin")
     monkeypatch.setenv("USER", "tester")
     backend = _FakeKeychainBackend()
     mkdtemp_root = tmp_path / "mkdtemp-root"
@@ -936,6 +940,7 @@ def test_mint_temp_config_dir_skips_keychain_check_on_non_darwin(
 def test_cleanup_deletes_scoped_item_and_removes_temp_dir(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.setattr(claude_capture.sys, "platform", "darwin")
     monkeypatch.setenv("USER", "tester")
     backend = _FakeKeychainBackend()
     config_dir = tmp_path / "config"
@@ -952,6 +957,7 @@ def test_cleanup_deletes_scoped_item_and_removes_temp_dir(
 def test_cleanup_attempts_both_actions_and_raises_when_either_fails(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.setattr(claude_capture.sys, "platform", "darwin")
     monkeypatch.setenv("USER", "tester")
     backend = _FakeKeychainBackend()
     backend.delete_failure = CaptureError("Keychain delete boom")
@@ -973,6 +979,7 @@ def test_cleanup_attempts_both_actions_and_raises_when_either_fails(
 def test_capture_interactive_succeeds_end_to_end_with_fake_keychain(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.setattr(claude_capture.sys, "platform", "darwin")
     _make_stdin_a_tty(monkeypatch)
     monkeypatch.setenv("USER", "tester")
     monkeypatch.delenv("USERNAME", raising=False)
@@ -1159,6 +1166,9 @@ def _interactive_fixture(
     """Shared arrangement for cancellation-scope tests: TTY stdin, fake
     `claude` on PATH, deterministic mkdtemp, fake Keychain, and a
     `_run_login` stand-in that deposits credentials like a real login."""
+    # The fake Keychain only participates on the darwin branch; force it so
+    # these tests exercise the Keychain path on any host (CI runs Linux).
+    monkeypatch.setattr(claude_capture.sys, "platform", "darwin")
     _make_stdin_a_tty(monkeypatch)
     monkeypatch.setenv("USER", "tester")
     monkeypatch.delenv("USERNAME", raising=False)
