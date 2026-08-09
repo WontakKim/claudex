@@ -420,28 +420,27 @@ class TestClaudeAccountRoutingSetting:
             GatewayConfig.load(settings_file).claude_account_routing_mode == "disabled"
         )
 
-    def test_balanced_mode_is_rejected_as_not_implemented(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_balanced_mode_is_accepted(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("CLAUDEX_CLAUDE_ACCOUNT_ROUTING", '{"mode": "balanced"}')
-        with pytest.raises(ConfigError, match="not implemented yet"):
-            GatewayConfig.from_env()
+        assert GatewayConfig.from_env().claude_account_routing_mode == "balanced"
 
-    def test_future_shaped_balanced_document_reports_not_implemented(
+    def test_balanced_mode_still_rejects_unknown_keys(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # A future-shaped document must name the real reason, not the
-        # incidental unknown key of its mode block.
+        # A future-shaped document must name the real (unknown-key) reason,
+        # not a stale "not implemented" one.
         monkeypatch.setenv(
             "CLAUDEX_CLAUDE_ACCOUNT_ROUTING",
             '{"mode": "balanced", "balanced": {"window": "session"}}',
         )
-        with pytest.raises(ConfigError, match="not implemented yet"):
+        with pytest.raises(ConfigError, match="unknown keys: balanced"):
             GatewayConfig.from_env()
 
     def test_unknown_mode_is_rejected(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("CLAUDEX_CLAUDE_ACCOUNT_ROUTING", '{"mode": "round-robin"}')
-        with pytest.raises(ConfigError, match="must be one of disabled, fallback"):
+        with pytest.raises(
+            ConfigError, match="must be one of disabled, fallback, balanced"
+        ):
             GatewayConfig.from_env()
 
     def test_unknown_document_keys_are_rejected(self, tmp_path: Path) -> None:
@@ -454,7 +453,9 @@ class TestClaudeAccountRoutingSetting:
 
     def test_missing_mode_key_is_rejected(self, tmp_path: Path) -> None:
         settings_file = self._write(tmp_path, {"claude_account.routing": {}})
-        with pytest.raises(ConfigError, match="must be one of disabled, fallback"):
+        with pytest.raises(
+            ConfigError, match="must be one of disabled, fallback, balanced"
+        ):
             GatewayConfig.load(settings_file)
 
     @pytest.mark.parametrize("value", [None, True, 1, [], "fallback"])
@@ -474,6 +475,10 @@ class TestClaudeAccountRoutingSetting:
 
     def test_parse_returns_disabled_for_explicit_disabled_document(self) -> None:
         assert parse_claude_account_routing({"mode": "disabled"}) == "disabled"
+
+    def test_parse_returns_balanced_for_explicit_balanced_document(self) -> None:
+        assert parse_claude_account_routing({"mode": "balanced"}) == "balanced"
+
     @staticmethod
     def _write(tmp_path: Path, payload: object) -> Path:
         settings_file = tmp_path / "settings.json"

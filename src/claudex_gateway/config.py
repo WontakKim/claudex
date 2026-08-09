@@ -50,7 +50,9 @@ SETTINGS_KEYS: dict[str, str] = {
     # Multi-account routing policy for the managed Anthropic relay, as a
     # JSON document like {"mode": "fallback"}. Absence of the key (or a
     # resolved empty env string) means "disabled" — single-account serving
-    # with rate limits relayed verbatim.
+    # with rate limits relayed verbatim. "fallback" fails over across the
+    # registered pool in order; "balanced" spreads sessions across the pool
+    # by weighted HRW (design v2) via ClaudeBalancedRuntime.
     "claude_account.routing": "CLAUDEX_CLAUDE_ACCOUNT_ROUTING",
 }
 
@@ -139,18 +141,18 @@ def parse_claude_account_id(value: str) -> str:
     return value
 
 
-VALID_CLAUDE_ACCOUNT_ROUTING_MODES = ("disabled", "fallback")
+VALID_CLAUDE_ACCOUNT_ROUTING_MODES = ("disabled", "fallback", "balanced")
 
 
 def parse_claude_account_routing(value: object) -> str:
     """Parse a claude_account.routing value into its routing mode.
 
-    The setting is a policy document — {"mode": "fallback"} — so future
-    modes can carry their own config blocks (e.g. a "balanced" object)
-    without renaming the key. The settings file holds the document itself;
-    the environment variable holds it JSON-encoded, with an empty string
-    meaning disabled like the other opt-in settings. "balanced" is reserved
-    and rejected until it is implemented.
+    The setting is a policy document — {"mode": "fallback"} — so a mode can
+    carry its own config blocks without renaming the key. The settings file
+    holds the document itself; the environment variable holds it
+    JSON-encoded, with an empty string meaning disabled like the other
+    opt-in settings. "balanced" is the weighted-HRW pool-wide routing mode
+    (design v2), constructed and persisted the same way as "fallback".
     """
     if isinstance(value, str):
         if not value:
@@ -167,11 +169,6 @@ def parse_claude_account_routing(value: object) -> str:
             f'{{"mode": "fallback"}}, got {value!r}'
         )
     mode = value.get("mode")
-    # The reserved mode is rejected before key validation so a future-shaped
-    # document ({"mode": "balanced", "balanced": {...}}) reports the real
-    # reason instead of "unknown keys".
-    if mode == "balanced":
-        raise ConfigError('claude account routing mode "balanced" is not implemented yet')
     unknown = sorted(set(value) - {"mode"})
     if unknown:
         raise ConfigError(
@@ -220,7 +217,9 @@ class GatewayConfig:
     claude_account_id: str | None = None
     # Multi-account routing mode for the managed relay. "disabled" (the
     # default) serves with the single configured account and relays rate
-    # limits verbatim; "fallback" fails over across registered accounts.
+    # limits verbatim; "fallback" fails over across registered accounts in
+    # order; "balanced" spreads sessions across the registered pool by
+    # weighted HRW, served through a ClaudeBalancedRuntime.
     claude_account_routing_mode: str = "disabled"
     # Where settings are read from and where runtime changes are persisted.
     settings_file: Path = field(default_factory=paths.settings_file)

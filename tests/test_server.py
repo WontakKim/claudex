@@ -24,6 +24,10 @@ import claudex_gateway.server as server
 from claudex_gateway import claude_accounts, compaction, paths
 from claudex_gateway.claude_account_pool import AccountCooldownTracker
 from claudex_gateway.claude_auth import CLAUDE_TOKEN_URL
+from claudex_gateway.claude_pool_runtime_state import (
+    ClaudePoolRuntimeStateStore,
+    RestoreValidationContext,
+)
 from claudex_gateway.codex_client import (
     CODEX_MODELS_URL,
     CODEX_RESPONSES_URL,
@@ -3513,24 +3517,21 @@ class TestAdminClaudeRoutingApi:
         assert config_after.claude_account_routing_mode == "disabled"
         assert "claude_account.routing" not in json.loads(settings_file.read_text())
 
-    def test_put_balanced_is_rejected_as_not_implemented(
+    def test_put_balanced_with_unknown_keys_is_rejected(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
+        # "balanced" is a fully valid mode now (T-10); a future-shaped
+        # document still reports the real "unknown keys" reason, not a stale
+        # "not implemented" one, and the exact mode-envelope shape is
+        # unchanged.
         with self._admin_client(monkeypatch, tmp_path) as client:
             response = client.put(
-                "/admin/providers/claude/pool/routing", json={"mode": "balanced"}
-            )
-            # A future-shaped balanced document reports the real reason,
-            # not the incidental unknown key of its mode block.
-            future_shaped = client.put(
                 "/admin/providers/claude/pool/routing",
                 json={"mode": "balanced", "balanced": {"window": "session"}},
             )
 
         assert response.status_code == 400
-        assert "not implemented yet" in response.json()["error"]["message"]
-        assert future_shaped.status_code == 400
-        assert "not implemented yet" in future_shaped.json()["error"]["message"]
+        assert "unknown keys: balanced" in response.json()["error"]["message"]
         assert not (tmp_path / "settings.json").exists()
 
     @pytest.mark.parametrize(
@@ -6144,3 +6145,430 @@ def test_lifespan_raises_the_pinned_message_when_the_pool_lock_is_contended(
         )
     finally:
         holder.release()
+
+
+# ---------------------------------------------------------------------------
+# Balanced routing lifecycle: transactional mode changes, restart-preserving
+# shutdown, fail-closed dispatch (T-10)
+# ---------------------------------------------------------------------------
+
+_BALANCED_ACCOUNT_UUID = "11111111-2222-3333-4444-555555555555"
+
+
+def _balanced_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Isolate HOME under `tmp_path` and clear the env-lock override, exactly
+    like `TestAdminClaudeRoutingApi._admin_client` -- so registry/pool state
+    lives under an isolated, per-test `.claudex` directory."""
+    monkeypatch.delenv("CLAUDEX_CLAUDE_ACCOUNT_ROUTING", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+
+
+def _register_balanced_ready_account(
+    *, email: str = "balanced@example.com", account_uuid: str | None = _BALANCED_ACCOUNT_UUID
+) -> str:
+    """Register one ready account. With the default canonical `account_uuid`, it
+    carries a valid T-3 profile fingerprint and can enable balanced routing; a
+    caller after `account_uuid=None` (or any non-UUID string, e.g.
+    `_register_serving_account`'s own default) gets one that cannot.
+    """
+    return _register_serving_account(email=email, account_uuid=account_uuid)
+
+
+class TestBalancedRoutingEnable:
+    """PUT .../pool/routing {"mode": "balanced"} -- prepares the complete runtime
+    (store, epoch, router, T-3 fingerprint verification) while the old mode keeps
+    serving, and persists settings only once every check passes (T-10 Steps 1-7).
+    """
+
+    def test_put_balanced_enables_with_valid_fingerprints(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        _balanced_env(monkeypatch, tmp_path)
+        _register_balanced_ready_account()
+        settings_file = tmp_path / "settings.json"
+        config = GatewayConfig(settings_file=settings_file)
+        with _create_test_client(
+            monkeypatch, config=config, base_url="http://127.0.0.1:8787"
+        ) as client:
+            response = client.put(
+                "/admin/providers/claude/pool/routing", json={"mode": "balanced"}
+            )
+            runtime = client.app.state.claude_balanced_runtime
+            config_after = client.app.state.config
+            # Read while the runtime is still live -- lifespan shutdown resets
+            # `status` to "disabled" on `with`-block exit (shutdown_preserving_epoch).
+            status_while_active = runtime.status
+            epoch_id_while_active = runtime.epoch_id
+            router_while_active = runtime.router
+
+        assert response.status_code == 200
+        assert response.json() == {"mode": "balanced", "env_locked": False}
+        assert config_after.claude_account_routing_mode == "balanced"
+        assert status_while_active == "active"
+        assert epoch_id_while_active is not None
+        assert router_while_active is not None
+        saved = json.loads(settings_file.read_text(encoding="utf-8"))
+        assert saved == {"claude_account.routing": {"mode": "balanced"}}
+
+    def test_put_balanced_rejects_invalid_account_uuid(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        _balanced_env(monkeypatch, tmp_path)
+        # The default account_uuid ("serving-account-uuid") is not a UUID, so
+        # this account carries no T-3 profile fingerprint.
+        _register_balanced_ready_account(account_uuid="serving-account-uuid")
+        settings_file = tmp_path / "settings.json"
+        config = GatewayConfig(settings_file=settings_file)
+        with _create_test_client(
+            monkeypatch, config=config, base_url="http://127.0.0.1:8787"
+        ) as client:
+            response = client.put(
+                "/admin/providers/claude/pool/routing", json={"mode": "balanced"}
+            )
+            runtime = client.app.state.claude_balanced_runtime
+            config_after = client.app.state.config
+
+        assert response.status_code == 400
+        assert "profile_fingerprint" in response.json()["error"]["message"]
+        assert config_after.claude_account_routing_mode == "disabled"
+        assert runtime.status == "disabled"
+        assert not settings_file.exists()
+
+    def test_put_balanced_rejects_store_open_failure(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        _balanced_env(monkeypatch, tmp_path)
+        _register_balanced_ready_account()
+        settings_file = tmp_path / "settings.json"
+        config = GatewayConfig(settings_file=settings_file)
+
+        def _boom(*_args: Any, **_kwargs: Any) -> Any:
+            raise RuntimeError("simulated store-open failure")
+
+        with _create_test_client(
+            monkeypatch, config=config, base_url="http://127.0.0.1:8787"
+        ) as client:
+            with monkeypatch.context() as fault:
+                fault.setattr(ClaudePoolRuntimeStateStore, "open_", classmethod(_boom))
+                response = client.put(
+                    "/admin/providers/claude/pool/routing", json={"mode": "balanced"}
+                )
+            runtime = client.app.state.claude_balanced_runtime
+
+        assert response.status_code == 500
+        assert "could not enable balanced routing" in response.json()["error"]["message"]
+        assert runtime.status == "disabled"
+        assert not settings_file.exists()
+
+    def test_put_balanced_tears_down_before_settings_persist_on_failure(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Publication ordering (Context): a failure at the persist() commit point
+        tears preparation down and leaves the old mode -- and a clean retry
+        (store closed, no lingering lock) then succeeds.
+        """
+        _balanced_env(monkeypatch, tmp_path)
+        _register_balanced_ready_account()
+        settings_file = tmp_path / "settings.json"
+        config = GatewayConfig(settings_file=settings_file)
+
+        def _boom(*_args: Any, **_kwargs: Any) -> None:
+            raise OSError("simulated disk-full settings write")
+
+        with _create_test_client(
+            monkeypatch, config=config, base_url="http://127.0.0.1:8787"
+        ) as client:
+            with monkeypatch.context() as fault:
+                fault.setattr(server, "update_settings_file", _boom)
+                failed = client.put(
+                    "/admin/providers/claude/pool/routing", json={"mode": "balanced"}
+                )
+            runtime = client.app.state.claude_balanced_runtime
+            status_after_failure = runtime.status
+            config_after_failure = client.app.state.config
+            settings_missing_after_failure = not settings_file.exists()
+
+            retried = client.put(
+                "/admin/providers/claude/pool/routing", json={"mode": "balanced"}
+            )
+            status_after_retry = runtime.status
+
+        assert failed.status_code == 500
+        assert status_after_failure == "disabled"
+        assert config_after_failure.claude_account_routing_mode == "disabled"
+        assert settings_missing_after_failure
+        assert retried.status_code == 200
+        assert status_after_retry == "active"
+
+    def test_lifespan_activates_persisted_balanced_mode_at_startup(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        _balanced_env(monkeypatch, tmp_path)
+        _register_balanced_ready_account()
+        settings_file = tmp_path / "settings.json"
+        settings_file.write_text(
+            json.dumps({"claude_account.routing": {"mode": "balanced"}}),
+            encoding="utf-8",
+        )
+        config = GatewayConfig.load(settings_file)
+        assert config.claude_account_routing_mode == "balanced"
+
+        with _create_test_client(
+            monkeypatch, config=config, base_url="http://127.0.0.1:8787"
+        ) as client:
+            runtime = client.app.state.claude_balanced_runtime
+            payload = client.get("/admin/providers/claude/pool/routing").json()
+            status_while_active = runtime.status
+            epoch_id_while_active = runtime.epoch_id
+
+        assert status_while_active == "active"
+        assert epoch_id_while_active is not None
+        assert payload == {"mode": "balanced", "env_locked": False}
+
+    def test_get_reports_balanced_mode(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        _balanced_env(monkeypatch, tmp_path)
+        _register_balanced_ready_account()
+        config = GatewayConfig(settings_file=tmp_path / "settings.json")
+        with _create_test_client(
+            monkeypatch, config=config, base_url="http://127.0.0.1:8787"
+        ) as client:
+            enable = client.put(
+                "/admin/providers/claude/pool/routing", json={"mode": "balanced"}
+            )
+            payload = client.get("/admin/providers/claude/pool/routing").json()
+
+        assert enable.status_code == 200
+        assert payload == {"mode": "balanced", "env_locked": False}
+
+
+def test_balanced_dispatch_fails_closed_when_runtime_not_active(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Fail-closed dispatch (Step 6): "balanced" persisted/published with no
+    active runtime (never prepared -- the lifespan never ran) is the
+    *inconsistent* state, reserved for the 503 -- never a silent fallback to
+    single-account routing.
+    """
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        raise AssertionError("balanced dispatch must never reach the upstream here")
+
+    client, _ = _gateway(
+        GatewayConfig(claude_account_routing_mode="balanced"), handler
+    )
+
+    response = client.post("/v1/messages", json=_message_body("claude-fable-5"))
+
+    assert response.status_code == 503
+    assert response.json()["error"]["message"] == "balanced routing is not active"
+
+
+class TestBalancedRoutingExit:
+    """Intentional balanced -> fallback/disabled exit (T-10 Step 8): drains
+    in-flight dispatch, persists+publishes the target mode, invalidates the
+    current epoch's pins, and starts a fresh epoch on any later re-entry --
+    contrast `test_graceful_shutdown_preserves_epoch_and_pin_for_restart`
+    below, where a process shutdown preserves that very same state instead.
+    """
+
+    def test_exit_drains_persists_invalidates_pins_and_reentry_gets_new_epoch(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        _balanced_env(monkeypatch, tmp_path)
+        account_id = _register_balanced_ready_account()
+
+        def handler(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={"id": "msg_1"})
+
+        settings_file = tmp_path / "settings.json"
+        config = GatewayConfig(settings_file=settings_file, claude_account_id=account_id)
+        with _create_test_client(
+            monkeypatch, config=config, base_url="http://127.0.0.1:8787"
+        ) as client:
+            client.app.state.http_client = httpx.AsyncClient(
+                transport=httpx.MockTransport(handler)
+            )
+            enable = client.put(
+                "/admin/providers/claude/pool/routing", json={"mode": "balanced"}
+            )
+            assert enable.status_code == 200
+            runtime = client.app.state.claude_balanced_runtime
+            epoch_id_1 = runtime.epoch_id
+
+            pinned = client.post("/v1/messages", json=_account_body())
+            assert pinned.status_code == 200
+            assert runtime.router is not None
+            assert runtime.router.pin_count() == 1
+
+            runtime_db_path = paths.claude_account_pool_runtime_db()
+
+            exited = client.put(
+                "/admin/providers/claude/pool/routing", json={"mode": "disabled"}
+            )
+            served_after_exit = client.post("/v1/messages", json=_account_body())
+
+            assert exited.status_code == 200
+            assert exited.json() == {"mode": "disabled", "env_locked": False}
+            assert runtime.status == "disabled"
+            # Draining resolved cleanly: the in-flight-created pin's request, and
+            # a fresh one after exit (now served single-account, "disabled"), both
+            # completed rather than erroring.
+            assert served_after_exit.status_code == 200
+            saved = json.loads(settings_file.read_text(encoding="utf-8"))
+            assert "claude_account.routing" not in saved
+
+            # The exited epoch's pins are gone at the persistence layer too --
+            # not just discarded in memory with this runtime instance.
+            inspect_store = ClaudePoolRuntimeStateStore.open_(runtime_db_path)
+            try:
+                restore_result = inspect_store.restore(
+                    RestoreValidationContext(now_utc=time.time())
+                )
+                epoch_id_after_exit = inspect_store.balanced_epoch_id
+            finally:
+                inspect_store.close()
+            assert epoch_id_after_exit != epoch_id_1
+            assert restore_result.pins == {}
+
+            reentered = client.put(
+                "/admin/providers/claude/pool/routing", json={"mode": "balanced"}
+            )
+            assert reentered.status_code == 200
+            assert runtime.status == "active"
+            assert runtime.epoch_id != epoch_id_1
+            assert runtime.epoch_id == epoch_id_after_exit
+            assert runtime.router is not None
+            assert runtime.router.pin_count() == 0
+
+
+def test_balanced_request_during_controlled_exit_awaits_and_serves_under_target_mode(
+    tmp_path: Path,
+) -> None:
+    """Step 6/8's spec-gate ruling, exercised directly against
+    `ClaudeBalancedRuntime` (the exact primitives
+    `server._passthrough_with_claude_balanced` dispatches through): a request
+    arriving while `exit_mode` is draining awaits the transition, then observes
+    the ALREADY-published target mode -- never a 503 merely because the
+    controlled transition was in flight.
+    """
+    from claudex_gateway.claude_accounts import AccountRecord
+    from claudex_gateway.claude_balanced_router import ClaudeBalancedRuntime
+
+    account_id = "22222222-3333-4444-5555-666666666666"
+    accounts_root = tmp_path / "accounts"
+    (accounts_root / account_id).mkdir(parents=True)
+    (accounts_root / account_id / "oauth-account.json").write_text(
+        json.dumps({"accountUuid": _BALANCED_ACCOUNT_UUID}), encoding="utf-8"
+    )
+    account = AccountRecord(
+        id=account_id,
+        email="balanced@example.com",
+        organization_uuid=None,
+        organization_name=None,
+        created_at=0,
+        updated_at=0,
+        last_authenticated_at=0,
+        state="ready",
+        account_incarnation_id="incarnation-1",
+        upstream_account_uuid=_BALANCED_ACCOUNT_UUID,
+    )
+    published = {"mode": "disabled"}
+
+    async def scenario() -> str:
+        runtime = ClaudeBalancedRuntime()
+        await runtime.prepare_and_publish(
+            accounts=[account],
+            accounts_root=accounts_root,
+            runtime_db_path=tmp_path / "runtime.sqlite3",
+            persist=lambda: published.__setitem__("mode", "balanced"),
+        )
+        assert runtime.status == "active"
+
+        # Simulate one in-flight balanced dispatch holding a slot open.
+        assert runtime.begin_request()
+
+        exit_task = asyncio.create_task(
+            runtime.exit_mode(
+                "fallback", publish=lambda: published.__setitem__("mode", "fallback")
+            )
+        )
+        await asyncio.sleep(0)
+        assert runtime.status == "draining"
+
+        async def waiting_dispatch() -> str:
+            # Mirrors server._passthrough_with_claude_balanced's transition-await
+            # branch: wait, then re-read the published mode.
+            await runtime.wait_for_transition()
+            return published["mode"]
+
+        waiter_task = asyncio.create_task(waiting_dispatch())
+        await asyncio.sleep(0)
+        assert not waiter_task.done()  # still awaiting -- draining hasn't resolved
+
+        runtime.end_request()  # the in-flight request finishes -> drain completes
+        target_mode_seen = await asyncio.wait_for(waiter_task, timeout=5.0)
+        await asyncio.wait_for(exit_task, timeout=5.0)
+        assert runtime.status == "disabled"
+        return target_mode_seen
+
+    assert asyncio.run(scenario()) == "fallback"
+
+
+def test_balanced_graceful_shutdown_preserves_epoch_and_pin_for_restart(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Step 9: two lifespan-backed app instances over the same pool directory.
+    Closing the first (settings still "balanced") preserves the epoch id, seed,
+    and durable pin for the second's automatic startup restoration -- contrast
+    `TestBalancedRoutingExit`, where an INTENTIONAL exit invalidates that very
+    same state instead.
+    """
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.delenv("CLAUDEX_CLAUDE_ACCOUNT_ROUTING", raising=False)
+    _register_balanced_ready_account()
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"id": "msg_1"})
+
+    settings_file = tmp_path / "settings.json"
+    first_config = GatewayConfig(settings_file=settings_file)
+    with _create_test_client(
+        monkeypatch, config=first_config, base_url="http://127.0.0.1:8787"
+    ) as client:
+        client.app.state.http_client = httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        )
+        enable = client.put(
+            "/admin/providers/claude/pool/routing", json={"mode": "balanced"}
+        )
+        assert enable.status_code == 200
+        first_runtime = client.app.state.claude_balanced_runtime
+        epoch_id_1 = first_runtime.epoch_id
+        seed_1 = first_runtime.epoch_seed
+
+        pinned = client.post("/v1/messages", json=_account_body())
+        assert pinned.status_code == 200
+        assert first_runtime.router is not None
+        assert first_runtime.router.pin_count() == 1
+
+    # The first instance's lifespan has shut down (shutdown_preserving_epoch,
+    # then the T-9 lease released) -- a second, independent app instance loads
+    # the SAME settings file and pool directory (HOME unchanged) and restores
+    # them automatically at startup.
+    second_config = GatewayConfig.load(settings_file)
+    assert second_config.claude_account_routing_mode == "balanced"
+    with _create_test_client(
+        monkeypatch, config=second_config, base_url="http://127.0.0.1:8787"
+    ) as client:
+        second_runtime = client.app.state.claude_balanced_runtime
+        assert second_runtime.status == "active"
+        assert second_runtime.epoch_id == epoch_id_1
+        assert second_runtime.epoch_seed == seed_1
+        assert second_runtime.router is not None
+        assert second_runtime.router.pin_count() == 1
+        payload = client.get("/admin/providers/claude/pool/routing").json()
+
+    assert payload == {"mode": "balanced", "env_locked": False}
