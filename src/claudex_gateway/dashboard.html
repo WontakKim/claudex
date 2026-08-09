@@ -1595,7 +1595,7 @@ document.getElementById("btn-local-refresh").addEventListener("click",function()
    a 1s poll drives the modal. The body re-renders only when the session
    status materially changes — an unconditional re-render would wipe the code
    input every second; the countdown ticks via textContent. */
-var LOGIN={timer:null,lastKey:null,failures:0,attemptId:null,existingAccountId:null};
+var LOGIN={timer:null,lastKey:null,failures:0,attemptId:null,existingAccountId:null,openGeneration:0};
 function loginStateKey(st){
   return[st.status,st.url||"",st.email||"",st.error||"",st.detail||"",st.code_prompt_detected?"1":"0"].join("|");
 }
@@ -1618,6 +1618,9 @@ function stopLoginPolling(){
 }
 function closeLoginModal(){
   stopLoginPolling();
+  // Invalidate any in-flight modal-open callback: an adoption that lands
+  // after the close must not resurrect the modal with an old attempt.
+  LOGIN.openGeneration++;
   LOGIN.attemptId=null;LOGIN.existingAccountId=null;
   document.getElementById("login-modal").classList.remove("open");
 }
@@ -1640,9 +1643,14 @@ function adoptLoginAttempt(attemptId){
   pollLogin();
 }
 function openLoginModal(){
+  // Adoption callbacks are pinned to this open operation: a delayed
+  // response from an overlapping (or since-closed) open must not adopt
+  // its attempt over the one the latest open established.
+  var generation=++LOGIN.openGeneration;
   jfetch("/admin/providers/claude/login",{
     method:"POST",headers:{"Content-Type":"application/json"},body:"{}"
   }).then(function(r){
+    if(generation!==LOGIN.openGeneration)return;
     var code=r.body&&r.body.error&&r.body.error.code;
     if(r.ok){
       adoptLoginAttempt(r.body&&r.body.attempt_id);
@@ -1652,6 +1660,7 @@ function openLoginModal(){
     // session — attach to it via a bare discovery GET instead of erroring.
     if(r.status===409&&code==="login-active"){
       jfetch("/admin/providers/claude/login").then(function(g){
+        if(generation!==LOGIN.openGeneration)return;
         if(g.ok&&g.body&&g.body.attempt_id){
           adoptLoginAttempt(g.body.attempt_id);
           return;
@@ -1659,6 +1668,7 @@ function openLoginModal(){
         showToast('<span class="chip chip-err">ERROR</span><br>계정 추가'+
           '<br><span class="dim">활성 로그인 세션에 연결할 수 없습니다.</span>',true);
       }).catch(function(){
+        if(generation!==LOGIN.openGeneration)return;
         showToast('<span class="chip chip-err">ERROR</span><br>계정 추가<br><span class="dim">gateway unreachable</span>',true);
       });
       return;
@@ -1666,6 +1676,7 @@ function openLoginModal(){
     showToast('<span class="chip chip-err">'+(r.status===409?"LOCKED":"ERROR")+'</span><span class="lat">'+r.status+
       '</span><br>계정 추가<br><span class="dim">'+esc(errDetail(r.body))+"</span>",true);
   }).catch(function(){
+    if(generation!==LOGIN.openGeneration)return;
     showToast('<span class="chip chip-err">ERROR</span><br>계정 추가<br><span class="dim">gateway unreachable</span>',true);
   });
 }
