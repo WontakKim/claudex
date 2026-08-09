@@ -755,13 +755,51 @@ def test_account_use_identified_daemon_puts_through_admin_api(
     assert calls == [
         {
             "method": "PUT",
-            "path": "/admin/claude-account",
+            "path": "/admin/providers/claude/pool/serving",
             "json_body": {"account_id": record.id},
         }
     ]
     assert f"({record.id})" in capsys.readouterr().out
     # The daemon persisted the change through the admin API; the CLI must
     # not also write the settings file behind its back.
+    assert not _settings_path().exists()
+
+
+def test_account_use_off_identified_daemon_deletes_through_admin_api(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _stub_probe(monkeypatch, gateway_main.ProbeOutcome.IDENTIFIED)
+    calls: list[dict[str, object]] = []
+
+    def fake_admin_request(
+        host: str,
+        port: int,
+        method: str,
+        path: str,
+        *,
+        local_token: str | None,
+        json_body: dict[str, object] | None = None,
+    ) -> "gateway_main._AdminHttpResponse":
+        calls.append({"method": method, "path": path, "json_body": json_body})
+        return gateway_main._AdminHttpResponse(
+            status=200,
+            body={"account_id": None, "env_locked": False},
+            detail="",
+        )
+
+    monkeypatch.setattr(gateway_main, "_admin_request", fake_admin_request)
+
+    exit_code = gateway_main._account_main(["use", "off"])
+
+    assert exit_code == 0
+    assert calls == [
+        {
+            "method": "DELETE",
+            "path": "/admin/providers/claude/pool/serving",
+            "json_body": None,
+        }
+    ]
+    assert "account use: off" in capsys.readouterr().out
     assert not _settings_path().exists()
 
 

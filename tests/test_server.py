@@ -2627,7 +2627,7 @@ def test_transport_error_during_aggregation_returns_claude_502(
 
 
 class TestAdminMappingApi:
-    """GET/PUT /admin/mapping — runtime map changes persisted to settings.json."""
+    """GET/PUT /admin/settings/mapping — runtime map changes persisted to settings.json."""
 
     @staticmethod
     def _admin_client(
@@ -2648,7 +2648,7 @@ class TestAdminMappingApi:
         with self._admin_client(
             monkeypatch, tmp_path, model_map={"haiku": "codex:gpt-5.6-luna"}
         ) as client:
-            response = client.get("/admin/mapping")
+            response = client.get("/admin/settings/mapping")
 
         assert response.status_code == 200
         assert response.json()["model_map"] == {"haiku": "codex:gpt-5.6-luna"}
@@ -2661,10 +2661,10 @@ class TestAdminMappingApi:
         settings_file.write_text('{"port": 9317}', encoding="utf-8")
         with self._admin_client(monkeypatch, tmp_path) as client:
             response = client.put(
-                "/admin/mapping", json={"model_map": {"opus": "codex:gpt-5.6-sol"}}
+                "/admin/settings/mapping", json={"model_map": {"opus": "codex:gpt-5.6-sol"}}
             )
             # The swap is live for later requests ...
-            reread = client.get("/admin/mapping")
+            reread = client.get("/admin/settings/mapping")
 
         assert response.status_code == 200
         assert response.json()["model_map"] == {"opus": "codex:gpt-5.6-sol"}
@@ -2679,7 +2679,7 @@ class TestAdminMappingApi:
         monkeypatch.setenv("CLAUDEX_MODEL_MAP", '{"haiku": "codex:gpt-5.6-luna"}')
         with self._admin_client(monkeypatch, tmp_path) as client:
             response = client.put(
-                "/admin/mapping", json={"model_map": {"opus": "codex:gpt-5.6-sol"}}
+                "/admin/settings/mapping", json={"model_map": {"opus": "codex:gpt-5.6-sol"}}
             )
 
         assert response.status_code == 409
@@ -2691,7 +2691,7 @@ class TestAdminMappingApi:
     ) -> None:
         with self._admin_client(monkeypatch, tmp_path) as client:
             response = client.put(
-                "/admin/mapping",
+                "/admin/settings/mapping",
                 content='{"model_map": {}}',
                 headers={"content-type": "text/plain"},
             )
@@ -2701,7 +2701,7 @@ class TestAdminMappingApi:
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         with self._admin_client(monkeypatch, tmp_path) as client:
-            response = client.put("/admin/mapping", json={"model_map": {"": "x"}})
+            response = client.put("/admin/settings/mapping", json={"model_map": {"": "x"}})
         assert response.status_code == 400
         assert "non-empty strings" in response.json()["error"]["message"]
 
@@ -2711,16 +2711,16 @@ class TestAdminMappingApi:
         monkeypatch.delenv("CLAUDEX_MODEL_MAP", raising=False)
         with self._admin_client(monkeypatch, tmp_path) as client:
             accepted = client.put(
-                "/admin/mapping", json={"model_map": {"opus": "kimi:k2.5"}}
+                "/admin/settings/mapping", json={"model_map": {"opus": "kimi:k2.5"}}
             )
             bare_value = client.put(
-                "/admin/mapping", json={"model_map": {"opus": "gpt-5.6-sol"}}
+                "/admin/settings/mapping", json={"model_map": {"opus": "gpt-5.6-sol"}}
             )
             empty_model = client.put(
-                "/admin/mapping", json={"model_map": {"opus": "kimi:"}}
+                "/admin/settings/mapping", json={"model_map": {"opus": "kimi:"}}
             )
             unknown_prefix = client.put(
-                "/admin/mapping", json={"model_map": {"opus": "kim:k2.5"}}
+                "/admin/settings/mapping", json={"model_map": {"opus": "kim:k2.5"}}
             )
 
         assert accepted.status_code == 200
@@ -2736,8 +2736,8 @@ class TestAdminMappingApi:
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         with self._admin_client(monkeypatch, tmp_path) as client:
-            assert client.put("/admin/mapping", json={"bogus": {}}).status_code == 400
-            assert client.put("/admin/mapping", json={}).status_code == 400
+            assert client.put("/admin/settings/mapping", json={"bogus": {}}).status_code == 400
+            assert client.put("/admin/settings/mapping", json={}).status_code == 400
 
     def test_admin_refuses_foreign_host_header(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -2745,7 +2745,7 @@ class TestAdminMappingApi:
         config = GatewayConfig(settings_file=tmp_path / "settings.json")
         # Default base_url keeps the Host header at "testserver".
         with _create_test_client(monkeypatch, config=config) as client:
-            response = client.get("/admin/mapping")
+            response = client.get("/admin/settings/mapping")
         assert response.status_code == 403
         assert "DNS-rebinding" in response.json()["error"]["message"]
 
@@ -2753,9 +2753,9 @@ class TestAdminMappingApi:
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         with self._admin_client(monkeypatch, tmp_path, local_token="secret") as client:
-            assert client.get("/admin/mapping").status_code == 401
+            assert client.get("/admin/settings/mapping").status_code == 401
             response = client.get(
-                "/admin/mapping", headers={"Authorization": "Bearer secret"}
+                "/admin/settings/mapping", headers={"Authorization": "Bearer secret"}
             )
         assert response.status_code == 200
 
@@ -2764,7 +2764,7 @@ class TestAdminMappingApi:
     ) -> None:
         monkeypatch.setenv("CLAUDEX_MODEL_MAP", '{"haiku": "codex:gpt-5.6-luna"}')
         with self._admin_client(monkeypatch, tmp_path) as client:
-            payload = client.get("/admin/mapping").json()
+            payload = client.get("/admin/settings/mapping").json()
 
         assert payload["env_locked"] == {"model_map": "CLAUDEX_MODEL_MAP"}
         assert payload["codex_home"].endswith(".codex")
@@ -2773,7 +2773,7 @@ class TestAdminMappingApi:
 
 
 class TestAdminLogLevel:
-    """GET/PUT /admin/log-level — runtime log level applied and persisted."""
+    """GET/PUT /admin/settings/log-level — runtime log level applied and persisted."""
 
     @staticmethod
     def _admin_client(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> TestClient:
@@ -2787,7 +2787,7 @@ class TestAdminLogLevel:
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         with self._admin_client(monkeypatch, tmp_path) as client:
-            payload = client.get("/admin/log-level").json()
+            payload = client.get("/admin/settings/log-level").json()
 
         assert payload == {
             "log_level": "info",
@@ -2804,8 +2804,8 @@ class TestAdminLogLevel:
         }
         try:
             with self._admin_client(monkeypatch, tmp_path) as client:
-                response = client.put("/admin/log-level", json={"log_level": "debug"})
-                reread = client.get("/admin/log-level")
+                response = client.put("/admin/settings/log-level", json={"log_level": "debug"})
+                reread = client.get("/admin/settings/log-level")
 
             assert response.status_code == 200
             assert response.json()["log_level"] == "debug"
@@ -2826,7 +2826,7 @@ class TestAdminLogLevel:
         with _create_test_client(
             monkeypatch, config=config, base_url="http://127.0.0.1:8787"
         ) as client:
-            response = client.put("/admin/log-level", json={"log_level": "debug"})
+            response = client.put("/admin/settings/log-level", json={"log_level": "debug"})
 
         assert response.status_code == 409
         assert "CLAUDEX_LOG_LEVEL" in response.json()["error"]["message"]
@@ -2836,12 +2836,12 @@ class TestAdminLogLevel:
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         with self._admin_client(monkeypatch, tmp_path) as client:
-            assert client.put("/admin/log-level", json={"log_level": "loud"}).status_code == 400
-            assert client.put("/admin/log-level", json={}).status_code == 400
+            assert client.put("/admin/settings/log-level", json={"log_level": "loud"}).status_code == 400
+            assert client.put("/admin/settings/log-level", json={}).status_code == 400
 
 
 class TestAdminCompactionApi:
-    """GET/PUT /admin/compaction — compaction reroute target, mirroring /admin/mapping."""
+    """GET/PUT /admin/settings/compaction — compaction reroute target, mirroring /admin/settings/mapping."""
 
     @staticmethod
     def _admin_client(
@@ -2861,7 +2861,7 @@ class TestAdminCompactionApi:
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         with self._admin_client(monkeypatch, tmp_path) as client:
-            payload = client.get("/admin/compaction").json()
+            payload = client.get("/admin/settings/compaction").json()
 
         assert payload == {"model": None, "env_locked": False, "last_reroute": None}
 
@@ -2871,7 +2871,7 @@ class TestAdminCompactionApi:
         with self._admin_client(
             monkeypatch, tmp_path, compaction_model="claude:claude-opus-5"
         ) as client:
-            payload = client.get("/admin/compaction").json()
+            payload = client.get("/admin/settings/compaction").json()
 
         assert payload == {
             "model": "claude:claude-opus-5",
@@ -2892,7 +2892,7 @@ class TestAdminCompactionApi:
                 context_window=4000,
                 detail=None,
             )
-            payload = client.get("/admin/compaction").json()
+            payload = client.get("/admin/settings/compaction").json()
 
         last_reroute = payload["last_reroute"]
         assert set(last_reroute) == _pinned_reroute_record_keys()
@@ -2913,7 +2913,7 @@ class TestAdminCompactionApi:
         with _create_test_client(
             monkeypatch, config=config, base_url="http://127.0.0.1:8787"
         ) as client:
-            payload = client.get("/admin/compaction").json()
+            payload = client.get("/admin/settings/compaction").json()
 
         assert payload["env_locked"] is True
 
@@ -2925,7 +2925,7 @@ class TestAdminCompactionApi:
         with _create_test_client(
             monkeypatch, config=config, base_url="http://127.0.0.1:8787"
         ) as client:
-            payload = client.get("/admin/compaction").json()
+            payload = client.get("/admin/settings/compaction").json()
 
         assert payload["env_locked"] is True
 
@@ -2938,9 +2938,9 @@ class TestAdminCompactionApi:
         settings_file.write_text('{"port": 9317}', encoding="utf-8")
         with self._admin_client(monkeypatch, tmp_path) as client:
             response = client.put(
-                "/admin/compaction", json={"model": "claude:claude-opus-5"}
+                "/admin/settings/compaction", json={"model": "claude:claude-opus-5"}
             )
-            reread = client.get("/admin/compaction")
+            reread = client.get("/admin/settings/compaction")
 
         assert response.status_code == 200
         assert response.json() == {
@@ -2956,9 +2956,9 @@ class TestAdminCompactionApi:
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         with self._admin_client(monkeypatch, tmp_path) as client:
-            client.put("/admin/compaction", json={"model": "claude:claude-opus-5"})
+            client.put("/admin/settings/compaction", json={"model": "claude:claude-opus-5"})
             assert client.app.state.config.compaction_model == "claude:claude-opus-5"
-            reread = client.get("/admin/compaction")
+            reread = client.get("/admin/settings/compaction")
 
         assert reread.json()["model"] == "claude:claude-opus-5"
 
@@ -2973,8 +2973,8 @@ class TestAdminCompactionApi:
         with self._admin_client(
             monkeypatch, tmp_path, compaction_model="claude:claude-old-5"
         ) as client:
-            response = client.put("/admin/compaction", json={"model": None})
-            reread = client.get("/admin/compaction")
+            response = client.put("/admin/settings/compaction", json={"model": None})
+            reread = client.get("/admin/settings/compaction")
 
         assert response.status_code == 200
         assert response.json() == {"model": None, "env_locked": False, "last_reroute": None}
@@ -3005,7 +3005,7 @@ class TestAdminCompactionApi:
         client.app.state.admin_lock = asyncio.Lock()
         client.base_url = "http://127.0.0.1:8787"
 
-        enable = client.put("/admin/compaction", json={"model": "claude:claude-opus-5"})
+        enable = client.put("/admin/settings/compaction", json={"model": "claude:claude-opus-5"})
         assert enable.status_code == 200
 
         rerouted = client.post(
@@ -3015,7 +3015,7 @@ class TestAdminCompactionApi:
         assert len(captured) == 1
         assert stub.payloads == []
 
-        disable = client.put("/admin/compaction", json={"model": None})
+        disable = client.put("/admin/settings/compaction", json={"model": None})
         assert disable.status_code == 200
 
         not_rerouted = client.post(
@@ -3039,7 +3039,7 @@ class TestAdminCompactionApi:
             monkeypatch, tmp_path, compaction_model="claude:claude-opus-5"
         ) as client:
             response = client.put(
-                "/admin/compaction",
+                "/admin/settings/compaction",
                 content='{"model": null}',
                 headers={"content-type": "text/plain"},
             )
@@ -3057,7 +3057,7 @@ class TestAdminCompactionApi:
         with self._admin_client(
             monkeypatch, tmp_path, compaction_model="claude:claude-opus-5"
         ) as client:
-            response = client.put("/admin/compaction", json={})
+            response = client.put("/admin/settings/compaction", json={})
             config_after = client.app.state.config
         assert response.status_code == 400
         assert json.loads(settings_file.read_text(encoding="utf-8")) == configured
@@ -3073,7 +3073,7 @@ class TestAdminCompactionApi:
             monkeypatch, tmp_path, compaction_model="claude:claude-opus-5"
         ) as client:
             response = client.put(
-                "/admin/compaction",
+                "/admin/settings/compaction",
                 json={"model": "claude:claude-opus-5", "bogus": True},
             )
             config_after = client.app.state.config
@@ -3087,7 +3087,7 @@ class TestAdminCompactionApi:
     ) -> None:
         settings_file = tmp_path / "settings.json"
         with self._admin_client(monkeypatch, tmp_path) as client:
-            response = client.put("/admin/compaction", json={"model": "gpt-5"})
+            response = client.put("/admin/settings/compaction", json={"model": "gpt-5"})
             config_after = client.app.state.config
 
         assert response.status_code == 400
@@ -3107,7 +3107,7 @@ class TestAdminCompactionApi:
         with self._admin_client(
             monkeypatch, tmp_path, compaction_model="claude:claude-opus-5"
         ) as client:
-            response = client.put("/admin/compaction", json={"model": value})
+            response = client.put("/admin/settings/compaction", json={"model": value})
             config_after = client.app.state.config
         assert response.status_code == 400
         assert json.loads(settings_file.read_text(encoding="utf-8")) == configured
@@ -3119,14 +3119,14 @@ class TestAdminCompactionApi:
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         with self._admin_client(monkeypatch, tmp_path, local_token="secret") as client:
-            assert client.get("/admin/compaction").status_code == 401
+            assert client.get("/admin/settings/compaction").status_code == 401
 
     def test_get_rejects_wrong_bearer_token(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         with self._admin_client(monkeypatch, tmp_path, local_token="secret") as client:
             response = client.get(
-                "/admin/compaction", headers={"Authorization": "Bearer wrong"}
+                "/admin/settings/compaction", headers={"Authorization": "Bearer wrong"}
             )
         assert response.status_code == 401
 
@@ -3135,7 +3135,7 @@ class TestAdminCompactionApi:
     ) -> None:
         with self._admin_client(monkeypatch, tmp_path, local_token="secret") as client:
             response = client.get(
-                "/admin/compaction", headers={"Authorization": "Bearer secret"}
+                "/admin/settings/compaction", headers={"Authorization": "Bearer secret"}
             )
         assert response.status_code == 200
 
@@ -3146,7 +3146,7 @@ class TestAdminCompactionApi:
         # Default base_url keeps the Host header at "testserver".
         with _create_test_client(monkeypatch, config=config) as client:
             response = client.get(
-                "/admin/compaction", headers={"Authorization": "Bearer secret"}
+                "/admin/settings/compaction", headers={"Authorization": "Bearer secret"}
             )
         assert response.status_code == 403
 
@@ -3154,7 +3154,7 @@ class TestAdminCompactionApi:
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         with self._admin_client(monkeypatch, tmp_path, local_token="secret") as client:
-            response = client.put("/admin/compaction", json={"model": None})
+            response = client.put("/admin/settings/compaction", json={"model": None})
             config_after = client.app.state.config
         assert response.status_code == 401
         assert not (tmp_path / "settings.json").exists()
@@ -3165,7 +3165,7 @@ class TestAdminCompactionApi:
     ) -> None:
         with self._admin_client(monkeypatch, tmp_path, local_token="secret") as client:
             response = client.put(
-                "/admin/compaction",
+                "/admin/settings/compaction",
                 json={"model": "claude:claude-opus-5"},
                 headers={"Authorization": "Bearer wrong"},
             )
@@ -3179,7 +3179,7 @@ class TestAdminCompactionApi:
     ) -> None:
         with self._admin_client(monkeypatch, tmp_path, local_token="secret") as client:
             response = client.put(
-                "/admin/compaction",
+                "/admin/settings/compaction",
                 json={"model": "claude:claude-opus-5"},
                 headers={"Authorization": "Bearer secret"},
             )
@@ -3191,7 +3191,7 @@ class TestAdminCompactionApi:
         config = GatewayConfig(settings_file=tmp_path / "settings.json", local_token="secret")
         with _create_test_client(monkeypatch, config=config) as client:
             response = client.put(
-                "/admin/compaction",
+                "/admin/settings/compaction",
                 json={"model": "claude:claude-opus-5"},
                 headers={"Authorization": "Bearer secret"},
             )
@@ -3211,7 +3211,7 @@ class TestAdminCompactionApi:
             monkeypatch, config=config, base_url="http://127.0.0.1:8787"
         ) as client:
             response = client.put(
-                "/admin/compaction", json={"model": "claude:claude-opus-5"}
+                "/admin/settings/compaction", json={"model": "claude:claude-opus-5"}
             )
             config_after = client.app.state.config
 
@@ -3228,7 +3228,7 @@ class TestAdminCompactionApi:
         with _create_test_client(
             monkeypatch, config=config, base_url="http://127.0.0.1:8787"
         ) as client:
-            response = client.put("/admin/compaction", json={"model": None})
+            response = client.put("/admin/settings/compaction", json={"model": None})
             config_after = client.app.state.config
 
         assert response.status_code == 409
@@ -3247,7 +3247,7 @@ class TestAdminCompactionApi:
         with self._admin_client(monkeypatch, tmp_path) as client:
             monkeypatch.setattr(server, "update_settings_file", boom)
             response = client.put(
-                "/admin/compaction", json={"model": "claude:claude-opus-5"}
+                "/admin/settings/compaction", json={"model": "claude:claude-opus-5"}
             )
             config_after = client.app.state.config
 
@@ -3260,8 +3260,8 @@ class TestAdminCompactionApi:
 
 
 class TestAdminClaudeAccountApi:
-    """GET/PUT /admin/claude-account — serving-account selection, mirroring
-    /admin/compaction. The shared bearer/Host guard paths are exhaustively
+    """GET/PUT /admin/providers/claude/pool/serving — serving-account selection, mirroring
+    /admin/settings/compaction. The shared bearer/Host guard paths are exhaustively
     covered by the compaction tests; here one auth check pins the guard is
     wired at all, and the rest exercises the account-specific logic."""
 
@@ -3284,7 +3284,7 @@ class TestAdminClaudeAccountApi:
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         with self._admin_client(monkeypatch, tmp_path) as client:
-            payload = client.get("/admin/claude-account").json()
+            payload = client.get("/admin/providers/claude/pool/serving").json()
 
         assert payload == {"account_id": None, "env_locked": False}
 
@@ -3294,7 +3294,7 @@ class TestAdminClaudeAccountApi:
         with self._admin_client(
             monkeypatch, tmp_path, claude_account_id=self._ACCOUNT_ID
         ) as client:
-            payload = client.get("/admin/claude-account").json()
+            payload = client.get("/admin/providers/claude/pool/serving").json()
 
         assert payload == {"account_id": self._ACCOUNT_ID, "env_locked": False}
 
@@ -3303,7 +3303,7 @@ class TestAdminClaudeAccountApi:
     ) -> None:
         with self._admin_client(monkeypatch, tmp_path) as client:
             monkeypatch.setenv("CLAUDEX_CLAUDE_ACCOUNT_ID", "")
-            payload = client.get("/admin/claude-account").json()
+            payload = client.get("/admin/providers/claude/pool/serving").json()
 
         assert payload["env_locked"] is True
 
@@ -3315,9 +3315,9 @@ class TestAdminClaudeAccountApi:
         with self._admin_client(monkeypatch, tmp_path) as client:
             account_id = _register_serving_account()
             response = client.put(
-                "/admin/claude-account", json={"account_id": account_id}
+                "/admin/providers/claude/pool/serving", json={"account_id": account_id}
             )
-            reread = client.get("/admin/claude-account")
+            reread = client.get("/admin/providers/claude/pool/serving")
             config_after = client.app.state.config
 
         assert response.status_code == 200
@@ -3327,7 +3327,7 @@ class TestAdminClaudeAccountApi:
         saved = json.loads(settings_file.read_text(encoding="utf-8"))
         assert saved == {"port": 9317, "claude_account.id": account_id}
 
-    def test_put_null_clears_the_setting_key(
+    def test_put_null_is_rejected_pointing_at_delete(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         settings_file = tmp_path / "settings.json"
@@ -3337,20 +3337,47 @@ class TestAdminClaudeAccountApi:
         with self._admin_client(
             monkeypatch, tmp_path, claude_account_id=self._ACCOUNT_ID
         ) as client:
-            response = client.put("/admin/claude-account", json={"account_id": None})
+            response = client.put("/admin/providers/claude/pool/serving", json={"account_id": None})
+            config_after = client.app.state.config
+
+        assert response.status_code == 400
+        assert "DELETE" in response.json()["error"]["message"]
+        assert config_after.claude_account_id == self._ACCOUNT_ID
+        assert "claude_account.id" in json.loads(settings_file.read_text())
+
+    def test_delete_clears_the_setting_key(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        settings_file = tmp_path / "settings.json"
+        settings_file.write_text(
+            json.dumps({"claude_account.id": self._ACCOUNT_ID}), encoding="utf-8"
+        )
+        with self._admin_client(
+            monkeypatch, tmp_path, claude_account_id=self._ACCOUNT_ID
+        ) as client:
+            response = client.delete("/admin/providers/claude/pool/serving")
             config_after = client.app.state.config
 
         assert response.status_code == 200
-        assert response.json()["account_id"] is None
+        assert response.json() == {"account_id": None, "env_locked": False}
         assert config_after.claude_account_id is None
         assert "claude_account.id" not in json.loads(settings_file.read_text())
+
+    def test_delete_when_already_clear_is_a_no_op_200(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        with self._admin_client(monkeypatch, tmp_path) as client:
+            response = client.delete("/admin/providers/claude/pool/serving")
+
+        assert response.status_code == 200
+        assert response.json() == {"account_id": None, "env_locked": False}
 
     def test_put_unregistered_account_is_rejected(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         with self._admin_client(monkeypatch, tmp_path) as client:
             response = client.put(
-                "/admin/claude-account", json={"account_id": self._ACCOUNT_ID}
+                "/admin/providers/claude/pool/serving", json={"account_id": self._ACCOUNT_ID}
             )
             config_after = client.app.state.config
 
@@ -3366,7 +3393,7 @@ class TestAdminClaudeAccountApi:
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, value: Any
     ) -> None:
         with self._admin_client(monkeypatch, tmp_path) as client:
-            response = client.put("/admin/claude-account", json={"account_id": value})
+            response = client.put("/admin/providers/claude/pool/serving", json={"account_id": value})
 
         assert response.status_code == 400
 
@@ -3374,8 +3401,8 @@ class TestAdminClaudeAccountApi:
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         with self._admin_client(monkeypatch, tmp_path) as client:
-            unknown = client.put("/admin/claude-account", json={"account": "x"})
-            missing = client.put("/admin/claude-account", json={})
+            unknown = client.put("/admin/providers/claude/pool/serving", json={"account": "x"})
+            missing = client.put("/admin/providers/claude/pool/serving", json={})
 
         assert unknown.status_code == 400
         assert missing.status_code == 400
@@ -3384,8 +3411,11 @@ class TestAdminClaudeAccountApi:
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         with self._admin_client(monkeypatch, tmp_path) as client:
+            account_id = _register_serving_account()
             monkeypatch.setenv("CLAUDEX_CLAUDE_ACCOUNT_ID", self._ACCOUNT_ID)
-            response = client.put("/admin/claude-account", json={"account_id": None})
+            response = client.put(
+                "/admin/providers/claude/pool/serving", json={"account_id": account_id}
+            )
             config_after = client.app.state.config
 
         assert response.status_code == 409
@@ -3393,18 +3423,141 @@ class TestAdminClaudeAccountApi:
         assert not (tmp_path / "settings.json").exists()
         assert config_after.claude_account_id is None
 
+    def test_delete_rejected_when_env_locked(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        with self._admin_client(
+            monkeypatch, tmp_path, claude_account_id=self._ACCOUNT_ID
+        ) as client:
+            monkeypatch.setenv("CLAUDEX_CLAUDE_ACCOUNT_ID", self._ACCOUNT_ID)
+            response = client.delete("/admin/providers/claude/pool/serving")
+            config_after = client.app.state.config
+
+        assert response.status_code == 409
+        assert "CLAUDEX_CLAUDE_ACCOUNT_ID" in response.json()["error"]["message"]
+        assert not (tmp_path / "settings.json").exists()
+        assert config_after.claude_account_id == self._ACCOUNT_ID
+
     def test_endpoints_require_local_token_when_configured(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         with self._admin_client(monkeypatch, tmp_path, local_token="secret") as client:
-            get_response = client.get("/admin/claude-account")
+            get_response = client.get("/admin/providers/claude/pool/serving")
             put_response = client.put(
-                "/admin/claude-account", json={"account_id": None}
+                "/admin/providers/claude/pool/serving", json={"account_id": None}
             )
 
         assert get_response.status_code == 401
         assert put_response.status_code == 401
         assert not (tmp_path / "settings.json").exists()
+
+
+class TestAdminClaudeRoutingApi:
+    """GET/PUT /admin/providers/claude/pool/routing — the pool policy document."""
+
+    @staticmethod
+    def _admin_client(
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        **config_kwargs: Any,
+    ) -> TestClient:
+        monkeypatch.delenv("CLAUDEX_CLAUDE_ACCOUNT_ROUTING", raising=False)
+        monkeypatch.setenv("HOME", str(tmp_path / "home"))
+        config = GatewayConfig(settings_file=tmp_path / "settings.json", **config_kwargs)
+        return _create_test_client(
+            monkeypatch, config=config, base_url="http://127.0.0.1:8787"
+        )
+
+    def test_get_defaults_to_disabled(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        with self._admin_client(monkeypatch, tmp_path) as client:
+            payload = client.get("/admin/providers/claude/pool/routing").json()
+
+        assert payload == {"mode": "disabled", "env_locked": False}
+
+    def test_put_fallback_persists_the_policy_document_and_hot_swaps(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        settings_file = tmp_path / "settings.json"
+        with self._admin_client(monkeypatch, tmp_path) as client:
+            response = client.put(
+                "/admin/providers/claude/pool/routing", json={"mode": "fallback"}
+            )
+            config_after = client.app.state.config
+
+        assert response.status_code == 200
+        assert response.json() == {"mode": "fallback", "env_locked": False}
+        assert config_after.claude_account_routing_mode == "fallback"
+        saved = json.loads(settings_file.read_text(encoding="utf-8"))
+        assert saved == {"claude_account.routing": {"mode": "fallback"}}
+
+    def test_put_disabled_removes_the_settings_key(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        settings_file = tmp_path / "settings.json"
+        settings_file.write_text(
+            json.dumps({"claude_account.routing": {"mode": "fallback"}}),
+            encoding="utf-8",
+        )
+        with self._admin_client(
+            monkeypatch, tmp_path, claude_account_routing_mode="fallback"
+        ) as client:
+            response = client.put(
+                "/admin/providers/claude/pool/routing", json={"mode": "disabled"}
+            )
+            config_after = client.app.state.config
+
+        assert response.status_code == 200
+        assert response.json() == {"mode": "disabled", "env_locked": False}
+        assert config_after.claude_account_routing_mode == "disabled"
+        assert "claude_account.routing" not in json.loads(settings_file.read_text())
+
+    def test_put_balanced_is_rejected_as_not_implemented(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        with self._admin_client(monkeypatch, tmp_path) as client:
+            response = client.put(
+                "/admin/providers/claude/pool/routing", json={"mode": "balanced"}
+            )
+
+        assert response.status_code == 400
+        assert "not implemented yet" in response.json()["error"]["message"]
+        assert not (tmp_path / "settings.json").exists()
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            {},
+            {"mode": "round-robin"},
+            {"mode": None},
+            {"mode": True},
+            {"mode": "fallback", "weights": [1]},
+        ],
+    )
+    def test_put_garbage_is_rejected(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, body: dict[str, Any]
+    ) -> None:
+        with self._admin_client(monkeypatch, tmp_path) as client:
+            response = client.put("/admin/providers/claude/pool/routing", json=body)
+
+        assert response.status_code == 400, body
+        assert not (tmp_path / "settings.json").exists()
+
+    def test_put_rejected_when_env_locked(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        with self._admin_client(monkeypatch, tmp_path) as client:
+            monkeypatch.setenv("CLAUDEX_CLAUDE_ACCOUNT_ROUTING", '{"mode": "fallback"}')
+            response = client.put(
+                "/admin/providers/claude/pool/routing", json={"mode": "disabled"}
+            )
+            locked = client.get("/admin/providers/claude/pool/routing").json()
+
+        assert response.status_code == 409
+        assert "CLAUDEX_CLAUDE_ACCOUNT_ROUTING" in response.json()["error"]["message"]
+        assert not (tmp_path / "settings.json").exists()
+        assert locked["env_locked"] is True
 
 
 def test_admin_logs_returns_recent_records(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -3518,7 +3671,7 @@ def test_admin_reset_credit_returns_the_backend_outcome(
         monkeypatch, [{"status": "ok", "outcome": "reset", "error": None}]
     )
     with _create_test_client(monkeypatch, base_url="http://127.0.0.1:8787") as client:
-        response = client.post("/admin/codex/reset-credit", json={})
+        response = client.post("/admin/providers/codex/reset-credit", json={})
 
     assert response.status_code == 200
     assert response.json() == {"status": "ok", "outcome": "reset", "error": None}
@@ -3542,7 +3695,7 @@ def test_admin_reset_credit_reuses_the_key_until_an_attempt_settles(
     )
     with _create_test_client(monkeypatch, base_url="http://127.0.0.1:8787") as client:
         for _ in range(4):
-            assert client.post("/admin/codex/reset-credit", json={}).status_code == 200
+            assert client.post("/admin/providers/codex/reset-credit", json={}).status_code == 200
 
     assert keys[0] == keys[1] == keys[2], "unsettled attempts must retry the same key"
     assert keys[3] != keys[2], "a settled attempt must not reuse its key"
@@ -3558,16 +3711,16 @@ def test_admin_reset_credit_is_guarded_like_every_other_admin_write(
 
     # Foreign Host header (DNS-rebinding guard).
     with _create_test_client(monkeypatch) as client:
-        assert client.post("/admin/codex/reset-credit", json={}).status_code == 403
+        assert client.post("/admin/providers/codex/reset-credit", json={}).status_code == 403
     # A form post would dodge the CORS preflight, so JSON is required.
     with _create_test_client(monkeypatch, base_url="http://127.0.0.1:8787") as client:
-        assert client.post("/admin/codex/reset-credit", content="x").status_code == 415
+        assert client.post("/admin/providers/codex/reset-credit", content="x").status_code == 415
     # And the local bearer token still applies.
     config = GatewayConfig(local_token="local-secret")
     with _create_test_client(
         monkeypatch, config=config, base_url="http://127.0.0.1:8787"
     ) as client:
-        assert client.post("/admin/codex/reset-credit", json={}).status_code == 401
+        assert client.post("/admin/providers/codex/reset-credit", json={}).status_code == 401
 
 
 def test_admin_reset_credit_is_never_reachable_by_GET(
@@ -3579,7 +3732,7 @@ def test_admin_reset_credit_is_never_reachable_by_GET(
 
     monkeypatch.setattr(server, "consume_codex_reset_credit", must_not_run)
     with _create_test_client(monkeypatch, base_url="http://127.0.0.1:8787") as client:
-        assert client.get("/admin/codex/reset-credit").status_code == 405
+        assert client.get("/admin/providers/codex/reset-credit").status_code == 405
 
 
 def test_dashboard_usage_merged_into_status_cards(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -3724,7 +3877,7 @@ def test_dashboard_served_at_root(monkeypatch: pytest.MonkeyPatch) -> None:
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("text/html")
     assert "Claudex Gateway" in response.text
-    assert "/admin/mapping" in response.text
+    assert "/admin/settings/mapping" in response.text
 
 
 def test_favicon_served_for_browser_probe(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -3813,8 +3966,8 @@ def test_dashboard_board_shows_only_referenced_targets(
     assert 'list="add-catalog"' in page
     # All provider catalogs feed it, so the dashboard depends on the Kimi
     # and Grok endpoints too — not just the Codex one.
-    assert '"/admin/kimi/models"' in page
-    assert '"/admin/grok/models"' in page
+    assert '"/admin/providers/kimi/models"' in page
+    assert '"/admin/providers/grok/models"' in page
 
 
 def _compaction_section(page: str) -> str:
@@ -3848,7 +4001,7 @@ def test_dashboard_compaction_section_marker_and_endpoint_present(
     assert "<!-- compaction-section:end -->" in page
     section = _compaction_section(page)
     assert 'id="compaction-card"' in section
-    assert "/admin/compaction" in page
+    assert "/admin/settings/compaction" in page
 
 
 def test_dashboard_compaction_options_in_pinned_order_without_haiku(
@@ -3905,7 +4058,7 @@ def test_dashboard_compaction_fetched_in_parallel_boot_sequence(
     promise_all = page.index("Promise.all([", boot_start)
     promise_all_end = page.index("]);", promise_all)
     parallel_calls = page[promise_all:promise_all_end]
-    assert 'jfetch("/admin/compaction")' in parallel_calls
+    assert 'jfetch("/admin/settings/compaction")' in parallel_calls
 
 
 def test_dashboard_compaction_keeps_configured_custom_model(
@@ -3924,7 +4077,7 @@ def test_dashboard_compaction_diagnostics_ui_removed_by_design(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # The Settings redesign dropped the last-reroute record from the page:
-    # diagnostics stay reachable through GET /admin/compaction only. Guard
+    # diagnostics stay reachable through GET /admin/settings/compaction only. Guard
     # against the UI quietly returning.
     with _create_test_client(monkeypatch) as client:
         page = client.get("/").text
@@ -3976,7 +4129,7 @@ def test_dashboard_compaction_409_branch_refreshes_via_get_not_error_body(
     assert "errDetail(r.body)" in locked_branch
     # Current state is only ever adopted from a fresh, authenticated GET —
     # never from the 409 response body itself.
-    assert 'jfetch("/admin/compaction")' in locked_branch
+    assert 'jfetch("/admin/settings/compaction")' in locked_branch
 
 
 def test_dashboard_compaction_409_refresh_failure_stays_locked(
@@ -3993,7 +4146,7 @@ def test_dashboard_compaction_409_refresh_failure_stays_locked(
     branch_end = apply_fn.index("if(!r.ok){", branch_start)
     locked_branch = apply_fn[branch_start:branch_end]
 
-    refresh_start = locked_branch.index('jfetch("/admin/compaction")')
+    refresh_start = locked_branch.index('jfetch("/admin/settings/compaction")')
     refresh_branch = locked_branch[refresh_start:]
     # renderCompactionState is guarded on a successful, well-formed envelope.
     guard_at = refresh_branch.index('typeof g.body.env_locked==="boolean"')
@@ -4075,10 +4228,10 @@ def test_dashboard_accounts_fetch_paints_registry_before_usage(
     with _create_test_client(monkeypatch) as client:
         page = client.get("/").text
 
-    assert 'jfetch("/admin/claude-accounts")' in page
-    assert 'jfetch("/admin/claude-accounts/usage")' in page
+    assert 'jfetch("/admin/providers/claude/accounts")' in page
+    assert 'jfetch("/admin/providers/claude/pool/usage")' in page
     assert 'jfetch("/admin/usage?provider=claude")' in page
-    assert "force" not in page.split('jfetch("/admin/claude-accounts/usage")')[1][:200]
+    assert "force" not in page.split('jfetch("/admin/providers/claude/pool/usage")')[1][:200]
     fetch_fn = page[page.index("function fetchAccounts(") :]
     assert fetch_fn.index("renderAcctList()") < fetch_fn.index("fetchAccountUsage()")
     # Data age renders from each result's updated_at.
@@ -4089,12 +4242,12 @@ def test_dashboard_accounts_fetch_paints_registry_before_usage(
 def test_dashboard_serving_selection_reuses_the_singular_admin_endpoint(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # 사용/해제 go through the existing PUT /admin/claude-account; a 409
+    # 사용/해제 go through the existing PUT /admin/providers/claude/pool/serving; a 409
     # env-lock renders the lockband and disables the buttons.
     with _create_test_client(monkeypatch) as client:
         page = client.get("/").text
 
-    assert 'jfetch("/admin/claude-account",{' in page
+    assert 'jfetch("/admin/providers/claude/pool/serving",{' in page
     assert "JSON.stringify({account_id:accountId})" in page
     assert "CLAUDEX_CLAUDE_ACCOUNT_ID" in page
     assert 'id="acct-lockband"' in page
@@ -4112,12 +4265,12 @@ def test_dashboard_login_modal_drives_the_login_endpoints(
         page = client.get("/").text
 
     # All five login endpoints are wired: start, poll, code, confirm, cancel.
-    assert 'jfetch("/admin/claude-accounts/login",{\n    method:"POST"' in page.replace(
+    assert 'jfetch("/admin/providers/claude/login",{\n    method:"POST"' in page.replace(
         "\r\n", "\n"
     ) or 'method:"POST",headers:{"Content-Type":"application/json"},body:"{}"' in page
-    assert 'jfetch("/admin/claude-accounts/login")' in page
-    assert "/admin/claude-accounts/login/code" in page
-    assert "/admin/claude-accounts/login/confirm" in page
+    assert 'jfetch("/admin/providers/claude/login")' in page
+    assert "/admin/providers/claude/login/code" in page
+    assert "/admin/providers/claude/login/replace" in page
     assert 'method:"DELETE"' in page
     # 409 login-active attaches to the running session instead of erroring.
     assert 'code==="login-active"' in page
@@ -4248,7 +4401,7 @@ class TestAdminDashboardApi:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         with self._client(monkeypatch, codex_client=CatalogCodexClient) as client:
-            response = client.get("/admin/codex/models")
+            response = client.get("/admin/providers/codex/models")
 
         assert response.status_code == 200
         assert response.json() == {"models": ["gpt-5.6-sol", "gpt-5.5"]}
@@ -4257,7 +4410,7 @@ class TestAdminDashboardApi:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         with self._client(monkeypatch, codex_client=FailingCatalogCodexClient) as client:
-            response = client.get("/admin/codex/models")
+            response = client.get("/admin/providers/codex/models")
 
         assert response.status_code == 400
         assert response.json()["error"]["message"] == "unsupported client"
@@ -4266,7 +4419,7 @@ class TestAdminDashboardApi:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         with _create_test_client(monkeypatch, codex_client=CatalogCodexClient) as client:
-            assert client.get("/admin/codex/models").status_code == 403
+            assert client.get("/admin/providers/codex/models").status_code == 403
 
     def test_kimi_models_relays_catalog_verbatim(
         self, monkeypatch: pytest.MonkeyPatch
@@ -4274,7 +4427,7 @@ class TestAdminDashboardApi:
         # The catalog passes through unshaped: the map bypasses model IDs
         # untouched, so the raw backend answer is the preset source.
         with self._client(monkeypatch, kimi_client=CatalogKimiClient) as client:
-            response = client.get("/admin/kimi/models")
+            response = client.get("/admin/providers/kimi/models")
 
         assert response.status_code == 200
         assert response.json() == {"data": [{"id": "k2.5"}, {"id": "k3"}]}
@@ -4283,7 +4436,7 @@ class TestAdminDashboardApi:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         with self._client(monkeypatch, kimi_client=FailingCatalogKimiClient) as client:
-            response = client.get("/admin/kimi/models")
+            response = client.get("/admin/providers/kimi/models")
 
         assert response.status_code == 401
         assert response.json()["error"]["message"] == "token expired"
@@ -4292,13 +4445,13 @@ class TestAdminDashboardApi:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         with _create_test_client(monkeypatch, kimi_client=CatalogKimiClient) as client:
-            assert client.get("/admin/kimi/models").status_code == 403
+            assert client.get("/admin/providers/kimi/models").status_code == 403
 
     def test_grok_models_returns_catalog_ids(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         with self._client(monkeypatch, grok_client=CatalogGrokClient) as client:
-            response = client.get("/admin/grok/models")
+            response = client.get("/admin/providers/grok/models")
 
         assert response.status_code == 200
         assert response.json() == {"models": ["grok-4.5", "grok-4.3"]}
@@ -4307,7 +4460,7 @@ class TestAdminDashboardApi:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         with self._client(monkeypatch, grok_client=FailingCatalogGrokClient) as client:
-            response = client.get("/admin/grok/models")
+            response = client.get("/admin/providers/grok/models")
 
         assert response.status_code == 401
         assert response.json()["error"]["message"] == "token expired"
@@ -4316,7 +4469,7 @@ class TestAdminDashboardApi:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         with _create_test_client(monkeypatch, grok_client=CatalogGrokClient) as client:
-            assert client.get("/admin/grok/models").status_code == 403
+            assert client.get("/admin/providers/grok/models").status_code == 403
 
     def test_connection_test_ok(self, monkeypatch: pytest.MonkeyPatch) -> None:
         with self._client(monkeypatch, codex_client=ProbeCodexClient) as client:
@@ -5210,18 +5363,20 @@ class TestAdminClaudeAccountsApi:
             base_url=_ADMIN_BASE,
         )
 
-    def test_list_returns_rows_and_serving_id_without_secrets(
+    def test_list_returns_only_registry_rows_without_secrets(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         client = self._client(monkeypatch, tmp_path)
         account_id = _register_serving_account()
 
         with client:
-            response = client.get("/admin/claude-accounts")
+            response = client.get("/admin/providers/claude/accounts")
 
         assert response.status_code == 200
         payload = response.json()
-        assert payload["serving_account_id"] is None
+        # The collection alone: local login, serving pin, and cooldown
+        # telemetry each live at their own endpoint now.
+        assert set(payload) == {"accounts"}
         [row] = payload["accounts"]
         assert set(row) == {
             "id",
@@ -5234,7 +5389,6 @@ class TestAdminClaudeAccountsApi:
             "state",
             "planType",
             "rateLimitTier",
-            "coolingDownUntil",
         }
         assert row["id"] == account_id
         assert row["state"] == "ready"
@@ -5242,27 +5396,50 @@ class TestAdminClaudeAccountsApi:
         # fields, so the derived plan metadata degrades to nulls.
         assert row["planType"] is None
         assert row["rateLimitTier"] is None
-        assert row["coolingDownUntil"] is None
         # The registry response must never leak credential material.
         assert "accessToken" not in response.text
         assert "refreshToken" not in response.text
         assert "pool-access" not in response.text
         assert "pool-refresh" not in response.text
 
-    def test_list_exposes_cooling_down_until_for_rate_limited_accounts(
+    def test_pool_status_reports_ready_cooldown_and_unavailable_members(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         client = self._client(monkeypatch, tmp_path)
-        account_id = _register_serving_account()
-        client.app.state.claude_account_cooldowns.mark(account_id, 120.0)
+        millis = iter(range(1_700_000_000_000, 1_700_000_000_100))
+        monkeypatch.setattr(claude_accounts, "_now_millis", lambda: next(millis))
+        ready_id = _register_serving_account()
+        cooling_id = _register_serving_account(
+            email="pool2@example.com",
+            account_uuid="second-account-uuid",
+            access_token="pool-access-2",
+            refresh_token="pool-refresh-2",
+        )
+        dead_id = _register_serving_account(
+            email="pool3@example.com",
+            account_uuid="third-account-uuid",
+            access_token="pool-access-3",
+            refresh_token="pool-refresh-3",
+        )
+        claude_accounts.mark_account_needs_reauth(dead_id)
+        client.app.state.claude_account_cooldowns.mark(cooling_id, 120.0)
 
         with client:
-            [row] = client.get("/admin/claude-accounts").json()["accounts"]
+            response = client.get("/admin/providers/claude/pool/status")
 
+        assert response.status_code == 200
+        members = {member["account_id"]: member for member in response.json()["members"]}
+        assert members[ready_id] == {"account_id": ready_id, "routing_state": "ready"}
+        cooling = members[cooling_id]
+        assert cooling["routing_state"] == "cooldown"
         # Epoch ms, like every other registry timestamp in the payload.
-        assert isinstance(row["coolingDownUntil"], int)
         expected = (time.time() + 120.0) * 1000
-        assert abs(row["coolingDownUntil"] - expected) < 5_000
+        assert abs(cooling["cooldown_until"] - expected) < 5_000
+        assert members[dead_id] == {
+            "account_id": dead_id,
+            "routing_state": "unavailable",
+            "reason": "needs-reauth",
+        }
 
     def test_list_derives_plan_fields_from_the_captured_oauth_account(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -5281,23 +5458,12 @@ class TestAdminClaudeAccountsApi:
         )
 
         with client:
-            [row] = client.get("/admin/claude-accounts").json()["accounts"]
+            [row] = client.get("/admin/providers/claude/accounts").json()["accounts"]
 
         assert row["planType"] == "claude_max"
         assert row["rateLimitTier"] == "default_claude_max_20x"
 
-    def test_list_reports_the_configured_serving_account(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-    ) -> None:
-        monkeypatch.setenv("HOME", str(tmp_path / "home"))
-        account_id = _register_serving_account()
-        client = self._client(monkeypatch, tmp_path, claude_account_id=account_id)
-
-        with client:
-            payload = client.get("/admin/claude-accounts").json()
-        assert payload["serving_account_id"] == account_id
-
-    def test_list_includes_the_local_ambient_login_identity(
+    def test_local_reports_the_ambient_login_identity(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         # The dashboard's 로컬 CLI 로그인 hero reads this block: identity and
@@ -5322,7 +5488,7 @@ class TestAdminClaudeAccountsApi:
         )
 
         with client:
-            payload = client.get("/admin/claude-accounts").json()
+            payload = client.get("/admin/providers/claude/local").json()
 
         assert payload["local"] == {
             "accountUuid": "11111111-2222-3333-4444-555555555555",
@@ -5332,16 +5498,16 @@ class TestAdminClaudeAccountsApi:
             "rateLimitTier": "default_claude_max_20x",
         }
 
-    def test_list_local_block_degrades_to_null_without_a_login(
+    def test_local_degrades_to_null_without_a_login(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
         client = self._client(monkeypatch, tmp_path)
 
         with client:
-            payload = client.get("/admin/claude-accounts").json()
+            payload = client.get("/admin/providers/claude/local").json()
 
-        assert payload["local"] is None
+        assert payload == {"local": None}
 
     def test_usage_serves_from_the_cache_after_the_first_fetch(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -5357,8 +5523,8 @@ class TestAdminClaudeAccountsApi:
         monkeypatch.setattr(server, "fetch_claude_account_usage", fake_fetch)
 
         with client:
-            first = client.get("/admin/claude-accounts/usage")
-            second = client.get("/admin/claude-accounts/usage")
+            first = client.get("/admin/providers/claude/pool/usage")
+            second = client.get("/admin/providers/claude/pool/usage")
 
         assert first.status_code == 200
         assert first.json()["accounts"][account_id]["status"] == "ok"
@@ -5378,7 +5544,7 @@ class TestAdminClaudeAccountsApi:
         monkeypatch.setattr(server, "fetch_claude_account_usage", fail_fetch)
 
         with client:
-            response = client.get("/admin/claude-accounts/usage")
+            response = client.get("/admin/providers/claude/pool/usage")
 
         assert response.status_code == 200
         result = response.json()["accounts"][account_id]
@@ -5392,7 +5558,7 @@ class TestAdminClaudeAccountsApi:
         _register_serving_account()
         with client:
             response = client.get(
-                "/admin/claude-accounts/usage",
+                "/admin/providers/claude/pool/usage",
                 params={"account": "99999999-9999-4999-8999-999999999999"},
             )
         assert response.status_code == 400
@@ -5400,13 +5566,13 @@ class TestAdminClaudeAccountsApi:
     @pytest.mark.parametrize(
         ("method", "path"),
         [
-            ("GET", "/admin/claude-accounts"),
-            ("GET", "/admin/claude-accounts/usage"),
-            ("GET", "/admin/claude-accounts/login"),
-            ("POST", "/admin/claude-accounts/login"),
-            ("DELETE", "/admin/claude-accounts/login"),
-            ("POST", "/admin/claude-accounts/login/code"),
-            ("POST", "/admin/claude-accounts/login/confirm"),
+            ("GET", "/admin/providers/claude/accounts"),
+            ("GET", "/admin/providers/claude/pool/usage"),
+            ("GET", "/admin/providers/claude/login"),
+            ("POST", "/admin/providers/claude/login"),
+            ("DELETE", "/admin/providers/claude/login"),
+            ("POST", "/admin/providers/claude/login/code"),
+            ("POST", "/admin/providers/claude/login/replace"),
         ],
     )
     def test_foreign_host_is_rejected(
@@ -5432,9 +5598,9 @@ class TestAdminClaudeAccountsApi:
         client = self._client(monkeypatch, tmp_path)
         with client:
             for path in (
-                "/admin/claude-accounts/login",
-                "/admin/claude-accounts/login/code",
-                "/admin/claude-accounts/login/confirm",
+                "/admin/providers/claude/login",
+                "/admin/providers/claude/login/code",
+                "/admin/providers/claude/login/replace",
             ):
                 response = client.post(
                     path, content="{}", headers={"content-type": "text/plain"}
@@ -5446,19 +5612,38 @@ class TestAdminClaudeAccountsApi:
     ) -> None:
         client = self._client(monkeypatch, tmp_path)
         with client:
-            assert client.get("/admin/claude-accounts/login").json() == {"status": "idle"}
+            assert client.get("/admin/providers/claude/login").json() == {"status": "idle"}
 
     def test_login_commands_without_a_session_are_409(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         client = self._client(monkeypatch, tmp_path)
         with client:
-            code = client.post("/admin/claude-accounts/login/code", json={"code": "x"})
+            code = client.post("/admin/providers/claude/login/code", json={"code": "x"})
             confirm = client.post(
-                "/admin/claude-accounts/login/confirm", json={"replace": True}
+                "/admin/providers/claude/login/replace",
+                json={"existing_account_id": "0a1b2c3d-4e5f-4678-9abc-def012345678"},
             )
         assert code.status_code == 409
         assert confirm.status_code == 409
+
+    def test_login_replace_body_validation(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        client = self._client(monkeypatch, tmp_path)
+        with client:
+            for bad_body in (
+                {},
+                {"existing_account_id": ""},
+                {"existing_account_id": None},
+                {"existing_account_id": 7},
+                {"replace": True},
+                {"existing_account_id": "x", "extra": 1},
+            ):
+                response = client.post(
+                    "/admin/providers/claude/login/replace", json=bad_body
+                )
+                assert response.status_code == 400, bad_body
 
     def test_login_code_validation(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -5473,7 +5658,7 @@ class TestAdminClaudeAccountsApi:
                 {"code": 7},
                 {"code": "ok", "extra": 1},
             ):
-                response = client.post("/admin/claude-accounts/login/code", json=bad_body)
+                response = client.post("/admin/providers/claude/login/code", json=bad_body)
                 assert response.status_code == 400, bad_body
 
     def test_login_post_rejects_a_non_empty_body(
@@ -5481,7 +5666,7 @@ class TestAdminClaudeAccountsApi:
     ) -> None:
         client = self._client(monkeypatch, tmp_path)
         with client:
-            response = client.post("/admin/claude-accounts/login", json={"mode": "x"})
+            response = client.post("/admin/providers/claude/login", json={"mode": "x"})
         assert response.status_code == 400
 
     def test_login_post_conflicts_with_a_held_capture_lock(
@@ -5495,11 +5680,96 @@ class TestAdminClaudeAccountsApi:
         assert handle is not None
         try:
             with client:
-                response = client.post("/admin/claude-accounts/login", json={})
+                response = client.post("/admin/providers/claude/login", json={})
         finally:
             handle.release()
         assert response.status_code == 409
         assert response.json()["error"]["code"] == "login-locked"
+
+    def test_account_delete_removes_the_registry_row(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        client = self._client(monkeypatch, tmp_path)
+        account_id = _register_serving_account()
+        client.app.state.claude_account_cooldowns.mark(account_id, 120.0)
+
+        with client:
+            # Prime the cached auth manager so the delete has one to drop.
+            client.app.state.claude_account_auth_managers[account_id] = object()
+            response = client.delete(f"/admin/providers/claude/accounts/{account_id}")
+
+        assert response.status_code == 204
+        assert response.content == b""
+        assert claude_accounts.list_accounts() == []
+        assert account_id not in client.app.state.claude_account_auth_managers
+        assert not client.app.state.claude_account_cooldowns.is_cooling(account_id)
+
+    def test_account_delete_unknown_id_is_404(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        client = self._client(monkeypatch, tmp_path)
+        with client:
+            response = client.delete(
+                "/admin/providers/claude/accounts/99999999-9999-4999-8999-999999999999"
+            )
+        assert response.status_code == 404
+
+    def test_account_delete_serving_account_is_409(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setenv("HOME", str(tmp_path / "home"))
+        account_id = _register_serving_account()
+        client = self._client(monkeypatch, tmp_path, claude_account_id=account_id)
+
+        with client:
+            response = client.delete(f"/admin/providers/claude/accounts/{account_id}")
+
+        assert response.status_code == 409
+        assert "pool/serving" in response.json()["error"]["message"]
+        assert [record.id for record in claude_accounts.list_accounts()] == [account_id]
+
+    def test_account_delete_requires_the_admin_guard(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        account_id = "99999999-9999-4999-8999-999999999999"
+        client = self._client(monkeypatch, tmp_path, local_token="secret")
+        with client:
+            response = client.delete(f"/admin/providers/claude/accounts/{account_id}")
+        assert response.status_code == 401
+
+
+# The atomic cutover removed every pre-reorg admin path with no aliases:
+# a request to an old path must 404, never silently hit a moved handler.
+@pytest.mark.parametrize(
+    ("method", "path"),
+    [
+        ("GET", "/admin/mapping"),
+        ("PUT", "/admin/mapping"),
+        ("GET", "/admin/log-level"),
+        ("PUT", "/admin/log-level"),
+        ("GET", "/admin/compaction"),
+        ("PUT", "/admin/compaction"),
+        ("GET", "/admin/claude-account"),
+        ("PUT", "/admin/claude-account"),
+        ("GET", "/admin/claude-accounts"),
+        ("GET", "/admin/claude-accounts/usage"),
+        ("GET", "/admin/claude-accounts/login"),
+        ("POST", "/admin/claude-accounts/login"),
+        ("DELETE", "/admin/claude-accounts/login"),
+        ("POST", "/admin/claude-accounts/login/code"),
+        ("POST", "/admin/claude-accounts/login/confirm"),
+        ("GET", "/admin/codex/models"),
+        ("POST", "/admin/codex/reset-credit"),
+        ("GET", "/admin/kimi/models"),
+        ("GET", "/admin/grok/models"),
+    ],
+)
+def test_pre_reorg_admin_paths_are_gone(
+    monkeypatch: pytest.MonkeyPatch, method: str, path: str
+) -> None:
+    with _create_test_client(monkeypatch, base_url=_ADMIN_BASE) as client:
+        response = client.request(method, path, json={})
+    assert response.status_code == 404
 
 
 class TestAdminClaudeLoginLifecycle:
@@ -5530,7 +5800,7 @@ class TestAdminClaudeLoginLifecycle:
     def _poll_until(client: TestClient, predicate: Any, timeout: float = 10.0) -> dict[str, Any]:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            status = client.get("/admin/claude-accounts/login").json()
+            status = client.get("/admin/providers/claude/login").json()
             if predicate(status):
                 return status
             time.sleep(0.05)
@@ -5543,26 +5813,32 @@ class TestAdminClaudeLoginLifecycle:
         client = self._client(monkeypatch, tmp_path)
 
         with client:
-            started = client.post("/admin/claude-accounts/login", json={})
+            started = client.post("/admin/providers/claude/login", json={})
             assert started.status_code == 201
-            assert started.json() == {"status": "starting"}
+            envelope = started.json()
+            assert envelope["status"] == "starting"
+            attempt = envelope["attempt_id"]
+            attempt_header = {"X-Login-Attempt": attempt}
 
             status = self._poll_until(
                 client, lambda s: s["status"] == "awaiting-browser"
             )
+            assert status["attempt_id"] == attempt
             assert status["url"].startswith("https://claude.com/cai/oauth/authorize")
             assert status["code_prompt_detected"] is True
             assert status["expires_at"] is not None
 
             submitted = client.post(
-                "/admin/claude-accounts/login/code", json={"code": "good-code"}
+                "/admin/providers/claude/login/code",
+                json={"code": "good-code"},
+                headers=attempt_header,
             )
             assert submitted.status_code == 200
 
             status = self._poll_until(client, lambda s: s["status"] == "succeeded")
             assert status["account"]["email"] == "fixture@example.com"
 
-            rows = client.get("/admin/claude-accounts").json()["accounts"]
+            rows = client.get("/admin/providers/claude/accounts").json()["accounts"]
             assert [row["email"] for row in rows] == ["fixture@example.com"]
 
     def test_second_login_while_active_is_409_then_cancel_converges(
@@ -5572,22 +5848,68 @@ class TestAdminClaudeLoginLifecycle:
         client = self._client(monkeypatch, tmp_path)
 
         with client:
-            assert client.post("/admin/claude-accounts/login", json={}).status_code == 201
-            conflict = client.post("/admin/claude-accounts/login", json={})
+            attempt = client.post("/admin/providers/claude/login", json={}).json()[
+                "attempt_id"
+            ]
+            attempt_header = {"X-Login-Attempt": attempt}
+            conflict = client.post("/admin/providers/claude/login", json={})
             assert conflict.status_code == 409
             assert conflict.json()["error"]["code"] == "login-active"
 
-            cancelled = client.delete("/admin/claude-accounts/login")
+            cancelled = client.delete(
+                "/admin/providers/claude/login", headers=attempt_header
+            )
             assert cancelled.json() == {"status": "cancelling"}
             self._poll_until(client, lambda s: s["status"] == "cancelled")
 
             # A terminal session clears on DELETE and frees the slot.
-            assert client.delete("/admin/claude-accounts/login").json() == {
+            assert client.delete(
+                "/admin/providers/claude/login", headers=attempt_header
+            ).json() == {"status": "idle"}
+            assert client.get("/admin/providers/claude/login").json() == {
                 "status": "idle"
             }
-            assert client.get("/admin/claude-accounts/login").json() == {
-                "status": "idle"
-            }
+
+    def test_stale_attempt_commands_are_409_stale_login(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setenv("CLAUDEX_FAKE_CLAUDE_MODE", "hang")
+        client = self._client(monkeypatch, tmp_path)
+
+        with client:
+            attempt = client.post("/admin/providers/claude/login", json={}).json()[
+                "attempt_id"
+            ]
+            stale_header = {"X-Login-Attempt": "0" * 32}
+
+            for response in (
+                client.get("/admin/providers/claude/login", headers=stale_header),
+                client.post(
+                    "/admin/providers/claude/login/code",
+                    json={"code": "late-code"},
+                    headers=stale_header,
+                ),
+                client.post(
+                    "/admin/providers/claude/login/replace",
+                    json={"existing_account_id": "0a1b2c3d-4e5f-4678-9abc-def012345678"},
+                    headers=stale_header,
+                ),
+                client.delete("/admin/providers/claude/login", headers=stale_header),
+            ):
+                assert response.status_code == 409
+                assert response.json()["error"]["code"] == "stale_login"
+
+            # A bare GET is discovery: it still answers, exposing the live
+            # attempt so a fresh tab can re-attach.
+            bare = client.get("/admin/providers/claude/login")
+            assert bare.status_code == 200
+            assert bare.json()["attempt_id"] == attempt
+
+            # The stale commands drove nothing: the session is still alive.
+            client.delete(
+                "/admin/providers/claude/login", headers={"X-Login-Attempt": attempt}
+            )
+            self._poll_until(client, lambda s: s["status"] == "cancelled")
 
     def test_duplicate_login_confirm_replace_via_the_api(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -5603,14 +5925,27 @@ class TestAdminClaudeLoginLifecycle:
         )
 
         with client:
-            assert client.post("/admin/claude-accounts/login", json={}).status_code == 201
+            attempt = client.post("/admin/providers/claude/login", json={}).json()[
+                "attempt_id"
+            ]
             status = self._poll_until(
-                client, lambda s: s["status"] == "awaiting-confirm-replace"
+                client, lambda s: s["status"] == "awaiting-replace"
             )
             assert status["email"] == "fixture@example.com"
+            assert status["existing_account_id"] == original.id
+
+            mismatched = client.post(
+                "/admin/providers/claude/login/replace",
+                json={"existing_account_id": "0a1b2c3d-4e5f-4678-9abc-def012345678"},
+                headers={"X-Login-Attempt": attempt},
+            )
+            assert mismatched.status_code == 409
+            assert "does not match" in mismatched.json()["error"]["message"]
 
             confirmed = client.post(
-                "/admin/claude-accounts/login/confirm", json={"replace": True}
+                "/admin/providers/claude/login/replace",
+                json={"existing_account_id": original.id},
+                headers={"X-Login-Attempt": attempt},
             )
             assert confirmed.status_code == 200
             status = self._poll_until(client, lambda s: s["status"] == "succeeded")
@@ -5619,3 +5954,32 @@ class TestAdminClaudeLoginLifecycle:
         [record] = claude_accounts.load_registry()
         assert record.id == original.id
         assert record.state == "ready"
+
+    def test_duplicate_login_decline_is_delete(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setenv("CLAUDEX_FAKE_CLAUDE_MODE", "piped-autocomplete")
+        client = self._client(monkeypatch, tmp_path)
+        original = claude_accounts.add_account(
+            "fixture@example.com",
+            None,
+            None,
+            {"claudeAiOauth": {"accessToken": "old-token"}},
+            None,
+        )
+
+        with client:
+            attempt = client.post("/admin/providers/claude/login", json={}).json()[
+                "attempt_id"
+            ]
+            self._poll_until(client, lambda s: s["status"] == "awaiting-replace")
+
+            declined = client.delete(
+                "/admin/providers/claude/login",
+                headers={"X-Login-Attempt": attempt},
+            )
+            assert declined.json() == {"status": "cancelling"}
+            self._poll_until(client, lambda s: s["status"] == "cancelled")
+
+        [record] = claude_accounts.load_registry()
+        assert record == original

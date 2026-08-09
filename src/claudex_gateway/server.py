@@ -37,11 +37,13 @@ from claudex_gateway.claude_account_pool import (
     rate_limit_cooldown_seconds,
 )
 from claudex_gateway.claude_accounts import (
+    AccountNotFoundError,
     AccountRecord,
     AccountRegistryError,
     list_accounts,
     load_registry,
     mark_account_needs_reauth,
+    remove_account,
 )
 from claudex_gateway.claude_auth import (
     ClaudeAccountAuthError,
@@ -63,6 +65,7 @@ from claudex_gateway.compaction import (
 )
 from claudex_gateway.config import (
     SETTINGS_KEYS,
+    VALID_CLAUDE_ACCOUNT_ROUTING_MODES,
     VALID_LOG_LEVELS,
     ConfigError,
     GatewayConfig,
@@ -1990,7 +1993,7 @@ _CLAUDE_ACCOUNT_KEYS = ("account_id",)
 
 
 def _claude_account_payload(config: GatewayConfig) -> dict[str, Any]:
-    """Pinned {account_id, env_locked} envelope for /admin/claude-account.
+    """Pinned {account_id, env_locked} envelope for claude pool/serving.
 
     `account_id` is the raw canonical uuid (or None), so a GET/PUT
     round-trip is loss-free. `env_locked` mirrors the compaction envelope:
@@ -2004,19 +2007,41 @@ def _claude_account_payload(config: GatewayConfig) -> dict[str, Any]:
     }
 
 
-async def _handle_admin_claude_account_get(request: Request) -> JSONResponse:
+async def _handle_admin_claude_serving_get(request: Request) -> JSONResponse:
     denied = _admin_guard(request)
     if denied is not None:
         return denied
     return JSONResponse(_claude_account_payload(request.app.state.config))
 
 
-async def _handle_admin_claude_account_put(request: Request) -> JSONResponse:
-    """Set or clear the registered account serving Anthropic passthrough.
+def _claude_account_env_locked() -> JSONResponse | None:
+    """409 when CLAUDEX_CLAUDE_ACCOUNT_ID overrides runtime writes.
 
-    Only a successful PUT returns the state envelope; the 409 (env-locked)
-    path uses the existing admin error envelope, so a caller needing current
-    state issues a GET afterward.
+    An environment variable outranks settings.json at every boot (even set
+    to an empty string), so a persisted change would silently vanish on
+    restart — refuse before the lock or any file/config read.
+    """
+    env_name = SETTINGS_KEYS["claude_account.id"]
+    if os.environ.get(env_name) is None:
+        return None
+    return JSONResponse(
+        _openai_error_body(
+            "invalid_request_error",
+            f"{env_name} is set in the gateway's environment and overrides "
+            f"claude_account.id; unset it to manage the setting at runtime",
+        ),
+        status_code=409,
+    )
+
+
+async def _handle_admin_claude_serving_put(request: Request) -> JSONResponse:
+    """Pin the registered account serving Anthropic passthrough.
+
+    The pin is cleared with DELETE, never with a null PUT — the two writes
+    stay distinct so a partial payload can't silently disable serving.
+    Only a successful write returns the state envelope; the 409
+    (env-locked) path uses the existing admin error envelope, so a caller
+    needing current state issues a GET afterward.
     """
     denied = _admin_guard(request) or _require_json_content_type(request)
     if denied is not None:
@@ -2035,78 +2060,54 @@ async def _handle_admin_claude_account_put(request: Request) -> JSONResponse:
             ),
             status_code=400,
         )
-    if "account_id" not in body:
+    value = body.get("account_id")
+    if not isinstance(value, str):
         return JSONResponse(
             _openai_error_body(
-                "invalid_request_error", "provide 'account_id' (a string or null)"
+                "invalid_request_error",
+                "provide 'account_id' as a string; to clear the serving "
+                "account, DELETE this endpoint instead",
+            ),
+            status_code=400,
+        )
+    try:
+        parse_claude_account_id(value)
+    except ConfigError as exc:
+        return JSONResponse(
+            _openai_error_body("invalid_request_error", str(exc)),
+            status_code=400,
+        )
+    # Selecting an unregistered account would turn every passthrough
+    # request into a 503, so refuse it here where the mistake is cheap.
+    # The serving path still re-resolves per request — this check only
+    # front-loads the obvious misconfiguration.
+    try:
+        records = load_registry()
+    except AccountRegistryError as exc:
+        return JSONResponse(
+            _openai_error_body(
+                "server_error", f"cannot read the claude account registry: {exc}"
+            ),
+            status_code=500,
+        )
+    if not any(record.id == value for record in records):
+        return JSONResponse(
+            _openai_error_body(
+                "invalid_request_error",
+                f"no account registered with id {value}; "
+                "see `claudex-gateway account list`",
             ),
             status_code=400,
         )
 
-    value = body["account_id"]
-    if value is not None:
-        if not isinstance(value, str):
-            return JSONResponse(
-                _openai_error_body(
-                    "invalid_request_error", "account_id must be a string or null"
-                ),
-                status_code=400,
-            )
-        try:
-            parse_claude_account_id(value)
-        except ConfigError as exc:
-            return JSONResponse(
-                _openai_error_body("invalid_request_error", str(exc)),
-                status_code=400,
-            )
-        # Selecting an unregistered account would turn every passthrough
-        # request into a 503, so refuse it here where the mistake is cheap.
-        # The serving path still re-resolves per request — this check only
-        # front-loads the obvious misconfiguration.
-        try:
-            records = load_registry()
-        except AccountRegistryError as exc:
-            return JSONResponse(
-                _openai_error_body(
-                    "server_error", f"cannot read the claude account registry: {exc}"
-                ),
-                status_code=500,
-            )
-        if not any(record.id == value for record in records):
-            return JSONResponse(
-                _openai_error_body(
-                    "invalid_request_error",
-                    f"no account registered with id {value}; "
-                    "see `claudex-gateway account list`",
-                ),
-                status_code=400,
-            )
-
-    # An environment variable outranks settings.json at every boot (even set
-    # to an empty string), so a persisted change would silently vanish on
-    # restart — refuse before the lock or any file/config read.
-    env_name = SETTINGS_KEYS["claude_account.id"]
-    if os.environ.get(env_name) is not None:
-        return JSONResponse(
-            _openai_error_body(
-                "invalid_request_error",
-                f"{env_name} is set in the gateway's environment and overrides "
-                f"claude_account.id; unset it to manage the setting at runtime",
-            ),
-            status_code=409,
-        )
+    denied = _claude_account_env_locked()
+    if denied is not None:
+        return denied
 
     async with request.app.state.admin_lock:
         config: GatewayConfig = request.app.state.config
         try:
-            if value is None:
-                # A disabled setting is represented by the key's absence, so
-                # a JSON null is never persisted.
-                update_settings_file(
-                    config.settings_file, {}, deletions=("claude_account.id",)
-                )
-            else:
-                update_settings_file(config.settings_file, {"claude_account.id": value})
+            update_settings_file(config.settings_file, {"claude_account.id": value})
         except (ConfigError, OSError) as exc:
             return JSONResponse(
                 _openai_error_body(
@@ -2121,13 +2122,206 @@ async def _handle_admin_claude_account_put(request: Request) -> JSONResponse:
     return JSONResponse(_claude_account_payload(new_config))
 
 
+async def _handle_admin_claude_serving_delete(request: Request) -> JSONResponse:
+    """Clear the serving pin: passthrough forwards client credentials again.
+
+    A disabled setting is represented by the key's absence, so a JSON null
+    is never persisted. Clearing an already-clear pin is a no-op 200.
+    """
+    denied = _admin_guard(request)
+    if denied is not None:
+        return denied
+    denied = _claude_account_env_locked()
+    if denied is not None:
+        return denied
+
+    async with request.app.state.admin_lock:
+        config: GatewayConfig = request.app.state.config
+        try:
+            update_settings_file(
+                config.settings_file, {}, deletions=("claude_account.id",)
+            )
+        except (ConfigError, OSError) as exc:
+            return JSONResponse(
+                _openai_error_body(
+                    "server_error", f"could not persist settings: {exc}"
+                ),
+                status_code=500,
+            )
+        new_config = replace(config, claude_account_id=None)
+        request.app.state.config = new_config
+    return JSONResponse(_claude_account_payload(new_config))
+
+
+_CLAUDE_ROUTING_KEYS = ("mode",)
+
+
+def _claude_routing_payload(config: GatewayConfig) -> dict[str, Any]:
+    """Pinned {mode, env_locked} envelope for claude pool/routing."""
+    env_name = SETTINGS_KEYS["claude_account.routing"]
+    return {
+        "mode": config.claude_account_routing_mode,
+        "env_locked": os.environ.get(env_name) is not None,
+    }
+
+
+async def _handle_admin_claude_routing_get(request: Request) -> JSONResponse:
+    denied = _admin_guard(request)
+    if denied is not None:
+        return denied
+    return JSONResponse(_claude_routing_payload(request.app.state.config))
+
+
+async def _handle_admin_claude_routing_put(request: Request) -> JSONResponse:
+    """Select the pool routing policy: "disabled" or "fallback".
+
+    "disabled" is represented by the settings key's absence; "fallback"
+    persists the policy document ({"mode": "fallback"}), whose object form
+    leaves room for future modes to carry their own config blocks.
+    "balanced" is reserved and refused until implemented.
+    """
+    denied = _admin_guard(request) or _require_json_content_type(request)
+    if denied is not None:
+        return denied
+    body, error = await _read_json_object(request, _openai_error_body)
+    if error is not None or body is None:
+        return error
+    unknown = sorted(set(body) - set(_CLAUDE_ROUTING_KEYS))
+    if unknown:
+        return JSONResponse(
+            _openai_error_body(
+                "invalid_request_error",
+                f"unknown keys: {', '.join(unknown)}; "
+                f"supported: {', '.join(_CLAUDE_ROUTING_KEYS)}",
+            ),
+            status_code=400,
+        )
+    mode = body.get("mode")
+    if mode == "balanced":
+        return JSONResponse(
+            _openai_error_body(
+                "invalid_request_error",
+                'routing mode "balanced" is not implemented yet',
+            ),
+            status_code=400,
+        )
+    if mode not in VALID_CLAUDE_ACCOUNT_ROUTING_MODES:
+        return JSONResponse(
+            _openai_error_body(
+                "invalid_request_error",
+                "provide 'mode' as one of "
+                f"{', '.join(VALID_CLAUDE_ACCOUNT_ROUTING_MODES)}",
+            ),
+            status_code=400,
+        )
+    env_name = SETTINGS_KEYS["claude_account.routing"]
+    if os.environ.get(env_name) is not None:
+        return JSONResponse(
+            _openai_error_body(
+                "invalid_request_error",
+                f"{env_name} is set in the gateway's environment and overrides "
+                f"claude_account.routing; unset it to manage the setting at runtime",
+            ),
+            status_code=409,
+        )
+
+    async with request.app.state.admin_lock:
+        config: GatewayConfig = request.app.state.config
+        try:
+            if mode == "disabled":
+                update_settings_file(
+                    config.settings_file, {}, deletions=("claude_account.routing",)
+                )
+            else:
+                update_settings_file(
+                    config.settings_file, {"claude_account.routing": {"mode": mode}}
+                )
+        except (ConfigError, OSError) as exc:
+            return JSONResponse(
+                _openai_error_body(
+                    "server_error", f"could not persist settings: {exc}"
+                ),
+                status_code=500,
+            )
+        new_config = replace(config, claude_account_routing_mode=mode)
+        request.app.state.config = new_config
+    return JSONResponse(_claude_routing_payload(new_config))
+
+
+async def _handle_admin_claude_pool_status(request: Request) -> JSONResponse:
+    """Per-account routing state: what the serving chain would see right now.
+
+    This is telemetry over the registry plus the daemon-memory cooldown
+    tracker — never the configured pin, which lives at pool/serving.
+    """
+    denied = _admin_guard(request)
+    if denied is not None:
+        return denied
+    try:
+        records = list_accounts()
+    except AccountRegistryError as exc:
+        return JSONResponse(
+            _openai_error_body(
+                "server_error", f"cannot read the claude account registry: {exc}"
+            ),
+            status_code=500,
+        )
+    tracker: AccountCooldownTracker = request.app.state.claude_account_cooldowns
+    members: list[dict[str, Any]] = []
+    for record in records:
+        if record.state != "ready":
+            members.append(
+                {
+                    "account_id": record.id,
+                    "routing_state": "unavailable",
+                    "reason": record.state,
+                }
+            )
+            continue
+        cooldown_until = _cooling_down_until_millis(tracker, record.id)
+        if cooldown_until is not None:
+            members.append(
+                {
+                    "account_id": record.id,
+                    "routing_state": "cooldown",
+                    "cooldown_until": cooldown_until,
+                }
+            )
+        else:
+            members.append({"account_id": record.id, "routing_state": "ready"})
+    return JSONResponse({"members": members})
+
+
 # --------------------------------------------------------------------------
 # Admin claude-accounts surface (dashboard account management)
 # --------------------------------------------------------------------------
 
 _CLAUDE_LOGIN_CODE_KEYS = ("code",)
-_CLAUDE_LOGIN_CONFIRM_KEYS = ("replace",)
+_CLAUDE_LOGIN_REPLACE_KEYS = ("existing_account_id",)
+_LOGIN_ATTEMPT_HEADER = "x-login-attempt"
 _CONTROL_CHARACTER_PATTERN = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def _require_login_attempt(
+    request: Request, session: ClaudeLoginSession
+) -> JSONResponse | None:
+    """409 unless X-Login-Attempt names the active session's attempt.
+
+    Attempt and state are validated together — this guard runs before any
+    state check — so a stale dashboard tab from an earlier login can never
+    drive a newer session that happens to be in the same state.
+    """
+    if request.headers.get(_LOGIN_ATTEMPT_HEADER) == session.attempt_id:
+        return None
+    return JSONResponse(
+        _openai_error_body(
+            "invalid_request_error",
+            "X-Login-Attempt does not name the active login attempt; "
+            "re-attach via GET /admin/providers/claude/login",
+            "stale_login",
+        ),
+        status_code=409,
+    )
 
 
 def _account_usage_fetch(app_state: Any) -> Any:
@@ -2222,7 +2416,13 @@ def _account_plan_fields(account_id: str) -> dict[str, Any]:
 
 
 async def _handle_admin_claude_accounts_get(request: Request) -> JSONResponse:
-    """List every registered account (registry metadata only — never secrets)."""
+    """List every registered account (registry metadata only — never secrets).
+
+    Deliberately just the collection: the local-login hero lives at
+    `claude/local`, the serving pin at `claude/pool/serving`, and cooldown
+    telemetry at `claude/pool/status` — each readable (and cacheable) on
+    its own.
+    """
     denied = _admin_guard(request)
     if denied is not None:
         return denied
@@ -2235,21 +2435,63 @@ async def _handle_admin_claude_accounts_get(request: Request) -> JSONResponse:
             ),
             status_code=500,
         )
-    tracker: AccountCooldownTracker = request.app.state.claude_account_cooldowns
     return JSONResponse(
         {
             "accounts": [
-                {
-                    **record.to_row(),
-                    **_account_plan_fields(record.id),
-                    "coolingDownUntil": _cooling_down_until_millis(tracker, record.id),
-                }
+                {**record.to_row(), **_account_plan_fields(record.id)}
                 for record in records
-            ],
-            "serving_account_id": request.app.state.config.claude_account_id,
-            "local": _local_claude_login_fields(),
+            ]
         }
     )
+
+
+async def _handle_admin_claude_local_get(request: Request) -> JSONResponse:
+    """This machine's ambient Claude Code login (informational hero card)."""
+    denied = _admin_guard(request)
+    if denied is not None:
+        return denied
+    return JSONResponse({"local": _local_claude_login_fields()})
+
+
+async def _handle_admin_claude_account_delete(request: Request) -> Response:
+    """Remove a registered account (dashboard analog of `account remove`).
+
+    Refuses while the account is the serving pin — silently unpinning here
+    would flip passthrough back to client credentials as a side effect.
+    The registry mutation itself is crash-safe under registry.lock
+    (tombstone protocol); afterwards the daemon-memory remnants (cached
+    auth manager, cooldown) are dropped.
+    """
+    denied = _admin_guard(request)
+    if denied is not None:
+        return denied
+    account_id = request.path_params["account_id"]
+    config: GatewayConfig = request.app.state.config
+    if config.claude_account_id == account_id:
+        return JSONResponse(
+            _openai_error_body(
+                "invalid_request_error",
+                f"account {account_id} is the serving account; clear the pin "
+                "at pool/serving first",
+            ),
+            status_code=409,
+        )
+    try:
+        await asyncio.to_thread(remove_account, account_id)
+    except AccountNotFoundError as exc:
+        return JSONResponse(
+            _openai_error_body("invalid_request_error", str(exc)), status_code=404
+        )
+    except AccountRegistryError as exc:
+        return JSONResponse(
+            _openai_error_body(
+                "server_error", f"could not remove the account: {exc}"
+            ),
+            status_code=500,
+        )
+    request.app.state.claude_account_auth_managers.pop(account_id, None)
+    request.app.state.claude_account_cooldowns.clear(account_id)
+    return Response(status_code=204)
 
 
 def _cooling_down_until_millis(tracker: AccountCooldownTracker, account_id: str) -> int | None:
@@ -2305,12 +2547,19 @@ async def _handle_admin_claude_accounts_usage(request: Request) -> JSONResponse:
 
 
 async def _handle_admin_claude_login_get(request: Request) -> JSONResponse:
+    """Poll the login session. A bare GET is discovery/attach — it returns
+    the full status (including attempt_id) so a fresh tab can pin itself;
+    a GET that carries X-Login-Attempt is an attached poll and is guarded."""
     denied = _admin_guard(request)
     if denied is not None:
         return denied
     session: ClaudeLoginSession | None = request.app.state.claude_login_session
     if session is None:
         return JSONResponse({"status": "idle"})
+    if _LOGIN_ATTEMPT_HEADER in request.headers:
+        denied = _require_login_attempt(request, session)
+        if denied is not None:
+            return denied
     return JSONResponse(session.status())
 
 
@@ -2341,7 +2590,7 @@ async def _handle_admin_claude_login_post(request: Request) -> JSONResponse:
         return JSONResponse(
             _openai_error_body(
                 "invalid_request_error",
-                "a login session is already active; poll GET /admin/claude-accounts/login",
+                "a login session is already active; poll GET /admin/providers/claude/login",
                 "login-active",
             ),
             status_code=409,
@@ -2360,7 +2609,9 @@ async def _handle_admin_claude_login_post(request: Request) -> JSONResponse:
     session = ClaudeLoginSession(lock_handle)
     request.app.state.claude_login_session = session
     session.start()
-    return JSONResponse({"status": "starting"}, status_code=201)
+    # The full envelope (not a minimal status) so the creating tab can pin
+    # its attempt_id without a follow-up GET racing another tab's POST.
+    return JSONResponse(session.status(), status_code=201)
 
 
 async def _handle_admin_claude_login_code_post(request: Request) -> JSONResponse:
@@ -2399,6 +2650,9 @@ async def _handle_admin_claude_login_code_post(request: Request) -> JSONResponse
             ),
             status_code=409,
         )
+    denied = _require_login_attempt(request, session)
+    if denied is not None:
+        return denied
     try:
         await session.submit_code(code)
     except LoginSessionStateError as exc:
@@ -2409,27 +2663,34 @@ async def _handle_admin_claude_login_code_post(request: Request) -> JSONResponse
     return JSONResponse({"status": session.status()["status"]})
 
 
-async def _handle_admin_claude_login_confirm_post(request: Request) -> JSONResponse:
+async def _handle_admin_claude_login_replace_post(request: Request) -> JSONResponse:
+    """Confirm replacing the duplicate registration the session collided with.
+
+    The body names the account being replaced (the `existing_account_id`
+    from status()) — a confirmation, not a generation token; the session
+    rejects a mismatch. Declining is DELETE (cancel), not a body variant.
+    """
     denied = _admin_guard(request) or _require_json_content_type(request)
     if denied is not None:
         return denied
     body, error = await _read_json_object(request, _openai_error_body)
     if error is not None or body is None:
         return error
-    unknown = sorted(set(body) - set(_CLAUDE_LOGIN_CONFIRM_KEYS))
+    unknown = sorted(set(body) - set(_CLAUDE_LOGIN_REPLACE_KEYS))
     if unknown:
         return JSONResponse(
             _openai_error_body(
                 "invalid_request_error",
-                f"unknown keys: {', '.join(unknown)}; supported: replace",
+                f"unknown keys: {', '.join(unknown)}; supported: existing_account_id",
             ),
             status_code=400,
         )
-    replace_choice = body.get("replace")
-    if not isinstance(replace_choice, bool):
+    existing_account_id = body.get("existing_account_id")
+    if not isinstance(existing_account_id, str) or not existing_account_id:
         return JSONResponse(
             _openai_error_body(
-                "invalid_request_error", "provide 'replace' as a boolean"
+                "invalid_request_error",
+                "provide 'existing_account_id' as a non-empty string",
             ),
             status_code=400,
         )
@@ -2441,8 +2702,11 @@ async def _handle_admin_claude_login_confirm_post(request: Request) -> JSONRespo
             ),
             status_code=409,
         )
+    denied = _require_login_attempt(request, session)
+    if denied is not None:
+        return denied
     try:
-        session.confirm_replace(replace_choice)
+        session.confirm_replace(existing_account_id)
     except LoginSessionStateError as exc:
         return JSONResponse(
             _openai_error_body("invalid_request_error", str(exc)),
@@ -2457,7 +2721,12 @@ async def _handle_admin_claude_login_delete(request: Request) -> JSONResponse:
     if denied is not None:
         return denied
     session: ClaudeLoginSession | None = request.app.state.claude_login_session
-    if session is None or session.is_terminal:
+    if session is None:
+        return JSONResponse({"status": "idle"})
+    denied = _require_login_attempt(request, session)
+    if denied is not None:
+        return denied
+    if session.is_terminal:
         request.app.state.claude_login_session = None
         return JSONResponse({"status": "idle"})
     session.request_cancel()
@@ -2789,61 +3058,117 @@ def create_app(config: GatewayConfig, daemon_nonce: str | None = None) -> Starle
             Route("/v1/messages/count_tokens", _handle_count_tokens, methods=["POST"]),
             Route("/api/hello", _handle_hello, methods=["GET"]),
             Route("/health", _handle_health, methods=["GET"]),
-            Route("/admin/mapping", _handle_admin_mapping_get, methods=["GET"]),
-            Route("/admin/mapping", _handle_admin_mapping_put, methods=["PUT"]),
-            Route("/admin/log-level", _handle_admin_log_level_get, methods=["GET"]),
-            Route("/admin/log-level", _handle_admin_log_level_put, methods=["PUT"]),
-            Route("/admin/compaction", _handle_admin_compaction_get, methods=["GET"]),
-            Route("/admin/compaction", _handle_admin_compaction_put, methods=["PUT"]),
+            # Admin tree (confirmed design, .docs/research/admin-api-reorg-gptpro.md):
+            # settings/* for gateway-wide settings, providers/{p}/* for each
+            # backend's own surface, top-level logs/usage/test as cross-cutting
+            # observability. No aliases: old paths 404.
+            Route("/admin/settings/mapping", _handle_admin_mapping_get, methods=["GET"]),
+            Route("/admin/settings/mapping", _handle_admin_mapping_put, methods=["PUT"]),
             Route(
-                "/admin/claude-account", _handle_admin_claude_account_get, methods=["GET"]
+                "/admin/settings/log-level", _handle_admin_log_level_get, methods=["GET"]
             ),
             Route(
-                "/admin/claude-account", _handle_admin_claude_account_put, methods=["PUT"]
+                "/admin/settings/log-level", _handle_admin_log_level_put, methods=["PUT"]
             ),
             Route(
-                "/admin/claude-accounts", _handle_admin_claude_accounts_get, methods=["GET"]
+                "/admin/settings/compaction", _handle_admin_compaction_get, methods=["GET"]
             ),
             Route(
-                "/admin/claude-accounts/usage",
-                _handle_admin_claude_accounts_usage,
+                "/admin/settings/compaction", _handle_admin_compaction_put, methods=["PUT"]
+            ),
+            Route(
+                "/admin/providers/codex/models",
+                _handle_admin_codex_models,
                 methods=["GET"],
             ),
             Route(
-                "/admin/claude-accounts/login",
+                "/admin/providers/codex/reset-credit",
+                _handle_admin_codex_reset_credit,
+                methods=["POST"],
+            ),
+            Route(
+                "/admin/providers/kimi/models", _handle_admin_kimi_models, methods=["GET"]
+            ),
+            Route(
+                "/admin/providers/grok/models", _handle_admin_grok_models, methods=["GET"]
+            ),
+            Route(
+                "/admin/providers/claude/local",
+                _handle_admin_claude_local_get,
+                methods=["GET"],
+            ),
+            Route(
+                "/admin/providers/claude/accounts",
+                _handle_admin_claude_accounts_get,
+                methods=["GET"],
+            ),
+            Route(
+                "/admin/providers/claude/accounts/{account_id}",
+                _handle_admin_claude_account_delete,
+                methods=["DELETE"],
+            ),
+            Route(
+                "/admin/providers/claude/login",
                 _handle_admin_claude_login_get,
                 methods=["GET"],
             ),
             Route(
-                "/admin/claude-accounts/login",
+                "/admin/providers/claude/login",
                 _handle_admin_claude_login_post,
                 methods=["POST"],
             ),
             Route(
-                "/admin/claude-accounts/login",
+                "/admin/providers/claude/login",
                 _handle_admin_claude_login_delete,
                 methods=["DELETE"],
             ),
             Route(
-                "/admin/claude-accounts/login/code",
+                "/admin/providers/claude/login/code",
                 _handle_admin_claude_login_code_post,
                 methods=["POST"],
             ),
             Route(
-                "/admin/claude-accounts/login/confirm",
-                _handle_admin_claude_login_confirm_post,
+                "/admin/providers/claude/login/replace",
+                _handle_admin_claude_login_replace_post,
                 methods=["POST"],
+            ),
+            Route(
+                "/admin/providers/claude/pool/serving",
+                _handle_admin_claude_serving_get,
+                methods=["GET"],
+            ),
+            Route(
+                "/admin/providers/claude/pool/serving",
+                _handle_admin_claude_serving_put,
+                methods=["PUT"],
+            ),
+            Route(
+                "/admin/providers/claude/pool/serving",
+                _handle_admin_claude_serving_delete,
+                methods=["DELETE"],
+            ),
+            Route(
+                "/admin/providers/claude/pool/routing",
+                _handle_admin_claude_routing_get,
+                methods=["GET"],
+            ),
+            Route(
+                "/admin/providers/claude/pool/routing",
+                _handle_admin_claude_routing_put,
+                methods=["PUT"],
+            ),
+            Route(
+                "/admin/providers/claude/pool/status",
+                _handle_admin_claude_pool_status,
+                methods=["GET"],
+            ),
+            Route(
+                "/admin/providers/claude/pool/usage",
+                _handle_admin_claude_accounts_usage,
+                methods=["GET"],
             ),
             Route("/admin/logs", _handle_admin_logs, methods=["GET"]),
             Route("/admin/usage", _handle_admin_usage, methods=["GET"]),
-            Route(
-                "/admin/codex/reset-credit",
-                _handle_admin_codex_reset_credit,
-                methods=["POST"],
-            ),
-            Route("/admin/codex/models", _handle_admin_codex_models, methods=["GET"]),
-            Route("/admin/kimi/models", _handle_admin_kimi_models, methods=["GET"]),
-            Route("/admin/grok/models", _handle_admin_grok_models, methods=["GET"]),
             Route("/admin/test", _handle_admin_connection_test, methods=["POST"]),
         ],
         lifespan=lifespan,

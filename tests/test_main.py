@@ -319,7 +319,7 @@ def test_login_subcommand_is_gone(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 # `compact` command family: unit tests around the daemon-aware helpers
 # (probe classification, endpoint resolution, URL bracketing, the
-# /admin/compaction HTTP client, envelope validation), plus command-level
+# /admin/settings/compaction HTTP client, envelope validation), plus command-level
 # tests for show/set/off across the outcome matrix. These run in-process
 # with `urllib.request.urlopen` (and, for the outcome matrix, the probe and
 # admin helpers themselves) faked, rather than spawning real subprocess
@@ -380,7 +380,7 @@ def _stub_full_stack_urlopen(
     monkeypatch: pytest.MonkeyPatch, admin_status: int, admin_body: bytes
 ) -> None:
     """Fake `urlopen` answering /api/hello with a valid hello and raising a
-    real `urllib.error.HTTPError` for the /admin/compaction call, so both the
+    real `urllib.error.HTTPError` for the /admin/settings/compaction call, so both the
     probe and the admin client run their real (unmocked) code paths."""
 
     def _fake(request: object, timeout: float | None = None) -> object:
@@ -542,7 +542,7 @@ def test_classify_daemon_ambiguous_on_connection_reset_before_response(
     assert gateway_main._classify_daemon("127.0.0.1", 8787) is gateway_main.ProbeOutcome.AMBIGUOUS
 
 
-# --- The /admin/compaction HTTP helper: auth, content type, error handling -
+# --- The /admin/settings/compaction HTTP helper: auth, content type, error handling -
 
 
 def test_admin_request_success_returns_status_body_and_detail(
@@ -552,7 +552,7 @@ def test_admin_request_success_returns_status_body_and_detail(
     _stub_urlopen(monkeypatch, response=_FakeResponse(200, body))
 
     response = gateway_main._admin_request(
-        "127.0.0.1", 8787, "GET", "/admin/compaction", local_token=None
+        "127.0.0.1", 8787, "GET", "/admin/settings/compaction", local_token=None
     )
 
     assert response.status == 200
@@ -566,7 +566,7 @@ def test_admin_request_attaches_bearer_header_when_local_token_configured(
     monkeypatch.setattr(gateway_main, "_urlopen_no_redirect", opener)
 
     gateway_main._admin_request(
-        "127.0.0.1", 8787, "GET", "/admin/compaction", local_token="local_token-value"
+        "127.0.0.1", 8787, "GET", "/admin/settings/compaction", local_token="local_token-value"
     )
 
     assert opener.last_request is not None
@@ -580,7 +580,7 @@ def test_admin_request_omits_bearer_header_when_no_local_token_configured(
     monkeypatch.setattr(gateway_main, "_urlopen_no_redirect", opener)
 
     gateway_main._admin_request(
-        "127.0.0.1", 8787, "GET", "/admin/compaction", local_token=None
+        "127.0.0.1", 8787, "GET", "/admin/settings/compaction", local_token=None
     )
 
     assert opener.last_request is not None
@@ -597,7 +597,7 @@ def test_admin_request_sets_json_content_type_on_put_but_not_get(
         "127.0.0.1",
         8787,
         "PUT",
-        "/admin/compaction",
+        "/admin/settings/compaction",
         local_token=None,
         json_body={"model": None},
     )
@@ -606,7 +606,7 @@ def test_admin_request_sets_json_content_type_on_put_but_not_get(
     assert opener.last_request.get_method() == "PUT"
 
     gateway_main._admin_request(
-        "127.0.0.1", 8787, "GET", "/admin/compaction", local_token=None
+        "127.0.0.1", 8787, "GET", "/admin/settings/compaction", local_token=None
     )
     assert opener.last_request is not None
     assert opener.last_request.get_header("Content-type") is None
@@ -618,12 +618,12 @@ def test_admin_request_http_error_with_json_body(monkeypatch: pytest.MonkeyPatch
         {"error": {"message": "no local token", "type": "authentication_error"}}
     ).encode()
     exc = urllib.error.HTTPError(
-        "http://127.0.0.1:8787/admin/compaction", 401, "Unauthorized", None, io.BytesIO(error_body)
+        "http://127.0.0.1:8787/admin/settings/compaction", 401, "Unauthorized", None, io.BytesIO(error_body)
     )
     _stub_urlopen(monkeypatch, exception=exc)
 
     response = gateway_main._admin_request(
-        "127.0.0.1", 8787, "GET", "/admin/compaction", local_token=None
+        "127.0.0.1", 8787, "GET", "/admin/settings/compaction", local_token=None
     )
 
     assert response.status == 401
@@ -633,7 +633,7 @@ def test_admin_request_http_error_with_json_body(monkeypatch: pytest.MonkeyPatch
 
 def test_admin_request_http_error_with_non_json_body(monkeypatch: pytest.MonkeyPatch) -> None:
     exc = urllib.error.HTTPError(
-        "http://127.0.0.1:8787/admin/compaction",
+        "http://127.0.0.1:8787/admin/settings/compaction",
         404,
         "Not Found",
         None,
@@ -642,7 +642,7 @@ def test_admin_request_http_error_with_non_json_body(monkeypatch: pytest.MonkeyP
     _stub_urlopen(monkeypatch, exception=exc)
 
     response = gateway_main._admin_request(
-        "127.0.0.1", 8787, "GET", "/admin/compaction", local_token=None
+        "127.0.0.1", 8787, "GET", "/admin/settings/compaction", local_token=None
     )
 
     assert response.status == 404
@@ -655,7 +655,7 @@ def test_admin_request_transport_failure_raises(monkeypatch: pytest.MonkeyPatch)
 
     with pytest.raises(gateway_main._AdminTransportError):
         gateway_main._admin_request(
-            "127.0.0.1", 8787, "GET", "/admin/compaction", local_token=None
+            "127.0.0.1", 8787, "GET", "/admin/settings/compaction", local_token=None
         )
 
 
@@ -975,7 +975,7 @@ def test_compact_set_identified_success_calls_put_with_the_local_bearer_token(
     assert not config.settings_file.exists()  # the admin call succeeded; no direct write
     [call] = calls
     assert call["method"] == "PUT"
-    assert call["path"] == "/admin/compaction"
+    assert call["path"] == "/admin/settings/compaction"
     assert call["json_body"] == {"model": "claude:claude-opus-5"}
     assert call["local_token"] == "local_token-abc"
 

@@ -73,6 +73,10 @@ class AccountCooldownTracker:
             return 0.0
         return remaining
 
+    def clear(self, account_id: str) -> None:
+        """Drop any cooldown for `account_id` (e.g. the account was removed)."""
+        self._deadlines.pop(account_id, None)
+
     def min_remaining_seconds(self) -> float | None:
         """The shortest active cooldown, or None when nothing is cooling."""
         remaining = [self.remaining_seconds(account_id) for account_id in list(self._deadlines)]

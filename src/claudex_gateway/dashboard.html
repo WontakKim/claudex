@@ -1202,7 +1202,7 @@ function fetchLogs(){
   }).catch(function(){});
 }
 function setLogLevel(level){
-  jfetch("/admin/log-level",{
+  jfetch("/admin/settings/log-level",{
     method:"PUT",
     headers:{"Content-Type":"application/json"},
     body:JSON.stringify({log_level:level})
@@ -1210,7 +1210,7 @@ function setLogLevel(level){
     if(!r.ok){
       showToast('<span class="chip chip-err">'+(r.status===409?"LOCKED":"ERROR")+'</span><span class="lat">'+r.status+
         "</span><br>log level"+'<br><span class="dim">'+esc(errDetail(r.body))+"</span>",true);
-      jfetch("/admin/log-level").then(function(g){if(g.ok)renderLogLevel(g.body)});
+      jfetch("/admin/settings/log-level").then(function(g){if(g.ok)renderLogLevel(g.body)});
       return;
     }
     renderLogLevel(r.body);
@@ -1259,7 +1259,7 @@ function renderCompaction(){
   btn.disabled=COMP.locked;
   btn.textContent="적용";
 }
-/* Adopts a fresh /admin/compaction GET/PUT envelope as the new live state
+/* Adopts a fresh /admin/settings/compaction GET/PUT envelope as the new live state
    and re-derives the draft selection from it. */
 function renderCompactionState(body){
   COMP.LIVE.model=body.model;
@@ -1284,7 +1284,7 @@ function applyCompaction(){
     model="claude:"+COMP.draftKind;
   }
   btn.disabled=true;btn.textContent="…";
-  jfetch("/admin/compaction",{
+  jfetch("/admin/settings/compaction",{
     method:"PUT",
     headers:{"Content-Type":"application/json"},
     body:JSON.stringify({model:model})
@@ -1299,7 +1299,7 @@ function applyCompaction(){
       // never from r.body above. And if that refresh GET itself fails or
       // returns a malformed envelope, its body must not be rendered as
       // state either — the card stays locked with its previous live state.
-      jfetch("/admin/compaction").then(function(g){
+      jfetch("/admin/settings/compaction").then(function(g){
         if(g.ok&&g.body&&typeof g.body.env_locked==="boolean"&&"model" in g.body&&"last_reroute" in g.body){
           renderCompactionState(g.body);
         }else{
@@ -1481,39 +1481,52 @@ function fetchAccountUsage(){
     });
     renderAcctList();
   };
-  jfetch("/admin/claude-accounts/usage").then(function(r){
+  jfetch("/admin/providers/claude/pool/usage").then(function(r){
     if(!r.ok){settle(errDetail(r.body));return}
     ACCT.usage=r.body.accounts||{};
     renderAcctList();
   }).catch(function(){settle("gateway unreachable")});
 }
 function fetchAccounts(){
-  Promise.all([jfetch("/admin/claude-accounts"),jfetch("/admin/claude-account")]).then(function(rs){
-    var listResp=rs[0],servingResp=rs[1];
+  /* The accounts screen paints from three independent resources: the
+     registry collection, the local-login hero, and the serving pin. */
+  Promise.all([
+    jfetch("/admin/providers/claude/accounts"),
+    jfetch("/admin/providers/claude/local"),
+    jfetch("/admin/providers/claude/pool/serving")
+  ]).then(function(rs){
+    var listResp=rs[0],localResp=rs[1],servingResp=rs[2];
     if(!listResp.ok){
       showToast('<span class="chip chip-err">ERROR</span><span class="lat">'+listResp.status+
-        '</span><br>GET /admin/claude-accounts<br><span class="dim">'+esc(errDetail(listResp.body))+"</span>",true);
+        '</span><br>GET /admin/providers/claude/accounts<br><span class="dim">'+esc(errDetail(listResp.body))+"</span>",true);
       return;
     }
     ACCT.rows=listResp.body.accounts||[];
-    ACCT.local=listResp.body.local||null;
-    ACCT.serving=listResp.body.serving_account_id||null;
-    if(servingResp.ok)ACCT.locked=!!servingResp.body.env_locked;
+    ACCT.local=localResp.ok?(localResp.body.local||null):null;
+    if(servingResp.ok){
+      ACCT.serving=servingResp.body.account_id||null;
+      ACCT.locked=!!servingResp.body.env_locked;
+    }
     renderAcctList();
     renderLocalHero();
     fetchAccountUsage();
     fetchLocalHeroUsage();
   }).catch(function(){
-    showToast('<span class="chip chip-err">ERROR</span><br>GET /admin/claude-accounts'+
+    showToast('<span class="chip chip-err">ERROR</span><br>GET /admin/providers/claude/accounts'+
       '<br><span class="dim">gateway unreachable</span>',true);
   });
 }
 function setServingAccount(accountId){
-  jfetch("/admin/claude-account",{
-    method:"PUT",
-    headers:{"Content-Type":"application/json"},
-    body:JSON.stringify({account_id:accountId})
-  }).then(function(r){
+  /* Selecting pins via PUT; 해제 clears via DELETE (a null PUT is refused).
+     Both answer with the same {account_id, env_locked} envelope. */
+  (accountId
+    ?jfetch("/admin/providers/claude/pool/serving",{
+      method:"PUT",
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({account_id:accountId})
+    })
+    :jfetch("/admin/providers/claude/pool/serving",{method:"DELETE"})
+  ).then(function(r){
     if(r.status===409){
       ACCT.locked=true;
       renderAcctList();
@@ -1575,42 +1588,76 @@ document.getElementById("btn-local-refresh").addEventListener("click",function()
    a 1s poll drives the modal. The body re-renders only when the session
    status materially changes — an unconditional re-render would wipe the code
    input every second; the countdown ticks via textContent. */
-var LOGIN={timer:null,lastKey:null,failures:0};
+var LOGIN={timer:null,lastKey:null,failures:0,attemptId:null,existingAccountId:null};
 function loginStateKey(st){
   return[st.status,st.url||"",st.email||"",st.error||"",st.detail||"",st.code_prompt_detected?"1":"0"].join("|");
+}
+function loginAttemptHeaders(extra){
+  /* Every attached call names its attempt: a stale tab from an earlier
+     login gets a 409 stale_login instead of driving a newer session. */
+  var headers=Object.assign({},extra||{});
+  if(LOGIN.attemptId)headers["X-Login-Attempt"]=LOGIN.attemptId;
+  return headers;
+}
+function isStaleLogin(r){
+  return r.status===409&&r.body&&r.body.error&&r.body.error.code==="stale_login";
 }
 function stopLoginPolling(){
   if(LOGIN.timer){clearInterval(LOGIN.timer);LOGIN.timer=null}
 }
 function closeLoginModal(){
   stopLoginPolling();
+  LOGIN.attemptId=null;LOGIN.existingAccountId=null;
   document.getElementById("login-modal").classList.remove("open");
 }
+function startLoginModal(){
+  LOGIN.lastKey=null;LOGIN.failures=0;
+  document.getElementById("login-reconnect").textContent="";
+  document.getElementById("login-modal").classList.add("open");
+  renderLoginModal({status:"starting"});
+  stopLoginPolling();
+  LOGIN.timer=setInterval(pollLogin,1000);
+  pollLogin();
+}
 function openLoginModal(){
-  jfetch("/admin/claude-accounts/login",{
+  jfetch("/admin/providers/claude/login",{
     method:"POST",headers:{"Content-Type":"application/json"},body:"{}"
   }).then(function(r){
     var code=r.body&&r.body.error&&r.body.error.code;
-    // login-active: another dashboard tab (or this one) already runs a
-    // session — attach to it instead of erroring.
-    if(!r.ok&&!(r.status===409&&code==="login-active")){
-      showToast('<span class="chip chip-err">'+(r.status===409?"LOCKED":"ERROR")+'</span><span class="lat">'+r.status+
-        '</span><br>계정 추가<br><span class="dim">'+esc(errDetail(r.body))+"</span>",true);
+    if(r.ok){
+      LOGIN.attemptId=r.body.attempt_id||null;
+      startLoginModal();
       return;
     }
-    LOGIN.lastKey=null;LOGIN.failures=0;
-    document.getElementById("login-reconnect").textContent="";
-    document.getElementById("login-modal").classList.add("open");
-    renderLoginModal({status:"starting"});
-    stopLoginPolling();
-    LOGIN.timer=setInterval(pollLogin,1000);
-    pollLogin();
+    // login-active: another dashboard tab (or this one) already runs a
+    // session — attach to it via a bare discovery GET instead of erroring.
+    if(r.status===409&&code==="login-active"){
+      jfetch("/admin/providers/claude/login").then(function(g){
+        if(g.ok&&g.body&&g.body.attempt_id){
+          LOGIN.attemptId=g.body.attempt_id;
+          startLoginModal();
+          return;
+        }
+        showToast('<span class="chip chip-err">ERROR</span><br>계정 추가'+
+          '<br><span class="dim">활성 로그인 세션에 연결할 수 없습니다.</span>',true);
+      }).catch(function(){
+        showToast('<span class="chip chip-err">ERROR</span><br>계정 추가<br><span class="dim">gateway unreachable</span>',true);
+      });
+      return;
+    }
+    showToast('<span class="chip chip-err">'+(r.status===409?"LOCKED":"ERROR")+'</span><span class="lat">'+r.status+
+      '</span><br>계정 추가<br><span class="dim">'+esc(errDetail(r.body))+"</span>",true);
   }).catch(function(){
     showToast('<span class="chip chip-err">ERROR</span><br>계정 추가<br><span class="dim">gateway unreachable</span>',true);
   });
 }
 function pollLogin(){
-  jfetch("/admin/claude-accounts/login").then(function(r){
+  jfetch("/admin/providers/claude/login",{headers:loginAttemptHeaders()}).then(function(r){
+    if(isStaleLogin(r)){
+      // A newer login superseded this tab's attempt: bow out quietly.
+      closeLoginModal();fetchAccounts();
+      return;
+    }
     if(!r.ok){loginPollFailed();return}
     LOGIN.failures=0;
     document.getElementById("login-reconnect").textContent="";
@@ -1658,8 +1705,10 @@ function renderLoginModal(st){
   }else if(st.status==="completing"){
     body.innerHTML='<p><span class="sk">로그인을 완료하는 중…</span></p>';
     actions.innerHTML=cancelBtn;
-  }else if(st.status==="awaiting-confirm-replace"){
-    // Exactly two buttons, mirroring the CLI's [y/N] replace prompt.
+  }else if(st.status==="awaiting-replace"){
+    // Exactly two buttons, mirroring the CLI's [y/N] replace prompt. The
+    // confirmation names the record being replaced; declining cancels.
+    LOGIN.existingAccountId=st.existing_account_id||null;
     body.innerHTML='<p><b>'+esc(st.email||"")+'</b> 계정이 이미 등록되어 있습니다.</p>'+
       '<p class="warn">교체하면 기존 자격증명을 이번 로그인으로 덮어씁니다.</p>';
     actions.innerHTML='<button class="cancel" data-lact="decline">교체 안 함</button>'+
@@ -1687,10 +1736,11 @@ function submitLoginCode(){
   if(!input)return;
   var code=input.value.trim();
   if(!code)return;
-  jfetch("/admin/claude-accounts/login/code",{
-    method:"POST",headers:{"Content-Type":"application/json"},
+  jfetch("/admin/providers/claude/login/code",{
+    method:"POST",headers:loginAttemptHeaders({"Content-Type":"application/json"}),
     body:JSON.stringify({code:code})
   }).then(function(r){
+    if(isStaleLogin(r)){closeLoginModal();fetchAccounts();return}
     if(!r.ok)
       showToast('<span class="chip chip-err">ERROR</span><span class="lat">'+r.status+
         '</span><br>코드 제출<br><span class="dim">'+esc(errDetail(r.body))+"</span>",true);
@@ -1698,24 +1748,32 @@ function submitLoginCode(){
     showToast('<span class="chip chip-err">ERROR</span><br>코드 제출<br><span class="dim">gateway unreachable</span>',true);
   });
 }
+function cancelLoginSession(){
+  jfetch("/admin/providers/claude/login",{
+    method:"DELETE",headers:loginAttemptHeaders()
+  }).then(function(r){
+    if(isStaleLogin(r)){closeLoginModal();fetchAccounts();return}
+    renderLoginModal({status:"cancelling"});
+  }).catch(function(){});
+}
 document.getElementById("login-modal").addEventListener("click",function(e){
   var btn=e.target.closest("button");
   if(!btn||!btn.dataset.lact)return;
   var act=btn.dataset.lact;
   if(act==="close"){closeLoginModal();return}
   if(act==="code"){submitLoginCode();return}
-  if(act==="cancel"){
+  if(act==="cancel"||act==="decline"){
     // Explicit cancel only: backdrop/Escape never close a live login.
-    jfetch("/admin/claude-accounts/login",{method:"DELETE"}).then(function(){
-      renderLoginModal({status:"cancelling"});
-    }).catch(function(){});
+    // Declining a replacement IS cancelling — the daemon has no decline verb.
+    cancelLoginSession();
     return;
   }
-  if(act==="replace"||act==="decline"){
-    jfetch("/admin/claude-accounts/login/confirm",{
-      method:"POST",headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({replace:act==="replace"})
+  if(act==="replace"){
+    jfetch("/admin/providers/claude/login/replace",{
+      method:"POST",headers:loginAttemptHeaders({"Content-Type":"application/json"}),
+      body:JSON.stringify({existing_account_id:LOGIN.existingAccountId})
     }).then(function(r){
+      if(isStaleLogin(r)){closeLoginModal();fetchAccounts();return}
       if(!r.ok)
         showToast('<span class="chip chip-err">ERROR</span><span class="lat">'+r.status+
           '</span><br>교체 확인<br><span class="dim">'+esc(errDetail(r.body))+"</span>",true);
@@ -1728,7 +1786,7 @@ document.getElementById("login-modal").addEventListener("keydown",function(e){
 function apply(){
   if(DIR.locked)return;
   var count=dirtyCount();
-  jfetch("/admin/mapping",{
+  jfetch("/admin/settings/mapping",{
     method:"PUT",
     headers:{"Content-Type":"application/json"},
     body:JSON.stringify({model_map:DIR.mapping})
@@ -1965,7 +2023,7 @@ document.getElementById("tab-status").addEventListener("click",function(ev){
 /* --- spending a Codex reset credit ---------------------------------------
    The credit is gone once the gateway forwards the request, so the card's
    button only arms the dialog: confirming there is the single path that
-   reaches /admin/codex/reset-credit. */
+   reaches /admin/providers/codex/reset-credit. */
 var RESET_OUTCOMES={
   reset:{spent:true,text:"한도 창을 리셋했습니다"},
   // The backend reports these so the card can say why nothing changed.
@@ -1994,7 +2052,7 @@ document.addEventListener("keydown",function(ev){if(ev.key==="Escape")closeReset
 document.getElementById("reset-confirm").addEventListener("click",function(){
   if(this.disabled)return;
   this.disabled=true;this.textContent="…";
-  jfetch("/admin/codex/reset-credit",{
+  jfetch("/admin/providers/codex/reset-credit",{
     method:"POST",
     headers:{"Content-Type":"application/json"},
     body:"{}"
@@ -2044,13 +2102,13 @@ function boot(){
     authRequired=!!(hello.body&&hello.body.local_auth_required);
     if(authRequired&&!localToken)promptLocalToken();
     return Promise.all([
-      jfetch("/admin/mapping"),
+      jfetch("/admin/settings/mapping"),
       jfetch("/health"),
-      jfetch("/admin/codex/models"),
-      jfetch("/admin/kimi/models"),
-      jfetch("/admin/grok/models"),
-      jfetch("/admin/log-level"),
-      jfetch("/admin/compaction")
+      jfetch("/admin/providers/codex/models"),
+      jfetch("/admin/providers/kimi/models"),
+      jfetch("/admin/providers/grok/models"),
+      jfetch("/admin/settings/log-level"),
+      jfetch("/admin/settings/compaction")
     ]);
   }).then(function(results){
     var mapping=results[0],health=results[1];
@@ -2061,7 +2119,7 @@ function boot(){
       renderCompactionState(compactionResp.body);
     }else{
       showToast('<span class="chip chip-err">ERROR</span><span class="lat">'+compactionResp.status+
-        '</span><br>GET /admin/compaction<br><span class="dim">'+esc(errDetail(compactionResp.body))+"</span>",true);
+        '</span><br>GET /admin/settings/compaction<br><span class="dim">'+esc(errDetail(compactionResp.body))+"</span>",true);
     }
     if(mapping.ok){
       DIR.LIVE=mapping.body.model_map||{};
@@ -2069,7 +2127,7 @@ function boot(){
       renderFacts(mapping.body);
     }else{
       showToast('<span class="chip chip-err">ERROR</span><span class="lat">'+mapping.status+
-        '</span><br>GET /admin/mapping<br><span class="dim">'+esc(errDetail(mapping.body))+"</span>",true);
+        '</span><br>GET /admin/settings/mapping<br><span class="dim">'+esc(errDetail(mapping.body))+"</span>",true);
     }
     // A catalog only feeds the add-node suggestions, and Kimi's routinely 401s
     // when the gateway has no Kimi login, so failures stay silent here.

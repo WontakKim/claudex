@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import glob
 import os
+import re
 import sys
 import tempfile
 import time
@@ -110,6 +111,10 @@ def test_autocomplete_login_succeeds_and_registers_the_account(
     assert status["status"] == "succeeded"
     assert status["account"]["email"] == "fixture@example.com"
     assert status["url"].startswith("https://claude.com/cai/oauth/authorize")
+    # The attempt id is minted at construction and never changes: a client
+    # pinned to it at POST time stays attached for the session's lifetime.
+    assert status["attempt_id"] == session.attempt_id
+    assert re.fullmatch(r"[0-9a-f]{32}", status["attempt_id"])
     [record] = claude_accounts.list_accounts()
     assert record.email == "fixture@example.com"
     assert record.state == "ready"
@@ -205,10 +210,11 @@ def test_duplicate_confirm_replace_updates_in_place(
     original = _register_fixture_account()
 
     async def drive(session: ClaudeLoginSession) -> None:
-        await _wait_until(lambda: session.status()["status"] == "awaiting-confirm-replace")
+        await _wait_until(lambda: session.status()["status"] == "awaiting-replace")
         assert session.status()["email"] == "fixture@example.com"
+        assert session.status()["existing_account_id"] == original.id
         assert session.status()["expires_at"] is not None
-        session.confirm_replace(True)
+        session.confirm_replace(original.id)
 
     session = _run_to_terminal("piped-autocomplete", monkeypatch, drive=drive)
 
@@ -221,20 +227,36 @@ def test_duplicate_confirm_replace_updates_in_place(
     assert record.last_authenticated_at >= original.last_authenticated_at
 
 
-def test_duplicate_decline_cancels_and_leaves_the_registry_untouched(
+def test_duplicate_confirm_replace_rejects_a_mismatched_target(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     original = _register_fixture_account()
 
     async def drive(session: ClaudeLoginSession) -> None:
-        await _wait_until(lambda: session.status()["status"] == "awaiting-confirm-replace")
-        session.confirm_replace(False)
+        await _wait_until(lambda: session.status()["status"] == "awaiting-replace")
+        with pytest.raises(LoginSessionStateError):
+            session.confirm_replace("0a1b2c3d-4e5f-4678-9abc-def012345678")
+        # The mismatch left the wait intact; the right id still confirms.
+        session.confirm_replace(original.id)
+
+    session = _run_to_terminal("piped-autocomplete", monkeypatch, drive=drive)
+
+    assert session.status()["status"] == "succeeded"
+
+
+def test_duplicate_cancel_declines_and_leaves_the_registry_untouched(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = _register_fixture_account()
+
+    async def drive(session: ClaudeLoginSession) -> None:
+        await _wait_until(lambda: session.status()["status"] == "awaiting-replace")
+        session.request_cancel()
 
     session = _run_to_terminal("piped-autocomplete", monkeypatch, drive=drive)
 
     status = session.status()
     assert status["status"] == "cancelled"
-    assert status["detail"] == "replace-declined"
     [record] = claude_accounts.list_accounts()
     assert record == original
 
@@ -256,7 +278,7 @@ def test_duplicate_confirm_timeout_fails_and_discards_the_capture(
 def test_out_of_state_commands_raise_state_errors(monkeypatch: pytest.MonkeyPatch) -> None:
     async def drive(session: ClaudeLoginSession) -> None:
         with pytest.raises(LoginSessionStateError):
-            session.confirm_replace(True)  # nothing pending yet
+            session.confirm_replace("any-id")  # nothing pending yet
 
     session = _run_to_terminal("piped-autocomplete", monkeypatch, drive=drive)
     assert session.status()["status"] == "succeeded"
@@ -265,7 +287,7 @@ def test_out_of_state_commands_raise_state_errors(monkeypatch: pytest.MonkeyPatc
         with pytest.raises(LoginSessionStateError):
             await session.submit_code("late-code")
         with pytest.raises(LoginSessionStateError):
-            session.confirm_replace(True)
+            session.confirm_replace("any-id")
 
     asyncio.run(late_commands())
     # Cancel after terminal is a silent no-op.

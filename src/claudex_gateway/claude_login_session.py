@@ -18,7 +18,12 @@ pasted code did is invisible here, by design.
 States:
     starting → awaiting-browser → completing
         → succeeded | failed | cancelled
-        → awaiting-confirm-replace → succeeded | failed | cancelled
+        → awaiting-replace → succeeded | failed | cancelled
+
+Every session carries an `attempt_id` minted at construction. Handlers pin
+mutating commands (and attached polls) to it via the X-Login-Attempt header,
+so a stale dashboard tab from an earlier attempt can never drive a newer
+session that happens to be in the same state.
 
 Single-writer discipline: only the driver task and the output pump (both
 event-loop coroutines) mutate the state; command methods only signal events
@@ -35,6 +40,7 @@ import os
 import re
 import signal
 import time
+import uuid
 from typing import Any
 
 from pathlib import Path
@@ -96,11 +102,13 @@ class ClaudeLoginSession:
         self._login_timeout = login_timeout
         self._confirm_timeout = confirm_timeout
 
+        self._attempt_id = uuid.uuid4().hex
         self._status = "starting"
         self._url: str | None = None
         self._code_prompt_detected = False
         self._expires_at: float | None = None
         self._email: str | None = None
+        self._existing_account_id: str | None = None
         self._account_row: dict[str, Any] | None = None
         self._error: str | None = None
         self._detail: str | None = None
@@ -110,7 +118,6 @@ class ClaudeLoginSession:
         self._cancel_event = asyncio.Event()
         self._denial_event = asyncio.Event()
         self._confirm_event = asyncio.Event()
-        self._confirm_choice: bool | None = None
         self._driver_task: asyncio.Task[None] | None = None
         self._pump_task: asyncio.Task[None] | None = None
 
@@ -125,15 +132,21 @@ class ClaudeLoginSession:
     def status(self) -> dict[str, Any]:
         """A JSON-ready snapshot with a stable key set."""
         return {
+            "attempt_id": self._attempt_id,
             "status": self._status,
             "url": self._url,
             "code_prompt_detected": self._code_prompt_detected,
             "expires_at": self._expires_at,
             "email": self._email,
+            "existing_account_id": self._existing_account_id,
             "account": self._account_row,
             "error": self._error,
             "detail": self._detail,
         }
+
+    @property
+    def attempt_id(self) -> str:
+        return self._attempt_id
 
     @property
     def is_terminal(self) -> bool:
@@ -157,13 +170,23 @@ class ClaudeLoginSession:
                 "the login process is no longer accepting input"
             ) from exc
 
-    def confirm_replace(self, replace: bool) -> None:
-        """Answer the duplicate-registration prompt (교체 / 교체 안 함)."""
-        if self._status != "awaiting-confirm-replace":
+    def confirm_replace(self, existing_account_id: str) -> None:
+        """Confirm replacing the already-registered duplicate account.
+
+        The caller must name the account being replaced — the id exposed in
+        status() — so a confirmation can never apply to a different record
+        than the one the owner saw. Declining is not a command: the owner
+        cancels the session instead (DELETE), which the duplicate wait
+        already honors.
+        """
+        if self._status != "awaiting-replace":
             raise LoginSessionStateError(
                 f"no replacement confirmation is pending (current state: {self._status})"
             )
-        self._confirm_choice = replace
+        if existing_account_id != self._existing_account_id:
+            raise LoginSessionStateError(
+                "existing_account_id does not match the pending replacement target"
+            )
         self._confirm_event.set()
 
     def request_cancel(self) -> None:
@@ -300,10 +323,26 @@ class ClaudeLoginSession:
         """Hold the captured credential until the owner confirms replacement.
 
         Returns the updated record on confirm, or None after setting a
-        terminal state (declined, cancelled, or timed out)."""
+        terminal state (cancelled or timed out — declining IS cancelling).
+        The registry row being replaced is resolved before entering
+        awaiting-replace so status() can name it and confirm_replace can
+        pin the confirmation to it.
+        """
         self._email = captured.email
+        self._existing_account_id = await asyncio.to_thread(
+            _find_registered_account_id, captured.email, captured.organization_uuid
+        )
+        if self._existing_account_id is None:
+            # The duplicate row vanished between add_account's rejection and
+            # this lookup (concurrent removal); the capture cannot be
+            # attributed to a record the owner can see, so fail loudly.
+            self._fail(
+                "the duplicate account row disappeared while resolving the "
+                "replacement target; retry the login"
+            )
+            return None
         self._expires_at = time.time() + self._confirm_timeout
-        self._status = "awaiting-confirm-replace"
+        self._status = "awaiting-replace"
 
         outcome = await self._await_first(
             {
@@ -317,9 +356,6 @@ class ClaudeLoginSession:
             return None
         if outcome == "timeout":
             self._fail("replacement confirmation timed out; the captured login was discarded")
-            return None
-        if self._confirm_choice is not True:
-            self._finish_cancelled(detail="replace-declined")
             return None
         self._status = "completing"
         self._expires_at = None
@@ -382,9 +418,8 @@ class ClaudeLoginSession:
         self._error = message
         self._expires_at = None
 
-    def _finish_cancelled(self, detail: str | None = None) -> None:
+    def _finish_cancelled(self) -> None:
         self._status = "cancelled"
-        self._detail = detail
         self._expires_at = None
 
     def _warn_if_legacy_login_changed(self, keychain: Any, baseline: object) -> None:
@@ -401,6 +436,25 @@ class ClaudeLoginSession:
             "own `claude` CLI sign-in — run `claude` in a terminal and sign "
             "in again if so"
         )
+
+
+def _find_registered_account_id(email: str, organization_uuid: str | None) -> str | None:
+    """Resolve the registry row `add_account` collided with, by its own key.
+
+    Uses the same normalization as the duplicate check so the lookup can
+    only miss when the row was concurrently removed.
+    """
+    normalized_email = claude_accounts._normalize_email(email)
+    normalized_organization_uuid = claude_accounts._normalize_optional_text(
+        organization_uuid, field="organizationUuid"
+    )
+    for record in claude_accounts.list_accounts():
+        if (
+            record.email == normalized_email
+            and record.organization_uuid == normalized_organization_uuid
+        ):
+            return record.id
+    return None
 
 
 async def _terminate_process_group_async(

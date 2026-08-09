@@ -512,7 +512,7 @@ def _account_main(argv: list[str]) -> int:
 # the admin compaction API.
 # ---------------------------------------------------------------------------
 
-_ADMIN_COMPACTION_PATH = "/admin/compaction"
+_ADMIN_COMPACTION_PATH = "/admin/settings/compaction"
 _PROBE_TIMEOUT = 2.0
 _ADMIN_TIMEOUT = 5.0
 
@@ -979,7 +979,7 @@ def _compact_main(arguments: list[str]) -> int:
 # ambiguous probe refuses to write.
 # ---------------------------------------------------------------------------
 
-_ADMIN_CLAUDE_ACCOUNT_PATH = "/admin/claude-account"
+_ADMIN_CLAUDE_ACCOUNT_PATH = "/admin/providers/claude/pool/serving"
 
 _ACCOUNT_USE_USAGE = "usage: claudex-gateway account use [<id|email>|off]"
 
@@ -1104,9 +1104,16 @@ def _account_use_apply(value: str | None) -> int:
     outcome = _classify_daemon(host, port)
 
     if outcome is ProbeOutcome.IDENTIFIED:
-        admin_outcome, envelope, detail = _run_admin_claude_account(
-            host, port, "PUT", config.local_token, {"account_id": value}
-        )
+        # Selecting pins via PUT; `off` clears the pin via DELETE (the
+        # endpoint refuses a null PUT). Both return the state envelope.
+        if value is None:
+            admin_outcome, envelope, detail = _run_admin_claude_account(
+                host, port, "DELETE", config.local_token, None
+            )
+        else:
+            admin_outcome, envelope, detail = _run_admin_claude_account(
+                host, port, "PUT", config.local_token, {"account_id": value}
+            )
         if admin_outcome is _AdminCallOutcome.SUCCESS:
             _print_account_use_state(envelope["account_id"])
             return 0
