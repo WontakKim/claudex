@@ -3999,6 +3999,15 @@ def _compaction_apply_fn(page: str) -> str:
     return page[start:end]
 
 
+def _routing_section(page: str) -> str:
+    """Slice the routing card's own markup — "balanced" legitimately appears
+    elsewhere in the document (API test prose never, but future copy might),
+    so absence is asserted against this scoped slice."""
+    start = page.index("<!-- routing-section:start -->")
+    end = page.index("<!-- routing-section:end -->")
+    return page[start:end]
+
+
 def test_dashboard_compaction_section_marker_and_endpoint_present(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -4264,6 +4273,73 @@ def test_dashboard_serving_selection_reuses_the_singular_admin_endpoint(
     assert "서빙 해제" in page
     # Removal stays CLI-only: the probe's danger button ships inert.
     assert "claudex-gateway account remove" in page
+
+
+def test_dashboard_routing_section_wires_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with _create_test_client(monkeypatch) as client:
+        page = client.get("/").text
+
+    assert "<!-- routing-section:start -->" in page
+    assert "<!-- routing-section:end -->" in page
+    # Policy row sits in General, directly after the compaction row.
+    assert page.index('id="compaction-card"') < page.index('id="routing-card"')
+    # Boot GET and the apply PUT both target the pool/routing endpoint, and
+    # the PUT body is pinned to exactly {"mode": ...}.
+    assert 'jfetch("/admin/providers/claude/pool/routing")' in page
+    assert 'jfetch("/admin/providers/claude/pool/routing",{' in page
+    assert "JSON.stringify({mode:ROUTING.draft})" in page
+    section = _routing_section(page)
+    assert ">Disabled<" in section
+    assert ">Fallback<" in section
+    # balanced is reserved server-side (400) and must not be offered.
+    assert "balanced" not in section
+    assert "계정별 라우팅 상태 보기" in section
+
+
+def test_dashboard_routing_locked_renders_readonly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A 409 flips the local lock; the lockband names the env var and the
+    # control disables — same discipline as the compaction card.
+    with _create_test_client(monkeypatch) as client:
+        page = client.get("/").text
+
+    assert "CLAUDEX_CLAUDE_ACCOUNT_ROUTING" in page
+    assert 'id="routing-lock-env"' in page
+    assert (
+        "#compaction-card.locked .complock,#routing-card.locked .complock{display:block}"
+        in page
+    )
+    apply_fn = page[
+        page.index("function applyRouting(){") : page.index(
+            'document.getElementById("routing-select").addEventListener("change"'
+        )
+    ]
+    assert "r.status===409" in apply_fn
+    assert "ROUTING.locked=true" in apply_fn
+
+
+def test_dashboard_accounts_surface_routing_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Row badges come from pool/status; a failed status GET renders no badges
+    # (never stale), and the cooldown row explains itself in the detail pane.
+    with _create_test_client(monkeypatch) as client:
+        page = client.get("/").text
+
+    assert 'jfetch("/admin/providers/claude/pool/status")' in page
+    assert "라우팅 준비" in page
+    assert "라우팅 불가" in page
+    assert "쿨다운 · " in page
+    assert "coolnote" in page
+    assert "function fmtCooldownUntil(" in page
+    # The accounts card links back to the policy row in General.
+    assert (
+        '라우팅 정책은 <a class="route-link" href="#settings/general">General</a>에서 설정합니다.'
+        in page
+    )
 
 
 def test_dashboard_login_modal_drives_the_login_endpoints(

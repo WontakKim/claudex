@@ -256,9 +256,11 @@ body.env-locked .applybar{display:none!important}
    so it carries its own lock indicator rather than reusing .lockband, which
    is wired to body.env-locked (the map's own env-lock flag). */
 .complock{display:none;margin-bottom:14px;border:1px solid var(--err);border-radius:8px;color:var(--err);padding:10px 14px;font-size:14px}
-#compaction-card.locked .complock{display:block}
-#comp-select{font:600 14px var(--sans);background:var(--inset);border:1.5px solid transparent;border-radius:6px;padding:9px 10px;color:var(--text)}
-#comp-select:disabled{opacity:.55;cursor:default}
+#compaction-card.locked .complock,#routing-card.locked .complock{display:block}
+#comp-select,#routing-select{font:600 14px var(--sans);background:var(--inset);border:1.5px solid transparent;border-radius:6px;padding:9px 10px;color:var(--text)}
+#comp-select:disabled,#routing-select:disabled{opacity:.55;cursor:default}
+.route-link{color:var(--accent);text-decoration:none}
+.route-link:hover{text-decoration:underline}
 .comp-custom{display:none;margin-top:10px}
 .comp-custom.show{display:block}
 /* Optional providers (kimi/grok) ship hidden and are revealed by /health:
@@ -283,7 +285,7 @@ body.env-locked .applybar{display:none!important}
 .srow .desc{font-size:13.5px;color:var(--muted);margin-top:8px}
 .srow .ctrow select,.srow .ctrow .ctnode{flex:1;min-width:0}
 .srow .cthint{font-size:11px;color:color-mix(in srgb,var(--muted) 70%,transparent)}
-#compaction-card.locked{border-left:3px solid var(--err);padding-left:14px;margin-left:-17px}
+#compaction-card.locked,#routing-card.locked{border-left:3px solid var(--err);padding-left:14px;margin-left:-17px}
 /* Settings categories: one .scard visible at a time, switched by the rail
    (data-cat on the section). */
 .scard{display:none}
@@ -299,6 +301,10 @@ body.env-locked .applybar{display:none!important}
 .pill{display:inline-flex;align-items:center;gap:5px;height:20px;padding:0 9px;border-radius:999px;
   font:700 11px var(--mono);letter-spacing:.02em;white-space:nowrap}
 .pill.same{background:var(--accent-soft);color:var(--accent);font-weight:600}
+/* Routing-state badges (pool/status): ready/cooldown/unavailable per member. */
+.pill.ready{background:var(--ok-soft);color:var(--ok)}
+.pill.cool{background:var(--warn-soft);color:var(--warn)}
+.pill.unavailable{background:var(--err-soft);color:var(--err)}
 .lhero{margin-top:16px;padding:18px 20px;border-radius:10px;background:var(--accent-soft);
   border:1.5px solid color-mix(in srgb,var(--accent) 35%,transparent)}
 .lhero .ribbon{display:flex;align-items:center;gap:6px;font:700 11px var(--sans);
@@ -339,6 +345,8 @@ body.env-locked .applybar{display:none!important}
 .adetail .actions{margin-top:16px;display:flex;gap:8px;align-items:center;
   padding-top:12px;border-top:1px solid color-mix(in srgb,var(--inset) 70%,transparent)}
 .adetail .actions .spacer{flex:1}
+.coolnote{margin-top:12px;padding:11px 13px;border-radius:6px;background:var(--warn-soft);color:var(--warn);font:600 13px var(--sans)}
+.coolnote .hint{display:block;margin-top:3px;font:400 12px var(--sans);color:var(--muted)}
 .unavail{margin-top:12px;padding:11px 13px;border-radius:6px;background:var(--err-soft);color:var(--err);font:600 13px var(--sans)}
 .unavail .hint{display:block;margin-top:3px;font:400 12px var(--sans);color:var(--muted)}
 button.ghost{font:600 13px var(--sans);border:1.5px solid var(--line);background:var(--panel);color:var(--text);border-radius:6px;padding:7px 14px;cursor:pointer}
@@ -418,12 +426,31 @@ button.primary:disabled{opacity:.5;cursor:default}
             </div>
           </div>
           <!-- compaction-section:end -->
+          <!-- routing-section:start -->
+          <div class="srow" id="routing-card">
+            <div>
+              <div class="name">Claude 계정 라우팅</div>
+              <div class="desc">서빙 계정이 429를 받았을 때 등록 계정 풀을 어떻게 쓸지 정합니다.</div>
+            </div>
+            <div>
+              <div class="complock" id="routing-lockband"><b>LOCKED</b> — <code id="routing-lock-env"></code> 환경변수가 우선합니다. 계정 라우팅은 열람 전용입니다.</div>
+              <div class="ctrow">
+                <select id="routing-select">
+                  <option value="disabled">Disabled</option>
+                  <option value="fallback">Fallback</option>
+                </select>
+                <button id="routing-apply">적용</button>
+              </div>
+              <div class="cthint" aria-live="polite"><span id="routing-current"></span> · <a class="route-link" href="#settings/accounts">계정별 라우팅 상태 보기</a></div>
+            </div>
+          </div>
+          <!-- routing-section:end -->
         </div>
         <div class="card scard" id="scard-accounts">
           <div class="acct-head">
             <div>
               <h2>Claude 계정</h2>
-              <div class="sub">게이트웨이가 서빙에 쓰는 등록 계정과 이 머신의 로컬 Claude Code 로그인입니다.</div>
+              <div class="sub">게이트웨이가 서빙에 쓰는 등록 계정과 이 머신의 로컬 Claude Code 로그인입니다. 라우팅 정책은 <a class="route-link" href="#settings/general">General</a>에서 설정합니다.</div>
             </div>
           </div>
           <div class="acctlock" id="acct-lockband"><b>LOCKED</b> — <code id="acct-lock-env"></code> 환경변수가 우선합니다. 서빙 계정 선택은 열람 전용입니다.</div>
@@ -1332,6 +1359,79 @@ document.getElementById("comp-custom-input").addEventListener("input",function()
   COMP.draftCustom=this.value;
 });
 document.getElementById("comp-apply").addEventListener("click",applyCompaction);
+/* --- account-pool routing mode (claude_account.routing) -------------------
+   Same envelope discipline as the compaction card: adopt {mode, env_locked}
+   from every successful response, 409 flips the local lock and re-syncs from
+   a fresh GET. 적용 stays inert while the draft equals the live mode. */
+var ROUTING={envName:"CLAUDEX_CLAUDE_ACCOUNT_ROUTING",locked:false,mode:"disabled",draft:"disabled"};
+var ROUTING_HINTS={
+  disabled:"현재: Disabled — 단일 서빙 계정만 사용하고 429는 그대로 전달합니다.",
+  fallback:"현재: Fallback — ready 계정으로 순차 폴백하고 쿨다운 후 자동 복귀합니다."
+};
+function isRoutingEnvelope(body){
+  return !!body&&typeof body.env_locked==="boolean"&&
+    (body.mode==="disabled"||body.mode==="fallback");
+}
+function renderRouting(){
+  document.getElementById("routing-card").classList.toggle("locked",ROUTING.locked);
+  document.getElementById("routing-lock-env").textContent=ROUTING.envName;
+  var select=document.getElementById("routing-select");
+  select.value=ROUTING.draft;
+  select.disabled=ROUTING.locked;
+  var btn=document.getElementById("routing-apply");
+  btn.disabled=ROUTING.locked||ROUTING.draft===ROUTING.mode;
+  btn.textContent="적용";
+  document.getElementById("routing-current").textContent=ROUTING_HINTS[ROUTING.mode];
+}
+function renderRoutingState(body){
+  ROUTING.mode=body.mode;
+  ROUTING.locked=!!body.env_locked;
+  ROUTING.draft=body.mode;
+  renderRouting();
+}
+function applyRouting(){
+  var btn=document.getElementById("routing-apply");
+  if(ROUTING.locked||btn.disabled)return;
+  btn.disabled=true;btn.textContent="…";
+  jfetch("/admin/providers/claude/pool/routing",{
+    method:"PUT",
+    headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({mode:ROUTING.draft})
+  }).then(function(r){
+    if(r.status===409){
+      ROUTING.locked=true;
+      renderRouting();
+      showToast('<span class="chip chip-err">LOCKED</span><span class="lat">409</span><br>'+esc(ROUTING.envName)+
+        '<br><span class="dim">'+esc(errDetail(r.body))+"</span>",true);
+      jfetch("/admin/providers/claude/pool/routing").then(function(g){
+        if(g.ok&&isRoutingEnvelope(g.body)){
+          renderRoutingState(g.body);
+        }else{
+          ROUTING.locked=true;
+          renderRouting();
+          showToast('<span class="chip chip-err">ERROR</span><br>라우팅 새로고침<br><span class="dim">could not load current state</span>',true);
+        }
+      });
+      return;
+    }
+    if(!r.ok){
+      renderRouting();
+      showToast('<span class="chip chip-err">ERROR</span><span class="lat">'+r.status+"</span><br>계정 라우팅"+
+        '<br><span class="dim">'+esc(errDetail(r.body))+"</span>",true);
+      return;
+    }
+    renderRoutingState(r.body);
+    showToast('<span class="chip chip-ok">APPLIED</span><br>라우팅 → '+(r.body.mode==="fallback"?"Fallback":"Disabled"),false);
+  }).catch(function(){
+    renderRouting();
+    showToast('<span class="chip chip-err">ERROR</span><br>계정 라우팅<br><span class="dim">gateway unreachable</span>',true);
+  });
+}
+document.getElementById("routing-select").addEventListener("change",function(){
+  ROUTING.draft=this.value;
+  renderRouting();
+});
+document.getElementById("routing-apply").addEventListener("click",applyRouting);
 /* The Settings rail switches the visible category card (.scard) and pins a
    deep-linkable #settings/<cat> hash; entering the accounts category fetches
    its data. */
@@ -1361,7 +1461,7 @@ document.querySelectorAll("#tab-settings .rail-item").forEach(function(a){
    the open set survives re-renders. No interval polling: fetch on entry,
    the hero's 갱신 button, and after a login succeeds. */
 var ACCT_ENV="CLAUDEX_CLAUDE_ACCOUNT_ID";
-var ACCT={rows:[],serving:null,local:null,locked:false,usage:{},open:{},localUsage:null};
+var ACCT={rows:[],serving:null,local:null,locked:false,usage:{},open:{},localUsage:null,routing:{}};
 function attr(s){return esc(s).replace(/"/g,"&quot;")}
 function planLabel(planType){
   // claude_max -> MAX, claude_pro -> PRO; an absent plan renders as a dash.
@@ -1377,6 +1477,22 @@ function fmtAgo(epochSec){
   if(!epochSec)return"—";
   var m=Math.max(0,Math.round((Date.now()/1000-epochSec)/60));
   return m<1?"방금":m<60?m+"분 전":Math.floor(m/60)+"시간 "+(m%60)+"분 전";
+}
+function fmtCooldownUntil(epochMs){
+  if(typeof epochMs!=="number")return"—";
+  var d=new Date(epochMs);
+  function pad(n){return(n<10?"0":"")+n}
+  return d.getFullYear()+"-"+pad(d.getMonth()+1)+"-"+pad(d.getDate())+" "+pad(d.getHours())+":"+pad(d.getMinutes());
+}
+function routingBadgeHtml(accountId){
+  var m=ACCT.routing[accountId];
+  if(!m)return"";
+  if(m.routing_state==="cooldown")
+    return'<span class="pill cool">쿨다운 · '+esc(fmtCooldownUntil(m.cooldown_until))+'</span>';
+  if(m.routing_state==="ready")return'<span class="pill ready">라우팅 준비</span>';
+  if(m.routing_state==="unavailable")
+    return'<span class="pill unavailable">라우팅 불가'+(m.reason==="needs-reauth"?" · 토큰 만료":"")+'</span>';
+  return"";
 }
 var ACCT_USAGE_SKELETON='<div class="uwin" aria-hidden="true"><div class="uwin-h"><span class="sk">세션 윈도우</span></div>'+
   '<div class="ubar"></div><div class="ureset"><span class="sk">0요일 00:00 리셋 (0시간 0분 후)</span></div></div>';
@@ -1417,7 +1533,12 @@ function acctDetailHtml(row,serving){
       :'<button type="button" class="primary" data-act="serve"'+(ACCT.locked?" disabled":"")+'>이 계정으로 서빙</button>';
   // Removal stays a CLI-only operation; the button mirrors the probe but is
   // inert with the command it defers to.
-  return'<div class="ad-grid"><div>'+acctUsageHtml(row)+'</div><div>'+kv+'</div>'+
+  var member=ACCT.routing[row.id];
+  var coolnote=member&&member.routing_state==="cooldown"
+    ?'<div class="coolnote">사용량 한도(429)로 쿨다운 중입니다.'+
+      '<span class="hint">'+esc(fmtCooldownUntil(member.cooldown_until))+' 이후 자동으로 다시 참여합니다.</span></div>'
+    :"";
+  return coolnote+'<div class="ad-grid"><div>'+acctUsageHtml(row)+'</div><div>'+kv+'</div>'+
     '<div class="actions">'+primary+'<span class="spacer"></span>'+
     '<button type="button" class="ghost danger" disabled title="대시보드 제거는 지원하지 않습니다 — CLI: claudex-gateway account remove '+attr(row.id)+'">제거</button></div></div>';
 }
@@ -1428,7 +1549,7 @@ function acctRowHtml(row){
     :row.state!=="ready"?'<span class="st reauth">⚠ 재로그인 필요</span>':"";
   return'<div class="arow'+(open?" open":"")+'" data-id="'+attr(row.id)+'" tabindex="0" role="button" aria-expanded="'+(open?"true":"false")+'">'+
     '<span class="chev" aria-hidden="true">▶</span>'+
-    '<span class="em">'+esc(row.email)+'</span>'+st+
+    '<span class="em">'+esc(row.email)+'</span>'+st+routingBadgeHtml(row.id)+
     '<span class="spacer"></span>'+
     '<span class="plan-txt">'+esc(planLabel(row.planType))+'</span></div>'+
     '<div class="adetail'+(open?" show":"")+'" data-for="'+attr(row.id)+'">'+acctDetailHtml(row,serving)+'</div>';
@@ -1488,14 +1609,16 @@ function fetchAccountUsage(){
   }).catch(function(){settle("gateway unreachable")});
 }
 function fetchAccounts(){
-  /* The accounts screen paints from three independent resources: the
-     registry collection, the local-login hero, and the serving pin. */
+  /* The accounts screen paints from four independent resources: the
+     registry collection, the local-login hero, the serving pin, and the
+     per-member routing status. */
   Promise.all([
     jfetch("/admin/providers/claude/accounts"),
     jfetch("/admin/providers/claude/local"),
-    jfetch("/admin/providers/claude/pool/serving")
+    jfetch("/admin/providers/claude/pool/serving"),
+    jfetch("/admin/providers/claude/pool/status")
   ]).then(function(rs){
-    var listResp=rs[0],localResp=rs[1],servingResp=rs[2];
+    var listResp=rs[0],localResp=rs[1],servingResp=rs[2],statusResp=rs[3];
     if(!listResp.ok){
       showToast('<span class="chip chip-err">ERROR</span><span class="lat">'+listResp.status+
         '</span><br>GET /admin/providers/claude/accounts<br><span class="dim">'+esc(errDetail(listResp.body))+"</span>",true);
@@ -1513,6 +1636,16 @@ function fetchAccounts(){
       showToast('<span class="chip chip-err">ERROR</span><span class="lat">'+servingResp.status+
         '</span><br>GET /admin/providers/claude/pool/serving<br><span class="dim">'+
         esc(errDetail(servingResp.body))+"</span>",true);
+    }
+    // Same stance as the serving pin: an unknown routing status renders as no
+    // badges, with the error — fresh rows never wear stale badges.
+    ACCT.routing={};
+    if(statusResp.ok){
+      (statusResp.body.members||[]).forEach(function(m){ACCT.routing[m.account_id]=m});
+    }else{
+      showToast('<span class="chip chip-err">ERROR</span><span class="lat">'+statusResp.status+
+        '</span><br>GET /admin/providers/claude/pool/status<br><span class="dim">'+
+        esc(errDetail(statusResp.body))+"</span>",true);
     }
     renderAcctList();
     renderLocalHero();
@@ -2152,18 +2285,26 @@ function boot(){
       jfetch("/admin/providers/kimi/models"),
       jfetch("/admin/providers/grok/models"),
       jfetch("/admin/settings/log-level"),
-      jfetch("/admin/settings/compaction")
+      jfetch("/admin/settings/compaction"),
+      jfetch("/admin/providers/claude/pool/routing")
     ]);
   }).then(function(results){
     var mapping=results[0],health=results[1];
     var codexCatalog=results[2],kimiCatalog=results[3],grokCatalog=results[4],loglevel=results[5];
-    var compactionResp=results[6];
+    var compactionResp=results[6],routingResp=results[7];
     if(loglevel.ok)renderLogLevel(loglevel.body);
     if(compactionResp.ok){
       renderCompactionState(compactionResp.body);
     }else{
       showToast('<span class="chip chip-err">ERROR</span><span class="lat">'+compactionResp.status+
         '</span><br>GET /admin/settings/compaction<br><span class="dim">'+esc(errDetail(compactionResp.body))+"</span>",true);
+    }
+    if(routingResp.ok&&isRoutingEnvelope(routingResp.body)){
+      renderRoutingState(routingResp.body);
+    }else{
+      renderRouting();
+      showToast('<span class="chip chip-err">ERROR</span><span class="lat">'+routingResp.status+
+        '</span><br>GET /admin/providers/claude/pool/routing<br><span class="dim">'+esc(errDetail(routingResp.body))+"</span>",true);
     }
     if(mapping.ok){
       DIR.LIVE=mapping.body.model_map||{};
