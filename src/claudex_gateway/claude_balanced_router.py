@@ -25,16 +25,31 @@ statelessly via `derive_stateless_routing_digest`.
 Random Weight) sample: a per-(session, account) digest reduced to a
 uniformly distributed point in the open interval (0, 1), so the account with
 the largest sample can be picked without keeping any pin-map state.
+
+The rest of this module (design v2 §2, §5.1-§5.3) is the balanced picker
+core built on top of the above: `ObservationView` turns per-window usage
+readings into freshness-ladder-adjusted pressures, `quota_family` and the
+positive-set / amended-emergency weight formulas turn pressures into a
+weighted-HRW draw, and `ClaudeBalancedRouter.place_session` performs the
+atomic pick-and-pin critical section against an in-memory, TTL/LRU-bounded
+pin map with a cancellation-safe `pending_durability` barrier for the
+initial durable write.
 """
 
 from __future__ import annotations
 
+import asyncio
 import hmac
 import json
+import math
+import time
 import uuid
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from hashlib import sha256
 from typing import Any, Literal
+
+from claudex_gateway.claude_pool_runtime_state import ClaudePoolRuntimeStateStore, RestoreResult
 
 _SESSION_KEY_DOMAIN = b"claudex-session-key-v1"
 _HRW_DOMAIN = b"claudex-balanced-hrw-v1"
@@ -162,3 +177,848 @@ def derive_stateless_routing_digest(seed: bytes, nonce: bytes) -> bytes:
     persisted, and never creates a pin-map entry.
     """
     return _hmac_sha256(seed, _STATELESS_REQUEST_DOMAIN + b"\x00" + _length_prefixed(nonce))
+
+
+# ==========================================================================
+# Balanced picker core (design v2 §2, §5.1-§5.3)
+# ==========================================================================
+
+# -- freshness ladder / unknown_floor (design v2 §2) -----------------------
+
+_FRESH_EXACT_SECONDS = 5 * 60
+_FRESH_PLUS5_SECONDS = 15 * 60
+_FRESH_PLUS10_SECONDS = 30 * 60
+_FRESH_PLUS5_PP = 5.0
+_FRESH_PLUS10_PP = 10.0
+
+_UNKNOWN_FLOOR_MARGIN = 10.0
+_UNKNOWN_FLOOR_CAP = 90.0
+
+# The 0.5 haircut window: an `allowed_warning` signal only applies while it
+# is at most this many seconds old.
+_WARNING_FRESH_SECONDS = 5 * 60
+_WARNING_HAIRCUT_FACTOR = 0.5
+
+# The "2" in `H(a) = max(0, 100 - P(a) - 2*M(a))` and the emergency branch's
+# `W = C0^2 / (C0 + 2M)`.
+_IN_FLIGHT_PRESSURE_WEIGHT = 2.0
+
+_NON_FABLE_WINDOWS: tuple[str, ...] = ("five_hour", "seven_day")
+_FABLE_WINDOWS: tuple[str, ...] = ("five_hour", "seven_day", "fable_weekly")
+
+# `ClaudeAccountUsageCache.peek_with_metadata` (T-6) window names -> this
+# module's binding-window names (also `ClaudePoolRuntimeStateStore`'s
+# `usage_observations.window` values).
+_PEEK_WINDOW_TO_BINDING: dict[str, str] = {
+    "session": "five_hour",
+    "weekly": "seven_day",
+    "fable_weekly": "fable_weekly",
+}
+
+# Pin map (design v2 §5.1)
+DEFAULT_PIN_TTL_UUID_SECONDS = 5 * 3600
+DEFAULT_PIN_TTL_CONTENT_HASH_SECONDS = 30 * 60
+DEFAULT_PIN_MAP_MAX_ENTRIES = 10_000
+
+
+def quota_family(model: str) -> str:
+    """The binding-window family a `model` id belongs to (adjudication G).
+
+    The ASCII case-insensitive token "fable", bounded on each side by the
+    string's start/end or a non-alphanumeric (ASCII) character, selects the
+    "fable" family — which adds the `fable_weekly` binding window on top of
+    the default `[five_hour, seven_day]` pair. Every other model (including
+    a token merely containing "fable" as a substring of a larger word, e.g.
+    "unfable" or "fabled") uses the "default" family.
+    """
+    lowered = model.lower()
+    token = "fable"
+    start = 0
+    while True:
+        index = lowered.find(token, start)
+        if index == -1:
+            return "default"
+        before = lowered[index - 1] if index > 0 else None
+        after_index = index + len(token)
+        after = lowered[after_index] if after_index < len(lowered) else None
+        if not _is_ascii_alnum(before) and not _is_ascii_alnum(after):
+            return "fable"
+        start = index + 1
+
+
+def _is_ascii_alnum(char: str | None) -> bool:
+    return char is not None and char.isascii() and char.isalnum()
+
+
+def binding_windows(family: str) -> tuple[str, ...]:
+    """Design v2 §2: non-Fable accounts bind on `[five_hour, seven_day]`; Fable adds `fable_weekly`."""
+    return _FABLE_WINDOWS if family == "fable" else _NON_FABLE_WINDOWS
+
+
+def freshness_adjusted_pressure(
+    used_percent: float, age_seconds: float, *, reset_passed: bool
+) -> float | None:
+    """Design v2 §2's freshness ladder, or `None` for UNKNOWN.
+
+    <=5 min: the exact reading. 5-15 min: +5 percentage points. 15-30 min:
+    +10 percentage points. Anything older than 30 minutes — or a window
+    whose reset has already passed — is UNKNOWN (`None`); a missing reading
+    is UNKNOWN by construction (the caller never invokes this at all).
+    """
+    if reset_passed:
+        return None
+    if age_seconds <= _FRESH_EXACT_SECONDS:
+        return min(100.0, used_percent)
+    if age_seconds <= _FRESH_PLUS5_SECONDS:
+        return min(100.0, used_percent + _FRESH_PLUS5_PP)
+    if age_seconds <= _FRESH_PLUS10_SECONDS:
+        return min(100.0, used_percent + _FRESH_PLUS10_PP)
+    return None
+
+
+def unknown_floor(complete_pressures: Sequence[float]) -> float:
+    """`unknown_floor = min(90, min(complete_pressures) + 10)`, or 0 with none complete.
+
+    `complete_pressures` is every freshness-complete (non-UNKNOWN) window
+    pressure across the CURRENT candidate set — every window of every
+    account still being considered for this placement, not just the one
+    account whose pressure is being filled in.
+    """
+    if not complete_pressures:
+        return 0.0
+    return min(_UNKNOWN_FLOOR_CAP, min(complete_pressures) + _UNKNOWN_FLOOR_MARGIN)
+
+
+def _wall_to_monotonic(wall_value: float, *, wall_now: float, monotonic_now: float) -> float:
+    """Design v2 §5.2: convert a stored wall-clock timestamp into the router's monotonic domain."""
+    return monotonic_now + (wall_value - wall_now)
+
+
+@dataclass
+class _WindowObservation:
+    used_percent: float
+    observed_at: float
+    reset_at: float | None
+    reset_identity: str | None
+    source: str
+
+
+@dataclass
+class _WarningSignal:
+    observed_at: float
+    reset_identity: str | None
+
+
+class ObservationView:
+    """Per-account, per-window usage observations feeding pressure computation.
+
+    Fed from two sources (design v2 §2): periodic `peek_with_metadata`-shaped
+    polls and directly ingested, source-tagged observations — both go
+    through `ingest_window`, which keeps only the latest reading per
+    `(account_id, window)`. `ingest_allowed_warning` separately retains the
+    upstream "allowed: warning" signal a fresh matching-reset-identity
+    window observation can haircut against. Every timestamp lives in one
+    caller-supplied clock domain (the owning router's monotonic clock);
+    callers convert wall-clock inputs (e.g. `resets_at` epochs) before
+    ingesting.
+    """
+
+    def __init__(self) -> None:
+        self._windows: dict[tuple[str, str], _WindowObservation] = {}
+        self._warnings: dict[tuple[str, str], _WarningSignal] = {}
+
+    def ingest_window(
+        self,
+        account_id: str,
+        window: str,
+        *,
+        used_percent: float,
+        source: str,
+        observed_at: float,
+        reset_at: float | None = None,
+        reset_identity: str | None = None,
+    ) -> None:
+        self._windows[(account_id, window)] = _WindowObservation(
+            used_percent=used_percent,
+            observed_at=observed_at,
+            reset_at=reset_at,
+            reset_identity=reset_identity,
+            source=source,
+        )
+
+    def ingest_allowed_warning(
+        self, account_id: str, window: str, *, observed_at: float, reset_identity: str | None
+    ) -> None:
+        self._warnings[(account_id, window)] = _WarningSignal(
+            observed_at=observed_at, reset_identity=reset_identity
+        )
+
+    def window_pressure(self, account_id: str, window: str, *, now: float) -> float | None:
+        """The freshness-ladder-adjusted pressure for one window, or `None` (UNKNOWN)."""
+        observation = self._windows.get((account_id, window))
+        if observation is None:
+            return None
+        reset_passed = observation.reset_at is not None and observation.reset_at <= now
+        return freshness_adjusted_pressure(
+            observation.used_percent, now - observation.observed_at, reset_passed=reset_passed
+        )
+
+    def window_reset_identity(self, account_id: str, window: str) -> str | None:
+        observation = self._windows.get((account_id, window))
+        return observation.reset_identity if observation is not None else None
+
+    def has_active_warning(self, account_id: str, window: str, *, now: float) -> bool:
+        """True while a fresh (<=5 min) `allowed_warning` with a matching reset identity is retained."""
+        warning = self._warnings.get((account_id, window))
+        if warning is None:
+            return False
+        if now - warning.observed_at > _WARNING_FRESH_SECONDS:
+            return False
+        return warning.reset_identity == self.window_reset_identity(account_id, window)
+
+
+def warning_factor(view: ObservationView, account_id: str, windows: Sequence[str], *, now: float) -> float:
+    """`W(a) = H(a) x warning_factor(a)`: the 0.5 haircut while any binding window retains a matching warning."""
+    if any(view.has_active_warning(account_id, window, now=now) for window in windows):
+        return _WARNING_HAIRCUT_FACTOR
+    return 1.0
+
+
+# -- weight computation: positive-set rule + amended emergency branch ------
+
+
+def account_headroom(pressure: float, in_flight: int) -> float:
+    """`H(a) = max(0, 100 - P(a) - 2*M(a))`."""
+    return max(0.0, 100.0 - pressure - _IN_FLIGHT_PRESSURE_WEIGHT * in_flight)
+
+
+def emergency_capacity(pressure: float, factor: float) -> float:
+    """`C0 = max(1, (100 - P) x factor)`: the amended emergency branch's capacity floor.
+
+    Only reached when every eligible candidate's ordinary weight is zero
+    (the positive-set is empty): it guarantees a strictly positive input to
+    `emergency_weight` even once raw headroom has bottomed out, so
+    `place_session` can still commit to somebody instead of dividing by
+    zero.
+    """
+    C0 = max(1.0, (100.0 - pressure) * factor)
+    return C0
+
+
+def emergency_weight(pressure: float, factor: float, in_flight: int) -> float:
+    """`W = C0^2 / (C0 + 2M)`: the amended emergency branch's weight."""
+    C0 = emergency_capacity(pressure, factor)
+    return (C0 * C0) / (C0 + _IN_FLIGHT_PRESSURE_WEIGHT * in_flight)
+
+
+def select_weights(
+    account_ids: Sequence[str],
+    *,
+    pressures: Mapping[str, float],
+    warning_factors: Mapping[str, float],
+    in_flight: Mapping[str, int],
+) -> dict[str, float]:
+    """The positive-set rule: score only positive-weight accounts, unless every account is zero.
+
+    Returns `{account_id: weight}` for exactly the accounts that may be
+    drawn from. When at least one candidate's ordinary `W(a) = H(a) x
+    warning_factor(a)` is positive, every zero-weight candidate is dropped
+    (a zero-weight account is never scored while a positive-weight one
+    exists) and the positive ones are returned as-is. Only when the
+    positive-set is empty does the amended emergency branch (`C0`,
+    `emergency_weight`) run, for every candidate.
+    """
+    ordinary_weights = {
+        account_id: account_headroom(pressures[account_id], in_flight.get(account_id, 0))
+        * warning_factors.get(account_id, 1.0)
+        for account_id in account_ids
+    }
+    positive_set = {account_id: weight for account_id, weight in ordinary_weights.items() if weight > 0}
+    if positive_set:
+        return positive_set
+    return {
+        account_id: emergency_weight(
+            pressures[account_id], warning_factors.get(account_id, 1.0), in_flight.get(account_id, 0)
+        )
+        for account_id in account_ids
+    }
+
+
+def resolve_tie_break(tied_account_ids: Sequence[str], *, serving_account_id: str | None) -> str:
+    """§2's tie rule: the serving pin wins if it is one of the tied accounts, else the lexically smallest id."""
+    if serving_account_id is not None and serving_account_id in tied_account_ids:
+        return serving_account_id
+    return min(tied_account_ids)
+
+
+def pick_weighted_hrw(
+    *,
+    weights: Mapping[str, float],
+    seed: bytes,
+    session_key_digest: bytes,
+    serving_account_id: str | None = None,
+) -> str:
+    """Weighted HRW draw: `score = -ln(u)/W(a)`; the lowest score wins.
+
+    `u` is `hrw_unit_interval`'s per-(session, account) sample. A tie in the
+    lowest score resolves via `resolve_tie_break`.
+    """
+    if not weights:
+        raise NoEligibleAccountError("no candidate carries a positive weight to draw from")
+    scored = [
+        (-math.log(hrw_unit_interval(seed, session_key_digest, account_id)) / weight, account_id)
+        for account_id, weight in weights.items()
+    ]
+    lowest_score = min(score for score, _account_id in scored)
+    tied = [account_id for score, account_id in scored if score == lowest_score]
+    if len(tied) == 1:
+        return tied[0]
+    return resolve_tie_break(tied, serving_account_id=serving_account_id)
+
+
+# -- eligibility filtering ---------------------------------------------------
+
+
+class NoEligibleAccountError(RuntimeError):
+    """Raised when no candidate survives eligibility filtering (or carries a positive weight)."""
+
+
+@dataclass(frozen=True)
+class AccountCandidate:
+    """One account's picker-relevant eligibility state for a single `place_session` call."""
+
+    account_id: str
+    account_incarnation_id: str
+    ready: bool = True
+    capability_denied: bool = False
+    account_cooldown_until: float | None = None
+    family_cooldown_until: float | None = None
+
+
+def is_eligible_candidate(
+    candidate: AccountCandidate, *, now: float, already_attempted: frozenset[str]
+) -> bool:
+    """ready, capability != denied, not account-cooling, not family-cooling, not already attempted."""
+    if not candidate.ready:
+        return False
+    if candidate.capability_denied:
+        return False
+    if candidate.account_id in already_attempted:
+        return False
+    if candidate.account_cooldown_until is not None and candidate.account_cooldown_until > now:
+        return False
+    if candidate.family_cooldown_until is not None and candidate.family_cooldown_until > now:
+        return False
+    return True
+
+
+# -- pin map (design v2 §5.1-§5.3) ------------------------------------------
+
+
+class PendingDurabilityBarrier:
+    """A cancellation-safe, resolve-exactly-once gate for one pin generation's durable write.
+
+    Spec-gate ruling (§5.3): every request resolving this pin generation —
+    not just its creator — awaits `wait()`, which shields the underlying
+    event so a waiter's own cancellation can never cancel (or double-fire)
+    the barrier's resolution, before starting an upstream attempt.
+    `resolve()` runs exactly once, whether the durable write succeeded or
+    failed; a second call is a no-op.
+    """
+
+    def __init__(self) -> None:
+        self._event = asyncio.Event()
+        self._resolved = False
+
+    @property
+    def is_resolved(self) -> bool:
+        return self._resolved
+
+    def resolve(self) -> None:
+        if self._resolved:
+            return
+        self._resolved = True
+        self._event.set()
+
+    async def wait(self) -> None:
+        await asyncio.shield(self._event.wait())
+
+
+@dataclass
+class PinEntry:
+    """One in-memory pin-map row: `digest -> {account_id, key_kind, last_seen_monotonic, generation, ...}`."""
+
+    session_key_digest: bytes
+    key_kind: str
+    account_id: str
+    account_incarnation_id: str
+    generation: int
+    last_seen_monotonic: float
+    expires_at_monotonic: float
+    migration_reserved: bool = False
+    pending_durability: PendingDurabilityBarrier | None = None
+
+
+@dataclass(frozen=True)
+class PlacementResult:
+    """`place_session`'s outcome: the picked/followed account and its pin's identity."""
+
+    account_id: str
+    session_key_digest: bytes
+    key_kind: str
+    generation: int
+    created: bool
+    durability_barrier: PendingDurabilityBarrier | None
+
+
+class ClaudeBalancedRouter:
+    """Design v2 §2/§5's balanced picker core: pressures, weighted HRW, pin map.
+
+    Owns the in-memory `ObservationView`, the `digest -> PinEntry` pin map
+    (TTLs, LRU eviction, exactly-once-decrementing counters), each
+    account's in-flight attempt count `M(a)`, and the atomic
+    `place_session` pick+pin-insert critical section — synchronous
+    end-to-end (no `await`), so nothing can interleave between picking an
+    account and inserting its pin. Durable persistence (the
+    `pending_durability` barrier and the coalesced `last_seen` refresh,
+    §5.3) goes through an optional `ClaudePoolRuntimeStateStore`.
+    """
+
+    def __init__(
+        self,
+        *,
+        balanced_epoch_id: str,
+        store: ClaudePoolRuntimeStateStore | None = None,
+        clock: Callable[[], float] = time.monotonic,
+        wall_clock: Callable[[], float] = time.time,
+        pin_ttl_uuid_seconds: float = DEFAULT_PIN_TTL_UUID_SECONDS,
+        pin_ttl_content_hash_seconds: float = DEFAULT_PIN_TTL_CONTENT_HASH_SECONDS,
+        pin_map_max_entries: int = DEFAULT_PIN_MAP_MAX_ENTRIES,
+    ) -> None:
+        self.balanced_epoch_id = balanced_epoch_id
+        self.observations = ObservationView()
+        self.persistence_degraded = False
+
+        self._store = store
+        self._clock = clock
+        self._wall_clock = wall_clock
+        self._pin_ttl_uuid_seconds = pin_ttl_uuid_seconds
+        self._pin_ttl_content_hash_seconds = pin_ttl_content_hash_seconds
+        self._pin_map_max_entries = pin_map_max_entries
+
+        self._pins: dict[bytes, PinEntry] = {}
+        self._in_flight: dict[str, int] = {}
+        self._restored_any_valid_pin = False
+
+        # Every removal path (expiry, LRU eviction, explicit removal,
+        # restore) goes through `_remove_pin`, so each pin is decremented
+        # exactly once no matter which path removed it.
+        self.removed_pin_counts: dict[str, int] = {}
+        self.total_removed_pins = 0
+        # Incremented whenever the bound is at capacity and every remaining
+        # candidate is migration-reserved (so eviction cannot reclaim
+        # space) — the "soft bound" being exceeded.
+        self.soft_bound_overflow_count = 0
+
+    # -- in-flight attempt counting: M(a) -----------------------------------
+
+    def begin_attempt(self, account_id: str) -> None:
+        self._in_flight[account_id] = self._in_flight.get(account_id, 0) + 1
+
+    def end_attempt(self, account_id: str) -> None:
+        current = self._in_flight.get(account_id, 0)
+        self._in_flight[account_id] = max(0, current - 1)
+
+    def in_flight_count(self, account_id: str) -> int:
+        return self._in_flight.get(account_id, 0)
+
+    # -- observation ingestion -----------------------------------------------
+
+    def ingest_usage_peek(
+        self, account_id: str, peeked: tuple[dict[str, Any], dict[str, dict[str, Any]]] | None
+    ) -> None:
+        """Adapt `ClaudeAccountUsageCache.peek_with_metadata`'s shape (T-6) into `ObservationView`."""
+        if peeked is None:
+            return
+        envelope, metadata = peeked
+        now = self._clock()
+        wall_now = self._wall_clock()
+        for peek_window, binding_window in _PEEK_WINDOW_TO_BINDING.items():
+            window_meta = metadata.get(peek_window)
+            window_envelope = envelope.get(peek_window)
+            if not isinstance(window_meta, dict) or not isinstance(window_envelope, dict):
+                continue
+            used_percent = window_envelope.get("used_percent")
+            if not isinstance(used_percent, (int, float)):
+                continue
+            raw_age = window_meta.get("age_seconds")
+            age_seconds = float(raw_age) if isinstance(raw_age, (int, float)) else 0.0
+            raw_reset_at = window_meta.get("reset_at")
+            reset_at = (
+                _wall_to_monotonic(float(raw_reset_at), wall_now=wall_now, monotonic_now=now)
+                if isinstance(raw_reset_at, (int, float))
+                else None
+            )
+            self.observations.ingest_window(
+                account_id,
+                binding_window,
+                used_percent=float(used_percent),
+                source=str(window_meta.get("source") or "usage_api"),
+                observed_at=now - age_seconds,
+                reset_at=reset_at,
+            )
+
+    def ingest_observation(
+        self,
+        account_id: str,
+        window: str,
+        *,
+        used_percent: float,
+        source: str,
+        age_seconds: float = 0.0,
+        reset_in_seconds: float | None = None,
+        reset_identity: str | None = None,
+    ) -> None:
+        """Directly ingest one source-tagged window observation (design v2 §2)."""
+        now = self._clock()
+        reset_at = now + reset_in_seconds if reset_in_seconds is not None else None
+        self.observations.ingest_window(
+            account_id,
+            window,
+            used_percent=used_percent,
+            source=source,
+            observed_at=now - age_seconds,
+            reset_at=reset_at,
+            reset_identity=reset_identity,
+        )
+
+    def ingest_allowed_warning(self, account_id: str, window: str, *, reset_identity: str | None) -> None:
+        self.observations.ingest_allowed_warning(
+            account_id, window, observed_at=self._clock(), reset_identity=reset_identity
+        )
+
+    # -- pressure / weight computation over the current candidate set ------
+
+    def account_pressure(self, account_id: str, family: str, *, now: float, floor: float) -> float:
+        """`P(a)`: the max, across `a`'s binding windows, of each window's pressure or `floor` if UNKNOWN."""
+        values = []
+        for window in binding_windows(family):
+            pressure_value = self.observations.window_pressure(account_id, window, now=now)
+            values.append(pressure_value if pressure_value is not None else floor)
+        return max(values)
+
+    def candidate_set_unknown_floor(
+        self, account_ids: Sequence[str], family: str, *, now: float
+    ) -> float:
+        """`unknown_floor` computed over every binding window of the CURRENT candidate set."""
+        complete: list[float] = []
+        for account_id in account_ids:
+            for window in binding_windows(family):
+                pressure_value = self.observations.window_pressure(account_id, window, now=now)
+                if pressure_value is not None:
+                    complete.append(pressure_value)
+        return unknown_floor(complete)
+
+    def _candidate_weights(
+        self, eligible: Sequence[AccountCandidate], family: str, *, now: float
+    ) -> dict[str, float]:
+        account_ids = [candidate.account_id for candidate in eligible]
+        floor = self.candidate_set_unknown_floor(account_ids, family, now=now)
+        pressures = {
+            account_id: self.account_pressure(account_id, family, now=now, floor=floor)
+            for account_id in account_ids
+        }
+        windows = binding_windows(family)
+        warning_factors = {
+            account_id: warning_factor(self.observations, account_id, windows, now=now)
+            for account_id in account_ids
+        }
+        in_flight = {account_id: self.in_flight_count(account_id) for account_id in account_ids}
+        return select_weights(account_ids, pressures=pressures, warning_factors=warning_factors, in_flight=in_flight)
+
+    # -- cold start (design v2 §2.4) -----------------------------------------
+
+    def _is_cold_start(
+        self,
+        eligible_by_id: dict[str, AccountCandidate],
+        all_candidates_by_id: dict[str, AccountCandidate],
+        family: str,
+        serving_account_id: str | None,
+        *,
+        now: float,
+    ) -> bool:
+        """All windows UNKNOWN, no valid restored pins for the current epoch, zero live pins
+        (already purged of expiry by the caller), zero active migrations, and the serving pin
+        itself eligible -> the first session goes to the serving pin.
+        """
+        if serving_account_id is None:
+            return False
+        if self._pins:
+            return False
+        if self._restored_any_valid_pin:
+            return False
+        if self.active_migration_count() != 0:
+            return False
+        for account_id in all_candidates_by_id:
+            for window in binding_windows(family):
+                if self.observations.window_pressure(account_id, window, now=now) is not None:
+                    return False
+        return serving_account_id in eligible_by_id
+
+    # -- pin map: reads, TTL/LRU/counters -------------------------------------
+
+    def get_pin(self, digest: bytes) -> PinEntry | None:
+        return self._pins.get(digest)
+
+    def pin_count(self) -> int:
+        return len(self._pins)
+
+    def active_migration_count(self) -> int:
+        return sum(1 for entry in self._pins.values() if entry.migration_reserved)
+
+    def set_migration_reserved(self, digest: bytes, reserved: bool) -> None:
+        entry = self._pins.get(digest)
+        if entry is not None:
+            entry.migration_reserved = reserved
+
+    def _pin_ttl_seconds(self, key_kind: str) -> float:
+        return self._pin_ttl_uuid_seconds if key_kind == "uuid" else self._pin_ttl_content_hash_seconds
+
+    def purge_expired_pins(self, *, now: float | None = None) -> int:
+        now = self._clock() if now is None else now
+        expired = [digest for digest, entry in self._pins.items() if entry.expires_at_monotonic <= now]
+        for digest in expired:
+            self._remove_pin(digest, reason="expired")
+        return len(expired)
+
+    def remove_pin(self, digest: bytes) -> bool:
+        """Explicit external removal (e.g. account removal, §5.7)."""
+        return self._remove_pin(digest, reason="removed") is not None
+
+    def _remove_pin(self, digest: bytes, *, reason: str) -> PinEntry | None:
+        entry = self._pins.pop(digest, None)
+        if entry is None:
+            return None
+        self.removed_pin_counts[reason] = self.removed_pin_counts.get(reason, 0) + 1
+        self.total_removed_pins += 1
+        return entry
+
+    def _lru_victim(self, *, key_kind: str) -> bytes | None:
+        candidates = [
+            (entry.last_seen_monotonic, digest)
+            for digest, entry in self._pins.items()
+            if entry.key_kind == key_kind and not entry.migration_reserved
+        ]
+        if not candidates:
+            return None
+        return min(candidates)[1]
+
+    def _ensure_capacity(self, *, now: float) -> None:
+        """Bound 10,000, eviction order expired -> LRU content-hash -> LRU uuid.
+
+        Entries holding an active migration reservation are never evicted
+        (a soft bound): if every remaining entry is reserved, the bound is
+        exceeded and `soft_bound_overflow_count` records it instead.
+        """
+        if len(self._pins) < self._pin_map_max_entries:
+            return
+        self.purge_expired_pins(now=now)
+        if len(self._pins) < self._pin_map_max_entries:
+            return
+        victim = self._lru_victim(key_kind="content_hash") or self._lru_victim(key_kind="uuid")
+        if victim is None:
+            self.soft_bound_overflow_count += 1
+            return
+        self._remove_pin(victim, reason="evicted_lru")
+
+    def touch_pin(
+        self,
+        digest: bytes,
+        *,
+        is_message_request: bool,
+        key_is_live: bool,
+        account_still_registered: bool,
+        now: float | None = None,
+    ) -> bool:
+        """The `last_seen` refresh predicate: a real /v1/messages request resolving a live key
+        with current registry membership, applied before the upstream outcome is known.
+        """
+        entry = self._pins.get(digest)
+        if entry is None:
+            return False
+        if not (is_message_request and key_is_live and account_still_registered):
+            return False
+        now = self._clock() if now is None else now
+        entry.last_seen_monotonic = now
+        entry.expires_at_monotonic = now + self._pin_ttl_seconds(entry.key_kind)
+        return True
+
+    # -- atomic pick + pin-insert (design v2 §5.1) ---------------------------
+
+    def place_session(
+        self,
+        *,
+        session_key: SessionKey,
+        model: str,
+        candidates: Sequence[AccountCandidate],
+        seed: bytes,
+        serving_account_id: str | None = None,
+        already_attempted: frozenset[str] = frozenset(),
+        now: float | None = None,
+    ) -> PlacementResult:
+        """The atomic pick+pin-insert critical section: entirely synchronous (no `await`),
+        so no other coroutine can interleave between the pick and the pin-map insert.
+        """
+        now = self._clock() if now is None else now
+        self.purge_expired_pins(now=now)
+
+        existing = self._pins.get(session_key.digest)
+        if existing is not None:
+            return PlacementResult(
+                account_id=existing.account_id,
+                session_key_digest=session_key.digest,
+                key_kind=existing.key_kind,
+                generation=existing.generation,
+                created=False,
+                durability_barrier=existing.pending_durability,
+            )
+
+        all_by_id = {candidate.account_id: candidate for candidate in candidates}
+        eligible = [
+            candidate
+            for candidate in candidates
+            if is_eligible_candidate(candidate, now=now, already_attempted=already_attempted)
+        ]
+        eligible_by_id = {candidate.account_id: candidate for candidate in eligible}
+        if not eligible:
+            raise NoEligibleAccountError("no eligible account is available to place this session")
+
+        family = quota_family(model)
+        if self._is_cold_start(eligible_by_id, all_by_id, family, serving_account_id, now=now):
+            chosen_id = serving_account_id
+            assert chosen_id is not None
+        else:
+            weights = self._candidate_weights(eligible, family, now=now)
+            chosen_id = pick_weighted_hrw(
+                weights=weights,
+                seed=seed,
+                session_key_digest=session_key.digest,
+                serving_account_id=serving_account_id,
+            )
+
+        chosen = eligible_by_id[chosen_id]
+        self._ensure_capacity(now=now)
+        barrier = PendingDurabilityBarrier()
+        entry = PinEntry(
+            session_key_digest=session_key.digest,
+            key_kind=session_key.kind,
+            account_id=chosen.account_id,
+            account_incarnation_id=chosen.account_incarnation_id,
+            generation=0,
+            last_seen_monotonic=now,
+            expires_at_monotonic=now + self._pin_ttl_seconds(session_key.kind),
+            pending_durability=barrier,
+        )
+        self._pins[session_key.digest] = entry
+        return PlacementResult(
+            account_id=chosen.account_id,
+            session_key_digest=session_key.digest,
+            key_kind=session_key.kind,
+            generation=0,
+            created=True,
+            durability_barrier=barrier,
+        )
+
+    # -- durable persistence (design v2 §5.3) --------------------------------
+
+    async def submit_new_pin_durability(self, digest: bytes) -> None:
+        """Submit the initial pin's HIGH-PRIORITY durable write and resolve its barrier.
+
+        Meant to run as a task independent of any one request's own
+        cancellation (spawned by whoever created the pin right after
+        `place_session` returns, never awaited inline inside its no-await
+        critical section). On store failure, `persistence_degraded` is set
+        and the in-memory pin is retained; the barrier still resolves
+        exactly once either way, releasing every blocked request.
+        """
+        entry = self._pins.get(digest)
+        if entry is None or entry.pending_durability is None:
+            return
+        barrier = entry.pending_durability
+        if self._store is None:
+            barrier.resolve()
+            return
+        try:
+            pending_write = self._store.upsert_pin(
+                session_key_digest=digest,
+                key_kind=entry.key_kind,
+                account_id=entry.account_id,
+                account_incarnation_id=entry.account_incarnation_id,
+                last_seen_utc=self._wall_clock(),
+                expires_at_utc=self._wall_clock() + (entry.expires_at_monotonic - self._clock()),
+                generation=entry.generation,
+                balanced_epoch_id=self.balanced_epoch_id,
+                high_priority=True,
+            )
+            await pending_write.wait_async()
+        except Exception:
+            self.persistence_degraded = True
+        finally:
+            barrier.resolve()
+
+    async def await_pin_durability(self, digest: bytes) -> None:
+        """Every request resolving this pin generation awaits its barrier before an upstream attempt."""
+        entry = self._pins.get(digest)
+        if entry is None or entry.pending_durability is None:
+            return
+        await entry.pending_durability.wait()
+
+    async def refresh_pin_durable_last_seen(self, digest: bytes) -> None:
+        """§5.3's durable `last_seen` refresh, coalesced <=1/60s per pin by the store itself."""
+        entry = self._pins.get(digest)
+        if entry is None or self._store is None:
+            return
+        pending_write = self._store.touch_pin_last_seen(digest, self._wall_clock())
+        if pending_write is None:
+            return
+        try:
+            await pending_write.wait_async()
+        except Exception:
+            self.persistence_degraded = True
+
+    # -- restore-from-store initialization (design v2 §5.2, §5.5) -----------
+
+    def restore_from_store(
+        self, restore_result: RestoreResult, *, now: float | None = None, wall_now: float | None = None
+    ) -> int:
+        """Convert restored pin rows (wall-clock) into the monotonic pin map, recomputing counters.
+
+        `restore_result.pins` already excludes expired and epoch-mismatched
+        rows (`ClaudePoolRuntimeStateStore.restore`); every remaining row is
+        durable, so it carries no `pending_durability` barrier.
+        """
+        monotonic_now = self._clock() if now is None else now
+        wall_now = self._wall_clock() if wall_now is None else wall_now
+
+        self._pins.clear()
+        self.removed_pin_counts.clear()
+        self.total_removed_pins = 0
+        self.soft_bound_overflow_count = 0
+
+        for digest, row in restore_result.pins.items():
+            self._pins[digest] = PinEntry(
+                session_key_digest=digest,
+                key_kind=row.key_kind,
+                account_id=row.account_id,
+                account_incarnation_id=row.account_incarnation_id,
+                generation=row.generation,
+                last_seen_monotonic=_wall_to_monotonic(
+                    row.last_seen_utc, wall_now=wall_now, monotonic_now=monotonic_now
+                ),
+                expires_at_monotonic=_wall_to_monotonic(
+                    row.expires_at_utc, wall_now=wall_now, monotonic_now=monotonic_now
+                ),
+                pending_durability=None,
+            )
+        self._restored_any_valid_pin = bool(restore_result.pins)
+        return len(self._pins)
