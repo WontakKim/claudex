@@ -46,3 +46,15 @@ def accounts_dir(provider: str) -> Path:
     ):
         raise ValueError(f"invalid provider name: {provider!r}")
     return runtime_dir() / "accounts" / provider
+
+
+def claude_account_pool_dir() -> Path:
+    return runtime_dir() / "claude-account-pool"
+
+
+def claude_account_pool_runtime_db() -> Path:
+    return claude_account_pool_dir() / "claude-account-pool-runtime.sqlite3"
+
+
+def claude_account_pool_lock() -> Path:
+    return claude_account_pool_dir() / "balanced-router.lock"
