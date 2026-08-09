@@ -43,12 +43,43 @@ def test_provider_rejects_unsafe_names(provider: str) -> None:
         paths.accounts_dir(provider)
 
 
+def test_claude_account_pool_dir_is_under_runtime_dir(tmp_path: Path) -> None:
+    assert (
+        paths.claude_account_pool_dir()
+        == tmp_path / ".claudex" / "claude-account-pool"
+    )
+
+
+def test_claude_account_pool_dir_is_a_child_of_runtime_dir() -> None:
+    assert paths.claude_account_pool_dir().parent == paths.runtime_dir()
+
+
+def test_claude_account_pool_runtime_db_is_under_the_pool_dir(tmp_path: Path) -> None:
+    assert (
+        paths.claude_account_pool_runtime_db()
+        == tmp_path
+        / ".claudex"
+        / "claude-account-pool"
+        / "claude-account-pool-runtime.sqlite3"
+    )
+
+
+def test_claude_account_pool_lock_is_under_the_pool_dir(tmp_path: Path) -> None:
+    assert (
+        paths.claude_account_pool_lock()
+        == tmp_path / ".claudex" / "claude-account-pool" / "balanced-router.lock"
+    )
+
+
 def test_do_not_create_the_runtime_directory(tmp_path: Path) -> None:
     paths.runtime_dir()
     paths.settings_file()
     paths.daemon_record_file()
     paths.log_file()
     paths.accounts_dir("claude")
+    paths.claude_account_pool_dir()
+    paths.claude_account_pool_runtime_db()
+    paths.claude_account_pool_lock()
     assert not (tmp_path / ".claudex").exists()
 
 
