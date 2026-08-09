@@ -50,6 +50,15 @@ from claudex_gateway.claude_auth import (
     ClaudeAccountAuthManager,
     ClaudeAccountReauthRequiredError,
 )
+from claudex_gateway.claude_balanced_router import (
+    AccountCandidate,
+    BalancedPrepareError,
+    ClaudeBalancedRuntime,
+    NoEligibleAccountError,
+    SessionKey,
+    derive_session_key,
+    derive_stateless_routing_digest,
+)
 from claudex_gateway.claude_login_session import (
     ClaudeLoginSession,
     LoginSessionStateError,
@@ -319,8 +328,15 @@ async def _passthrough_to_anthropic(
     configured, the request is served with the registered account instead —
     and when claude_account.routing selects the "fallback" mode, with the
     whole pool, serving account first (see `_passthrough_with_claude_pool`).
+    The "balanced" mode is checked first, ahead of the claude_account.id
+    gate: it spreads sessions across the whole registered pool by weighted
+    HRW and never falls through to single-account/fallback routing (T-10
+    Step 6) — only through an active `ClaudeBalancedRuntime`, or the
+    reserved fail-closed 503.
     """
     config: GatewayConfig = request.app.state.config
+    if config.claude_account_routing_mode == "balanced":
+        return await _passthrough_with_claude_balanced(request, raw_body, parsed_body)
     if config.claude_account_id is not None:
         if config.claude_account_routing_mode == "fallback":
             return await _passthrough_with_claude_pool(
@@ -755,6 +771,130 @@ async def _passthrough_with_claude_pool(
         return last_rate_limited
     assert first_failure is not None  # attempts was non-empty, so one branch recorded
     return first_failure
+
+
+# The transition-aware wait loop (Step 6) re-checks at most this many times: one
+# controlled acquiring/draining transition settling is the expected case, so this only
+# bounds a pathological back-to-back-transitions edge case from spinning forever.
+_BALANCED_TRANSITION_WAIT_LIMIT = 4
+
+
+def _balanced_routing_not_active() -> JSONResponse:
+    """The reserved 503 for the *inconsistent* state (Step 6): claude_account.routing
+    persisted/published as "balanced" with no usable balanced runtime, outside a
+    controlled acquiring/draining transition. Never used merely because a controlled
+    transition is in flight — those requests await it and dispatch under the
+    post-transition mode instead (`_passthrough_with_claude_balanced`).
+    """
+    return _claude_account_unavailable("balanced routing is not active")
+
+
+async def _passthrough_with_claude_balanced(
+    request: Request, raw_body: bytes, parsed_body: Any
+) -> Response:
+    """Dispatch fail-closed and transition-aware through the balanced runtime (Step 6).
+
+    Only an active `ClaudeBalancedRuntime` ever serves this mode. A request that
+    arrives while a controlled enable ("acquiring") or exit ("draining") transition is
+    in flight awaits it (`ClaudeBalancedRuntime.wait_for_transition`), then re-reads the
+    published `claude_account.routing` mode and dispatches under THAT mode — it is
+    never rejected merely because a controlled transition is running. The 503
+    "balanced routing is not active" is reserved for the inconsistent state outside a
+    controlled transition; balanced traffic never falls through to single-account or
+    fallback routing.
+    """
+    app_state = request.app.state
+    runtime: ClaudeBalancedRuntime = app_state.claude_balanced_runtime
+    for _ in range(_BALANCED_TRANSITION_WAIT_LIMIT):
+        if runtime.status in ("acquiring", "draining"):
+            await runtime.wait_for_transition()
+            config: GatewayConfig = app_state.config
+            if config.claude_account_routing_mode != "balanced":
+                return await _passthrough_to_anthropic(request, raw_body, parsed_body)
+            continue
+        if runtime.begin_request():
+            try:
+                return await _dispatch_via_balanced_runtime(request, raw_body, parsed_body, runtime)
+            finally:
+                runtime.end_request()
+        break
+    return _balanced_routing_not_active()
+
+
+async def _dispatch_via_balanced_runtime(
+    request: Request, raw_body: bytes, parsed_body: Any, runtime: ClaudeBalancedRuntime
+) -> Response:
+    """Serve one request through an active balanced runtime's picker + pin map.
+
+    Mirrors `_passthrough_with_claude_pool`'s read-through registry pattern (no cache,
+    so CLI/dashboard account changes take effect immediately), derives the request's
+    session key under the runtime's epoch seed (falling back to a stateless, unpinned
+    digest when the body carries neither a usable session_id nor a first user
+    message), and serves the router's chosen account through the same
+    `_attempt_with_account` upstream path every other mode uses.
+    """
+    assert runtime.router is not None
+    try:
+        records = load_registry()
+    except AccountRegistryError as exc:
+        return _claude_account_unavailable(f"cannot read the claude account registry: {exc}")
+
+    candidates = [
+        AccountCandidate(
+            account_id=record.id,
+            account_incarnation_id=record.account_incarnation_id,
+            ready=record.state == "ready",
+        )
+        for record in records
+    ]
+    if not any(candidate.ready for candidate in candidates):
+        return _claude_account_unavailable("no usable claude account is registered")
+
+    model = parsed_body.get("model") if isinstance(parsed_body, dict) else None
+    session_key = (
+        derive_session_key(parsed_body, runtime.epoch_seed)
+        if isinstance(parsed_body, dict)
+        else None
+    )
+    if session_key is None:
+        session_key = SessionKey(
+            digest=derive_stateless_routing_digest(runtime.epoch_seed, secrets.token_bytes(32)),
+            kind="content_hash",
+        )
+
+    try:
+        placement = runtime.router.place_session(
+            session_key=session_key,
+            model=model if isinstance(model, str) else "",
+            candidates=candidates,
+            seed=runtime.epoch_seed,
+        )
+    except NoEligibleAccountError:
+        return _claude_account_unavailable(
+            "no eligible claude account is available for balanced routing"
+        )
+
+    if placement.created and placement.durability_barrier is not None:
+        asyncio.create_task(runtime.router.submit_new_pin_durability(placement.session_key_digest))
+    await runtime.router.await_pin_durability(placement.session_key_digest)
+
+    record = next((r for r in records if r.id == placement.account_id), None)
+    if record is None:
+        return _claude_account_unavailable(
+            f"balanced routing selected claude account {placement.account_id}, "
+            "which is no longer registered"
+        )
+
+    runtime.router.begin_attempt(record.id)
+    try:
+        outcome = await _attempt_with_account(
+            request, raw_body, parsed_body, record, rate_limit_failover=False
+        )
+    finally:
+        runtime.router.end_attempt(record.id)
+    if isinstance(outcome, _FailedAttempt):
+        return outcome.response
+    return outcome
 
 
 async def _handle_messages(request: Request) -> JSONResponse | StreamingResponse:
@@ -2176,13 +2316,36 @@ async def _handle_admin_claude_routing_get(request: Request) -> JSONResponse:
     return JSONResponse(_claude_routing_payload(request.app.state.config))
 
 
-async def _handle_admin_claude_routing_put(request: Request) -> JSONResponse:
-    """Select the pool routing policy: "disabled" or "fallback".
+def _persist_claude_routing_mode(config: GatewayConfig, mode: str) -> None:
+    """Write `claude_account.routing` to `mode`'s on-disk representation.
 
-    "disabled" is represented by the settings key's absence; "fallback"
-    persists the policy document ({"mode": "fallback"}), whose object form
-    leaves room for future modes to carry their own config blocks.
-    "balanced" is reserved and refused until implemented.
+    "disabled" is represented by the settings key's absence; every other
+    mode ("fallback", "balanced") persists the policy document
+    ({"mode": mode}), whose object form leaves room for a mode to carry its
+    own config block without renaming the key.
+    """
+    if mode == "disabled":
+        update_settings_file(config.settings_file, {}, deletions=("claude_account.routing",))
+    else:
+        update_settings_file(config.settings_file, {"claude_account.routing": {"mode": mode}})
+
+
+async def _handle_admin_claude_routing_put(request: Request) -> JSONResponse:
+    """Select the pool routing policy: "disabled", "fallback", or "balanced".
+
+    Enabling ("disabled"/"fallback" -> "balanced") and intentionally exiting
+    ("balanced" -> "disabled"/"fallback") balanced routing are both
+    transactional under `admin_lock` (T-10 Step 5): enabling prepares the
+    complete `ClaudeBalancedRuntime` — opening the runtime store, restoring
+    its state, constructing the router, and verifying every ready account's
+    T-3 profile_fingerprint — while the OLD mode keeps serving, and persists
+    settings only once every check passes, immediately before publishing the
+    prepared runtime; a failure at any point tears preparation down and
+    leaves the old mode untouched. Exiting drains in-flight balanced
+    dispatch, rotates (invalidates) the epoch, and persists+publishes the
+    target mode before waking any request that arrived mid-transition.
+    Switching between "disabled" and "fallback" is unaffected — the
+    pre-existing settings-file swap.
     """
     denied = _admin_guard(request) or _require_json_content_type(request)
     if denied is not None:
@@ -2191,16 +2354,6 @@ async def _handle_admin_claude_routing_put(request: Request) -> JSONResponse:
     if error is not None or body is None:
         return error
     mode = body.get("mode")
-    # Reserved mode first, so a future-shaped balanced document reports the
-    # real reason instead of "unknown keys" (mirrors the config parser).
-    if mode == "balanced":
-        return JSONResponse(
-            _openai_error_body(
-                "invalid_request_error",
-                'routing mode "balanced" is not implemented yet',
-            ),
-            status_code=400,
-        )
     unknown = sorted(set(body) - set(_CLAUDE_ROUTING_KEYS))
     if unknown:
         return JSONResponse(
@@ -2233,15 +2386,73 @@ async def _handle_admin_claude_routing_put(request: Request) -> JSONResponse:
 
     async with request.app.state.admin_lock:
         config: GatewayConfig = request.app.state.config
+        current_mode = config.claude_account_routing_mode
+        runtime: ClaudeBalancedRuntime = request.app.state.claude_balanced_runtime
+
+        if mode == "balanced" and current_mode != "balanced":
+            lease = getattr(request.app.state, "claude_pool_lease", None)
+            if lease is None:
+                return JSONResponse(
+                    _openai_error_body(
+                        "server_error",
+                        "the claude account pool lease is not held; balanced "
+                        "routing cannot be enabled",
+                    ),
+                    status_code=500,
+                )
+            try:
+                accounts = list_accounts()
+            except AccountRegistryError as exc:
+                return JSONResponse(
+                    _openai_error_body(
+                        "server_error", f"cannot read the claude account registry: {exc}"
+                    ),
+                    status_code=500,
+                )
+
+            def _persist_balanced() -> None:
+                _persist_claude_routing_mode(config, "balanced")
+                request.app.state.config = replace(config, claude_account_routing_mode="balanced")
+
+            try:
+                await runtime.prepare_and_publish(
+                    accounts=accounts,
+                    accounts_root=paths.accounts_dir("claude"),
+                    runtime_db_path=paths.claude_account_pool_runtime_db(),
+                    persist=_persist_balanced,
+                )
+            except BalancedPrepareError as exc:
+                return JSONResponse(
+                    _openai_error_body("invalid_request_error", str(exc)), status_code=400
+                )
+            except Exception as exc:
+                return JSONResponse(
+                    _openai_error_body(
+                        "server_error", f"could not enable balanced routing: {exc}"
+                    ),
+                    status_code=500,
+                )
+            return JSONResponse(_claude_routing_payload(request.app.state.config))
+
+        if mode != "balanced" and current_mode == "balanced":
+
+            def _publish_target() -> None:
+                _persist_claude_routing_mode(config, mode)
+                request.app.state.config = replace(config, claude_account_routing_mode=mode)
+
+            try:
+                await runtime.exit_mode(mode, publish=_publish_target)
+            except (ConfigError, OSError) as exc:
+                return JSONResponse(
+                    _openai_error_body(
+                        "server_error", f"could not persist settings: {exc}"
+                    ),
+                    status_code=500,
+                )
+            return JSONResponse(_claude_routing_payload(request.app.state.config))
+
         try:
-            if mode == "disabled":
-                update_settings_file(
-                    config.settings_file, {}, deletions=("claude_account.routing",)
-                )
-            else:
-                update_settings_file(
-                    config.settings_file, {"claude_account.routing": {"mode": mode}}
-                )
+            _persist_claude_routing_mode(config, mode)
         except (ConfigError, OSError) as exc:
             return JSONResponse(
                 _openai_error_body(
@@ -3049,6 +3260,35 @@ def create_app(config: GatewayConfig, daemon_nonce: str | None = None) -> Starle
                     app.state.grok_client = GrokClient(grok_auth_manager, http_client)
                     app.state.http_client = http_client
 
+                    if config.claude_account_routing_mode == "balanced":
+                        # A persisted "balanced" setting is prepared right here, after
+                        # the pool lease is held and `app.state.config` already reads
+                        # "balanced" -- a request racing this window sees `status ==
+                        # "acquiring"` and awaits it (T-10 Step 6), never a stale mode.
+                        # `persist` is a no-op: settings are already on disk, which is
+                        # exactly why this runs.
+                        try:
+                            await app.state.claude_balanced_runtime.prepare_and_publish(
+                                accounts=list_accounts(),
+                                accounts_root=paths.accounts_dir("claude"),
+                                runtime_db_path=paths.claude_account_pool_runtime_db(),
+                                persist=lambda: None,
+                            )
+                            logger.info(
+                                "balanced routing runtime restored (epoch=%s)",
+                                app.state.claude_balanced_runtime.epoch_id,
+                            )
+                        except Exception as exc:
+                            # Degrade, don't crash the daemon: balanced dispatch fails
+                            # closed (503 "balanced routing is not active") until an
+                            # admin fixes the underlying issue and re-enables it.
+                            logger.error(
+                                "could not activate persisted balanced routing at "
+                                "startup: %s",
+                                exc,
+                                exc_info=True,
+                            )
+
                     try:
                         credentials = await codex_auth_manager.get_credentials()
                         logger.info(
@@ -3077,6 +3317,13 @@ def create_app(config: GatewayConfig, daemon_nonce: str | None = None) -> Starle
             finally:
                 logging.getLogger().removeHandler(log_buffer)
         finally:
+            # Process shutdown while settings remain "balanced" preserves the
+            # persisted mode, epoch id/seed, pins, observations, cooldowns, and
+            # capability evidence (T-10 Step 4) -- distinct from an intentional
+            # `exit_mode`, which invalidates them. This must run before the T-9
+            # lease releases, so no other process can open the runtime store
+            # while this one is still draining/closing it.
+            await app.state.claude_balanced_runtime.shutdown_preserving_epoch()
             app.state.claude_pool_lease.release()
 
     app = Starlette(
@@ -3218,4 +3465,10 @@ def create_app(config: GatewayConfig, daemon_nonce: str | None = None) -> Starle
     # Rate-limit cooldowns are ephemeral runtime state and live only in this
     # process — the registry records exclusively durable facts (design §8).
     app.state.claude_account_cooldowns = AccountCooldownTracker()
+    # Starts "disabled" — a persisted "balanced" mode is prepared+published
+    # during lifespan startup (after the T-9 pool lease is held); set here
+    # (not in the lifespan) so it exists, and balanced dispatch fails closed
+    # rather than crashing, even for a test that drives the app without
+    # entering the lifespan context.
+    app.state.claude_balanced_runtime = ClaudeBalancedRuntime()
     return app

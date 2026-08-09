@@ -47,9 +47,16 @@ import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from hashlib import sha256
+from pathlib import Path
 from typing import Any, Literal
 
-from claudex_gateway.claude_pool_runtime_state import ClaudePoolRuntimeStateStore, RestoreResult
+from claudex_gateway.claude_account_profile import load_account_profile_fingerprint
+from claudex_gateway.claude_accounts import AccountRecord
+from claudex_gateway.claude_pool_runtime_state import (
+    ClaudePoolRuntimeStateStore,
+    RestoreResult,
+    RestoreValidationContext,
+)
 
 _SESSION_KEY_DOMAIN = b"claudex-session-key-v1"
 _HRW_DOMAIN = b"claudex-balanced-hrw-v1"
@@ -1360,3 +1367,234 @@ class ClaudeBalancedRouter:
                 # (the CAS never requires the source to still be registered).
                 case_counts["source_removed_migration_continues"] += 1
         return case_counts
+
+
+# ==========================================================================
+# Runtime lifecycle (T-10): ClaudeBalancedRuntime
+# ==========================================================================
+
+BalancedRuntimeStatus = Literal["disabled", "acquiring", "active", "draining"]
+
+
+class BalancedPrepareError(RuntimeError):
+    """Raised by `ClaudeBalancedRuntime.prepare_and_publish` when the runtime cannot be
+    safely readied: a ready account carries no valid T-3 profile fingerprint. The
+    caller (server.py's PUT routing handler) reports this to the admin client;
+    preparation is always torn down first, so the previous routing mode is left
+    untouched.
+    """
+
+
+class ClaudeBalancedRuntime:
+    """Owns balanced routing's whole process-lifetime state machine.
+
+    `status` gates every dispatch (`server._passthrough_with_claude_balanced`):
+    "disabled" (no runtime — balanced traffic fails closed), "acquiring" (an enable is
+    being prepared — the OLD mode still serves, since `claude_account.routing` itself
+    hasn't flipped to "balanced" yet), "active" (`store`/`router` are live and
+    `begin_request` admits new dispatch slots), "draining" (an intentional exit or
+    process shutdown is underway — no new slot is admitted, in-flight ones are
+    awaited). `wait_for_transition` is the spec-gate-ruling primitive (Step 6) a
+    request arriving mid-transition awaits before re-reading the published routing
+    mode and dispatching under it: the transition event is cleared for the whole
+    "acquiring"/"draining" window and only set once the new state is fully published,
+    so a woken waiter never observes a stale mode.
+
+    `persist`/`publish` are the coordinator hooks (Step 3) the server layer supplies so
+    this class can enforce the exact ordering its two distinct lifecycle operations
+    need without owning `GatewayConfig` or the settings file itself: enabling persists
+    settings before the prepared runtime is published (`prepare_and_publish`); exiting
+    persists+publishes the target mode before waking transition waiters (`exit_mode`).
+    Process shutdown (`shutdown_preserving_epoch`) takes no hook at all — it never
+    touches persisted settings or epoch metadata, so a restart can restore them.
+
+    In-flight accounting (`begin_request`/`end_request`, also Step 3) is this class's
+    own request-slot counter, entirely independent of `ClaudeBalancedRouter`'s
+    per-account `M(a)` attempt counting: it exists purely so the drain step of
+    `exit_mode`/`shutdown_preserving_epoch` has something to wait on.
+    """
+
+    def __init__(self) -> None:
+        self.status: BalancedRuntimeStatus = "disabled"
+        self.epoch_id: str | None = None
+        self.epoch_seed: bytes = b""
+        self.router: ClaudeBalancedRouter | None = None
+
+        self._store: ClaudePoolRuntimeStateStore | None = None
+        self._lifecycle_lock = asyncio.Lock()
+        self._transition_event = asyncio.Event()
+        self._transition_event.set()
+        self._active_requests = 0
+        self._drain_complete = asyncio.Event()
+        self._drain_complete.set()
+
+    @property
+    def epoch_active(self) -> bool:
+        """This class's own "is the current epoch live" flag (Step 4's "mark the epoch
+        inactive"): true only in "active" status. `ClaudePoolRuntimeStateStore`'s own
+        `epoch_active` meta column (T-5) has no public setter and is never written by
+        this class — this is an in-memory concept, computed from `status` alone.
+        """
+        return self.status == "active"
+
+    async def wait_for_transition(self) -> None:
+        """Block while a controlled enable ("acquiring") or exit ("draining")
+        transition is in flight; returns immediately once none is (including when none
+        ever was).
+        """
+        await self._transition_event.wait()
+
+    def begin_request(self) -> bool:
+        """Admit one balanced dispatch slot iff `status == "active"`. Returns whether
+        the slot was admitted; a caller that admits one MUST call `end_request` exactly
+        once, however the dispatch ends.
+        """
+        if self.status != "active":
+            return False
+        self._active_requests += 1
+        self._drain_complete.clear()
+        return True
+
+    def end_request(self) -> None:
+        """Release one slot `begin_request` admitted. Always safe to call — a defensive
+        no-op floor at zero, never below."""
+        if self._active_requests > 0:
+            self._active_requests -= 1
+        if self._active_requests == 0:
+            self._drain_complete.set()
+
+    # -- enabling: prepare the complete runtime, publish only once settings commit ----
+
+    async def prepare_and_publish(
+        self,
+        *,
+        accounts: Sequence[AccountRecord],
+        accounts_root: Path,
+        runtime_db_path: Path,
+        persist: Callable[[], None],
+    ) -> None:
+        """Enable balanced routing (Step 4/Context).
+
+        Opens and validates the runtime store, restores its state, constructs the
+        router, and verifies every *ready* account carries a valid T-3 profile
+        fingerprint — all while the OLD mode remains published, so traffic is
+        unaffected until every check passes. `persist()` — the coordinator hook that
+        persists+swaps `claude_account.routing` to "balanced" — is invoked exactly
+        once, after every check passes and strictly before this runtime is published
+        (`status` flips to "active"): it is the commit point. A failure anywhere up to
+        and including `persist()` itself tears the (partial) preparation down (closing
+        any opened store) and leaves `status` "disabled" — the old mode keeps serving,
+        exactly as if this call had never happened.
+        """
+        async with self._lifecycle_lock:
+            if self.status != "disabled":
+                raise RuntimeError(
+                    f"cannot enable balanced routing from status {self.status!r}"
+                )
+            self.status = "acquiring"
+            self._transition_event.clear()
+            store: ClaudePoolRuntimeStateStore | None = None
+            try:
+                store = ClaudePoolRuntimeStateStore.open_(runtime_db_path)
+                for record in accounts:
+                    if record.state != "ready":
+                        continue
+                    fingerprint = load_account_profile_fingerprint(accounts_root / record.id)
+                    if fingerprint is None:
+                        raise BalancedPrepareError(
+                            f"claude account {record.id} has no valid "
+                            "profile_fingerprint (missing or non-UUID accountUuid); it "
+                            "cannot participate in balanced routing until it is "
+                            "re-authenticated"
+                        )
+
+                restore_result = store.restore(RestoreValidationContext(now_utc=time.time()))
+                router = ClaudeBalancedRouter(
+                    balanced_epoch_id=store.balanced_epoch_id, store=store
+                )
+                router.restore_from_store(restore_result)
+
+                persist()
+
+                self._store = store
+                self.epoch_id = store.balanced_epoch_id
+                self.epoch_seed = store.epoch_seed
+                self.router = router
+                self.status = "active"
+            except BaseException:
+                if store is not None:
+                    store.close()
+                self.status = "disabled"
+                raise
+            finally:
+                self._transition_event.set()
+
+    # -- intentional exit: drain, invalidate the epoch, publish the target mode -------
+
+    async def exit_mode(self, target_mode: str, *, publish: Callable[[], None]) -> None:
+        """Intentional balanced -> fallback/disabled exit (Step 4/Context) — distinct
+        from process shutdown (`shutdown_preserving_epoch`): this is the ONLY path that
+        rotates the epoch (invalidating every current-epoch pin) and marks it inactive,
+        so a later re-entry (`prepare_and_publish`) always starts a fresh epoch.
+
+        Sequence: mark draining (blocks new balanced entrants — `begin_request` only
+        admits while "active"), drain in-flight attempts, rotate the epoch durably
+        (waits for the rotation to commit), `publish()` — the coordinator hook that
+        persists+swaps `claude_account.routing` to `target_mode`, so a woken transition
+        waiter re-reads the ALREADY-published target mode — then wake every transition
+        waiter and close the store, discarding balanced-only state. The store is closed
+        (and balanced-only state discarded) even if `publish()` raises: the drain
+        already happened and cannot be undone, so this runtime cannot keep serving
+        either way.
+        """
+        if target_mode == "balanced":
+            raise ValueError('exit_mode target_mode must not be "balanced"')
+        async with self._lifecycle_lock:
+            if self.status != "active":
+                raise RuntimeError(
+                    f"cannot exit balanced routing from status {self.status!r}"
+                )
+            self.status = "draining"
+            self._transition_event.clear()
+            try:
+                await self._drain_complete.wait()
+                store = self._store
+                assert store is not None
+                await store.rotate_epoch().wait_async()
+                publish()
+            finally:
+                if self._store is not None:
+                    self._store.close()
+                self._store = None
+                self.router = None
+                self.epoch_id = None
+                self.epoch_seed = b""
+                self.status = "disabled"
+                self._transition_event.set()
+
+    # -- process shutdown: drain and close, preserving every persisted setting --------
+
+    async def shutdown_preserving_epoch(self) -> None:
+        """Process-lifetime finalization (Step 4/Context): drains and closes exactly
+        like `exit_mode`, but never rotates the epoch, never touches persisted
+        settings, and takes no coordinator hook — so a restart's `prepare_and_publish`
+        finds the SAME epoch id/seed/pins/observations/cooldowns/capability evidence
+        right where this left them. A no-op when balanced routing was never prepared
+        this run (`status == "disabled"`).
+        """
+        async with self._lifecycle_lock:
+            if self.status == "disabled":
+                return
+            self.status = "draining"
+            self._transition_event.clear()
+            try:
+                await self._drain_complete.wait()
+            finally:
+                if self._store is not None:
+                    self._store.close()
+                self._store = None
+                self.router = None
+                self.epoch_id = None
+                self.epoch_seed = b""
+                self.status = "disabled"
+                self._transition_event.set()
