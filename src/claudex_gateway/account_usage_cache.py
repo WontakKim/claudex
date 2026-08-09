@@ -16,7 +16,7 @@ import asyncio
 import logging
 import time
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from claudex_gateway.usage import _provider_result
@@ -28,12 +28,29 @@ _FAILURE_BACKOFF_SECONDS = 60.0
 _RETRY_AFTER_MIN_SECONDS = 5.0
 _RETRY_AFTER_MAX_SECONDS = 3600.0
 
+# The only per-window source this cache ever observes: a live usage-API fetch.
+_SOURCE_USAGE_API = "usage_api"
+
+# Envelope keys (see usage._provider_result / _map_claude_window) that carry
+# a per-window quota reading and are eligible for observation metadata.
+_WINDOW_NAMES = ("session", "weekly", "fable_weekly")
+
+
+@dataclass
+class _WindowObservation:
+    """When and how a single window's reading was captured for an entry."""
+
+    observed_at: float
+    source: str
+    resets_at: float | None
+
 
 @dataclass
 class _Entry:
     result: dict[str, Any]
     fetched_at: float
     ok: bool
+    windows: dict[str, _WindowObservation] = field(default_factory=dict)
 
 
 class ClaudeAccountUsageCache:
@@ -104,6 +121,32 @@ class ClaudeAccountUsageCache:
         entry = self._entries.get(account_id)
         return entry.result if entry is not None else None
 
+    def peek_with_metadata(
+        self, account_id: str
+    ) -> tuple[dict[str, Any], dict[str, dict[str, Any]]] | None:
+        """Return the cached envelope plus per-window observation metadata.
+
+        Like `peek`, this never fetches. Unlike `peek`, it reports how each
+        window's reading was obtained: `age_seconds` (computed against the
+        cache clock, not ignored), `source`, and the normalized `reset_at`
+        epoch. Windows absent from the last successful fetch — or all
+        windows, when the last fetch failed — contribute no metadata entry.
+        Returns None only when nothing has ever been cached for the account.
+        """
+        entry = self._entries.get(account_id)
+        if entry is None:
+            return None
+        now = self._clock()
+        metadata = {
+            window_name: {
+                "age_seconds": now - observation.observed_at,
+                "source": observation.source,
+                "reset_at": observation.resets_at,
+            }
+            for window_name, observation in entry.windows.items()
+        }
+        return entry.result, metadata
+
     async def _refresh(self, account_id: str) -> dict[str, Any]:
         # Re-check under the lock: a concurrent get() may have refreshed this
         # account, or started a cooldown, while we waited.
@@ -134,7 +177,20 @@ class ClaudeAccountUsageCache:
             retry_after = None
 
         ok = result.get("status") == "ok"
-        self._entries[account_id] = _Entry(result=result, fetched_at=self._clock(), ok=ok)
+        fetched_at = self._clock()
+        windows: dict[str, _WindowObservation] = {}
+        if ok:
+            for window_name in _WINDOW_NAMES:
+                window = result.get(window_name)
+                if isinstance(window, dict):
+                    windows[window_name] = _WindowObservation(
+                        observed_at=fetched_at,
+                        source=_SOURCE_USAGE_API,
+                        resets_at=window.get("resets_at"),
+                    )
+        self._entries[account_id] = _Entry(
+            result=result, fetched_at=fetched_at, ok=ok, windows=windows
+        )
 
         # A 429 opens the global cooldown: Retry-After when the server sent
         # one (clamped to sane bounds), the failure backoff otherwise. The

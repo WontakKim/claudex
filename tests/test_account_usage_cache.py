@@ -25,6 +25,19 @@ def _ok(account_id: str) -> dict[str, Any]:
     return {"provider": "claude", "status": "ok", "error": None, "session": {"id": account_id}}
 
 
+def _ok_with_windows(
+    *, session_resets_at: float | None = None, weekly_resets_at: float | None = None
+) -> dict[str, Any]:
+    return {
+        "provider": "claude",
+        "status": "ok",
+        "error": None,
+        "session": {"used_percent": 10.0, "resets_at": session_resets_at},
+        "weekly": {"used_percent": 20.0, "resets_at": weekly_resets_at},
+        "fable_weekly": None,
+    }
+
+
 def _err(message: str) -> dict[str, Any]:
     return {"provider": "claude", "status": "error", "error": message, "session": None}
 
@@ -213,3 +226,65 @@ def test_peek_returns_cached_entry_without_fetching_and_none_when_absent() -> No
     assert cache.peek("a") == _ok("a")
     assert cache.peek("never-fetched") is None
     assert fetch.calls == ["a"]
+
+
+def test_peek_with_metadata_reports_age_source_and_reset_and_none_when_absent() -> None:
+    clock = FakeClock()
+    fetch = FakeFetch()
+    envelope = _ok_with_windows(session_resets_at=1_500.0, weekly_resets_at=2_500.0)
+    fetch.queue("a", envelope)
+    cache = _cache(fetch, clock)
+
+    assert cache.peek_with_metadata("a") is None
+    asyncio.run(cache.get(["a"]))
+
+    result, metadata = cache.peek_with_metadata("a")
+    assert result == envelope
+    assert metadata["session"] == {"age_seconds": 0.0, "source": "usage_api", "reset_at": 1_500.0}
+    assert metadata["weekly"] == {"age_seconds": 0.0, "source": "usage_api", "reset_at": 2_500.0}
+
+    # Age advances with the clock, independently of peek()'s age-ignoring behavior.
+    clock.advance(45.0)
+    _, aged_metadata = cache.peek_with_metadata("a")
+    assert aged_metadata["session"]["age_seconds"] == 45.0
+    assert aged_metadata["weekly"]["age_seconds"] == 45.0
+    assert cache.peek("a") == envelope
+
+    assert cache.peek_with_metadata("never-fetched") is None
+    assert fetch.calls == ["a"]
+
+
+def test_peek_with_metadata_omits_windows_absent_from_the_envelope() -> None:
+    clock = FakeClock()
+    fetch = FakeFetch()
+    envelope = {
+        "provider": "claude",
+        "status": "ok",
+        "error": None,
+        "session": {"used_percent": 10.0, "resets_at": 1_500.0},
+        "weekly": None,
+        "fable_weekly": None,
+    }
+    fetch.queue("a", envelope)
+    cache = _cache(fetch, clock)
+
+    asyncio.run(cache.get(["a"]))
+
+    _, metadata = cache.peek_with_metadata("a")
+    assert set(metadata) == {"session"}
+    assert "weekly" not in metadata
+    assert "fable_weekly" not in metadata
+
+
+def test_peek_with_metadata_has_no_windows_on_failed_fetch() -> None:
+    clock = FakeClock()
+    fetch = FakeFetch()
+    fetch.queue("a", _err("usage API returned 500: boom"))
+    cache = _cache(fetch, clock)
+
+    results = asyncio.run(cache.get(["a"]))
+    assert results["a"]["status"] == "error"
+
+    result, metadata = cache.peek_with_metadata("a")
+    assert result["status"] == "error"
+    assert metadata == {}
