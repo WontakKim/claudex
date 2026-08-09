@@ -23,6 +23,7 @@ import pytest
 from claudex_gateway import __main__ as gateway_main
 from claudex_gateway import paths
 from claudex_gateway.config import GatewayConfig
+from claudex_gateway.locking import try_file_lock
 
 # Serves the given JSON payload on every GET; "__SELF_PID__": true is
 # replaced with the fake server's own pid so identity checks can match.
@@ -78,6 +79,10 @@ def _run_cli(env: dict[str, str], *arguments: str) -> subprocess.CompletedProces
 
 def _record_file(tmp_path: Path) -> Path:
     return tmp_path / ".claudex" / "gateway.pid"
+
+
+def _pool_lock_file(tmp_path: Path) -> Path:
+    return tmp_path / ".claudex" / "claude-account-pool" / "balanced-router.lock"
 
 
 def _write_daemon_record(
@@ -314,6 +319,31 @@ def test_login_subcommand_is_gone(tmp_path: Path) -> None:
         result = _run_cli(_gateway_env(tmp_path, _free_port()), *arguments)
         assert result.returncode == 2
         assert "usage: claudex-gateway" in result.stderr
+
+
+def test_foreground_start_fails_with_the_pinned_message_when_pool_lock_is_held(
+    tmp_path: Path,
+) -> None:
+    # Every routing mode shares one claude account pool lease (T-9); a
+    # process already holding it (in-process here, standing in for another
+    # gateway) must make a freshly spawned foreground gateway abort startup
+    # instead of silently serving alongside it.
+    env = _gateway_env(tmp_path, _free_port())
+    holder = try_file_lock(_pool_lock_file(tmp_path))
+    assert holder is not None
+    try:
+        result = subprocess.run(
+            [sys.executable, "-m", "claudex_gateway", "--foreground"],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=30,
+        )
+        assert result.returncode != 0
+        assert "balanced-router.lock held" in result.stdout
+    finally:
+        holder.release()
 
 
 # ---------------------------------------------------------------------------
