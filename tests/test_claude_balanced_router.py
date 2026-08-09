@@ -13,6 +13,7 @@ import pytest
 from claudex_gateway.claude_balanced_router import (
     AccountCandidate,
     ClaudeBalancedRouter,
+    MigrationReservation,
     NoEligibleAccountError,
     ObservationView,
     PendingDurabilityBarrier,
@@ -999,3 +1000,543 @@ def test_refresh_pin_durable_last_seen_delegates_to_the_store() -> None:
         await asyncio.wait_for(refresh_task, timeout=1.0)
 
     asyncio.run(scenario())
+
+
+# ==========================================================================
+# Migration machinery: reservations, waiters, tokens, generation CAS (T-8)
+# ==========================================================================
+
+
+def _place_and_reserve(
+    router: ClaudeBalancedRouter,
+    digest: bytes,
+    *,
+    source_account: str = "acct-a",
+    target_account: str = "acct-b",
+    attempt_id: str = "owner-1",
+) -> MigrationReservation:
+    """Place a fresh pin at `digest` for `source_account`, then have `attempt_id` acquire
+    the migration reservation for it as the owner.
+    """
+    router.place_session(
+        session_key=SessionKey(digest=digest, kind="content_hash"),
+        model="claude-sonnet-5",
+        candidates=[_candidate(source_account)],
+        seed=b"seed",
+    )
+    reservation, is_owner = router.acquire_migration_reservation(
+        digest,
+        source_account=source_account,
+        source_generation=0,
+        target_account=target_account,
+        attempt_id=attempt_id,
+    )
+    assert is_owner is True
+    return reservation
+
+
+def test_second_caller_for_the_same_session_becomes_a_waiter_on_the_existing_reservation() -> None:
+    router = _make_router()
+    digest = b"\x10" * 32
+    owner_reservation = _place_and_reserve(router, digest)
+
+    assert router.active_migration_count() == 1
+    assert router.get_pin(digest).migration_reserved is True
+
+    waiter_reservation, is_owner = router.acquire_migration_reservation(
+        digest,
+        source_account="acct-a",
+        source_generation=0,
+        target_account="acct-c",  # a concurrent caller's own (irrelevant) intended target
+        attempt_id="waiter-1",
+    )
+
+    assert is_owner is False
+    assert waiter_reservation is owner_reservation  # never an independent reservation/target
+    assert router.migration_token_target("waiter-1") is None  # no token minted for a waiter
+
+
+def test_concurrent_waiters_resume_immediately_after_commit_at_headers_while_the_stream_stays_open() -> None:
+    async def scenario() -> None:
+        router = _make_router()
+        digest = b"\x11" * 32
+        reservation = _place_and_reserve(router, digest)
+
+        waiter_reservation_a, _ = router.acquire_migration_reservation(
+            digest, source_account="acct-a", source_generation=0, target_account="acct-z", attempt_id="waiter-a"
+        )
+        waiter_reservation_b, _ = router.acquire_migration_reservation(
+            digest, source_account="acct-a", source_generation=0, target_account="acct-z", attempt_id="waiter-b"
+        )
+        assert waiter_reservation_a is reservation and waiter_reservation_b is reservation
+
+        marks = [False, False]
+
+        async def waiter(index: int) -> None:
+            await router.wait_for_migration_reservation(reservation)
+            marks[index] = True
+
+        waiter_tasks = [asyncio.create_task(waiter(0)), asyncio.create_task(waiter(1))]
+        for task in waiter_tasks:
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(asyncio.shield(task), timeout=0.05)
+        assert marks == [False, False]
+
+        headers_ingested: list[bool] = []
+        outcome, pin, barrier = router.commit_at_headers(
+            digest,
+            attempt_id="owner-1",
+            source_account="acct-a",
+            source_generation=0,
+            target_account="acct-b",
+            target_account_incarnation_id="inc-acct-b",
+            ingest_headers=lambda: headers_ingested.append(True),
+        )
+        assert outcome == "committed"
+        assert headers_ingested == [True]
+        assert router.get_migration_reservation(digest) is None  # reservation cleared
+        assert reservation.outcome == "committed"
+        assert reservation.resolved_event.is_set()  # event set exactly once, right here
+
+        await asyncio.wait_for(asyncio.gather(*waiter_tasks), timeout=1.0)
+        assert marks == [True, True]
+
+        # the migrated stream is still open: M(target) stays incremented until the
+        # attempt's own `finally` releases its token.
+        assert router.in_flight_count("acct-b") == 1
+        assert router.migration_token_target("owner-1") == "acct-b"
+
+        # a waiter re-reading now sees the migrated pin, not the stale target embedded
+        # in the (by-now-cleared) reservation it just waited on.
+        current_pin = router.get_pin(digest)
+        assert current_pin is not None and current_pin.account_id == "acct-b" and current_pin.generation == 1
+        assert current_pin.pending_durability is barrier and not barrier.is_resolved
+
+        # only once the upstream stream terminates does the common `finally` release
+        # the token; the reservation is already resolved, so this call only does that.
+        resolved_now = router.resolve_migration_owner_terminal(
+            digest, attempt_id="owner-1", outcome="terminal_failure"
+        )
+        assert resolved_now is False
+        assert router.in_flight_count("acct-b") == 0
+        assert router.migration_token_target("owner-1") is None
+
+    asyncio.run(scenario())
+
+
+def test_owner_cancellation_wakes_every_blocked_waiter_exactly_once_and_clears_shared_state() -> None:
+    async def scenario() -> None:
+        router = _make_router()
+        digest = b"\x12" * 32
+        reservation = _place_and_reserve(router, digest)
+
+        never_ready = asyncio.Event()
+
+        async def owner_attempt() -> None:
+            try:
+                await never_ready.wait()  # blocked "before headers"
+            finally:
+                # the balanced runner's own `finally` block: synchronous, no intervening
+                # await between ownership verification and event signaling.
+                router.resolve_migration_owner_terminal(digest, attempt_id="owner-1", outcome="terminal_failure")
+
+        async def waiter(results: list[bool], index: int) -> None:
+            current, _ = router.acquire_migration_reservation(
+                digest,
+                source_account="acct-a",
+                source_generation=0,
+                target_account="acct-z",
+                attempt_id=f"waiter-{index}",
+            )
+            await router.wait_for_migration_reservation(current)
+            results[index] = True
+
+        owner_task = asyncio.create_task(owner_attempt())
+        results = [False, False, False]
+        waiter_tasks = [asyncio.create_task(waiter(results, i)) for i in range(3)]
+        for task in waiter_tasks:
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(asyncio.shield(task), timeout=0.05)
+
+        assert all(router.migration_token_target(f"waiter-{i}") is None for i in range(3))
+
+        owner_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await owner_task
+
+        await asyncio.wait_for(asyncio.gather(*waiter_tasks), timeout=1.0)
+        assert results == [True, True, True]
+
+        assert router.get_migration_reservation(digest) is None
+        assert reservation.outcome == "terminal_failure"
+        assert reservation.resolved_event.is_set()
+        assert router.migration_token_target("owner-1") is None
+        assert router.in_flight_count("acct-b") == 0
+
+        # the reservation-protected pin can be handled normally afterward, and a later
+        # request re-places instead of hanging.
+        assert router.get_pin(digest).migration_reserved is False
+        new_reservation, is_new_owner = router.acquire_migration_reservation(
+            digest, source_account="acct-a", source_generation=0, target_account="acct-c", attempt_id="owner-2"
+        )
+        assert is_new_owner is True
+        assert new_reservation is not reservation
+
+    asyncio.run(scenario())
+
+
+def test_generation_cas_loss_when_a_stale_attempts_commit_arrives_after_a_newer_owner_committed() -> None:
+    router = _make_router()
+    digest = b"\x13" * 32
+    _place_and_reserve(router, digest, attempt_id="stale-owner")
+
+    # the stale owner times out before its (eventually late) headers arrive.
+    router.resolve_migration_owner_terminal(digest, attempt_id="stale-owner", outcome="terminal_failure")
+
+    # a fresh owner re-acquires (Step 6: re-enters the acquisition loop) and commits.
+    router.acquire_migration_reservation(
+        digest, source_account="acct-a", source_generation=0, target_account="acct-c", attempt_id="fresh-owner"
+    )
+    outcome, pin, _ = router.commit_at_headers(
+        digest,
+        attempt_id="fresh-owner",
+        source_account="acct-a",
+        source_generation=0,
+        target_account="acct-c",
+        target_account_incarnation_id="inc-acct-c",
+    )
+    assert outcome == "committed"
+    assert pin.account_id == "acct-c" and pin.generation == 1
+
+    # the stale owner's late 2xx headers finally arrive: its CAS no longer matches
+    # (its reservation is gone) - it must never overwrite the newer pin.
+    assert router.migration_cas_lost == 0
+    stale_outcome, stale_pin, stale_barrier = router.commit_at_headers(
+        digest,
+        attempt_id="stale-owner",
+        source_account="acct-a",
+        source_generation=0,
+        target_account="acct-b",
+        target_account_incarnation_id="inc-acct-b",
+    )
+    assert stale_outcome == "cas_lost"
+    assert stale_barrier is None
+    assert stale_pin is not None and stale_pin.account_id == "acct-c"  # unchanged by the loser
+    assert router.migration_cas_lost == 1  # the attempt-level counter fires regardless
+
+    # the stale owner's own reservation was already resolved to `terminal_failure`
+    # earlier (immutable from then on) — this late, already-orphaned CAS attempt never
+    # gets to (re)resolve it to `cas_lost`, so the reservation-outcome tally reflects
+    # what actually happened to each reservation, not every attempt-level CAS check.
+    assert router.migration_outcome_counts["terminal_failure"] == 1
+    assert router.migration_outcome_counts["committed"] == 1
+    assert "cas_lost" not in router.migration_outcome_counts
+    assert router.get_pin(digest).account_id == "acct-c"
+
+
+def test_preheader_failure_lets_a_waiter_become_the_next_owner_not_the_original_owner_alone() -> None:
+    router = _make_router()
+    digest = b"\x14" * 32
+    _place_and_reserve(router, digest)
+
+    # a concurrent same-session request arrives while the migration is pending and
+    # becomes a waiter rather than picking an independent target.
+    waiter_reservation, is_owner = router.acquire_migration_reservation(
+        digest, source_account="acct-a", source_generation=0, target_account="acct-z", attempt_id="waiter-1"
+    )
+    assert is_owner is False
+
+    # owner-1's target rejects pre-headers (a classified quota/eligibility failure).
+    resolved = router.resolve_migration_preheader_failure(
+        digest, attempt_id="owner-1", outcome="retryable_preheader_failure"
+    )
+    assert resolved is True
+    assert waiter_reservation.outcome == "retryable_preheader_failure"
+    assert waiter_reservation.resolved_event.is_set()
+    assert router.migration_token_target("owner-1") is None  # released alongside the resolve
+
+    # the (woken) waiter re-enters the SAME acquisition loop - it never trusts a
+    # privately-continued target - so it can become the new owner here.
+    next_reservation, is_next_owner = router.acquire_migration_reservation(
+        digest, source_account="acct-a", source_generation=0, target_account="acct-c", attempt_id="waiter-1"
+    )
+    assert is_next_owner is True
+    assert next_reservation is not waiter_reservation
+    assert next_reservation.target_account == "acct-c"
+
+
+def test_preheader_terminal_ordering_makes_the_cooldown_visible_before_a_woken_waiter_rereads() -> None:
+    async def scenario() -> None:
+        router = _make_router()
+        digest = b"\x15" * 32
+        _place_and_reserve(router, digest)
+        reservation, _ = router.acquire_migration_reservation(
+            digest, source_account="acct-a", source_generation=0, target_account="acct-z", attempt_id="waiter-1"
+        )
+
+        cooldowns: dict[str, float] = {}
+        cooldown_seen_by_waiter: dict[str, float] = {}
+
+        async def waiter() -> None:
+            await router.wait_for_migration_reservation(reservation)
+            cooldown_seen_by_waiter.update(cooldowns)  # re-read AFTER the wait resolves
+
+        waiter_task = asyncio.create_task(waiter())
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(asyncio.shield(waiter_task), timeout=0.05)
+
+        # design v2 §4.4's terminal ordering: (1) classify (2) install cooldown/evidence
+        # (3) fence target - all in memory, BEFORE (4) resolve+wake.
+        cooldowns["acct-b"] = 999.0
+        router.resolve_migration_preheader_failure(digest, attempt_id="owner-1", outcome="retryable_preheader_failure")
+
+        await asyncio.wait_for(waiter_task, timeout=1.0)
+        assert cooldown_seen_by_waiter == {"acct-b": 999.0}
+
+    asyncio.run(scenario())
+
+
+def test_owner_cleanup_is_idempotent_after_success() -> None:
+    router = _make_router()
+    digest = b"\x16" * 32
+    _place_and_reserve(router, digest)
+    outcome, _pin, _barrier = router.commit_at_headers(
+        digest,
+        attempt_id="owner-1",
+        source_account="acct-a",
+        source_generation=0,
+        target_account="acct-b",
+        target_account_incarnation_id="inc-acct-b",
+    )
+    assert outcome == "committed"
+
+    first = router.resolve_migration_owner_terminal(digest, attempt_id="owner-1", outcome="terminal_failure")
+    second = router.resolve_migration_owner_terminal(digest, attempt_id="owner-1", outcome="terminal_failure")
+    third = router.resolve_migration_owner_terminal(digest, attempt_id="owner-1", outcome="terminal_failure")
+
+    assert (first, second, third) == (False, False, False)  # already resolved by commit_at_headers
+    assert router.in_flight_count("acct-b") == 0  # the token released exactly once, never negative
+    assert router.migration_outcome_counts["committed"] == 1
+    assert "terminal_failure" not in router.migration_outcome_counts
+
+
+def test_owner_cleanup_is_idempotent_after_a_preheader_failure() -> None:
+    router = _make_router()
+    digest = b"\x17" * 32
+    _place_and_reserve(router, digest)
+
+    first = router.resolve_migration_preheader_failure(digest, attempt_id="owner-1")
+    second = router.resolve_migration_owner_terminal(digest, attempt_id="owner-1", outcome="terminal_failure")
+    third = router.resolve_migration_owner_terminal(digest, attempt_id="owner-1", outcome="terminal_failure")
+
+    assert first is True
+    assert second is False and third is False
+    assert router.in_flight_count("acct-b") == 0
+    assert router.migration_outcome_counts["retryable_preheader_failure"] == 1
+
+
+def test_owner_cleanup_is_idempotent_after_cancellation() -> None:
+    async def scenario() -> None:
+        router = _make_router()
+        digest = b"\x18" * 32
+        reservation = _place_and_reserve(router, digest)
+
+        never_ready = asyncio.Event()
+
+        async def owner_attempt() -> None:
+            try:
+                await never_ready.wait()
+            finally:
+                router.resolve_migration_owner_terminal(digest, attempt_id="owner-1", outcome="terminal_failure")
+
+        owner_task = asyncio.create_task(owner_attempt())
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(asyncio.shield(owner_task), timeout=0.05)
+        owner_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await owner_task
+
+        first_replay = router.resolve_migration_owner_terminal(
+            digest, attempt_id="owner-1", outcome="terminal_failure"
+        )
+        second_replay = router.resolve_migration_owner_terminal(digest, attempt_id="owner-1", outcome="mode_stopped")
+
+        assert first_replay is False and second_replay is False  # already resolved in the cancelled owner's finally
+        assert reservation.outcome == "terminal_failure"  # immutable once set; the replay never overwrote it
+        assert router.in_flight_count("acct-b") == 0
+        assert router.migration_outcome_counts["terminal_failure"] == 1
+        assert "mode_stopped" not in router.migration_outcome_counts
+
+    asyncio.run(scenario())
+
+
+def test_migration_reserved_pin_survives_eviction_pressure_and_becomes_evictable_once_resolved() -> None:
+    clock = _FakeClock()
+    router = _make_router(clock=clock, pin_map_max_entries=1)
+    candidates = [_candidate("acct-a")]
+    digest = b"\x19" * 32
+    _place_and_reserve(router, digest)
+    assert router.get_pin(digest).migration_reserved is True
+
+    clock.advance(1.0)
+    second_key = SessionKey(digest=b"\x1a" * 32, kind="content_hash")
+    router.place_session(session_key=second_key, model="claude-sonnet-5", candidates=candidates, seed=b"seed")
+
+    assert router.get_pin(digest) is not None  # never evicted while migration-reserved
+    assert router.soft_bound_overflow_count == 1
+
+    router.resolve_migration_owner_terminal(digest, attempt_id="owner-1", outcome="terminal_failure")
+    assert router.get_pin(digest).migration_reserved is False
+
+    clock.advance(1.0)
+    third_key = SessionKey(digest=b"\x1b" * 32, kind="content_hash")
+    router.place_session(session_key=third_key, model="claude-sonnet-5", candidates=candidates, seed=b"seed")
+
+    assert router.get_pin(digest) is None  # now evictable like any ordinary pin
+
+
+# -- account removal transition matrix, §5.7 cases 1-5 -----------------------
+
+
+def test_account_removal_case_1_deletes_an_ordinary_pin_with_no_active_migration() -> None:
+    router = _make_router()
+    digest = b"\x20" * 32
+    router.place_session(
+        session_key=SessionKey(digest=digest, kind="content_hash"),
+        model="claude-sonnet-5",
+        candidates=[_candidate("acct-a")],
+        seed=b"seed",
+    )
+
+    counts = router.remove_account("acct-a")
+
+    assert counts["ordinary_pin_removed"] == 1
+    assert router.get_pin(digest) is None
+
+
+def test_account_removal_case_2_source_removed_leaves_pin_and_reservation_for_the_owner_to_finish() -> None:
+    router = _make_router()
+    digest = b"\x21" * 32
+    _place_and_reserve(router, digest)
+
+    counts = router.remove_account("acct-a")
+
+    assert counts["source_removed_migration_continues"] == 1
+    assert router.get_pin(digest) is not None  # pin untouched
+    assert router.get_migration_reservation(digest) is not None  # reservation untouched
+
+    # the CAS never requires the source to still be registered.
+    outcome, pin, _barrier = router.commit_at_headers(
+        digest,
+        attempt_id="owner-1",
+        source_account="acct-a",
+        source_generation=0,
+        target_account="acct-b",
+        target_account_incarnation_id="inc-acct-b",
+    )
+    assert outcome == "committed"
+    assert pin.account_id == "acct-b"
+
+
+def test_account_removal_case_2_orphaned_source_pin_is_deleted_if_the_migration_later_fails() -> None:
+    router = _make_router()
+    digest = b"\x22" * 32
+    _place_and_reserve(router, digest)
+
+    router.remove_account("acct-a")
+    assert router.get_pin(digest) is not None
+
+    router.resolve_migration_preheader_failure(digest, attempt_id="owner-1")
+
+    assert router.get_pin(digest) is None  # the now-orphaned source pin is cleaned up too
+
+
+def test_account_removal_case_3_target_removed_before_headers_resolves_and_wakes_waiters() -> None:
+    async def scenario() -> None:
+        router = _make_router()
+        digest = b"\x23" * 32
+        reservation = _place_and_reserve(router, digest)
+
+        waiter_task = asyncio.create_task(router.wait_for_migration_reservation(reservation))
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(asyncio.shield(waiter_task), timeout=0.05)
+
+        counts = router.remove_account("acct-b")  # target removed before upstream 2xx
+
+        assert counts["target_removed_before_headers"] == 1
+        await asyncio.wait_for(waiter_task, timeout=1.0)
+        assert reservation.outcome == "target_removed"
+        assert router.get_migration_reservation(digest) is None  # commit is prohibited
+        assert router.get_pin(digest) is not None  # source pin left intact
+        assert router.migration_token_target("owner-1") == "acct-b"  # token stays owned by the attempt
+
+    asyncio.run(scenario())
+
+
+def test_account_removal_case_4_target_removed_race_at_headers_rejects_commit_without_retry() -> None:
+    router = _make_router()
+    digest = b"\x24" * 32
+    _place_and_reserve(router, digest)
+
+    assert router.migration_commit_rejected_target_removed == 0
+    outcome, pin, barrier = router.commit_at_headers(
+        digest,
+        attempt_id="owner-1",
+        source_account="acct-a",
+        source_generation=0,
+        target_account="acct-b",
+        target_account_incarnation_id="inc-acct-b",
+        target_still_registered=False,  # removed by the time 2xx headers arrived
+    )
+
+    assert outcome == "target_removed"
+    assert barrier is None
+    assert router.migration_commit_rejected_target_removed == 1
+    assert pin is not None and pin.account_id == "acct-a"  # never pins the removed target
+    assert router.get_migration_reservation(digest) is None
+
+
+def test_account_removal_case_5_both_source_and_target_removed_aborts_and_removes_the_pin() -> None:
+    router = _make_router()
+    digest = b"\x25" * 32
+    _place_and_reserve(router, digest)
+
+    first_counts = router.remove_account("acct-a")  # case 2 first: source removed alone
+    assert first_counts["source_removed_migration_continues"] == 1
+    assert router.get_pin(digest) is not None
+    assert router.get_migration_reservation(digest) is not None
+
+    second_counts = router.remove_account("acct-b")  # now the target is ALSO removed - a race
+
+    assert second_counts["both_removed_aborted"] == 1
+    assert router.get_pin(digest) is None
+    assert router.get_migration_reservation(digest) is None
+
+
+def test_release_migration_token_is_an_idempotent_pop_that_never_underflows_the_in_flight_count() -> None:
+    router = _make_router()
+    digest = b"\x26" * 32
+    _place_and_reserve(router, digest)
+    assert router.in_flight_count("acct-b") == 1
+
+    first = router.release_migration_token("owner-1")
+    second = router.release_migration_token("owner-1")
+    third = router.release_migration_token("never-existed")
+
+    assert first == "acct-b"
+    assert second is None and third is None
+    assert router.in_flight_count("acct-b") == 0  # never negative
+
+
+def test_mode_stopped_resolves_the_reservation_like_any_other_terminal_outcome() -> None:
+    router = _make_router()
+    digest = b"\x27" * 32
+    reservation = _place_and_reserve(router, digest)
+
+    resolved = router.resolve_migration_owner_terminal(digest, attempt_id="owner-1", outcome="mode_stopped")
+
+    assert resolved is True
+    assert reservation.outcome == "mode_stopped"
+    assert reservation.resolved_event.is_set()
+    assert router.migration_outcome_counts["mode_stopped"] == 1
+    assert router.migration_token_target("owner-1") is None

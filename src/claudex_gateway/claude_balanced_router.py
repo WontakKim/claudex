@@ -45,7 +45,7 @@ import math
 import time
 import uuid
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from hashlib import sha256
 from typing import Any, Literal
 
@@ -571,6 +571,46 @@ class PlacementResult:
     durability_barrier: PendingDurabilityBarrier | None
 
 
+# -- migration machinery: reservations, waiters, tokens, generation CAS -----
+# (design v2 §4.3-§4.5, §5.7)
+
+MigrationOutcome = Literal[
+    "pending",
+    "committed",
+    "cas_lost",
+    "retryable_preheader_failure",
+    "terminal_failure",
+    "target_removed",
+    "mode_stopped",
+]
+
+CommitOutcome = Literal["committed", "cas_lost", "target_removed"]
+
+
+@dataclass
+class MigrationReservation:
+    """One migration reservation per session generation (design v2 §4.3), attempt-owned
+    and cancellation-safe.
+
+    Created in the same no-await critical section as its migration-attempt token
+    (`ClaudeBalancedRouter.acquire_migration_reservation`). `resolved_event` (an
+    `asyncio.Event`) plus the stored `outcome` is the resolution primitive every waiter
+    awaits through `asyncio.shield` — cancelling one waiter never cancels, and never
+    double-fires, the shared event. `outcome` starts `"pending"` and is set exactly once
+    by the owner-terminal path after it verifies `owner_attempt_id`; once terminal it is
+    immutable — a second attempted resolution is always a no-op (enforced by the router).
+    Never persisted (§4.3): reservations refer to live tasks and cancellation scopes that
+    die with the process.
+    """
+
+    source_account: str
+    source_generation: int
+    target_account: str
+    owner_attempt_id: str
+    outcome: MigrationOutcome = "pending"
+    resolved_event: asyncio.Event = field(default_factory=asyncio.Event)
+
+
 class ClaudeBalancedRouter:
     """Design v2 §2/§5's balanced picker core: pressures, weighted HRW, pin map.
 
@@ -581,7 +621,13 @@ class ClaudeBalancedRouter:
     end-to-end (no `await`), so nothing can interleave between picking an
     account and inserting its pin. Durable persistence (the
     `pending_durability` barrier and the coalesced `last_seen` refresh,
-    §5.3) goes through an optional `ClaudePoolRuntimeStateStore`.
+    §5.3) goes through an optional `ClaudePoolRuntimeStateStore`. It also
+    owns the design v2 §4.3-§4.5/§5.7 migration machinery: per-session-
+    generation reservations, their `asyncio.shield`-based waiter protocol,
+    migration-attempt tokens keyed by attempt id (the §2.4 `M(a)` term),
+    the generation/owner CAS performed at upstream 2xx headers
+    (`commit_at_headers`), and the account-removal transition matrix.
+    Reservations and tokens are NEVER persisted and always start empty.
     """
 
     def __init__(
@@ -619,6 +665,16 @@ class ClaudeBalancedRouter:
         # candidate is migration-reserved (so eviction cannot reclaim
         # space) — the "soft bound" being exceeded.
         self.soft_bound_overflow_count = 0
+
+        # Migration machinery (design v2 §4.3-§4.5, §5.7): reservations and
+        # tokens are NEVER persisted, so both always start empty here —
+        # there is no restore path for either.
+        self._reservations: dict[bytes, MigrationReservation] = {}
+        self._migration_tokens: dict[str, str] = {}
+        self._removed_accounts: set[str] = set()
+        self.migration_outcome_counts: dict[str, int] = {}
+        self.migration_cas_lost = 0
+        self.migration_commit_rejected_target_removed = 0
 
     # -- in-flight attempt counting: M(a) -----------------------------------
 
@@ -1022,3 +1078,285 @@ class ClaudeBalancedRouter:
             )
         self._restored_any_valid_pin = bool(restore_result.pins)
         return len(self._pins)
+
+    # -- migration reservations and waiters (design v2 §4.3) -----------------
+
+    def get_migration_reservation(self, digest: bytes) -> MigrationReservation | None:
+        """The no-await critical-section read a waiter's loop starts with (§4.3 step 1):
+        the current reservation reference for `digest`, or `None` if no migration is
+        in flight for this session.
+        """
+        return self._reservations.get(digest)
+
+    def acquire_migration_reservation(
+        self,
+        digest: bytes,
+        *,
+        source_account: str,
+        source_generation: int,
+        target_account: str,
+        attempt_id: str,
+    ) -> tuple[MigrationReservation, bool]:
+        """The atomic reservation+token acquisition critical section (§4.3-§4.4):
+        entirely synchronous (no `await`), the same single-event-loop discipline as
+        `place_session`, so no other coroutine can interleave between the check and
+        the insert.
+
+        If a reservation is already pending for `digest`, returns THAT reservation and
+        `False` — this caller becomes a WAITER on the existing migration; concurrent
+        same-session requests wait and re-read, they never pick an independent target
+        (§4.3). Otherwise this caller becomes the OWNER: a fresh pending reservation and
+        its migration-attempt token (keyed by `attempt_id`, created in the SAME critical
+        section, §4.4) are inserted, the pin is marked `migration_reserved` so eviction
+        cannot reclaim it mid-migration, and `(reservation, True)` is returned.
+        """
+        existing = self._reservations.get(digest)
+        if existing is not None and existing.outcome == "pending":
+            return existing, False
+        reservation = MigrationReservation(
+            source_account=source_account,
+            source_generation=source_generation,
+            target_account=target_account,
+            owner_attempt_id=attempt_id,
+        )
+        self._reservations[digest] = reservation
+        self._migration_tokens[attempt_id] = target_account
+        self.begin_attempt(target_account)
+        self.set_migration_reserved(digest, True)
+        return reservation, True
+
+    async def wait_for_migration_reservation(self, reservation: MigrationReservation) -> None:
+        """§4.3's waiter protocol step 2: `await asyncio.shield(...)` on the reservation's
+        event, so a waiter's own cancellation can never cancel — or double-fire — the
+        shared resolution. The caller re-enters the critical section and re-reads all
+        routing state afterward (steps 3-4); it never trusts the stale target embedded
+        in the (by-then-cleared) reservation it just waited on.
+        """
+        await asyncio.shield(reservation.resolved_event.wait())
+
+    def resolve_migration_reservation(
+        self, digest: bytes, *, attempt_id: str, outcome: MigrationOutcome
+    ) -> bool:
+        """The no-await, idempotent core of every owner-terminal path (§4.3): verify
+        `owner_attempt_id`, record the (from-here-immutable) outcome, clear the
+        reservation, un-protect the pin from eviction, then set its event exactly once.
+        Returns `True` only when THIS call performed the transition; a reservation that
+        is missing, already resolved, or owned by a different attempt is a no-op that
+        returns `False` — safe to call more than once, from more than one terminal path.
+        """
+        reservation = self._reservations.get(digest)
+        if (
+            reservation is None
+            or reservation.outcome != "pending"
+            or reservation.owner_attempt_id != attempt_id
+        ):
+            return False
+        reservation.outcome = outcome
+        self.migration_outcome_counts[outcome] = self.migration_outcome_counts.get(outcome, 0) + 1
+        del self._reservations[digest]
+        self.set_migration_reserved(digest, False)
+        reservation.resolved_event.set()
+        return True
+
+    # -- migration-attempt tokens: M(a) (design v2 §4.4) ---------------------
+
+    def migration_token_target(self, attempt_id: str) -> str | None:
+        """The live token's target account for `attempt_id`, or `None` if released/absent."""
+        return self._migration_tokens.get(attempt_id)
+
+    def release_migration_token(self, attempt_id: str) -> str | None:
+        """`migration_tokens.pop(attempt_id, None)` — inherently idempotent (§4.4): the
+        first call releases the token and decrements the target's `M(a)`; every later
+        call for the same `attempt_id` is a no-op that returns `None`.
+        """
+        target_account = self._migration_tokens.pop(attempt_id, None)
+        if target_account is not None:
+            self.end_attempt(target_account)
+        return target_account
+
+    def resolve_migration_owner_terminal(
+        self, digest: bytes, *, attempt_id: str, outcome: MigrationOutcome
+    ) -> bool:
+        """The ONE idempotent owner-terminal API (Steps 2-3): every owner exit path —
+        request cancellation, timeout, mode drain, an exception raised before response
+        headers, target rejection, CAS loss, or success — funnels through this. Entirely
+        synchronous (no `await`), so it is safe to call from a `finally` block while
+        reservation state is mutated: no cancellation can interrupt the transition
+        between ownership verification and event signaling. Resolves the owned
+        reservation to `outcome` (a no-op if it is not pending, not owned by
+        `attempt_id`, or was already resolved by an earlier explicit terminal path such
+        as `commit_at_headers`), then releases the attempt's migration token exactly
+        once (a no-op if already released). Returns whether THIS call resolved the
+        reservation.
+        """
+        resolved_now = self.resolve_migration_reservation(digest, attempt_id=attempt_id, outcome=outcome)
+        self.release_migration_token(attempt_id)
+        return resolved_now
+
+    def resolve_migration_preheader_failure(
+        self,
+        digest: bytes,
+        *,
+        attempt_id: str,
+        outcome: MigrationOutcome = "retryable_preheader_failure",
+    ) -> bool:
+        """Design v2 §4.4's terminal ordering for a pre-header quota/eligibility failure:
+        ① classify the response, ② install the cooldown/capability evidence in memory,
+        and ③ fence the target are the caller's own responsibility, run BEFORE calling
+        this (so a woken waiter re-reads state that already reflects them); this method
+        performs ④ resolve the reservation and wake waiters and ⑤ release the migration
+        token, synchronously and without an intervening await, via
+        `resolve_migration_owner_terminal`. ⑥ persistence/diagnostics are scheduled by
+        the caller AFTER this returns.
+
+        Also applies §5.7 case 2's follow-up clause: if this reservation's source
+        account was separately marked removed (`remove_account`), the now-orphaned
+        source pin is deleted too, so a later request places fresh instead of reusing a
+        pin to a removed account.
+        """
+        reservation = self._reservations.get(digest)
+        source_account = reservation.source_account if reservation is not None else None
+        resolved_now = self.resolve_migration_owner_terminal(digest, attempt_id=attempt_id, outcome=outcome)
+        if resolved_now and source_account is not None and source_account in self._removed_accounts:
+            self.remove_pin(digest)
+        return resolved_now
+
+    # -- commit point: upstream 2xx headers (design v2 §4.5) -----------------
+
+    def commit_at_headers(
+        self,
+        digest: bytes,
+        *,
+        attempt_id: str,
+        source_account: str,
+        source_generation: int,
+        target_account: str,
+        target_account_incarnation_id: str,
+        target_still_registered: bool = True,
+        ingest_headers: Callable[[], None] | None = None,
+    ) -> tuple[CommitOutcome, PinEntry | None, PendingDurabilityBarrier | None]:
+        """ONE no-await critical section performing design v2 §4.5's commit at the
+        target's upstream 2xx headers. Reservation resolution happens HERE — never
+        deferred to stream completion:
+
+        1. `ingest_headers()` (if supplied) — the caller's own ratelimit-header
+           ingestion hook (§3.2), run first so the fresh observation is visible before
+           anything else in this section reads pressure/eligibility state;
+        2. validate target membership (§5.7 case 4: the target was removed by the time
+           its 2xx headers arrived) — on failure: outcome `target_removed`, the
+           reservation resolves and wakes waiters, no pin is touched;
+        3. the generation/owner CAS: `pin.account_id == source_account`,
+           `pin.generation == source_generation`,
+           `reservation.owner_attempt_id == attempt_id` — on failure: outcome
+           `cas_lost` (the newer pin is never overwritten, `migration_cas_lost`
+           increments), the reservation resolves and wakes waiters;
+        4. on success: the pin flips to `target_account`, `generation += 1`, a fresh
+           `pending_durability` barrier is attached to the new generation, the
+           reservation is cleared, and its event is set exactly once — outcome
+           `committed`.
+
+        The migration-attempt TOKEN is untouched here by design (§4.4/Step 5): it
+        survives until the caller releases it (`resolve_migration_owner_terminal` /
+        `release_migration_token`) from the attempt's common `finally`, once the
+        upstream body/stream terminates — `M(target_account)` stays incremented for the
+        whole streamed response, not just until these headers commit.
+
+        Returns `(outcome, pin, barrier)`. On `committed`, the caller awaits `barrier`'s
+        high-priority durability completion (`submit_new_pin_durability` /
+        `await_pin_durability`, T-7 semantics) OUTSIDE this critical section, before
+        forwarding any downstream byte; same-session waiters re-read the pin and await
+        that same barrier before sending upstream.
+        """
+        if ingest_headers is not None:
+            ingest_headers()
+
+        if not target_still_registered:
+            self.migration_commit_rejected_target_removed += 1
+            self.resolve_migration_reservation(digest, attempt_id=attempt_id, outcome="target_removed")
+            return "target_removed", self._pins.get(digest), None
+
+        reservation = self._reservations.get(digest)
+        pin = self._pins.get(digest)
+        cas_ok = (
+            pin is not None
+            and pin.account_id == source_account
+            and pin.generation == source_generation
+            and reservation is not None
+            and reservation.owner_attempt_id == attempt_id
+        )
+        if not cas_ok:
+            # `migration_cas_lost` counts THIS attempt's own CAS rejection, independent
+            # of whether a still-pending reservation is left to formally resolve to
+            # `cas_lost` (a sufficiently stale attempt may find its reservation already
+            # cleared under a different terminal outcome).
+            self.migration_cas_lost += 1
+            self.resolve_migration_reservation(digest, attempt_id=attempt_id, outcome="cas_lost")
+            return "cas_lost", pin, None
+
+        assert pin is not None
+        barrier = PendingDurabilityBarrier()
+        pin.account_id = target_account
+        pin.account_incarnation_id = target_account_incarnation_id
+        pin.generation += 1
+        pin.pending_durability = barrier
+        self.resolve_migration_reservation(digest, attempt_id=attempt_id, outcome="committed")
+        return "committed", pin, barrier
+
+    # -- account removal transition matrix (design v2 §5.7) ------------------
+
+    def remove_account(self, account_id: str) -> dict[str, int]:
+        """§5.7's account-removal transition matrix, cases 1-5 (case 4 is handled at
+        commit time by `commit_at_headers`'s `target_still_registered` check, since it
+        depends on whether upstream 2xx already arrived). Never bulk-resets migration
+        tokens or the in-flight counters underneath them — an owned token is released
+        exactly once, only by its own attempt's own terminal cleanup (case 3: "removed
+        exactly once by terminal cleanup"), not by this batch operation; the mandatory
+        lazy per-lookup/pre-commit membership re-check remains the correctness
+        backstop. Returns a per-case removal count for diagnostics.
+        """
+        self._removed_accounts.add(account_id)
+        case_counts = {
+            "ordinary_pin_removed": 0,
+            "source_removed_migration_continues": 0,
+            "target_removed_before_headers": 0,
+            "both_removed_aborted": 0,
+        }
+
+        touching_digests = {
+            digest for digest, entry in self._pins.items() if entry.account_id == account_id
+        } | {
+            digest
+            for digest, reservation in self._reservations.items()
+            if account_id in (reservation.source_account, reservation.target_account)
+        }
+
+        for digest in touching_digests:
+            reservation = self._reservations.get(digest)
+            if reservation is None:
+                # Case 1: an ordinary pinned account, no active migration.
+                if self.remove_pin(digest):
+                    case_counts["ordinary_pin_removed"] += 1
+                continue
+
+            source_removed = reservation.source_account in self._removed_accounts
+            target_removed = reservation.target_account in self._removed_accounts
+            if source_removed and target_removed:
+                # Case 5: both source and target removed through a race - abort outright.
+                self.resolve_migration_reservation(
+                    digest, attempt_id=reservation.owner_attempt_id, outcome="target_removed"
+                )
+                self.remove_pin(digest)
+                case_counts["both_removed_aborted"] += 1
+            elif target_removed:
+                # Case 3: target removed before upstream 2xx - resolve, wake, prohibit
+                # commit; the (source) pin is left intact for later requests/backstop.
+                self.resolve_migration_reservation(
+                    digest, attempt_id=reservation.owner_attempt_id, outcome="target_removed"
+                )
+                case_counts["target_removed_before_headers"] += 1
+            elif source_removed:
+                # Case 2: source of an active migration, target still eligible - leave
+                # the pin and reservation untouched; the owner completes the migration
+                # (the CAS never requires the source to still be registered).
+                case_counts["source_removed_migration_continues"] += 1
+        return case_counts
