@@ -47,6 +47,11 @@ SETTINGS_KEYS: dict[str, str] = {
     # traffic. Absence of the key (or a resolved empty string) means
     # passthrough forwards the client's own credentials untouched.
     "claude_account.id": "CLAUDEX_CLAUDE_ACCOUNT_ID",
+    # Multi-account routing policy for the managed Anthropic relay, as a
+    # JSON document like {"mode": "fallback"}. Absence of the key (or a
+    # resolved empty env string) means "disabled" — single-account serving
+    # with rate limits relayed verbatim.
+    "claude_account.routing": "CLAUDEX_CLAUDE_ACCOUNT_ROUTING",
 }
 
 
@@ -134,6 +139,50 @@ def parse_claude_account_id(value: str) -> str:
     return value
 
 
+VALID_CLAUDE_ACCOUNT_ROUTING_MODES = ("disabled", "fallback")
+
+
+def parse_claude_account_routing(value: object) -> str:
+    """Parse a claude_account.routing value into its routing mode.
+
+    The setting is a policy document — {"mode": "fallback"} — so future
+    modes can carry their own config blocks (e.g. a "balanced" object)
+    without renaming the key. The settings file holds the document itself;
+    the environment variable holds it JSON-encoded, with an empty string
+    meaning disabled like the other opt-in settings. "balanced" is reserved
+    and rejected until it is implemented.
+    """
+    if isinstance(value, str):
+        if not value:
+            return "disabled"
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise ConfigError(
+                f"claude account routing {value!r} is not valid JSON: {exc}"
+            ) from exc
+    if not isinstance(value, dict):
+        raise ConfigError(
+            "claude account routing must be a JSON object like "
+            f'{{"mode": "fallback"}}, got {value!r}'
+        )
+    unknown = sorted(set(value) - {"mode"})
+    if unknown:
+        raise ConfigError(
+            f"claude account routing has unknown keys: {', '.join(map(str, unknown))}; "
+            "valid keys: mode"
+        )
+    mode = value.get("mode")
+    if mode == "balanced":
+        raise ConfigError('claude account routing mode "balanced" is not implemented yet')
+    if mode not in VALID_CLAUDE_ACCOUNT_ROUTING_MODES:
+        raise ConfigError(
+            "claude account routing mode must be one of "
+            f"{', '.join(VALID_CLAUDE_ACCOUNT_ROUTING_MODES)}, got {mode!r}"
+        )
+    return mode
+
+
 def _default_kimi_code_home() -> Path:
     return Path.home() / ".kimi-code"
 
@@ -166,6 +215,10 @@ class GatewayConfig:
     # passthrough traffic. None means passthrough forwards the client's own
     # credentials untouched — there is no separate "enabled" flag.
     claude_account_id: str | None = None
+    # Multi-account routing mode for the managed relay. "disabled" (the
+    # default) serves with the single configured account and relays rate
+    # limits verbatim; "fallback" fails over across registered accounts.
+    claude_account_routing_mode: str = "disabled"
     # Where settings are read from and where runtime changes are persisted.
     settings_file: Path = field(default_factory=paths.settings_file)
 
@@ -290,6 +343,21 @@ class GatewayConfig:
                 except ConfigError as exc:
                     raise ConfigError(f"{label}: {exc}") from exc
 
+        value, label = _resolve("claude_account.routing", settings)
+        env_name = SETTINGS_KEYS["claude_account.routing"]
+        if value is None:
+            if label == env_name:
+                claude_account_routing_mode = "disabled"
+            else:
+                # The key is present in the settings file (e.g. JSON null) —
+                # that must not be conflated with "not configured".
+                raise ConfigError(f"{label} must be a JSON object, got {value!r}")
+        else:
+            try:
+                claude_account_routing_mode = parse_claude_account_routing(value)
+            except ConfigError as exc:
+                raise ConfigError(f"{label}: {exc}") from exc
+
         return cls(
             host=host,
             port=port,
@@ -302,6 +370,7 @@ class GatewayConfig:
             log_level=log_level,
             compaction_model=compaction_model,
             claude_account_id=claude_account_id,
+            claude_account_routing_mode=claude_account_routing_mode,
             settings_file=settings_file,
         )
 

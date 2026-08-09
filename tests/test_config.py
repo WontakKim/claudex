@@ -10,6 +10,7 @@ from claudex_gateway.config import (
     GatewayConfig,
     RouteTarget,
     parse_claude_account_id,
+    parse_claude_account_routing,
     parse_compaction_model,
     parse_route_target,
     update_settings_file,
@@ -376,7 +377,91 @@ class TestClaudeAccountIdSetting:
             GatewayConfig.from_env()
 
 
-class TestUpdateSettingsFile:
+class TestClaudeAccountRoutingSetting:
+    @staticmethod
+    def _write(tmp_path: Path, payload: object) -> Path:
+        settings_file = tmp_path / "settings.json"
+        settings_file.write_text(json.dumps(payload), encoding="utf-8")
+        return settings_file
+
+    def test_absent_key_defaults_to_disabled(self, tmp_path: Path) -> None:
+        settings_file = self._write(tmp_path, {})
+        assert (
+            GatewayConfig.load(settings_file).claude_account_routing_mode == "disabled"
+        )
+
+    def test_file_document_sets_the_mode(self, tmp_path: Path) -> None:
+        settings_file = self._write(
+            tmp_path, {"claude_account.routing": {"mode": "fallback"}}
+        )
+        assert (
+            GatewayConfig.load(settings_file).claude_account_routing_mode == "fallback"
+        )
+
+    def test_env_json_string_overrides_settings_file(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        settings_file = self._write(
+            tmp_path, {"claude_account.routing": {"mode": "disabled"}}
+        )
+        monkeypatch.setenv("CLAUDEX_CLAUDE_ACCOUNT_ROUTING", '{"mode": "fallback"}')
+        assert (
+            GatewayConfig.load(settings_file).claude_account_routing_mode == "fallback"
+        )
+
+    def test_empty_env_forces_disabled_even_with_file_value(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        settings_file = self._write(
+            tmp_path, {"claude_account.routing": {"mode": "fallback"}}
+        )
+        monkeypatch.setenv("CLAUDEX_CLAUDE_ACCOUNT_ROUTING", "")
+        assert (
+            GatewayConfig.load(settings_file).claude_account_routing_mode == "disabled"
+        )
+
+    def test_balanced_mode_is_rejected_as_not_implemented(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("CLAUDEX_CLAUDE_ACCOUNT_ROUTING", '{"mode": "balanced"}')
+        with pytest.raises(ConfigError, match="not implemented yet"):
+            GatewayConfig.from_env()
+
+    def test_unknown_mode_is_rejected(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("CLAUDEX_CLAUDE_ACCOUNT_ROUTING", '{"mode": "round-robin"}')
+        with pytest.raises(ConfigError, match="must be one of disabled, fallback"):
+            GatewayConfig.from_env()
+
+    def test_unknown_document_keys_are_rejected(self, tmp_path: Path) -> None:
+        settings_file = self._write(
+            tmp_path,
+            {"claude_account.routing": {"mode": "fallback", "weights": [1, 2]}},
+        )
+        with pytest.raises(ConfigError, match="unknown keys: weights"):
+            GatewayConfig.load(settings_file)
+
+    def test_missing_mode_key_is_rejected(self, tmp_path: Path) -> None:
+        settings_file = self._write(tmp_path, {"claude_account.routing": {}})
+        with pytest.raises(ConfigError, match="must be one of disabled, fallback"):
+            GatewayConfig.load(settings_file)
+
+    @pytest.mark.parametrize("value", [None, True, 1, [], "fallback"])
+    def test_non_object_file_value_fails_to_load(
+        self, tmp_path: Path, value: object
+    ) -> None:
+        settings_file = self._write(tmp_path, {"claude_account.routing": value})
+        with pytest.raises(ConfigError, match="claude_account.routing"):
+            GatewayConfig.load(settings_file)
+
+    def test_invalid_env_json_fails_to_load(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("CLAUDEX_CLAUDE_ACCOUNT_ROUTING", "fallback")
+        with pytest.raises(ConfigError, match="CLAUDEX_CLAUDE_ACCOUNT_ROUTING"):
+            GatewayConfig.from_env()
+
+    def test_parse_returns_disabled_for_explicit_disabled_document(self) -> None:
+        assert parse_claude_account_routing({"mode": "disabled"}) == "disabled"
     @staticmethod
     def _write(tmp_path: Path, payload: object) -> Path:
         settings_file = tmp_path / "settings.json"
