@@ -163,7 +163,7 @@ authoritative list of valid IDs is Kimi's own live catalog, which the gateway
 exposes for map authoring (and as the preset source for the future dashboard):
 
 ```sh
-curl http://127.0.0.1:8787/admin/kimi/models
+curl http://127.0.0.1:8787/admin/providers/kimi/models
 ```
 
 The endpoint requires a logged-in Kimi Code CLI and honors the same
@@ -261,25 +261,25 @@ a different account than the one serving it.
 The selection is the flat `claude_account.id` settings key (env override:
 `CLAUDEX_CLAUDE_ACCOUNT_ID`). `account use` manages it through the same
 channel decision table as `compact`: a confirmed running daemon is updated
-live through `GET/PUT /admin/claude-account` (no restart needed), a
-settings-file write is used only when no live daemon can be confirmed, and
-an ambiguous probe refuses to apply changes. `account use off` returns to
-today's default: client credentials forwarded untouched.
+live through the `/admin/providers/claude/pool/serving` endpoint (no
+restart needed), a settings-file write is used only when no live daemon can
+be confirmed, and an ambiguous probe refuses to apply changes.
+`account use off` clears the pin via `DELETE` and returns to today's
+default: client credentials forwarded untouched.
 
 ```sh
-curl http://127.0.0.1:8787/admin/claude-account
-curl -X PUT http://127.0.0.1:8787/admin/claude-account \
+curl http://127.0.0.1:8787/admin/providers/claude/pool/serving
+curl -X PUT http://127.0.0.1:8787/admin/providers/claude/pool/serving \
   -H 'Content-Type: application/json' \
   -d '{"account_id": "<registered-account-id>"}'
-curl -X PUT http://127.0.0.1:8787/admin/claude-account \
-  -H 'Content-Type: application/json' \
-  -d '{"account_id": null}'
+curl -X DELETE http://127.0.0.1:8787/admin/providers/claude/pool/serving
 ```
 
 The endpoint honors the same `CLAUDEX_LOCAL_TOKEN` and Host guard as the
-other admin routes; a `PUT` validates that the id is registered, persists
-the change to `settings.json`, and is refused with `409` when
-`CLAUDEX_CLAUDE_ACCOUNT_ID` is set in the environment.
+other admin routes; a `PUT` requires a registered id (clearing is `DELETE`,
+never a null `PUT`), persists the change to `settings.json`, and both
+writes are refused with `409` when `CLAUDEX_CLAUDE_ACCOUNT_ID` is set in
+the environment.
 
 Caveats to accept consciously:
 
@@ -287,10 +287,10 @@ Caveats to accept consciously:
   subscription, and Anthropic's response rate-limit headers (and the CLI's
   usage display) reflect the serving account.
 - If the selected account is removed or its refresh token becomes invalid,
-  the pool serves from the remaining ready accounts (see the next section);
-  only when nothing usable remains does passthrough fail with a clear
-  gateway 503 — there is never a silent fallback to client credentials.
-  Re-add the account or run `account use off`.
+  passthrough fails with a clear gateway 503 — there is never a silent
+  fallback to client credentials. Re-add the account or run
+  `account use off`. (With the `fallback` routing mode enabled — see the
+  next section — the remaining ready accounts serve instead.)
 - The [compaction reroute](#compaction-reroute) still uses the credentials
   the client itself sent: with a credential-less client it records
   `skipped_no_credentials` and falls back to the mapped model as usual.
@@ -299,31 +299,51 @@ Caveats to accept consciously:
 
 ### Ordered fallback across registered accounts
 
-With more than one registered account, the selection above becomes the head
-of a fallback chain instead of a hard single choice: every **ready** account
-is a pool member, ordered serving-account-first and then by registration
-time. When the account being served with answers `429`, the gateway puts it
-on an in-memory cooldown, transparently retries the same request with the
+Multi-account routing is an explicit opt-in, off by default: with the
+routing mode `disabled`, only the pinned serving account is used and a
+`429` relays to the client verbatim. Selecting the `fallback` mode turns
+the pin into the head of a fallback chain: every **ready** account is a
+pool member, ordered serving-account-first and then by registration time.
+When the account being served with answers `429`, the gateway puts it on
+an in-memory cooldown, transparently retries the same request with the
 next account in the chain, and fails back automatically once the cooldown
 expires — the client never has to handle the rate limit itself as long as
 any account has quota left.
+
+The mode is the `claude_account.routing` settings key — a policy document
+like `{"mode": "fallback"}`, leaving room for future modes (a usage-
+balancing `balanced` is reserved and refused until implemented) — managed
+at runtime through `/admin/providers/claude/pool/routing`:
+
+```sh
+curl http://127.0.0.1:8787/admin/providers/claude/pool/routing
+curl -X PUT http://127.0.0.1:8787/admin/providers/claude/pool/routing \
+  -H 'Content-Type: application/json' \
+  -d '{"mode": "fallback"}'
+```
+
+The env override `CLAUDEX_CLAUDE_ACCOUNT_ROUTING` holds the same document
+JSON-encoded (empty string = disabled) and locks the endpoint with `409`
+while set.
 
 How long a rate-limited account sits out is taken from the best signal the
 429 offers: a `Retry-After` header or a reset timestamp when present,
 otherwise the account's cached usage window resets (as shown in the
 dashboard), otherwise a 60-second default — in practice Anthropic's OAuth
 quota rejections carry no machine-readable reset, so the cached usage data
-is what turns a blind minute into an accurate multi-hour cooldown. The
-cooldown state is visible as `coolingDownUntil` (epoch ms) in
-`GET /admin/claude-accounts` rows and lives in daemon memory only: a restart
-clears it, at worst costing one extra upstream probe.
+is what turns a blind minute into an accurate multi-hour cooldown. Each
+account's routing state is visible at
+`GET /admin/providers/claude/pool/status` (`ready`, `cooldown` with a
+`cooldown_until` epoch-ms deadline, or `unavailable`) and lives in daemon
+memory only: a restart clears it, at worst costing one extra upstream
+probe.
 
 Boundaries to know:
 
-- Only `429` triggers failover. Auth failures durably mark the account
-  `needs-reauth` (excluded from the chain until a re-login); other upstream
-  errors and network failures are relayed as before — retrying a different
-  account would not help them.
+- Only `429` triggers failover, and only in `fallback` mode. Auth failures
+  durably mark the account `needs-reauth` (excluded from the chain until a
+  re-login); other upstream errors and network failures are relayed as
+  before — retrying a different account would not help them.
 - When every account is rate-limited, the client sees a real `429`: the last
   upstream rejection while probing, or a synthesized one with `Retry-After`
   once everything is already cooling (upstream is then not contacted at all).
@@ -350,7 +370,7 @@ uv run claudex-gateway compact off                    # disable
 ```
 
 When a compatible daemon is identified, the command uses its authenticated
-`GET`/`PUT /admin/compaction` API, so successful changes take effect
+`GET`/`PUT /admin/settings/compaction` API, so successful changes take effect
 immediately with no restart. An identified older daemon returning `404` or
 `405` falls back to the settings file and warns that a restart is
 required. With no listener, or a confirmed foreign process on the port,
@@ -381,6 +401,7 @@ stays available for one-off overrides.
 | `CLAUDEX_LOCAL_TOKEN` | unset | Bearer token required by the model request routes and the admin/dashboard routes when set; mandatory for non-loopback binds. See [the passthrough interaction](#mixing-claude-and-codex-models) |
 | `CLAUDEX_COMPACTION_MODEL` | unset | `compaction.model` setting: opt-in `claude:<model-id>` reroute target for oversized Claude Code compaction requests; unset (default) disables the reroute entirely. See [Compaction reroute](#compaction-reroute) |
 | `CLAUDEX_CLAUDE_ACCOUNT_ID` | unset | `claude_account.id` setting: id of the registered Claude account that serves Anthropic passthrough traffic; unset (default) forwards client credentials untouched. See [Serving with a registered account](#serving-with-a-registered-account-account-use) |
+| `CLAUDEX_CLAUDE_ACCOUNT_ROUTING` | unset | `claude_account.routing` setting as a JSON-encoded policy document, e.g. `{"mode": "fallback"}`; unset or empty (default) keeps multi-account routing disabled. See [Ordered fallback across registered accounts](#ordered-fallback-across-registered-accounts) |
 
 ### settings.json
 
@@ -405,8 +426,8 @@ The model map can be changed while the gateway is running — no restart of
 the gateway or its clients:
 
 ```sh
-curl http://127.0.0.1:8787/admin/mapping
-curl -X PUT http://127.0.0.1:8787/admin/mapping \
+curl http://127.0.0.1:8787/admin/settings/mapping
+curl -X PUT http://127.0.0.1:8787/admin/settings/mapping \
   -H 'Content-Type: application/json' \
   -d '{"model_map": {"opus": "codex:gpt-5.6-sol"}}'
 ```
@@ -436,16 +457,16 @@ detect a compaction request are a versioned contract with Claude Code
 changed, never guessed.
 
 ```sh
-curl http://127.0.0.1:8787/admin/compaction
-curl -X PUT http://127.0.0.1:8787/admin/compaction \
+curl http://127.0.0.1:8787/admin/settings/compaction
+curl -X PUT http://127.0.0.1:8787/admin/settings/compaction \
   -H 'Content-Type: application/json' \
   -d '{"model": "claude:claude-opus-5"}'
-curl -X PUT http://127.0.0.1:8787/admin/compaction \
+curl -X PUT http://127.0.0.1:8787/admin/settings/compaction \
   -H 'Content-Type: application/json' \
   -d '{"model": null}'
 ```
 
-`GET`/`PUT /admin/compaction` read and change the same `compaction.model`
+`GET`/`PUT /admin/settings/compaction` read and change the same `compaction.model`
 setting on a running gateway, honoring the same `CLAUDEX_LOCAL_TOKEN` and
 Host guard as the other admin routes; a `PUT` persists the change to
 `settings.json` and, like the mapping API, is refused with `409` when
@@ -463,17 +484,17 @@ their Router add-node buttons) appear only when a local login is detected or
 the model map already routes to them; hiding is cosmetic and never affects
 routing or `settings.json` — the Log tab tails the gateway's recent
 log lines (`GET /admin/logs`) and holds the runtime log-level control
-(`PUT /admin/log-level`, applied immediately and persisted), and the Router
+(`PUT /admin/settings/log-level`, applied immediately and persisted), and the Router
 tab is a canvas editor — drag a port to wire a model, Apply to `PUT` the
 map, and use the connection test box (`POST /admin/test`) to send one
 minimal request through the gateway before wiring a new model id. The board
 turns view-only when `CLAUDEX_MODEL_MAP` overrides the map, and the Codex
 column is loaded from the live Codex model catalog
-(`GET /admin/codex/models`). The dashboard predates the Kimi direction — its
+(`GET /admin/providers/codex/models`). The dashboard predates the Kimi direction — its
 model column is Codex-only and `kimi:`-prefixed targets show up as plain
 values, though the connection test understands the prefix and probes the
 right backend; a redesign is planned separately and will draw its Kimi
-presets from `GET /admin/kimi/models`.
+presets from `GET /admin/providers/kimi/models`.
 
 When `CLAUDEX_LOCAL_TOKEN` is set, the dashboard prompts for the token once
 per page load and keeps it in memory for the lifetime of that page only — it
