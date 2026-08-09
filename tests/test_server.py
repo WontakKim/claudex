@@ -3520,9 +3520,17 @@ class TestAdminClaudeRoutingApi:
             response = client.put(
                 "/admin/providers/claude/pool/routing", json={"mode": "balanced"}
             )
+            # A future-shaped balanced document reports the real reason,
+            # not the incidental unknown key of its mode block.
+            future_shaped = client.put(
+                "/admin/providers/claude/pool/routing",
+                json={"mode": "balanced", "balanced": {"window": "session"}},
+            )
 
         assert response.status_code == 400
         assert "not implemented yet" in response.json()["error"]["message"]
+        assert future_shaped.status_code == 400
+        assert "not implemented yet" in future_shaped.json()["error"]["message"]
         assert not (tmp_path / "settings.json").exists()
 
     @pytest.mark.parametrize(

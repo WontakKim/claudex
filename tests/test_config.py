@@ -427,6 +427,18 @@ class TestClaudeAccountRoutingSetting:
         with pytest.raises(ConfigError, match="not implemented yet"):
             GatewayConfig.from_env()
 
+    def test_future_shaped_balanced_document_reports_not_implemented(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A future-shaped document must name the real reason, not the
+        # incidental unknown key of its mode block.
+        monkeypatch.setenv(
+            "CLAUDEX_CLAUDE_ACCOUNT_ROUTING",
+            '{"mode": "balanced", "balanced": {"window": "session"}}',
+        )
+        with pytest.raises(ConfigError, match="not implemented yet"):
+            GatewayConfig.from_env()
+
     def test_unknown_mode_is_rejected(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("CLAUDEX_CLAUDE_ACCOUNT_ROUTING", '{"mode": "round-robin"}')
         with pytest.raises(ConfigError, match="must be one of disabled, fallback"):

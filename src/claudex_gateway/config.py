@@ -166,15 +166,18 @@ def parse_claude_account_routing(value: object) -> str:
             "claude account routing must be a JSON object like "
             f'{{"mode": "fallback"}}, got {value!r}'
         )
+    mode = value.get("mode")
+    # The reserved mode is rejected before key validation so a future-shaped
+    # document ({"mode": "balanced", "balanced": {...}}) reports the real
+    # reason instead of "unknown keys".
+    if mode == "balanced":
+        raise ConfigError('claude account routing mode "balanced" is not implemented yet')
     unknown = sorted(set(value) - {"mode"})
     if unknown:
         raise ConfigError(
             f"claude account routing has unknown keys: {', '.join(map(str, unknown))}; "
             "valid keys: mode"
         )
-    mode = value.get("mode")
-    if mode == "balanced":
-        raise ConfigError('claude account routing mode "balanced" is not implemented yet')
     if mode not in VALID_CLAUDE_ACCOUNT_ROUTING_MODES:
         raise ConfigError(
             "claude account routing mode must be one of "

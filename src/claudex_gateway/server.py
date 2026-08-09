@@ -2186,6 +2186,17 @@ async def _handle_admin_claude_routing_put(request: Request) -> JSONResponse:
     body, error = await _read_json_object(request, _openai_error_body)
     if error is not None or body is None:
         return error
+    mode = body.get("mode")
+    # Reserved mode first, so a future-shaped balanced document reports the
+    # real reason instead of "unknown keys" (mirrors the config parser).
+    if mode == "balanced":
+        return JSONResponse(
+            _openai_error_body(
+                "invalid_request_error",
+                'routing mode "balanced" is not implemented yet',
+            ),
+            status_code=400,
+        )
     unknown = sorted(set(body) - set(_CLAUDE_ROUTING_KEYS))
     if unknown:
         return JSONResponse(
@@ -2193,15 +2204,6 @@ async def _handle_admin_claude_routing_put(request: Request) -> JSONResponse:
                 "invalid_request_error",
                 f"unknown keys: {', '.join(unknown)}; "
                 f"supported: {', '.join(_CLAUDE_ROUTING_KEYS)}",
-            ),
-            status_code=400,
-        )
-    mode = body.get("mode")
-    if mode == "balanced":
-        return JSONResponse(
-            _openai_error_body(
-                "invalid_request_error",
-                'routing mode "balanced" is not implemented yet',
             ),
             status_code=400,
         )
