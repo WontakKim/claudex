@@ -313,12 +313,17 @@ async def _passthrough_to_anthropic(
     With no claude_account.id configured, the client's own credentials and
     beta headers are forwarded untouched, so passthrough traffic behaves
     exactly as if Claude Code talked to Anthropic directly. With one
-    configured, the request is served with the registered accounts instead,
-    serving account first (see `_passthrough_with_claude_pool`).
+    configured, the request is served with the registered account instead —
+    and when claude_account.routing selects the "fallback" mode, with the
+    whole pool, serving account first (see `_passthrough_with_claude_pool`).
     """
     config: GatewayConfig = request.app.state.config
     if config.claude_account_id is not None:
-        return await _passthrough_with_claude_pool(
+        if config.claude_account_routing_mode == "fallback":
+            return await _passthrough_with_claude_pool(
+                request, raw_body, parsed_body, config.claude_account_id
+            )
+        return await _passthrough_with_claude_account(
             request, raw_body, parsed_body, config.claude_account_id
         )
     headers = {
@@ -517,7 +522,12 @@ def _replay_buffered_response(status_code: int, headers: dict[str, str], body: b
 
 
 async def _attempt_with_account(
-    request: Request, raw_body: bytes, parsed_body: Any, record: AccountRecord
+    request: Request,
+    raw_body: bytes,
+    parsed_body: Any,
+    record: AccountRecord,
+    *,
+    rate_limit_failover: bool,
 ) -> Response | _FailedAttempt:
     """Serve an Anthropic passthrough request with one registered account's token.
 
@@ -531,6 +541,10 @@ async def _attempt_with_account(
     a 429 that just started this account's cooldown) so the pool can try the
     next account; every other outcome — success, other upstream statuses,
     and transport errors, which are not account-specific — is terminal.
+
+    With `rate_limit_failover` off (routing mode "disabled"), a 429 is not
+    an account-specific failure: it streams back verbatim with zero cooldown
+    bookkeeping, exactly like any other upstream status.
     """
     account_id = record.id
     manager = _claude_account_auth_manager(request.app.state, account_id)
@@ -603,7 +617,7 @@ async def _attempt_with_account(
                 status_code=401,
             )
         )
-    if upstream_response.status_code == 429:
+    if upstream_response.status_code == 429 and rate_limit_failover:
         # Buffer the (small) error response and release the connection before
         # any next attempt reuses the shared client. Quota 429s carry no
         # machine-readable reset (.docs/research/claude-429-shape.md), so the
@@ -627,6 +641,41 @@ async def _attempt_with_account(
             rate_limited=True,
         )
     return _relay_anthropic_response(upstream_response)
+
+
+async def _passthrough_with_claude_account(
+    request: Request, raw_body: bytes, parsed_body: Any, serving_account_id: str
+) -> Response:
+    """Serve a passthrough request with the single configured account.
+
+    This is the routing mode "disabled" path: only the serving account is
+    used, and every upstream status — including 429 — relays verbatim with
+    no cooldown bookkeeping. The registry is re-resolved on every request
+    (read-through, no cache) so CLI- and dashboard-side account changes take
+    effect without a restart.
+    """
+    try:
+        records = load_registry()
+    except AccountRegistryError as exc:
+        return _claude_account_unavailable(f"cannot read the claude account registry: {exc}")
+    record = next((record for record in records if record.id == serving_account_id), None)
+    if record is None:
+        return _claude_account_unavailable(
+            f"configured claude account {serving_account_id} is not registered; "
+            "pick another with `claudex-gateway account use` or disable it "
+            "with `claudex-gateway account use off`"
+        )
+    if record.state != "ready":
+        return _claude_account_unavailable(
+            f"configured claude account {serving_account_id} is in state "
+            f"{record.state!r}, not ready"
+        )
+    outcome = await _attempt_with_account(
+        request, raw_body, parsed_body, record, rate_limit_failover=False
+    )
+    if isinstance(outcome, _FailedAttempt):
+        return outcome.response
+    return outcome
 
 
 async def _passthrough_with_claude_pool(
@@ -679,7 +728,9 @@ async def _passthrough_with_claude_pool(
     first_failure: Response | None = None
     last_rate_limited: Response | None = None
     for position, record in enumerate(chain.attempts):
-        outcome = await _attempt_with_account(request, raw_body, parsed_body, record)
+        outcome = await _attempt_with_account(
+            request, raw_body, parsed_body, record, rate_limit_failover=True
+        )
         if not isinstance(outcome, _FailedAttempt):
             if position:
                 logger.warning(

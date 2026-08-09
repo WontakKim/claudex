@@ -4798,6 +4798,13 @@ def _register_pool_accounts(
     return first, second
 
 
+def _pool_config(serving_account_id: str) -> GatewayConfig:
+    """Fallback-mode config: the pool section exercises multi-account routing."""
+    return GatewayConfig(
+        claude_account_id=serving_account_id, claude_account_routing_mode="fallback"
+    )
+
+
 def _quota_429(marker: str = "Error") -> httpx.Response:
     """The empirically observed OAuth quota rejection: no reset signal at all."""
     return httpx.Response(
@@ -4805,6 +4812,37 @@ def _quota_429(marker: str = "Error") -> httpx.Response:
         json={"type": "error", "error": {"type": "rate_limit_error", "message": marker}},
         headers={"x-should-retry": "true"},
     )
+
+
+def test_routing_disabled_by_default_relays_429_without_touching_other_accounts(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    first, _second = _register_pool_accounts(monkeypatch)
+    calls: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return _quota_429("relayed")
+
+    # No claude_account.routing configured: multi-account routing stays off.
+    client, _ = _gateway(GatewayConfig(claude_account_id=first), handler)
+
+    first_response = client.post("/v1/messages", json=_account_body())
+    assert first_response.status_code == 429
+    assert first_response.json()["error"]["message"] == "relayed"
+    assert [call.headers["authorization"] for call in calls] == ["Bearer pool-access-1"]
+
+    # No cooldown bookkeeping either: the next request probes upstream again
+    # instead of answering from a synthesized cooldown 429.
+    second_response = client.post("/v1/messages", json=_account_body())
+    assert second_response.status_code == 429
+    assert "retry-after" not in second_response.headers
+    assert not client.app.state.claude_account_cooldowns.is_cooling(first)
+    assert [call.headers["authorization"] for call in calls] == [
+        "Bearer pool-access-1",
+        "Bearer pool-access-1",
+    ]
 
 
 def test_pool_fails_over_to_second_account_on_429(
@@ -4820,7 +4858,7 @@ def test_pool_fails_over_to_second_account_on_429(
             return _quota_429()
         return httpx.Response(200, json={"id": "msg_1"})
 
-    client, _ = _gateway(GatewayConfig(claude_account_id=first), handler)
+    client, _ = _gateway(_pool_config(first), handler)
 
     response = client.post("/v1/messages", json=_account_body())
 
@@ -4849,7 +4887,7 @@ def test_pool_cooldown_persists_across_requests(
             return _quota_429()
         return httpx.Response(200, json={"id": "msg_1"})
 
-    client, _ = _gateway(GatewayConfig(claude_account_id=first), handler)
+    client, _ = _gateway(_pool_config(first), handler)
 
     assert client.post("/v1/messages", json=_account_body()).status_code == 200
     calls.clear()
@@ -4874,7 +4912,7 @@ def test_pool_fails_back_after_cooldown_expiry(
             return _quota_429()
         return httpx.Response(200, json={"id": "msg_1"})
 
-    client, _ = _gateway(GatewayConfig(claude_account_id=first), handler)
+    client, _ = _gateway(_pool_config(first), handler)
     now = [1_000.0]
     client.app.state.claude_account_cooldowns = AccountCooldownTracker(clock=lambda: now[0])
 
@@ -4899,7 +4937,7 @@ def test_pool_exhausted_replays_final_upstream_429(
         marker = "first" if request.headers["authorization"] == "Bearer pool-access-1" else "second"
         return _quota_429(marker)
 
-    client, _ = _gateway(GatewayConfig(claude_account_id=first), handler)
+    client, _ = _gateway(_pool_config(first), handler)
 
     response = client.post("/v1/messages", json=_account_body())
 
@@ -4921,7 +4959,7 @@ def test_all_cooling_returns_429_with_retry_after_without_contacting_upstream(
         calls.append(request)
         return _quota_429()
 
-    client, _ = _gateway(GatewayConfig(claude_account_id=first), handler)
+    client, _ = _gateway(_pool_config(first), handler)
 
     assert client.post("/v1/messages", json=_account_body()).status_code == 429
     upstream_probes = len(calls)
@@ -4946,7 +4984,7 @@ def test_pool_429_cooldown_uses_cached_usage_reset(
             return _quota_429()
         return httpx.Response(200, json={"id": "msg_1"})
 
-    client, _ = _gateway(GatewayConfig(claude_account_id=first), handler)
+    client, _ = _gateway(_pool_config(first), handler)
     envelope = {
         "provider": "claude",
         "status": "ok",
@@ -4985,7 +5023,7 @@ def test_pool_fails_over_when_refresh_requires_reauth(
         api_calls.append(request.headers["authorization"])
         return httpx.Response(200, json={"id": "msg_1"})
 
-    client, _ = _gateway(GatewayConfig(claude_account_id=first), handler)
+    client, _ = _gateway(_pool_config(first), handler)
 
     response = client.post("/v1/messages", json=_account_body())
 
@@ -5018,7 +5056,7 @@ def test_pool_fails_over_on_post_retry_401_and_marks_reauth(
             return httpx.Response(200, json={"id": "msg_1"})
         return httpx.Response(401, json={"type": "error"})
 
-    client, _ = _gateway(GatewayConfig(claude_account_id=first), handler)
+    client, _ = _gateway(_pool_config(first), handler)
 
     response = client.post("/v1/messages", json=_account_body())
 
@@ -5041,7 +5079,7 @@ def test_pool_transport_error_returns_502_without_failover(
         calls.append(request)
         raise httpx.ConnectError("network down", request=request)
 
-    client, _ = _gateway(GatewayConfig(claude_account_id=first), handler)
+    client, _ = _gateway(_pool_config(first), handler)
 
     response = client.post("/v1/messages", json=_account_body())
 
@@ -5064,7 +5102,7 @@ def test_pool_serves_count_tokens_failover(
             return _quota_429()
         return httpx.Response(200, json={"input_tokens": 42})
 
-    client, _ = _gateway(GatewayConfig(claude_account_id=first), handler)
+    client, _ = _gateway(_pool_config(first), handler)
 
     response = client.post("/v1/messages/count_tokens", json=_account_body())
 
@@ -5087,7 +5125,7 @@ def test_pool_single_account_429_replays_upstream_body_and_cools_down(
         calls.append(request)
         return _quota_429("single")
 
-    client, _ = _gateway(GatewayConfig(claude_account_id=account_id), handler)
+    client, _ = _gateway(_pool_config(account_id), handler)
 
     first_response = client.post("/v1/messages", json=_account_body())
     assert first_response.status_code == 429
@@ -5114,7 +5152,7 @@ def test_pool_forwards_non_claude_code_body_unchanged_on_failover(
             return _quota_429()
         return httpx.Response(200, json={"id": "msg_1"})
 
-    client, _ = _gateway(GatewayConfig(claude_account_id=first), handler)
+    client, _ = _gateway(_pool_config(first), handler)
     body = _message_body("claude-fable-5")
     body["metadata"] = {"user_id": "not-a-json-string"}
     raw = json.dumps(body)
@@ -5139,7 +5177,7 @@ def test_pool_skips_unregistered_serving_id_when_other_ready_accounts_exist(
         return httpx.Response(200, json={"id": "msg_1"})
 
     client, _ = _gateway(
-        GatewayConfig(claude_account_id="0a1b2c3d-4e5f-4678-9abc-def012345678"), handler
+        _pool_config("0a1b2c3d-4e5f-4678-9abc-def012345678"), handler
     )
 
     response = client.post("/v1/messages", json=_account_body())
