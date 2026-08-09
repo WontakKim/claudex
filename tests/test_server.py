@@ -5471,6 +5471,8 @@ class TestAdminClaudeAccountsApi:
             "updatedAt",
             "lastAuthenticatedAt",
             "state",
+            "accountIncarnationId",
+            "upstreamAccountUuid",
             "planType",
             "rateLimitTier",
         }

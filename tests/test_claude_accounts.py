@@ -11,8 +11,9 @@ import stat
 import subprocess
 import sys
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 import pytest
 
@@ -51,7 +52,8 @@ def _write_raw_registry(rows: list[Any]) -> None:
     (root / "registry.json").write_text(json.dumps(rows), encoding="utf-8")
 
 
-def _base_row(**overrides: Any) -> dict[str, Any]:
+def _legacy_row(**overrides: Any) -> dict[str, Any]:
+    """The one recognized legacy (pre-incarnation-identity) 8-key row shape."""
     row: dict[str, Any] = {
         "id": str(uuid.uuid4()),
         "email": "user@example.com",
@@ -61,6 +63,17 @@ def _base_row(**overrides: Any) -> dict[str, Any]:
         "updatedAt": 1_700_000_000_000,
         "lastAuthenticatedAt": 1_700_000_000_000,
         "state": "ready",
+    }
+    row.update(overrides)
+    return row
+
+
+def _base_row(**overrides: Any) -> dict[str, Any]:
+    """The current (post-migration) 10-key row shape."""
+    row: dict[str, Any] = {
+        **_legacy_row(),
+        "accountIncarnationId": str(uuid.uuid4()),
+        "upstreamAccountUuid": None,
     }
     row.update(overrides)
     return row
@@ -169,6 +182,8 @@ def test_registry_row_has_exact_camel_case_keys() -> None:
         "updatedAt",
         "lastAuthenticatedAt",
         "state",
+        "accountIncarnationId",
+        "upstreamAccountUuid",
     }
 
 
@@ -485,6 +500,254 @@ def test_load_registry_strict_rejects_non_canonical_id() -> None:
     _write_raw_registry([_base_row(id="../../etc/passwd")])
     with pytest.raises(claude_accounts.AccountRegistryError, match="row 0"):
         claude_accounts.load_registry()
+
+
+def test_load_registry_accepts_exact_current_schema_without_rewriting() -> None:
+    _write_raw_registry([_base_row()])
+    mtime_before = _registry_path().stat().st_mtime_ns
+
+    [record] = claude_accounts.load_registry()
+
+    assert record.account_incarnation_id
+    assert _registry_path().stat().st_mtime_ns == mtime_before
+
+
+def test_empty_registry_array_is_valid_current_state_and_not_rewritten() -> None:
+    _write_raw_registry([])
+    mtime_before = _registry_path().stat().st_mtime_ns
+
+    assert claude_accounts.load_registry() == []
+    assert claude_accounts.load_registry() == []
+
+    assert _registry_path().stat().st_mtime_ns == mtime_before
+
+
+def test_load_registry_rejects_mixed_legacy_and_current_rows() -> None:
+    _write_raw_registry([_legacy_row(), _base_row()])
+    mtime_before = _registry_path().stat().st_mtime_ns
+
+    with pytest.raises(claude_accounts.AccountRegistryError):
+        claude_accounts.load_registry()
+
+    assert _registry_path().stat().st_mtime_ns == mtime_before  # rejected, never rewritten
+
+
+# --------------------------------------------------------------------------
+# Legacy schema migration: classification, atomic rewrite, and race safety
+# --------------------------------------------------------------------------
+
+
+def test_load_registry_migrates_legacy_registry_and_rewrites_atomically() -> None:
+    _write_raw_registry([_legacy_row(email="a@example.com"), _legacy_row(email="b@example.com")])
+
+    migrated = claude_accounts.load_registry()
+
+    assert {record.email for record in migrated} == {"a@example.com", "b@example.com"}
+    incarnation_ids = [record.account_incarnation_id for record in migrated]
+    assert len(set(incarnation_ids)) == 2  # each row gets its own fresh incarnation
+    for incarnation_id in incarnation_ids:
+        uuid.UUID(incarnation_id)  # a canonical uuid was actually assigned
+    # No account directory exists for either row, so the upstream uuid
+    # cannot be established — the migration must not fail or invent one.
+    assert all(record.upstream_account_uuid is None for record in migrated)
+
+    on_disk = json.loads(_registry_path().read_text())
+    assert all(set(row) == set(_base_row()) for row in on_disk)  # rewritten to the current schema
+    # The atomic writer's own staging file must never survive a successful write.
+    assert not any(
+        entry.name.startswith(".registry.json.tmp-") for entry in _accounts_root().iterdir()
+    )
+
+
+def test_load_registry_migration_derives_upstream_uuid_from_account_directory() -> None:
+    legacy_id = str(uuid.uuid4())
+    _write_raw_registry([_legacy_row(id=legacy_id)])
+    account_dir = _accounts_root() / legacy_id
+    account_dir.mkdir(mode=0o700)
+    upstream_uuid = str(uuid.uuid4())
+    (account_dir / "oauth-account.json").write_text(
+        json.dumps({"accountUuid": upstream_uuid}), encoding="utf-8"
+    )
+
+    [migrated] = claude_accounts.load_registry()
+
+    assert migrated.upstream_account_uuid == upstream_uuid
+
+
+def test_load_registry_migration_is_idempotent_and_does_not_rewrite_again() -> None:
+    _write_raw_registry([_legacy_row()])
+    first = claude_accounts.load_registry()
+    mtime_after_migration = _registry_path().stat().st_mtime_ns
+
+    second = claude_accounts.load_registry()
+
+    assert _registry_path().stat().st_mtime_ns == mtime_after_migration
+    assert [r.account_incarnation_id for r in second] == [r.account_incarnation_id for r in first]
+
+
+def test_load_registry_migration_race_double_check_returns_the_winner_without_rewriting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A concurrent writer finishes migrating the exact same legacy registry
+    between this loader's lock-free legacy classification and its own lock
+    acquisition. Detecting legacy data before the lock is only advisory: the
+    loader must re-read and reclassify under the lock, see the winning
+    current-schema data, and return it as-is — never re-migrate (a second,
+    different set of incarnation ids) or rewrite over the winner."""
+    legacy_id = str(uuid.uuid4())
+    _write_raw_registry([_legacy_row(id=legacy_id)])
+    winning_row = {
+        **_legacy_row(id=legacy_id),
+        "accountIncarnationId": str(uuid.uuid4()),
+        "upstreamAccountUuid": None,
+    }
+    real_file_lock = claude_accounts.file_lock
+
+    @contextmanager
+    def _racing_file_lock(path: Path) -> Iterator[None]:
+        # Simulate another process completing the identical migration right
+        # here: after this test's own lock-free classification (already
+        # done, above, before `load_registry` ever calls `file_lock`) and
+        # before this process's own lock acquisition (about to happen).
+        _write_raw_registry([winning_row])
+        with real_file_lock(path):
+            yield
+
+    monkeypatch.setattr(claude_accounts, "file_lock", _racing_file_lock)
+
+    [record] = claude_accounts.load_registry()
+
+    assert record.account_incarnation_id == winning_row["accountIncarnationId"]
+    # Never rewritten: the winner's exact row content stands unmodified.
+    assert json.loads(_registry_path().read_text()) == [winning_row]
+
+
+_LOAD_SCRIPT = """
+import sys
+from claudex_gateway import claude_accounts as ca
+
+records = ca.load_registry()
+print(",".join(sorted(f"{r.id}:{r.account_incarnation_id}" for r in records)))
+"""
+
+
+def test_concurrent_legacy_registry_loaders_converge_on_one_migration(tmp_path: Path) -> None:
+    legacy_id = str(uuid.uuid4())
+    _write_raw_registry([_legacy_row(id=legacy_id)])
+    env = _child_env(tmp_path)
+
+    p1 = subprocess.Popen(
+        [sys.executable, "-c", _LOAD_SCRIPT],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    p2 = subprocess.Popen(
+        [sys.executable, "-c", _LOAD_SCRIPT],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    out1, err1 = p1.communicate(timeout=30)
+    out2, err2 = p2.communicate(timeout=30)
+    assert p1.returncode == 0, (out1, err1)
+    assert p2.returncode == 0, (out2, err2)
+
+    # Both loaders must converge on exactly one migration's winning
+    # incarnation id for the row, whichever process actually won the lock.
+    assert out1 == out2
+
+    on_disk = json.loads(_registry_path().read_text())
+    assert len(on_disk) == 1
+    assert set(on_disk[0]) == set(_base_row())
+
+
+# --------------------------------------------------------------------------
+# Incarnation identity: assignment and the reauthentication transition table
+# --------------------------------------------------------------------------
+
+
+def test_add_account_assigns_incarnation_and_captures_upstream_account_uuid() -> None:
+    upstream_uuid = str(uuid.uuid4())
+    record = _add(oauth_account_json={"accountUuid": upstream_uuid})
+
+    assert record.upstream_account_uuid == upstream_uuid
+    uuid.UUID(record.account_incarnation_id)  # a fresh canonical incarnation id was assigned
+
+
+def test_add_account_without_capturable_upstream_uuid_still_assigns_incarnation() -> None:
+    record = _add(oauth_account_json={"accountUuid": "not-a-uuid"})
+
+    assert record.upstream_account_uuid is None
+    uuid.UUID(record.account_incarnation_id)
+
+
+def test_reauth_same_uuid_keeps_incarnation() -> None:
+    upstream_uuid = str(uuid.uuid4())
+    original = _add(organization_uuid="org-1", oauth_account_json={"accountUuid": upstream_uuid})
+
+    updated = claude_accounts.update_account_credentials(
+        "user@example.com", "org-1", None, {"accessToken": "at-2"}, {"accountUuid": upstream_uuid}
+    )
+
+    assert updated.account_incarnation_id == original.account_incarnation_id
+    assert updated.upstream_account_uuid == upstream_uuid
+
+
+def test_reauth_null_to_known_upstream_uuid_keeps_incarnation_and_stores_it() -> None:
+    original = _add(organization_uuid="org-1", oauth_account_json=None)
+    assert original.upstream_account_uuid is None
+    upstream_uuid = str(uuid.uuid4())
+
+    updated = claude_accounts.update_account_credentials(
+        "user@example.com", "org-1", None, {"accessToken": "at-2"}, {"accountUuid": upstream_uuid}
+    )
+
+    assert updated.account_incarnation_id == original.account_incarnation_id
+    assert updated.upstream_account_uuid == upstream_uuid
+
+
+def test_reauth_known_to_missing_upstream_uuid_preserves_uuid_and_incarnation() -> None:
+    upstream_uuid = str(uuid.uuid4())
+    original = _add(organization_uuid="org-1", oauth_account_json={"accountUuid": upstream_uuid})
+
+    updated = claude_accounts.update_account_credentials(
+        "user@example.com", "org-1", None, {"accessToken": "at-2"}, None
+    )
+
+    assert updated.account_incarnation_id == original.account_incarnation_id
+    assert updated.upstream_account_uuid == upstream_uuid  # never erased by a failed capture
+
+
+def test_reauth_both_null_upstream_uuid_remain_null_and_keep_incarnation() -> None:
+    original = _add(organization_uuid="org-1", oauth_account_json=None)
+
+    updated = claude_accounts.update_account_credentials(
+        "user@example.com", "org-1", None, {"accessToken": "at-2"}, None
+    )
+
+    assert updated.account_incarnation_id == original.account_incarnation_id
+    assert updated.upstream_account_uuid is None
+
+
+def test_reauth_valid_uuid_change_rotates_incarnation() -> None:
+    original = _add(
+        organization_uuid="org-1", oauth_account_json={"accountUuid": str(uuid.uuid4())}
+    )
+    new_upstream_uuid = str(uuid.uuid4())
+
+    updated = claude_accounts.update_account_credentials(
+        "user@example.com",
+        "org-1",
+        None,
+        {"accessToken": "at-2"},
+        {"accountUuid": new_upstream_uuid},
+    )
+
+    assert updated.account_incarnation_id != original.account_incarnation_id
+    assert updated.upstream_account_uuid == new_upstream_uuid
 
 
 # --------------------------------------------------------------------------

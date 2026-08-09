@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import uuid
 from datetime import datetime, timezone
 from email.utils import format_datetime
 
@@ -37,6 +38,8 @@ def _record(account_id: str, created_at: int, state: str = "ready") -> AccountRe
         updated_at=created_at,
         last_authenticated_at=created_at,
         state=state,
+        account_incarnation_id=str(uuid.uuid4()),
+        upstream_account_uuid=None,
     )
 
 
