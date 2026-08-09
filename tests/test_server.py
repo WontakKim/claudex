@@ -5600,20 +5600,20 @@ class TestAdminClaudeAccountsApi:
             response = client.request(method, path, json={})
         assert response.status_code == 403
 
-    def test_login_endpoints_require_json_content_type(
+    def test_login_post_requires_json_content_type(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
+        # code/replace content-type handling is covered in the lifecycle
+        # class — those endpoints check the attempt guard first, so they
+        # need an attached session to reach the 415.
         client = self._client(monkeypatch, tmp_path)
         with client:
-            for path in (
+            response = client.post(
                 "/admin/providers/claude/login",
-                "/admin/providers/claude/login/code",
-                "/admin/providers/claude/login/replace",
-            ):
-                response = client.post(
-                    path, content="{}", headers={"content-type": "text/plain"}
-                )
-                assert response.status_code == 415, path
+                content="{}",
+                headers={"content-type": "text/plain"},
+            )
+        assert response.status_code == 415
 
     def test_login_get_without_a_session_is_idle(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -5622,9 +5622,11 @@ class TestAdminClaudeAccountsApi:
         with client:
             assert client.get("/admin/providers/claude/login").json() == {"status": "idle"}
 
-    def test_login_commands_without_a_session_are_409(
+    def test_login_commands_without_a_session_are_409_stale_login(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
+        # With no session there is no attempt any command could name — the
+        # guard answers before body or state validation ever runs.
         client = self._client(monkeypatch, tmp_path)
         with client:
             code = client.post("/admin/providers/claude/login/code", json={"code": "x"})
@@ -5632,42 +5634,10 @@ class TestAdminClaudeAccountsApi:
                 "/admin/providers/claude/login/replace",
                 json={"existing_account_id": "0a1b2c3d-4e5f-4678-9abc-def012345678"},
             )
-        assert code.status_code == 409
-        assert confirm.status_code == 409
-
-    def test_login_replace_body_validation(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-    ) -> None:
-        client = self._client(monkeypatch, tmp_path)
-        with client:
-            for bad_body in (
-                {},
-                {"existing_account_id": ""},
-                {"existing_account_id": None},
-                {"existing_account_id": 7},
-                {"replace": True},
-                {"existing_account_id": "x", "extra": 1},
-            ):
-                response = client.post(
-                    "/admin/providers/claude/login/replace", json=bad_body
-                )
-                assert response.status_code == 400, bad_body
-
-    def test_login_code_validation(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-    ) -> None:
-        client = self._client(monkeypatch, tmp_path)
-        with client:
-            for bad_body in (
-                {},
-                {"code": ""},
-                {"code": "  "},
-                {"code": "line\nbreak"},
-                {"code": 7},
-                {"code": "ok", "extra": 1},
-            ):
-                response = client.post("/admin/providers/claude/login/code", json=bad_body)
-                assert response.status_code == 400, bad_body
+            cancel = client.delete("/admin/providers/claude/login")
+        for response in (code, confirm, cancel):
+            assert response.status_code == 409
+            assert response.json()["error"]["code"] == "stale_login"
 
     def test_login_post_rejects_a_non_empty_body(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -5962,6 +5932,66 @@ class TestAdminClaudeLoginLifecycle:
         [record] = claude_accounts.load_registry()
         assert record.id == original.id
         assert record.state == "ready"
+
+    def test_attached_login_code_body_validation(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        # Body validation sits behind the attempt guard, so it is exercised
+        # through an attached session.
+        monkeypatch.setenv("CLAUDEX_FAKE_CLAUDE_MODE", "hang")
+        client = self._client(monkeypatch, tmp_path)
+
+        with client:
+            attempt = client.post("/admin/providers/claude/login", json={}).json()[
+                "attempt_id"
+            ]
+            attempt_header = {"X-Login-Attempt": attempt}
+
+            wrong_type = client.post(
+                "/admin/providers/claude/login/code",
+                content="{}",
+                headers={**attempt_header, "content-type": "text/plain"},
+            )
+            assert wrong_type.status_code == 415
+            wrong_type = client.post(
+                "/admin/providers/claude/login/replace",
+                content="{}",
+                headers={**attempt_header, "content-type": "text/plain"},
+            )
+            assert wrong_type.status_code == 415
+
+            for bad_body in (
+                {},
+                {"code": ""},
+                {"code": "  "},
+                {"code": "line\nbreak"},
+                {"code": 7},
+                {"code": "ok", "extra": 1},
+            ):
+                response = client.post(
+                    "/admin/providers/claude/login/code",
+                    json=bad_body,
+                    headers=attempt_header,
+                )
+                assert response.status_code == 400, bad_body
+
+            for bad_body in (
+                {},
+                {"existing_account_id": ""},
+                {"existing_account_id": None},
+                {"existing_account_id": 7},
+                {"replace": True},
+                {"existing_account_id": "x", "extra": 1},
+            ):
+                response = client.post(
+                    "/admin/providers/claude/login/replace",
+                    json=bad_body,
+                    headers=attempt_header,
+                )
+                assert response.status_code == 400, bad_body
+
+            client.delete("/admin/providers/claude/login", headers=attempt_header)
+            self._poll_until(client, lambda s: s["status"] == "cancelled")
 
     def test_duplicate_login_decline_is_delete(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path

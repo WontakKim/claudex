@@ -2077,34 +2077,38 @@ async def _handle_admin_claude_serving_put(request: Request) -> JSONResponse:
             _openai_error_body("invalid_request_error", str(exc)),
             status_code=400,
         )
-    # Selecting an unregistered account would turn every passthrough
-    # request into a 503, so refuse it here where the mistake is cheap.
-    # The serving path still re-resolves per request — this check only
-    # front-loads the obvious misconfiguration.
-    try:
-        records = load_registry()
-    except AccountRegistryError as exc:
-        return JSONResponse(
-            _openai_error_body(
-                "server_error", f"cannot read the claude account registry: {exc}"
-            ),
-            status_code=500,
-        )
-    if not any(record.id == value for record in records):
-        return JSONResponse(
-            _openai_error_body(
-                "invalid_request_error",
-                f"no account registered with id {value}; "
-                "see `claudex-gateway account list`",
-            ),
-            status_code=400,
-        )
-
+    # The env lock dooms every write, so it is checked before any registry
+    # I/O — a registry hiccup must not turn the required 409 into a 500.
     denied = _claude_account_env_locked()
     if denied is not None:
         return denied
 
     async with request.app.state.admin_lock:
+        # Selecting an unregistered account would turn every passthrough
+        # request into a 503, so refuse it here where the mistake is cheap.
+        # The membership check runs under the same lock that serializes the
+        # accounts/{id} DELETE, so pinning and removal are linearizable
+        # within this daemon (a concurrent CLI `account remove` can still
+        # race from another process; the serve path re-resolves per request
+        # and degrades to a loud 503 by design).
+        try:
+            records = load_registry()
+        except AccountRegistryError as exc:
+            return JSONResponse(
+                _openai_error_body(
+                    "server_error", f"cannot read the claude account registry: {exc}"
+                ),
+                status_code=500,
+            )
+        if not any(record.id == value for record in records):
+            return JSONResponse(
+                _openai_error_body(
+                    "invalid_request_error",
+                    f"no account registered with id {value}; "
+                    "see `claudex-gateway account list`",
+                ),
+                status_code=400,
+            )
         config: GatewayConfig = request.app.state.config
         try:
             update_settings_file(config.settings_file, {"claude_account.id": value})
@@ -2305,15 +2309,20 @@ _CONTROL_CHARACTER_PATTERN = re.compile(r"[\x00-\x1f\x7f]")
 
 
 def _require_login_attempt(
-    request: Request, session: ClaudeLoginSession
+    request: Request, session: ClaudeLoginSession | None
 ) -> JSONResponse | None:
     """409 unless X-Login-Attempt names the active session's attempt.
 
-    Attempt and state are validated together — this guard runs before any
-    state check — so a stale dashboard tab from an earlier login can never
-    drive a newer session that happens to be in the same state.
+    Runs immediately after the admin guard — before content-type, body,
+    or state validation — so a stale caller always learns it is stale
+    instead of receiving an incidental 400/415/state error first. With no
+    active session there is no attempt any header could name, so every
+    attached call is stale by definition.
     """
-    if request.headers.get(_LOGIN_ATTEMPT_HEADER) == session.attempt_id:
+    if (
+        session is not None
+        and request.headers.get(_LOGIN_ATTEMPT_HEADER) == session.attempt_id
+    ):
         return None
     return JSONResponse(
         _openai_error_body(
@@ -2468,31 +2477,35 @@ async def _handle_admin_claude_account_delete(request: Request) -> Response:
     if denied is not None:
         return denied
     account_id = request.path_params["account_id"]
-    config: GatewayConfig = request.app.state.config
-    if config.claude_account_id == account_id:
-        return JSONResponse(
-            _openai_error_body(
-                "invalid_request_error",
-                f"account {account_id} is the serving account; clear the pin "
-                "at pool/serving first",
-            ),
-            status_code=409,
-        )
-    try:
-        await asyncio.to_thread(remove_account, account_id)
-    except AccountNotFoundError as exc:
-        return JSONResponse(
-            _openai_error_body("invalid_request_error", str(exc)), status_code=404
-        )
-    except AccountRegistryError as exc:
-        return JSONResponse(
-            _openai_error_body(
-                "server_error", f"could not remove the account: {exc}"
-            ),
-            status_code=500,
-        )
-    request.app.state.claude_account_auth_managers.pop(account_id, None)
-    request.app.state.claude_account_cooldowns.clear(account_id)
+    # The pin check and the removal share the admin lock with the
+    # pool/serving writes, so a concurrent serving PUT cannot pin this
+    # account between the check and the removal (or vice versa).
+    async with request.app.state.admin_lock:
+        config: GatewayConfig = request.app.state.config
+        if config.claude_account_id == account_id:
+            return JSONResponse(
+                _openai_error_body(
+                    "invalid_request_error",
+                    f"account {account_id} is the serving account; clear the pin "
+                    "at pool/serving first",
+                ),
+                status_code=409,
+            )
+        try:
+            await asyncio.to_thread(remove_account, account_id)
+        except AccountNotFoundError as exc:
+            return JSONResponse(
+                _openai_error_body("invalid_request_error", str(exc)), status_code=404
+            )
+        except AccountRegistryError as exc:
+            return JSONResponse(
+                _openai_error_body(
+                    "server_error", f"could not remove the account: {exc}"
+                ),
+                status_code=500,
+            )
+        request.app.state.claude_account_auth_managers.pop(account_id, None)
+        request.app.state.claude_account_cooldowns.clear(account_id)
     return Response(status_code=204)
 
 
@@ -2551,17 +2564,18 @@ async def _handle_admin_claude_accounts_usage(request: Request) -> JSONResponse:
 async def _handle_admin_claude_login_get(request: Request) -> JSONResponse:
     """Poll the login session. A bare GET is discovery/attach — it returns
     the full status (including attempt_id) so a fresh tab can pin itself;
-    a GET that carries X-Login-Attempt is an attached poll and is guarded."""
+    a GET that carries X-Login-Attempt is an attached poll and is guarded
+    (including against a cleared slot: a dead attempt is a stale one)."""
     denied = _admin_guard(request)
     if denied is not None:
         return denied
     session: ClaudeLoginSession | None = request.app.state.claude_login_session
-    if session is None:
-        return JSONResponse({"status": "idle"})
     if _LOGIN_ATTEMPT_HEADER in request.headers:
         denied = _require_login_attempt(request, session)
         if denied is not None:
             return denied
+    if session is None:
+        return JSONResponse({"status": "idle"})
     return JSONResponse(session.status())
 
 
@@ -2617,7 +2631,14 @@ async def _handle_admin_claude_login_post(request: Request) -> JSONResponse:
 
 
 async def _handle_admin_claude_login_code_post(request: Request) -> JSONResponse:
-    denied = _admin_guard(request) or _require_json_content_type(request)
+    denied = _admin_guard(request)
+    if denied is not None:
+        return denied
+    session: ClaudeLoginSession | None = request.app.state.claude_login_session
+    denied = _require_login_attempt(request, session)
+    if denied is not None:
+        return denied
+    denied = _require_json_content_type(request)
     if denied is not None:
         return denied
     body, error = await _read_json_object(request, _openai_error_body)
@@ -2644,17 +2665,6 @@ async def _handle_admin_claude_login_code_post(request: Request) -> JSONResponse
             ),
             status_code=400,
         )
-    session: ClaudeLoginSession | None = request.app.state.claude_login_session
-    if session is None:
-        return JSONResponse(
-            _openai_error_body(
-                "invalid_request_error", "no login session is active", "login-idle"
-            ),
-            status_code=409,
-        )
-    denied = _require_login_attempt(request, session)
-    if denied is not None:
-        return denied
     try:
         await session.submit_code(code)
     except LoginSessionStateError as exc:
@@ -2672,7 +2682,14 @@ async def _handle_admin_claude_login_replace_post(request: Request) -> JSONRespo
     from status()) — a confirmation, not a generation token; the session
     rejects a mismatch. Declining is DELETE (cancel), not a body variant.
     """
-    denied = _admin_guard(request) or _require_json_content_type(request)
+    denied = _admin_guard(request)
+    if denied is not None:
+        return denied
+    session: ClaudeLoginSession | None = request.app.state.claude_login_session
+    denied = _require_login_attempt(request, session)
+    if denied is not None:
+        return denied
+    denied = _require_json_content_type(request)
     if denied is not None:
         return denied
     body, error = await _read_json_object(request, _openai_error_body)
@@ -2696,17 +2713,6 @@ async def _handle_admin_claude_login_replace_post(request: Request) -> JSONRespo
             ),
             status_code=400,
         )
-    session: ClaudeLoginSession | None = request.app.state.claude_login_session
-    if session is None:
-        return JSONResponse(
-            _openai_error_body(
-                "invalid_request_error", "no login session is active", "login-idle"
-            ),
-            status_code=409,
-        )
-    denied = _require_login_attempt(request, session)
-    if denied is not None:
-        return denied
     try:
         session.confirm_replace(existing_account_id)
     except LoginSessionStateError as exc:
@@ -2718,13 +2724,17 @@ async def _handle_admin_claude_login_replace_post(request: Request) -> JSONRespo
 
 
 async def _handle_admin_claude_login_delete(request: Request) -> JSONResponse:
-    """Cancel an active session, or clear a terminal one from the slot."""
+    """Cancel an active session, or clear a terminal one from the slot.
+
+    Attempt-addressed like every mutating login command: the caller must
+    name the attempt it is cancelling, so a stale tab (or a call after
+    the slot was cleared) gets 409 stale_login instead of touching a
+    session it never attached to.
+    """
     denied = _admin_guard(request)
     if denied is not None:
         return denied
     session: ClaudeLoginSession | None = request.app.state.claude_login_session
-    if session is None:
-        return JSONResponse({"status": "idle"})
     denied = _require_login_attempt(request, session)
     if denied is not None:
         return denied
