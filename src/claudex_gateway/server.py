@@ -15,7 +15,7 @@ import time
 import traceback
 import uuid
 from collections import deque
-from collections.abc import AsyncGenerator, AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -53,11 +53,18 @@ from claudex_gateway.claude_auth import (
 from claudex_gateway.claude_balanced_router import (
     AccountCandidate,
     BalancedPrepareError,
+    ClaudeBalancedRouter,
     ClaudeBalancedRuntime,
     NoEligibleAccountError,
     SessionKey,
+    binding_windows,
     derive_session_key,
     derive_stateless_routing_digest,
+    is_eligible_candidate,
+    pick_weighted_hrw,
+    quota_family,
+    select_weights,
+    warning_factor,
 )
 from claudex_gateway.claude_login_session import (
     ClaudeLoginSession,
@@ -378,8 +385,17 @@ async def _send_to_anthropic(
     return await http_client.send(upstream_request, stream=True)
 
 
-def _relay_anthropic_response(upstream_response: httpx.Response) -> StreamingResponse:
-    """Relay an open Anthropic response verbatim, owning its lifetime."""
+def _relay_anthropic_response(
+    upstream_response: httpx.Response, *, on_finished: Callable[[], None] | None = None
+) -> StreamingResponse:
+    """Relay an open Anthropic response verbatim, owning its lifetime.
+
+    `on_finished` (T-11), when given, runs synchronously once the body iterator
+    is fully done -- success, mid-stream failure, or cancellation alike -- right
+    alongside closing `upstream_response`; the balanced runner uses it to release
+    a migrated attempt's migration token only once the whole stream terminates,
+    not merely once its 2xx headers commit.
+    """
     response_headers = {
         key: value
         for key, value in upstream_response.headers.items()
@@ -405,6 +421,8 @@ def _relay_anthropic_response(upstream_response: httpx.Response) -> StreamingRes
                 ).encode()
         finally:
             await upstream_response.aclose()
+            if on_finished is not None:
+                on_finished()
 
     return StreamingResponse(
         forward_body(),
@@ -547,6 +565,8 @@ async def _attempt_with_account(
     record: AccountRecord,
     *,
     rate_limit_failover: bool,
+    commit_hook: Callable[[httpx.Response], Awaitable[None]] | None = None,
+    on_relay_complete: Callable[[], None] | None = None,
 ) -> Response | _FailedAttempt:
     """Serve an Anthropic passthrough request with one registered account's token.
 
@@ -564,6 +584,15 @@ async def _attempt_with_account(
     With `rate_limit_failover` off (routing mode "disabled"), a 429 is not
     an account-specific failure: it streams back verbatim with zero cooldown
     bookkeeping, exactly like any other upstream status.
+
+    `commit_hook`/`on_relay_complete` (T-11) are the balanced runner's minimal
+    extension for the migration commit protocol: when this attempt is about to
+    relay (every path that reaches the final `_relay_anthropic_response` call,
+    not the 401/429-failover branches above), `commit_hook` — if given — is
+    awaited with the still-open `upstream_response` before any byte is
+    forwarded, and `on_relay_complete` is threaded through as the relay's
+    `on_finished` hook. Both default to `None`, which reproduces the prior
+    behavior exactly.
     """
     account_id = record.id
     manager = _claude_account_auth_manager(request.app.state, account_id)
@@ -659,7 +688,9 @@ async def _attempt_with_account(
             _replay_buffered_response(429, response_headers, response_body),
             rate_limited=True,
         )
-    return _relay_anthropic_response(upstream_response)
+    if commit_hook is not None:
+        await commit_hook(upstream_response)
+    return _relay_anthropic_response(upstream_response, on_finished=on_relay_complete)
 
 
 async def _passthrough_with_claude_account(
@@ -814,24 +845,146 @@ async def _passthrough_with_claude_balanced(
             continue
         if runtime.begin_request():
             try:
-                return await _dispatch_via_balanced_runtime(request, raw_body, parsed_body, runtime)
+                return await _passthrough_with_balanced_pool(request, raw_body, parsed_body, runtime)
             finally:
                 runtime.end_request()
         break
     return _balanced_routing_not_active()
 
 
-async def _dispatch_via_balanced_runtime(
+# ==========================================================================
+# Balanced serve-path chain runner (T-11): §4.5 commit-at-headers protocol
+# and §6.5 exhaustion responses, analogous to `_passthrough_with_claude_pool`.
+# ==========================================================================
+
+
+def _balanced_candidates(
+    records: Iterable[AccountRecord], tracker: AccountCooldownTracker, *, now: float
+) -> list[AccountCandidate]:
+    """One `AccountCandidate` per registered account for a request's whole retry chain.
+
+    `account_cooldown_until` is an absolute monotonic deadline read from the SAME
+    in-memory `AccountCooldownTracker` the fallback pool uses — durable, family-scoped
+    cooldowns and capability evidence are T-12's job, so `family_cooldown_until` and
+    `capability_denied` stay at their defaults here.
+    """
+    candidates = []
+    for record in records:
+        remaining = tracker.remaining_seconds(record.id) if record.state == "ready" else 0.0
+        candidates.append(
+            AccountCandidate(
+                account_id=record.id,
+                account_incarnation_id=record.account_incarnation_id,
+                ready=record.state == "ready",
+                account_cooldown_until=now + remaining if remaining > 0.0 else None,
+            )
+        )
+    return candidates
+
+
+def _balanced_pick_account(
+    router: ClaudeBalancedRouter,
+    *,
+    session_key_digest: bytes,
+    model: str,
+    candidates: Sequence[AccountCandidate],
+    seed: bytes,
+    already_attempted: frozenset[str] = frozenset(),
+    now: float | None = None,
+) -> str:
+    """A weighted-HRW pick against the router's live pressure/in-flight state, WITHOUT
+    touching the pin map: `place_session`'s own pick logic, reconstructed here from its
+    public building blocks, so unpinnable/count_tokens-fallback routing and each
+    migration hop's next-target selection never insert a pin-map entry.
+    """
+    now = time.monotonic() if now is None else now
+    eligible = [
+        candidate
+        for candidate in candidates
+        if is_eligible_candidate(candidate, now=now, already_attempted=already_attempted)
+    ]
+    if not eligible:
+        raise NoEligibleAccountError("no eligible account is available for balanced routing")
+    family = quota_family(model)
+    account_ids = [candidate.account_id for candidate in eligible]
+    floor = router.candidate_set_unknown_floor(account_ids, family, now=now)
+    pressures = {
+        account_id: router.account_pressure(account_id, family, now=now, floor=floor)
+        for account_id in account_ids
+    }
+    windows = binding_windows(family)
+    warning_factors = {
+        account_id: warning_factor(router.observations, account_id, windows, now=now)
+        for account_id in account_ids
+    }
+    in_flight = {account_id: router.in_flight_count(account_id) for account_id in account_ids}
+    weights = select_weights(
+        account_ids, pressures=pressures, warning_factors=warning_factors, in_flight=in_flight
+    )
+    return pick_weighted_hrw(weights=weights, seed=seed, session_key_digest=session_key_digest)
+
+
+def _balanced_eligible_candidate_set(
+    records_by_id: Mapping[str, AccountRecord]
+) -> list[AccountRecord]:
+    """§6.5's spec-gate-pinned candidate set `C`: registered AND ready AND
+    capability-not-denied, ignoring cooldowns. Capability evidence is T-12's job, so
+    every registered, ready account currently qualifies.
+    """
+    return [record for record in records_by_id.values() if record.state == "ready"]
+
+
+def _balanced_all_cooling_response(
+    records_by_id: Mapping[str, AccountRecord],
+    tracker: AccountCooldownTracker,
+    *,
+    chain_exhausted_429: Response | None,
+) -> Response:
+    """§6.5: a retry chain (or an initial placement) found no eligible candidate.
+
+    A chain that just exhausted on a real upstream 429 relays THAT response verbatim.
+    Otherwise this synthesizes the local Anthropic-compatible 429, with
+    `Retry-After` clamped to the earliest `unblock_at` over the candidate set `C` — a
+    disabled (not ready) or capability-denied account never enters `C`, so its own
+    cooldown deadline, however soon, can never shorten `Retry-After` — or, when `C`
+    is empty, the adjudicated 503.
+    """
+    if chain_exhausted_429 is not None:
+        return chain_exhausted_429
+    candidate_set = _balanced_eligible_candidate_set(records_by_id)
+    if not candidate_set:
+        return JSONResponse(
+            _claude_error_body(
+                "api_error", "no registered account is eligible for the requested model"
+            ),
+            status_code=503,
+        )
+    now = time.monotonic()
+    # unblock_at(a, family) = max(account-wide deadline, family deadline) or now;
+    # family-scoped cooldowns are T-12's job, so the family term is always `now`.
+    min_unblock_at = min(now + tracker.remaining_seconds(record.id) for record in candidate_set)
+    retry_after = max(1, math.ceil(min_unblock_at - now))
+    return JSONResponse(
+        _claude_error_body(
+            "rate_limit_error",
+            "every eligible claude account is rate-limited; retry after the cooldown",
+        ),
+        status_code=429,
+        headers={"retry-after": str(retry_after)},
+    )
+
+
+async def _passthrough_with_balanced_pool(
     request: Request, raw_body: bytes, parsed_body: Any, runtime: ClaudeBalancedRuntime
 ) -> Response:
-    """Serve one request through an active balanced runtime's picker + pin map.
+    """Serve one request through an active balanced runtime (T-11).
 
     Mirrors `_passthrough_with_claude_pool`'s read-through registry pattern (no cache,
-    so CLI/dashboard account changes take effect immediately), derives the request's
-    session key under the runtime's epoch seed (falling back to a stateless, unpinned
-    digest when the body carries neither a usable session_id nor a first user
-    message), and serves the router's chosen account through the same
-    `_attempt_with_account` upstream path every other mode uses.
+    so CLI/dashboard account changes take effect immediately). The session key is
+    derived from the parsed body BEFORE `_rewrite_metadata_account_uuid`'s mutation
+    (that rewrite only ever happens later, inside `_attempt_with_account`).
+    `/v1/messages/count_tokens` follows the council-pinned rule instead of this
+    function's own placement/migration flow: see `_serve_balanced_count_tokens`.
     """
     assert runtime.router is not None
     try:
@@ -839,62 +992,310 @@ async def _dispatch_via_balanced_runtime(
     except AccountRegistryError as exc:
         return _claude_account_unavailable(f"cannot read the claude account registry: {exc}")
 
-    candidates = [
-        AccountCandidate(
-            account_id=record.id,
-            account_incarnation_id=record.account_incarnation_id,
-            ready=record.state == "ready",
-        )
-        for record in records
-    ]
-    if not any(candidate.ready for candidate in candidates):
-        return _claude_account_unavailable("no usable claude account is registered")
-
+    records_by_id = {record.id: record for record in records}
+    tracker: AccountCooldownTracker = request.app.state.claude_account_cooldowns
     model = parsed_body.get("model") if isinstance(parsed_body, dict) else None
+    model = model if isinstance(model, str) else ""
     session_key = (
-        derive_session_key(parsed_body, runtime.epoch_seed)
-        if isinstance(parsed_body, dict)
-        else None
+        derive_session_key(parsed_body, runtime.epoch_seed) if isinstance(parsed_body, dict) else None
     )
-    if session_key is None:
-        session_key = SessionKey(
-            digest=derive_stateless_routing_digest(runtime.epoch_seed, secrets.token_bytes(32)),
-            kind="content_hash",
+
+    if request.url.path.endswith("/count_tokens"):
+        return await _serve_balanced_count_tokens(
+            request, raw_body, parsed_body, runtime, records_by_id, tracker, session_key, model
         )
+    if session_key is not None:
+        return await _serve_balanced_pinned_message(
+            request, raw_body, parsed_body, runtime, records_by_id, tracker, session_key, model
+        )
+    return await _serve_balanced_stateless_message(
+        request, raw_body, parsed_body, runtime, records_by_id, tracker, model
+    )
+
+
+async def _serve_balanced_stateless_message(
+    request: Request,
+    raw_body: bytes,
+    parsed_body: Any,
+    runtime: ClaudeBalancedRuntime,
+    records_by_id: Mapping[str, AccountRecord],
+    tracker: AccountCooldownTracker,
+    model: str,
+) -> Response:
+    """No session key is derivable: weighted-HRW routing over one fresh stateless
+    digest (T-4 `derive_stateless_routing_digest`), reused across this request's
+    whole retry chain and never persisted — no pin-map entry is ever created.
+    """
+    router = runtime.router
+    assert router is not None
+    digest = derive_stateless_routing_digest(runtime.epoch_seed, secrets.token_bytes(32))
+    candidates = _balanced_candidates(records_by_id.values(), tracker, now=time.monotonic())
+
+    attempted: set[str] = set()
+    chain_429: Response | None = None
+    while True:
+        try:
+            account_id = _balanced_pick_account(
+                router,
+                session_key_digest=digest,
+                model=model,
+                candidates=candidates,
+                seed=runtime.epoch_seed,
+                already_attempted=frozenset(attempted),
+            )
+        except NoEligibleAccountError:
+            return _balanced_all_cooling_response(records_by_id, tracker, chain_exhausted_429=chain_429)
+
+        attempted.add(account_id)
+        record = records_by_id[account_id]
+        router.begin_attempt(account_id)
+        try:
+            outcome = await _attempt_with_account(
+                request, raw_body, parsed_body, record, rate_limit_failover=True
+            )
+        finally:
+            router.end_attempt(account_id)
+        if not isinstance(outcome, _FailedAttempt):
+            return outcome
+        chain_429 = outcome.response if outcome.rate_limited else None
+
+
+async def _serve_balanced_pinned_message(
+    request: Request,
+    raw_body: bytes,
+    parsed_body: Any,
+    runtime: ClaudeBalancedRuntime,
+    records_by_id: Mapping[str, AccountRecord],
+    tracker: AccountCooldownTracker,
+    session_key: SessionKey,
+    model: str,
+) -> Response:
+    """Place or follow `session_key`'s pin, then serve it with the full §4.2-§4.5
+    migration chain: every request resolving a pin generation awaits its
+    `pending_durability` barrier before an upstream attempt; a §4.2 migration
+    trigger (quota 429, already cooling, removed/disabled, or a positively
+    classified account-specific auth failure — `_attempt_with_account`'s own
+    `_FailedAttempt` classification) creates a reservation + migration-attempt
+    token and retries the next eligible account (retry-chain exclusion); the
+    target's upstream 2xx headers run the T-8 commit section and await the
+    durable pin write before ANY downstream byte is forwarded; once 2xx is
+    relayed there is no cross-account retry.
+    """
+    router = runtime.router
+    assert router is not None
+    digest = session_key.digest
+    now = time.monotonic()
+    candidates = _balanced_candidates(records_by_id.values(), tracker, now=now)
 
     try:
-        placement = runtime.router.place_session(
-            session_key=session_key,
-            model=model if isinstance(model, str) else "",
-            candidates=candidates,
-            seed=runtime.epoch_seed,
+        placement = router.place_session(
+            session_key=session_key, model=model, candidates=candidates, seed=runtime.epoch_seed, now=now
         )
     except NoEligibleAccountError:
-        return _claude_account_unavailable(
-            "no eligible claude account is available for balanced routing"
-        )
+        return _balanced_all_cooling_response(records_by_id, tracker, chain_exhausted_429=None)
 
     if placement.created and placement.durability_barrier is not None:
-        asyncio.create_task(runtime.router.submit_new_pin_durability(placement.session_key_digest))
-    await runtime.router.await_pin_durability(placement.session_key_digest)
+        asyncio.create_task(router.submit_new_pin_durability(digest))
+    await router.await_pin_durability(digest)
 
-    record = next((r for r in records if r.id == placement.account_id), None)
-    if record is None:
-        return _claude_account_unavailable(
-            f"balanced routing selected claude account {placement.account_id}, "
-            "which is no longer registered"
+    pin = router.get_pin(digest)
+    router.touch_pin(
+        digest,
+        is_message_request=True,
+        key_is_live=pin is not None,
+        account_still_registered=pin is not None and pin.account_id in records_by_id,
+    )
+
+    attempted: set[str] = set()
+    chain_429: Response | None = None
+    owner_attempt_id: str | None = None
+    current_target = ""
+
+    while True:
+        pin = router.get_pin(digest)
+        if pin is None:
+            # Extremely rare mid-flight eviction/removal race: re-place fresh.
+            try:
+                placement = router.place_session(
+                    session_key=session_key,
+                    model=model,
+                    candidates=_balanced_candidates(records_by_id.values(), tracker, now=time.monotonic()),
+                    seed=runtime.epoch_seed,
+                )
+            except NoEligibleAccountError:
+                return _balanced_all_cooling_response(
+                    records_by_id, tracker, chain_exhausted_429=chain_429
+                )
+            if placement.created and placement.durability_barrier is not None:
+                asyncio.create_task(router.submit_new_pin_durability(digest))
+            await router.await_pin_durability(digest)
+            owner_attempt_id = None
+            continue
+
+        if owner_attempt_id is None:
+            current_target = pin.account_id
+
+        record = records_by_id.get(current_target)
+        eligible_now = (
+            record is not None and record.state == "ready" and not tracker.is_cooling(current_target)
         )
+        attempted.add(current_target)
 
-    runtime.router.begin_attempt(record.id)
+        if eligible_now:
+            assert record is not None
+            attempt_id = owner_attempt_id
+            source_account = pin.account_id
+            source_generation = pin.generation
+            target_record = record
+
+            async def _commit_hook(
+                upstream_response: httpx.Response,
+                *,
+                _attempt_id: str | None = attempt_id,
+                _source_account: str = source_account,
+                _source_generation: int = source_generation,
+                _target_record: AccountRecord = target_record,
+            ) -> None:
+                if _attempt_id is None or upstream_response.status_code // 100 != 2:
+                    return
+                commit_outcome, _committed_pin, barrier = router.commit_at_headers(
+                    digest,
+                    attempt_id=_attempt_id,
+                    source_account=_source_account,
+                    source_generation=_source_generation,
+                    target_account=_target_record.id,
+                    target_account_incarnation_id=_target_record.account_incarnation_id,
+                    target_still_registered=_target_record.id in records_by_id,
+                )
+                if commit_outcome == "committed" and barrier is not None:
+                    asyncio.create_task(router.submit_new_pin_durability(digest))
+                    await router.await_pin_durability(digest)
+
+            def _on_relay_complete(*, _attempt_id: str | None = attempt_id) -> None:
+                # M(target) stays incremented for the whole streamed response; this
+                # only releases the migration token once the stream terminates. A
+                # no-op if `commit_at_headers` above never ran (not a migration leg)
+                # or already resolved (or failed to resolve, e.g. cas_lost).
+                if _attempt_id is not None:
+                    router.resolve_migration_owner_terminal(
+                        digest, attempt_id=_attempt_id, outcome="terminal_failure"
+                    )
+
+            if owner_attempt_id is not None:
+                try:
+                    outcome = await _attempt_with_account(
+                        request,
+                        raw_body,
+                        parsed_body,
+                        target_record,
+                        rate_limit_failover=True,
+                        commit_hook=_commit_hook,
+                        on_relay_complete=_on_relay_complete,
+                    )
+                except BaseException:
+                    # Cancellation (or any other failure) before this owner's
+                    # response was ever constructed: the streaming relay's own
+                    # `on_finished` hook never gets a chance to run, so release the
+                    # reservation/token here instead (T-8 Step 3).
+                    router.resolve_migration_owner_terminal(
+                        digest, attempt_id=owner_attempt_id, outcome="terminal_failure"
+                    )
+                    raise
+            else:
+                router.begin_attempt(current_target)
+                try:
+                    outcome = await _attempt_with_account(
+                        request, raw_body, parsed_body, target_record, rate_limit_failover=True
+                    )
+                finally:
+                    router.end_attempt(current_target)
+
+            if not isinstance(outcome, _FailedAttempt):
+                return outcome
+            chain_429 = outcome.response if outcome.rate_limited else None
+        else:
+            chain_429 = None
+
+        # --- §4.2 migration trigger -----------------------------------------
+        if owner_attempt_id is not None:
+            router.resolve_migration_preheader_failure(digest, attempt_id=owner_attempt_id)
+            owner_attempt_id = None
+
+        try:
+            next_target = _balanced_pick_account(
+                router,
+                session_key_digest=digest,
+                model=model,
+                candidates=candidates,
+                seed=runtime.epoch_seed,
+                already_attempted=frozenset(attempted),
+            )
+        except NoEligibleAccountError:
+            return _balanced_all_cooling_response(records_by_id, tracker, chain_exhausted_429=chain_429)
+
+        reservation, is_owner = router.acquire_migration_reservation(
+            digest,
+            source_account=pin.account_id,
+            source_generation=pin.generation,
+            target_account=next_target,
+            attempt_id=uuid.uuid4().hex,
+        )
+        if is_owner:
+            owner_attempt_id = reservation.owner_attempt_id
+            current_target = next_target
+        else:
+            await router.wait_for_migration_reservation(reservation)
+            owner_attempt_id = None
+        # loop: re-reads the pin (never trusts the stale target embedded in the
+        # by-then-cleared reservation a waiter just waited on).
+
+
+async def _serve_balanced_count_tokens(
+    request: Request,
+    raw_body: bytes,
+    parsed_body: Any,
+    runtime: ClaudeBalancedRuntime,
+    records_by_id: Mapping[str, AccountRecord],
+    tracker: AccountCooldownTracker,
+    session_key: SessionKey | None,
+    model: str,
+) -> Response:
+    """Council-pinned count_tokens rule: follow an existing pin (no `last_seen`
+    refresh) when one resolves, else fall back to the same stateless-digest
+    placement — NEVER creating a pin, reservation, cooldown, or capability
+    evidence, and never retrying across accounts (`rate_limit_failover=False`).
+    """
+    router = runtime.router
+    assert router is not None
+    if session_key is not None:
+        pin = router.get_pin(session_key.digest)
+        if pin is not None:
+            record = records_by_id.get(pin.account_id)
+            if record is not None:
+                if pin.pending_durability is not None:
+                    await router.await_pin_durability(session_key.digest)
+                outcome = await _attempt_with_account(
+                    request, raw_body, parsed_body, record, rate_limit_failover=False
+                )
+                return outcome.response if isinstance(outcome, _FailedAttempt) else outcome
+
+    digest = (
+        session_key.digest
+        if session_key is not None
+        else derive_stateless_routing_digest(runtime.epoch_seed, secrets.token_bytes(32))
+    )
+    candidates = _balanced_candidates(records_by_id.values(), tracker, now=time.monotonic())
     try:
-        outcome = await _attempt_with_account(
-            request, raw_body, parsed_body, record, rate_limit_failover=False
+        account_id = _balanced_pick_account(
+            router, session_key_digest=digest, model=model, candidates=candidates, seed=runtime.epoch_seed
         )
-    finally:
-        runtime.router.end_attempt(record.id)
-    if isinstance(outcome, _FailedAttempt):
-        return outcome.response
-    return outcome
+    except NoEligibleAccountError:
+        return _balanced_all_cooling_response(records_by_id, tracker, chain_exhausted_429=None)
+    record = records_by_id[account_id]
+    outcome = await _attempt_with_account(
+        request, raw_body, parsed_body, record, rate_limit_failover=False
+    )
+    return outcome.response if isinstance(outcome, _FailedAttempt) else outcome
 
 
 async def _handle_messages(request: Request) -> JSONResponse | StreamingResponse:
