@@ -10,6 +10,7 @@ import socket
 import struct
 import threading
 import time
+import uuid
 from collections.abc import AsyncIterator
 from pathlib import Path
 from types import SimpleNamespace
@@ -22,8 +23,14 @@ from starlette.testclient import TestClient
 
 import claudex_gateway.server as server
 from claudex_gateway import claude_accounts, compaction, paths
+from claudex_gateway.account_usage_cache import ClaudeAccountUsageCache
 from claudex_gateway.claude_account_pool import AccountCooldownTracker
 from claudex_gateway.claude_auth import CLAUDE_TOKEN_URL
+from claudex_gateway.claude_balanced_router import (
+    ClaudeBalancedRouter,
+    ClaudeBalancedRuntime,
+    derive_session_key,
+)
 from claudex_gateway.claude_pool_runtime_state import (
     ClaudePoolRuntimeStateStore,
     RestoreValidationContext,
@@ -6572,3 +6579,610 @@ def test_balanced_graceful_shutdown_preserves_epoch_and_pin_for_restart(
         payload = client.get("/admin/providers/claude/pool/routing").json()
 
     assert payload == {"mode": "balanced", "env_locked": False}
+
+
+# ---------------------------------------------------------------------------
+# Balanced serve-path chain runner: commit-at-headers protocol and §6.5
+# exhaustion responses (T-11). The Step 3 fallback-regression guard is every
+# `test_pool_*`/`test_account_passthrough_*` test above, left byte-for-byte
+# unmodified and still green in this same run.
+# ---------------------------------------------------------------------------
+
+
+def _register_balanced_accounts(count: int) -> list[tuple[str, str]]:
+    """Register `count` balanced-ready accounts, each with a distinct valid T-3
+    fingerprint and a distinct access token, in registration order.
+    """
+    accounts = []
+    for index in range(count):
+        access_token = f"balanced-access-{index}"
+        account_id = _register_serving_account(
+            email=f"balanced{index}@example.com",
+            account_uuid=str(uuid.uuid4()),
+            access_token=access_token,
+            refresh_token=f"balanced-refresh-{index}",
+        )
+        accounts.append((account_id, access_token))
+    return accounts
+
+
+def _enable_balanced(client: TestClient, anthropic_handler: Any) -> Any:
+    """Swap in a mock Anthropic transport and enable balanced routing.
+
+    Returns the resulting `ClaudeBalancedRuntime`.
+    """
+    client.app.state.http_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(anthropic_handler)
+    )
+    response = client.put("/admin/providers/claude/pool/routing", json={"mode": "balanced"})
+    assert response.status_code == 200, response.text
+    return client.app.state.claude_balanced_runtime
+
+
+def _new_session_id() -> str:
+    return str(uuid.uuid4())
+
+
+def _balanced_body(session_id: str, *, model: str = "claude-fable-5") -> dict[str, Any]:
+    body = _message_body(model)
+    body["metadata"] = {
+        "user_id": json.dumps(
+            {
+                "device_id": "d" * 64,
+                "account_uuid": "client-account-uuid",
+                "session_id": session_id,
+            },
+            separators=(",", ":"),
+        )
+    }
+    return body
+
+
+_UNPINNABLE_BODY: dict[str, Any] = {
+    "model": "claude-fable-5",
+    "max_tokens": 16,
+    "messages": [],
+}
+
+
+def test_balanced_new_session_pins_and_serves_with_a_durable_pin(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _balanced_env(monkeypatch, tmp_path)
+    account_id, access_token = _register_balanced_accounts(1)[0]
+    calls: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(200, json={"id": "msg_1"})
+
+    settings_file = tmp_path / "settings.json"
+    config = GatewayConfig(settings_file=settings_file)
+    with _create_test_client(
+        monkeypatch, config=config, base_url="http://127.0.0.1:8787"
+    ) as client:
+        runtime = _enable_balanced(client, handler)
+        body = _balanced_body(_new_session_id())
+
+        response = client.post("/v1/messages", json=body)
+
+        assert response.status_code == 200
+        assert response.json() == {"id": "msg_1"}
+        assert len(calls) == 1
+        assert calls[0].headers["authorization"] == f"Bearer {access_token}"
+        assert runtime.router.pin_count() == 1
+
+        session_key = derive_session_key(body, runtime.epoch_seed)
+        assert session_key is not None
+        pin = runtime.router.get_pin(session_key.digest)
+        assert pin is not None
+        assert pin.account_id == account_id
+
+        store_row = runtime._store.get_pin(session_key.digest)
+        assert store_row is not None
+        assert store_row.account_id == account_id
+        assert store_row.generation == 0
+
+
+def test_balanced_repeat_request_reuses_the_existing_pin_without_a_new_placement(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _balanced_env(monkeypatch, tmp_path)
+    account_id, access_token = _register_balanced_accounts(1)[0]
+    calls: list[httpx.Request] = []
+    created_flags: list[bool] = []
+    original_place_session = ClaudeBalancedRouter.place_session
+
+    def spy_place_session(self: ClaudeBalancedRouter, **kwargs: Any) -> Any:
+        result = original_place_session(self, **kwargs)
+        created_flags.append(result.created)
+        return result
+
+    monkeypatch.setattr(ClaudeBalancedRouter, "place_session", spy_place_session)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(200, json={"id": "msg_1"})
+
+    with _create_test_client(
+        monkeypatch, config=GatewayConfig(), base_url="http://127.0.0.1:8787"
+    ) as client:
+        runtime = _enable_balanced(client, handler)
+        body = _balanced_body(_new_session_id())
+
+        first = client.post("/v1/messages", json=body)
+        second = client.post("/v1/messages", json=body)
+
+        assert first.status_code == 200
+        assert second.status_code == 200
+        assert runtime.router.pin_count() == 1
+        assert created_flags == [True, False]
+        assert [call.headers["authorization"] for call in calls] == [
+            f"Bearer {access_token}",
+            f"Bearer {access_token}",
+        ]
+
+
+def test_balanced_quota_429_migrates_commits_and_cools_down_the_source(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _balanced_env(monkeypatch, tmp_path)
+    accounts = _register_balanced_accounts(2)
+    tokens_by_call: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        tokens_by_call.append(request.headers["authorization"])
+        if len(tokens_by_call) == 1:
+            return _quota_429()
+        return httpx.Response(200, json={"id": "msg_1"})
+
+    with _create_test_client(
+        monkeypatch, config=GatewayConfig(), base_url="http://127.0.0.1:8787"
+    ) as client:
+        runtime = _enable_balanced(client, handler)
+        body = _balanced_body(_new_session_id())
+
+        response = client.post("/v1/messages", json=body)
+
+        assert response.status_code == 200
+        assert len(tokens_by_call) == 2
+        source_token, target_token = tokens_by_call
+        assert source_token != target_token
+        source_id = next(aid for aid, token in accounts if f"Bearer {token}" == source_token)
+        target_id = next(aid for aid, token in accounts if f"Bearer {token}" == target_token)
+
+        session_key = derive_session_key(body, runtime.epoch_seed)
+        pin = runtime.router.get_pin(session_key.digest)
+        assert pin is not None
+        assert pin.account_id == target_id
+        assert pin.generation == 1
+        assert runtime.router.migration_outcome_counts.get("committed") == 1
+        assert client.app.state.claude_account_cooldowns.is_cooling(source_id)
+        assert not client.app.state.claude_account_cooldowns.is_cooling(target_id)
+
+
+def test_balanced_migration_target_preheader_failure_tries_the_next_candidate(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _balanced_env(monkeypatch, tmp_path)
+    _register_balanced_accounts(3)
+    tokens_by_call: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        tokens_by_call.append(request.headers["authorization"])
+        if len(tokens_by_call) < 3:
+            return _quota_429()
+        return httpx.Response(200, json={"id": "msg_1"})
+
+    with _create_test_client(
+        monkeypatch, config=GatewayConfig(), base_url="http://127.0.0.1:8787"
+    ) as client:
+        runtime = _enable_balanced(client, handler)
+        body = _balanced_body(_new_session_id())
+
+        response = client.post("/v1/messages", json=body)
+
+        assert response.status_code == 200
+        assert len(tokens_by_call) == 3
+        assert len(set(tokens_by_call)) == 3  # three distinct accounts, never repeated
+        assert runtime.router.migration_outcome_counts.get("retryable_preheader_failure") == 1
+        assert runtime.router.migration_outcome_counts.get("committed") == 1
+
+
+def test_balanced_post_2xx_midstream_failure_relays_sse_error_and_retains_the_committed_pin(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _balanced_env(monkeypatch, tmp_path)
+    accounts = _register_balanced_accounts(2)
+    tokens_by_call: list[str] = []
+    first_event = b'event: message_start\ndata: {"type": "message_start"}\n\n'
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        tokens_by_call.append(request.headers["authorization"])
+        if len(tokens_by_call) == 1:
+            return _quota_429()
+        return httpx.Response(
+            200,
+            stream=_AbortingByteStream(first_event),
+            headers={"content-type": "text/event-stream"},
+        )
+
+    with _create_test_client(
+        monkeypatch, config=GatewayConfig(), base_url="http://127.0.0.1:8787"
+    ) as client:
+        runtime = _enable_balanced(client, handler)
+        body = _balanced_body(_new_session_id())
+
+        response = client.post("/v1/messages", json=body)
+
+        assert response.status_code == 200
+        assert response.content.startswith(first_event)
+        assert b"event: error" in response.content
+
+        target_token = tokens_by_call[1]
+        target_id = next(aid for aid, token in accounts if f"Bearer {token}" == target_token)
+        session_key = derive_session_key(body, runtime.epoch_seed)
+        pin = runtime.router.get_pin(session_key.digest)
+        assert pin is not None
+        assert pin.account_id == target_id
+        assert pin.generation == 1
+
+
+def test_balanced_all_cooling_chain_exhaustion_relays_the_upstream_429_verbatim(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _balanced_env(monkeypatch, tmp_path)
+    account_id, _access_token = _register_balanced_accounts(1)[0]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _quota_429("balanced-exhausted")
+
+    with _create_test_client(
+        monkeypatch, config=GatewayConfig(), base_url="http://127.0.0.1:8787"
+    ) as client:
+        _enable_balanced(client, handler)
+        body = _balanced_body(_new_session_id())
+
+        response = client.post("/v1/messages", json=body)
+
+        assert response.status_code == 429
+        assert response.json()["error"]["message"] == "balanced-exhausted"
+        assert response.headers["x-should-retry"] == "true"
+        assert client.app.state.claude_account_cooldowns.is_cooling(account_id)
+
+
+def test_balanced_all_cooling_synthesizes_429_with_retry_after_clamped_over_candidate_set(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _balanced_env(monkeypatch, tmp_path)
+    ready_id, _ready_token = _register_balanced_accounts(1)[0]
+    # A second, not-ready ("disabled") account with a much EARLIER cooldown
+    # deadline: it must never enter the candidate set `C`, so it can never
+    # shorten Retry-After below the ready account's own (longer) deadline.
+    denied_id = _register_serving_account(
+        email="denied@example.com", account_uuid=str(uuid.uuid4())
+    )
+    claude_accounts.mark_account_needs_reauth(denied_id)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _quota_429()
+
+    with _create_test_client(
+        monkeypatch, config=GatewayConfig(), base_url="http://127.0.0.1:8787"
+    ) as client:
+        _enable_balanced(client, handler)
+        tracker = client.app.state.claude_account_cooldowns
+        tracker.mark(denied_id, 5.0)
+
+        exhausted = client.post("/v1/messages", json=_balanced_body(_new_session_id()))
+        assert exhausted.status_code == 429
+        assert tracker.is_cooling(ready_id)
+
+        second = client.post("/v1/messages", json=_balanced_body(_new_session_id()))
+
+        assert second.status_code == 429
+        retry_after = int(second.headers["retry-after"])
+        # The ready account's own (freshly installed, ~60s default) cooldown drives
+        # Retry-After; the excluded, not-ready account's much shorter 5s deadline
+        # never shortens it.
+        assert retry_after > 10
+        assert retry_after <= 61
+
+
+def test_balanced_returns_the_adjudicated_503_byte_exact_when_the_candidate_set_is_empty(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _balanced_env(monkeypatch, tmp_path)
+    account_id, _access_token = _register_balanced_accounts(1)[0]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("no upstream call may happen with an empty candidate set")
+
+    with _create_test_client(
+        monkeypatch, config=GatewayConfig(), base_url="http://127.0.0.1:8787"
+    ) as client:
+        _enable_balanced(client, handler)
+        claude_accounts.mark_account_needs_reauth(account_id)
+
+        response = client.post("/v1/messages", json=_balanced_body(_new_session_id()))
+
+        assert response.status_code == 503
+        assert response.json() == {
+            "type": "error",
+            "error": {
+                "type": "api_error",
+                "message": "no registered account is eligible for the requested model",
+            },
+        }
+        assert "retry-after" not in response.headers
+
+
+def test_balanced_non_streaming_request_commits_at_headers_before_body_relay(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _balanced_env(monkeypatch, tmp_path)
+    _register_balanced_accounts(2)
+    order: list[str] = []
+
+    original_commit_at_headers = ClaudeBalancedRouter.commit_at_headers
+
+    def spy_commit_at_headers(self: ClaudeBalancedRouter, *args: Any, **kwargs: Any) -> Any:
+        result = original_commit_at_headers(self, *args, **kwargs)
+        order.append(f"commit:{result[0]}")
+        return result
+
+    monkeypatch.setattr(ClaudeBalancedRouter, "commit_at_headers", spy_commit_at_headers)
+
+    class _LoggingByteStream(httpx.AsyncByteStream):
+        def __init__(self, body: bytes) -> None:
+            self._body = body
+
+        async def __aiter__(self) -> AsyncIterator[bytes]:
+            order.append("body_pulled")
+            yield self._body
+
+    tokens_by_call: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        tokens_by_call.append(request.headers["authorization"])
+        if len(tokens_by_call) == 1:
+            return _quota_429()
+        return httpx.Response(
+            200,
+            stream=_LoggingByteStream(b'{"id": "msg_1"}'),
+            headers={"content-type": "application/json"},
+        )
+
+    with _create_test_client(
+        monkeypatch, config=GatewayConfig(), base_url="http://127.0.0.1:8787"
+    ) as client:
+        _enable_balanced(client, handler)
+        body = _balanced_body(_new_session_id())
+        body["stream"] = False
+
+        response = client.post("/v1/messages", json=body)
+
+        assert response.status_code == 200
+        assert response.json() == {"id": "msg_1"}
+        assert order == ["commit:committed", "body_pulled"]
+
+
+def test_balanced_concurrent_same_session_request_awaits_the_pending_durability_barrier(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _balanced_env(monkeypatch, tmp_path)
+    _register_balanced_accounts(1)
+
+    upstream_calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        upstream_calls.append(request.headers["authorization"])
+        return httpx.Response(200, json={"id": "msg_1"})
+
+    config = GatewayConfig(claude_account_routing_mode="balanced")
+    app = server.create_app(config)
+    app.state.config = config
+    app.state.compaction_last_reroute = None
+    app.state.compaction_reroute_sequence = 0
+    app.state.codex_client = StubCodexClient()
+    app.state.http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    app.state.claude_account_auth_managers = {}
+
+    async def _unused_fetch(_account_id: str) -> tuple[dict[str, Any], float | None]:
+        raise AssertionError("usage cache fetch must not be reached in this test")
+
+    app.state.claude_account_usage_cache = ClaudeAccountUsageCache(_unused_fetch)
+    app.state.claude_account_cooldowns = AccountCooldownTracker()
+    app.state.claude_balanced_runtime = ClaudeBalancedRuntime()
+
+    gate = asyncio.Event()
+    write_pending: list[bool] = []
+    original_submit_new_pin_durability = ClaudeBalancedRouter.submit_new_pin_durability
+
+    async def delayed_submit_new_pin_durability(self: ClaudeBalancedRouter, digest: bytes) -> None:
+        write_pending.append(True)
+        await gate.wait()
+        await original_submit_new_pin_durability(self, digest)
+
+    monkeypatch.setattr(
+        ClaudeBalancedRouter, "submit_new_pin_durability", delayed_submit_new_pin_durability
+    )
+
+    async def scenario() -> tuple[list[int], list[str]]:
+        runtime = app.state.claude_balanced_runtime
+        await runtime.prepare_and_publish(
+            accounts=claude_accounts.list_accounts(),
+            accounts_root=paths.accounts_dir("claude"),
+            runtime_db_path=paths.claude_account_pool_runtime_db(),
+            persist=lambda: None,
+        )
+        body = _balanced_body(_new_session_id())
+
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://testserver"
+        ) as async_client:
+            first_task = asyncio.create_task(async_client.post("/v1/messages", json=body))
+            for _ in range(200):
+                if write_pending:
+                    break
+                await asyncio.sleep(0)
+            assert write_pending  # the creator is blocked on its own durability barrier
+
+            second_task = asyncio.create_task(async_client.post("/v1/messages", json=body))
+            for _ in range(50):
+                await asyncio.sleep(0)
+            # Neither request has reached upstream yet: both await the barrier first.
+            assert upstream_calls == []
+
+            gate.set()
+            first_response = await asyncio.wait_for(first_task, timeout=5.0)
+            second_response = await asyncio.wait_for(second_task, timeout=5.0)
+            return [first_response.status_code, second_response.status_code], list(upstream_calls)
+
+    statuses, calls = asyncio.run(scenario())
+
+    assert statuses == [200, 200]
+    assert len(calls) == 2
+
+
+def test_balanced_unpinnable_retry_chain_reuses_one_stateless_digest_and_creates_no_pin(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _balanced_env(monkeypatch, tmp_path)
+    _register_balanced_accounts(2)
+    digest_calls: list[bytes] = []
+    original_derive_stateless_routing_digest = server.derive_stateless_routing_digest
+
+    def spy_derive_stateless_routing_digest(seed: bytes, nonce: bytes) -> bytes:
+        digest = original_derive_stateless_routing_digest(seed, nonce)
+        digest_calls.append(digest)
+        return digest
+
+    monkeypatch.setattr(
+        server, "derive_stateless_routing_digest", spy_derive_stateless_routing_digest
+    )
+
+    tokens_by_call: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        tokens_by_call.append(request.headers["authorization"])
+        if len(tokens_by_call) == 1:
+            return _quota_429()
+        return httpx.Response(200, json={"id": "msg_1"})
+
+    with _create_test_client(
+        monkeypatch, config=GatewayConfig(), base_url="http://127.0.0.1:8787"
+    ) as client:
+        runtime = _enable_balanced(client, handler)
+
+        response = client.post("/v1/messages", json=_UNPINNABLE_BODY)
+
+        assert response.status_code == 200
+        assert len(tokens_by_call) == 2
+        assert len(set(tokens_by_call)) == 2  # both accounts tried, never repeated
+        assert len(digest_calls) == 1  # ONE stateless digest reused for the whole chain
+        assert runtime.router.pin_count() == 0
+
+
+def test_balanced_unpinnable_separate_requests_get_independent_stateless_digests(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _balanced_env(monkeypatch, tmp_path)
+    _register_balanced_accounts(1)
+    digest_calls: list[bytes] = []
+    original_derive_stateless_routing_digest = server.derive_stateless_routing_digest
+
+    def spy_derive_stateless_routing_digest(seed: bytes, nonce: bytes) -> bytes:
+        digest = original_derive_stateless_routing_digest(seed, nonce)
+        digest_calls.append(digest)
+        return digest
+
+    monkeypatch.setattr(
+        server, "derive_stateless_routing_digest", spy_derive_stateless_routing_digest
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"id": "msg_1"})
+
+    with _create_test_client(
+        monkeypatch, config=GatewayConfig(), base_url="http://127.0.0.1:8787"
+    ) as client:
+        runtime = _enable_balanced(client, handler)
+
+        first = client.post("/v1/messages", json=_UNPINNABLE_BODY)
+        second = client.post("/v1/messages", json=_UNPINNABLE_BODY)
+
+        assert first.status_code == 200
+        assert second.status_code == 200
+        assert len(digest_calls) == 2
+        assert digest_calls[0] != digest_calls[1]
+        assert runtime.router.pin_count() == 0
+
+
+def test_balanced_count_tokens_follows_the_pin_without_refresh_or_router_state_changes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _balanced_env(monkeypatch, tmp_path)
+    account_id, access_token = _register_balanced_accounts(1)[0]
+    count_calls: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url).endswith("/count_tokens"):
+            count_calls.append(request)
+            return httpx.Response(200, json={"input_tokens": 7})
+        return httpx.Response(200, json={"id": "msg_1"})
+
+    with _create_test_client(
+        monkeypatch, config=GatewayConfig(), base_url="http://127.0.0.1:8787"
+    ) as client:
+        runtime = _enable_balanced(client, handler)
+        body = _balanced_body(_new_session_id())
+
+        pinned = client.post("/v1/messages", json=body)
+        assert pinned.status_code == 200
+
+        session_key = derive_session_key(body, runtime.epoch_seed)
+        pin_before = runtime.router.get_pin(session_key.digest)
+        assert pin_before is not None
+        last_seen_before = pin_before.last_seen_monotonic
+        pin_count_before = runtime.router.pin_count()
+        migration_counts_before = dict(runtime.router.migration_outcome_counts)
+        in_flight_before = runtime.router.in_flight_count(account_id)
+
+        counted = client.post("/v1/messages/count_tokens", json=body)
+
+        assert counted.status_code == 200
+        assert counted.json() == {"input_tokens": 7}
+        assert len(count_calls) == 1
+        assert count_calls[0].headers["authorization"] == f"Bearer {access_token}"
+
+        pin_after = runtime.router.get_pin(session_key.digest)
+        assert pin_after is not None
+        assert pin_after.last_seen_monotonic == last_seen_before
+        assert runtime.router.pin_count() == pin_count_before
+        assert dict(runtime.router.migration_outcome_counts) == migration_counts_before
+        assert runtime.router.in_flight_count(account_id) == in_flight_before
+
+
+def test_balanced_count_tokens_never_creates_a_pin_or_a_cooldown(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _balanced_env(monkeypatch, tmp_path)
+    account_id, _access_token = _register_balanced_accounts(1)[0]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _quota_429()
+
+    with _create_test_client(
+        monkeypatch, config=GatewayConfig(), base_url="http://127.0.0.1:8787"
+    ) as client:
+        runtime = _enable_balanced(client, handler)
+        body = _balanced_body(_new_session_id())
+
+        response = client.post("/v1/messages/count_tokens", json=body)
+
+        # A 429 relays verbatim -- no failover chain, no cooldown bookkeeping --
+        # matching the council-pinned "never creates ... cooldowns" rule.
+        assert response.status_code == 429
+        assert runtime.router.pin_count() == 0
+        assert not client.app.state.claude_account_cooldowns.is_cooling(account_id)
