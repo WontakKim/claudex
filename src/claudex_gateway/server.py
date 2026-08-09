@@ -3008,59 +3008,76 @@ async def _handle_admin_connection_test(request: Request) -> JSONResponse:
 def create_app(config: GatewayConfig, daemon_nonce: str | None = None) -> Starlette:
     @contextlib.asynccontextmanager
     async def lifespan(app: Starlette) -> AsyncIterator[None]:
-        log_buffer = _LogBufferHandler()
-        logging.getLogger().addHandler(log_buffer)
-        app.state.log_buffer = log_buffer
+        # Every daemon capable of serving the Claude account pool — disabled,
+        # fallback, or balanced routing mode alike — takes this lease before
+        # any endpoint is exposed and holds it for the process lifetime;
+        # routing-mode transitions never acquire or release it (Adjudication
+        # C). This is the same nonblocking exclusive lock used to serialize
+        # `account login` (see capture_lock_path() above).
+        pool_dir = paths.claude_account_pool_dir()
+        pool_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        claude_pool_lease = try_file_lock(paths.claude_account_pool_lock())
+        if claude_pool_lease is None:
+            raise RuntimeError(
+                "claude account pool is already served by another process (balanced-router.lock held)"
+            )
+        app.state.claude_pool_lease = claude_pool_lease
         try:
-            async with httpx.AsyncClient(timeout=_UPSTREAM_TIMEOUT) as http_client:
-                codex_auth_manager = CodexAuthManager(config.codex_home / "auth.json", http_client)
-                kimi_auth_manager = KimiAuthManager(config.kimi_code_home, http_client)
-                grok_auth_manager = GrokAuthManager(config.grok_home / "auth.json", http_client)
-                app.state.config = config
-                app.state.admin_lock = asyncio.Lock()
-                # Redeem key of a reset attempt whose outcome never came back.
-                app.state.codex_reset_key = None
-                # Diagnostics for the compaction reroute (see
-                # _assign_compaction_reroute): no reroute has been attempted
-                # yet, and the sequence counter starts a fresh count for this
-                # process's lifetime.
-                app.state.compaction_last_reroute = None
-                app.state.compaction_reroute_sequence = 0
-                app.state.codex_auth_manager = codex_auth_manager
-                app.state.codex_client = CodexClient(codex_auth_manager, http_client)
-                app.state.kimi_auth_manager = kimi_auth_manager
-                app.state.kimi_client = KimiClient(kimi_auth_manager, http_client)
-                app.state.grok_auth_manager = grok_auth_manager
-                app.state.grok_client = GrokClient(grok_auth_manager, http_client)
-                app.state.http_client = http_client
+            log_buffer = _LogBufferHandler()
+            logging.getLogger().addHandler(log_buffer)
+            app.state.log_buffer = log_buffer
+            try:
+                async with httpx.AsyncClient(timeout=_UPSTREAM_TIMEOUT) as http_client:
+                    codex_auth_manager = CodexAuthManager(config.codex_home / "auth.json", http_client)
+                    kimi_auth_manager = KimiAuthManager(config.kimi_code_home, http_client)
+                    grok_auth_manager = GrokAuthManager(config.grok_home / "auth.json", http_client)
+                    app.state.config = config
+                    app.state.admin_lock = asyncio.Lock()
+                    # Redeem key of a reset attempt whose outcome never came back.
+                    app.state.codex_reset_key = None
+                    # Diagnostics for the compaction reroute (see
+                    # _assign_compaction_reroute): no reroute has been attempted
+                    # yet, and the sequence counter starts a fresh count for this
+                    # process's lifetime.
+                    app.state.compaction_last_reroute = None
+                    app.state.compaction_reroute_sequence = 0
+                    app.state.codex_auth_manager = codex_auth_manager
+                    app.state.codex_client = CodexClient(codex_auth_manager, http_client)
+                    app.state.kimi_auth_manager = kimi_auth_manager
+                    app.state.kimi_client = KimiClient(kimi_auth_manager, http_client)
+                    app.state.grok_auth_manager = grok_auth_manager
+                    app.state.grok_client = GrokClient(grok_auth_manager, http_client)
+                    app.state.http_client = http_client
 
-                try:
-                    credentials = await codex_auth_manager.get_credentials()
-                    logger.info(
-                        "codex credentials ready (mode=%s, account=%s)",
-                        "api_key" if credentials.is_api_key else "chatgpt",
-                        credentials.account_id,
-                    )
-                except CodexAuthError as exc:
-                    logger.warning("codex direction unavailable: %s", exc)
-
-                if config.maps_to_provider("kimi"):
                     try:
-                        await kimi_auth_manager.get_credentials()
-                        logger.info("kimi credentials ready")
-                    except KimiAuthError as exc:
-                        logger.warning("kimi direction unavailable: %s", exc)
+                        credentials = await codex_auth_manager.get_credentials()
+                        logger.info(
+                            "codex credentials ready (mode=%s, account=%s)",
+                            "api_key" if credentials.is_api_key else "chatgpt",
+                            credentials.account_id,
+                        )
+                    except CodexAuthError as exc:
+                        logger.warning("codex direction unavailable: %s", exc)
 
-                if config.maps_to_provider("grok"):
-                    try:
-                        await grok_auth_manager.get_credentials()
-                        logger.info("grok credentials ready")
-                    except GrokAuthError as exc:
-                        logger.warning("grok direction unavailable: %s", exc)
+                    if config.maps_to_provider("kimi"):
+                        try:
+                            await kimi_auth_manager.get_credentials()
+                            logger.info("kimi credentials ready")
+                        except KimiAuthError as exc:
+                            logger.warning("kimi direction unavailable: %s", exc)
 
-                yield
+                    if config.maps_to_provider("grok"):
+                        try:
+                            await grok_auth_manager.get_credentials()
+                            logger.info("grok credentials ready")
+                        except GrokAuthError as exc:
+                            logger.warning("grok direction unavailable: %s", exc)
+
+                    yield
+            finally:
+                logging.getLogger().removeHandler(log_buffer)
         finally:
-            logging.getLogger().removeHandler(log_buffer)
+            app.state.claude_pool_lease.release()
 
     app = Starlette(
         routes=[

@@ -21,7 +21,7 @@ import uvicorn
 from starlette.testclient import TestClient
 
 import claudex_gateway.server as server
-from claudex_gateway import claude_accounts, compaction
+from claudex_gateway import claude_accounts, compaction, paths
 from claudex_gateway.claude_account_pool import AccountCooldownTracker
 from claudex_gateway.claude_auth import CLAUDE_TOKEN_URL
 from claudex_gateway.codex_client import (
@@ -6099,3 +6099,48 @@ class TestAdminClaudeLoginLifecycle:
 
         [record] = claude_accounts.load_registry()
         assert record == original
+
+
+# ---------------------------------------------------------------------------
+# Claude account pool lease: acquired at lifespan startup and held for the
+# process lifetime, regardless of routing mode (T-9)
+# ---------------------------------------------------------------------------
+
+
+def test_lifespan_holds_the_claude_pool_lease_for_the_process_lifetime(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    lock_path = paths.claude_account_pool_lock()
+
+    with _create_test_client(monkeypatch) as client:
+        assert lock_path.is_file()
+        # Contended while the lifespan-backed client is open.
+        assert server.try_file_lock(lock_path) is None
+        assert client.get("/api/hello").status_code == 200
+
+    # Released once the client (and its lifespan) has shut down.
+    reacquired = server.try_file_lock(lock_path)
+    assert reacquired is not None
+    reacquired.release()
+
+
+def test_lifespan_raises_the_pinned_message_when_the_pool_lock_is_contended(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    lock_path = paths.claude_account_pool_lock()
+
+    holder = server.try_file_lock(lock_path)
+    assert holder is not None
+    try:
+        client = _create_test_client(monkeypatch)
+        with pytest.raises(RuntimeError) as exc_info:
+            with client:
+                pass
+        assert str(exc_info.value) == (
+            "claude account pool is already served by another process "
+            "(balanced-router.lock held)"
+        )
+    finally:
+        holder.release()
