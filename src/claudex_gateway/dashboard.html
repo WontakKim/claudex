@@ -1506,6 +1506,13 @@ function fetchAccounts(){
     if(servingResp.ok){
       ACCT.serving=servingResp.body.account_id||null;
       ACCT.locked=!!servingResp.body.env_locked;
+    }else{
+      // Never paint fresh rows against a stale pin from a previous
+      // refresh: an unknown pin state renders as none, with the error.
+      ACCT.serving=null;ACCT.locked=false;
+      showToast('<span class="chip chip-err">ERROR</span><span class="lat">'+servingResp.status+
+        '</span><br>GET /admin/providers/claude/pool/serving<br><span class="dim">'+
+        esc(errDetail(servingResp.body))+"</span>",true);
     }
     renderAcctList();
     renderLocalHero();
@@ -1592,15 +1599,19 @@ var LOGIN={timer:null,lastKey:null,failures:0,attemptId:null,existingAccountId:n
 function loginStateKey(st){
   return[st.status,st.url||"",st.email||"",st.error||"",st.detail||"",st.code_prompt_detected?"1":"0"].join("|");
 }
-function loginAttemptHeaders(extra){
-  /* Every attached call names its attempt: a stale tab from an earlier
-     login gets a 409 stale_login instead of driving a newer session. */
-  var headers=Object.assign({},extra||{});
-  if(LOGIN.attemptId)headers["X-Login-Attempt"]=LOGIN.attemptId;
-  return headers;
-}
 function isStaleLogin(r){
   return r.status===409&&r.body&&r.body.error&&r.body.error.code==="stale_login";
+}
+/* Async responses are pinned to the attempt they were dispatched for: a
+   delayed callback from attempt A must never render, close, or cancel a
+   session after the tab adopted attempt B (or closed). Capture
+   LOGIN.attemptId at dispatch and drop the response when it no longer
+   matches. */
+function isCurrentAttempt(attempt){
+  return attempt!==null&&attempt===LOGIN.attemptId;
+}
+function attemptHeaders(attempt,extra){
+  return Object.assign({},extra||{},{"X-Login-Attempt":attempt});
 }
 function stopLoginPolling(){
   if(LOGIN.timer){clearInterval(LOGIN.timer);LOGIN.timer=null}
@@ -1610,7 +1621,16 @@ function closeLoginModal(){
   LOGIN.attemptId=null;LOGIN.existingAccountId=null;
   document.getElementById("login-modal").classList.remove("open");
 }
-function startLoginModal(){
+function adoptLoginAttempt(attemptId){
+  /* Adopt only a well-formed attempt id — a malformed envelope must not
+     leave the tab polling as bare unattached GETs. */
+  if(typeof attemptId!=="string"||!attemptId){
+    showToast('<span class="chip chip-err">ERROR</span><br>계정 추가'+
+      '<br><span class="dim">로그인 세션 응답에 attempt_id가 없습니다.</span>',true);
+    return;
+  }
+  LOGIN.attemptId=attemptId;
+  LOGIN.existingAccountId=null;
   LOGIN.lastKey=null;LOGIN.failures=0;
   document.getElementById("login-reconnect").textContent="";
   document.getElementById("login-modal").classList.add("open");
@@ -1625,8 +1645,7 @@ function openLoginModal(){
   }).then(function(r){
     var code=r.body&&r.body.error&&r.body.error.code;
     if(r.ok){
-      LOGIN.attemptId=r.body.attempt_id||null;
-      startLoginModal();
+      adoptLoginAttempt(r.body&&r.body.attempt_id);
       return;
     }
     // login-active: another dashboard tab (or this one) already runs a
@@ -1634,8 +1653,7 @@ function openLoginModal(){
     if(r.status===409&&code==="login-active"){
       jfetch("/admin/providers/claude/login").then(function(g){
         if(g.ok&&g.body&&g.body.attempt_id){
-          LOGIN.attemptId=g.body.attempt_id;
-          startLoginModal();
+          adoptLoginAttempt(g.body.attempt_id);
           return;
         }
         showToast('<span class="chip chip-err">ERROR</span><br>계정 추가'+
@@ -1652,7 +1670,10 @@ function openLoginModal(){
   });
 }
 function pollLogin(){
-  jfetch("/admin/providers/claude/login",{headers:loginAttemptHeaders()}).then(function(r){
+  var attempt=LOGIN.attemptId;
+  if(!attempt){stopLoginPolling();return}
+  jfetch("/admin/providers/claude/login",{headers:attemptHeaders(attempt)}).then(function(r){
+    if(!isCurrentAttempt(attempt))return;
     if(isStaleLogin(r)){
       // A newer login superseded this tab's attempt: bow out quietly.
       closeLoginModal();fetchAccounts();
@@ -1673,7 +1694,9 @@ function pollLogin(){
     renderLoginModal(st);
     if(st.status==="failed")stopLoginPolling();
     updateLoginCountdown(st);
-  }).catch(loginPollFailed);
+  }).catch(function(){
+    if(isCurrentAttempt(attempt))loginPollFailed();
+  });
 }
 function loginPollFailed(){
   LOGIN.failures++;
@@ -1736,22 +1759,29 @@ function submitLoginCode(){
   if(!input)return;
   var code=input.value.trim();
   if(!code)return;
+  var attempt=LOGIN.attemptId;
+  if(!attempt)return;
   jfetch("/admin/providers/claude/login/code",{
-    method:"POST",headers:loginAttemptHeaders({"Content-Type":"application/json"}),
+    method:"POST",headers:attemptHeaders(attempt,{"Content-Type":"application/json"}),
     body:JSON.stringify({code:code})
   }).then(function(r){
+    if(!isCurrentAttempt(attempt))return;
     if(isStaleLogin(r)){closeLoginModal();fetchAccounts();return}
     if(!r.ok)
       showToast('<span class="chip chip-err">ERROR</span><span class="lat">'+r.status+
         '</span><br>코드 제출<br><span class="dim">'+esc(errDetail(r.body))+"</span>",true);
   }).catch(function(){
+    if(!isCurrentAttempt(attempt))return;
     showToast('<span class="chip chip-err">ERROR</span><br>코드 제출<br><span class="dim">gateway unreachable</span>',true);
   });
 }
 function cancelLoginSession(){
+  var attempt=LOGIN.attemptId;
+  if(!attempt){closeLoginModal();return}
   jfetch("/admin/providers/claude/login",{
-    method:"DELETE",headers:loginAttemptHeaders()
+    method:"DELETE",headers:attemptHeaders(attempt)
   }).then(function(r){
+    if(!isCurrentAttempt(attempt))return;
     if(isStaleLogin(r)){closeLoginModal();fetchAccounts();return}
     renderLoginModal({status:"cancelling"});
   }).catch(function(){});
@@ -1769,10 +1799,13 @@ document.getElementById("login-modal").addEventListener("click",function(e){
     return;
   }
   if(act==="replace"){
+    var attempt=LOGIN.attemptId;
+    if(!attempt)return;
     jfetch("/admin/providers/claude/login/replace",{
-      method:"POST",headers:loginAttemptHeaders({"Content-Type":"application/json"}),
+      method:"POST",headers:attemptHeaders(attempt,{"Content-Type":"application/json"}),
       body:JSON.stringify({existing_account_id:LOGIN.existingAccountId})
     }).then(function(r){
+      if(!isCurrentAttempt(attempt))return;
       if(isStaleLogin(r)){closeLoginModal();fetchAccounts();return}
       if(!r.ok)
         showToast('<span class="chip chip-err">ERROR</span><span class="lat">'+r.status+
