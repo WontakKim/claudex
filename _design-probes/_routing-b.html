@@ -1,0 +1,302 @@
+<!-- directed-by: claude-fable-5 (Product / Workflows) · run: f2b30e1a-8eeb-4dfa-9d9c-54c389f6b5f0 -->
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Claudex Gateway — 계정 풀 라우팅 (routing-b)</title>
+<link rel="stylesheet" href="dashboard-real.css">
+<style>
+/* ---- probe framing ---- */
+.pv-cap{margin:30px 0 8px;font:700 11px var(--sans);letter-spacing:.08em;text-transform:uppercase;color:var(--muted)}
+.pv-cap:first-child{margin-top:0}
+.pv-cap b{color:var(--accent)}
+
+/* ---- 계정 풀 라우팅 strip: pool-level policy, sits directly above the pool it governs ---- */
+.rpol{margin-top:18px;padding:14px 16px;border:1px solid var(--inset);border-radius:10px;
+  background:color-mix(in srgb,var(--inset) 45%,transparent)}
+.rpol .rname{font:650 14.5px var(--sans)}
+.rpol .rdesc{font:400 12.5px var(--sans);color:var(--muted);margin-top:3px}
+.rpol .ctrow{margin-top:10px;max-width:560px}
+select.rsel{flex:1;min-width:0;font:600 14px var(--sans);background:var(--panel);
+  border:1.5px solid var(--line);border-radius:6px;padding:9px 10px;color:var(--text)}
+select.rsel:disabled{opacity:.55;cursor:default}
+.rpol .ctrow button{width:88px;padding:9px 0}
+.rpol .cthint{margin-top:8px}
+
+/* fallback chain: live routing order, only rendered in fallback mode */
+.rchain{margin-top:12px;display:flex;align-items:center;gap:8px;flex-wrap:wrap;font:600 12px var(--mono)}
+.rchain .lbl{font:700 10.5px var(--sans);color:var(--muted);letter-spacing:.08em;text-transform:uppercase;margin-right:2px}
+.rchain .hop{display:inline-flex;align-items:baseline;gap:6px;padding:3px 10px;border-radius:999px;
+  background:var(--panel);border:1px solid var(--inset)}
+.rchain .hop .s{font:600 10.5px var(--sans)}
+.rchain .hop.cool{color:var(--warn);border-color:color-mix(in srgb,var(--warn) 45%,transparent)}
+.rchain .hop.now{color:var(--ok);border-color:color-mix(in srgb,var(--ok) 50%,transparent)}
+.rchain .hop.out{color:var(--muted);opacity:.75}
+.rchain .arr{color:var(--muted)}
+
+/* pool/status badges on account rows (warn=cooldown, ok=currently answering) */
+.arow .st.cool{color:var(--warn)}
+.arow .st.cool::before{content:"";width:7px;height:7px;border-radius:50%;background:var(--warn);flex:none}
+.arow .st.now{color:var(--ok)}
+.arow .st.now::before{content:"";width:7px;height:7px;border-radius:50%;background:var(--ok);flex:none}
+.arow .dim{font:500 12px var(--sans);color:var(--muted)}
+
+/* cooldown notice band inside expanded row — warn analog of shipped .unavail */
+.cooldown{margin-top:12px;padding:11px 13px;border-radius:6px;background:var(--warn-soft);color:var(--warn);font:600 13px var(--sans)}
+.cooldown .hint{display:block;margin-top:3px;font:400 12px var(--sans);color:var(--muted)}
+
+/* env-lock band for the routing strip — same voice as .complock/.acctlock */
+.rlock{margin-bottom:12px;border:1px solid var(--err);border-radius:8px;color:var(--err);padding:10px 13px;font-size:13.5px}
+.rlock code{font:600 12.5px var(--mono)}
+</style>
+</head>
+<body data-tab="settings">
+<div class="doc">
+  <header>
+    <h1>Claudex Gateway</h1><span class="ep">127.0.0.1:8787</span>
+    <div class="health"><span class="ok">Claude ✓</span><span class="ok">Codex ✓</span></div>
+  </header>
+  <nav class="tabs">
+    <a href="#settings" class="on">Settings</a>
+    <a href="#status">Status</a>
+    <a href="#map">Router</a>
+    <a href="#log">Log</a>
+  </nav>
+  <main>
+    <section id="tab-settings" style="display:block;padding-top:20px">
+      <div class="layout">
+        <nav class="rail" aria-label="설정 종류">
+          <a class="rail-item" href="#settings/general">General</a>
+          <a class="rail-item on" href="#settings/accounts">Claude 계정</a>
+        </nav>
+
+        <div>
+          <!-- ================================================================ -->
+          <div class="pv-cap"><b>A</b> — 평상시 · 라우팅 disabled (기본)</div>
+          <div class="card" id="accounts-a">
+            <div class="acct-head">
+              <div>
+                <h2>Claude 계정</h2>
+                <div class="sub">게이트웨이가 서빙에 쓰는 등록 계정과 이 머신의 로컬 Claude Code 로그인입니다.</div>
+              </div>
+            </div>
+
+            <div class="lhero">
+              <div class="ribbon">로컬 CLI 로그인
+                <button type="button" class="urefresh">갱신</button>
+              </div>
+              <div class="who">
+                <span class="em">ai-platform@wrtn.io</span>
+                <span class="plan-lg">PRO</span>
+              </div>
+              <div class="org">Wrtn AI Platform · 게이트웨이 서빙과 무관 · <b>2분 전</b> 기준</div>
+              <div class="uwin">
+                <div class="uwin-h"><span>세션 윈도우</span><span class="upct err">97%</span></div>
+                <div class="ubar"><i class="err" style="width:97%"></i></div>
+                <div class="ureset">15:00 리셋 (2시간 34분 후)</div>
+              </div>
+              <div class="uwin">
+                <div class="uwin-h"><span>주간 윈도우</span><span class="upct warn">88%</span></div>
+                <div class="ubar"><i class="warn" style="width:88%"></i></div>
+                <div class="ureset">일요일 21:00 리셋 (5일 6시간 후)</div>
+              </div>
+            </div>
+
+            <!-- 계정 풀 라우팅: 풀 리스트 바로 위 -->
+            <div class="rpol">
+              <div class="rname">계정 풀 라우팅</div>
+              <div class="rdesc">서빙 계정이 429를 받았을 때 등록 계정 풀을 어떻게 쓸지 정합니다.</div>
+              <div class="ctrow">
+                <select class="rsel">
+                  <option selected>Disabled — 단일 서빙 계정 (기본)</option>
+                  <option>Fallback — ready 계정 순차 폴백</option>
+                  <option disabled>Balanced — 계정 간 부하 분산 (준비 중)</option>
+                </select>
+                <button type="button">적용</button>
+              </div>
+              <div class="cthint">단일 서빙 계정만 사용합니다. 429는 클라이언트로 그대로 전달됩니다.</div>
+            </div>
+
+            <div class="tbl-cap">
+              <span class="t">등록 계정</span><span class="n">3</span>
+              <button type="button" class="add">계정 추가</button>
+            </div>
+
+            <div>
+              <div class="arow" tabindex="0" role="button" aria-expanded="false">
+                <span class="chev" aria-hidden="true">▶</span>
+                <span class="em">wontak@wrtn.io</span>
+                <span class="st serve">서빙 중</span>
+                <span class="spacer"></span>
+                <span class="plan-txt">MAX</span>
+              </div>
+              <div class="arow" tabindex="0" role="button" aria-expanded="false">
+                <span class="chev" aria-hidden="true">▶</span>
+                <span class="em">ai-platform@wrtn.io</span>
+                <span class="spacer"></span>
+                <span class="plan-txt">PRO</span>
+              </div>
+              <div class="arow" tabindex="0" role="button" aria-expanded="false">
+                <span class="chev" aria-hidden="true">▶</span>
+                <span class="em">dev-test@wrtn.io</span>
+                <span class="st reauth">⚠ 재로그인 필요</span>
+                <span class="spacer"></span>
+                <span class="plan-txt">—</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- ================================================================ -->
+          <div class="pv-cap"><b>B</b> — 쿼터 인시던트 · 라우팅 fallback (서빙 계정 쿨다운 중)</div>
+          <div class="card" id="accounts-b">
+            <div class="acct-head">
+              <div>
+                <h2>Claude 계정</h2>
+                <div class="sub">게이트웨이가 서빙에 쓰는 등록 계정과 이 머신의 로컬 Claude Code 로그인입니다.</div>
+              </div>
+            </div>
+
+            <div class="lhero">
+              <div class="ribbon">로컬 CLI 로그인
+                <button type="button" class="urefresh">갱신</button>
+              </div>
+              <div class="who">
+                <span class="em">ai-platform@wrtn.io</span>
+                <span class="plan-lg">PRO</span>
+              </div>
+              <div class="org">Wrtn AI Platform · 게이트웨이 서빙과 무관 · <b>2분 전</b> 기준</div>
+              <div class="uwin">
+                <div class="uwin-h"><span>세션 윈도우</span><span class="upct err">97%</span></div>
+                <div class="ubar"><i class="err" style="width:97%"></i></div>
+                <div class="ureset">15:00 리셋 (2시간 34분 후)</div>
+              </div>
+              <div class="uwin">
+                <div class="uwin-h"><span>주간 윈도우</span><span class="upct warn">88%</span></div>
+                <div class="ubar"><i class="warn" style="width:88%"></i></div>
+                <div class="ureset">일요일 21:00 리셋 (5일 6시간 후)</div>
+              </div>
+            </div>
+
+            <div class="rpol">
+              <div class="rname">계정 풀 라우팅</div>
+              <div class="rdesc">서빙 계정이 429를 받았을 때 등록 계정 풀을 어떻게 쓸지 정합니다.</div>
+              <div class="ctrow">
+                <select class="rsel">
+                  <option>Disabled — 단일 서빙 계정 (기본)</option>
+                  <option selected>Fallback — ready 계정 순차 폴백</option>
+                  <option disabled>Balanced — 계정 간 부하 분산 (준비 중)</option>
+                </select>
+                <button type="button">적용</button>
+              </div>
+              <div class="cthint">서빙 계정을 머리로 ready 계정에 순차 폴백합니다. 429를 받은 계정은 쿨다운 후 자동 복귀합니다.</div>
+              <div class="rchain">
+                <span class="lbl">폴백 체인</span>
+                <span class="hop cool">1 wontak@wrtn.io <span class="s">쿨다운</span></span>
+                <span class="arr">→</span>
+                <span class="hop now">2 ai-platform@wrtn.io <span class="s">지금 응답 중</span></span>
+                <span class="arr">·</span>
+                <span class="hop out">dev-test@wrtn.io <span class="s">제외 — 재로그인 필요</span></span>
+              </div>
+            </div>
+
+            <div class="tbl-cap">
+              <span class="t">등록 계정</span><span class="n">3</span>
+              <button type="button" class="add">계정 추가</button>
+            </div>
+
+            <div>
+              <!-- serving head, cooling down — expanded to show why + when it comes back -->
+              <div class="arow open" tabindex="0" role="button" aria-expanded="true">
+                <span class="chev" aria-hidden="true">▶</span>
+                <span class="em">wontak@wrtn.io</span>
+                <span class="st serve">서빙 중</span>
+                <span class="st cool">쿨다운 · 8/12 06:00 해제</span>
+                <span class="spacer"></span>
+                <span class="plan-txt">MAX</span>
+              </div>
+              <div class="adetail show">
+                <div class="cooldown">쿨다운 중 — Fable 주간 윈도우 소진 (429)
+                  <span class="hint">2026-08-12 (수) 06:00 KST에 자동으로 폴백 체인 머리로 복귀합니다. 그동안 요청은 다음 ready 계정으로 갑니다.</span>
+                </div>
+                <div>
+                  <div class="uwin">
+                    <div class="uwin-h"><span>세션 윈도우</span><span class="upct">62%</span></div>
+                    <div class="ubar"><i style="width:62%"></i></div>
+                    <div class="ureset">14:30 리셋 (2시간 4분 후)</div>
+                  </div>
+                  <div class="uwin">
+                    <div class="uwin-h"><span>주간 윈도우</span><span class="upct">41%</span></div>
+                    <div class="ubar"><i style="width:41%"></i></div>
+                    <div class="ureset">금요일 09:00 리셋 (2일 18시간 후)</div>
+                  </div>
+                  <div class="uwin">
+                    <div class="uwin-h"><span>Fable 주간</span><span class="upct err">100%</span></div>
+                    <div class="ubar"><i class="err" style="width:100%"></i></div>
+                    <div class="ureset">8/12 (수) 06:00 쿨다운 해제 (17시간 42분 후)</div>
+                  </div>
+                  <div class="age">사용량 <b>1분 전</b> 기준</div>
+                </div>
+                <div>
+                  <div class="kv">
+                    <span class="k">플랜</span><span class="v">MAX</span>
+                    <span class="k">조직</span><span class="v">Wrtn</span>
+                    <span class="k">추가</span><span class="v">2026-07-12</span>
+                    <span class="k">마지막 인증</span><span class="v">2026-08-08</span>
+                  </div>
+                </div>
+                <div class="actions">
+                  <button type="button" class="ghost">서빙 해제</button>
+                  <span class="spacer"></span>
+                  <button type="button" class="ghost danger">제거</button>
+                </div>
+              </div>
+
+              <!-- fallback target actually answering right now -->
+              <div class="arow" tabindex="0" role="button" aria-expanded="false">
+                <span class="chev" aria-hidden="true">▶</span>
+                <span class="em">ai-platform@wrtn.io</span>
+                <span class="st now">지금 응답 중 · 폴백 2순위</span>
+                <span class="spacer"></span>
+                <span class="plan-txt">PRO</span>
+              </div>
+
+              <!-- unavailable: excluded from the chain -->
+              <div class="arow" tabindex="0" role="button" aria-expanded="false">
+                <span class="chev" aria-hidden="true">▶</span>
+                <span class="em">dev-test@wrtn.io</span>
+                <span class="st reauth">⚠ 재로그인 필요</span>
+                <span class="dim">폴백 제외</span>
+                <span class="spacer"></span>
+                <span class="plan-txt">—</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- ================================================================ -->
+          <div class="pv-cap"><b>C</b> — env-locked · 라우팅 스트립만 (컨트롤 상태 비교용)</div>
+          <div class="card" id="accounts-c">
+            <div class="rpol">
+              <div class="rlock"><b>LOCKED</b> — <code>CLAUDEX_CLAUDE_ACCOUNT_ROUTING</code> 환경변수가 우선합니다. 라우팅 모드는 열람 전용입니다.</div>
+              <div class="rname">계정 풀 라우팅</div>
+              <div class="rdesc">서빙 계정이 429를 받았을 때 등록 계정 풀을 어떻게 쓸지 정합니다.</div>
+              <div class="ctrow">
+                <select class="rsel" disabled>
+                  <option>Disabled — 단일 서빙 계정 (기본)</option>
+                  <option selected>Fallback — ready 계정 순차 폴백</option>
+                  <option disabled>Balanced — 계정 간 부하 분산 (준비 중)</option>
+                </select>
+                <button type="button" disabled>적용</button>
+              </div>
+              <div class="cthint">환경변수가 값을 고정하는 동안 변경은 409로 거부됩니다. 변수를 해제하면 이 자리에서 다시 편집할 수 있습니다.</div>
+            </div>
+          </div>
+
+        </div>
+      </div>
+    </section>
+  </main>
+</div>
+<div style="position:fixed;right:16px;bottom:16px;z-index:80;background:#172026;color:#f2f4f5;border-radius:999px;padding:8px 6px;display:flex;gap:2px;font:600 12px ui-monospace,monospace;box-shadow:0 6px 20px rgba(0,0,0,.3)"><a href="_routing-proposals.html" style="color:inherit;text-decoration:none;padding:4px 10px">허브</a><a href="_routing-a.html" style="color:inherit;text-decoration:none;padding:4px 10px">A</a><a href="_routing-b.html" style="text-decoration:none;padding:4px 10px;background:#f2f4f5;color:#172026;border-radius:999px">B</a><a href="_routing-c.html" style="color:inherit;text-decoration:none;padding:4px 10px">C</a><a href="_routing-d.html" style="color:inherit;text-decoration:none;padding:4px 10px">D</a></div>
+</body>
+</html>

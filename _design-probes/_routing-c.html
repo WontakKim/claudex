@@ -1,0 +1,472 @@
+<!-- directed-by: gemini-3.1-pro-preview (Interaction / Ergonomics) · run: be1a71ee-cce0-44e5-b91e-c462efe62b0c · no-tools dispatch (gateway tool-loop limitation), excerpts inlined by apprentice -->
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Claudex Gateway — 계정 라우팅 (Probe)</title>
+<link rel="stylesheet" href="dashboard-real.css">
+<style>
+/* ---- card head & structural ---- */
+.acct-head{display:flex;align-items:flex-start;justify-content:space-between;gap:14px}
+.acct-head h2{margin:0}
+.acct-head .sub{margin:4px 0 0}
+.add{font:600 13.5px var(--sans);background:var(--accent);color:#fff;border:0;border-radius:6px;padding:8px 15px;cursor:pointer}
+.add:hover{background:color-mix(in srgb,var(--accent) 88%,var(--text))}
+
+/* ---- pills & badges ---- */
+.pill{display:inline-flex;align-items:center;gap:5px;height:20px;padding:0 9px;border-radius:999px;
+  font:700 11px var(--mono);letter-spacing:.02em;white-space:nowrap}
+.pill.serve{background:var(--accent-soft);color:var(--accent)}
+.pill.reauth{background:var(--err-soft);color:var(--err)}
+.pill.plan{background:var(--inset);color:var(--text);letter-spacing:.05em}
+.pill.same{background:var(--accent-soft);color:var(--accent);font-weight:600}
+
+.st{display:inline-flex;align-items:center;gap:6px;font:600 12px var(--sans);white-space:nowrap}
+.st.serve{color:var(--accent)}
+.st.serve::before{content:"";width:7px;height:7px;border-radius:50%;background:var(--accent);flex:none}
+.st.reauth{color:var(--err)}
+.st.warn{color:var(--warn)}
+
+.risk{font:600 12px var(--mono);color:var(--muted);white-space:nowrap}
+.risk.hot{color:var(--err)}
+
+/* ---- local CLI hero ---- */
+.lhero{margin-top:16px;padding:18px 20px;border-radius:10px;background:var(--accent-soft);
+  border:1.5px solid color-mix(in srgb,var(--accent) 35%,transparent)}
+.lhero .ribbon{display:flex;align-items:center;gap:6px;font:700 11px var(--sans);
+  letter-spacing:.06em;text-transform:uppercase;color:var(--accent)}
+.lhero .ribbon::before{content:"";width:8px;height:8px;border-radius:50%;background:var(--accent);flex:none}
+.lhero .ribbon .urefresh{margin-left:auto;padding:4px 11px;font-size:12px;letter-spacing:0;text-transform:none;
+  background:none;border:1px solid currentColor;color:inherit;border-radius:4px;cursor:pointer}
+.lhero .ribbon .urefresh:hover{background:color-mix(in srgb,var(--accent) 15%,transparent)}
+.lhero .who{margin-top:10px;display:flex;align-items:baseline;gap:10px;flex-wrap:wrap}
+.lhero .em{font:650 20px var(--mono);letter-spacing:-.01em}
+.lhero .plan-lg{font:700 12px var(--mono);letter-spacing:.06em;color:var(--muted);
+  background:var(--panel);padding:3px 10px;border-radius:999px}
+.lhero .org{font:400 13px var(--sans);color:var(--muted);margin-top:4px}
+.lhero .org b{color:var(--text);font-weight:600;font-family:var(--mono)}
+
+/* ---- usage bar unit ---- */
+.uwin{margin-top:12px}
+.uwin-h{display:flex;justify-content:space-between;font:600 12px var(--sans);color:var(--text);margin-bottom:6px}
+.upct{font-family:var(--mono)}
+.ubar{height:6px;background:var(--inset);border-radius:999px;overflow:hidden}
+.ubar i{display:block;height:100%;background:var(--ok);border-radius:999px}
+.ubar i.warn{background:var(--warn)}
+.ubar i.err{background:var(--err)}
+.ureset{margin-top:5px;font:400 11.5px var(--sans);color:var(--muted)}
+
+/* chevron */
+.chev{display:inline-block;width:12px;color:var(--muted);font-size:10px;transition:transform .15s ease;flex:none}
+.open>.chev,.arow.open .chev{transform:rotate(90deg);color:var(--accent)}
+@media (prefers-reduced-motion:reduce){.chev{transition:none}}
+
+/* ---- registered account rows ---- */
+.tbl-cap{display:flex;align-items:center;gap:10px;margin:24px 0 2px}
+.tbl-cap .t{font:700 10.5px var(--sans);color:var(--muted);letter-spacing:.08em;text-transform:uppercase}
+.tbl-cap .n{font:600 11px var(--mono);color:var(--accent)}
+.tbl-cap .add{margin-left:auto}
+.arow{display:flex;align-items:center;gap:9px;padding:10px 0;cursor:pointer;border:0;background:none;width:100%;text-align:left;color:inherit}
+.arow+.arow,.adetail+.arow{border-top:1px solid var(--inset)}
+.arow:hover .em{color:var(--accent)}
+.arow:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}
+.arow .em{font:600 13.5px var(--mono);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.arow .spacer{flex:1}
+.arow .plan-txt{font:700 11.5px var(--mono);color:var(--muted);letter-spacing:.05em}
+
+/* detail pane */
+.adetail{display:none;padding:0 0 16px 21px}
+.adetail.show{display:block}
+.adetail+.arow{border-top:1px solid var(--inset)}
+.ad-grid{display:block}
+.kv{display:grid;grid-template-columns:max-content 1fr;gap:6px 14px;font-size:13px;align-items:center}
+.kv .k{font-size:12.5px;color:var(--muted)}
+.kv .v{font-family:var(--mono);font-weight:500}
+.age{margin-top:12px;font:400 12px var(--sans);color:var(--muted)}
+.age b{color:var(--text);font-weight:600;font-family:var(--mono)}
+.actions{margin-top:16px;display:flex;gap:8px;align-items:center;grid-column:1/-1;
+  padding-top:12px;border-top:1px solid color-mix(in srgb,var(--inset) 70%,transparent)}
+.actions .spacer{flex:1}
+.unavail{margin-top:12px;margin-bottom:14px;padding:11px 13px;border-radius:6px;background:var(--err-soft);color:var(--err);font:600 13px var(--sans)}
+.unavail .hint{display:block;margin-top:3px;font:400 12px var(--sans);color:var(--muted)}
+
+/* toasts */
+.toast-hub { position:fixed; bottom:24px; left:50%; transform:translateX(-50%); display:flex; flex-direction:column; gap:8px; z-index:9999; pointer-events:none; }
+.toast { background:var(--text); color:var(--canvas); padding:9px 18px; border-radius:999px; font:600 13px var(--sans); box-shadow:0 4px 12px rgba(0,0,0,.15); animation:slideup 0.2s cubic-bezier(0.1, 0.9, 0.2, 1) forwards; }
+.toast b { color:var(--ok); margin-right:6px; font-weight:800; }
+@keyframes slideup { from { opacity:0; transform:translateY(15px); } to { opacity:1; transform:translateY(0); } }
+
+/* overrides for probing contexts */
+.probe-title { margin: 40px 0 16px; font: 600 15px var(--sans); color: var(--muted); }
+.probe-title:first-child { margin-top: 0; }
+</style>
+</head>
+<body data-tab="settings">
+<div class="doc">
+  <header>
+    <h1>Claudex Gateway</h1><span class="ep">127.0.0.1:8787</span>
+    <div class="health"><span class="ok">Claude ✓</span><span class="ok">Codex ✓</span></div>
+  </header>
+  <nav class="tabs">
+    <a href="#settings" class="on">Settings</a>
+    <a href="#status">Status</a>
+    <a href="#map">Router</a>
+    <a href="#log">Log</a>
+  </nav>
+  <main>
+    <section id="tab-settings" style="display:block;padding-top:20px">
+      <div class="layout">
+        <nav class="rail" aria-label="설정 종류">
+          <a class="rail-item" href="#settings/general">General</a>
+          <a class="rail-item on" href="#settings/accounts">Claude 계정</a>
+        </nav>
+
+        <div>
+          <!-- PROBE A: Disabled (Default) -->
+          <div class="probe-title">Probe A: 단일 서빙 모드 (기본) — 429 시 클라이언트 노출</div>
+          <div class="card">
+            <div class="acct-head" style="margin-bottom: 24px;">
+              <div>
+                <h2>Claude 계정</h2>
+                <div class="sub">게이트웨이가 서빙에 쓰는 등록 계정과 이 머신의 로컬 Claude Code 로그인입니다.</div>
+              </div>
+            </div>
+
+            <div class="srow" style="margin-top:-8px; padding-top:0;">
+              <div>
+                <div class="name">풀 라우팅 (Pool Routing)</div>
+                <div class="desc">서빙 중인 계정이 제한(429)에 도달했을 때의 동작을 지정합니다.</div>
+              </div>
+              <div>
+                <div class="seg" id="seg-probe-a">
+                  <button class="on" data-mode="disabled">단일 (기본)</button>
+                  <button data-mode="fallback">순차 폴백</button>
+                  <button disabled title="준비 중">분산 (준비 중)</button>
+                </div>
+                <div class="cthint" id="hint-probe-a">단일 서빙 계정만 사용합니다. 429 응답은 클라이언트로 그대로 전달됩니다.</div>
+              </div>
+            </div>
+
+            <div class="lhero">
+              <div class="ribbon">로컬 CLI 로그인
+                <button type="button" class="urefresh">갱신</button>
+              </div>
+              <div class="who">
+                <span class="em">ai-platform@wrtn.io</span>
+                <span class="plan-lg">PRO</span>
+              </div>
+              <div class="org">Wrtn AI Platform · <b>2분 전</b> 기준</div>
+            </div>
+
+            <div class="tbl-cap">
+              <span class="t">등록 계정</span><span class="n">3</span>
+              <button type="button" class="add">계정 추가</button>
+            </div>
+
+            <div class="acct-list">
+              <!-- A1 -->
+              <button type="button" class="arow" data-id="a1" aria-expanded="false">
+                <span class="chev" aria-hidden="true">▶</span>
+                <span class="em">wontak@wrtn.io</span>
+                <span class="st serve">서빙 중</span>
+                <span class="spacer"></span>
+                <span class="plan-txt">MAX</span>
+              </button>
+              <div class="adetail" data-for="a1">
+                <div class="ad-grid">
+                  <div>
+                    <div class="uwin">
+                      <div class="uwin-h"><span>Fable 주간</span><span class="upct" style="color:var(--err)">100%</span></div>
+                      <div class="ubar"><i class="err" style="width:100%"></i></div>
+                      <div class="ureset">수요일 06:00 리셋 (2026-08-12)</div>
+                    </div>
+                    <div class="uwin">
+                      <div class="uwin-h"><span>세션 윈도우</span><span class="upct">62%</span></div>
+                      <div class="ubar"><i style="width:62%"></i></div>
+                      <div class="ureset">14:30 리셋 (2시간 4분 후)</div>
+                    </div>
+                    <div class="age">사용량 <b>1분 전</b> 기준</div>
+                  </div>
+                  <div>
+                    <div class="kv">
+                      <span class="k">플랜</span><span class="v">MAX</span>
+                      <span class="k">조직</span><span class="v">Wrtn</span>
+                      <span class="k">추가</span><span class="v">2026-07-12</span>
+                      <span class="k">마지막 인증</span><span class="v">2026-08-08</span>
+                    </div>
+                  </div>
+                  <div class="actions">
+                    <button type="button" class="ghost">서빙 해제</button>
+                    <span class="spacer"></span>
+                    <button type="button" class="ghost danger">제거</button>
+                  </div>
+                </div>
+              </div>
+
+              <!-- A2 -->
+              <button type="button" class="arow" data-id="a2" aria-expanded="false">
+                <span class="chev" aria-hidden="true">▶</span>
+                <span class="em">ai-platform@wrtn.io</span>
+                <span class="spacer"></span>
+                <span class="plan-txt">PRO</span>
+              </button>
+              <div class="adetail" data-for="a2">
+                <div class="ad-grid">
+                  <div>
+                    <div class="uwin">
+                      <div class="uwin-h"><span>세션 윈도우</span><span class="upct" style="color:var(--err)">97%</span></div>
+                      <div class="ubar"><i class="err" style="width:97%"></i></div>
+                      <div class="ureset">15:00 리셋 (2시간 34분 후)</div>
+                    </div>
+                    <div class="age">사용량 <b>2분 전</b> 기준</div>
+                  </div>
+                  <div>
+                    <div class="kv">
+                      <span class="k">플랜</span><span class="v">PRO</span>
+                      <span class="k">마지막 인증</span><span class="v">2026-08-09</span>
+                      <span class="k">로컬 CLI</span><span class="v"><span class="pill same">동일 계정</span></span>
+                    </div>
+                  </div>
+                  <div class="actions">
+                    <button type="button" class="primary">이 계정으로 서빙</button>
+                    <span class="spacer"></span>
+                    <button type="button" class="ghost danger">제거</button>
+                  </div>
+                </div>
+              </div>
+
+              <!-- A3 -->
+              <button type="button" class="arow" data-id="a3" aria-expanded="false">
+                <span class="chev" aria-hidden="true">▶</span>
+                <span class="em">dev-test@wrtn.io</span>
+                <span class="st reauth">⚠ 재로그인 필요</span>
+                <span class="spacer"></span>
+                <span class="plan-txt">—</span>
+              </button>
+              <div class="adetail" data-for="a3">
+                <div class="unavail">사용량을 불러올 수 없습니다.
+                  <span class="hint">토큰이 만료됐습니다. 다시 로그인하면 이 자리에서 갱신됩니다.</span>
+                </div>
+                <div class="ad-grid">
+                  <div>
+                    <div class="kv">
+                      <span class="k">마지막 인증</span><span class="v">2026-08-02</span>
+                    </div>
+                  </div>
+                  <div class="actions">
+                    <button type="button" class="primary">다시 로그인</button>
+                    <span class="spacer"></span>
+                    <button type="button" class="ghost danger">제거</button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+
+          <!-- PROBE B: Fallback (Active) -->
+          <div class="probe-title">Probe B: 순차 폴백 모드 — 429 발생으로 인한 쿨다운 및 전환 반영</div>
+          <div class="card">
+            <div class="acct-head" style="margin-bottom: 24px;">
+              <div>
+                <h2>Claude 계정</h2>
+                <div class="sub">게이트웨이가 서빙에 쓰는 등록 계정과 이 머신의 로컬 Claude Code 로그인입니다.</div>
+              </div>
+            </div>
+
+            <div class="srow" style="margin-top:-8px; padding-top:0;">
+              <div>
+                <div class="name">풀 라우팅 (Pool Routing)</div>
+                <div class="desc">서빙 중인 계정이 제한(429)에 도달했을 때의 동작을 지정합니다.</div>
+              </div>
+              <div>
+                <div class="seg" id="seg-probe-b">
+                  <button data-mode="disabled">단일 (기본)</button>
+                  <button class="on" data-mode="fallback">순차 폴백</button>
+                  <button disabled title="준비 중">분산 (준비 중)</button>
+                </div>
+                <div class="cthint" id="hint-probe-b">서빙 계정이 429를 받으면 준비된 계정으로 순차 폴백(Fallback)합니다. 제한된 계정은 쿨다운 후 자동 복귀합니다.</div>
+              </div>
+            </div>
+
+            <!-- local hero omitted for brevity in Probe B, focus on rows -->
+
+            <div class="tbl-cap" style="margin-top: 16px;">
+              <span class="t">등록 계정</span><span class="n">3</span>
+              <button type="button" class="add">계정 추가</button>
+            </div>
+
+            <div class="acct-list">
+              <!-- B1: In Cooldown -->
+              <button type="button" class="arow" data-id="b1" aria-expanded="false">
+                <span class="chev" aria-hidden="true">▶</span>
+                <span class="em">wontak@wrtn.io</span>
+                <span class="st warn">⚠ 쿨다운 (08-12 06:00 복귀)</span>
+                <span class="spacer"></span>
+                <span class="plan-txt">MAX</span>
+              </button>
+              <div class="adetail" data-for="b1">
+                <div class="ad-grid">
+                  <div>
+                    <div class="uwin">
+                      <div class="uwin-h"><span>Fable 주간</span><span class="upct" style="color:var(--err)">100%</span></div>
+                      <div class="ubar"><i class="err" style="width:100%"></i></div>
+                      <div class="ureset">수요일 06:00 리셋 (2026-08-12)</div>
+                    </div>
+                    <div class="uwin">
+                      <div class="uwin-h"><span>세션 윈도우</span><span class="upct">62%</span></div>
+                      <div class="ubar"><i style="width:62%"></i></div>
+                      <div class="ureset">14:30 리셋 (2시간 4분 후)</div>
+                    </div>
+                  </div>
+                  <div>
+                    <div class="kv">
+                      <span class="k">플랜</span><span class="v">MAX</span>
+                      <span class="k">상태</span><span class="v" style="color:var(--warn)">429 Rate Limited</span>
+                    </div>
+                  </div>
+                  <div class="actions">
+                    <button type="button" class="ghost">서빙 해제</button>
+                    <span class="spacer"></span>
+                    <button type="button" class="ghost danger">제거</button>
+                  </div>
+                </div>
+              </div>
+
+              <!-- B2: Stepped in as fallback -->
+              <button type="button" class="arow open" data-id="b2" aria-expanded="true">
+                <span class="chev" aria-hidden="true">▶</span>
+                <span class="em">ai-platform@wrtn.io</span>
+                <span class="st serve">폴백 서빙 중</span>
+                <span class="spacer"></span>
+                <span class="plan-txt">PRO</span>
+              </button>
+              <div class="adetail show" data-for="b2">
+                <div class="ad-grid">
+                  <div>
+                    <div class="uwin">
+                      <div class="uwin-h"><span>세션 윈도우</span><span class="upct" style="color:var(--err)">97%</span></div>
+                      <div class="ubar"><i class="err" style="width:97%"></i></div>
+                      <div class="ureset">15:00 리셋 (2시간 34분 후)</div>
+                    </div>
+                  </div>
+                  <div>
+                    <div class="kv">
+                      <span class="k">플랜</span><span class="v">PRO</span>
+                      <span class="k">마지막 인증</span><span class="v">2026-08-09</span>
+                    </div>
+                  </div>
+                  <div class="actions">
+                    <button type="button" class="primary" disabled>이 계정으로 서빙</button>
+                    <span class="spacer"></span>
+                    <button type="button" class="ghost danger">제거</button>
+                  </div>
+                </div>
+              </div>
+
+              <!-- B3 -->
+              <button type="button" class="arow" data-id="b3" aria-expanded="false">
+                <span class="chev" aria-hidden="true">▶</span>
+                <span class="em">dev-test@wrtn.io</span>
+                <span class="st reauth">⚠ 재로그인 필요</span>
+                <span class="spacer"></span>
+                <span class="plan-txt">—</span>
+              </button>
+              <div class="adetail" data-for="b3">
+                <div class="unavail">사용량을 불러올 수 없습니다.</div>
+              </div>
+            </div>
+          </div>
+
+
+          <!-- PROBE C: Env-Locked -->
+          <div class="probe-title">Probe C: Env-Locked — 환경변수 우선 적용 (열람 전용)</div>
+          <div class="card">
+            <div class="srow" style="padding:4px 0;">
+              <div>
+                <div class="name">풀 라우팅 (Pool Routing)</div>
+                <div class="desc">서빙 중인 계정이 제한(429)에 도달했을 때의 동작을 지정합니다.</div>
+              </div>
+              <div>
+                <div class="acctlock" style="display:block; margin-bottom:14px;"><b>LOCKED</b> — <code>CLAUDEX_CLAUDE_ACCOUNT_ROUTING</code> 환경변수가 우선합니다. 라우팅 모드는 열람 전용입니다.</div>
+                <div class="seg" id="seg-probe-c">
+                  <button data-mode="disabled" disabled>단일 (기본)</button>
+                  <button class="on" data-mode="fallback" disabled>순차 폴백</button>
+                  <button disabled title="준비 중">분산 (준비 중)</button>
+                </div>
+                <div class="cthint">서빙 계정이 429를 받으면 준비된 계정으로 순차 폴백(Fallback)합니다. 제한된 계정은 쿨다운 후 자동 복귀합니다.</div>
+              </div>
+            </div>
+          </div>
+
+        </div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<div id="toast-hub" class="toast-hub"></div>
+
+<script>
+(function(){
+  // Accordion Logic (generic for .arow buttons)
+  document.addEventListener("click", function(e){
+    var btn = e.target.closest("button.arow");
+    if(!btn) return;
+    
+    var open = !btn.classList.contains("open");
+    btn.classList.toggle("open", open);
+    btn.setAttribute("aria-expanded", open ? "true" : "false");
+    
+    var id = btn.getAttribute("data-id");
+    var card = btn.closest('.card');
+    var det = card.querySelector('.adetail[data-for="' + id + '"]');
+    if(det) det.classList.toggle("show", open);
+  });
+
+  // Toast Function
+  function toast(msg) {
+    var hub = document.getElementById('toast-hub');
+    var t = document.createElement('div');
+    t.className = 'toast';
+    t.innerHTML = '<b>APPLIED ✓</b>' + msg;
+    hub.appendChild(t);
+    setTimeout(function(){ t.remove(); }, 3000);
+  }
+
+  // Seg Toggle Logic (Probe A only, for demo)
+  var segA = document.getElementById('seg-probe-a');
+  var hintA = document.getElementById('hint-probe-a');
+  var texts = {
+    'disabled': '단일 서빙 계정만 사용합니다. 429 응답은 클라이언트로 그대로 전달됩니다.',
+    'fallback': '서빙 계정이 429를 받으면 준비된 계정으로 순차 폴백(Fallback)합니다. 제한된 계정은 쿨다운 후 자동 복귀합니다.'
+  };
+  
+  if(segA) {
+    segA.addEventListener("click", function(e){
+      var btn = e.target.closest("button");
+      if(!btn || btn.disabled) return;
+      
+      var btns = segA.querySelectorAll("button");
+      btns.forEach(function(b){ b.classList.remove("on"); });
+      btn.classList.add("on");
+      
+      var mode = btn.getAttribute("data-mode");
+      if(texts[mode]) hintA.textContent = texts[mode];
+      
+      toast('라우팅: ' + (mode === 'fallback' ? 'fallback' : 'disabled'));
+    });
+  }
+
+})();
+</script>
+<div style="position:fixed;right:16px;bottom:16px;z-index:80;background:#172026;color:#f2f4f5;border-radius:999px;padding:8px 6px;display:flex;gap:2px;font:600 12px ui-monospace,monospace;box-shadow:0 6px 20px rgba(0,0,0,.3)">
+<a href="_routing-proposals.html" style="color:inherit;text-decoration:none;padding:4px 10px">허브</a>
+<a href="_routing-a.html" style="color:inherit;text-decoration:none;padding:4px 10px">A</a>
+<a href="_routing-b.html" style="color:inherit;text-decoration:none;padding:4px 10px">B</a>
+<a href="_routing-c.html" style="text-decoration:none;padding:4px 10px;background:#f2f4f5;color:#172026;border-radius:999px">C</a>
+<a href="_routing-d.html" style="color:inherit;text-decoration:none;padding:4px 10px">D</a>
+</div>
+</body>
+</html>

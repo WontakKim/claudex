@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>routing 시안 허브 — 계정 라우팅 모드 컨트롤</title>
+<link rel="stylesheet" href="dashboard-real.css">
+<style>
+body{padding:32px 0 90px}
+.hub{max-width:1020px;margin:0 auto;padding:0 24px}
+.hub h1{font-size:24px;margin:0}
+.hub .sub{color:var(--muted);font-size:14px;margin-top:6px;line-height:1.55}
+.hub .trail{margin-top:10px;font:600 12px var(--mono);color:var(--muted)}
+.blk{margin-top:22px;border:1px solid var(--inset);border-radius:10px;background:var(--panel);padding:16px 18px}
+.blk h3{margin:0 0 8px;font:700 11px var(--sans);letter-spacing:.08em;text-transform:uppercase;color:var(--muted)}
+.blk ul{margin:0;padding-left:18px;font-size:13.5px;line-height:1.65}
+.blk code{font:600 12px var(--mono);background:var(--inset);padding:1px 6px;border-radius:4px}
+.blk.method{border-style:dashed;color:var(--muted);font-size:13px;line-height:1.6}
+.grid{margin-top:24px;display:grid;grid-template-columns:1fr 1fr;gap:16px}
+@media (max-width:860px){.grid{grid-template-columns:1fr}}
+.pcard{border:1.5px solid var(--inset);border-radius:12px;background:var(--panel);padding:18px;display:flex;flex-direction:column;gap:10px}
+.pcard.challenger{border-color:color-mix(in srgb,var(--warn) 55%,transparent)}
+.pcard .top{display:flex;align-items:center;gap:10px}
+.pcard .letter{font:800 18px var(--mono);color:var(--accent);width:28px;height:28px;border-radius:8px;
+  background:var(--accent-soft);display:inline-flex;align-items:center;justify-content:center;flex:none}
+.pcard h2{font-size:16.5px;margin:0}
+.pcard .challenger-tag{margin-left:auto;font:700 10px var(--mono);letter-spacing:.06em;color:var(--warn);
+  background:var(--warn-soft);border-radius:999px;padding:3px 9px;flex:none}
+.director{display:flex;align-items:center;gap:8px;font:600 11.5px var(--mono);color:var(--muted);flex-wrap:wrap}
+.director .m{color:var(--text);background:var(--inset);border-radius:5px;padding:2px 8px}
+.take{font-size:13.5px;line-height:1.55}
+.tr{font-size:12.5px;line-height:1.6;color:var(--muted)}
+.tr b.p{color:var(--ok)} .tr b.n{color:var(--err)}
+.corr{font:400 11.5px var(--sans);color:var(--muted);border-top:1px dashed var(--inset);padding-top:8px}
+.corr b{font:700 10px var(--sans);letter-spacing:.06em;text-transform:uppercase;color:var(--warn)}
+.pcard .open{margin-top:auto}
+.pcard .open a{display:inline-block;font:600 13.5px var(--sans);background:var(--accent);color:#fff;
+  border-radius:6px;padding:8px 16px;text-decoration:none}
+.pcard .open a:hover{background:color-mix(in srgb,var(--accent) 88%,var(--text))}
+.pcard .open .hint{margin-left:10px;font:400 12px var(--sans);color:var(--muted)}
+</style>
+</head>
+<body>
+<div class="hub">
+  <h1>계정 라우팅 모드 — 시안 4종</h1>
+  <div class="sub">2026-08-09 · <b>토큰과 컴포넌트 어휘는 고정</b> — 구성(위치·형태·상태 표면화)만 다릅니다.
+    모든 시안은 배포 스타일시트(<code>dashboard-real.css</code>) 위에서 렌더링됩니다.</div>
+  <div class="trail">R1: 방향 4종 — A General·정책행 / B 계정카드·운영화면 / C 컨트롤 해부 / D 서빙 파이프라인(챌린저) → <b style="color:var(--accent)">오너 픽: A</b> (_routing-final.html로 승격, kneading r1)</div>
+
+  <div class="blk">
+    <h3>전제 &amp; 메커니즘 — 비교 전에 읽기</h3>
+    <ul>
+      <li>API는 확정: <code>GET/PUT /admin/providers/claude/pool/routing</code> → <code>{mode, env_locked}</code>. <code>balanced</code>는 예약(적용 시 400), env-lock 시 PUT 409.</li>
+      <li>시맨틱: <b>disabled(기본)</b> = 단일 서빙 계정, 429 그대로 전달 · <b>fallback</b> = 서빙 계정을 머리로 ready 계정 순차 폴백, 쿨다운 후 자동 복귀.</li>
+      <li>상태 읽기: <code>pool/serving</code>(핀) · <code>pool/status</code>(ready/cooldown/unavailable + cooldown_until, reason). 이 세 read가 UI가 쓸 수 있는 전부.</li>
+      <li>실데이터 엣지 반영: wontak@wrtn.io Fable 주간 소진(08-12 06:00 KST 복귀), dev-test@wrtn.io 토큰 만료.</li>
+    </ul>
+  </div>
+
+  <div class="blk">
+    <h3>공통 합의 — 네 시안이 동일한 부분</h3>
+    <ul>
+      <li>전부 Settings 탭 안(오너 지시 "설정에서" 충족). 갈림은 <b>General 카드 vs Claude 계정 카드</b>.</li>
+      <li>env-locked는 기존 <code>complock/acctlock</code> 문법: 빨간 LOCKED 밴드 + 환경변수 이름 + 컨트롤 비활성(열람 전용).</li>
+      <li>모드 설명 카피는 위 시맨틱을 그대로 사용 — 모드가 무엇을 바꾸는지 한 줄로 항상 표기.</li>
+      <li>balanced 노출은 A만 숨김, B·C·D는 비활성 미리보기 — 형태만 다름(옵션/세그먼트).</li>
+    </ul>
+  </div>
+
+  <div class="blk method">
+    <b>방법 기록</b> — 이번 사이클은 assemble 심의 없이 <b>direct-to-probes</b>(프론티어 선정·역할 배정 후 각 체어가 시안 1개씩 지휘, 도제가 실체화).
+    선택된 방향에 대한 사후 council 검토는 언제든 가능. 게이트웨이 제약으로 A(gpt-5.6-sol)·C(gemini-3.1-pro)는 툴 없이
+    발췌 인라인 방식으로 지휘했고, D(grok-4.5)는 1차 run이 HTML 미제출로 끝나 1회 재디스패치.
+  </div>
+
+  <div class="grid">
+    <div class="pcard" style="border-color:var(--accent)">
+      <div class="top"><span class="letter">A</span><h2>정책은 General에</h2><span class="challenger-tag" style="color:var(--accent);background:var(--accent-soft)">오너 픽 · R1</span></div>
+      <div class="director"><span class="m">gpt-5.6-sol</span> IA / 데이터 모델</div>
+      <div class="take">라우팅은 계정 객체가 아니라 게이트웨이 <b>정책</b> — Compact Reroute 바로 다음 <code>.srow</code>로.
+        select+적용, balanced 숨김. 계정 화면은 상태 표면(행 배지: 준비/쿨다운/불가)으로 분리, 양방향 크로스 링크.</div>
+      <div class="tr">
+        <b class="p">+</b> 정책은 General·객체는 계정 — IA 예측 가능성. 기존 설정행 문법 그대로.<br>
+        <b class="p">+</b> API의 명시적 PUT에 맞는 신중한 적용 버튼.<br>
+        <b class="n">−</b> 모드와 그 효과(계정 상태)가 다른 카테고리 — 이동 필요.<br>
+        <b class="n">−</b> 잠금 상태는 검토용 정적 복제 카드로 병치(실화면은 한 상태만).</div>
+      <div class="corr"><b>도제 기록</b> 툴 없이 발췌 인라인 지휘(게이트웨이가 이 모델의 툴+reasoning 병용 거부) · 탭 라벨을 배포 크롬(영문)으로 정규화</div>
+      <div class="open"><a href="_routing-a.html">열기</a><span class="hint">rail 전환 동작 — General ↔ Claude 계정 클릭</span></div>
+    </div>
+
+    <div class="pcard">
+      <div class="top"><span class="letter">B</span><h2>정책은 풀 옆에</h2></div>
+      <div class="director"><span class="m">claude-fable-5</span> 프로덕트 / 워크플로</div>
+      <div class="take">계정 카드 안, 로컬 히어로와 등록 계정 사이의 <b>"계정 풀 라우팅" 스트립</b>(select+적용, balanced 미리보기).
+        fallback에선 폴백 체인 라인이 자라나고 행 배지·확장 행의 쿨다운 밴드와 색으로 상호 참조 — 429 인시던트가 한 화면에서 읽힘.</div>
+      <div class="tr">
+        <b class="p">+</b> 모드 확인→쿨다운 확인→핀 변경이 카드 안에서 완결.<br>
+        <b class="p">+</b> 신규 인터랙션 패턴 0 — 전부 기존 어휘 재배치.<br>
+        <b class="n">−</b> 카드가 길어짐 — 히어로·정책·리스트 3개 개념이 리스트 앞에 적층.<br>
+        <b class="n">−</b> 체인 라인이 행 배지와 정보 중복 — 중복이면 배지만 남기는 축소 여지.</div>
+      <div class="corr"><b>도제 기록</b> 보정 없음 — 전 어휘 배포 CSS 실재 확인</div>
+      <div class="open"><a href="_routing-b.html">열기</a><span class="hint">상태 B(인시던트) 세로 읽기가 핵심 논증</span></div>
+    </div>
+
+    <div class="pcard">
+      <div class="top"><span class="letter">C</span><h2>컨트롤 해부학</h2></div>
+      <div class="director"><span class="m">gemini-3.1-pro-preview</span> 인터랙션 / 에고노믹스</div>
+      <div class="take">계정 카드 헤더 바로 아래 <code>.srow</code> + <b>즉시 적용 세그먼트 토글</b>(단일/순차 폴백/분산-준비 중).
+        APPLIED 토스트가 적용 확인. 기본/폴백/잠금 세 상태를 카드 3장으로 병치해 컨트롤의 상태 전이를 비교.</div>
+      <div class="tr">
+        <b class="p">+</b> 2-상태 토글의 즉시성 — 라우팅 스위치라는 본성에 부합.<br>
+        <b class="p">+</b> 효과가 렌더되는 행 바로 위 — 설정과 풀 상태를 잇는 다리.<br>
+        <b class="n">−</b> 계정 카드 수직 공간 소모.<br>
+        <b class="n">−</b> 즉시 적용은 트래픽에 바로 영향 — 실수 클릭 비용은 검토 필요.</div>
+      <div class="corr"><b>도제 기록</b> 툴 없이 발췌 인라인 지휘(gemini-3.x 툴 루프 게이트웨이 결함) · 보정 없음(.seg는 배포 어휘로 확인)</div>
+      <div class="open"><a href="_routing-c.html">열기</a><span class="hint">첫 카드의 토글은 실제로 움직임 + 토스트</span></div>
+    </div>
+
+    <div class="pcard challenger">
+      <div class="top"><span class="letter">D</span><h2>서빙 파이프라인</h2><span class="challenger-tag">CHALLENGER</span></div>
+      <div class="director"><span class="m">grok-4.5</span> 실현성 / 시스템 충실도</div>
+      <div class="take">서빙 핀 + 라우팅 모드 = <b>하나의 "서빙 정책" 객체</b>. 카드 상단을 파이프라인 스트립으로 재구성 —
+        핀이 체인 머리, 모드가 체인 모양을 실시간 재성형(단일=1칸+회색 / 폴백=쿨다운 복귀시각 / 균형=ghost 미리보기). 리스트 행에도 서수·상태 동기화.</div>
+      <div class="tr">
+        <b class="p">+</b> 모드의 의미가 카피가 아니라 그림으로 전달. 3개 pool read만으로 전 픽셀 공급.<br>
+        <b class="p">+</b> 세그먼트 즉시 적용 — 파이프라인 프리뷰가 곧 확인 UI.<br>
+        <b class="n">−</b> 카드 상단 무거워짐, 행 정보 밀도·스캔 비용 상승.<br>
+        <b class="n">−</b> 체인 순서가 status members 배열 순서에 의존(명시 정렬 API 없음).</div>
+      <div class="corr"><b>도제 기록</b> 1차 run HTML 미제출 → 재디스패치 · balanced 세그먼트 <code>disabled→aria-disabled</code> 보정(지휘된 클릭-미리보기가 브라우저에서 실제 동작하도록)</div>
+      <div class="open"><a href="_routing-d.html">열기</a><span class="hint">세그먼트를 눌러 체인 재성형 + "장면" 스위치로 env-locked</span></div>
+    </div>
+  </div>
+</div>
+
+<div style="position:fixed;right:16px;bottom:16px;z-index:80;background:#172026;color:#f2f4f5;border-radius:999px;padding:8px 6px;display:flex;gap:2px;font:600 12px ui-monospace,monospace;box-shadow:0 6px 20px rgba(0,0,0,.3)">
+<a href="_routing-proposals.html" style="text-decoration:none;padding:4px 10px;background:#f2f4f5;color:#172026;border-radius:999px">허브</a>
+<a href="_routing-a.html" style="color:inherit;text-decoration:none;padding:4px 10px">A</a>
+<a href="_routing-b.html" style="color:inherit;text-decoration:none;padding:4px 10px">B</a>
+<a href="_routing-c.html" style="color:inherit;text-decoration:none;padding:4px 10px">C</a>
+<a href="_routing-d.html" style="color:inherit;text-decoration:none;padding:4px 10px">D</a>
+</div>
+</body>
+</html>

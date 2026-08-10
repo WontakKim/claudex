@@ -1,0 +1,362 @@
+:root{
+  --canvas:#f2f4f5; --panel:#ffffff; --inset:#e9edf0; --text:#172026; --muted:#56616a; --line:#7a858d;
+  --accent:#1d5fbf; --accent-soft:#e3edfa; --ok:#1a7f4b; --ok-soft:#e2f2e9; --warn:#8a5d00; --warn-soft:#f7ecd4; --err:#a03427; --err-soft:#f7e3e0;
+  --wire:#98a4ad;
+  --sk-shine:linear-gradient(90deg,var(--inset) 25%,
+    color-mix(in srgb,var(--text) 10%,var(--inset)) 50%,var(--inset) 75%);
+  --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  --sans:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+}
+@media (prefers-color-scheme: dark){
+  :root{ --canvas:#111417; --panel:#191e22; --inset:#232a2f; --text:#f1f4f6; --muted:#aab4bc; --line:#68747d;
+         --accent:#5da2e8; --accent-soft:#173044; --ok:#5cbd8a; --ok-soft:#15301f; --warn:#cfa24d; --warn-soft:#37301c; --err:#d8746a; --err-soft:#3a1f1b;
+         --wire:#5a666f; }
+}
+*{box-sizing:border-box} body{margin:0;background:var(--canvas);color:var(--text);font:15.5px/1.45 var(--sans);padding-bottom:90px}
+.doc{max-width:1120px;margin:0 auto;padding:0 24px}
+header{height:60px;display:flex;align-items:baseline;gap:14px;padding-top:14px}
+header h1{font-size:26px;font-weight:650;margin:0;line-height:1.2}
+header .ep{font:13px var(--mono);color:var(--muted)}
+.health{margin-left:auto;display:flex;gap:14px;font-size:13px;font-weight:600}
+.health span{cursor:pointer}
+.health .ok{color:var(--ok)} .health .er{color:var(--err)} .health .dg{color:var(--warn)}
+nav.tabs{display:flex;gap:4px;margin-top:16px;border-bottom:2px solid var(--line)}
+nav.tabs a{font:600 15px var(--sans);color:var(--muted);text-decoration:none;padding:10px 18px;border-radius:8px 8px 0 0}
+nav.tabs a.on{background:var(--text);color:var(--canvas)}
+nav.tabs a:not(.on):hover{background:var(--inset)}
+nav.tabs .cnt{font:600 12px var(--mono);color:var(--accent);margin-left:6px}
+nav.tabs a.on .cnt{color:var(--canvas)}
+main>section{display:none;padding-top:20px}
+body[data-tab="settings"] #tab-settings,body[data-tab="status"] #tab-status,body[data-tab="map"] #tab-map,body[data-tab="log"] #tab-log{display:block}
+.card{background:var(--panel);border-radius:8px;padding:18px;box-shadow:0 1px 3px rgba(0,0,0,.07);margin-bottom:16px}
+.card h2{font-size:20px;font-weight:650;margin:0 0 4px}
+.card .sub{font-size:14px;color:var(--muted);margin-bottom:14px}
+/* The plan qualifies the whole card. Cards with a login-status box carry it
+   inside that box, above the state line; Claude has no such box, so there it
+   reads under the description. Empty collapses either way, so a provider that
+   reports no plan — or a card still loading — keeps the original spacing. */
+.cardplan{margin:-9px 0 14px;font:400 13px var(--sans);color:var(--muted)}
+.cardplan b{display:inline-block;padding:2px 10px;border-radius:999px;background:var(--inset);
+  color:var(--text);font:700 12px var(--mono);letter-spacing:.04em;text-transform:uppercase}
+.cardplan:empty{display:none}
+.stat .cardplan{flex-basis:100%;margin:0 0 -4px;color:inherit}
+.stat{display:flex;align-items:center;gap:12px;flex-wrap:wrap;border-radius:6px;padding:12px 14px;font-weight:600}
+/* Only this inner line is rewritten on a health render, so the plan the usage
+   probe wrote into the same box survives. */
+.statline{flex-basis:100%;display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+.stat.err{background:var(--err-soft);color:var(--err)}
+.stat.okv{background:var(--ok-soft);color:var(--ok)}
+.stat .detail{font:400 13.5px var(--sans);color:var(--muted)}
+.stat .codeblock{flex-basis:100%;display:flex;align-items:center;gap:10px;background:color-mix(in srgb,var(--text) 8%,transparent);border-radius:6px;padding:8px 12px;font:400 13px var(--mono);color:var(--text);overflow-wrap:anywhere}
+.kv{display:grid;grid-template-columns:220px 1fr;gap:8px 16px;font-size:14.5px;margin-top:16px;align-items:center}
+.kv .kvh{font:700 12px var(--sans);color:var(--muted);letter-spacing:.08em}
+.kv .k{color:var(--muted);display:flex;align-items:center} .kv .v{font-family:var(--mono)}
+.kv .k code{display:inline-block;font:600 12.5px var(--mono);background:color-mix(in srgb,var(--text) 8%,transparent);border-radius:6px;padding:6px 10px}
+/* A skeleton carries the placeholder text it stands in for, painted
+   transparent, so its line box is exactly as tall as the line that replaces
+   it and the card never resizes as data lands. */
+@keyframes skshine{from{background-position:200% 0}to{background-position:-200% 0}}
+.sk{display:inline-block;color:transparent;border-radius:4px;user-select:none;-webkit-user-select:none;
+  background:var(--sk-shine);background-size:200% 100%;animation:skshine 1.4s linear infinite}
+.cardplan b.sk{color:transparent}
+@media (prefers-reduced-motion: reduce){.sk{animation:none}}
+.uwin{margin-top:16px}
+.uwin-h{display:flex;justify-content:space-between;align-items:baseline;font:600 14px var(--sans);margin-bottom:6px}
+.uwin-h .upct{font-family:var(--mono)}
+.ubar{height:8px;border-radius:999px;background:var(--inset);overflow:hidden}
+.ubar i{display:block;height:100%;border-radius:999px;background:var(--ok)}
+.ubar i.warn{background:var(--warn)} .ubar i.err{background:var(--err)}
+.ureset{margin-top:5px;font-size:12.5px;color:var(--muted)}
+.ucard-h{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}
+.ucard-h h2{margin:0 0 4px}
+.urefresh{flex:none;font:600 13px var(--mono);border:1.5px solid var(--line);background:var(--panel);
+  color:var(--muted);border-radius:999px;padding:6px 14px;cursor:pointer}
+.urefresh:hover{background:var(--inset);color:var(--text)}
+.urefresh:disabled{opacity:.5;cursor:default}
+.umeta{margin-top:14px;font:400 12.5px var(--sans);color:var(--muted)}
+.umeta b{color:var(--text);font-weight:600;font-family:var(--mono)}
+/* The reset-credit line owns everything about credits: the count, the state
+   when there are none, and the only control that spends one. */
+.uact{margin-top:16px;padding-top:14px;border-top:1px solid var(--inset);display:flex;
+  align-items:center;gap:10px;flex-wrap:wrap}
+.uact .lbl{font:600 13.5px var(--sans)}
+.uact .num{font:600 13.5px var(--mono);color:var(--accent)}
+.uact button{flex:none;margin-left:4px;font:600 13.5px var(--sans);border:1.5px solid var(--warn);
+  background:var(--panel);color:var(--warn);border-radius:6px;padding:7px 14px;cursor:pointer}
+.uact button:hover{background:var(--warn-soft)}
+.uact button:disabled{opacity:.5;cursor:default}
+.uact .hint{font:400 12.5px var(--sans);color:var(--muted)}
+/* Placeholders have to out-rank the colours of what they stand in for, so
+   these follow the rules above rather than sitting with the other .sk styles. */
+.uact .sk{color:transparent}
+.uact button.sk{opacity:1;border-color:transparent;background:var(--sk-shine);background-size:200% 100%}
+/* Confirm dialog for the one action here that cannot be undone. */
+.modalwrap{position:fixed;inset:0;z-index:70;display:none;align-items:center;justify-content:center;
+  background:rgba(0,0,0,.45);padding:24px}
+.modalwrap.open{display:flex}
+.modal{background:var(--panel);border-radius:10px;box-shadow:0 16px 48px rgba(0,0,0,.3);
+  padding:22px 24px;width:min(420px,100%)}
+.modal h3{margin:0 0 10px;font-size:18px;font-weight:650}
+.modal p{margin:0;font-size:14.5px;line-height:1.6;color:var(--muted)}
+.modal p b{color:var(--text)}
+.modal .warn{margin-top:10px;color:var(--warn);font-weight:600}
+.modal-actions{margin-top:20px;display:flex;justify-content:flex-end;gap:8px}
+.modal-actions button{font:600 14px var(--sans);border-radius:6px;padding:9px 18px;cursor:pointer}
+.modal-actions .cancel{background:var(--panel);border:1.5px solid var(--line);color:var(--text)}
+.modal-actions .cancel:hover{background:var(--inset)}
+.modal-actions .go{background:var(--warn);border:0;color:#fff}
+.modal-actions button:disabled{opacity:.5;cursor:default}
+.ubody{margin-top:16px}
+.logbox{margin-top:12px;background:var(--inset);border-radius:6px;padding:10px 12px;font:12.5px/1.7 var(--mono);
+  height:420px;overflow-y:auto;overflow-x:hidden}
+.logline{white-space:pre-wrap;overflow-wrap:anywhere}
+.logline .lts{color:var(--muted);margin-right:8px}
+.logline .llv{font-weight:700;margin-right:8px}
+.llv.DEBUG{color:var(--muted)} .llv.INFO{color:var(--ok)} .llv.WARNING{color:var(--warn)}
+.llv.ERROR,.llv.CRITICAL{color:var(--err)}
+.logempty{color:var(--muted)}
+.seg{display:flex;gap:8px;margin-top:12px}
+.seg button{font:600 13px var(--mono);border:1.5px solid var(--line);background:var(--panel);color:var(--muted);
+  border-radius:999px;padding:8px 14px;cursor:pointer}
+.seg button.on{background:var(--text);border-color:var(--text);color:var(--canvas)}
+.seg button:disabled{opacity:.5;cursor:default}
+.tx{flex:1;overflow-wrap:anywhere}
+.cp{display:inline-flex;align-items:center;justify-content:center;flex:none;width:28px;height:28px;
+  border:0;background:none;border-radius:6px;color:var(--muted);cursor:pointer;padding:0}
+.cp:hover{background:color-mix(in srgb,var(--text) 8%,transparent);color:var(--text)}
+.cp svg{display:block}
+.nicon{display:inline-flex;vertical-align:middle;margin-right:7px}
+.nicon svg{display:block}
+.node .name{vertical-align:middle}
+.board{position:relative;background:var(--panel);border-radius:10px;box-shadow:0 1px 3px rgba(0,0,0,.07);height:460px;overflow:hidden;cursor:grab}
+.board.panning{cursor:grabbing}
+#layer{position:absolute;inset:0;will-change:transform;pointer-events:none;transform-origin:0 0;z-index:1}
+#layer .node{pointer-events:auto}
+.ztools{position:absolute;left:14px;bottom:14px;z-index:6;display:flex;align-items:center;gap:2px;
+  background:var(--panel);border:1.5px solid var(--line);border-radius:8px;padding:4px}
+.ztools button{border:0;background:none;color:var(--text);font:600 15px var(--sans);width:30px;height:28px;
+  border-radius:6px;cursor:pointer}
+.ztools button:hover{background:var(--inset)}
+.ztools .pct{font:600 12.5px var(--mono);color:var(--muted);min-width:46px;text-align:center;cursor:pointer}
+/* Sits opposite the zoom tools on the bottom edge, so neither floating
+   control covers the target column the nodes stack down. */
+.addnode{position:absolute;right:14px;bottom:14px;z-index:6}
+.addnode>button{font:600 13px var(--mono);border:1.5px solid var(--line);background:var(--panel);
+  color:var(--text);border-radius:8px;padding:7px 13px;cursor:pointer}
+.addnode>button:hover{background:var(--inset)}
+.addform{display:none;position:absolute;right:0;bottom:40px;width:272px;background:var(--panel);
+  border:1.5px solid var(--line);border-radius:8px;padding:10px;box-shadow:0 6px 20px rgba(0,0,0,.16)}
+.addform.open{display:block}
+.addprov{display:flex;gap:6px;margin-bottom:8px}
+.addprov button{flex:1;font:600 12.5px var(--mono);border:1.5px solid var(--line);background:var(--panel);
+  color:var(--muted);border-radius:999px;padding:6px 0;cursor:pointer}
+.addprov button.on{background:var(--text);border-color:var(--text);color:var(--canvas)}
+.addrow{display:flex;gap:6px}
+.addrow input{flex:1;min-width:0;font:600 13.5px var(--mono);background:var(--inset);
+  border:1.5px solid transparent;border-radius:6px;padding:8px 10px;color:var(--text)}
+.addrow input:focus{outline:none;border-color:var(--accent)}
+.addrow button{flex:none;font:600 13.5px var(--sans);background:var(--accent);color:#fff;border:0;
+  border-radius:6px;padding:0 14px;cursor:pointer}
+svg#wires{position:absolute;inset:0;width:100%;height:100%}
+svg#wires path.w{fill:none;stroke:var(--wire);stroke-width:2.5;pointer-events:visibleStroke;cursor:pointer}
+svg#wires path.w.chg{stroke:var(--warn);stroke-width:3;stroke-dasharray:7 5}
+svg#wires path.w.ghost{opacity:.28;pointer-events:none}
+svg#wires path.flow.ghostflow{opacity:.28;pointer-events:none}
+svg#wires path.w.sel{stroke-width:5;filter:drop-shadow(0 0 3px var(--accent))}
+svg#wires path.temp{fill:none;stroke:var(--accent);stroke-width:2.5;stroke-dasharray:6 5;pointer-events:none}
+@keyframes flowmove{to{stroke-dashoffset:-54}}
+svg#wires path.flow{fill:none;stroke:var(--ok);stroke-width:7;stroke-dasharray:6 48;
+  animation:flowmove 1.4s linear infinite;pointer-events:none;opacity:.9}
+@media (prefers-reduced-motion: reduce){svg#wires path.flow{animation:none;opacity:.35}}
+.node{position:absolute;width:222px;background:var(--inset);border:1.5px solid transparent;border-radius:8px;
+  padding:10px 12px;font:600 15px var(--mono);cursor:grab;user-select:none;-webkit-user-select:none;touch-action:none}
+.node:active{cursor:grabbing}
+.node .st{display:block;font:600 11px var(--mono);margin-top:2px;color:var(--muted)}
+.node .st .dr{color:var(--warn)}
+@keyframes liveping{0%{box-shadow:0 0 0 0 color-mix(in srgb,var(--ok) 55%,transparent)}70%,100%{box-shadow:0 0 0 9px transparent}}
+.node.live .port{border-color:var(--ok);background:var(--ok);animation:liveping 1.4s ease-out infinite}
+@media (prefers-reduced-motion: reduce){.node.live .port{animation:none}}
+.node.src{left:24px;cursor:default} .node.tgt{right:24px;background:var(--panel);border-color:var(--inset)}
+.node.droppable{border-color:var(--ok);box-shadow:0 0 0 3px color-mix(in srgb,var(--ok) 30%,transparent)}
+.node.removed{opacity:.5}.node.removed .name{text-decoration:line-through}
+/* undo lives inline in the always-present status line so toggling it never changes the node height */
+.node .st .undo{color:var(--warn);text-decoration:underline;cursor:pointer;padding:2px 4px;margin:-2px 0}
+.node .x{position:absolute;top:-9px;right:-9px;width:20px;height:20px;border-radius:50%;background:var(--err);
+  border:0;cursor:pointer;display:none;align-items:center;justify-content:center;z-index:5;padding:0}
+.node:hover .x{display:flex}
+/* while a wire drag is active, the port's invisible zone wins over the
+   disconnect button so a grab that starts inside the zone never disconnects */
+body.wiring .node .x{pointer-events:none}
+.node .x svg{display:block}
+.node.src .port{right:-8px}
+.port{position:absolute;top:50%;width:14px;height:14px;border-radius:50%;background:var(--panel);
+  border:3px solid var(--line);transform:translateY(-50%);cursor:crosshair;touch-action:none}
+/* The real clickable drag handle: an invisible zone that spans the node's
+   full height and reaches past the column edge, so the tiny visible dot
+   does not have to be aimed at. pointer-events:auto makes it hittable. */
+.node.src .port::after{content:"";position:absolute;top:-28px;bottom:-28px;
+  left:-8px;right:-20px;pointer-events:auto}
+.node.tgt .port::after{content:"";position:absolute;top:-28px;bottom:-28px;
+  left:-20px;right:-8px;pointer-events:auto}
+/* the handle must sit above the node's own icon/name spans so they do not
+   intercept the drag before the handler sees a port hit */
+.node .port{z-index:3}
+.node.src .port{right:-8px} .node.tgt .port{left:-8px;cursor:crosshair}
+/* A target port with nothing feeding it has no wire to pick up, so it must
+   not advertise a grab: the press just drags the node like the rest of it. */
+.node.tgt .port.idle{cursor:inherit}
+.node.src .port:hover{border-color:var(--accent);background:var(--accent-soft)}
+.wdel{position:absolute;transform:translate(-50%,-50%);background:var(--err);color:#fff;border:0;border-radius:999px;
+  font:700 12px var(--sans);padding:4px 10px;cursor:pointer;display:none;z-index:5}
+.wdel.show{display:block}
+.ctest{margin-top:16px;background:var(--panel);border-radius:8px;padding:16px;display:flex;gap:24px;align-items:flex-start;box-shadow:0 1px 3px rgba(0,0,0,.07)}
+.ctest .l{flex:1}
+.ctest label{display:block;font:600 14px var(--sans);margin-bottom:8px}
+.ctrow{display:flex;gap:8px;align-items:center}
+.ctnode{display:flex;align-items:center;background:var(--inset);border-radius:8px;padding:10px 12px;width:222px;box-sizing:border-box}
+.ctnode.grow{flex:1;width:auto}
+.ctnode input{flex:1;min-width:0;font:600 15px var(--mono);background:none;border:0;padding:0;color:var(--text)}
+.ctnode input:focus{outline:none}
+.ctnode:focus-within{outline:2px solid var(--accent)}
+.ctrow button{font:600 14px var(--sans);background:var(--accent);color:#fff;border:0;border-radius:6px;
+  width:112px;flex:none;padding:11px 0;text-align:center;cursor:pointer}
+.ctrow button:disabled{opacity:.5;cursor:default}
+.cthint{font-size:12.5px;color:var(--muted);margin-top:8px}
+.toast{position:fixed;bottom:84px;right:18px;z-index:60;width:min(440px,calc(100vw - 36px));background:var(--panel);border-left:4px solid var(--ok);
+  border-radius:10px;box-shadow:0 8px 28px rgba(0,0,0,.18);padding:13px 18px;font:14px/1.7 var(--mono);cursor:pointer;
+  animation:toastin .25s ease}
+.toast.err{border-left-color:var(--err)}
+@keyframes toastin{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
+.toast .chip{display:inline-block;padding:2px 9px;border-radius:999px;font:700 12px var(--mono);vertical-align:1px}
+.toast .chip-ok{background:color-mix(in srgb,var(--ok) 14%,transparent);color:var(--ok)}
+.toast .chip-err{background:color-mix(in srgb,var(--err) 12%,transparent);color:var(--err)}
+.toast .lat{color:var(--muted);margin-left:6px}
+.toast .dim{color:var(--muted)}
+.applybar{position:fixed;left:0;right:0;bottom:0;background:var(--panel);border-top:2px solid var(--line);padding:12px 0;display:none}
+body[data-tab="map"] .applybar.dirty{display:block}
+.applybar .in{max-width:1120px;margin:0 auto;padding:0 24px;display:flex;align-items:center;gap:18px;font-size:14.5px}
+.applybar .cnt b{color:var(--accent)}
+.applybar .cnt .dim{color:var(--muted);margin-left:8px}
+.applybar .ghost{margin-left:auto;background:none;border:1.5px solid var(--line);color:var(--muted);border-radius:6px;padding:9px 18px;font:600 15px var(--sans);cursor:pointer}
+.applybar .ghost:hover{background:var(--inset);color:var(--text)}
+.applybar .go{background:var(--accent);color:#fff;border:0;border-radius:6px;padding:10px 20px;font:600 15px var(--sans);cursor:pointer}
+.lockband{display:none;margin-bottom:14px;border:1px solid var(--err);border-radius:8px;color:var(--err);padding:10px 14px;font-size:14px}
+body.env-locked .lockband{display:block}
+body.env-locked .board{pointer-events:none;opacity:.75}
+body.env-locked .applybar{display:none!important}
+/* The compaction card locks independently of the Claude → Codex map above,
+   so it carries its own lock indicator rather than reusing .lockband, which
+   is wired to body.env-locked (the map's own env-lock flag). */
+.complock{display:none;margin-bottom:14px;border:1px solid var(--err);border-radius:8px;color:var(--err);padding:10px 14px;font-size:14px}
+#compaction-card.locked .complock{display:block}
+#comp-select{font:600 14px var(--sans);background:var(--inset);border:1.5px solid transparent;border-radius:6px;padding:9px 10px;color:var(--text)}
+#comp-select:disabled{opacity:.55;cursor:default}
+.comp-custom{display:none;margin-top:10px}
+.comp-custom.show{display:block}
+/* Optional providers (kimi/grok) ship hidden and are revealed by /health:
+   local auth detected, or the map already routes to them (a required login
+   failure must stay visible). Codex is built in and never hides. */
+.provider-hidden{display:none}
+/* Settings tab (probe-final spec): a category rail on the left, a title-less
+   card of multi-line setting rows on the right. The rail lists setting
+   categories; General is the only one until more runtime settings ship. */
+.layout{display:grid;grid-template-columns:240px minmax(0,1fr);gap:20px;align-items:start}
+.rail{display:flex;flex-direction:column;gap:2px;position:sticky;top:16px}
+.rail-item{display:flex;align-items:center;gap:8px;font:600 14.5px var(--sans);color:var(--muted);text-decoration:none;
+  padding:9px 14px;border-left:3px solid transparent;border-radius:0 7px 7px 0}
+.rail-item:hover{background:var(--inset);color:var(--text)}
+.rail-item.on{border-left-color:var(--accent);background:var(--accent-soft);color:var(--accent)}
+.srow{padding:16px 0}
+.srow:first-child{padding-top:4px}
+.srow:last-child{padding-bottom:4px}
+.srow+.srow{border-top:1px solid var(--inset)}
+.srow>div+div{margin-top:12px}
+.srow .name{font:650 17.5px var(--sans)}
+.srow .desc{font-size:13.5px;color:var(--muted);margin-top:8px}
+.srow .ctrow select,.srow .ctrow .ctnode{flex:1;min-width:0}
+.srow .cthint{font-size:11px;color:color-mix(in srgb,var(--muted) 70%,transparent)}
+#compaction-card.locked{border-left:3px solid var(--err);padding-left:14px;margin-left:-17px}
+/* Settings categories: one .scard visible at a time, switched by the rail
+   (data-cat on the section). */
+.scard{display:none}
+#tab-settings[data-cat="general"] #scard-general,
+#tab-settings[data-cat="accounts"] #scard-accounts{display:block}
+/* Claude accounts (Settings > Claude 계정) — mirrors the confirmed probe
+   _design-probes/_accounts-final.html; deviations are bugs. */
+.acct-head{display:flex;align-items:flex-start;justify-content:space-between;gap:14px}
+.acct-head h2{margin:0}
+.acct-head .sub{margin:4px 0 0}
+.add{font:600 13.5px var(--sans);background:var(--accent);color:#fff;border:0;border-radius:6px;padding:8px 15px;cursor:pointer}
+.add:hover{background:color-mix(in srgb,var(--accent) 88%,var(--text))}
+.pill{display:inline-flex;align-items:center;gap:5px;height:20px;padding:0 9px;border-radius:999px;
+  font:700 11px var(--mono);letter-spacing:.02em;white-space:nowrap}
+.pill.same{background:var(--accent-soft);color:var(--accent);font-weight:600}
+.lhero{margin-top:16px;padding:18px 20px;border-radius:10px;background:var(--accent-soft);
+  border:1.5px solid color-mix(in srgb,var(--accent) 35%,transparent)}
+.lhero .ribbon{display:flex;align-items:center;gap:6px;font:700 11px var(--sans);
+  letter-spacing:.06em;text-transform:uppercase;color:var(--accent)}
+.lhero .ribbon::before{content:"";width:8px;height:8px;border-radius:50%;background:var(--accent);flex:none}
+.lhero .ribbon .urefresh{margin-left:auto;padding:4px 11px;font-size:12px;letter-spacing:0;text-transform:none}
+.lhero .who{margin-top:10px;display:flex;align-items:baseline;gap:10px;flex-wrap:wrap}
+.lhero .em{font:650 20px var(--mono);letter-spacing:-.01em}
+.lhero .plan-lg{font:700 12px var(--mono);letter-spacing:.06em;color:var(--muted);
+  background:var(--panel);padding:3px 10px;border-radius:999px}
+.lhero .org{font:400 13px var(--sans);color:var(--muted);margin-top:4px}
+.lhero .org b{color:var(--text);font-weight:600;font-family:var(--mono)}
+.chev{display:inline-block;width:12px;color:var(--muted);font-size:10px;transition:transform .15s ease;flex:none}
+.arow.open .chev{transform:rotate(90deg);color:var(--accent)}
+@media (prefers-reduced-motion:reduce){.chev{transition:none}}
+.tbl-cap{display:flex;align-items:center;gap:10px;margin:18px 0 2px}
+.tbl-cap .t{font:700 10.5px var(--sans);color:var(--muted);letter-spacing:.08em;text-transform:uppercase}
+.tbl-cap .n{font:600 11px var(--mono);color:var(--accent)}
+.tbl-cap .add{margin-left:auto}
+.arow{display:flex;align-items:center;gap:9px;padding:10px 0;cursor:pointer}
+.arow+.arow,.adetail+.arow{border-top:1px solid var(--inset)}
+.arow:hover .em{color:var(--accent)}
+.arow:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}
+.arow .em{font:600 13.5px var(--mono);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.arow .spacer{flex:1}
+.arow .plan-txt{font:700 11.5px var(--mono);color:var(--muted);letter-spacing:.05em}
+.arow .st{display:inline-flex;align-items:center;gap:6px;font:600 12px var(--sans);white-space:nowrap}
+.arow .st.serve{color:var(--accent)}
+.arow .st.serve::before{content:"";width:7px;height:7px;border-radius:50%;background:var(--accent);flex:none}
+.arow .st.reauth{color:var(--err)}
+.adetail{display:none;padding:0 0 16px 21px}
+.adetail.show{display:block}
+.adetail .uwin{margin-top:12px}
+.adetail .kv{margin-top:14px;grid-template-columns:96px 1fr;gap:6px 14px;font-size:13px}
+.adetail .kv .k{font-size:12.5px}
+.adetail .age{margin-top:12px;font:400 12px var(--sans);color:var(--muted)}
+.adetail .age b{color:var(--text);font-weight:600;font-family:var(--mono)}
+.adetail .actions{margin-top:16px;display:flex;gap:8px;align-items:center;
+  padding-top:12px;border-top:1px solid color-mix(in srgb,var(--inset) 70%,transparent)}
+.adetail .actions .spacer{flex:1}
+.unavail{margin-top:12px;padding:11px 13px;border-radius:6px;background:var(--err-soft);color:var(--err);font:600 13px var(--sans)}
+.unavail .hint{display:block;margin-top:3px;font:400 12px var(--sans);color:var(--muted)}
+button.ghost{font:600 13px var(--sans);border:1.5px solid var(--line);background:var(--panel);color:var(--text);border-radius:6px;padding:7px 14px;cursor:pointer}
+button.ghost:hover{background:var(--inset)}
+button.ghost.danger{border-color:color-mix(in srgb,var(--err) 55%,transparent);color:var(--err)}
+button.ghost.danger:hover{background:var(--err-soft)}
+button.ghost:disabled{opacity:.5;cursor:default}
+button.ghost:disabled:hover{background:var(--panel)}
+button.primary{font:600 13px var(--sans);border:0;background:var(--accent);color:#fff;border-radius:6px;padding:8px 15px;cursor:pointer}
+button.primary:hover{background:color-mix(in srgb,var(--accent) 88%,var(--text))}
+button.primary:disabled{opacity:.5;cursor:default}
+/* Accounts screens color the % readout to match its bar's state. */
+.upct.warn{color:var(--warn)} .upct.err{color:var(--err)}
+/* Serving-selection env lock: same banner pattern as the compaction card. */
+.acctlock{display:none;margin-top:14px;border:1px solid var(--err);border-radius:8px;color:var(--err);padding:10px 14px;font-size:14px}
+#scard-accounts.locked .acctlock{display:block}
+/* Login modal (계정 추가): wider than the confirm dialog, code input always
+   visible, no backdrop/Escape close — a silent close would leak a live
+   CLI login child. */
+.modal.wide{width:min(560px,100%)}
+.modal .lgurl{margin-top:12px;display:flex;align-items:center;gap:10px;background:var(--inset);border-radius:6px;padding:8px 12px;font:400 13px var(--mono)}
+.modal .lgurl .tx{flex:1;overflow-wrap:anywhere}
+.modal .lgopen{display:inline-block;margin-top:10px;font:600 13.5px var(--sans);color:var(--accent)}
+.modal .lgrow{margin-top:14px;display:flex;gap:8px}
+.modal .lgrow input{flex:1;min-width:0;font:600 13.5px var(--mono);background:var(--inset);
+  border:1.5px solid transparent;border-radius:6px;padding:8px 10px;color:var(--text)}
+.modal .lgrow input:focus{outline:none;border-color:var(--accent)}
+.modal .lghint{margin-top:12px;font:400 12.5px var(--sans);color:var(--muted)}
+.modal .lghint b{color:var(--text);font-weight:600;font-family:var(--mono)}

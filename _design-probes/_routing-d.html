@@ -1,0 +1,631 @@
+<!-- directed-by: grok-4.5 (Feasibility / Fidelity — CHALLENGER) · run: 2a0188f0-36fd-49aa-9a9f-ccb6c3066d4b · apprentice fix: balanced segment disabled→aria-disabled so the dictated click-preview actually fires -->
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Claudex Gateway — 서빙 정책 (routing probe d)</title>
+<link rel="stylesheet" href="dashboard-real.css">
+<style>
+/* accounts-final structural pieces mirrored (card lives outside shipped scard wiring) */
+.acct-head{display:flex;align-items:flex-start;justify-content:space-between;gap:14px}
+.acct-head h2{margin:0}
+.acct-head .sub{margin:4px 0 0}
+.add{font:600 13.5px var(--sans);background:var(--accent);color:#fff;border:0;border-radius:6px;padding:8px 15px;cursor:pointer}
+.add:hover{background:color-mix(in srgb,var(--accent) 88%,var(--text))}
+
+.pill{display:inline-flex;align-items:center;gap:5px;height:20px;padding:0 9px;border-radius:999px;
+  font:700 11px var(--mono);letter-spacing:.02em;white-space:nowrap}
+.pill.same{background:var(--accent-soft);color:var(--accent);font-weight:600}
+.pill.cd{background:var(--warn-soft);color:var(--warn)}
+.pill.down{background:var(--err-soft);color:var(--err)}
+.pill.out{background:var(--inset);color:var(--muted)}
+
+.st{display:inline-flex;align-items:center;gap:6px;font:600 12px var(--sans);white-space:nowrap}
+.st.serve{color:var(--accent)}
+.st.serve::before{content:"";width:7px;height:7px;border-radius:50%;background:var(--accent);flex:none}
+.st.reauth{color:var(--err)}
+.st.cd{color:var(--warn)}
+.st.cd::before{content:"";width:7px;height:7px;border-radius:50%;background:var(--warn);flex:none}
+.st.ready{color:var(--ok)}
+.st.ready::before{content:"";width:7px;height:7px;border-radius:50%;background:var(--ok);flex:none}
+
+.lhero{margin-top:18px;padding:18px 20px;border-radius:10px;background:var(--accent-soft);
+  border:1.5px solid color-mix(in srgb,var(--accent) 35%,transparent)}
+.lhero .ribbon{display:flex;align-items:center;gap:6px;font:700 11px var(--sans);
+  letter-spacing:.06em;text-transform:uppercase;color:var(--accent)}
+.lhero .ribbon::before{content:"";width:8px;height:8px;border-radius:50%;background:var(--accent);flex:none}
+.lhero .ribbon .urefresh{margin-left:auto;padding:4px 11px;font-size:12px;letter-spacing:0;text-transform:none}
+.lhero .who{margin-top:10px;display:flex;align-items:baseline;gap:10px;flex-wrap:wrap}
+.lhero .em{font:650 20px var(--mono);letter-spacing:-.01em}
+.lhero .plan-lg{font:700 12px var(--mono);letter-spacing:.06em;color:var(--muted);
+  background:var(--panel);padding:3px 10px;border-radius:999px}
+.lhero .org{font:400 13px var(--sans);color:var(--muted);margin-top:4px}
+.lhero .org b{color:var(--text);font-weight:600;font-family:var(--mono)}
+
+.chev{display:inline-block;width:12px;color:var(--muted);font-size:10px;transition:transform .15s ease;flex:none}
+.arow.open .chev{transform:rotate(90deg);color:var(--accent)}
+@media (prefers-reduced-motion:reduce){.chev{transition:none}}
+
+.tbl-cap{display:flex;align-items:center;gap:10px;margin:18px 0 2px}
+.tbl-cap .t{font:700 10.5px var(--sans);color:var(--muted);letter-spacing:.08em;text-transform:uppercase}
+.tbl-cap .n{font:600 11px var(--mono);color:var(--accent)}
+.tbl-cap .add{margin-left:auto}
+.arow{display:flex;align-items:center;gap:9px;padding:10px 0;cursor:pointer}
+.arow+.arow,.adetail+.arow{border-top:1px solid var(--inset)}
+.arow:hover .em{color:var(--accent)}
+.arow:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}
+.arow .em{font:600 13.5px var(--mono);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.arow .spacer{flex:1}
+.arow .plan-txt{font:700 11.5px var(--mono);color:var(--muted);letter-spacing:.05em}
+.arow .ord{font:700 11px var(--mono);color:var(--accent);width:18px;flex:none;text-align:center}
+.arow.is-out .em{color:var(--muted)}
+.arow.is-out .ord{color:var(--muted)}
+.adetail{display:none;padding:0 0 16px 21px}
+.adetail.show{display:block}
+.adetail .uwin{margin-top:12px}
+.adetail .kv{margin-top:14px;grid-template-columns:96px 1fr;gap:6px 14px;font-size:13px}
+.adetail .kv .k{font-size:12.5px}
+.adetail .age{margin-top:12px;font:400 12px var(--sans);color:var(--muted)}
+.adetail .age b{color:var(--text);font-weight:600;font-family:var(--mono)}
+.adetail .actions{margin-top:16px;display:flex;gap:8px;align-items:center;
+  padding-top:12px;border-top:1px solid color-mix(in srgb,var(--inset) 70%,transparent)}
+.adetail .actions .spacer{flex:1}
+.unavail{margin-top:12px;padding:11px 13px;border-radius:6px;background:var(--err-soft);color:var(--err);font:600 13px var(--sans)}
+.unavail .hint{display:block;margin-top:3px;font:400 12px var(--sans);color:var(--muted)}
+.cdbox{margin-top:12px;padding:11px 13px;border-radius:6px;background:var(--warn-soft);color:var(--warn);font:600 13px var(--sans)}
+.cdbox .hint{display:block;margin-top:3px;font:400 12px var(--sans);color:var(--muted)}
+
+button.ghost{font:600 13px var(--sans);border:1.5px solid var(--line);background:var(--panel);color:var(--text);border-radius:6px;padding:7px 14px;cursor:pointer}
+button.ghost:hover{background:var(--inset)}
+button.ghost.danger{border-color:color-mix(in srgb,var(--err) 55%,transparent);color:var(--err)}
+button.ghost.danger:hover{background:var(--err-soft)}
+button.ghost:disabled{opacity:.5;cursor:default}
+button.primary{font:600 13px var(--sans);border:0;background:var(--accent);color:#fff;border-radius:6px;padding:8px 15px;cursor:pointer}
+button.primary:hover{background:color-mix(in srgb,var(--accent) 88%,var(--text))}
+button.primary:disabled{opacity:.5;cursor:default}
+.upct.warn{color:var(--warn)} .upct.err{color:var(--err)}
+
+/* ========== NEW: 서빙 정책 pipeline strip ========== */
+.pol{margin-top:16px;border:1.5px solid color-mix(in srgb,var(--line) 55%,transparent);
+  border-radius:10px;background:var(--panel);overflow:hidden}
+.pol-h{display:flex;align-items:flex-start;justify-content:space-between;gap:14px;flex-wrap:wrap;
+  padding:14px 16px 12px;border-bottom:1px solid var(--inset)}
+.pol-h .ttl{font:700 11px var(--sans);letter-spacing:.08em;text-transform:uppercase;color:var(--muted)}
+.pol-h .ttl b{color:var(--text);font-weight:700;letter-spacing:.04em;text-transform:none;font-size:15px;margin-left:8px}
+.pol-h .blurb{margin-top:6px;font:400 13px var(--sans);color:var(--muted);max-width:46ch;line-height:1.45}
+
+/* segmented mode control — immediate, no 적용 */
+.seg{display:inline-flex;background:var(--inset);border-radius:8px;padding:3px;gap:2px;flex:none}
+.seg button{font:600 13px var(--sans);border:0;background:transparent;color:var(--muted);
+  border-radius:6px;padding:7px 14px;cursor:pointer;position:relative}
+.seg button:hover:not(:disabled):not(.on){color:var(--text)}
+.seg button.on{background:var(--panel);color:var(--accent);
+  box-shadow:0 1px 2px rgba(0,0,0,.08)}
+.seg button:disabled,.seg button[aria-disabled="true"]{opacity:.45;cursor:default}
+.seg button .soon{display:block;font:700 9px var(--mono);letter-spacing:.06em;color:var(--muted);
+  margin-top:1px;text-transform:uppercase}
+.seg button.on .soon{color:color-mix(in srgb,var(--accent) 70%,var(--muted))}
+
+/* pipeline chain */
+.pipe{padding:14px 16px 16px}
+.pipe-cap{display:flex;align-items:baseline;gap:10px;margin-bottom:10px}
+.pipe-cap .t{font:700 10.5px var(--sans);color:var(--muted);letter-spacing:.08em;text-transform:uppercase}
+.pipe-cap .live{font:600 12px var(--sans);color:var(--text)}
+.pipe-cap .live em{font-style:normal;color:var(--accent);font-family:var(--mono);font-weight:700}
+.pipe-cap .hint{margin-left:auto;font:400 12px var(--sans);color:var(--muted)}
+
+.chain{display:flex;align-items:stretch;gap:0;flex-wrap:wrap}
+.clink{display:flex;align-items:center;flex:none;padding:0 6px;color:var(--line);font:700 14px var(--mono)}
+.clink[data-dim="1"]{opacity:.28}
+
+.cnode{flex:1 1 180px;min-width:160px;max-width:280px;border:1.5px solid var(--inset);
+  border-radius:8px;padding:10px 12px;background:var(--canvas);position:relative;
+  transition:opacity .15s ease,border-color .15s ease}
+.cnode .rk{font:700 10px var(--mono);letter-spacing:.08em;text-transform:uppercase;color:var(--muted)}
+.cnode .mail{margin-top:4px;font:650 13px var(--mono);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.cnode .meta{margin-top:6px;display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.cnode .why{margin-top:6px;font:400 11.5px var(--sans);color:var(--muted);line-height:1.35}
+.cnode .why b{font-family:var(--mono);font-weight:600;color:var(--text)}
+
+.cnode.head{border-color:color-mix(in srgb,var(--accent) 45%,transparent);background:var(--accent-soft)}
+.cnode.head .rk{color:var(--accent)}
+.cnode.ready{border-color:color-mix(in srgb,var(--ok) 40%,transparent)}
+.cnode.cooldown{border-color:color-mix(in srgb,var(--warn) 50%,transparent);background:var(--warn-soft)}
+.cnode.cooldown .rk{color:var(--warn)}
+.cnode.unavail{border-color:color-mix(in srgb,var(--err) 35%,transparent);opacity:.72}
+.cnode.out{opacity:.38;filter:grayscale(.35)}
+.cnode.ghost{border-style:dashed;opacity:.5}
+.cnode.ghost .mail{color:var(--muted)}
+
+/* mode-specific caption under chain */
+.pipe-foot{margin-top:12px;font:400 12.5px var(--sans);color:var(--muted);line-height:1.5}
+.pipe-foot b{font-weight:600;color:var(--text)}
+.pipe-foot code{font:600 12px var(--mono);background:var(--inset);padding:1px 6px;border-radius:4px}
+
+/* locked policy: whole strip dims, controls inert */
+#scard-accounts.locked .pol{border-color:color-mix(in srgb,var(--err) 45%,transparent)}
+#scard-accounts.locked .seg button{pointer-events:none}
+#scard-accounts.locked .pipe{opacity:.72}
+
+/* probe scene switcher (design argument only — not product UI) */
+.scene{display:flex;gap:8px;align-items:center;margin:0 0 14px;flex-wrap:wrap}
+.scene .lab{font:700 11px var(--sans);letter-spacing:.08em;text-transform:uppercase;color:var(--muted)}
+.scene button{font:600 12.5px var(--sans);border:1.5px solid var(--line);background:var(--panel);
+  color:var(--muted);border-radius:999px;padding:5px 12px;cursor:pointer}
+.scene button.on{border-color:var(--accent);color:var(--accent);background:var(--accent-soft)}
+.scene button:hover{color:var(--text)}
+</style>
+</head>
+<body data-tab="settings">
+<div class="doc">
+  <header>
+    <h1>Claudex Gateway</h1><span class="ep">127.0.0.1:8787</span>
+    <div class="health"><span class="ok">Claude ✓</span><span class="ok">Codex ✓</span></div>
+  </header>
+  <nav class="tabs">
+    <a href="#settings" class="on">Settings</a>
+    <a href="#status">Status</a>
+    <a href="#map">Router</a>
+    <a href="#log">Log</a>
+  </nav>
+  <main>
+    <section id="tab-settings" data-cat="accounts" style="display:block;padding-top:20px">
+      <div class="layout">
+        <nav class="rail" aria-label="설정 종류">
+          <a class="rail-item" href="#settings/general">General</a>
+          <a class="rail-item on" href="#settings/accounts">Claude 계정</a>
+        </nav>
+
+        <div class="card scard" id="scard-accounts" style="display:block">
+          <div class="acct-head">
+            <div>
+              <h2>Claude 계정</h2>
+              <div class="sub">게이트웨이가 서빙에 쓰는 등록 계정과 이 머신의 로컬 Claude Code 로그인입니다.</div>
+            </div>
+          </div>
+
+          <!-- probe-only scene rail: flip live vs env-locked compositions -->
+          <div class="scene" id="scene-rail" aria-label="프로브 장면">
+            <span class="lab">장면</span>
+            <button type="button" class="on" data-scene="live">편집 가능</button>
+            <button type="button" data-scene="locked">env-locked</button>
+          </div>
+
+          <div class="acctlock" id="acct-lockband"><b>LOCKED</b> — <code>CLAUDEX_CLAUDE_ACCOUNT_ROUTING</code> · <code>CLAUDEX_CLAUDE_ACCOUNT</code> 환경변수가 우선합니다. 서빙 정책은 열람 전용입니다.</div>
+
+          <!-- ========== 서빙 정책 = pin(head) + mode(pipeline shape) ========== -->
+          <div class="pol" id="serving-policy" data-mode="fallback">
+            <div class="pol-h">
+              <div>
+                <div class="ttl">서빙 정책<span style="color:var(--text);font:700 15px var(--sans);letter-spacing:0;text-transform:none;margin-left:8px">Serving pipeline</span></div>
+                <div class="blurb" id="pol-blurb">서빙 계정이 체인의 머리입니다. 모드가 그 뒤로 이어지는 파이프라인 모양을 바꿉니다.</div>
+              </div>
+              <div class="seg" role="radiogroup" aria-label="라우팅 모드" id="mode-seg">
+                <button type="button" role="radio" aria-checked="false" data-mode="disabled">단일</button>
+                <button type="button" role="radio" aria-checked="true" class="on" data-mode="fallback">폴백</button>
+                <button type="button" role="radio" aria-checked="false" data-mode="balanced" aria-disabled="true" title="API 미구현 · 미리보기">균형<span class="soon">soon</span></button>
+              </div>
+            </div>
+
+            <div class="pipe">
+              <div class="pipe-cap">
+                <span class="t">요청 경로</span>
+                <span class="live" id="pipe-live">머리 <em>wontak@wrtn.io</em> → ready 순 폴백</span>
+                <span class="hint" id="pipe-hint">pool/serving + pool/status</span>
+              </div>
+
+              <!-- chain nodes fed only by serving + status (+ mode) -->
+              <div class="chain" id="chain">
+                <!-- head: serving pin, currently in cooldown (Fable 주간) -->
+                <div class="cnode head cooldown" data-id="a1" data-state="cooldown">
+                  <div class="rk">1 · 머리 · 서빙</div>
+                  <div class="mail">wontak@wrtn.io</div>
+                  <div class="meta">
+                    <span class="pill cd">쿨다운</span>
+                    <span class="plan-txt">MAX</span>
+                  </div>
+                  <div class="why">Fable 주간 소진 · <b>08-12 06:00 KST</b> 복귀</div>
+                </div>
+                <div class="clink" aria-hidden="true" data-edge="1">→</div>
+                <!-- next ready -->
+                <div class="cnode ready" data-id="a2" data-state="ready">
+                  <div class="rk">2 · 폴백</div>
+                  <div class="mail">ai-platform@wrtn.io</div>
+                  <div class="meta">
+                    <span class="pill same">ready</span>
+                    <span class="plan-txt">PRO</span>
+                  </div>
+                  <div class="why">현재 실서빙 후보 · 로컬 CLI 동일</div>
+                </div>
+                <div class="clink" aria-hidden="true" data-edge="2">→</div>
+                <!-- unavailable -->
+                <div class="cnode unavail" data-id="a3" data-state="unavailable">
+                  <div class="rk">3 · 제외</div>
+                  <div class="mail">dev-test@wrtn.io</div>
+                  <div class="meta">
+                    <span class="pill down">unavailable</span>
+                  </div>
+                  <div class="why">토큰 만료 · 재로그인 필요</div>
+                </div>
+              </div>
+
+              <div class="pipe-foot" id="pipe-foot">
+                <b>폴백</b> — 429를 받은 계정은 쿨다운에 들어가고, 체인의 다음 <b>ready</b>로 넘깁니다. 복귀 시각이 지나면 자동으로 다시 끼어듭니다.
+                머리 계정은 <code>pool/serving</code> 핀으로 고릅니다.
+              </div>
+            </div>
+          </div>
+
+          <!-- local CLI hero (unchanged role) -->
+          <div class="lhero" id="local-sec">
+            <div class="ribbon">로컬 CLI 로그인
+              <button type="button" class="urefresh" id="btn-local-refresh">갱신</button>
+            </div>
+            <div class="who">
+              <span class="em">ai-platform@wrtn.io</span>
+              <span class="plan-lg">PRO</span>
+            </div>
+            <div class="org">Wrtn AI Platform · 게이트웨이 서빙과 무관 · <b>2분 전</b> 기준</div>
+            <div class="uwin">
+              <div class="uwin-h"><span>세션 윈도우</span><span class="upct err">97%</span></div>
+              <div class="ubar"><i class="err" style="width:97%"></i></div>
+              <div class="ureset">15:00 리셋 (2시간 34분 후)</div>
+            </div>
+            <div class="uwin">
+              <div class="uwin-h"><span>주간 윈도우</span><span class="upct warn">88%</span></div>
+              <div class="ubar"><i class="warn" style="width:88%"></i></div>
+              <div class="ureset">일요일 21:00 리셋 (5일 6시간 후)</div>
+            </div>
+          </div>
+
+          <div class="tbl-cap">
+            <span class="t">등록 계정</span><span class="n">3</span>
+            <button type="button" class="add" id="btn-add-account">계정 추가</button>
+          </div>
+
+          <!-- list doubles as chain roster: ordinal + routing_state surface in fallback -->
+          <div id="acct-list">
+            <!-- 1 · chain head / serving pin -->
+            <div class="arow" data-id="a1" tabindex="0" role="button" aria-expanded="false">
+              <span class="chev" aria-hidden="true">▶</span>
+              <span class="ord" data-ord>1</span>
+              <span class="em">wontak@wrtn.io</span>
+              <span class="st serve" data-row-st>서빙 · 머리</span>
+              <span class="spacer"></span>
+              <span class="pill cd" data-row-pill>쿨다운 · 08-12 06:00</span>
+              <span class="plan-txt">MAX</span>
+            </div>
+            <div class="adetail" data-for="a1">
+              <div class="cdbox">Fable 주간 한도 소진 — 쿨다운 중
+                <span class="hint">2026-08-12 06:00 KST에 자동 복귀합니다. 폴백 모드에서는 다음 ready 계정으로 넘어갑니다.</span>
+              </div>
+              <div class="uwin">
+                <div class="uwin-h"><span>세션 윈도우</span><span class="upct">62%</span></div>
+                <div class="ubar"><i style="width:62%"></i></div>
+                <div class="ureset">14:30 리셋 (2시간 4분 후)</div>
+              </div>
+              <div class="uwin">
+                <div class="uwin-h"><span>주간 윈도우</span><span class="upct">41%</span></div>
+                <div class="ubar"><i style="width:41%"></i></div>
+                <div class="ureset">금요일 09:00 리셋 (2일 18시간 후)</div>
+              </div>
+              <div class="uwin">
+                <div class="uwin-h"><span>Fable 주간</span><span class="upct err">100%</span></div>
+                <div class="ubar"><i class="err" style="width:100%"></i></div>
+                <div class="ureset">08-12 06:00 리셋 (쿨다운)</div>
+              </div>
+              <div class="age">사용량 <b>1분 전</b> 기준</div>
+              <div class="kv">
+                <span class="k">플랜</span><span class="v">MAX</span>
+                <span class="k">조직</span><span class="v">Wrtn</span>
+                <span class="k">라우팅</span><span class="v">cooldown · head</span>
+                <span class="k">추가</span><span class="v">2026-07-12</span>
+                <span class="k">마지막 인증</span><span class="v">2026-08-08</span>
+              </div>
+              <div class="actions">
+                <button type="button" class="ghost">머리 해제</button>
+                <span class="spacer"></span>
+                <button type="button" class="ghost danger">제거</button>
+              </div>
+            </div>
+
+            <!-- 2 · ready fallback -->
+            <div class="arow" data-id="a2" tabindex="0" role="button" aria-expanded="false">
+              <span class="chev" aria-hidden="true">▶</span>
+              <span class="ord" data-ord>2</span>
+              <span class="em">ai-platform@wrtn.io</span>
+              <span class="st ready" data-row-st>ready</span>
+              <span class="spacer"></span>
+              <span class="pill same" data-row-pill>폴백 1순위</span>
+              <span class="plan-txt">PRO</span>
+            </div>
+            <div class="adetail" data-for="a2">
+              <div class="uwin">
+                <div class="uwin-h"><span>세션 윈도우</span><span class="upct err">97%</span></div>
+                <div class="ubar"><i class="err" style="width:97%"></i></div>
+                <div class="ureset">15:00 리셋 (2시간 34분 후)</div>
+              </div>
+              <div class="uwin">
+                <div class="uwin-h"><span>주간 윈도우</span><span class="upct warn">88%</span></div>
+                <div class="ubar"><i class="warn" style="width:88%"></i></div>
+                <div class="ureset">일요일 21:00 리셋 (5일 6시간 후)</div>
+              </div>
+              <div class="age">사용량 <b>2분 전</b> 기준</div>
+              <div class="kv">
+                <span class="k">플랜</span><span class="v">PRO</span>
+                <span class="k">조직</span><span class="v">Wrtn AI Platform</span>
+                <span class="k">라우팅</span><span class="v">ready</span>
+                <span class="k">추가</span><span class="v">2026-06-03</span>
+                <span class="k">마지막 인증</span><span class="v">2026-08-09</span>
+                <span class="k">로컬 CLI</span><span class="v"><span class="pill same">동일 계정</span></span>
+              </div>
+              <div class="actions">
+                <button type="button" class="primary">이 계정을 머리로</button>
+                <span class="spacer"></span>
+                <button type="button" class="ghost danger">제거</button>
+              </div>
+            </div>
+
+            <!-- 3 · unavailable -->
+            <div class="arow" data-id="a3" tabindex="0" role="button" aria-expanded="false">
+              <span class="chev" aria-hidden="true">▶</span>
+              <span class="ord" data-ord>3</span>
+              <span class="em">dev-test@wrtn.io</span>
+              <span class="st reauth" data-row-st>⚠ 재로그인 필요</span>
+              <span class="spacer"></span>
+              <span class="pill down" data-row-pill>unavailable</span>
+              <span class="plan-txt">—</span>
+            </div>
+            <div class="adetail" data-for="a3">
+              <div class="unavail">사용량을 불러올 수 없습니다.
+                <span class="hint">토큰이 만료됐습니다. 다시 로그인하면 이 자리에서 갱신되고 체인에 복귀합니다.</span>
+              </div>
+              <div class="kv">
+                <span class="k">조직</span><span class="v" style="color:var(--muted);font-style:italic">없음</span>
+                <span class="k">라우팅</span><span class="v">unavailable</span>
+                <span class="k">추가</span><span class="v">2026-08-01</span>
+                <span class="k">마지막 인증</span><span class="v">2026-08-02</span>
+              </div>
+              <div class="actions">
+                <button type="button" class="primary">다시 로그인</button>
+                <span class="spacer"></span>
+                <button type="button" class="ghost danger">제거</button>
+              </div>
+            </div>
+          </div>
+
+        </div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<script>
+(function(){
+  /* ----- row expand (accounts-final behavior) ----- */
+  var list=document.getElementById("acct-list");
+  list.addEventListener("click",function(e){
+    if(e.target.closest("button"))return;
+    var row=e.target.closest(".arow"); if(!row)return;
+    var open=!row.classList.contains("open");
+    row.classList.toggle("open",open);
+    row.setAttribute("aria-expanded",open?"true":"false");
+    var det=list.querySelector('.adetail[data-for="'+row.getAttribute("data-id")+'"]');
+    if(det)det.classList.toggle("show",open);
+  });
+  list.addEventListener("keydown",function(e){
+    if(e.key!=="Enter"&&e.key!==" ")return;
+    var row=e.target.closest(".arow"); if(!row)return;
+    e.preventDefault();row.click();
+  });
+
+  /* ----- mode → pipeline reshape (the design argument) ----- */
+  var pol=document.getElementById("serving-policy");
+  var blurb=document.getElementById("pol-blurb");
+  var live=document.getElementById("pipe-live");
+  var foot=document.getElementById("pipe-foot");
+  var seg=document.getElementById("mode-seg");
+  var chain=document.getElementById("chain");
+  var card=document.getElementById("scard-accounts");
+
+  function isOff(b){return b.disabled||b.getAttribute("aria-disabled")==="true"}
+  var copy={
+    disabled:{
+      blurb:"단일 서빙 계정만 사용합니다. 429는 그대로 클라이언트에 전달되고, 다른 등록 계정은 체인에 끼지 않습니다.",
+      live:'머리 <em>wontak@wrtn.io</em> 단독 · 폴백 없음',
+      foot:'<b>단일</b> — <code>mode: disabled</code> (기본). 핀이 곧 전부입니다. 머리가 쿨다운이어도 다른 계정으로 넘어가지 않습니다. 429는 그대로 전달됩니다.'
+    },
+    fallback:{
+      blurb:"서빙 계정이 체인의 머리입니다. 모드가 그 뒤로 이어지는 파이프라인 모양을 바꿉니다.",
+      live:'머리 <em>wontak@wrtn.io</em> → ready 순 폴백',
+      foot:'<b>폴백</b> — 429를 받은 계정은 쿨다운에 들어가고, 체인의 다음 <b>ready</b>로 넘깁니다. 복귀 시각이 지나면 자동으로 다시 끼어듭니다. 머리 계정은 <code>pool/serving</code> 핀으로 고릅니다.'
+    },
+    balanced:{
+      blurb:"장래 모드. 부하를 계정 사이에 나눕니다 — API는 아직 400 not implemented.",
+      live:'미리보기 · 균등 분배 (미구현)',
+      foot:'<b>균형</b> — 예약된 미래 모드입니다. UI만 미리 보여 두며, 적용 시 서버가 <code>400 not implemented yet</code>를 반환합니다.'
+    }
+  };
+
+  function setMode(mode){
+    pol.setAttribute("data-mode",mode);
+    seg.querySelectorAll("button").forEach(function(b){
+      var on=b.getAttribute("data-mode")===mode && !isOff(b);
+      /* balanced stays visual-only preview when clicked via scene — keep disabled */
+      if(isOff(b) && mode==="balanced"){
+        b.classList.add("on"); b.setAttribute("aria-checked","true");
+      } else {
+        b.classList.toggle("on", on);
+        b.setAttribute("aria-checked", on?"true":"false");
+        if(isOff(b)) b.classList.remove("on");
+      }
+    });
+    /* If user picked a live mode, clear balanced highlight */
+    if(mode!=="balanced"){
+      var bal=seg.querySelector('[data-mode="balanced"]');
+      bal.classList.remove("on"); bal.setAttribute("aria-checked","false");
+    }
+
+    var c=copy[mode]||copy.fallback;
+    blurb.textContent=c.blurb;
+    live.innerHTML=c.live;
+    foot.innerHTML=c.foot;
+
+    var n1=chain.querySelector('[data-id="a1"]');
+    var n2=chain.querySelector('[data-id="a2"]');
+    var n3=chain.querySelector('[data-id="a3"]');
+    var e1=chain.querySelector('[data-edge="1"]');
+    var e2=chain.querySelector('[data-edge="2"]');
+    var rows=list.querySelectorAll(".arow");
+
+    /* reset node class shells, keep identity */
+    function shell(node, base){
+      node.className="cnode "+base;
+    }
+
+    if(mode==="disabled"){
+      shell(n1,"head cooldown");
+      n1.querySelector(".rk").textContent="1 · 머리 · 서빙";
+      n1.querySelector(".why").innerHTML="Fable 주간 소진 · <b>08-12 06:00 KST</b> 복귀 · 단일 모드에선 그대로 429";
+      shell(n2,"out");
+      n2.querySelector(".rk").textContent="체인 밖";
+      n2.querySelector(".meta").innerHTML='<span class="pill out">미사용</span><span class="plan-txt">PRO</span>';
+      n2.querySelector(".why").textContent="단일 모드 · 폴백 대상 아님";
+      shell(n3,"out");
+      n3.querySelector(".rk").textContent="체인 밖";
+      n3.querySelector(".meta").innerHTML='<span class="pill out">미사용</span>';
+      n3.querySelector(".why").textContent="단일 모드 · 폴백 대상 아님";
+      e1.setAttribute("data-dim","1"); e2.setAttribute("data-dim","1");
+
+      rows[0].classList.remove("is-out");
+      rows[0].querySelector("[data-ord]").textContent="1";
+      rows[0].querySelector("[data-row-st]").className="st serve";
+      rows[0].querySelector("[data-row-st]").textContent="서빙 중";
+      rows[0].querySelector("[data-row-pill]").className="pill cd";
+      rows[0].querySelector("[data-row-pill]").textContent="쿨다운 · 08-12 06:00";
+      rows[1].classList.add("is-out");
+      rows[1].querySelector("[data-ord]").textContent="·";
+      rows[1].querySelector("[data-row-st]").className="st";
+      rows[1].querySelector("[data-row-st]").textContent="";
+      rows[1].querySelector("[data-row-pill]").className="pill out";
+      rows[1].querySelector("[data-row-pill]").textContent="체인 밖";
+      rows[2].classList.add("is-out");
+      rows[2].querySelector("[data-ord]").textContent="·";
+      rows[2].querySelector("[data-row-st]").className="st reauth";
+      rows[2].querySelector("[data-row-st]").textContent="⚠ 재로그인 필요";
+      rows[2].querySelector("[data-row-pill]").className="pill out";
+      rows[2].querySelector("[data-row-pill]").textContent="체인 밖";
+    } else if(mode==="fallback"){
+      shell(n1,"head cooldown");
+      n1.querySelector(".rk").textContent="1 · 머리 · 서빙";
+      n1.querySelector(".meta").innerHTML='<span class="pill cd">쿨다운</span><span class="plan-txt">MAX</span>';
+      n1.querySelector(".why").innerHTML="Fable 주간 소진 · <b>08-12 06:00 KST</b> 복귀";
+      shell(n2,"ready");
+      n2.querySelector(".rk").textContent="2 · 폴백";
+      n2.querySelector(".meta").innerHTML='<span class="pill same">ready</span><span class="plan-txt">PRO</span>';
+      n2.querySelector(".why").textContent="현재 실서빙 후보 · 로컬 CLI 동일";
+      shell(n3,"unavail");
+      n3.querySelector(".rk").textContent="3 · 제외";
+      n3.querySelector(".meta").innerHTML='<span class="pill down">unavailable</span>';
+      n3.querySelector(".why").textContent="토큰 만료 · 재로그인 필요";
+      e1.setAttribute("data-dim","0"); e2.setAttribute("data-dim","0");
+
+      rows[0].classList.remove("is-out");
+      rows[0].querySelector("[data-ord]").textContent="1";
+      rows[0].querySelector("[data-row-st]").className="st serve";
+      rows[0].querySelector("[data-row-st]").textContent="서빙 · 머리";
+      rows[0].querySelector("[data-row-pill]").className="pill cd";
+      rows[0].querySelector("[data-row-pill]").textContent="쿨다운 · 08-12 06:00";
+      rows[1].classList.remove("is-out");
+      rows[1].querySelector("[data-ord]").textContent="2";
+      rows[1].querySelector("[data-row-st]").className="st ready";
+      rows[1].querySelector("[data-row-st]").textContent="ready";
+      rows[1].querySelector("[data-row-pill]").className="pill same";
+      rows[1].querySelector("[data-row-pill]").textContent="폴백 1순위";
+      rows[2].classList.remove("is-out");
+      rows[2].querySelector("[data-ord]").textContent="3";
+      rows[2].querySelector("[data-row-st]").className="st reauth";
+      rows[2].querySelector("[data-row-st]").textContent="⚠ 재로그인 필요";
+      rows[2].querySelector("[data-row-pill]").className="pill down";
+      rows[2].querySelector("[data-row-pill]").textContent="unavailable";
+    } else if(mode==="balanced"){
+      /* ghosted future preview — same roster, dashed nodes, no real states */
+      shell(n1,"head ghost");
+      n1.querySelector(".rk").textContent="slot · head";
+      n1.querySelector(".meta").innerHTML='<span class="pill out">preview</span><span class="plan-txt">MAX</span>';
+      n1.querySelector(".why").textContent="균등 분배 슬롯 (미구현)";
+      shell(n2,"ghost");
+      n2.querySelector(".rk").textContent="slot";
+      n2.querySelector(".meta").innerHTML='<span class="pill out">preview</span><span class="plan-txt">PRO</span>';
+      n2.querySelector(".why").textContent="균등 분배 슬롯 (미구현)";
+      shell(n3,"ghost");
+      n3.querySelector(".rk").textContent="slot";
+      n3.querySelector(".meta").innerHTML='<span class="pill out">preview</span>';
+      n3.querySelector(".why").textContent="복귀 후 참여 예정";
+      e1.setAttribute("data-dim","0"); e2.setAttribute("data-dim","0");
+
+      rows[0].classList.remove("is-out");
+      rows[0].querySelector("[data-ord]").textContent="~";
+      rows[0].querySelector("[data-row-st]").className="st serve";
+      rows[0].querySelector("[data-row-st]").textContent="서빙 핀 유지";
+      rows[0].querySelector("[data-row-pill]").className="pill out";
+      rows[0].querySelector("[data-row-pill]").textContent="balanced soon";
+      rows[1].classList.remove("is-out");
+      rows[1].querySelector("[data-ord]").textContent="~";
+      rows[1].querySelector("[data-row-st]").className="st";
+      rows[1].querySelector("[data-row-st]").textContent="";
+      rows[1].querySelector("[data-row-pill]").className="pill out";
+      rows[1].querySelector("[data-row-pill]").textContent="balanced soon";
+      rows[2].classList.remove("is-out");
+      rows[2].querySelector("[data-ord]").textContent="~";
+      rows[2].querySelector("[data-row-st]").className="st reauth";
+      rows[2].querySelector("[data-row-st]").textContent="⚠ 재로그인 필요";
+      rows[2].querySelector("[data-row-pill]").className="pill out";
+      rows[2].querySelector("[data-row-pill]").textContent="balanced soon";
+    }
+  }
+
+  seg.addEventListener("click",function(e){
+    var b=e.target.closest("button[data-mode]"); if(!b)return;
+    if(card.classList.contains("locked"))return;
+    if(isOff(b)){
+      /* still allow preview flash of balanced without claiming it's applied */
+      setMode("balanced");
+      return;
+    }
+    setMode(b.getAttribute("data-mode"));
+  });
+
+  /* ----- env-locked scene ----- */
+  var scene=document.getElementById("scene-rail");
+  scene.addEventListener("click",function(e){
+    var b=e.target.closest("button[data-scene]"); if(!b)return;
+    scene.querySelectorAll("button").forEach(function(x){x.classList.toggle("on",x===b);});
+    var locked=b.getAttribute("data-scene")==="locked";
+    card.classList.toggle("locked",locked);
+    /* when locked, force fallback-looking chain (env says fallback) but inert */
+    if(locked){
+      setMode("fallback");
+      seg.querySelectorAll("button").forEach(function(x){x.disabled=true;});
+      /* re-enable balanced's disabled attribute properly after unlock */
+      seg.querySelector('[data-mode="disabled"]').disabled=true;
+      seg.querySelector('[data-mode="fallback"]').disabled=true;
+      seg.querySelector('[data-mode="balanced"]').disabled=true;
+      list.querySelectorAll(".actions button").forEach(function(x){x.disabled=true;});
+    } else {
+      seg.querySelector('[data-mode="disabled"]').disabled=false;
+      seg.querySelector('[data-mode="fallback"]').disabled=false;
+      seg.querySelector('[data-mode="balanced"]').disabled=false;
+      list.querySelectorAll(".actions button").forEach(function(x){x.disabled=false;});
+      setMode(pol.getAttribute("data-mode")==="balanced"?"fallback":pol.getAttribute("data-mode"));
+    }
+  });
+
+  /* initial: fallback — the interesting edge (head in cooldown, ready next) */
+  setMode("fallback");
+})();
+</script>
+<div style="position:fixed;right:16px;bottom:16px;z-index:80;background:#172026;color:#f2f4f5;border-radius:999px;padding:8px 6px;display:flex;gap:2px;font:600 12px ui-monospace,monospace;box-shadow:0 6px 20px rgba(0,0,0,.3)"><a href="_routing-proposals.html" style="color:inherit;text-decoration:none;padding:4px 10px">허브</a><a href="_routing-a.html" style="color:inherit;text-decoration:none;padding:4px 10px">A</a><a href="_routing-b.html" style="color:inherit;text-decoration:none;padding:4px 10px">B</a><a href="_routing-c.html" style="color:inherit;text-decoration:none;padding:4px 10px">C</a><a href="_routing-d.html" style="text-decoration:none;padding:4px 10px;background:#f2f4f5;color:#172026;border-radius:999px">D</a></div>
+</body>
+</html>
