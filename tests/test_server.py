@@ -119,8 +119,18 @@ class FakeGrokClient:
         return None
 
 
+# The real HOME this process started with, captured before any test ever
+# monkeypatches it -- lets `_create_test_client` tell a still-real HOME
+# (a naive test that never isolated it) apart from one a caller already
+# isolated itself (e.g. `_balanced_env`, `_admin_client`, under its own
+# `tmp_path` subpath), so it isolates HOME without clobbering a caller's
+# own choice.
+_REAL_HOME = Path.home()
+
+
 def _create_test_client(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
     *,
     config: GatewayConfig | None = None,
     codex_auth: type = AvailableCodexAuthManager,
@@ -131,6 +141,14 @@ def _create_test_client(
     grok_client: type = FakeGrokClient,
     base_url: str = "http://testserver",
 ) -> TestClient:
+    # T-9's lifespan acquires the process-lifetime claude account pool lease
+    # (paths.runtime_dir() == Path.home() / ".claudex") for every routing
+    # mode, so a naive lifespan test run against the REAL HOME would contend
+    # with a live claudex-gateway daemon holding that lock (G-6). Isolate
+    # HOME to this test's own tmp_path before the lifespan ever runs, unless
+    # the caller already isolated it to somewhere else first.
+    if Path.home() == _REAL_HOME:
+        monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setattr(server, "CodexAuthManager", codex_auth)
     monkeypatch.setattr(server, "CodexClient", codex_client)
     monkeypatch.setattr(server, "KimiAuthManager", kimi_auth)
@@ -141,10 +159,10 @@ def _create_test_client(
 
 
 def test_messages_routes_enforce_local_bearer_token(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     config = GatewayConfig(local_token="local-secret")
-    with _create_test_client(monkeypatch, config=config) as client:
+    with _create_test_client(monkeypatch, tmp_path, config=config) as client:
         messages = client.post("/v1/messages", json={"messages": []})
         count_tokens = client.post("/v1/messages/count_tokens", json={"messages": []})
 
@@ -155,17 +173,17 @@ def test_messages_routes_enforce_local_bearer_token(
 
 
 def test_removed_responses_direction_routes_return_404(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    with _create_test_client(monkeypatch) as client:
+    with _create_test_client(monkeypatch, tmp_path) as client:
         assert client.post("/v1/responses", json={"input": "Hello"}).status_code == 404
         assert client.get("/v1/models").status_code == 404
 
 
 def test_health_reports_ok_with_codex_credentials(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    with _create_test_client(monkeypatch) as client:
+    with _create_test_client(monkeypatch, tmp_path) as client:
         health = client.get("/health")
 
     assert health.status_code == 200
@@ -190,9 +208,9 @@ def test_health_reports_ok_with_codex_credentials(
 
 
 def test_health_reports_error_without_codex_credentials(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    with _create_test_client(monkeypatch, codex_auth=MissingCodexAuthManager) as client:
+    with _create_test_client(monkeypatch, tmp_path, codex_auth=MissingCodexAuthManager) as client:
         health = client.get("/health")
 
     assert health.status_code == 503
@@ -201,9 +219,9 @@ def test_health_reports_error_without_codex_credentials(
 
 
 def test_health_stays_ok_without_kimi_credentials_when_map_has_no_kimi_route(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    with _create_test_client(monkeypatch, kimi_auth=MissingKimiAuthManager) as client:
+    with _create_test_client(monkeypatch, tmp_path, kimi_auth=MissingKimiAuthManager) as client:
         health = client.get("/health")
 
     assert health.status_code == 200
@@ -213,11 +231,11 @@ def test_health_stays_ok_without_kimi_credentials_when_map_has_no_kimi_route(
 
 
 def test_health_reports_error_without_kimi_credentials_when_map_routes_to_kimi(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     config = GatewayConfig(model_map={"opus": "kimi:k2.5"})
     with _create_test_client(
-        monkeypatch, config=config, kimi_auth=MissingKimiAuthManager
+        monkeypatch, tmp_path, config=config, kimi_auth=MissingKimiAuthManager
     ) as client:
         health = client.get("/health")
 
@@ -228,9 +246,9 @@ def test_health_reports_error_without_kimi_credentials_when_map_routes_to_kimi(
 
 
 def test_health_stays_ok_without_grok_credentials_when_map_has_no_grok_route(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    with _create_test_client(monkeypatch, grok_auth=MissingGrokAuthManager) as client:
+    with _create_test_client(monkeypatch, tmp_path, grok_auth=MissingGrokAuthManager) as client:
         health = client.get("/health")
 
     assert health.status_code == 200
@@ -240,11 +258,11 @@ def test_health_stays_ok_without_grok_credentials_when_map_has_no_grok_route(
 
 
 def test_health_reports_error_without_grok_credentials_when_map_routes_to_grok(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     config = GatewayConfig(model_map={"opus": "grok:grok-4.5"})
     with _create_test_client(
-        monkeypatch, config=config, grok_auth=MissingGrokAuthManager
+        monkeypatch, tmp_path, config=config, grok_auth=MissingGrokAuthManager
     ) as client:
         health = client.get("/health")
 
@@ -570,13 +588,13 @@ class MidStreamOverflowCodexClient(FakeCodexClient):
 
 
 def test_mid_stream_overflow_error_carries_catalog_numbers(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     config = GatewayConfig(model_map={"opus": "codex:gpt-5.6-sol"})
     body = _message_body("claude-opus-4-6")
     body["stream"] = True
     with _create_test_client(
-        monkeypatch, config=config, codex_client=MidStreamOverflowCodexClient
+        monkeypatch, tmp_path, config=config, codex_client=MidStreamOverflowCodexClient
     ) as client:
         response = client.post("/v1/messages", json=body)
 
@@ -2567,7 +2585,7 @@ class ScriptedCodexClient(FakeCodexClient):
 
 
 def test_non_streaming_request_closes_the_codex_stream(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     ScriptedCodexClient.events = [
         _CREATED_EVENT,
@@ -2579,7 +2597,7 @@ def test_non_streaming_request_closes_the_codex_stream(
     ]
     ScriptedCodexClient.closed = False
     client = _create_test_client(
-        monkeypatch,
+        monkeypatch, tmp_path,
         config=GatewayConfig(model_map={"opus": "codex:gpt-5.6-sol"}),
         codex_client=ScriptedCodexClient,
     )
@@ -2613,11 +2631,11 @@ class MidStreamErrorCodexClient(FakeCodexClient):
 
 
 def test_transport_error_before_first_event_returns_claude_502(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     config = GatewayConfig(model_map={"opus": "codex:gpt-5.6-sol"})
     with _create_test_client(
-        monkeypatch, config=config, codex_client=TimeoutCodexClient
+        monkeypatch, tmp_path, config=config, codex_client=TimeoutCodexClient
     ) as client:
         response = client.post("/v1/messages", json=_message_body("claude-opus-4-6"))
 
@@ -2627,11 +2645,11 @@ def test_transport_error_before_first_event_returns_claude_502(
 
 
 def test_transport_error_during_aggregation_returns_claude_502(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     config = GatewayConfig(model_map={"opus": "codex:gpt-5.6-sol"})
     with _create_test_client(
-        monkeypatch, config=config, codex_client=MidStreamErrorCodexClient
+        monkeypatch, tmp_path, config=config, codex_client=MidStreamErrorCodexClient
     ) as client:
         response = client.post("/v1/messages", json=_message_body("claude-opus-4-6"))
 
@@ -2652,7 +2670,7 @@ class TestAdminMappingApi:
             settings_file=tmp_path / "settings.json", **config_kwargs
         )
         return _create_test_client(
-            monkeypatch, config=config, base_url="http://127.0.0.1:8787"
+            monkeypatch, tmp_path, config=config, base_url="http://127.0.0.1:8787"
         )
 
     def test_get_returns_current_mapping(
@@ -2757,7 +2775,7 @@ class TestAdminMappingApi:
     ) -> None:
         config = GatewayConfig(settings_file=tmp_path / "settings.json")
         # Default base_url keeps the Host header at "testserver".
-        with _create_test_client(monkeypatch, config=config) as client:
+        with _create_test_client(monkeypatch, tmp_path, config=config) as client:
             response = client.get("/admin/settings/mapping")
         assert response.status_code == 403
         assert "DNS-rebinding" in response.json()["error"]["message"]
@@ -2793,7 +2811,7 @@ class TestAdminLogLevel:
         monkeypatch.delenv("CLAUDEX_LOG_LEVEL", raising=False)
         config = GatewayConfig(settings_file=tmp_path / "settings.json")
         return _create_test_client(
-            monkeypatch, config=config, base_url="http://127.0.0.1:8787"
+            monkeypatch, tmp_path, config=config, base_url="http://127.0.0.1:8787"
         )
 
     def test_get_returns_current_level(
@@ -2837,7 +2855,7 @@ class TestAdminLogLevel:
         config = GatewayConfig(settings_file=tmp_path / "settings.json")
         monkeypatch.setenv("CLAUDEX_LOG_LEVEL", "info")
         with _create_test_client(
-            monkeypatch, config=config, base_url="http://127.0.0.1:8787"
+            monkeypatch, tmp_path, config=config, base_url="http://127.0.0.1:8787"
         ) as client:
             response = client.put("/admin/settings/log-level", json={"log_level": "debug"})
 
@@ -2865,7 +2883,7 @@ class TestAdminCompactionApi:
         monkeypatch.delenv("CLAUDEX_COMPACTION_MODEL", raising=False)
         config = GatewayConfig(settings_file=tmp_path / "settings.json", **config_kwargs)
         return _create_test_client(
-            monkeypatch, config=config, base_url="http://127.0.0.1:8787"
+            monkeypatch, tmp_path, config=config, base_url="http://127.0.0.1:8787"
         )
 
     # --- GET: fresh/configured state, diagnostics schema -------------------
@@ -2924,7 +2942,7 @@ class TestAdminCompactionApi:
         monkeypatch.setenv("CLAUDEX_COMPACTION_MODEL", "claude:claude-env-5")
         config = GatewayConfig(settings_file=tmp_path / "settings.json")
         with _create_test_client(
-            monkeypatch, config=config, base_url="http://127.0.0.1:8787"
+            monkeypatch, tmp_path, config=config, base_url="http://127.0.0.1:8787"
         ) as client:
             payload = client.get("/admin/settings/compaction").json()
 
@@ -2936,7 +2954,7 @@ class TestAdminCompactionApi:
         monkeypatch.setenv("CLAUDEX_COMPACTION_MODEL", "")
         config = GatewayConfig(settings_file=tmp_path / "settings.json")
         with _create_test_client(
-            monkeypatch, config=config, base_url="http://127.0.0.1:8787"
+            monkeypatch, tmp_path, config=config, base_url="http://127.0.0.1:8787"
         ) as client:
             payload = client.get("/admin/settings/compaction").json()
 
@@ -3157,7 +3175,7 @@ class TestAdminCompactionApi:
     ) -> None:
         config = GatewayConfig(settings_file=tmp_path / "settings.json", local_token="secret")
         # Default base_url keeps the Host header at "testserver".
-        with _create_test_client(monkeypatch, config=config) as client:
+        with _create_test_client(monkeypatch, tmp_path, config=config) as client:
             response = client.get(
                 "/admin/settings/compaction", headers={"Authorization": "Bearer secret"}
             )
@@ -3202,7 +3220,7 @@ class TestAdminCompactionApi:
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         config = GatewayConfig(settings_file=tmp_path / "settings.json", local_token="secret")
-        with _create_test_client(monkeypatch, config=config) as client:
+        with _create_test_client(monkeypatch, tmp_path, config=config) as client:
             response = client.put(
                 "/admin/settings/compaction",
                 json={"model": "claude:claude-opus-5"},
@@ -3221,7 +3239,7 @@ class TestAdminCompactionApi:
         monkeypatch.setenv("CLAUDEX_COMPACTION_MODEL", "claude:claude-env-5")
         config = GatewayConfig(settings_file=tmp_path / "settings.json")
         with _create_test_client(
-            monkeypatch, config=config, base_url="http://127.0.0.1:8787"
+            monkeypatch, tmp_path, config=config, base_url="http://127.0.0.1:8787"
         ) as client:
             response = client.put(
                 "/admin/settings/compaction", json={"model": "claude:claude-opus-5"}
@@ -3239,7 +3257,7 @@ class TestAdminCompactionApi:
         monkeypatch.setenv("CLAUDEX_COMPACTION_MODEL", "")
         config = GatewayConfig(settings_file=tmp_path / "settings.json")
         with _create_test_client(
-            monkeypatch, config=config, base_url="http://127.0.0.1:8787"
+            monkeypatch, tmp_path, config=config, base_url="http://127.0.0.1:8787"
         ) as client:
             response = client.put("/admin/settings/compaction", json={"model": None})
             config_after = client.app.state.config
@@ -3290,7 +3308,7 @@ class TestAdminClaudeAccountApi:
         monkeypatch.setenv("HOME", str(tmp_path / "home"))
         config = GatewayConfig(settings_file=tmp_path / "settings.json", **config_kwargs)
         return _create_test_client(
-            monkeypatch, config=config, base_url="http://127.0.0.1:8787"
+            monkeypatch, tmp_path, config=config, base_url="http://127.0.0.1:8787"
         )
 
     def test_get_returns_fresh_state_when_unconfigured(
@@ -3478,7 +3496,7 @@ class TestAdminClaudeRoutingApi:
         monkeypatch.setenv("HOME", str(tmp_path / "home"))
         config = GatewayConfig(settings_file=tmp_path / "settings.json", **config_kwargs)
         return _create_test_client(
-            monkeypatch, config=config, base_url="http://127.0.0.1:8787"
+            monkeypatch, tmp_path, config=config, base_url="http://127.0.0.1:8787"
         )
 
     def test_get_defaults_to_disabled(
@@ -3578,8 +3596,8 @@ class TestAdminClaudeRoutingApi:
         assert locked["env_locked"] is True
 
 
-def test_admin_logs_returns_recent_records(monkeypatch: pytest.MonkeyPatch) -> None:
-    with _create_test_client(monkeypatch, base_url="http://127.0.0.1:8787") as client:
+def test_admin_logs_returns_recent_records(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    with _create_test_client(monkeypatch, tmp_path, base_url="http://127.0.0.1:8787") as client:
         logging.getLogger("claudex_gateway.test").warning("hello %s", "world")
         response = client.get("/admin/logs")
 
@@ -3589,12 +3607,12 @@ def test_admin_logs_returns_recent_records(monkeypatch: pytest.MonkeyPatch) -> N
     assert entries[0]["logger"] == "claudex_gateway.test"
 
 
-def test_admin_logs_refuses_foreign_host(monkeypatch: pytest.MonkeyPatch) -> None:
-    with _create_test_client(monkeypatch) as client:
+def test_admin_logs_refuses_foreign_host(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
         assert client.get("/admin/logs").status_code == 403
 
 
-def test_admin_usage_returns_all_providers(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_admin_usage_returns_all_providers(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     async def fake_claude(http_client: Any) -> dict[str, Any]:
         return {"provider": "claude", "status": "ok", "error": None}
 
@@ -3611,7 +3629,7 @@ def test_admin_usage_returns_all_providers(monkeypatch: pytest.MonkeyPatch) -> N
     monkeypatch.setattr(server, "fetch_codex_usage", fake_codex)
     monkeypatch.setattr(server, "fetch_kimi_usage", fake_kimi)
     monkeypatch.setattr(server, "fetch_grok_usage", fake_grok)
-    with _create_test_client(monkeypatch, base_url="http://127.0.0.1:8787") as client:
+    with _create_test_client(monkeypatch, tmp_path, base_url="http://127.0.0.1:8787") as client:
         response = client.get("/admin/usage")
 
     assert response.status_code == 200
@@ -3623,13 +3641,13 @@ def test_admin_usage_returns_all_providers(monkeypatch: pytest.MonkeyPatch) -> N
     assert body["fetched_at"] > 0
 
 
-def test_admin_usage_refuses_foreign_host(monkeypatch: pytest.MonkeyPatch) -> None:
-    with _create_test_client(monkeypatch) as client:
+def test_admin_usage_refuses_foreign_host(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
         assert client.get("/admin/usage").status_code == 403
 
 
 def test_admin_usage_single_provider_skips_the_others(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     async def fake_claude(http_client: Any) -> dict[str, Any]:
         return {"provider": "claude", "status": "ok", "error": None}
@@ -3647,7 +3665,7 @@ def test_admin_usage_single_provider_skips_the_others(
     monkeypatch.setattr(server, "fetch_codex_usage", codex_must_not_run)
     monkeypatch.setattr(server, "fetch_kimi_usage", kimi_must_not_run)
     monkeypatch.setattr(server, "fetch_grok_usage", grok_must_not_run)
-    with _create_test_client(monkeypatch, base_url="http://127.0.0.1:8787") as client:
+    with _create_test_client(monkeypatch, tmp_path, base_url="http://127.0.0.1:8787") as client:
         response = client.get("/admin/usage", params={"provider": "claude"})
 
     assert response.status_code == 200
@@ -3658,8 +3676,8 @@ def test_admin_usage_single_provider_skips_the_others(
     assert "grok" not in body
 
 
-def test_admin_usage_rejects_unknown_provider(monkeypatch: pytest.MonkeyPatch) -> None:
-    with _create_test_client(monkeypatch, base_url="http://127.0.0.1:8787") as client:
+def test_admin_usage_rejects_unknown_provider(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    with _create_test_client(monkeypatch, tmp_path, base_url="http://127.0.0.1:8787") as client:
         response = client.get("/admin/usage", params={"provider": "gemini"})
 
     assert response.status_code == 400
@@ -3683,12 +3701,12 @@ def _record_reset_keys(
 
 
 def test_admin_reset_credit_returns_the_backend_outcome(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     keys = _record_reset_keys(
         monkeypatch, [{"status": "ok", "outcome": "reset", "error": None}]
     )
-    with _create_test_client(monkeypatch, base_url="http://127.0.0.1:8787") as client:
+    with _create_test_client(monkeypatch, tmp_path, base_url="http://127.0.0.1:8787") as client:
         response = client.post("/admin/providers/codex/reset-credit", json={})
 
     assert response.status_code == 200
@@ -3697,7 +3715,7 @@ def test_admin_reset_credit_returns_the_backend_outcome(
 
 
 def test_admin_reset_credit_reuses_the_key_until_an_attempt_settles(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     # A timed-out attempt may or may not have burned the credit, so the retry
     # must carry the same idempotency key and let the backend deduplicate;
@@ -3711,7 +3729,7 @@ def test_admin_reset_credit_reuses_the_key_until_an_attempt_settles(
             {"status": "ok", "outcome": "no_credit", "error": None},
         ],
     )
-    with _create_test_client(monkeypatch, base_url="http://127.0.0.1:8787") as client:
+    with _create_test_client(monkeypatch, tmp_path, base_url="http://127.0.0.1:8787") as client:
         for _ in range(4):
             assert client.post("/admin/providers/codex/reset-credit", json={}).status_code == 200
 
@@ -3720,7 +3738,7 @@ def test_admin_reset_credit_reuses_the_key_until_an_attempt_settles(
 
 
 def test_admin_reset_credit_is_guarded_like_every_other_admin_write(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     def must_not_run(*args: Any, **kwargs: Any) -> None:
         raise AssertionError("a guarded request reached the ChatGPT backend")
@@ -3728,35 +3746,35 @@ def test_admin_reset_credit_is_guarded_like_every_other_admin_write(
     monkeypatch.setattr(server, "consume_codex_reset_credit", must_not_run)
 
     # Foreign Host header (DNS-rebinding guard).
-    with _create_test_client(monkeypatch) as client:
+    with _create_test_client(monkeypatch, tmp_path) as client:
         assert client.post("/admin/providers/codex/reset-credit", json={}).status_code == 403
     # A form post would dodge the CORS preflight, so JSON is required.
-    with _create_test_client(monkeypatch, base_url="http://127.0.0.1:8787") as client:
+    with _create_test_client(monkeypatch, tmp_path, base_url="http://127.0.0.1:8787") as client:
         assert client.post("/admin/providers/codex/reset-credit", content="x").status_code == 415
     # And the local bearer token still applies.
     config = GatewayConfig(local_token="local-secret")
     with _create_test_client(
-        monkeypatch, config=config, base_url="http://127.0.0.1:8787"
+        monkeypatch, tmp_path, config=config, base_url="http://127.0.0.1:8787"
     ) as client:
         assert client.post("/admin/providers/codex/reset-credit", json={}).status_code == 401
 
 
 def test_admin_reset_credit_is_never_reachable_by_GET(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     # Spending a credit must not be possible by navigating to a URL.
     def must_not_run(*args: Any, **kwargs: Any) -> None:
         raise AssertionError("a GET spent a reset credit")
 
     monkeypatch.setattr(server, "consume_codex_reset_credit", must_not_run)
-    with _create_test_client(monkeypatch, base_url="http://127.0.0.1:8787") as client:
+    with _create_test_client(monkeypatch, tmp_path, base_url="http://127.0.0.1:8787") as client:
         assert client.get("/admin/providers/codex/reset-credit").status_code == 405
 
 
-def test_dashboard_usage_merged_into_status_cards(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_dashboard_usage_merged_into_status_cards(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     # Usage renders inside the Status tab's provider cards: a per-provider
     # body hook, the fetch on entering Status, and no separate tab.
-    with _create_test_client(monkeypatch) as client:
+    with _create_test_client(monkeypatch, tmp_path) as client:
         page = client.get("/").text
 
     assert 'data-t="usage"' not in page
@@ -3775,12 +3793,12 @@ def test_dashboard_usage_merged_into_status_cards(monkeypatch: pytest.MonkeyPatc
 
 
 def test_dashboard_settings_tab_leads_and_holds_compaction(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     # The Settings tab is the settings home: it leads the tab bar, opens by
     # default, and holds the Compact Reroute row behind the category rail;
     # the provider status cards live in the Status tab.
-    with _create_test_client(monkeypatch) as client:
+    with _create_test_client(monkeypatch, tmp_path) as client:
         page = client.get("/").text
 
     assert (
@@ -3807,7 +3825,7 @@ def test_dashboard_settings_tab_leads_and_holds_compaction(
 
 
 def test_dashboard_optional_providers_hidden_until_detected(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     # Kimi and Grok are extensions: their Status cards and the Router
     # add-node provider buttons ship hidden and are revealed from /health
@@ -3815,7 +3833,7 @@ def test_dashboard_optional_providers_hidden_until_detected(
     # to them, where hiding a required-login error would mislead. The gating
     # is cosmetic only; routing, settings.json, and the admin API are
     # untouched.
-    with _create_test_client(monkeypatch) as client:
+    with _create_test_client(monkeypatch, tmp_path) as client:
         page = client.get("/").text
 
     assert '<div class="card provider-hidden" id="card-kimi">' in page
@@ -3831,9 +3849,9 @@ def test_dashboard_optional_providers_hidden_until_detected(
 
 
 def test_dashboard_plan_and_credits_read_inside_the_card(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    with _create_test_client(monkeypatch) as client:
+    with _create_test_client(monkeypatch, tmp_path) as client:
         page = client.get("/").text
 
     # Plan and credit chips used to crowd the card headings; both now read as
@@ -3868,9 +3886,9 @@ def test_dashboard_plan_and_credits_read_inside_the_card(
 
 
 def test_dashboard_status_cards_load_as_skeletons(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    with _create_test_client(monkeypatch) as client:
+    with _create_test_client(monkeypatch, tmp_path) as client:
         page = client.get("/").text
 
     # The cards used to render a one-line "확인 중…" that the loaded content
@@ -3888,8 +3906,8 @@ def test_dashboard_status_cards_load_as_skeletons(
     assert 'renderUsageProvider(p,null)' in page
 
 
-def test_dashboard_served_at_root(monkeypatch: pytest.MonkeyPatch) -> None:
-    with _create_test_client(monkeypatch) as client:
+def test_dashboard_served_at_root(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
         response = client.get("/")
 
     assert response.status_code == 200
@@ -3898,8 +3916,8 @@ def test_dashboard_served_at_root(monkeypatch: pytest.MonkeyPatch) -> None:
     assert "/admin/settings/mapping" in response.text
 
 
-def test_favicon_served_for_browser_probe(monkeypatch: pytest.MonkeyPatch) -> None:
-    with _create_test_client(monkeypatch) as client:
+def test_favicon_served_for_browser_probe(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
         response = client.get("/favicon.ico")
 
     assert response.status_code == 200
@@ -3909,20 +3927,20 @@ def test_favicon_served_for_browser_probe(monkeypatch: pytest.MonkeyPatch) -> No
 
 
 def test_dashboard_port_has_an_enlarged_invisible_hit_zone(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     # The 14px visible port dot is too small to drag from: the board widens
     # the grab area to the node's full height plus margins without changing
     # the visual. These markers are the whole mechanism, so pin them.
-    with _create_test_client(monkeypatch) as client:
+    with _create_test_client(monkeypatch, tmp_path) as client:
         page = client.get("/").text
 
     assert ".node.src .port::after" in page
     assert "pointer-events:auto" in page
 
 
-def test_hello_reports_identity_and_auth_flag(monkeypatch: pytest.MonkeyPatch) -> None:
-    with _create_test_client(monkeypatch) as client:
+def test_hello_reports_identity_and_auth_flag(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
         body = client.get("/api/hello").json()
 
     assert body["hello"] == "claudex-gateway"
@@ -3931,10 +3949,10 @@ def test_hello_reports_identity_and_auth_flag(monkeypatch: pytest.MonkeyPatch) -
 
 
 def test_hello_reports_auth_required_without_leaking_the_token(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     config = GatewayConfig(local_token="secret-token-value")
-    with _create_test_client(monkeypatch, config=config) as client:
+    with _create_test_client(monkeypatch, tmp_path, config=config) as client:
         response = client.get("/api/hello")
 
     assert response.json()["local_auth_required"] is True
@@ -3942,9 +3960,9 @@ def test_hello_reports_auth_required_without_leaking_the_token(
 
 
 def test_dashboard_keeps_the_local_token_in_memory_only(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    with _create_test_client(monkeypatch) as client:
+    with _create_test_client(monkeypatch, tmp_path) as client:
         page = client.get("/").text
 
     # The dashboard bootstraps from the safe hello flag and attaches the
@@ -3958,9 +3976,9 @@ def test_dashboard_keeps_the_local_token_in_memory_only(
 
 
 def test_dashboard_has_no_hardcoded_codex_model_snapshot(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    with _create_test_client(monkeypatch) as client:
+    with _create_test_client(monkeypatch, tmp_path) as client:
         page = client.get("/").text
 
     # Catalogs are fetched live; a baked-in model list goes stale and misleads
@@ -3972,9 +3990,9 @@ def test_dashboard_has_no_hardcoded_codex_model_snapshot(
 
 
 def test_dashboard_board_shows_only_referenced_targets(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    with _create_test_client(monkeypatch) as client:
+    with _create_test_client(monkeypatch, tmp_path) as client:
         page = client.get("/").text
 
     # With several providers a catalog dump is unusable as a board, so target
@@ -4019,9 +4037,9 @@ def _routing_section(page: str) -> str:
 
 
 def test_dashboard_compaction_section_marker_and_endpoint_present(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    with _create_test_client(monkeypatch) as client:
+    with _create_test_client(monkeypatch, tmp_path) as client:
         page = client.get("/").text
 
     assert "<!-- compaction-section:start -->" in page
@@ -4032,9 +4050,9 @@ def test_dashboard_compaction_section_marker_and_endpoint_present(
 
 
 def test_dashboard_compaction_options_in_pinned_order_without_haiku(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    with _create_test_client(monkeypatch) as client:
+    with _create_test_client(monkeypatch, tmp_path) as client:
         page = client.get("/").text
 
     section = _compaction_section(page)
@@ -4053,9 +4071,9 @@ def test_dashboard_compaction_options_in_pinned_order_without_haiku(
 
 
 def test_dashboard_compaction_custom_input_labeled_unverified(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    with _create_test_client(monkeypatch) as client:
+    with _create_test_client(monkeypatch, tmp_path) as client:
         page = client.get("/").text
 
     section = _compaction_section(page)
@@ -4064,11 +4082,11 @@ def test_dashboard_compaction_custom_input_labeled_unverified(
 
 
 def test_dashboard_compaction_credentials_disclosure_present(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     # The card must state which credentials rerouted requests run on, so the
     # user knows their own Claude account is being used.
-    with _create_test_client(monkeypatch) as client:
+    with _create_test_client(monkeypatch, tmp_path) as client:
         page = client.get("/").text
 
     section = _compaction_section(page)
@@ -4076,9 +4094,9 @@ def test_dashboard_compaction_credentials_disclosure_present(
 
 
 def test_dashboard_compaction_fetched_in_parallel_boot_sequence(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    with _create_test_client(monkeypatch) as client:
+    with _create_test_client(monkeypatch, tmp_path) as client:
         page = client.get("/").text
 
     boot_start = page.index("function boot(){")
@@ -4089,9 +4107,9 @@ def test_dashboard_compaction_fetched_in_parallel_boot_sequence(
 
 
 def test_dashboard_compaction_keeps_configured_custom_model(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    with _create_test_client(monkeypatch) as client:
+    with _create_test_client(monkeypatch, tmp_path) as client:
         page = client.get("/").text
 
     # A configured model that is not one of the three curated ids renders as
@@ -4101,12 +4119,12 @@ def test_dashboard_compaction_keeps_configured_custom_model(
 
 
 def test_dashboard_compaction_diagnostics_ui_removed_by_design(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     # The Settings redesign dropped the last-reroute record from the page:
     # diagnostics stay reachable through GET /admin/settings/compaction only. Guard
     # against the UI quietly returning.
-    with _create_test_client(monkeypatch) as client:
+    with _create_test_client(monkeypatch, tmp_path) as client:
         page = client.get("/").text
 
     assert 'id="comp-diagnostics"' not in page
@@ -4115,9 +4133,9 @@ def test_dashboard_compaction_diagnostics_ui_removed_by_design(
 
 
 def test_dashboard_compaction_apply_body_matches_pinned_shape(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    with _create_test_client(monkeypatch) as client:
+    with _create_test_client(monkeypatch, tmp_path) as client:
         page = client.get("/").text
 
     assert "JSON.stringify({model:model})" in page
@@ -4130,9 +4148,9 @@ def test_dashboard_compaction_apply_body_matches_pinned_shape(
 
 
 def test_dashboard_compaction_custom_submission_is_trimmed_and_guarded(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    with _create_test_client(monkeypatch) as client:
+    with _create_test_client(monkeypatch, tmp_path) as client:
         page = client.get("/").text
 
     apply_fn = _compaction_apply_fn(page)
@@ -4141,9 +4159,9 @@ def test_dashboard_compaction_custom_submission_is_trimmed_and_guarded(
 
 
 def test_dashboard_compaction_409_branch_refreshes_via_get_not_error_body(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    with _create_test_client(monkeypatch) as client:
+    with _create_test_client(monkeypatch, tmp_path) as client:
         page = client.get("/").text
 
     apply_fn = _compaction_apply_fn(page)
@@ -4160,12 +4178,12 @@ def test_dashboard_compaction_409_branch_refreshes_via_get_not_error_body(
 
 
 def test_dashboard_compaction_409_refresh_failure_stays_locked(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     # If the post-409 refresh GET itself fails or returns a malformed
     # envelope, its body must not be rendered as state and the card must
     # remain locked.
-    with _create_test_client(monkeypatch) as client:
+    with _create_test_client(monkeypatch, tmp_path) as client:
         page = client.get("/").text
 
     apply_fn = _compaction_apply_fn(page)
@@ -4190,11 +4208,11 @@ def test_dashboard_compaction_409_refresh_failure_stays_locked(
 
 
 def test_dashboard_settings_rail_switches_categories(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     # The Settings rail is real category switching now: one .scard visible at
     # a time, gated by data-cat on the section, deep-linkable per category.
-    with _create_test_client(monkeypatch) as client:
+    with _create_test_client(monkeypatch, tmp_path) as client:
         page = client.get("/").text
 
     assert '<section id="tab-settings" data-cat="general">' in page
@@ -4216,12 +4234,12 @@ def test_dashboard_settings_rail_switches_categories(
 
 
 def test_dashboard_accounts_card_mirrors_the_final_probe(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     # Composition per _design-probes/_accounts-final.html: the local CLI hero
     # leads (the only boxed area), then the 등록 계정 caption with the add
     # button, then dense flat rows that expand independently.
-    with _create_test_client(monkeypatch) as client:
+    with _create_test_client(monkeypatch, tmp_path) as client:
         page = client.get("/").text
 
     assert 'class="lhero"' in page
@@ -4247,12 +4265,12 @@ def test_dashboard_accounts_card_mirrors_the_final_probe(
 
 
 def test_dashboard_accounts_fetch_paints_registry_before_usage(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     # The registry GET paints rows immediately; the cache-backed usage GET
     # and the local hero's ambient usage fill in async afterwards. No force
     # parameter exists — the UI shows data age instead.
-    with _create_test_client(monkeypatch) as client:
+    with _create_test_client(monkeypatch, tmp_path) as client:
         page = client.get("/").text
 
     assert 'jfetch("/admin/providers/claude/accounts")' in page
@@ -4267,11 +4285,11 @@ def test_dashboard_accounts_fetch_paints_registry_before_usage(
 
 
 def test_dashboard_serving_selection_reuses_the_singular_admin_endpoint(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     # 사용/해제 go through the existing PUT /admin/providers/claude/pool/serving; a 409
     # env-lock renders the lockband and disables the buttons.
-    with _create_test_client(monkeypatch) as client:
+    with _create_test_client(monkeypatch, tmp_path) as client:
         page = client.get("/").text
 
     assert 'jfetch("/admin/providers/claude/pool/serving",{' in page
@@ -4286,9 +4304,9 @@ def test_dashboard_serving_selection_reuses_the_singular_admin_endpoint(
 
 
 def test_dashboard_routing_section_wires_endpoint(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    with _create_test_client(monkeypatch) as client:
+    with _create_test_client(monkeypatch, tmp_path) as client:
         page = client.get("/").text
 
     assert "<!-- routing-section:start -->" in page
@@ -4314,13 +4332,13 @@ def test_dashboard_routing_section_wires_endpoint(
 
 
 def test_dashboard_accounts_surface_pool_usage_freshness(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     # Balanced-mode usage reads are cache-only (T-13): the accounts screen
     # renders pool/status's usage_freshness chip plus each window's
     # pool/usage observation age/source, and a queued manual refresh renders
     # its own indication instead of claiming a completed refresh.
-    with _create_test_client(monkeypatch) as client:
+    with _create_test_client(monkeypatch, tmp_path) as client:
         page = client.get("/").text
 
     assert "ACCT.usageFreshness" in page
@@ -4334,11 +4352,11 @@ def test_dashboard_accounts_surface_pool_usage_freshness(
 
 
 def test_dashboard_routing_locked_renders_readonly(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     # A 409 flips the local lock; the lockband names the env var and the
     # control disables — same discipline as the compaction card.
-    with _create_test_client(monkeypatch) as client:
+    with _create_test_client(monkeypatch, tmp_path) as client:
         page = client.get("/").text
 
     assert "CLAUDEX_CLAUDE_ACCOUNT_ROUTING" in page
@@ -4357,11 +4375,11 @@ def test_dashboard_routing_locked_renders_readonly(
 
 
 def test_dashboard_accounts_surface_routing_status(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     # Row badges come from pool/status; a failed status GET renders no badges
     # (never stale), and the cooldown row explains itself in the detail pane.
-    with _create_test_client(monkeypatch) as client:
+    with _create_test_client(monkeypatch, tmp_path) as client:
         page = client.get("/").text
 
     assert 'jfetch("/admin/providers/claude/pool/status")' in page
@@ -4378,9 +4396,9 @@ def test_dashboard_accounts_surface_routing_status(
 
 
 def test_dashboard_login_modal_drives_the_login_endpoints(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    with _create_test_client(monkeypatch) as client:
+    with _create_test_client(monkeypatch, tmp_path) as client:
         page = client.get("/").text
 
     # All five login endpoints are wired: start, poll, code, confirm, cancel.
@@ -4511,87 +4529,87 @@ class TestAdminDashboardApi:
     """Codex catalog proxy and connection-test endpoints behind the admin guard."""
 
     @staticmethod
-    def _client(monkeypatch: pytest.MonkeyPatch, **kwargs: Any) -> TestClient:
+    def _client(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, **kwargs: Any) -> TestClient:
         return _create_test_client(
-            monkeypatch, base_url="http://127.0.0.1:8787", **kwargs
+            monkeypatch, tmp_path, base_url="http://127.0.0.1:8787", **kwargs
         )
 
     def test_codex_models_returns_visible_slugs(
-        self, monkeypatch: pytest.MonkeyPatch
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        with self._client(monkeypatch, codex_client=CatalogCodexClient) as client:
+        with self._client(monkeypatch, tmp_path, codex_client=CatalogCodexClient) as client:
             response = client.get("/admin/providers/codex/models")
 
         assert response.status_code == 200
         assert response.json() == {"models": ["gpt-5.6-sol", "gpt-5.5"]}
 
     def test_codex_models_relays_upstream_error(
-        self, monkeypatch: pytest.MonkeyPatch
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        with self._client(monkeypatch, codex_client=FailingCatalogCodexClient) as client:
+        with self._client(monkeypatch, tmp_path, codex_client=FailingCatalogCodexClient) as client:
             response = client.get("/admin/providers/codex/models")
 
         assert response.status_code == 400
         assert response.json()["error"]["message"] == "unsupported client"
 
     def test_codex_models_refuses_foreign_host(
-        self, monkeypatch: pytest.MonkeyPatch
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        with _create_test_client(monkeypatch, codex_client=CatalogCodexClient) as client:
+        with _create_test_client(monkeypatch, tmp_path, codex_client=CatalogCodexClient) as client:
             assert client.get("/admin/providers/codex/models").status_code == 403
 
     def test_kimi_models_relays_catalog_verbatim(
-        self, monkeypatch: pytest.MonkeyPatch
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         # The catalog passes through unshaped: the map bypasses model IDs
         # untouched, so the raw backend answer is the preset source.
-        with self._client(monkeypatch, kimi_client=CatalogKimiClient) as client:
+        with self._client(monkeypatch, tmp_path, kimi_client=CatalogKimiClient) as client:
             response = client.get("/admin/providers/kimi/models")
 
         assert response.status_code == 200
         assert response.json() == {"data": [{"id": "k2.5"}, {"id": "k3"}]}
 
     def test_kimi_models_relays_upstream_error(
-        self, monkeypatch: pytest.MonkeyPatch
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        with self._client(monkeypatch, kimi_client=FailingCatalogKimiClient) as client:
+        with self._client(monkeypatch, tmp_path, kimi_client=FailingCatalogKimiClient) as client:
             response = client.get("/admin/providers/kimi/models")
 
         assert response.status_code == 401
         assert response.json()["error"]["message"] == "token expired"
 
     def test_kimi_models_refuses_foreign_host(
-        self, monkeypatch: pytest.MonkeyPatch
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        with _create_test_client(monkeypatch, kimi_client=CatalogKimiClient) as client:
+        with _create_test_client(monkeypatch, tmp_path, kimi_client=CatalogKimiClient) as client:
             assert client.get("/admin/providers/kimi/models").status_code == 403
 
     def test_grok_models_returns_catalog_ids(
-        self, monkeypatch: pytest.MonkeyPatch
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        with self._client(monkeypatch, grok_client=CatalogGrokClient) as client:
+        with self._client(monkeypatch, tmp_path, grok_client=CatalogGrokClient) as client:
             response = client.get("/admin/providers/grok/models")
 
         assert response.status_code == 200
         assert response.json() == {"models": ["grok-4.5", "grok-4.3"]}
 
     def test_grok_models_relays_upstream_error(
-        self, monkeypatch: pytest.MonkeyPatch
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        with self._client(monkeypatch, grok_client=FailingCatalogGrokClient) as client:
+        with self._client(monkeypatch, tmp_path, grok_client=FailingCatalogGrokClient) as client:
             response = client.get("/admin/providers/grok/models")
 
         assert response.status_code == 401
         assert response.json()["error"]["message"] == "token expired"
 
     def test_grok_models_refuses_foreign_host(
-        self, monkeypatch: pytest.MonkeyPatch
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        with _create_test_client(monkeypatch, grok_client=CatalogGrokClient) as client:
+        with _create_test_client(monkeypatch, tmp_path, grok_client=CatalogGrokClient) as client:
             assert client.get("/admin/providers/grok/models").status_code == 403
 
-    def test_connection_test_ok(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        with self._client(monkeypatch, codex_client=ProbeCodexClient) as client:
+    def test_connection_test_ok(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        with self._client(monkeypatch, tmp_path, codex_client=ProbeCodexClient) as client:
             response = client.post(
                 "/admin/test",
                 json={"target": "codex:gpt-5.6-luna"},
@@ -4605,9 +4623,9 @@ class TestAdminDashboardApi:
         assert isinstance(result["latency_ms"], int)
 
     def test_connection_test_rejects_bare_target(
-        self, monkeypatch: pytest.MonkeyPatch
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        with self._client(monkeypatch, codex_client=ProbeCodexClient) as client:
+        with self._client(monkeypatch, tmp_path, codex_client=ProbeCodexClient) as client:
             response = client.post(
                 "/admin/test",
                 json={"target": "gpt-5.6-luna"},
@@ -4617,9 +4635,9 @@ class TestAdminDashboardApi:
         assert "no provider prefix" in response.json()["error"]["message"]
 
     def test_connection_test_kimi_target_probes_kimi(
-        self, monkeypatch: pytest.MonkeyPatch
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        with self._client(monkeypatch, kimi_client=ProbeKimiClient) as client:
+        with self._client(monkeypatch, tmp_path, kimi_client=ProbeKimiClient) as client:
             response = client.post(
                 "/admin/test",
                 json={"target": "kimi:k3"},
@@ -4632,9 +4650,9 @@ class TestAdminDashboardApi:
         assert result["response_model"] == "k3"
 
     def test_connection_test_reports_kimi_error(
-        self, monkeypatch: pytest.MonkeyPatch
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        with self._client(monkeypatch, kimi_client=RejectingKimiClient) as client:
+        with self._client(monkeypatch, tmp_path, kimi_client=RejectingKimiClient) as client:
             response = client.post(
                 "/admin/test",
                 json={"target": "kimi:k3"},
@@ -4646,9 +4664,9 @@ class TestAdminDashboardApi:
         assert "model not found" in result["detail"]
 
     def test_connection_test_grok_target_probes_grok(
-        self, monkeypatch: pytest.MonkeyPatch
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        with self._client(monkeypatch, grok_client=ProbeGrokClient) as client:
+        with self._client(monkeypatch, tmp_path, grok_client=ProbeGrokClient) as client:
             response = client.post(
                 "/admin/test",
                 json={"target": "grok:grok-4.5"},
@@ -4661,9 +4679,9 @@ class TestAdminDashboardApi:
         assert result["response_model"] == "grok-4.5"
 
     def test_connection_test_reports_grok_error(
-        self, monkeypatch: pytest.MonkeyPatch
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        with self._client(monkeypatch, grok_client=RejectingGrokClient) as client:
+        with self._client(monkeypatch, tmp_path, grok_client=RejectingGrokClient) as client:
             response = client.post(
                 "/admin/test",
                 json={"target": "grok:grok-nope"},
@@ -4675,9 +4693,9 @@ class TestAdminDashboardApi:
         assert "model_not_found" in result["detail"]
 
     def test_connection_test_rejects_unknown_prefix(
-        self, monkeypatch: pytest.MonkeyPatch
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        with self._client(monkeypatch) as client:
+        with self._client(monkeypatch, tmp_path) as client:
             response = client.post(
                 "/admin/test",
                 json={"target": "kim:k3"},
@@ -4687,9 +4705,9 @@ class TestAdminDashboardApi:
         assert "unknown provider prefix" in response.json()["error"]["message"]
 
     def test_connection_test_reports_unknown_codex_model(
-        self, monkeypatch: pytest.MonkeyPatch
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        with self._client(monkeypatch, codex_client=RejectingCodexClient) as client:
+        with self._client(monkeypatch, tmp_path, codex_client=RejectingCodexClient) as client:
             response = client.post(
                 "/admin/test",
                 json={"target": "codex:gpt-nope"},
@@ -4702,9 +4720,9 @@ class TestAdminDashboardApi:
         assert result["detail"] == "model_not_found"
 
     def test_connection_test_validates_input(
-        self, monkeypatch: pytest.MonkeyPatch
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        with self._client(monkeypatch) as client:
+        with self._client(monkeypatch, tmp_path) as client:
             empty_target = client.post(
                 "/admin/test",
                 json={"target": " "},
@@ -5475,7 +5493,7 @@ class TestAdminClaudeAccountsApi:
         monkeypatch.setenv("HOME", str(tmp_path / "home"))
         monkeypatch.delenv("CLAUDEX_CLAUDE_ACCOUNT_ID", raising=False)
         return _create_test_client(
-            monkeypatch,
+            monkeypatch, tmp_path,
             config=GatewayConfig(
                 settings_file=tmp_path / "settings.json", **config_kwargs
             ),
@@ -5705,7 +5723,7 @@ class TestAdminClaudeAccountsApi:
     ) -> None:
         monkeypatch.setenv("HOME", str(tmp_path / "home"))
         client = _create_test_client(
-            monkeypatch,
+            monkeypatch, tmp_path,
             config=GatewayConfig(settings_file=tmp_path / "settings.json"),
             base_url="http://evil.example",
         )
@@ -5856,9 +5874,9 @@ class TestAdminClaudeAccountsApi:
     ],
 )
 def test_pre_reorg_admin_paths_are_gone(
-    monkeypatch: pytest.MonkeyPatch, method: str, path: str
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, method: str, path: str
 ) -> None:
-    with _create_test_client(monkeypatch, base_url=_ADMIN_BASE) as client:
+    with _create_test_client(monkeypatch, tmp_path, base_url=_ADMIN_BASE) as client:
         response = client.request(method, path, json={})
     assert response.status_code == 404
 
@@ -5882,7 +5900,7 @@ class TestAdminClaudeLoginLifecycle:
         monkeypatch.setattr(_sys, "platform", "linux")
         prepend_fake_claude(monkeypatch, tmp_path)
         return _create_test_client(
-            monkeypatch,
+            monkeypatch, tmp_path,
             config=GatewayConfig(settings_file=tmp_path / "settings.json"),
             base_url=_ADMIN_BASE,
         )
@@ -6148,7 +6166,7 @@ def test_lifespan_holds_the_claude_pool_lease_for_the_process_lifetime(
     monkeypatch.setenv("HOME", str(tmp_path))
     lock_path = paths.claude_account_pool_lock()
 
-    with _create_test_client(monkeypatch) as client:
+    with _create_test_client(monkeypatch, tmp_path) as client:
         assert lock_path.is_file()
         # Contended while the lifespan-backed client is open.
         assert server.try_file_lock(lock_path) is None
@@ -6169,7 +6187,7 @@ def test_lifespan_raises_the_pinned_message_when_the_pool_lock_is_contended(
     holder = server.try_file_lock(lock_path)
     assert holder is not None
     try:
-        client = _create_test_client(monkeypatch)
+        client = _create_test_client(monkeypatch, tmp_path)
         with pytest.raises(RuntimeError) as exc_info:
             with client:
                 pass
@@ -6222,7 +6240,7 @@ class TestBalancedRoutingEnable:
         settings_file = tmp_path / "settings.json"
         config = GatewayConfig(settings_file=settings_file)
         with _create_test_client(
-            monkeypatch, config=config, base_url="http://127.0.0.1:8787"
+            monkeypatch, tmp_path, config=config, base_url="http://127.0.0.1:8787"
         ) as client:
             response = client.put(
                 "/admin/providers/claude/pool/routing", json={"mode": "balanced"}
@@ -6254,7 +6272,7 @@ class TestBalancedRoutingEnable:
         settings_file = tmp_path / "settings.json"
         config = GatewayConfig(settings_file=settings_file)
         with _create_test_client(
-            monkeypatch, config=config, base_url="http://127.0.0.1:8787"
+            monkeypatch, tmp_path, config=config, base_url="http://127.0.0.1:8787"
         ) as client:
             response = client.put(
                 "/admin/providers/claude/pool/routing", json={"mode": "balanced"}
@@ -6280,7 +6298,7 @@ class TestBalancedRoutingEnable:
             raise RuntimeError("simulated store-open failure")
 
         with _create_test_client(
-            monkeypatch, config=config, base_url="http://127.0.0.1:8787"
+            monkeypatch, tmp_path, config=config, base_url="http://127.0.0.1:8787"
         ) as client:
             with monkeypatch.context() as fault:
                 fault.setattr(ClaudePoolRuntimeStateStore, "open_", classmethod(_boom))
@@ -6310,7 +6328,7 @@ class TestBalancedRoutingEnable:
             raise OSError("simulated disk-full settings write")
 
         with _create_test_client(
-            monkeypatch, config=config, base_url="http://127.0.0.1:8787"
+            monkeypatch, tmp_path, config=config, base_url="http://127.0.0.1:8787"
         ) as client:
             with monkeypatch.context() as fault:
                 fault.setattr(server, "update_settings_file", _boom)
@@ -6348,7 +6366,7 @@ class TestBalancedRoutingEnable:
         assert config.claude_account_routing_mode == "balanced"
 
         with _create_test_client(
-            monkeypatch, config=config, base_url="http://127.0.0.1:8787"
+            monkeypatch, tmp_path, config=config, base_url="http://127.0.0.1:8787"
         ) as client:
             runtime = client.app.state.claude_balanced_runtime
             payload = client.get("/admin/providers/claude/pool/routing").json()
@@ -6366,7 +6384,7 @@ class TestBalancedRoutingEnable:
         _register_balanced_ready_account()
         config = GatewayConfig(settings_file=tmp_path / "settings.json")
         with _create_test_client(
-            monkeypatch, config=config, base_url="http://127.0.0.1:8787"
+            monkeypatch, tmp_path, config=config, base_url="http://127.0.0.1:8787"
         ) as client:
             enable = client.put(
                 "/admin/providers/claude/pool/routing", json={"mode": "balanced"}
@@ -6420,7 +6438,7 @@ class TestBalancedRoutingExit:
         settings_file = tmp_path / "settings.json"
         config = GatewayConfig(settings_file=settings_file, claude_account_id=account_id)
         with _create_test_client(
-            monkeypatch, config=config, base_url="http://127.0.0.1:8787"
+            monkeypatch, tmp_path, config=config, base_url="http://127.0.0.1:8787"
         ) as client:
             client.app.state.http_client = httpx.AsyncClient(
                 transport=httpx.MockTransport(handler)
@@ -6498,7 +6516,7 @@ class TestBalancedRoutingExit:
         settings_file = tmp_path / "settings.json"
         config = GatewayConfig(settings_file=settings_file, claude_account_id=account_id)
         with _create_test_client(
-            monkeypatch, config=config, base_url="http://127.0.0.1:8787"
+            monkeypatch, tmp_path, config=config, base_url="http://127.0.0.1:8787"
         ) as client:
             client.app.state.http_client = httpx.AsyncClient(
                 transport=httpx.MockTransport(handler)
@@ -6567,7 +6585,7 @@ class TestBalancedRoutingExit:
         config = GatewayConfig(settings_file=settings_file, claude_account_id=account_id)
         caplog.set_level(logging.WARNING, logger="claudex_gateway.claude_balanced_router")
         with _create_test_client(
-            monkeypatch, config=config, base_url="http://127.0.0.1:8787"
+            monkeypatch, tmp_path, config=config, base_url="http://127.0.0.1:8787"
         ) as client:
             client.app.state.http_client = httpx.AsyncClient(
                 transport=httpx.MockTransport(handler)
@@ -6687,7 +6705,7 @@ def test_balanced_graceful_shutdown_preserves_epoch_and_pin_for_restart(
     settings_file = tmp_path / "settings.json"
     first_config = GatewayConfig(settings_file=settings_file)
     with _create_test_client(
-        monkeypatch, config=first_config, base_url="http://127.0.0.1:8787"
+        monkeypatch, tmp_path, config=first_config, base_url="http://127.0.0.1:8787"
     ) as client:
         client.app.state.http_client = httpx.AsyncClient(
             transport=httpx.MockTransport(handler)
@@ -6712,7 +6730,7 @@ def test_balanced_graceful_shutdown_preserves_epoch_and_pin_for_restart(
     second_config = GatewayConfig.load(settings_file)
     assert second_config.claude_account_routing_mode == "balanced"
     with _create_test_client(
-        monkeypatch, config=second_config, base_url="http://127.0.0.1:8787"
+        monkeypatch, tmp_path, config=second_config, base_url="http://127.0.0.1:8787"
     ) as client:
         second_runtime = client.app.state.claude_balanced_runtime
         assert second_runtime.status == "active"
@@ -6833,7 +6851,7 @@ def test_balanced_new_session_pins_and_serves_with_a_durable_pin(
     settings_file = tmp_path / "settings.json"
     config = GatewayConfig(settings_file=settings_file)
     with _create_test_client(
-        monkeypatch, config=config, base_url="http://127.0.0.1:8787"
+        monkeypatch, tmp_path, config=config, base_url="http://127.0.0.1:8787"
     ) as client:
         runtime = _enable_balanced(client, handler)
         body = _balanced_body(_new_session_id())
@@ -6879,7 +6897,7 @@ def test_balanced_repeat_request_reuses_the_existing_pin_without_a_new_placement
         return httpx.Response(200, json={"id": "msg_1"})
 
     with _create_test_client(
-        monkeypatch, config=GatewayConfig(), base_url="http://127.0.0.1:8787"
+        monkeypatch, tmp_path, config=GatewayConfig(), base_url="http://127.0.0.1:8787"
     ) as client:
         runtime = _enable_balanced(client, handler)
         body = _balanced_body(_new_session_id())
@@ -6911,7 +6929,7 @@ def test_balanced_quota_429_migrates_commits_and_cools_down_the_source(
         return httpx.Response(200, json={"id": "msg_1"})
 
     with _create_test_client(
-        monkeypatch, config=GatewayConfig(), base_url="http://127.0.0.1:8787"
+        monkeypatch, tmp_path, config=GatewayConfig(), base_url="http://127.0.0.1:8787"
     ) as client:
         runtime = _enable_balanced(client, handler)
         body = _balanced_body(_new_session_id())
@@ -6949,7 +6967,7 @@ def test_balanced_migration_target_preheader_failure_tries_the_next_candidate(
         return httpx.Response(200, json={"id": "msg_1"})
 
     with _create_test_client(
-        monkeypatch, config=GatewayConfig(), base_url="http://127.0.0.1:8787"
+        monkeypatch, tmp_path, config=GatewayConfig(), base_url="http://127.0.0.1:8787"
     ) as client:
         runtime = _enable_balanced(client, handler)
         body = _balanced_body(_new_session_id())
@@ -6982,7 +7000,7 @@ def test_balanced_post_2xx_midstream_failure_relays_sse_error_and_retains_the_co
         )
 
     with _create_test_client(
-        monkeypatch, config=GatewayConfig(), base_url="http://127.0.0.1:8787"
+        monkeypatch, tmp_path, config=GatewayConfig(), base_url="http://127.0.0.1:8787"
     ) as client:
         runtime = _enable_balanced(client, handler)
         body = _balanced_body(_new_session_id())
@@ -7012,7 +7030,7 @@ def test_balanced_all_cooling_chain_exhaustion_relays_the_upstream_429_verbatim(
         return _quota_429("balanced-exhausted")
 
     with _create_test_client(
-        monkeypatch, config=GatewayConfig(), base_url="http://127.0.0.1:8787"
+        monkeypatch, tmp_path, config=GatewayConfig(), base_url="http://127.0.0.1:8787"
     ) as client:
         _enable_balanced(client, handler)
         body = _balanced_body(_new_session_id())
@@ -7042,7 +7060,7 @@ def test_balanced_all_cooling_synthesizes_429_with_retry_after_clamped_over_cand
         return _quota_429()
 
     with _create_test_client(
-        monkeypatch, config=GatewayConfig(), base_url="http://127.0.0.1:8787"
+        monkeypatch, tmp_path, config=GatewayConfig(), base_url="http://127.0.0.1:8787"
     ) as client:
         _enable_balanced(client, handler)
         tracker = client.app.state.claude_account_cooldowns
@@ -7073,7 +7091,7 @@ def test_balanced_returns_the_adjudicated_503_byte_exact_when_the_candidate_set_
         raise AssertionError("no upstream call may happen with an empty candidate set")
 
     with _create_test_client(
-        monkeypatch, config=GatewayConfig(), base_url="http://127.0.0.1:8787"
+        monkeypatch, tmp_path, config=GatewayConfig(), base_url="http://127.0.0.1:8787"
     ) as client:
         _enable_balanced(client, handler)
         claude_accounts.mark_account_needs_reauth(account_id)
@@ -7128,7 +7146,7 @@ def test_balanced_non_streaming_request_commits_at_headers_before_body_relay(
         )
 
     with _create_test_client(
-        monkeypatch, config=GatewayConfig(), base_url="http://127.0.0.1:8787"
+        monkeypatch, tmp_path, config=GatewayConfig(), base_url="http://127.0.0.1:8787"
     ) as client:
         _enable_balanced(client, handler)
         body = _balanced_body(_new_session_id())
@@ -7245,7 +7263,7 @@ def test_balanced_unpinnable_retry_chain_reuses_one_stateless_digest_and_creates
         return httpx.Response(200, json={"id": "msg_1"})
 
     with _create_test_client(
-        monkeypatch, config=GatewayConfig(), base_url="http://127.0.0.1:8787"
+        monkeypatch, tmp_path, config=GatewayConfig(), base_url="http://127.0.0.1:8787"
     ) as client:
         runtime = _enable_balanced(client, handler)
 
@@ -7279,7 +7297,7 @@ def test_balanced_unpinnable_separate_requests_get_independent_stateless_digests
         return httpx.Response(200, json={"id": "msg_1"})
 
     with _create_test_client(
-        monkeypatch, config=GatewayConfig(), base_url="http://127.0.0.1:8787"
+        monkeypatch, tmp_path, config=GatewayConfig(), base_url="http://127.0.0.1:8787"
     ) as client:
         runtime = _enable_balanced(client, handler)
 
@@ -7307,7 +7325,7 @@ def test_balanced_count_tokens_follows_the_pin_without_refresh_or_router_state_c
         return httpx.Response(200, json={"id": "msg_1"})
 
     with _create_test_client(
-        monkeypatch, config=GatewayConfig(), base_url="http://127.0.0.1:8787"
+        monkeypatch, tmp_path, config=GatewayConfig(), base_url="http://127.0.0.1:8787"
     ) as client:
         runtime = _enable_balanced(client, handler)
         body = _balanced_body(_new_session_id())
@@ -7348,7 +7366,7 @@ def test_balanced_count_tokens_never_creates_a_pin_or_a_cooldown(
         return _quota_429()
 
     with _create_test_client(
-        monkeypatch, config=GatewayConfig(), base_url="http://127.0.0.1:8787"
+        monkeypatch, tmp_path, config=GatewayConfig(), base_url="http://127.0.0.1:8787"
     ) as client:
         runtime = _enable_balanced(client, handler)
         body = _balanced_body(_new_session_id())
@@ -7403,7 +7421,7 @@ def test_balanced_fable_429_with_fresh_gate_observations_installs_family_cooldow
         return httpx.Response(200, json={"id": "msg_1"})
 
     with _create_test_client(
-        monkeypatch, config=GatewayConfig(), base_url="http://127.0.0.1:8787"
+        monkeypatch, tmp_path, config=GatewayConfig(), base_url="http://127.0.0.1:8787"
     ) as client:
         runtime = _enable_balanced(client, handler)
         router = runtime.router
@@ -7437,7 +7455,7 @@ def test_balanced_fable_429_with_one_stale_observation_fails_the_family_gate_and
         return _quota_429()
 
     with _create_test_client(
-        monkeypatch, config=GatewayConfig(), base_url="http://127.0.0.1:8787"
+        monkeypatch, tmp_path, config=GatewayConfig(), base_url="http://127.0.0.1:8787"
     ) as client:
         runtime = _enable_balanced(client, handler)
         router = runtime.router
@@ -7481,7 +7499,7 @@ def test_balanced_restart_restores_the_family_cooldown_without_a_repeat_429_burs
     settings_file = tmp_path / "settings.json"
     first_config = GatewayConfig(settings_file=settings_file)
     with _create_test_client(
-        monkeypatch, config=first_config, base_url="http://127.0.0.1:8787"
+        monkeypatch, tmp_path, config=first_config, base_url="http://127.0.0.1:8787"
     ) as client:
         client.app.state.http_client = httpx.AsyncClient(
             transport=httpx.MockTransport(_usage_probe_intercepting_handler(handler))
@@ -7503,7 +7521,7 @@ def test_balanced_restart_restores_the_family_cooldown_without_a_repeat_429_burs
     second_config = GatewayConfig.load(settings_file)
     assert second_config.claude_account_routing_mode == "balanced"
     with _create_test_client(
-        monkeypatch, config=second_config, base_url="http://127.0.0.1:8787"
+        monkeypatch, tmp_path, config=second_config, base_url="http://127.0.0.1:8787"
     ) as client:
         client.app.state.http_client = httpx.AsyncClient(
             transport=httpx.MockTransport(_usage_probe_intercepting_handler(handler))
@@ -7537,7 +7555,7 @@ def test_balanced_account_removal_clears_its_durable_rows_for_that_incarnation(
     settings_file = tmp_path / "settings.json"
     config = GatewayConfig(settings_file=settings_file)
     with _create_test_client(
-        monkeypatch, config=config, base_url="http://127.0.0.1:8787"
+        monkeypatch, tmp_path, config=config, base_url="http://127.0.0.1:8787"
     ) as client:
         runtime = _enable_balanced(client, handler)
         router = runtime.router
@@ -7595,7 +7613,7 @@ def test_balanced_successful_2xx_records_eligible_capability_evidence_for_the_re
         return httpx.Response(200, json={"id": "msg_1"})
 
     with _create_test_client(
-        monkeypatch, config=GatewayConfig(), base_url="http://127.0.0.1:8787"
+        monkeypatch, tmp_path, config=GatewayConfig(), base_url="http://127.0.0.1:8787"
     ) as client:
         runtime = _enable_balanced(client, handler)
         router = runtime.router
@@ -7657,7 +7675,7 @@ def test_balanced_unified_header_ingestion_is_inert_while_the_recognized_table_i
         )
 
     with _create_test_client(
-        monkeypatch, config=GatewayConfig(), base_url="http://127.0.0.1:8787"
+        monkeypatch, tmp_path, config=GatewayConfig(), base_url="http://127.0.0.1:8787"
     ) as client:
         runtime = _enable_balanced(client, handler)
         router = runtime.router
@@ -7704,7 +7722,7 @@ def test_balanced_unified_header_ingestion_updates_observations_from_the_recogni
         return httpx.Response(200, json={"id": "msg_1"}, headers=synthetic_headers)
 
     with _create_test_client(
-        monkeypatch, config=GatewayConfig(), base_url="http://127.0.0.1:8787"
+        monkeypatch, tmp_path, config=GatewayConfig(), base_url="http://127.0.0.1:8787"
     ) as client:
         runtime = _enable_balanced(client, handler)
         router = runtime.router
@@ -8036,7 +8054,7 @@ class TestBalancedUsageCoordinatorEndpoints:
             raise AssertionError("no /v1/messages traffic in this test")
 
         with _create_test_client(
-            monkeypatch, config=GatewayConfig(), base_url="http://127.0.0.1:8787"
+            monkeypatch, tmp_path, config=GatewayConfig(), base_url="http://127.0.0.1:8787"
         ) as client:
             _enable_balanced(client, handler)
             response = client.get("/admin/providers/claude/pool/usage")
@@ -8068,7 +8086,7 @@ class TestBalancedUsageCoordinatorEndpoints:
             raise AssertionError("no /v1/messages traffic in this test")
 
         with _create_test_client(
-            monkeypatch, config=GatewayConfig(), base_url="http://127.0.0.1:8787"
+            monkeypatch, tmp_path, config=GatewayConfig(), base_url="http://127.0.0.1:8787"
         ) as client:
             runtime = _enable_balanced(client, handler)
             response = client.get(
@@ -8093,7 +8111,7 @@ class TestBalancedUsageCoordinatorEndpoints:
     ) -> None:
         monkeypatch.setenv("HOME", str(tmp_path / "home"))
         client = _create_test_client(
-            monkeypatch,
+            monkeypatch, tmp_path,
             config=GatewayConfig(settings_file=tmp_path / "settings.json"),
             base_url=_ADMIN_BASE,
         )
@@ -8120,7 +8138,7 @@ class TestBalancedUsageCoordinatorEndpoints:
     ) -> None:
         monkeypatch.setenv("HOME", str(tmp_path / "home"))
         client = _create_test_client(
-            monkeypatch,
+            monkeypatch, tmp_path,
             config=GatewayConfig(settings_file=tmp_path / "settings.json"),
             base_url=_ADMIN_BASE,
         )
@@ -8151,7 +8169,7 @@ class TestBalancedUsageCoordinatorEndpoints:
     ) -> None:
         monkeypatch.setenv("HOME", str(tmp_path / "home"))
         client = _create_test_client(
-            monkeypatch,
+            monkeypatch, tmp_path,
             config=GatewayConfig(
                 settings_file=tmp_path / "settings.json", claude_account_routing_mode="fallback"
             ),
@@ -8182,7 +8200,7 @@ class TestBalancedUsageCoordinatorEndpoints:
     ) -> None:
         monkeypatch.setenv("HOME", str(tmp_path / "home"))
         client = _create_test_client(
-            monkeypatch,
+            monkeypatch, tmp_path,
             config=GatewayConfig(settings_file=tmp_path / "settings.json"),
             base_url=_ADMIN_BASE,
         )
@@ -8205,7 +8223,7 @@ class TestBalancedUsageCoordinatorEndpoints:
             raise AssertionError("no /v1/messages traffic in this test")
 
         with _create_test_client(
-            monkeypatch, config=GatewayConfig(), base_url="http://127.0.0.1:8787"
+            monkeypatch, tmp_path, config=GatewayConfig(), base_url="http://127.0.0.1:8787"
         ) as client:
             _enable_balanced(client, handler)
             response = client.get("/admin/providers/claude/pool/status")
@@ -8245,7 +8263,7 @@ class TestBalancedUsageCoordinatorEndpoints:
             raise AssertionError("no /v1/messages traffic in this test")
 
         with _create_test_client(
-            monkeypatch, config=GatewayConfig(), base_url="http://127.0.0.1:8787"
+            monkeypatch, tmp_path, config=GatewayConfig(), base_url="http://127.0.0.1:8787"
         ) as client:
             # Populate the cache through the ordinary (still-disabled-mode)
             # fetch path first -- the SAME cache instance survives the mode
@@ -8290,7 +8308,7 @@ class TestBalancedUsageCoordinatorEndpoints:
             raise AssertionError("no /v1/messages traffic in this test")
 
         with _create_test_client(
-            monkeypatch, config=GatewayConfig(), base_url="http://127.0.0.1:8787"
+            monkeypatch, tmp_path, config=GatewayConfig(), base_url="http://127.0.0.1:8787"
         ) as client:
             seeded = client.get("/admin/providers/claude/pool/usage")
             assert seeded.json()["accounts"][account_id]["status"] == "ok"
@@ -8331,7 +8349,7 @@ class TestBalancedUsageCoordinatorEndpoints:
             raise AssertionError("no /v1/messages traffic in this test")
 
         with _create_test_client(
-            monkeypatch, config=GatewayConfig(), base_url="http://127.0.0.1:8787"
+            monkeypatch, tmp_path, config=GatewayConfig(), base_url="http://127.0.0.1:8787"
         ) as client:
             seeded = client.get("/admin/providers/claude/pool/usage")
             assert seeded.json()["accounts"][account_id]["status"] == "ok"
@@ -8397,7 +8415,7 @@ class TestUsagePollDriver:
             )
 
         with _create_test_client(
-            monkeypatch, config=GatewayConfig(), base_url="http://127.0.0.1:8787"
+            monkeypatch, tmp_path, config=GatewayConfig(), base_url="http://127.0.0.1:8787"
         ) as client:
             _enable_balanced(client, handler, intercept_usage_probe=False)
             _wait_until(client, lambda: len(calls) >= 1)
@@ -8428,7 +8446,7 @@ class TestUsagePollDriver:
             return httpx.Response(200, json={})
 
         with _create_test_client(
-            monkeypatch, config=GatewayConfig(), base_url="http://127.0.0.1:8787"
+            monkeypatch, tmp_path, config=GatewayConfig(), base_url="http://127.0.0.1:8787"
         ) as client:
             runtime = _enable_balanced(client, handler, intercept_usage_probe=False)
             assert runtime.usage_poll_coordinator is not None
@@ -8465,7 +8483,7 @@ class TestUsagePollDriver:
             return httpx.Response(200, json={})
 
         with _create_test_client(
-            monkeypatch, config=GatewayConfig(), base_url="http://127.0.0.1:8787"
+            monkeypatch, tmp_path, config=GatewayConfig(), base_url="http://127.0.0.1:8787"
         ) as client:
             runtime = _enable_balanced(client, handler, intercept_usage_probe=False)
             assert runtime.usage_poll_coordinator is not None
@@ -8510,7 +8528,7 @@ class TestUsagePollDriver:
             )
 
         with _create_test_client(
-            monkeypatch, config=GatewayConfig(), base_url="http://127.0.0.1:8787"
+            monkeypatch, tmp_path, config=GatewayConfig(), base_url="http://127.0.0.1:8787"
         ) as client:
             client.app.state.http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
             # Pre-seed the manual-target account as already fresh (still in
