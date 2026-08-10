@@ -109,58 +109,52 @@ def test_deferred_gate_8_5_two_account_live_confirmation_of_the_t8_simulated_fai
 
 
 @pytest.mark.skip(
-    reason="deferred — needs 2nd account: 8.12 live multi-account persistence-degraded recovery"
+    reason="deferred — needs 2nd account: 8.12 freshness-penalty placement bias measured live (header-fresh vs poll-fresh accounts at N=10/20) before tuning the +5/+10pp reserves"
 )
-def test_deferred_gate_8_12_two_account_live_persistence_degraded_recovery() -> None:
-    """Live confirmation that a persistence outage affecting one account's
-    durable writes never blocks a second, healthy account from being placed
-    and served while the store self-heals -- T-17's own
-    `test_persistence_degrades_under_transient_failures_but_recovers_and_durably_lands_the_pin`
-    covers the single-account recovery mechanics locally."""
+def test_deferred_gate_8_12_live_freshness_penalty_placement_bias_measurement() -> None:
+    """Design v2 §8.12: measure the placement bias between header-fresh (hot)
+    and poll-fresh (idle) accounts at N=10/20 live accounts BEFORE any tuning
+    of the +5/+10pp freshness reserves -- the known hedge that placement
+    skews mildly toward hot accounts must be quantified, not assumed."""
 
 
 @pytest.mark.skip(
-    reason="deferred — needs 2nd account: 8.14 live multi-account reservation-aware LRU eviction"
+    reason="deferred — needs 2nd account: 8.14 capture verified Pro/Max unsupported-model response signatures; denial classification stays dormant until they exist"
 )
-def test_deferred_gate_8_14_two_account_live_reservation_aware_lru_eviction() -> None:
-    """Live confirmation that a migration-reserved pin survives eviction
-    pressure while a SECOND real account's traffic drives the pin map toward
-    its bound -- `test_claude_balanced_router.py`'s
-    `test_migration_reserved_pin_survives_eviction_pressure_and_becomes_evictable_once_resolved`
-    already covers the mechanism deterministically with simulated entries."""
+def test_deferred_gate_8_14_live_unsupported_model_signature_capture() -> None:
+    """Design v2 §8.14: capture the real Pro/Max unsupported-model response
+    signatures from a live account that lacks the entitlement; v1 records no
+    denied capability evidence and the model-ineligible migration trigger
+    stays dormant until classification is built from verified signatures."""
 
 
 @pytest.mark.skip(
-    reason="deferred — needs 2nd account: 8.15 live multi-account cooldown restore without a repeat burst"
+    reason="deferred — needs 2nd account: 8.15 multi-model sessions (Sonnet/Opus/Fable + parallel subagents): whole-session migration vs per-family pins — the runner-up gate"
 )
-def test_deferred_gate_8_15_two_account_live_cooldown_restore_without_a_repeat_burst() -> None:
-    """Live confirmation that a restored durable cooldown for one account
-    coexists correctly with a second, healthy account continuing to serve
-    traffic across the same restart -- `test_server.py`'s
-    `test_balanced_restart_restores_the_family_cooldown_without_a_repeat_429_burst`
-    already covers the single-account restore mechanics locally."""
+def test_deferred_gate_8_15_live_multi_model_session_migration_runner_up_gate() -> None:
+    """Design v2 §8.15: observe real multi-model sessions (Sonnet/Opus/Fable
+    plus parallel subagents) under a family-specific hard failure -- the
+    evidence gate for the one genuine runner-up design (per-family pin
+    overrides) versus the shipped whole-session migration."""
 
 
 @pytest.mark.skip(
-    reason="deferred — needs 2nd account: 8.16 live multi-account epoch rotation on mode exit"
+    reason="deferred — needs 2nd account: 8.16 real A→B failover cache cost (first-request latency on B, subsequent hits) confirming no-failback"
 )
-def test_deferred_gate_8_16_two_account_live_epoch_rotation_on_mode_exit() -> None:
-    """Live confirmation that an intentional mode exit's epoch rotation
-    invalidates BOTH accounts' pins consistently and a later re-entry
-    re-places live traffic across both -- this file's own
-    `test_mode_exit_rotates_the_epoch_so_a_later_reentry_never_restores_the_old_pin`
-    covers the single-account rotation mechanics locally."""
+def test_deferred_gate_8_16_live_failover_cache_cost_measurement() -> None:
+    """Design v2 §8.16: measure the real A→B failover prompt-cache cost --
+    first-request latency on the migration target and subsequent cache hits --
+    confirming the sticky no-failback policy is cheaper than returning."""
 
 
 @pytest.mark.skip(
-    reason="deferred — needs 2nd account: 8.19 live multi-account disable-while-streaming drain"
+    reason="deferred — needs 2nd account: 8.19 multi-worker startup refusal + rolling-deploy behavior against a live pool (the lease refusal is unit-tested; the operational rollout pattern is not)"
 )
-def test_deferred_gate_8_19_two_account_live_disable_while_streaming_drain() -> None:
-    """Live confirmation that a disable-mode drain correctly waits out an
-    in-flight stream on one account while a second account's own traffic is
-    unaffected until the drain completes -- this file's own
-    `test_disable_while_streaming_drains_the_in_flight_stream_before_epoch_rotation_invalidates_pins`
-    covers the single-account drain-ordering mechanics locally."""
+def test_deferred_gate_8_19_live_multi_worker_refusal_and_rolling_deploy() -> None:
+    """Design v2 §8.19: exercise multi-worker startup refusal and the
+    rolling-deploy pattern against a live pool -- the balanced-router.lock
+    contention path is unit-tested, but the operational one-process rollout
+    behavior needs live confirmation."""
 
 
 # ===========================================================================
