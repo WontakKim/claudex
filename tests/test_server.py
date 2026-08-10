@@ -7186,3 +7186,260 @@ def test_balanced_count_tokens_never_creates_a_pin_or_a_cooldown(
         assert response.status_code == 429
         assert runtime.router.pin_count() == 0
         assert not client.app.state.claude_account_cooldowns.is_cooling(account_id)
+
+
+# ---------------------------------------------------------------------------
+# Durable cooldowns, Fable family gate, capability evidence, removal cleanup
+# (T-12, design v2 §6.4/§5.5/§5.7, adjudication G)
+# ---------------------------------------------------------------------------
+
+
+def _ingest_gate_satisfying_fable_observations(router: ClaudeBalancedRouter, account_id: str) -> None:
+    """Fresh, REAL readings satisfying every non-status/non-family §6.4 gate
+    condition: `fable_weekly` >=99%, `five_hour`/`seven_day` <=70%, all <=15 min
+    old, with a valid future Fable reset."""
+    router.ingest_observation(
+        account_id,
+        "fable_weekly",
+        used_percent=99.0,
+        source="usage_api",
+        age_seconds=0.0,
+        reset_in_seconds=3600.0,
+        reset_identity="fable-reset-1",
+    )
+    router.ingest_observation(account_id, "five_hour", used_percent=40.0, source="usage_api", age_seconds=0.0)
+    router.ingest_observation(account_id, "seven_day", used_percent=40.0, source="usage_api", age_seconds=0.0)
+
+
+def test_balanced_fable_429_with_fresh_gate_observations_installs_family_cooldown_and_still_serves_sonnet(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A Fable 429 with three fresh, gate-satisfying observations installs a
+    FAMILY-scoped cooldown (not account-wide) -- so a later Sonnet (default
+    family) request keeps being served from the very same account.
+    """
+    _balanced_env(monkeypatch, tmp_path)
+    account_id, access_token = _register_balanced_accounts(1)[0]
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.headers["authorization"])
+        if len(calls) == 1:
+            return _quota_429()
+        return httpx.Response(200, json={"id": "msg_1"})
+
+    with _create_test_client(
+        monkeypatch, config=GatewayConfig(), base_url="http://127.0.0.1:8787"
+    ) as client:
+        runtime = _enable_balanced(client, handler)
+        router = runtime.router
+        assert router is not None
+        _ingest_gate_satisfying_fable_observations(router, account_id)
+
+        fable_response = client.post("/v1/messages", json=_balanced_body(_new_session_id()))
+        assert fable_response.status_code == 429
+
+        now = time.monotonic()
+        assert router.family_cooldown_deadline(account_id, "fable", now=now) is not None
+        assert router.account_cooldown_deadline(account_id, now=now) is None
+
+        sonnet_body = _balanced_body(_new_session_id(), model="claude-sonnet-5")
+        sonnet_response = client.post("/v1/messages", json=sonnet_body)
+
+        assert sonnet_response.status_code == 200
+        assert len(calls) == 2
+        assert calls[1] == f"Bearer {access_token}"
+
+
+def test_balanced_fable_429_with_one_stale_observation_fails_the_family_gate_and_installs_account_wide_cooldown(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Ambiguous observations (one stale, >15 min old) fail the family gate's
+    freshness condition -- the cooldown falls back to account-wide."""
+    _balanced_env(monkeypatch, tmp_path)
+    account_id, _access_token = _register_balanced_accounts(1)[0]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _quota_429()
+
+    with _create_test_client(
+        monkeypatch, config=GatewayConfig(), base_url="http://127.0.0.1:8787"
+    ) as client:
+        runtime = _enable_balanced(client, handler)
+        router = runtime.router
+        assert router is not None
+        router.ingest_observation(
+            account_id,
+            "fable_weekly",
+            used_percent=99.0,
+            source="usage_api",
+            age_seconds=0.0,
+            reset_in_seconds=3600.0,
+            reset_identity="fable-reset-1",
+        )
+        # Stale: >15 min old, so the family gate's freshness condition fails.
+        router.ingest_observation(account_id, "five_hour", used_percent=40.0, source="usage_api", age_seconds=20 * 60)
+        router.ingest_observation(account_id, "seven_day", used_percent=40.0, source="usage_api", age_seconds=0.0)
+
+        response = client.post("/v1/messages", json=_balanced_body(_new_session_id()))
+        assert response.status_code == 429
+
+        now = time.monotonic()
+        assert router.family_cooldown_deadline(account_id, "fable", now=now) is None
+        assert router.account_cooldown_deadline(account_id, now=now) is not None
+
+
+def test_balanced_restart_restores_the_family_cooldown_without_a_repeat_429_burst(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A daemon restart restores durable cooldowns (§5.4/§5.5): the second
+    process instance skips the still-cooling account for its own Fable-family
+    request WITHOUT ever calling upstream again -- no repeat-429 burst.
+    """
+    _balanced_env(monkeypatch, tmp_path)
+    account_id, _access_token = _register_balanced_accounts(1)[0]
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.headers["authorization"])
+        return _quota_429()
+
+    settings_file = tmp_path / "settings.json"
+    first_config = GatewayConfig(settings_file=settings_file)
+    with _create_test_client(
+        monkeypatch, config=first_config, base_url="http://127.0.0.1:8787"
+    ) as client:
+        client.app.state.http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        enable = client.put("/admin/providers/claude/pool/routing", json={"mode": "balanced"})
+        assert enable.status_code == 200
+        first_runtime = client.app.state.claude_balanced_runtime
+        router = first_runtime.router
+        assert router is not None
+        _ingest_gate_satisfying_fable_observations(router, account_id)
+
+        first_response = client.post("/v1/messages", json=_balanced_body(_new_session_id()))
+        assert first_response.status_code == 429
+        assert len(calls) == 1
+        assert router.family_cooldown_deadline(account_id, "fable", now=time.monotonic()) is not None
+
+    # A second, independent process instance over the same pool directory
+    # (mirrors `test_balanced_graceful_shutdown_preserves_epoch_and_pin_for_restart`).
+    second_config = GatewayConfig.load(settings_file)
+    assert second_config.claude_account_routing_mode == "balanced"
+    with _create_test_client(
+        monkeypatch, config=second_config, base_url="http://127.0.0.1:8787"
+    ) as client:
+        client.app.state.http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        second_runtime = client.app.state.claude_balanced_runtime
+        assert second_runtime.status == "active"
+        assert second_runtime.router is not None
+        assert second_runtime.router.family_cooldown_deadline(
+            account_id, "fable", now=time.monotonic()
+        ) is not None
+
+        second_response = client.post("/v1/messages", json=_balanced_body(_new_session_id()))
+
+        assert second_response.status_code == 429
+        assert len(calls) == 1  # no repeat-429 burst: the restored cooldown skipped upstream entirely
+
+
+def test_balanced_account_removal_clears_its_durable_rows_for_that_incarnation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Removing an account while balanced is active runs the router's own
+    removal matrix and deletes every durable row of that incarnation (§5.7) --
+    verified directly against the persisted store after the process shuts down.
+    """
+    _balanced_env(monkeypatch, tmp_path)
+    account_id, _access_token = _register_balanced_accounts(1)[0]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _quota_429()
+
+    settings_file = tmp_path / "settings.json"
+    config = GatewayConfig(settings_file=settings_file)
+    with _create_test_client(
+        monkeypatch, config=config, base_url="http://127.0.0.1:8787"
+    ) as client:
+        runtime = _enable_balanced(client, handler)
+        router = runtime.router
+        assert router is not None
+
+        incarnation = next(
+            record.account_incarnation_id
+            for record in claude_accounts.list_accounts()
+            if record.id == account_id
+        )
+
+        # One 429 leaves both a pin (still pointing at the cooling account) and
+        # a durable cooldown row -- both durably written and awaited already.
+        cooling_response = client.post("/v1/messages", json=_balanced_body(_new_session_id()))
+        assert cooling_response.status_code == 429
+        assert router.pin_count() == 1
+        assert router.account_cooldown_deadline(account_id, now=time.monotonic()) is not None
+
+        delete_response = client.delete(f"/admin/providers/claude/accounts/{account_id}")
+
+        assert delete_response.status_code == 204
+        assert router.pin_count() == 0
+        assert router.account_cooldown_deadline(account_id, now=time.monotonic()) is None
+
+    runtime_db_path = paths.claude_account_pool_runtime_db()
+    inspect_store = ClaudePoolRuntimeStateStore.open_(runtime_db_path)
+    try:
+        restore_result = inspect_store.restore(RestoreValidationContext(now_utc=time.time()))
+        assert not any(row.account_incarnation_id == incarnation for row in restore_result.pins.values())
+        assert not any(row.account_incarnation_id == incarnation for row in restore_result.cooldowns.values())
+        assert not any(
+            row.account_incarnation_id == incarnation
+            for row in restore_result.usage_observations.values()
+        )
+        assert not any(
+            row.account_incarnation_id == incarnation
+            for row in restore_result.capability_evidence.values()
+        )
+    finally:
+        inspect_store.close()
+
+
+
+def test_balanced_successful_2xx_records_eligible_capability_evidence_for_the_request_model(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A successful balanced 2xx records ELIGIBLE capability evidence for the
+    request's own capability key (adjudication G) -- and never implies
+    eligibility for a different key.
+    """
+    _balanced_env(monkeypatch, tmp_path)
+    account_id, _access_token = _register_balanced_accounts(1)[0]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"id": "msg_1"})
+
+    with _create_test_client(
+        monkeypatch, config=GatewayConfig(), base_url="http://127.0.0.1:8787"
+    ) as client:
+        runtime = _enable_balanced(client, handler)
+        router = runtime.router
+        assert router is not None
+        record = next(r for r in claude_accounts.list_accounts() if r.id == account_id)
+        from claudex_gateway.claude_account_profile import load_account_profile_fingerprint
+
+        fingerprint = load_account_profile_fingerprint(paths.accounts_dir("claude") / account_id)
+        assert fingerprint is not None
+
+        response = client.post("/v1/messages", json=_balanced_body(_new_session_id()))
+        assert response.status_code == 200
+
+        assert router.is_capability_eligible(
+            account_id,
+            "fable",
+            account_incarnation_id=record.account_incarnation_id,
+            account_profile_fingerprint=fingerprint,
+        )
+        assert not router.is_capability_eligible(
+            account_id,
+            "opus",
+            account_incarnation_id=record.account_incarnation_id,
+            account_profile_fingerprint=fingerprint,
+        )

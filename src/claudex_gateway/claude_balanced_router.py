@@ -228,6 +228,29 @@ DEFAULT_PIN_TTL_CONTENT_HASH_SECONDS = 30 * 60
 DEFAULT_PIN_MAP_MAX_ENTRIES = 10_000
 
 
+def _is_ascii_alnum(char: str | None) -> bool:
+    return char is not None and char.isascii() and char.isalnum()
+
+
+def _bounded_token_present(lowered: str, token: str) -> bool:
+    """True when `token` appears in `lowered`, bounded on each side by the
+    string's start/end or a non-alphanumeric (ASCII) character — so a token
+    merely contained in a larger word (e.g. "fable" inside "unfable" or
+    "fabled") never matches.
+    """
+    start = 0
+    while True:
+        index = lowered.find(token, start)
+        if index == -1:
+            return False
+        before = lowered[index - 1] if index > 0 else None
+        after_index = index + len(token)
+        after = lowered[after_index] if after_index < len(lowered) else None
+        if not _is_ascii_alnum(before) and not _is_ascii_alnum(after):
+            return True
+        start = index + 1
+
+
 def quota_family(model: str) -> str:
     """The binding-window family a `model` id belongs to (adjudication G).
 
@@ -238,23 +261,29 @@ def quota_family(model: str) -> str:
     a token merely containing "fable" as a substring of a larger word, e.g.
     "unfable" or "fabled") uses the "default" family.
     """
+    return "fable" if _bounded_token_present(model.lower(), "fable") else "default"
+
+
+# `ClaudePoolRuntimeStateStore.capability_evidence.capability_key` (§5.5,
+# adjudication G): the bounded, case-insensitive family token a model id
+# carries, else the exact (lowercased) model id itself. Checked in this
+# fixed order — real model ids never carry more than one of these tokens.
+_CAPABILITY_KEY_TOKENS: tuple[str, ...] = ("fable", "opus", "sonnet", "haiku")
+
+
+def capability_key(model: str) -> str:
+    """The capability-evidence key a `model` id is classified under (adjudication G).
+
+    A bounded (never a larger word's substring), case-insensitive match
+    against `_CAPABILITY_KEY_TOKENS` wins; every other model id falls back to
+    `"model:<lowercase id>"`, so capability evidence never accidentally
+    conflates two unrelated model ids that merely share no family token.
+    """
     lowered = model.lower()
-    token = "fable"
-    start = 0
-    while True:
-        index = lowered.find(token, start)
-        if index == -1:
-            return "default"
-        before = lowered[index - 1] if index > 0 else None
-        after_index = index + len(token)
-        after = lowered[after_index] if after_index < len(lowered) else None
-        if not _is_ascii_alnum(before) and not _is_ascii_alnum(after):
-            return "fable"
-        start = index + 1
-
-
-def _is_ascii_alnum(char: str | None) -> bool:
-    return char is not None and char.isascii() and char.isalnum()
+    for token in _CAPABILITY_KEY_TOKENS:
+        if _bounded_token_present(lowered, token):
+            return token
+    return f"model:{lowered}"
 
 
 def binding_windows(family: str) -> tuple[str, ...]:
@@ -316,6 +345,17 @@ class _WarningSignal:
     reset_identity: str | None
 
 
+@dataclass(frozen=True)
+class RealWindowReading:
+    """One window's REAL (never `unknown_floor`, never inferred) freshness-
+    adjusted reading, plus its raw age — `ObservationView.real_window_reading`'s
+    result, consumed by the design v2 §6.4 family gate.
+    """
+
+    adjusted_pressure: float
+    age_seconds: float
+
+
 class ObservationView:
     """Per-account, per-window usage observations feeding pressure computation.
 
@@ -373,6 +413,34 @@ class ObservationView:
     def window_reset_identity(self, account_id: str, window: str) -> str | None:
         observation = self._windows.get((account_id, window))
         return observation.reset_identity if observation is not None else None
+
+    def window_reset_at(self, account_id: str, window: str) -> float | None:
+        observation = self._windows.get((account_id, window))
+        return observation.reset_at if observation is not None else None
+
+    def real_window_reading(
+        self, account_id: str, window: str, *, now: float, max_age_seconds: float
+    ) -> RealWindowReading | None:
+        """The window's own freshness-adjusted pressure, but ONLY when a REAL
+        observation exists and is at most `max_age_seconds` old — `None` for
+        anything else (missing, aged out, or its reset already passed). Reads the
+        raw stored observation directly, never `unknown_floor`-substituted and
+        never emergency-weighted — the design v2 §6.4 family gate's own
+        REAL/fresh requirement.
+        """
+        observation = self._windows.get((account_id, window))
+        if observation is None:
+            return None
+        age_seconds = now - observation.observed_at
+        if age_seconds > max_age_seconds:
+            return None
+        reset_passed = observation.reset_at is not None and observation.reset_at <= now
+        adjusted = freshness_adjusted_pressure(
+            observation.used_percent, age_seconds, reset_passed=reset_passed
+        )
+        if adjusted is None:
+            return None
+        return RealWindowReading(adjusted_pressure=adjusted, age_seconds=age_seconds)
 
     def has_active_warning(self, account_id: str, window: str, *, now: float) -> bool:
         """True while a fresh (<=5 min) `allowed_warning` with a matching reset identity is retained."""
@@ -517,6 +585,111 @@ def is_eligible_candidate(
     if candidate.family_cooldown_until is not None and candidate.family_cooldown_until > now:
         return False
     return True
+
+
+# -- Fable family-scoped cooldown gate (design v2 §6.4, §5.5) ---------------
+
+# All in percentage points / seconds, exactly as design v2 §6.4 states them.
+_FAMILY_GATE_MAX_OBSERVATION_AGE_SECONDS = 15 * 60
+_FAMILY_GATE_FABLE_WEEKLY_MIN_PERCENT = 99.0
+_FAMILY_GATE_FIVE_HOUR_MAX_PERCENT = 70.0
+_FAMILY_GATE_SEVEN_DAY_MAX_PERCENT = 70.0
+
+
+@dataclass(frozen=True)
+class FamilyGateOutcome:
+    """`classify_balanced_cooldown_scope`'s verdict: which `install_cooldown`
+    scope to install, and why."""
+
+    scope: Literal["account", "family"]
+    reason: str
+    family_deadline: float | None = None
+
+
+def classify_balanced_cooldown_scope(
+    observations: ObservationView,
+    *,
+    account_id: str,
+    model: str,
+    upstream_status_code: int,
+    now: float,
+) -> FamilyGateOutcome:
+    """Design v2 §6.4's family gate: a FAMILY-scoped cooldown (keyed
+    account+family) installs only when ALL SIX hold, each checked
+    independently — a single failing condition falls all the way back to
+    account-wide, never a partial family scope:
+
+    1. the request's model family is "fable";
+    2. the account-specific failure is an ACTUAL upstream quota 429;
+    3. `fable_weekly`'s reading is REAL and fresh (§6.4: never
+       `unknown_floor`, never an emergency weight, never inferred; here,
+       present and <=15 min old) with an adjusted pressure >=99%;
+    4. `five_hour`'s reading is REAL/fresh with an adjusted pressure <=70%;
+    5. `seven_day`'s reading is REAL/fresh with an adjusted pressure <=70%;
+    6. the Fable reset is present and still in the future — it becomes the
+       scoped deadline (`family_deadline`).
+
+    Otherwise account-wide. A 429 never implies model ineligibility on its
+    own — this only ever decides cooldown SCOPE, never capability evidence.
+    """
+    if quota_family(model) != "fable":
+        return FamilyGateOutcome("account", "request_family_not_fable")
+    if upstream_status_code != 429:
+        return FamilyGateOutcome("account", "not_upstream_quota_429")
+
+    fable_weekly = observations.real_window_reading(
+        account_id, "fable_weekly", now=now, max_age_seconds=_FAMILY_GATE_MAX_OBSERVATION_AGE_SECONDS
+    )
+    if fable_weekly is None or fable_weekly.adjusted_pressure < _FAMILY_GATE_FABLE_WEEKLY_MIN_PERCENT:
+        return FamilyGateOutcome("account", "fable_weekly_not_saturated")
+
+    five_hour = observations.real_window_reading(
+        account_id, "five_hour", now=now, max_age_seconds=_FAMILY_GATE_MAX_OBSERVATION_AGE_SECONDS
+    )
+    if five_hour is None or five_hour.adjusted_pressure > _FAMILY_GATE_FIVE_HOUR_MAX_PERCENT:
+        return FamilyGateOutcome("account", "five_hour_not_clear")
+
+    seven_day = observations.real_window_reading(
+        account_id, "seven_day", now=now, max_age_seconds=_FAMILY_GATE_MAX_OBSERVATION_AGE_SECONDS
+    )
+    if seven_day is None or seven_day.adjusted_pressure > _FAMILY_GATE_SEVEN_DAY_MAX_PERCENT:
+        return FamilyGateOutcome("account", "seven_day_not_clear")
+
+    reset_at = observations.window_reset_at(account_id, "fable_weekly")
+    if reset_at is None or reset_at <= now:
+        return FamilyGateOutcome("account", "fable_reset_not_valid")
+
+    return FamilyGateOutcome("family", "fable_family_gate_satisfied", family_deadline=reset_at)
+
+
+# -- durable cooldowns and capability evidence (design v2 §5.5, §6.4, adjudication G) --
+
+# New-cooldown derivation keeps the pre-existing [5s, 7d] clamp (unchanged,
+# `claude_account_pool.rate_limit_cooldown_seconds`); a RESTORED cooldown's
+# remaining duration gets its own, looser [1s, 7d] clamp (§5.5).
+_COOLDOWN_RESTORE_MIN_SECONDS = 1.0
+_COOLDOWN_RESTORE_MAX_SECONDS = 7 * 24 * 3600.0
+
+# Capability evidence: state is always "eligible" here — v1 never writes
+# "denied" (§5.5/§6.4/adjudication G) — under a fixed classifier version and
+# a 1h TTL.
+CAPABILITY_CLASSIFIER_VERSION = "v1"
+CAPABILITY_EVIDENCE_TTL_SECONDS = 3600.0
+
+
+@dataclass
+class _CooldownEntry:
+    deadline_monotonic: float
+    account_incarnation_id: str
+    reason: str
+
+
+@dataclass(frozen=True)
+class _CapabilityEvidenceEntry:
+    account_incarnation_id: str
+    account_profile_fingerprint: str
+    classifier_version: str
+    expires_at_monotonic: float
 
 
 # -- pin map (design v2 §5.1-§5.3) ------------------------------------------
@@ -682,6 +855,17 @@ class ClaudeBalancedRouter:
         self.migration_outcome_counts: dict[str, int] = {}
         self.migration_cas_lost = 0
         self.migration_commit_rejected_target_removed = 0
+
+        # Durable cooldowns (design v2 §6.4/§5.5): account-wide by default,
+        # Fable family-scoped only when `classify_cooldown_scope` says so.
+        self._account_cooldowns: dict[str, _CooldownEntry] = {}
+        self._family_cooldowns: dict[tuple[str, str], _CooldownEntry] = {}
+        # Capability evidence (§5.5, adjudication G): keyed by the EXACT
+        # `(account_id, capability_key)` pair — never inferred across keys.
+        self._capability_evidence: dict[tuple[str, str], _CapabilityEvidenceEntry] = {}
+        # `remove_account`'s durable incarnation-scoped deletion, keyed by
+        # incarnation so a caller can await its completion afterward.
+        self._pending_incarnation_removals: dict[str, Any] = {}
 
     # -- in-flight attempt counting: M(a) -----------------------------------
 
@@ -1054,11 +1238,20 @@ class ClaudeBalancedRouter:
     def restore_from_store(
         self, restore_result: RestoreResult, *, now: float | None = None, wall_now: float | None = None
     ) -> int:
-        """Convert restored pin rows (wall-clock) into the monotonic pin map, recomputing counters.
+        """Convert restored rows (wall-clock) into monotonic in-memory state,
+        recomputing pin counters.
 
         `restore_result.pins` already excludes expired and epoch-mismatched
         rows (`ClaudePoolRuntimeStateStore.restore`); every remaining row is
-        durable, so it carries no `pending_durability` barrier.
+        durable, so it carries no `pending_durability` barrier. Cooldowns and
+        capability evidence get the same wall->monotonic conversion, each with
+        its own §5.5 restore clamp/validation; a restored cooldown's remaining
+        duration clamps to `[1s, 7d]`, and a restored capability row is kept
+        only while it is still `eligible`, still carries a TTL, is not yet
+        expired, and matches this build's `CAPABILITY_CLASSIFIER_VERSION` (the
+        incarnation/fingerprint match is enforced lazily, at query time,
+        against the live candidate the caller supplies — the same backstop
+        pattern pins rely on).
         """
         monotonic_now = self._clock() if now is None else now
         wall_now = self._wall_clock() if wall_now is None else wall_now
@@ -1067,6 +1260,9 @@ class ClaudeBalancedRouter:
         self.removed_pin_counts.clear()
         self.total_removed_pins = 0
         self.soft_bound_overflow_count = 0
+        self._account_cooldowns.clear()
+        self._family_cooldowns.clear()
+        self._capability_evidence.clear()
 
         for digest, row in restore_result.pins.items():
             self._pins[digest] = PinEntry(
@@ -1084,7 +1280,194 @@ class ClaudeBalancedRouter:
                 pending_durability=None,
             )
         self._restored_any_valid_pin = bool(restore_result.pins)
+
+        for (account_id, scope, model_family), cooldown_row in restore_result.cooldowns.items():
+            remaining = cooldown_row.deadline_utc - wall_now
+            clamped_remaining = max(
+                _COOLDOWN_RESTORE_MIN_SECONDS, min(_COOLDOWN_RESTORE_MAX_SECONDS, remaining)
+            )
+            entry = _CooldownEntry(
+                deadline_monotonic=monotonic_now + clamped_remaining,
+                account_incarnation_id=cooldown_row.account_incarnation_id,
+                reason=cooldown_row.reason,
+            )
+            if scope == "account":
+                self._account_cooldowns[account_id] = entry
+            else:
+                self._family_cooldowns[(account_id, model_family)] = entry
+
+        for (account_id, capability_key_value), capability_row in restore_result.capability_evidence.items():
+            if capability_row.state != "eligible" or capability_row.expires_at_utc is None:
+                continue  # v1 never trusts a restored denial; eligible evidence always carries a TTL
+            if capability_row.classifier_version != CAPABILITY_CLASSIFIER_VERSION:
+                continue
+            expires_at_monotonic = _wall_to_monotonic(
+                capability_row.expires_at_utc, wall_now=wall_now, monotonic_now=monotonic_now
+            )
+            if expires_at_monotonic <= monotonic_now:
+                continue
+            self._capability_evidence[(account_id, capability_key_value)] = _CapabilityEvidenceEntry(
+                account_incarnation_id=capability_row.account_incarnation_id,
+                account_profile_fingerprint=capability_row.account_profile_fingerprint,
+                classifier_version=capability_row.classifier_version,
+                expires_at_monotonic=expires_at_monotonic,
+            )
+
         return len(self._pins)
+
+    # -- cooldowns: account-wide default, Fable family-scoped gate (§6.4) ----
+
+    def classify_cooldown_scope(
+        self, *, account_id: str, model: str, upstream_status_code: int, now: float | None = None
+    ) -> FamilyGateOutcome:
+        """`classify_balanced_cooldown_scope` against this router's own live
+        `observations` and clock."""
+        now = self._clock() if now is None else now
+        return classify_balanced_cooldown_scope(
+            self.observations,
+            account_id=account_id,
+            model=model,
+            upstream_status_code=upstream_status_code,
+            now=now,
+        )
+
+    def install_cooldown(
+        self,
+        *,
+        account_id: str,
+        account_incarnation_id: str,
+        account_profile_fingerprint: str | None,
+        scope: Literal["account", "family"],
+        deadline: float,
+        reason: str,
+        model_family: str = "",
+        evidence: str = "",
+        now: float | None = None,
+        wall_now: float | None = None,
+    ) -> Any:
+        """Install a cooldown (account-wide, or Fable family-scoped when
+        `scope == "family"`), in-memory and — when both a store and a profile
+        fingerprint are available — durably, always HIGH PRIORITY (design v2
+        §5.5's "cooldown installation" bullet). `deadline` is monotonic.
+        Returns the store's `PendingWrite`, or `None` when nothing was
+        submitted (no store, or no fingerprint yet).
+        """
+        now = self._clock() if now is None else now
+        entry = _CooldownEntry(
+            deadline_monotonic=deadline, account_incarnation_id=account_incarnation_id, reason=reason
+        )
+        if scope == "account":
+            self._account_cooldowns[account_id] = entry
+        else:
+            self._family_cooldowns[(account_id, model_family)] = entry
+
+        if self._store is None or account_profile_fingerprint is None:
+            return None
+        wall_now = self._wall_clock() if wall_now is None else wall_now
+        return self._store.upsert_cooldown(
+            account_id=account_id,
+            scope=scope,
+            model_family=model_family,
+            account_incarnation_id=account_incarnation_id,
+            account_profile_fingerprint=account_profile_fingerprint,
+            deadline_utc=wall_now + (deadline - now),
+            reason=reason,
+            evidence=evidence,
+            updated_at_utc=wall_now,
+            high_priority=True,
+        )
+
+    def account_cooldown_deadline(self, account_id: str, *, now: float | None = None) -> float | None:
+        """The account-wide cooldown's monotonic deadline, or `None` when absent/expired."""
+        now = self._clock() if now is None else now
+        entry = self._account_cooldowns.get(account_id)
+        if entry is None or entry.deadline_monotonic <= now:
+            return None
+        return entry.deadline_monotonic
+
+    def family_cooldown_deadline(
+        self, account_id: str, model_family: str, *, now: float | None = None
+    ) -> float | None:
+        """The `(account_id, model_family)` cooldown's monotonic deadline, or `None`
+        when absent/expired."""
+        now = self._clock() if now is None else now
+        entry = self._family_cooldowns.get((account_id, model_family))
+        if entry is None or entry.deadline_monotonic <= now:
+            return None
+        return entry.deadline_monotonic
+
+    # -- capability evidence: eligible-only, TTL'd (§5.5, adjudication G) ----
+
+    def classify_capability_evidence(
+        self,
+        *,
+        account_id: str,
+        capability_key: str,
+        account_incarnation_id: str,
+        account_profile_fingerprint: str,
+        status_code: int,
+        evidence_source: str,
+        now: float | None = None,
+        wall_now: float | None = None,
+    ) -> None:
+        """Design v2 adjudication G / §6.4: v1 records ONLY `eligible` evidence,
+        and only from an EXPLICIT successful 2xx for the EXACT `capability_key`
+        — any other status (403/404/400/other 4xx, 5xx, ...) records nothing at
+        all. `denied` is never written in v1 (the model-ineligible migration
+        trigger stays dormant).
+        """
+        if status_code // 100 != 2:
+            return
+        now = self._clock() if now is None else now
+        wall_now = self._wall_clock() if wall_now is None else wall_now
+        expires_at_monotonic = now + CAPABILITY_EVIDENCE_TTL_SECONDS
+        self._capability_evidence[(account_id, capability_key)] = _CapabilityEvidenceEntry(
+            account_incarnation_id=account_incarnation_id,
+            account_profile_fingerprint=account_profile_fingerprint,
+            classifier_version=CAPABILITY_CLASSIFIER_VERSION,
+            expires_at_monotonic=expires_at_monotonic,
+        )
+        if self._store is not None:
+            self._store.upsert_capability_evidence(
+                account_id=account_id,
+                capability_key=capability_key,
+                account_incarnation_id=account_incarnation_id,
+                account_profile_fingerprint=account_profile_fingerprint,
+                state="eligible",
+                evidence_source=evidence_source,
+                classifier_version=CAPABILITY_CLASSIFIER_VERSION,
+                observed_at_utc=wall_now,
+                expires_at_utc=wall_now + CAPABILITY_EVIDENCE_TTL_SECONDS,
+                high_priority=False,
+            )
+
+    def is_capability_eligible(
+        self,
+        account_id: str,
+        capability_key: str,
+        *,
+        account_incarnation_id: str,
+        account_profile_fingerprint: str,
+        now: float | None = None,
+    ) -> bool:
+        """True only for a fresh, EXACT-key match whose incarnation, profile
+        fingerprint, and classifier version all still match what was recorded
+        — never inferred from a different capability key, never trusted past
+        its TTL or across a reauth/plan change.
+        """
+        entry = self._capability_evidence.get((account_id, capability_key))
+        if entry is None:
+            return False
+        now = self._clock() if now is None else now
+        if entry.expires_at_monotonic <= now:
+            return False
+        if entry.account_incarnation_id != account_incarnation_id:
+            return False
+        if entry.account_profile_fingerprint != account_profile_fingerprint:
+            return False
+        if entry.classifier_version != CAPABILITY_CLASSIFIER_VERSION:
+            return False
+        return True
 
     # -- migration reservations and waiters (design v2 §4.3) -----------------
 
@@ -1311,7 +1694,7 @@ class ClaudeBalancedRouter:
 
     # -- account removal transition matrix (design v2 §5.7) ------------------
 
-    def remove_account(self, account_id: str) -> dict[str, int]:
+    def remove_account(self, account_id: str, incarnation: str) -> dict[str, int]:
         """§5.7's account-removal transition matrix, cases 1-5 (case 4 is handled at
         commit time by `commit_at_headers`'s `target_still_registered` check, since it
         depends on whether upstream 2xx already arrived). Never bulk-resets migration
@@ -1320,6 +1703,15 @@ class ClaudeBalancedRouter:
         exactly once by terminal cleanup"), not by this batch operation; the mandatory
         lazy per-lookup/pre-commit membership re-check remains the correctness
         backstop. Returns a per-case removal count for diagnostics.
+
+        Also drops every in-memory cooldown/capability-evidence entry keyed to
+        `account_id`, and submits a HIGH-PRIORITY durable deletion of every row
+        (pins, cooldowns, usage observations, capability evidence) belonging to
+        `incarnation` (`ClaudePoolRuntimeStateStore.delete_all_for_incarnation`,
+        §5.7) — scoped precisely by incarnation id, so a reused `account_id`
+        under a later, different incarnation is never touched. Await
+        `await_account_removal_durability(incarnation)` for that deletion to
+        complete.
         """
         self._removed_accounts.add(account_id)
         case_counts = {
@@ -1366,7 +1758,33 @@ class ClaudeBalancedRouter:
                 # the pin and reservation untouched; the owner completes the migration
                 # (the CAS never requires the source to still be registered).
                 case_counts["source_removed_migration_continues"] += 1
+
+        self._account_cooldowns.pop(account_id, None)
+        for key in [key for key in self._family_cooldowns if key[0] == account_id]:
+            del self._family_cooldowns[key]
+        for key in [key for key in self._capability_evidence if key[0] == account_id]:
+            del self._capability_evidence[key]
+
+        if self._store is not None:
+            self._pending_incarnation_removals[incarnation] = self._store.delete_all_for_incarnation(
+                incarnation
+            )
+
         return case_counts
+
+    async def await_account_removal_durability(self, incarnation: str) -> None:
+        """Await the durable incarnation-scoped deletion `remove_account` submitted
+        for `incarnation`, if any — so a caller (e.g. the admin removal handler)
+        can be sure the durable rows are gone before it responds. A no-op when
+        no such deletion is pending (no store, or already awaited).
+        """
+        pending_write = self._pending_incarnation_removals.pop(incarnation, None)
+        if pending_write is None:
+            return
+        try:
+            await pending_write.wait_async()
+        except Exception:
+            self.persistence_degraded = True
 
 
 # ==========================================================================

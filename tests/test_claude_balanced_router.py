@@ -11,8 +11,11 @@ from typing import Any
 import pytest
 
 from claudex_gateway.claude_balanced_router import (
+    CAPABILITY_CLASSIFIER_VERSION,
+    CAPABILITY_EVIDENCE_TTL_SECONDS,
     AccountCandidate,
     ClaudeBalancedRouter,
+    FamilyGateOutcome,
     MigrationReservation,
     NoEligibleAccountError,
     ObservationView,
@@ -21,6 +24,8 @@ from claudex_gateway.claude_balanced_router import (
     SessionKey,
     account_headroom,
     binding_windows,
+    capability_key,
+    classify_balanced_cooldown_scope,
     derive_session_key,
     derive_stateless_routing_digest,
     emergency_capacity,
@@ -263,10 +268,15 @@ class _FakePendingWrite:
 
 
 class _FakeStore:
-    """A controllable stand-in store: records every `upsert_pin`/`touch_pin_last_seen` call."""
+    """A controllable stand-in store: records every `upsert_pin`/`touch_pin_last_seen`/
+    `upsert_cooldown`/`upsert_capability_evidence`/`delete_all_for_incarnation` call.
+    """
 
     def __init__(self) -> None:
         self.upsert_calls: list[dict[str, Any]] = []
+        self.cooldown_calls: list[dict[str, Any]] = []
+        self.capability_calls: list[dict[str, Any]] = []
+        self.deleted_incarnations: list[str] = []
         self.pending_writes: list[_FakePendingWrite] = []
 
     def upsert_pin(self, **kwargs: Any) -> _FakePendingWrite:
@@ -276,6 +286,24 @@ class _FakeStore:
         return pending_write
 
     def touch_pin_last_seen(self, session_key_digest: bytes, last_seen_utc: float) -> _FakePendingWrite:
+        pending_write = _FakePendingWrite()
+        self.pending_writes.append(pending_write)
+        return pending_write
+
+    def upsert_cooldown(self, **kwargs: Any) -> _FakePendingWrite:
+        self.cooldown_calls.append(kwargs)
+        pending_write = _FakePendingWrite()
+        self.pending_writes.append(pending_write)
+        return pending_write
+
+    def upsert_capability_evidence(self, **kwargs: Any) -> _FakePendingWrite:
+        self.capability_calls.append(kwargs)
+        pending_write = _FakePendingWrite()
+        self.pending_writes.append(pending_write)
+        return pending_write
+
+    def delete_all_for_incarnation(self, account_incarnation_id: str) -> _FakePendingWrite:
+        self.deleted_incarnations.append(account_incarnation_id)
         pending_write = _FakePendingWrite()
         self.pending_writes.append(pending_write)
         return pending_write
@@ -1408,7 +1436,7 @@ def test_account_removal_case_1_deletes_an_ordinary_pin_with_no_active_migration
         seed=b"seed",
     )
 
-    counts = router.remove_account("acct-a")
+    counts = router.remove_account("acct-a", "inc-acct-a")
 
     assert counts["ordinary_pin_removed"] == 1
     assert router.get_pin(digest) is None
@@ -1419,7 +1447,7 @@ def test_account_removal_case_2_source_removed_leaves_pin_and_reservation_for_th
     digest = b"\x21" * 32
     _place_and_reserve(router, digest)
 
-    counts = router.remove_account("acct-a")
+    counts = router.remove_account("acct-a", "inc-acct-a")
 
     assert counts["source_removed_migration_continues"] == 1
     assert router.get_pin(digest) is not None  # pin untouched
@@ -1443,7 +1471,7 @@ def test_account_removal_case_2_orphaned_source_pin_is_deleted_if_the_migration_
     digest = b"\x22" * 32
     _place_and_reserve(router, digest)
 
-    router.remove_account("acct-a")
+    router.remove_account("acct-a", "inc-acct-a")
     assert router.get_pin(digest) is not None
 
     router.resolve_migration_preheader_failure(digest, attempt_id="owner-1")
@@ -1461,7 +1489,7 @@ def test_account_removal_case_3_target_removed_before_headers_resolves_and_wakes
         with pytest.raises(asyncio.TimeoutError):
             await asyncio.wait_for(asyncio.shield(waiter_task), timeout=0.05)
 
-        counts = router.remove_account("acct-b")  # target removed before upstream 2xx
+        counts = router.remove_account("acct-b", "inc-acct-b")  # target removed before upstream 2xx
 
         assert counts["target_removed_before_headers"] == 1
         await asyncio.wait_for(waiter_task, timeout=1.0)
@@ -1501,12 +1529,12 @@ def test_account_removal_case_5_both_source_and_target_removed_aborts_and_remove
     digest = b"\x25" * 32
     _place_and_reserve(router, digest)
 
-    first_counts = router.remove_account("acct-a")  # case 2 first: source removed alone
+    first_counts = router.remove_account("acct-a", "inc-acct-a")  # case 2 first: source removed alone
     assert first_counts["source_removed_migration_continues"] == 1
     assert router.get_pin(digest) is not None
     assert router.get_migration_reservation(digest) is not None
 
-    second_counts = router.remove_account("acct-b")  # now the target is ALSO removed - a race
+    second_counts = router.remove_account("acct-b", "inc-acct-b")  # now the target is ALSO removed - a race
 
     assert second_counts["both_removed_aborted"] == 1
     assert router.get_pin(digest) is None
@@ -1540,3 +1568,412 @@ def test_mode_stopped_resolves_the_reservation_like_any_other_terminal_outcome()
     assert reservation.resolved_event.is_set()
     assert router.migration_outcome_counts["mode_stopped"] == 1
     assert router.migration_token_target("owner-1") is None
+
+
+
+# ==========================================================================
+# Durable cooldowns, Fable family gate, capability evidence, removal cleanup
+# (T-12, design v2 §6.4/§5.5/§5.7, adjudication G)
+# ==========================================================================
+
+_GATE_NOW = 1_000_000.0
+
+
+def _gate_satisfying_view(*, five_hour_age_seconds: float = 0.0) -> ObservationView:
+    """An `ObservationView` satisfying every non-family/non-status §6.4 gate
+    condition: `fable_weekly` >=99%, `five_hour`/`seven_day` <=70%, all fresh
+    (<=15 min old unless overridden), with a valid future Fable reset.
+    """
+    view = ObservationView()
+    view.ingest_window(
+        "acct-a",
+        "fable_weekly",
+        used_percent=99.0,
+        source="usage_api",
+        observed_at=_GATE_NOW,
+        reset_at=_GATE_NOW + 3600.0,
+        reset_identity="fable-reset-1",
+    )
+    view.ingest_window(
+        "acct-a",
+        "five_hour",
+        used_percent=40.0,
+        source="usage_api",
+        observed_at=_GATE_NOW - five_hour_age_seconds,
+    )
+    view.ingest_window("acct-a", "seven_day", used_percent=40.0, source="usage_api", observed_at=_GATE_NOW)
+    return view
+
+
+def test_family_gate_passes_when_all_six_conditions_hold() -> None:
+    view = _gate_satisfying_view()
+
+    outcome = classify_balanced_cooldown_scope(
+        view, account_id="acct-a", model="claude-fable-5", upstream_status_code=429, now=_GATE_NOW
+    )
+
+    assert outcome == FamilyGateOutcome("family", "fable_family_gate_satisfied", family_deadline=_GATE_NOW + 3600.0)
+
+
+def test_family_gate_falls_back_to_account_wide_when_request_family_is_not_fable() -> None:
+    view = _gate_satisfying_view()
+
+    outcome = classify_balanced_cooldown_scope(
+        view, account_id="acct-a", model="claude-sonnet-5", upstream_status_code=429, now=_GATE_NOW
+    )
+
+    assert outcome.scope == "account"
+    assert outcome.reason == "request_family_not_fable"
+    assert outcome.family_deadline is None
+
+
+def test_family_gate_falls_back_to_account_wide_when_status_is_not_an_upstream_quota_429() -> None:
+    view = _gate_satisfying_view()
+
+    outcome = classify_balanced_cooldown_scope(
+        view, account_id="acct-a", model="claude-fable-5", upstream_status_code=403, now=_GATE_NOW
+    )
+
+    assert outcome.scope == "account"
+    assert outcome.reason == "not_upstream_quota_429"
+
+
+def test_family_gate_falls_back_to_account_wide_when_fable_weekly_is_below_the_saturation_threshold() -> None:
+    view = _gate_satisfying_view()
+    view.ingest_window(
+        "acct-a", "fable_weekly", used_percent=98.9, source="usage_api", observed_at=_GATE_NOW, reset_at=_GATE_NOW + 3600.0
+    )
+
+    outcome = classify_balanced_cooldown_scope(
+        view, account_id="acct-a", model="claude-fable-5", upstream_status_code=429, now=_GATE_NOW
+    )
+
+    assert outcome.scope == "account"
+    assert outcome.reason == "fable_weekly_not_saturated"
+
+
+def test_family_gate_falls_back_to_account_wide_when_five_hour_observation_is_stale() -> None:
+    # >99% and <=70% both still hold; only the freshness (<=15 min) condition fails.
+    view = _gate_satisfying_view(five_hour_age_seconds=16 * 60)
+
+    outcome = classify_balanced_cooldown_scope(
+        view, account_id="acct-a", model="claude-fable-5", upstream_status_code=429, now=_GATE_NOW
+    )
+
+    assert outcome.scope == "account"
+    assert outcome.reason == "five_hour_not_clear"
+
+
+def test_family_gate_falls_back_to_account_wide_when_seven_day_exceeds_the_clear_threshold() -> None:
+    view = _gate_satisfying_view()
+    view.ingest_window("acct-a", "seven_day", used_percent=70.1, source="usage_api", observed_at=_GATE_NOW)
+
+    outcome = classify_balanced_cooldown_scope(
+        view, account_id="acct-a", model="claude-fable-5", upstream_status_code=429, now=_GATE_NOW
+    )
+
+    assert outcome.scope == "account"
+    assert outcome.reason == "seven_day_not_clear"
+
+
+def test_family_gate_falls_back_to_account_wide_when_the_fable_reset_is_missing() -> None:
+    view = ObservationView()
+    view.ingest_window("acct-a", "fable_weekly", used_percent=99.0, source="usage_api", observed_at=_GATE_NOW)
+    view.ingest_window("acct-a", "five_hour", used_percent=40.0, source="usage_api", observed_at=_GATE_NOW)
+    view.ingest_window("acct-a", "seven_day", used_percent=40.0, source="usage_api", observed_at=_GATE_NOW)
+
+    outcome = classify_balanced_cooldown_scope(
+        view, account_id="acct-a", model="claude-fable-5", upstream_status_code=429, now=_GATE_NOW
+    )
+
+    assert outcome.scope == "account"
+    assert outcome.reason == "fable_reset_not_valid"
+
+
+# -- family-scoped cooldown: eligibility filtering ---------------------------
+
+
+def test_family_scoped_cooldown_blocks_fable_placements_but_leaves_default_family_eligible() -> None:
+    clock = _FakeClock()
+    router = _make_router(clock=clock)
+    now = clock()
+    router.install_cooldown(
+        account_id="acct-a",
+        account_incarnation_id="inc-acct-a",
+        account_profile_fingerprint=None,
+        scope="family",
+        model_family="fable",
+        deadline=now + 3600.0,
+        reason="fable_family_gate_satisfied",
+    )
+
+    assert router.family_cooldown_deadline("acct-a", "fable", now=now) == pytest.approx(now + 3600.0)
+    assert router.family_cooldown_deadline("acct-a", "default", now=now) is None
+    assert router.account_cooldown_deadline("acct-a", now=now) is None
+
+    fable_candidate = _candidate(
+        "acct-a", family_cooldown_until=router.family_cooldown_deadline("acct-a", "fable", now=now)
+    )
+    with pytest.raises(NoEligibleAccountError):
+        router.place_session(
+            session_key=SessionKey(digest=b"\x30" * 32, kind="content_hash"),
+            model="claude-fable-5",
+            candidates=[fable_candidate],
+            seed=b"seed",
+            now=now,
+        )
+
+    default_candidate = _candidate(
+        "acct-a", family_cooldown_until=router.family_cooldown_deadline("acct-a", "default", now=now)
+    )
+    placement = router.place_session(
+        session_key=SessionKey(digest=b"\x31" * 32, kind="content_hash"),
+        model="claude-sonnet-5",
+        candidates=[default_candidate],
+        seed=b"seed",
+        now=now,
+    )
+    assert placement.account_id == "acct-a"
+
+
+# -- capability evidence: eligible-only, TTL'd, no cross-key inference -------
+
+
+def test_capability_evidence_ttl_expires_after_one_hour() -> None:
+    clock = _FakeClock()
+    router = _make_router(clock=clock)
+    router.classify_capability_evidence(
+        account_id="acct-a",
+        capability_key="fable",
+        account_incarnation_id="inc-acct-a",
+        account_profile_fingerprint="fp-1",
+        status_code=200,
+        evidence_source="probe",
+    )
+    assert router.is_capability_eligible(
+        "acct-a", "fable", account_incarnation_id="inc-acct-a", account_profile_fingerprint="fp-1"
+    )
+
+    clock.advance(CAPABILITY_EVIDENCE_TTL_SECONDS - 1.0)
+    assert router.is_capability_eligible(
+        "acct-a", "fable", account_incarnation_id="inc-acct-a", account_profile_fingerprint="fp-1"
+    )
+
+    clock.advance(1.0)  # exactly at the 1h TTL boundary -> expired
+    assert not router.is_capability_eligible(
+        "acct-a", "fable", account_incarnation_id="inc-acct-a", account_profile_fingerprint="fp-1"
+    )
+
+
+def test_capability_evidence_fingerprint_or_incarnation_mismatch_invalidates_it() -> None:
+    router = _make_router()
+    router.classify_capability_evidence(
+        account_id="acct-a",
+        capability_key="opus",
+        account_incarnation_id="inc-acct-a",
+        account_profile_fingerprint="fp-1",
+        status_code=200,
+        evidence_source="probe",
+    )
+
+    assert router.is_capability_eligible(
+        "acct-a", "opus", account_incarnation_id="inc-acct-a", account_profile_fingerprint="fp-1"
+    )
+    # A plan change unmasks (or here, masks) immediately via the fingerprint.
+    assert not router.is_capability_eligible(
+        "acct-a", "opus", account_incarnation_id="inc-acct-a", account_profile_fingerprint="fp-2"
+    )
+    # A reauth-rotated incarnation invalidates it too.
+    assert not router.is_capability_eligible(
+        "acct-a", "opus", account_incarnation_id="inc-other", account_profile_fingerprint="fp-1"
+    )
+
+
+def test_capability_evidence_never_implies_a_different_capability_key() -> None:
+    router = _make_router()
+    router.classify_capability_evidence(
+        account_id="acct-a",
+        capability_key="sonnet",
+        account_incarnation_id="inc-acct-a",
+        account_profile_fingerprint="fp-1",
+        status_code=200,
+        evidence_source="probe",
+    )
+
+    assert router.is_capability_eligible(
+        "acct-a", "sonnet", account_incarnation_id="inc-acct-a", account_profile_fingerprint="fp-1"
+    )
+    assert not router.is_capability_eligible(
+        "acct-a", "opus", account_incarnation_id="inc-acct-a", account_profile_fingerprint="fp-1"
+    )
+    assert not router.is_capability_eligible(
+        "acct-a", capability_key("gpt-4"), account_incarnation_id="inc-acct-a", account_profile_fingerprint="fp-1"
+    )
+
+
+def test_capability_classification_records_no_denied_evidence_no_denied() -> None:
+    store = _FakeStore()
+    router = _make_router(store=store)
+
+    for status_code in (403, 404, 400):
+        router.classify_capability_evidence(
+            account_id="acct-a",
+            capability_key="fable",
+            account_incarnation_id="inc-acct-a",
+            account_profile_fingerprint="fp-1",
+            status_code=status_code,
+            evidence_source="probe",
+        )
+        assert not router.is_capability_eligible(
+            "acct-a", "fable", account_incarnation_id="inc-acct-a", account_profile_fingerprint="fp-1"
+        )
+
+    assert store.capability_calls == []  # never a durable write either, denied or otherwise
+
+    # A genuine 2xx, by contrast, DOES record eligible evidence for the exact key.
+    router.classify_capability_evidence(
+        account_id="acct-a",
+        capability_key="fable",
+        account_incarnation_id="inc-acct-a",
+        account_profile_fingerprint="fp-1",
+        status_code=200,
+        evidence_source="probe",
+    )
+    assert router.is_capability_eligible(
+        "acct-a", "fable", account_incarnation_id="inc-acct-a", account_profile_fingerprint="fp-1"
+    )
+    assert len(store.capability_calls) == 1
+    assert store.capability_calls[0]["state"] == "eligible"
+
+
+def test_capability_key_bounded_family_token_or_lowercased_model_id() -> None:
+    assert capability_key("claude-fable-5") == "fable"
+    assert capability_key("claude-3-Opus-20240229") == "opus"
+    assert capability_key("claude-3-5-sonnet-latest") == "sonnet"
+    assert capability_key("claude-haiku-4") == "haiku"
+    assert capability_key("unfable-model") == "model:unfable-model"
+    assert capability_key("gpt-4") == "model:gpt-4"
+
+
+# -- account removal: durable cleanup of all four row kinds ------------------
+
+
+def test_remove_account_deletes_all_four_durable_row_kinds_for_only_that_incarnation(tmp_path: Any) -> None:
+    async def scenario() -> None:
+        db_path = tmp_path / "runtime.sqlite3"
+        store = ClaudePoolRuntimeStateStore.open_(db_path, debounce_seconds=0.0)
+        try:
+            epoch_id = store.balanced_epoch_id
+            now_utc = 1_700_000_000.0
+
+            # The incarnation under test: one row of each of the four kinds.
+            digest = b"\x40" * 32
+            store.upsert_pin(
+                session_key_digest=digest,
+                key_kind="content_hash",
+                account_id="acct-a",
+                account_incarnation_id="inc-1",
+                last_seen_utc=now_utc,
+                expires_at_utc=now_utc + 300.0,
+                generation=0,
+                balanced_epoch_id=epoch_id,
+            ).wait(timeout=5.0)
+            store.upsert_cooldown(
+                account_id="acct-a",
+                scope="account",
+                model_family="",
+                account_incarnation_id="inc-1",
+                account_profile_fingerprint="fp-1",
+                deadline_utc=now_utc + 600.0,
+                reason="quota_429",
+                evidence="",
+                updated_at_utc=now_utc,
+            ).wait(timeout=5.0)
+            store.upsert_usage_observation(
+                account_id="acct-a",
+                window="five_hour",
+                account_incarnation_id="inc-1",
+                account_profile_fingerprint="fp-1",
+                used_percent=42.0,
+                reset_identity="r1",
+                reset_at_utc=now_utc + 3600.0,
+                observed_at_utc=now_utc,
+                source="usage_api",
+            ).wait(timeout=5.0)
+            store.upsert_capability_evidence(
+                account_id="acct-a",
+                capability_key="fable",
+                account_incarnation_id="inc-1",
+                account_profile_fingerprint="fp-1",
+                state="eligible",
+                evidence_source="probe",
+                classifier_version=CAPABILITY_CLASSIFIER_VERSION,
+                observed_at_utc=now_utc,
+                expires_at_utc=now_utc + 3600.0,
+            ).wait(timeout=5.0)
+
+            # A DIFFERENT incarnation under the SAME account_id (a reauth-rotated
+            # slot) -- must survive completely untouched.
+            other_digest = b"\x41" * 32
+            store.upsert_pin(
+                session_key_digest=other_digest,
+                key_kind="content_hash",
+                account_id="acct-a",
+                account_incarnation_id="inc-2",
+                last_seen_utc=now_utc,
+                expires_at_utc=now_utc + 300.0,
+                generation=0,
+                balanced_epoch_id=epoch_id,
+            ).wait(timeout=5.0)
+            store.upsert_cooldown(
+                account_id="acct-a",
+                scope="family",
+                model_family="fable",
+                account_incarnation_id="inc-2",
+                account_profile_fingerprint="fp-2",
+                deadline_utc=now_utc + 600.0,
+                reason="fable_family_gate_satisfied",
+                evidence="",
+                updated_at_utc=now_utc,
+            ).wait(timeout=5.0)
+            store.upsert_usage_observation(
+                account_id="acct-a",
+                window="seven_day",
+                account_incarnation_id="inc-2",
+                account_profile_fingerprint="fp-2",
+                used_percent=20.0,
+                reset_identity="r2",
+                reset_at_utc=now_utc + 3600.0,
+                observed_at_utc=now_utc,
+                source="usage_api",
+            ).wait(timeout=5.0)
+            store.upsert_capability_evidence(
+                account_id="acct-a",
+                capability_key="opus",
+                account_incarnation_id="inc-2",
+                account_profile_fingerprint="fp-2",
+                state="eligible",
+                evidence_source="probe",
+                classifier_version=CAPABILITY_CLASSIFIER_VERSION,
+                observed_at_utc=now_utc,
+                expires_at_utc=now_utc + 3600.0,
+            ).wait(timeout=5.0)
+
+            router = _make_router(balanced_epoch_id=epoch_id, store=store)
+
+            router.remove_account("acct-a", "inc-1")
+            await router.await_account_removal_durability("inc-1")
+
+            assert store.get_pin(digest) is None
+            assert store.get_cooldown("acct-a", "account", "") is None
+            assert store.get_usage_observation("acct-a", "five_hour") is None
+            assert store.get_capability_evidence("acct-a", "fable") is None
+
+            assert store.get_pin(other_digest) is not None
+            assert store.get_cooldown("acct-a", "family", "fable") is not None
+            assert store.get_usage_observation("acct-a", "seven_day") is not None
+            assert store.get_capability_evidence("acct-a", "opus") is not None
+        finally:
+            store.close()
+
+    asyncio.run(scenario())

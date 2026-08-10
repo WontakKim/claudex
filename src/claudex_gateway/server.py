@@ -50,6 +50,7 @@ from claudex_gateway.claude_auth import (
     ClaudeAccountAuthManager,
     ClaudeAccountReauthRequiredError,
 )
+from claudex_gateway.claude_account_profile import load_account_profile_fingerprint
 from claudex_gateway.claude_balanced_router import (
     AccountCandidate,
     BalancedPrepareError,
@@ -58,6 +59,7 @@ from claudex_gateway.claude_balanced_router import (
     NoEligibleAccountError,
     SessionKey,
     binding_windows,
+    capability_key,
     derive_session_key,
     derive_stateless_routing_digest,
     is_eligible_candidate,
@@ -567,6 +569,8 @@ async def _attempt_with_account(
     rate_limit_failover: bool,
     commit_hook: Callable[[httpx.Response], Awaitable[None]] | None = None,
     on_relay_complete: Callable[[], None] | None = None,
+    on_quota_429: Callable[[float], Awaitable[None]] | None = None,
+    on_response: Callable[[httpx.Response], Awaitable[None]] | None = None,
 ) -> Response | _FailedAttempt:
     """Serve an Anthropic passthrough request with one registered account's token.
 
@@ -593,6 +597,17 @@ async def _attempt_with_account(
     forwarded, and `on_relay_complete` is threaded through as the relay's
     `on_finished` hook. Both default to `None`, which reproduces the prior
     behavior exactly.
+
+    `on_quota_429`/`on_response` (T-12) are the balanced runner's own minimal
+    extension: `on_quota_429`, if given, is awaited with the just-derived
+    `cooldown_seconds` right after this account-specific 429 marks the shared
+    in-memory tracker (unchanged, fallback-mode behavior) — the balanced
+    caller uses it to classify the design v2 §6.4 family gate and install the
+    resulting cooldown durably. `on_response`, if given, is awaited with the
+    still-open `upstream_response` at the same point as `commit_hook` — the
+    balanced caller uses it to record eligible capability evidence on an
+    explicit 2xx (adjudication G). Both default to `None`, which reproduces
+    the prior behavior exactly.
     """
     account_id = record.id
     manager = _claude_account_auth_manager(request.app.state, account_id)
@@ -684,13 +699,97 @@ async def _attempt_with_account(
             account_id,
             cooldown_seconds,
         )
+        if on_quota_429 is not None:
+            await on_quota_429(cooldown_seconds)
         return _FailedAttempt(
             _replay_buffered_response(429, response_headers, response_body),
             rate_limited=True,
         )
     if commit_hook is not None:
         await commit_hook(upstream_response)
+    if on_response is not None:
+        await on_response(upstream_response)
     return _relay_anthropic_response(upstream_response, on_finished=on_relay_complete)
+
+
+# ==========================================================================
+# Balanced-mode durable cooldowns and capability evidence (T-12, design v2
+# §6.4/§5.5, adjudication G)
+# ==========================================================================
+
+
+async def _install_balanced_quota_cooldown(
+    router: ClaudeBalancedRouter,
+    *,
+    account_id: str,
+    account_incarnation_id: str,
+    model: str,
+    cooldown_seconds: float,
+) -> None:
+    """Balanced-mode 429 cooldown installation: classify the Fable family gate
+    (design v2 §6.4) before choosing scope. A FAMILY-scoped cooldown uses the
+    gate's own Fable reset as its deadline; otherwise the SAME account-wide
+    `cooldown_seconds` the shared in-memory tracker was just marked with
+    drives the deadline. Always awaits the durable write (§5.5: cooldown
+    installation is high priority) so a restart never repeats a burst of
+    429s against an account that just cooled down.
+    """
+    now = time.monotonic()
+    gate = router.classify_cooldown_scope(
+        account_id=account_id, model=model, upstream_status_code=429, now=now
+    )
+    fingerprint = load_account_profile_fingerprint(paths.accounts_dir("claude") / account_id)
+    if gate.scope == "family":
+        assert gate.family_deadline is not None
+        pending_write = router.install_cooldown(
+            account_id=account_id,
+            account_incarnation_id=account_incarnation_id,
+            account_profile_fingerprint=fingerprint,
+            scope="family",
+            model_family=quota_family(model),
+            deadline=gate.family_deadline,
+            reason=gate.reason,
+        )
+    else:
+        pending_write = router.install_cooldown(
+            account_id=account_id,
+            account_incarnation_id=account_incarnation_id,
+            account_profile_fingerprint=fingerprint,
+            scope="account",
+            deadline=now + cooldown_seconds,
+            reason=gate.reason,
+        )
+    if pending_write is not None:
+        try:
+            await pending_write.wait_async()
+        except Exception:
+            router.persistence_degraded = True
+
+
+async def _record_balanced_capability_evidence(
+    router: ClaudeBalancedRouter,
+    *,
+    account_id: str,
+    account_incarnation_id: str,
+    model: str,
+    upstream_response: httpx.Response,
+) -> None:
+    """Balanced-mode successful-2xx capability-evidence recording (adjudication
+    G): v1 records ONLY `eligible` evidence, and only from an explicit
+    successful 2xx for the exact capability key — `classify_capability_evidence`
+    itself is the one true gate (never `denied`, never inferred across keys).
+    """
+    fingerprint = load_account_profile_fingerprint(paths.accounts_dir("claude") / account_id)
+    if fingerprint is None:
+        return
+    router.classify_capability_evidence(
+        account_id=account_id,
+        capability_key=capability_key(model),
+        account_incarnation_id=account_incarnation_id,
+        account_profile_fingerprint=fingerprint,
+        status_code=upstream_response.status_code,
+        evidence_source="serve_path_2xx",
+    )
 
 
 async def _passthrough_with_claude_account(
@@ -859,24 +958,29 @@ async def _passthrough_with_claude_balanced(
 
 
 def _balanced_candidates(
-    records: Iterable[AccountRecord], tracker: AccountCooldownTracker, *, now: float
+    records: Iterable[AccountRecord], router: ClaudeBalancedRouter, *, family: str, now: float
 ) -> list[AccountCandidate]:
     """One `AccountCandidate` per registered account for a request's whole retry chain.
 
-    `account_cooldown_until` is an absolute monotonic deadline read from the SAME
-    in-memory `AccountCooldownTracker` the fallback pool uses — durable, family-scoped
-    cooldowns and capability evidence are T-12's job, so `family_cooldown_until` and
-    `capability_denied` stay at their defaults here.
+    `account_cooldown_until`/`family_cooldown_until` are absolute monotonic
+    deadlines read from the router's OWN durable cooldown state (T-12) — the
+    balanced-mode fallback pool's shared in-memory `AccountCooldownTracker` is
+    no longer consulted for balanced eligibility (it stays account-wide-only
+    and fallback-mode-only, design v2 §6.4). `capability_denied` stays at its
+    default: v1 never records `denied` capability evidence (adjudication G).
     """
     candidates = []
     for record in records:
-        remaining = tracker.remaining_seconds(record.id) if record.state == "ready" else 0.0
+        ready = record.state == "ready"
         candidates.append(
             AccountCandidate(
                 account_id=record.id,
                 account_incarnation_id=record.account_incarnation_id,
-                ready=record.state == "ready",
-                account_cooldown_until=now + remaining if remaining > 0.0 else None,
+                ready=ready,
+                account_cooldown_until=router.account_cooldown_deadline(record.id, now=now) if ready else None,
+                family_cooldown_until=(
+                    router.family_cooldown_deadline(record.id, family, now=now) if ready else None
+                ),
             )
         )
     return candidates
@@ -928,7 +1032,8 @@ def _balanced_eligible_candidate_set(
     records_by_id: Mapping[str, AccountRecord]
 ) -> list[AccountRecord]:
     """§6.5's spec-gate-pinned candidate set `C`: registered AND ready AND
-    capability-not-denied, ignoring cooldowns. Capability evidence is T-12's job, so
+    capability-not-denied, ignoring cooldowns. `capability_denied` never fires in
+    v1 (only `eligible` capability evidence is ever recorded, adjudication G), so
     every registered, ready account currently qualifies.
     """
     return [record for record in records_by_id.values() if record.state == "ready"]
@@ -936,8 +1041,9 @@ def _balanced_eligible_candidate_set(
 
 def _balanced_all_cooling_response(
     records_by_id: Mapping[str, AccountRecord],
-    tracker: AccountCooldownTracker,
+    router: ClaudeBalancedRouter,
     *,
+    family: str,
     chain_exhausted_429: Response | None,
 ) -> Response:
     """§6.5: a retry chain (or an initial placement) found no eligible candidate.
@@ -960,9 +1066,15 @@ def _balanced_all_cooling_response(
             status_code=503,
         )
     now = time.monotonic()
-    # unblock_at(a, family) = max(account-wide deadline, family deadline) or now;
-    # family-scoped cooldowns are T-12's job, so the family term is always `now`.
-    min_unblock_at = min(now + tracker.remaining_seconds(record.id) for record in candidate_set)
+
+    # unblock_at(a, family) = max(account-wide deadline, family deadline) or now
+    # (§6.5); the per-account MAX across scopes, then the MIN across accounts.
+    def _unblock_at(record: AccountRecord) -> float:
+        account_deadline = router.account_cooldown_deadline(record.id, now=now) or now
+        family_deadline = router.family_cooldown_deadline(record.id, family, now=now) or now
+        return max(account_deadline, family_deadline)
+
+    min_unblock_at = min(_unblock_at(record) for record in candidate_set)
     retry_after = max(1, math.ceil(min_unblock_at - now))
     return JSONResponse(
         _claude_error_body(
@@ -993,7 +1105,6 @@ async def _passthrough_with_balanced_pool(
         return _claude_account_unavailable(f"cannot read the claude account registry: {exc}")
 
     records_by_id = {record.id: record for record in records}
-    tracker: AccountCooldownTracker = request.app.state.claude_account_cooldowns
     model = parsed_body.get("model") if isinstance(parsed_body, dict) else None
     model = model if isinstance(model, str) else ""
     session_key = (
@@ -1002,14 +1113,14 @@ async def _passthrough_with_balanced_pool(
 
     if request.url.path.endswith("/count_tokens"):
         return await _serve_balanced_count_tokens(
-            request, raw_body, parsed_body, runtime, records_by_id, tracker, session_key, model
+            request, raw_body, parsed_body, runtime, records_by_id, session_key, model
         )
     if session_key is not None:
         return await _serve_balanced_pinned_message(
-            request, raw_body, parsed_body, runtime, records_by_id, tracker, session_key, model
+            request, raw_body, parsed_body, runtime, records_by_id, session_key, model
         )
     return await _serve_balanced_stateless_message(
-        request, raw_body, parsed_body, runtime, records_by_id, tracker, model
+        request, raw_body, parsed_body, runtime, records_by_id, model
     )
 
 
@@ -1019,7 +1130,6 @@ async def _serve_balanced_stateless_message(
     parsed_body: Any,
     runtime: ClaudeBalancedRuntime,
     records_by_id: Mapping[str, AccountRecord],
-    tracker: AccountCooldownTracker,
     model: str,
 ) -> Response:
     """No session key is derivable: weighted-HRW routing over one fresh stateless
@@ -1028,8 +1138,9 @@ async def _serve_balanced_stateless_message(
     """
     router = runtime.router
     assert router is not None
+    family = quota_family(model)
     digest = derive_stateless_routing_digest(runtime.epoch_seed, secrets.token_bytes(32))
-    candidates = _balanced_candidates(records_by_id.values(), tracker, now=time.monotonic())
+    candidates = _balanced_candidates(records_by_id.values(), router, family=family, now=time.monotonic())
 
     attempted: set[str] = set()
     chain_429: Response | None = None
@@ -1044,14 +1155,46 @@ async def _serve_balanced_stateless_message(
                 already_attempted=frozenset(attempted),
             )
         except NoEligibleAccountError:
-            return _balanced_all_cooling_response(records_by_id, tracker, chain_exhausted_429=chain_429)
+            return _balanced_all_cooling_response(records_by_id, router, family=family, chain_exhausted_429=chain_429)
 
         attempted.add(account_id)
         record = records_by_id[account_id]
+
+        async def _on_quota_429(
+            cooldown_seconds: float, *, _account_id: str = record.id, _incarnation: str = record.account_incarnation_id
+        ) -> None:
+            await _install_balanced_quota_cooldown(
+                router,
+                account_id=_account_id,
+                account_incarnation_id=_incarnation,
+                model=model,
+                cooldown_seconds=cooldown_seconds,
+            )
+
+        async def _on_response(
+            upstream_response: httpx.Response,
+            *,
+            _account_id: str = record.id,
+            _incarnation: str = record.account_incarnation_id,
+        ) -> None:
+            await _record_balanced_capability_evidence(
+                router,
+                account_id=_account_id,
+                account_incarnation_id=_incarnation,
+                model=model,
+                upstream_response=upstream_response,
+            )
+
         router.begin_attempt(account_id)
         try:
             outcome = await _attempt_with_account(
-                request, raw_body, parsed_body, record, rate_limit_failover=True
+                request,
+                raw_body,
+                parsed_body,
+                record,
+                rate_limit_failover=True,
+                on_quota_429=_on_quota_429,
+                on_response=_on_response,
             )
         finally:
             router.end_attempt(account_id)
@@ -1066,7 +1209,6 @@ async def _serve_balanced_pinned_message(
     parsed_body: Any,
     runtime: ClaudeBalancedRuntime,
     records_by_id: Mapping[str, AccountRecord],
-    tracker: AccountCooldownTracker,
     session_key: SessionKey,
     model: str,
 ) -> Response:
@@ -1083,16 +1225,17 @@ async def _serve_balanced_pinned_message(
     """
     router = runtime.router
     assert router is not None
+    family = quota_family(model)
     digest = session_key.digest
     now = time.monotonic()
-    candidates = _balanced_candidates(records_by_id.values(), tracker, now=now)
+    candidates = _balanced_candidates(records_by_id.values(), router, family=family, now=now)
 
     try:
         placement = router.place_session(
             session_key=session_key, model=model, candidates=candidates, seed=runtime.epoch_seed, now=now
         )
     except NoEligibleAccountError:
-        return _balanced_all_cooling_response(records_by_id, tracker, chain_exhausted_429=None)
+        return _balanced_all_cooling_response(records_by_id, router, family=family, chain_exhausted_429=None)
 
     if placement.created and placement.durability_barrier is not None:
         asyncio.create_task(router.submit_new_pin_durability(digest))
@@ -1119,12 +1262,14 @@ async def _serve_balanced_pinned_message(
                 placement = router.place_session(
                     session_key=session_key,
                     model=model,
-                    candidates=_balanced_candidates(records_by_id.values(), tracker, now=time.monotonic()),
+                    candidates=_balanced_candidates(
+                        records_by_id.values(), router, family=family, now=time.monotonic()
+                    ),
                     seed=runtime.epoch_seed,
                 )
             except NoEligibleAccountError:
                 return _balanced_all_cooling_response(
-                    records_by_id, tracker, chain_exhausted_429=chain_429
+                    records_by_id, router, family=family, chain_exhausted_429=chain_429
                 )
             if placement.created and placement.durability_barrier is not None:
                 asyncio.create_task(router.submit_new_pin_durability(digest))
@@ -1136,8 +1281,12 @@ async def _serve_balanced_pinned_message(
             current_target = pin.account_id
 
         record = records_by_id.get(current_target)
+        cooldown_check_now = time.monotonic()
         eligible_now = (
-            record is not None and record.state == "ready" and not tracker.is_cooling(current_target)
+            record is not None
+            and record.state == "ready"
+            and router.account_cooldown_deadline(current_target, now=cooldown_check_now) is None
+            and router.family_cooldown_deadline(current_target, family, now=cooldown_check_now) is None
         )
         attempted.add(current_target)
 
@@ -1181,6 +1330,34 @@ async def _serve_balanced_pinned_message(
                         digest, attempt_id=_attempt_id, outcome="terminal_failure"
                     )
 
+            async def _on_quota_429(
+                cooldown_seconds: float,
+                *,
+                _account_id: str = target_record.id,
+                _incarnation: str = target_record.account_incarnation_id,
+            ) -> None:
+                await _install_balanced_quota_cooldown(
+                    router,
+                    account_id=_account_id,
+                    account_incarnation_id=_incarnation,
+                    model=model,
+                    cooldown_seconds=cooldown_seconds,
+                )
+
+            async def _on_response(
+                upstream_response: httpx.Response,
+                *,
+                _account_id: str = target_record.id,
+                _incarnation: str = target_record.account_incarnation_id,
+            ) -> None:
+                await _record_balanced_capability_evidence(
+                    router,
+                    account_id=_account_id,
+                    account_incarnation_id=_incarnation,
+                    model=model,
+                    upstream_response=upstream_response,
+                )
+
             if owner_attempt_id is not None:
                 try:
                     outcome = await _attempt_with_account(
@@ -1191,6 +1368,8 @@ async def _serve_balanced_pinned_message(
                         rate_limit_failover=True,
                         commit_hook=_commit_hook,
                         on_relay_complete=_on_relay_complete,
+                        on_quota_429=_on_quota_429,
+                        on_response=_on_response,
                     )
                 except BaseException:
                     # Cancellation (or any other failure) before this owner's
@@ -1205,7 +1384,13 @@ async def _serve_balanced_pinned_message(
                 router.begin_attempt(current_target)
                 try:
                     outcome = await _attempt_with_account(
-                        request, raw_body, parsed_body, target_record, rate_limit_failover=True
+                        request,
+                        raw_body,
+                        parsed_body,
+                        target_record,
+                        rate_limit_failover=True,
+                        on_quota_429=_on_quota_429,
+                        on_response=_on_response,
                     )
                 finally:
                     router.end_attempt(current_target)
@@ -1231,7 +1416,7 @@ async def _serve_balanced_pinned_message(
                 already_attempted=frozenset(attempted),
             )
         except NoEligibleAccountError:
-            return _balanced_all_cooling_response(records_by_id, tracker, chain_exhausted_429=chain_429)
+            return _balanced_all_cooling_response(records_by_id, router, family=family, chain_exhausted_429=chain_429)
 
         reservation, is_owner = router.acquire_migration_reservation(
             digest,
@@ -1256,7 +1441,6 @@ async def _serve_balanced_count_tokens(
     parsed_body: Any,
     runtime: ClaudeBalancedRuntime,
     records_by_id: Mapping[str, AccountRecord],
-    tracker: AccountCooldownTracker,
     session_key: SessionKey | None,
     model: str,
 ) -> Response:
@@ -1284,13 +1468,14 @@ async def _serve_balanced_count_tokens(
         if session_key is not None
         else derive_stateless_routing_digest(runtime.epoch_seed, secrets.token_bytes(32))
     )
-    candidates = _balanced_candidates(records_by_id.values(), tracker, now=time.monotonic())
+    family = quota_family(model)
+    candidates = _balanced_candidates(records_by_id.values(), router, family=family, now=time.monotonic())
     try:
         account_id = _balanced_pick_account(
             router, session_key_digest=digest, model=model, candidates=candidates, seed=runtime.epoch_seed
         )
     except NoEligibleAccountError:
-        return _balanced_all_cooling_response(records_by_id, tracker, chain_exhausted_429=None)
+        return _balanced_all_cooling_response(records_by_id, router, family=family, chain_exhausted_429=None)
     record = records_by_id[account_id]
     outcome = await _attempt_with_account(
         request, raw_body, parsed_body, record, rate_limit_failover=False
@@ -3083,7 +3268,11 @@ async def _handle_admin_claude_account_delete(request: Request) -> Response:
     would flip passthrough back to client credentials as a side effect.
     The registry mutation itself is crash-safe under registry.lock
     (tombstone protocol); afterwards the daemon-memory remnants (cached
-    auth manager, cooldown) are dropped.
+    auth manager, cooldown) are dropped, and — while balanced routing is
+    active (T-12, design v2 §5.7) — the router's own removal matrix runs and
+    every durable row (pins, cooldowns, usage observations, capability
+    evidence) for the removed incarnation is deleted, awaited before this
+    responds.
     """
     denied = _admin_guard(request)
     if denied is not None:
@@ -3104,6 +3293,16 @@ async def _handle_admin_claude_account_delete(request: Request) -> Response:
                 status_code=409,
             )
         try:
+            records = list_accounts()
+        except AccountRegistryError as exc:
+            return JSONResponse(
+                _openai_error_body(
+                    "server_error", f"cannot read the claude account registry: {exc}"
+                ),
+                status_code=500,
+            )
+        removed_record = next((record for record in records if record.id == account_id), None)
+        try:
             await asyncio.to_thread(remove_account, account_id)
         except AccountNotFoundError as exc:
             return JSONResponse(
@@ -3118,6 +3317,10 @@ async def _handle_admin_claude_account_delete(request: Request) -> Response:
             )
         request.app.state.claude_account_auth_managers.pop(account_id, None)
         request.app.state.claude_account_cooldowns.clear(account_id)
+        runtime: ClaudeBalancedRuntime = request.app.state.claude_balanced_runtime
+        if runtime.status == "active" and runtime.router is not None and removed_record is not None:
+            runtime.router.remove_account(account_id, removed_record.account_incarnation_id)
+            await runtime.router.await_account_removal_durability(removed_record.account_incarnation_id)
     return Response(status_code=204)
 
 
