@@ -288,3 +288,66 @@ def test_peek_with_metadata_has_no_windows_on_failed_fetch() -> None:
     result, metadata = cache.peek_with_metadata("a")
     assert result["status"] == "error"
     assert metadata == {}
+
+
+def test_poll_reports_fetched_for_a_never_cached_account() -> None:
+    clock = FakeClock()
+    fetch = FakeFetch()
+    fetch.queue("a", _ok("a"))
+    cache = _cache(fetch, clock)
+
+    outcome = asyncio.run(cache.poll("a"))
+
+    assert outcome.source == "fetched"
+    assert outcome.result == _ok("a")
+    assert fetch.calls == ["a"]
+
+
+def test_poll_reports_cache_hit_without_fetching_when_the_entry_is_still_fresh() -> None:
+    clock = FakeClock()
+    fetch = FakeFetch()
+    fetch.queue("a", _ok("a"))
+    cache = _cache(fetch, clock)
+
+    asyncio.run(cache.poll("a"))
+    clock.advance(60.0)
+    outcome = asyncio.run(cache.poll("a"))
+
+    assert outcome.source == "cache_hit"
+    assert outcome.result == _ok("a")
+    assert fetch.calls == ["a"]
+
+
+def test_poll_force_bypasses_the_freshness_gate_and_fetches_again() -> None:
+    clock = FakeClock()
+    fetch = FakeFetch()
+    fetch.queue("a", _ok("a"))
+    fetch.queue("a", _ok("a"))
+    cache = _cache(fetch, clock)
+
+    asyncio.run(cache.poll("a"))
+    clock.advance(1.0)  # still well within the TTL -- a bare poll would cache-hit
+    forced = asyncio.run(cache.poll("a", force=True))
+
+    assert forced.source == "fetched"
+    assert fetch.calls == ["a", "a"]
+
+
+def test_poll_reports_cooldown_without_fetching_while_the_global_cooldown_is_active() -> None:
+    clock = FakeClock()
+    fetch = FakeFetch()
+    fetch.queue("a", _err("usage API rate-limited (429); try again shortly"), 30.0)
+    cache = _cache(fetch, clock)
+
+    asyncio.run(cache.poll("a"))
+    outcome = asyncio.run(cache.poll("b"))
+
+    assert outcome.source == "cooldown"
+    assert outcome.result["status"] == "error"
+    assert fetch.calls == ["a"]
+
+    # force=True still respects the shared cooldown -- it is not a scheduling
+    # preference the caller can override.
+    forced = asyncio.run(cache.poll("b", force=True))
+    assert forced.source == "cooldown"
+    assert fetch.calls == ["a"]
