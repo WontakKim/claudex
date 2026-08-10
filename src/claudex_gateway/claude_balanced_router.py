@@ -58,6 +58,11 @@ from claudex_gateway.claude_pool_runtime_state import (
     RestoreResult,
     RestoreValidationContext,
 )
+from claudex_gateway.claude_unified_headers import (
+    RECOGNIZED_HEADERS,
+    HeaderDescriptor,
+    parse_unified_headers,
+)
 
 _SESSION_KEY_DOMAIN = b"claudex-session-key-v1"
 _HRW_DOMAIN = b"claudex-balanced-hrw-v1"
@@ -331,6 +336,28 @@ def _wall_to_monotonic(wall_value: float, *, wall_now: float, monotonic_now: flo
     return monotonic_now + (wall_value - wall_now)
 
 
+# Header-sourced reset identity (design v2 §3.2, T-15): two readings of the
+# very same upstream reset boundary that merely disagree by wall/monotonic
+# clock-conversion jitter still compare equal within this tolerance.
+_RESET_BOUNDARY_BUCKET_SECONDS = 30.0
+
+
+def unified_reset_identity(window: str, reset_at_monotonic: float | None) -> str | None:
+    """A header-sourced reset identity combining `window` (the model/window
+    scope — `five_hour`/`seven_day`/`fable_weekly` already distinguish
+    Fable's model-scoped window from the shared ones) with
+    `reset_at_monotonic`, normalized into `_RESET_BOUNDARY_BUCKET_SECONDS`-wide
+    buckets so two readings of the same upstream boundary within that
+    tolerance always compare equal. `None` (an unparsable/missing reset)
+    never claims an identity of its own — the caller treats that as an
+    incomplete reading, never as evidence of a fresh boundary.
+    """
+    if reset_at_monotonic is None:
+        return None
+    bucket = math.floor(reset_at_monotonic / _RESET_BOUNDARY_BUCKET_SECONDS)
+    return f"{window}:{bucket}"
+
+
 @dataclass
 class _WindowObservation:
     used_percent: float
@@ -400,6 +427,70 @@ class ObservationView:
         self._warnings[(account_id, window)] = _WarningSignal(
             observed_at=observed_at, reset_identity=reset_identity
         )
+
+    def merge_unified_window(
+        self,
+        account_id: str,
+        window: str,
+        *,
+        used_percent: float,
+        reset_at: float | None,
+        reset_identity: str | None,
+        source: str,
+        observed_at: float,
+    ) -> float | None:
+        """Design v2 §3.2's header-sourced merge (T-15), distinct from
+        `ingest_window`'s unconditional overwrite (fed by the independently
+        authoritative periodic usage poll): a header-sourced reading must
+        reconcile against whatever is already on file for `(account_id,
+        window)` before it may replace it.
+
+        * strictly OLDER than the stored reading (`observed_at`): dropped
+          outright, returns `None` — newest valid observation wins.
+        * shares the stored reading's `reset_identity` (or `reset_identity`
+          is `None` — an incomplete/unresolvable reset, treated
+          conservatively as "no evidence of a new boundary"): keeps the
+          LARGER of the two `used_percent` values — usage never regresses
+          within one window boundary, and an incomplete header can only ever
+          raise the stored value, never erase it downward.
+        * a genuinely CHANGED (both known, and different) `reset_identity`:
+          replaces the stored reading outright, even with a lower
+          `used_percent` — a rollover legitimately lowers usage.
+
+        Returns the resulting stored `used_percent`, or `None` when the
+        reading was dropped as stale.
+        """
+        key = (account_id, window)
+        existing = self._windows.get(key)
+        if existing is not None and observed_at < existing.observed_at:
+            return None
+        if existing is not None and (reset_identity is None or reset_identity == existing.reset_identity):
+            used_percent = max(used_percent, existing.used_percent)
+        self._windows[key] = _WindowObservation(
+            used_percent=used_percent,
+            observed_at=observed_at,
+            reset_at=reset_at,
+            reset_identity=reset_identity,
+            source=source,
+        )
+        return used_percent
+
+    def clear_allowed_warning(self, account_id: str, window: str, *, observed_at: float) -> bool:
+        """Design v2 §3.2: a newer valid `allowed` status clears a previously
+        retained `allowed_warning` outright, rather than waiting for its own
+        5-minute staleness (`has_active_warning`) to lapse. A clear OLDER than
+        the retained warning's own `observed_at` is dropped — an out-of-order
+        stale `allowed` never erases a legitimately fresher warning. Returns
+        whether a warning was actually cleared.
+        """
+        key = (account_id, window)
+        existing = self._warnings.get(key)
+        if existing is None:
+            return False
+        if observed_at < existing.observed_at:
+            return False
+        del self._warnings[key]
+        return True
 
     def window_pressure(self, account_id: str, window: str, *, now: float) -> float | None:
         """The freshness-ladder-adjusted pressure for one window, or `None` (UNKNOWN)."""
@@ -944,6 +1035,96 @@ class ClaudeBalancedRouter:
         self.observations.ingest_allowed_warning(
             account_id, window, observed_at=self._clock(), reset_identity=reset_identity
         )
+
+    # -- unified response-header ingestion (T-15, design v2 §3.2) -----------
+
+    def ingest_unified_response_headers(
+        self,
+        headers: Mapping[str, str],
+        *,
+        account_id: str,
+        serving_account_id: str,
+        account_incarnation_id: str,
+        account_profile_fingerprint: str | None,
+        model: str,
+        recognized: Mapping[str, HeaderDescriptor] = RECOGNIZED_HEADERS,
+        now: float | None = None,
+        wall_now: float | None = None,
+    ) -> None:
+        """Merge one upstream 2xx response's recognized unified rate-limit
+        headers into this router's live `ObservationView`, and durably
+        persist every window whose stored reading actually changed —
+        coalesced for free by the store's own same-row write debounce (T-5),
+        fire-and-forget like `classify_capability_evidence` (never awaited
+        here).
+
+        Scoped strictly to `account_id == serving_account_id` — these are the
+        SAME account by construction at every real call site (the account
+        whose response these headers came from); the explicit check is a
+        standalone safety backstop headers alone can never route around
+        ("headers update only the serving account"). `fable_weekly`, even if
+        `recognized` maps a header onto it, is dropped unless this request's
+        own `model` is itself in the "fable" family — never fabricated for an
+        unrelated request. Never installs a cooldown or creates migration
+        state: purely an observation/warning update.
+        """
+        if account_id != serving_account_id:
+            return
+        parsed = parse_unified_headers(headers, recognized=recognized)
+        if not parsed:
+            return
+
+        now = self._clock() if now is None else now
+        wall_now = self._wall_clock() if wall_now is None else wall_now
+        family = quota_family(model)
+
+        for window, fields in parsed.items():
+            if window not in _NON_FABLE_WINDOWS and window != "fable_weekly":
+                continue
+            if window == "fable_weekly" and family != "fable":
+                continue
+
+            reset_at_monotonic = (
+                _wall_to_monotonic(fields.reset_epoch, wall_now=wall_now, monotonic_now=now)
+                if fields.reset_epoch is not None
+                else None
+            )
+            identity = unified_reset_identity(window, reset_at_monotonic)
+
+            merged_used_percent: float | None = None
+            if fields.used_percent is not None:
+                merged_used_percent = self.observations.merge_unified_window(
+                    account_id,
+                    window,
+                    used_percent=fields.used_percent,
+                    reset_at=reset_at_monotonic,
+                    reset_identity=identity,
+                    source="unified_headers",
+                    observed_at=now,
+                )
+
+            if fields.status == "allowed_warning":
+                self.observations.ingest_allowed_warning(
+                    account_id, window, observed_at=now, reset_identity=identity
+                )
+            elif fields.status == "allowed":
+                self.observations.clear_allowed_warning(account_id, window, observed_at=now)
+
+            if merged_used_percent is None or self._store is None or account_profile_fingerprint is None:
+                continue
+            self._store.upsert_usage_observation(
+                account_id=account_id,
+                window=window,
+                account_incarnation_id=account_incarnation_id,
+                account_profile_fingerprint=account_profile_fingerprint,
+                used_percent=merged_used_percent,
+                reset_identity=identity or "none",
+                reset_at_utc=fields.reset_epoch,
+                observed_at_utc=wall_now,
+                source="unified_headers",
+                unified_status=fields.status,
+                unified_claim=identity,
+            )
 
     # -- pressure / weight computation over the current candidate set ------
 
