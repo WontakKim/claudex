@@ -2975,10 +2975,13 @@ async def _handle_admin_claude_routing_put(request: Request) -> JSONResponse:
     settings only once every check passes, immediately before publishing the
     prepared runtime; a failure at any point tears preparation down and
     leaves the old mode untouched. Exiting drains in-flight balanced
-    dispatch, rotates (invalidates) the epoch, and persists+publishes the
-    target mode before waking any request that arrived mid-transition.
-    Switching between "disabled" and "fallback" is unaffected — the
-    pre-existing settings-file swap.
+    dispatch, durably PERSISTS the target mode first (T-20, fix for gap
+    G-3 — a failure here aborts the exit, leaving the runtime "active" with
+    its epoch and pins untouched and this handler returning 500 with the
+    mode unchanged), THEN rotates (invalidates) the epoch, THEN publishes
+    the target mode in memory before waking any request that arrived
+    mid-transition. Switching between "disabled" and "fallback" is
+    unaffected — the pre-existing settings-file swap.
     """
     denied = _admin_guard(request) or _require_json_content_type(request)
     if denied is not None:
@@ -3070,12 +3073,14 @@ async def _handle_admin_claude_routing_put(request: Request) -> JSONResponse:
 
         if mode != "balanced" and current_mode == "balanced":
 
-            def _publish_target() -> None:
+            def _persist_target() -> None:
                 _persist_claude_routing_mode(config, mode)
+
+            def _publish_target() -> None:
                 request.app.state.config = replace(config, claude_account_routing_mode=mode)
 
             try:
-                await runtime.exit_mode(mode, publish=_publish_target)
+                await runtime.exit_mode(mode, persist=_persist_target, publish=_publish_target)
             except (ConfigError, OSError) as exc:
                 return JSONResponse(
                     _openai_error_body(
