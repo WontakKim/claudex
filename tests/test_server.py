@@ -4303,9 +4303,34 @@ def test_dashboard_routing_section_wires_endpoint(
     section = _routing_section(page)
     assert ">Disabled<" in section
     assert ">Fallback<" in section
-    # balanced is reserved server-side (400) and must not be offered.
-    assert "balanced" not in section
+    # balanced is a fully valid server-side mode (config.py's
+    # VALID_CLAUDE_ACCOUNT_ROUTING_MODES) and is offered here too.
+    assert 'value="balanced"' in section
+    assert ">Balanced<" in section
     assert "계정별 라우팅 상태 보기" in section
+    # The mode-envelope validator adopts a balanced boot GET/apply response
+    # instead of rejecting it as malformed.
+    assert 'body.mode==="balanced"' in page
+
+
+def test_dashboard_accounts_surface_pool_usage_freshness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Balanced-mode usage reads are cache-only (T-13): the accounts screen
+    # renders pool/status's usage_freshness chip plus each window's
+    # pool/usage observation age/source, and a queued manual refresh renders
+    # its own indication instead of claiming a completed refresh.
+    with _create_test_client(monkeypatch) as client:
+        page = client.get("/").text
+
+    assert "ACCT.usageFreshness" in page
+    assert "statusResp.body.usage_freshness" in page
+    assert 'id="pool-fresh-pill"' in page
+    assert "function renderPoolFreshness(" in page
+    assert "meta.age_seconds" in page
+    assert "meta.source" in page
+    assert "u.queued" in page
+    assert "대기 중" in page
 
 
 def test_dashboard_routing_locked_renders_readonly(

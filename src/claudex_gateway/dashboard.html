@@ -75,6 +75,12 @@ body[data-tab="settings"] #tab-settings,body[data-tab="status"] #tab-status,body
 .ubar i{display:block;height:100%;border-radius:999px;background:var(--ok)}
 .ubar i.warn{background:var(--warn)} .ubar i.err{background:var(--err)}
 .ureset{margin-top:5px;font-size:12.5px;color:var(--muted)}
+/* Per-window observation age/source (balanced mode's cache-only usage read,
+   pool/usage's windows map) — never implied by the % bar alone. */
+.wmeta{font-family:var(--mono)}
+.wmeta.aging{color:var(--warn)}
+.wmeta.stale{color:var(--err)}
+.ureset.queued{color:var(--accent);font-weight:600}
 .ucard-h{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}
 .ucard-h h2{margin:0 0 4px}
 .urefresh{flex:none;font:600 13px var(--mono);border:1.5px solid var(--line);background:var(--panel);
@@ -305,6 +311,12 @@ body.env-locked .applybar{display:none!important}
 .pill.ready{background:var(--ok-soft);color:var(--ok)}
 .pill.cool{background:var(--warn-soft);color:var(--warn)}
 .pill.unavailable{background:var(--err-soft);color:var(--err)}
+/* Pool usage_freshness (balanced mode only): fresh/partial/degraded — a
+   degraded pool must never look quota-aware, so it gets the same err
+   treatment as an unavailable account. */
+.pill.fresh{background:var(--ok-soft);color:var(--ok)}
+.pill.partial{background:var(--warn-soft);color:var(--warn)}
+.pill.degraded{background:var(--err-soft);color:var(--err)}
 .lhero{margin-top:16px;padding:18px 20px;border-radius:10px;background:var(--accent-soft);
   border:1.5px solid color-mix(in srgb,var(--accent) 35%,transparent)}
 .lhero .ribbon{display:flex;align-items:center;gap:6px;font:700 11px var(--sans);
@@ -438,6 +450,7 @@ button.primary:disabled{opacity:.5;cursor:default}
                 <select id="routing-select">
                   <option value="disabled">Disabled</option>
                   <option value="fallback">Fallback</option>
+                  <option value="balanced">Balanced</option>
                 </select>
                 <button id="routing-apply">적용</button>
               </div>
@@ -462,6 +475,8 @@ button.primary:disabled{opacity:.5;cursor:default}
           </div>
           <div class="tbl-cap">
             <span class="t">등록 계정</span><span class="n" id="acct-count"></span>
+            <span class="pill" id="pool-fresh-pill" hidden></span>
+            <button type="button" class="urefresh" id="btn-usage-refresh" hidden>사용량 새로고침</button>
             <button type="button" class="add" id="btn-add-account">계정 추가</button>
           </div>
           <div id="acct-list"></div>
@@ -1364,13 +1379,15 @@ document.getElementById("comp-apply").addEventListener("click",applyCompaction);
    from every successful response, 409 flips the local lock and re-syncs from
    a fresh GET. 적용 stays inert while the draft equals the live mode. */
 var ROUTING={envName:"CLAUDEX_CLAUDE_ACCOUNT_ROUTING",locked:false,mode:"disabled",draft:"disabled"};
+var ROUTING_LABELS={disabled:"Disabled",fallback:"Fallback",balanced:"Balanced"};
 var ROUTING_HINTS={
   disabled:"현재: Disabled — 단일 서빙 계정만 사용하고 429는 그대로 전달합니다.",
-  fallback:"현재: Fallback — ready 계정으로 순차 폴백하고 쿨다운 후 자동 복귀합니다."
+  fallback:"현재: Fallback — ready 계정으로 순차 폴백하고 쿨다운 후 자동 복귀합니다.",
+  balanced:"현재: Balanced — ready 계정 풀 전체에 세션을 사용량 기반으로 고르게 분산합니다."
 };
 function isRoutingEnvelope(body){
   return !!body&&typeof body.env_locked==="boolean"&&
-    (body.mode==="disabled"||body.mode==="fallback");
+    (body.mode==="disabled"||body.mode==="fallback"||body.mode==="balanced");
 }
 function renderRouting(){
   document.getElementById("routing-card").classList.toggle("locked",ROUTING.locked);
@@ -1421,7 +1438,7 @@ function applyRouting(){
       return;
     }
     renderRoutingState(r.body);
-    showToast('<span class="chip chip-ok">APPLIED</span><br>라우팅 → '+(r.body.mode==="fallback"?"Fallback":"Disabled"),false);
+    showToast('<span class="chip chip-ok">APPLIED</span><br>라우팅 → '+(ROUTING_LABELS[r.body.mode]||"Disabled"),false);
   }).catch(function(){
     renderRouting();
     showToast('<span class="chip chip-err">ERROR</span><br>계정 라우팅<br><span class="dim">gateway unreachable</span>',true);
@@ -1461,7 +1478,7 @@ document.querySelectorAll("#tab-settings .rail-item").forEach(function(a){
    the open set survives re-renders. No interval polling: fetch on entry,
    the hero's 갱신 button, and after a login succeeds. */
 var ACCT_ENV="CLAUDEX_CLAUDE_ACCOUNT_ID";
-var ACCT={rows:[],serving:null,local:null,locked:false,usage:{},open:{},localUsage:null,routing:{}};
+var ACCT={rows:[],serving:null,local:null,locked:false,usage:{},open:{},localUsage:null,routing:{},usageFreshness:null};
 function attr(s){return esc(s).replace(/"/g,"&quot;")}
 function planLabel(planType){
   // claude_max -> MAX, claude_pro -> PRO; an absent plan renders as a dash.
@@ -1476,6 +1493,14 @@ function fmtAcctDate(epochMs){
 function fmtAgo(epochSec){
   if(!epochSec)return"—";
   var m=Math.max(0,Math.round((Date.now()/1000-epochSec)/60));
+  return m<1?"방금":m<60?m+"분 전":Math.floor(m/60)+"시간 "+(m%60)+"분 전";
+}
+/* Same "N분 전" phrasing as fmtAgo, but for a pool/usage window's own
+   age_seconds duration rather than an epoch timestamp — this is the
+   per-window observation age, not the whole envelope's updated_at. */
+function fmtAge(ageSeconds){
+  if(typeof ageSeconds!=="number")return"—";
+  var m=Math.max(0,Math.round(ageSeconds/60));
   return m<1?"방금":m<60?m+"분 전":Math.floor(m/60)+"시간 "+(m%60)+"분 전";
 }
 function fmtCooldownUntil(epochMs){
@@ -1497,10 +1522,14 @@ function routingBadgeHtml(accountId){
 var ACCT_USAGE_SKELETON='<div class="uwin" aria-hidden="true"><div class="uwin-h"><span class="sk">세션 윈도우</span></div>'+
   '<div class="ubar"></div><div class="ureset"><span class="sk">0요일 00:00 리셋 (0시간 0분 후)</span></div></div>';
 function usageWindowsHtml(u){
-  return(u.session?usageWindowHtml("세션 윈도우",u.session,true):"")+
-    (u.weekly?usageWindowHtml("주간 윈도우",u.weekly,true):"")+
-    (u.fable_weekly?usageWindowHtml("Fable 주간",u.fable_weekly,true):"")+
-    (u.monthly?usageWindowHtml("월간 윈도우",u.monthly,true):"");
+  // Outside active balanced mode, pool/usage carries no windows map — u.windows
+  // is then undefined and every lookup below falls back to "no metadata",
+  // rendering exactly as it did before T-16.
+  var w=u.windows||{};
+  return(u.session?usageWindowHtml("세션 윈도우",u.session,true,w.session):"")+
+    (u.weekly?usageWindowHtml("주간 윈도우",u.weekly,true,w.weekly):"")+
+    (u.fable_weekly?usageWindowHtml("Fable 주간",u.fable_weekly,true,w.fable_weekly):"")+
+    (u.monthly?usageWindowHtml("월간 윈도우",u.monthly,true,w.monthly):"");
 }
 function acctUsageHtml(row){
   if(row.state!=="ready")
@@ -1512,7 +1541,11 @@ function acctUsageHtml(row){
     return'<div class="unavail">사용량을 불러올 수 없습니다.'+
       (u.error?'<span class="hint">'+esc(u.error)+"</span>":"")+"</div>";
   var rows=usageWindowsHtml(u);
-  return(rows||'<div class="ureset">표시되는 윈도우가 없습니다</div>')+
+  // A queued manual refresh (balanced mode, T-13 Step 5) never fetches
+  // inline — it must render as "queued", not silently claim a completed
+  // refresh, until the coordinator's next poll actually lands.
+  var queuedHtml=u.queued?'<div class="ureset queued">사용량 새로고침 대기 중 — 다음 폴링에 반영됩니다</div>':"";
+  return(rows||'<div class="ureset">표시되는 윈도우가 없습니다</div>')+queuedHtml+
     '<div class="age">사용량 <b>'+esc(fmtAgo(u.updated_at))+'</b> 기준</div>';
 }
 function acctDetailHtml(row,serving){
@@ -1554,10 +1587,26 @@ function acctRowHtml(row){
     '<span class="plan-txt">'+esc(planLabel(row.planType))+'</span></div>'+
     '<div class="adetail'+(open?" show":"")+'" data-for="'+attr(row.id)+'">'+acctDetailHtml(row,serving)+'</div>';
 }
+/* Pool-wide usage_freshness (pool/status, balanced mode only — null in every
+   other mode): fresh means every ready account's every window is at most 5
+   minutes old, degraded means persistence is degraded or nothing is within
+   30 minutes, partial is everything between. The manual-refresh button only
+   does anything useful while balanced routing is actually polling, so it
+   shares this chip's visibility. */
+var POOL_FRESHNESS_LABEL={fresh:"사용량 최신",partial:"사용량 일부 지연",degraded:"사용량 지연됨"};
+function renderPoolFreshness(){
+  var pill=document.getElementById("pool-fresh-pill");
+  var refreshBtn=document.getElementById("btn-usage-refresh");
+  var label=POOL_FRESHNESS_LABEL[ACCT.usageFreshness];
+  pill.hidden=!label;
+  refreshBtn.hidden=!label;
+  if(label){pill.className="pill "+ACCT.usageFreshness;pill.textContent=label}
+}
 function renderAcctList(){
   document.getElementById("acct-count").textContent=String(ACCT.rows.length);
   document.getElementById("acct-lock-env").textContent=ACCT_ENV;
   document.getElementById("scard-accounts").classList.toggle("locked",ACCT.locked);
+  renderPoolFreshness();
   var list=document.getElementById("acct-list");
   if(!ACCT.rows.length){
     list.innerHTML='<div class="ureset" style="padding:12px 0">등록된 계정이 없습니다. 계정 추가로 브라우저 로그인을 시작하세요.</div>';
@@ -1608,6 +1657,29 @@ function fetchAccountUsage(){
     renderAcctList();
   }).catch(function(){settle("gateway unreachable")});
 }
+/* Manual refresh (balanced mode only, T-13 Step 5): `?refresh` enqueues a
+   coalesced, rate-limited poll on the balanced coordinator and returns
+   whatever is already cached immediately either way — it never fetches
+   inline. A queued request renders via acctUsageHtml's own u.queued check;
+   this only needs to adopt the response and surface it wasn't ignored. */
+function refreshAccountUsage(){
+  if(!ACCT.rows.length)return Promise.resolve();
+  return jfetch("/admin/providers/claude/pool/usage?refresh").then(function(r){
+    if(!r.ok){
+      showToast('<span class="chip chip-err">ERROR</span><span class="lat">'+r.status+
+        '</span><br>사용량 새로고침<br><span class="dim">'+esc(errDetail(r.body))+"</span>",true);
+      return;
+    }
+    ACCT.usage=r.body.accounts||{};
+    renderAcctList();
+    if(r.body.queued){
+      showToast('<span class="chip chip-ok">QUEUED</span><br>사용량 새로고침이 대기열에 들어갔습니다'+
+        '<br><span class="dim">다음 폴링에 반영됩니다</span>',false);
+    }
+  }).catch(function(){
+    showToast('<span class="chip chip-err">ERROR</span><br>사용량 새로고침<br><span class="dim">gateway unreachable</span>',true);
+  });
+}
 function fetchAccounts(){
   /* The accounts screen paints from four independent resources: the
      registry collection, the local-login hero, the serving pin, and the
@@ -1640,6 +1712,7 @@ function fetchAccounts(){
     // Same stance as the serving pin: an unknown routing status renders as no
     // badges, with the error — fresh rows never wear stale badges.
     ACCT.routing={};
+    ACCT.usageFreshness=statusResp.ok?(statusResp.body.usage_freshness||null):null;
     if(statusResp.ok){
       (statusResp.body.members||[]).forEach(function(m){ACCT.routing[m.account_id]=m});
     }else{
@@ -1722,6 +1795,12 @@ document.getElementById("btn-local-refresh").addEventListener("click",function()
   btn.disabled=true;btn.textContent="…";
   ACCT.localUsage=null;renderLocalHero();
   fetchLocalHeroUsage().finally(function(){btn.disabled=false;btn.textContent="갱신"});
+});
+document.getElementById("btn-usage-refresh").addEventListener("click",function(){
+  var btn=this;
+  if(btn.disabled)return;
+  btn.disabled=true;btn.textContent="…";
+  refreshAccountUsage().finally(function(){btn.disabled=false;btn.textContent="사용량 새로고침"});
 });
 /* --- dashboard login (browser OAuth through the gateway's claude CLI) -----
    POST starts the session (or attaches to a running one on 409 login-active);
@@ -2085,13 +2164,17 @@ function fmtReset(epochSec){
   return abs+" 리셋 ("+rel+")";
 }
 /* colorPct (accounts screens only) mirrors the bar's state color onto the
-   % readout; the Status cards keep their original neutral readout. */
-function usageWindowHtml(label,win,colorPct){
+   % readout; the Status cards keep their original neutral readout. meta is
+   this window's pool/usage observation metadata ({age_seconds, source,
+   state}, balanced mode only) — absent everywhere else, so the reset line
+   renders exactly as before when it is undefined. */
+function usageWindowHtml(label,win,colorPct,meta){
   var pct=Math.round(win.used_percent*10)/10;
   var cls=pct>=90?"err":pct>=70?"warn":"";
+  var metaHtml=meta?' · <span class="wmeta '+esc(meta.state||"")+'">'+esc(fmtAge(meta.age_seconds))+" · "+esc(meta.source)+'</span>':"";
   return'<div class="uwin"><div class="uwin-h"><span>'+esc(label)+'</span><span class="upct'+(colorPct&&cls?" "+cls:"")+'">'+fmtPct(pct)+'</span></div>'+
     '<div class="ubar"><i class="'+cls+'" style="width:'+Math.min(100,Math.max(0,pct))+'%"></i></div>'+
-    '<div class="ureset">'+fmtReset(win.resets_at)+'</div></div>';
+    '<div class="ureset">'+fmtReset(win.resets_at)+metaHtml+'</div></div>';
 }
 /* Renders whenever the provider reports a credit count, so this line is the
    single place credits are stated. The button is part of it only when there
