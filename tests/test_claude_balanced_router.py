@@ -13,11 +13,13 @@ from typing import Any
 import pytest
 
 from claudex_gateway import claude_unified_headers
+from claudex_gateway.account_usage_cache import ClaudeAccountUsageCache
 from claudex_gateway.claude_balanced_router import (
     CAPABILITY_CLASSIFIER_VERSION,
     CAPABILITY_EVIDENCE_TTL_SECONDS,
     AccountCandidate,
     ClaudeBalancedRouter,
+    ClaudeUsagePollCoordinator,
     FamilyGateOutcome,
     MigrationReservation,
     NoEligibleAccountError,
@@ -70,6 +72,31 @@ def _reference_session_key_digest(seed: bytes, kind: bytes, canonical_utf8: byte
         + canonical_utf8
     )
     return hmac.new(seed, frame, hashlib.sha256).digest()
+
+
+# ---------------------------------------------------------------------------
+# Usage poll coordinator (T-18, fix for gap G-1): the public mirror the
+# runtime-owned background driver reads to pace its own loop.
+# ---------------------------------------------------------------------------
+
+
+def test_usage_poll_coordinator_exposes_its_configured_poll_interval_seconds() -> None:
+    """`poll_interval_seconds` is a read-only public mirror of the private
+    constructor argument -- not a new scheduling knob -- so
+    `ClaudeBalancedRuntime`'s background driver can pace its own loop
+    against the exact same budget the coordinator itself enforces.
+    """
+
+    async def fetch(_account_id: str) -> tuple[dict[str, Any], float | None]:
+        raise AssertionError("never called")
+
+    cache = ClaudeAccountUsageCache(fetch)
+    router = ClaudeBalancedRouter(balanced_epoch_id="epoch-1")
+    coordinator = ClaudeUsagePollCoordinator(
+        cache=cache, router=router, poll_interval_seconds=12.5
+    )
+
+    assert coordinator.poll_interval_seconds == 12.5
 
 
 def test_uuid_branch_is_case_insensitive_and_yields_the_same_digest() -> None:

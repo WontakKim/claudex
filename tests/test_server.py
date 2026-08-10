@@ -11,7 +11,7 @@ import struct
 import threading
 import time
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -6633,14 +6633,44 @@ def _register_balanced_accounts(count: int) -> list[tuple[str, str]]:
     return accounts
 
 
-def _enable_balanced(client: TestClient, anthropic_handler: Any) -> Any:
+_USAGE_PROBE_PATH = "/api/oauth/usage"  # usage._CLAUDE_USAGE_URL's path component
+
+
+def _usage_probe_intercepting_handler(anthropic_handler: Any) -> Any:
+    """Wrap `anthropic_handler` so the T-18 background usage poll driver's own
+    automatic probe (`GET .../api/oauth/usage`) is answered directly with a
+    no-window "ok" envelope, without ever reaching `anthropic_handler` --
+    once balanced routing is active, that driver immediately runs its own
+    warm-up poll in the background, and most tests here only care about
+    `/v1/messages` traffic (call counts, retry/migration sequencing, ...).
+    """
+
+    def transport_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == _USAGE_PROBE_PATH:
+            return httpx.Response(200, json={})
+        return anthropic_handler(request)
+
+    return transport_handler
+
+
+def _enable_balanced(
+    client: TestClient, anthropic_handler: Any, *, intercept_usage_probe: bool = True
+) -> Any:
     """Swap in a mock Anthropic transport and enable balanced routing.
+
+    `intercept_usage_probe` (default `True`, T-18) wraps `anthropic_handler`
+    with `_usage_probe_intercepting_handler`; pass `False` for the few tests
+    that deliberately want to observe or control the driver's own automatic
+    probe's HTTP behavior.
 
     Returns the resulting `ClaudeBalancedRuntime`.
     """
-    client.app.state.http_client = httpx.AsyncClient(
-        transport=httpx.MockTransport(anthropic_handler)
+    handler = (
+        _usage_probe_intercepting_handler(anthropic_handler)
+        if intercept_usage_probe
+        else anthropic_handler
     )
+    client.app.state.http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     response = client.put("/admin/providers/claude/pool/routing", json={"mode": "balanced"})
     assert response.status_code == 200, response.text
     return client.app.state.claude_balanced_runtime
@@ -7336,7 +7366,9 @@ def test_balanced_restart_restores_the_family_cooldown_without_a_repeat_429_burs
     with _create_test_client(
         monkeypatch, config=first_config, base_url="http://127.0.0.1:8787"
     ) as client:
-        client.app.state.http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        client.app.state.http_client = httpx.AsyncClient(
+            transport=httpx.MockTransport(_usage_probe_intercepting_handler(handler))
+        )
         enable = client.put("/admin/providers/claude/pool/routing", json={"mode": "balanced"})
         assert enable.status_code == 200
         first_runtime = client.app.state.claude_balanced_runtime
@@ -7356,7 +7388,9 @@ def test_balanced_restart_restores_the_family_cooldown_without_a_repeat_429_burs
     with _create_test_client(
         monkeypatch, config=second_config, base_url="http://127.0.0.1:8787"
     ) as client:
-        client.app.state.http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        client.app.state.http_client = httpx.AsyncClient(
+            transport=httpx.MockTransport(_usage_probe_intercepting_handler(handler))
+        )
         second_runtime = client.app.state.claude_balanced_runtime
         assert second_runtime.status == "active"
         assert second_runtime.router is not None
@@ -7892,10 +7926,13 @@ class TestBalancedUsageCoordinatorEndpoints:
 
         assert response.status_code == 200
         payload = response.json()
-        assert payload["accounts"][account_id]["status"] == "unavailable"
+        # T-18: the background driver already warmed this account up with one
+        # automatic poll the moment balanced routing activated -- this
+        # endpoint's OWN read is still cache-only and adds no second call.
+        assert payload["accounts"][account_id]["status"] == "ok"
         assert payload["accounts"][account_id]["windows"] == {}
         assert payload["accounts"][account_id]["queued"] is False
-        assert calls == []
+        assert calls == [account_id]
 
     def test_manual_refresh_returns_queued_without_fetching_in_active_balanced_mode(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -7929,7 +7966,10 @@ class TestBalancedUsageCoordinatorEndpoints:
         assert payload["queued"] is True
         assert payload["accounts"][account_id]["queued"] is True
         assert pending is True
-        assert calls == []
+        # T-18: the background driver's own automatic warm-up poll is the
+        # only call recorded -- `?refresh` itself never fetches inline, it
+        # only enqueues the manual refresh the driver will service later.
+        assert calls == [account_id]
 
     def test_manual_refresh_is_inert_outside_active_balanced_mode(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -8056,7 +8096,12 @@ class TestBalancedUsageCoordinatorEndpoints:
         payload = response.json()
         assert payload["usage_freshness"] == "degraded"
         assert payload["usage_diagnostics"]["persistence_degraded"] is False
-        assert payload["usage_diagnostics"]["coordinator"]["fetched_count"] == 0
+        # T-18: the background driver already made its one automatic warm-up
+        # attempt (the mock transport's no-window "ok" stub, same as every
+        # other `_enable_balanced` caller) -- still "degraded" since it
+        # carried no actual window data, but no longer the pre-driver "never
+        # even tried" baseline of 0.
+        assert payload["usage_diagnostics"]["coordinator"]["fetched_count"] == 1
 
     def test_pool_status_reports_fresh_usage_freshness_once_every_window_is_recent(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -8097,3 +8142,199 @@ class TestBalancedUsageCoordinatorEndpoints:
 
         payload = response.json()
         assert payload["usage_freshness"] == "fresh"
+
+
+# ---------------------------------------------------------------------------
+# Usage poll driver (T-18, fix for gap G-1): the background task that
+# actually calls `ClaudeUsagePollCoordinator.run_due_poll` while balanced
+# routing is active -- no production code path ever did before this.
+# ---------------------------------------------------------------------------
+
+
+def _wait_until(client: TestClient, predicate: Callable[[], bool], *, timeout: float = 2.0) -> None:
+    """Poll `predicate`, giving the app's background event loop another turn
+    (a real `GET /health` round trip) between checks, until it holds or
+    `timeout` elapses. Avoids a fixed real-time `sleep` in the test itself
+    while staying deterministic: a working driver satisfies `predicate`
+    almost immediately, and a genuinely broken/cancelled one fails fast
+    instead of hanging until the timeout.
+    """
+    deadline = time.monotonic() + timeout
+    while not predicate():
+        if time.monotonic() >= deadline:
+            raise AssertionError("condition not met within timeout")
+        client.get("/health")
+
+
+class TestUsagePollDriver:
+    """T-18 (fix for gap G-1): `ClaudeBalancedRuntime` now actually drives
+    `usage_poll_coordinator.run_due_poll` itself -- automatically once
+    balanced routing activates, cancelled on exit/shutdown strictly before
+    the store closes, and eventually draining a queued manual refresh --
+    instead of leaving the coordinator dormant outside of tests.
+    """
+
+    def test_usage_poll_driver_starts_automatically_and_polls_without_any_manual_call(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Merely activating balanced routing starts the driver: it performs
+        one automatic upstream poll entirely on its own -- this test never
+        calls `run_due_poll` or requests a manual refresh itself.
+        """
+        _balanced_env(monkeypatch, tmp_path)
+        account_id, _access_token = _register_balanced_accounts(1)[0]
+        calls: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path != _USAGE_PROBE_PATH:
+                raise AssertionError("no /v1/messages traffic in this test")
+            calls.append(request.url.path)
+            return httpx.Response(
+                200,
+                json={
+                    "five_hour": {"utilization": 42.0, "resets_at": None},
+                    "seven_day": {"utilization": 17.0, "resets_at": None},
+                },
+            )
+
+        with _create_test_client(
+            monkeypatch, config=GatewayConfig(), base_url="http://127.0.0.1:8787"
+        ) as client:
+            _enable_balanced(client, handler, intercept_usage_probe=False)
+            _wait_until(client, lambda: len(calls) >= 1)
+
+            response = client.get("/admin/providers/claude/pool/usage")
+
+        assert calls == [_USAGE_PROBE_PATH]
+        payload = response.json()
+        assert payload["accounts"][account_id]["status"] == "ok"
+        assert payload["accounts"][account_id]["windows"]["session"]["state"] == "fresh"
+        assert payload["accounts"][account_id]["windows"]["weekly"]["state"] == "fresh"
+
+    def test_usage_poll_driver_is_cancelled_by_an_intentional_exit_and_polls_no_further(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Step 2: disabling balanced routing (`exit_mode`) cancels+awaits the
+        driver strictly before the store closes -- no further automatic poll
+        happens afterward, even though a short scheduling budget would
+        otherwise have allowed several more within this test's own
+        wall-clock time.
+        """
+        _balanced_env(monkeypatch, tmp_path)
+        _register_balanced_accounts(1)
+        calls: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(request.url.path)
+            return httpx.Response(200, json={})
+
+        with _create_test_client(
+            monkeypatch, config=GatewayConfig(), base_url="http://127.0.0.1:8787"
+        ) as client:
+            runtime = _enable_balanced(client, handler, intercept_usage_probe=False)
+            assert runtime.usage_poll_coordinator is not None
+            runtime.usage_poll_coordinator._poll_interval_seconds = 0.01
+            _wait_until(client, lambda: len(calls) >= 1)
+            assert calls == [_USAGE_PROBE_PATH]
+
+            disabled = client.put(
+                "/admin/providers/claude/pool/routing", json={"mode": "disabled"}
+            )
+            assert disabled.status_code == 200
+            assert runtime.status == "disabled"
+            assert runtime._usage_poll_driver_task is None
+
+            # Several more short-budget ticks would fit in this window if the
+            # driver were still running -- none did.
+            client.get("/health")
+            client.get("/health")
+            assert calls == [_USAGE_PROBE_PATH]
+
+    def test_usage_poll_driver_is_cancelled_on_lifespan_shutdown_and_polls_no_further(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Step 2: process shutdown (`shutdown_preserving_epoch`) gives the
+        same cancel-before-close guarantee as an intentional exit, via the
+        lifespan's own teardown path instead of an explicit disable.
+        """
+        _balanced_env(monkeypatch, tmp_path)
+        _register_balanced_accounts(1)
+        calls: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(request.url.path)
+            return httpx.Response(200, json={})
+
+        with _create_test_client(
+            monkeypatch, config=GatewayConfig(), base_url="http://127.0.0.1:8787"
+        ) as client:
+            runtime = _enable_balanced(client, handler, intercept_usage_probe=False)
+            assert runtime.usage_poll_coordinator is not None
+            runtime.usage_poll_coordinator._poll_interval_seconds = 0.01
+            _wait_until(client, lambda: len(calls) >= 1)
+            assert calls == [_USAGE_PROBE_PATH]
+            assert runtime.status == "active"
+
+        # The `with` block's exit ran `shutdown_preserving_epoch` to
+        # completion -- the driver is cancelled+awaited and the store closed
+        # before it returned; no additional automatic poll occurred despite
+        # the short scheduling budget.
+        assert runtime.status == "disabled"
+        assert runtime._usage_poll_driver_task is None
+        assert calls == [_USAGE_PROBE_PATH]
+
+    def test_usage_poll_driver_drains_a_pending_manual_refresh_without_an_extra_upstream_call(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A manual refresh (T-13 Step 5) never fetches inline -- it is only
+        ever consumed by THIS driver's own next tick, once every automatic
+        candidate has yielded no fetch that tick. Total calls stay exactly
+        one per account attempt: the pre-seed, the automatic poll, and the
+        one deliberate manual-forced poll -- never a redundant extra one.
+        """
+        _balanced_env(monkeypatch, tmp_path)
+        (auto_id, auto_token), (manual_id, manual_token) = _register_balanced_accounts(2)
+        auto_bearer = f"Bearer {auto_token}"
+        manual_bearer = f"Bearer {manual_token}"
+        calls: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path != _USAGE_PROBE_PATH:
+                raise AssertionError("no /v1/messages traffic in this test")
+            calls.append(request.headers["authorization"])
+            return httpx.Response(
+                200,
+                json={
+                    "five_hour": {"utilization": 10.0, "resets_at": None},
+                    "seven_day": {"utilization": 5.0, "resets_at": None},
+                },
+            )
+
+        with _create_test_client(
+            monkeypatch, config=GatewayConfig(), base_url="http://127.0.0.1:8787"
+        ) as client:
+            client.app.state.http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+            # Pre-seed the manual-target account as already fresh (still in
+            # the pre-existing, ordinary fetch-through mode) -- it is never
+            # automatically due once balanced routing activates below.
+            seeded = client.get(
+                "/admin/providers/claude/pool/usage", params={"account": manual_id}
+            )
+            assert seeded.json()["accounts"][manual_id]["status"] == "ok"
+            assert calls == [manual_bearer]
+
+            runtime = _enable_balanced(client, handler, intercept_usage_probe=False)
+            assert runtime.usage_poll_coordinator is not None
+            runtime.usage_poll_coordinator._poll_interval_seconds = 0.01
+
+            # Tick 1: the only genuinely due account is `auto_id`.
+            _wait_until(client, lambda: len(calls) >= 2)
+            assert calls == [manual_bearer, auto_bearer]
+
+            runtime.usage_poll_coordinator.request_manual_refresh(manual_id)
+            # Tick 2+: nothing automatic is due anymore -- the driver drains
+            # the pending manual refresh instead.
+            _wait_until(client, lambda: len(calls) >= 3)
+            assert runtime.usage_poll_coordinator.is_manual_refresh_pending(manual_id) is False
+
+        assert calls == [manual_bearer, auto_bearer, manual_bearer]
