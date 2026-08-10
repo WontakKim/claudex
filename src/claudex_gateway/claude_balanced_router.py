@@ -41,6 +41,7 @@ from __future__ import annotations
 import asyncio
 import hmac
 import json
+import logging
 import math
 import time
 import uuid
@@ -52,7 +53,7 @@ from typing import Any, Literal
 
 from claudex_gateway.account_usage_cache import ClaudeAccountUsageCache
 from claudex_gateway.claude_account_profile import load_account_profile_fingerprint
-from claudex_gateway.claude_accounts import AccountRecord
+from claudex_gateway.claude_accounts import AccountRecord, list_accounts
 from claudex_gateway.claude_pool_runtime_state import (
     ClaudePoolRuntimeStateStore,
     RestoreResult,
@@ -63,6 +64,8 @@ from claudex_gateway.claude_unified_headers import (
     HeaderDescriptor,
     parse_unified_headers,
 )
+
+logger = logging.getLogger(__name__)
 
 _SESSION_KEY_DOMAIN = b"claudex-session-key-v1"
 _HRW_DOMAIN = b"claudex-balanced-hrw-v1"
@@ -2113,6 +2116,15 @@ class ClaudeUsagePollCoordinator:
         self.manual_rate_limited_count = 0
         self.manual_served_count = 0
 
+    @property
+    def poll_interval_seconds(self) -> float:
+        """The scheduling budget passed in at construction (Step 1 grounding
+        for `ClaudeBalancedRuntime`'s background driver, which paces its own
+        loop against this exact value): at most one actual upstream call per
+        this many seconds.
+        """
+        return self._poll_interval_seconds
+
     # -- manual refresh: enqueue-only, coalesced, globally rate-limited -----
 
     def request_manual_refresh(self, account_id: str, *, now: float | None = None) -> bool:
@@ -2373,6 +2385,12 @@ class ClaudeBalancedRuntime:
         self.usage_poll_coordinator: ClaudeUsagePollCoordinator | None = None
 
         self._store: ClaudePoolRuntimeStateStore | None = None
+        # T-18 (fix for gap G-1): the background driver that actually calls
+        # `usage_poll_coordinator.run_due_poll` while this runtime is
+        # "active" -- `None` whenever no coordinator is driving (every status
+        # other than "active", or "active" without a `usage_cache`).
+        self._usage_poll_driver_task: asyncio.Task[None] | None = None
+        self._accounts_root: Path | None = None
         self._lifecycle_lock = asyncio.Lock()
         self._transition_event = asyncio.Event()
         self._transition_event.set()
@@ -2478,12 +2496,14 @@ class ClaudeBalancedRuntime:
                 self.epoch_id = store.balanced_epoch_id
                 self.epoch_seed = store.epoch_seed
                 self.router = router
+                self._accounts_root = accounts_root
                 self.usage_poll_coordinator = (
                     ClaudeUsagePollCoordinator(cache=usage_cache, router=router, store=store)
                     if usage_cache is not None
                     else None
                 )
                 self.status = "active"
+                self._start_usage_poll_driver()
             except BaseException:
                 if store is not None:
                     store.close()
@@ -2491,6 +2511,79 @@ class ClaudeBalancedRuntime:
                 raise
             finally:
                 self._transition_event.set()
+
+    # -- usage poll driver (T-18, fix for gap G-1): runs while "active" ---------------
+
+    def _start_usage_poll_driver(self) -> None:
+        """Start the background driver task (Step 1) once this runtime is published
+        "active" -- a no-op when `prepare_and_publish` was called without a
+        `usage_cache`, so `usage_poll_coordinator` is `None` and nothing needs
+        driving. Must only be called from inside the `_lifecycle_lock` critical
+        section that just set `status = "active"`.
+        """
+        if self.usage_poll_coordinator is None:
+            return
+        self._usage_poll_driver_task = asyncio.create_task(self._run_usage_poll_driver())
+
+    async def _stop_usage_poll_driver(self) -> None:
+        """Cancel and await the driver task, if one is running (Step 2). MUST be
+        awaited before the store closes in both `exit_mode` and
+        `shutdown_preserving_epoch`, so no poll tick can ever touch a closed store.
+        """
+        task = self._usage_poll_driver_task
+        self._usage_poll_driver_task = None
+        if task is None:
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    async def _run_usage_poll_driver(self) -> None:
+        """The driver's sequential loop (Step 1): the first tick runs immediately
+        (the coordinator's warm-up-on-enable, Context), then it sleeps for the
+        coordinator's own scheduling budget before trying again, forever, until
+        `_stop_usage_poll_driver` cancels it. Re-reads `usage_poll_coordinator`
+        every iteration rather than capturing it once, so it stops cleanly the
+        moment the attribute is cleared instead of racing a stale reference.
+        """
+        while True:
+            coordinator = self.usage_poll_coordinator
+            if coordinator is None:
+                return
+            await self._usage_poll_driver_tick(coordinator)
+            await asyncio.sleep(coordinator.poll_interval_seconds)
+
+    async def _usage_poll_driver_tick(self, coordinator: ClaudeUsagePollCoordinator) -> None:
+        """One driver iteration: re-reads the registry (read-through, exactly like
+        `server._passthrough_with_balanced_pool`, so an account added/removed
+        while balanced routing is active takes effect immediately) and calls
+        `run_due_poll` with the current ready set. Never lets an exception escape
+        -- an unexpected failure here (a bad registry read, a broken fingerprint
+        file, ...) must never crash this loop or surface into a request path.
+        """
+        try:
+            records = list_accounts()
+            ready_ids = [record.id for record in records if record.state == "ready"]
+            accounts: dict[str, UsagePollAccount] = {}
+            accounts_root = self._accounts_root
+            if accounts_root is not None:
+                for record in records:
+                    if record.state != "ready":
+                        continue
+                    accounts[record.id] = UsagePollAccount(
+                        account_id=record.id,
+                        account_incarnation_id=record.account_incarnation_id,
+                        account_profile_fingerprint=load_account_profile_fingerprint(
+                            accounts_root / record.id
+                        ),
+                    )
+            await coordinator.run_due_poll(ready_ids, accounts=accounts)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning("balanced usage poll driver tick failed", exc_info=True)
 
     # -- intentional exit: drain, invalidate the epoch, publish the target mode -------
 
@@ -2526,11 +2619,16 @@ class ClaudeBalancedRuntime:
                 await store.rotate_epoch().wait_async()
                 publish()
             finally:
+                # T-18 (Step 2): cancel+await the driver strictly before the
+                # store closes, so no in-flight or newly-scheduled poll tick
+                # can ever touch it once closed.
+                await self._stop_usage_poll_driver()
                 if self._store is not None:
                     self._store.close()
                 self._store = None
                 self.router = None
                 self.usage_poll_coordinator = None
+                self._accounts_root = None
                 self.epoch_id = None
                 self.epoch_seed = b""
                 self.status = "disabled"
@@ -2554,11 +2652,16 @@ class ClaudeBalancedRuntime:
             try:
                 await self._drain_complete.wait()
             finally:
+                # T-18 (Step 2): same cancel-before-close ordering as
+                # `exit_mode` -- process shutdown must not race a poll tick
+                # against the store it is about to close either.
+                await self._stop_usage_poll_driver()
                 if self._store is not None:
                     self._store.close()
                 self._store = None
                 self.router = None
                 self.usage_poll_coordinator = None
+                self._accounts_root = None
                 self.epoch_id = None
                 self.epoch_seed = b""
                 self.status = "disabled"
