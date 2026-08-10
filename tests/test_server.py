@@ -8143,6 +8143,88 @@ class TestBalancedUsageCoordinatorEndpoints:
         payload = response.json()
         assert payload["usage_freshness"] == "fresh"
 
+    def test_pool_status_reports_partial_usage_freshness_when_a_binding_window_is_missing(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """G-2 regression: `fresh` requires BOTH binding windows (`session`
+        AND `weekly`) present -- an account with only `session` recently
+        observed, and `weekly` never observed, must not count as fresh even
+        though its one observed window is well within the 5-minute bound.
+        """
+        _balanced_env(monkeypatch, tmp_path)
+        account_id = _register_balanced_ready_account()
+
+        async def fake_fetch(http_client: Any, manager: Any) -> tuple[dict[str, Any], None]:
+            return (
+                {
+                    "provider": "claude",
+                    "status": "ok",
+                    "error": None,
+                    "session": {"used_percent": 10.0, "resets_at": None},
+                    "weekly": None,
+                    "fable_weekly": None,
+                },
+                None,
+            )
+
+        monkeypatch.setattr(server, "fetch_claude_account_usage", fake_fetch)
+
+        def handler(_request: httpx.Request) -> httpx.Response:
+            raise AssertionError("no /v1/messages traffic in this test")
+
+        with _create_test_client(
+            monkeypatch, config=GatewayConfig(), base_url="http://127.0.0.1:8787"
+        ) as client:
+            seeded = client.get("/admin/providers/claude/pool/usage")
+            assert seeded.json()["accounts"][account_id]["status"] == "ok"
+
+            _enable_balanced(client, handler)
+            response = client.get("/admin/providers/claude/pool/status")
+
+        payload = response.json()
+        assert payload["usage_freshness"] == "partial"
+
+    def test_pool_status_reports_partial_usage_freshness_when_fable_weekly_present_but_weekly_missing(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """G-2 regression: `fable_weekly` is a scoped, Fable-only extra
+        window and must never substitute for a missing `weekly` binding
+        window -- an account with a fresh `session` and a fresh
+        `fable_weekly`, but no `weekly`, still does not count as fresh.
+        """
+        _balanced_env(monkeypatch, tmp_path)
+        account_id = _register_balanced_ready_account()
+
+        async def fake_fetch(http_client: Any, manager: Any) -> tuple[dict[str, Any], None]:
+            return (
+                {
+                    "provider": "claude",
+                    "status": "ok",
+                    "error": None,
+                    "session": {"used_percent": 10.0, "resets_at": None},
+                    "weekly": None,
+                    "fable_weekly": {"used_percent": 1.0, "resets_at": None},
+                },
+                None,
+            )
+
+        monkeypatch.setattr(server, "fetch_claude_account_usage", fake_fetch)
+
+        def handler(_request: httpx.Request) -> httpx.Response:
+            raise AssertionError("no /v1/messages traffic in this test")
+
+        with _create_test_client(
+            monkeypatch, config=GatewayConfig(), base_url="http://127.0.0.1:8787"
+        ) as client:
+            seeded = client.get("/admin/providers/claude/pool/usage")
+            assert seeded.json()["accounts"][account_id]["status"] == "ok"
+
+            _enable_balanced(client, handler)
+            response = client.get("/admin/providers/claude/pool/status")
+
+        payload = response.json()
+        assert payload["usage_freshness"] == "partial"
+
 
 # ---------------------------------------------------------------------------
 # Usage poll driver (T-18, fix for gap G-1): the background task that

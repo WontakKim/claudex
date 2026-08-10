@@ -3134,15 +3134,25 @@ def _usage_window_state(age_seconds: float) -> str:
     return "stale"
 
 
+
+# The account-level binding-window pair required for `fresh` (§2.1):
+# envelope names for `five_hour`/`seven_day`. `fable_weekly` is a scoped,
+# Fable-only extra window and must never be required for -- or substitute
+# for a missing member of -- this pair.
+_USAGE_FRESHNESS_BINDING_WINDOWS = ("session", "weekly")
+
+
 def _compute_usage_freshness(
     ready_ids: list[str], cache: ClaudeAccountUsageCache, *, persistence_degraded: bool
 ) -> tuple[str, dict[str, Any]]:
     """Step 6's aggregate `usage_freshness` plus per-account diagnostics.
 
-    `"fresh"`: every ready account's every observed binding window is at
-    most 5 minutes old. `"degraded"`: persistence is degraded, or no window
-    across the whole ready set is at most 30 minutes old. Otherwise
-    `"partial"`.
+    `"fresh"`: every ready account has BOTH binding windows
+    (`_USAGE_FRESHNESS_BINDING_WINDOWS`) present, each at most 5 minutes
+    old -- a ready account missing either window does not count as fresh,
+    even if every window it does have is recent. `"degraded"`: persistence
+    is degraded, or no window across the whole ready set is at most 30
+    minutes old. Otherwise `"partial"`.
     """
     per_account: dict[str, Any] = {}
     all_fresh = True
@@ -3159,7 +3169,15 @@ def _compute_usage_freshness(
             "oldest_age_seconds": max(ages),
             "window_count": len(ages),
         }
-        if max(ages) > _USAGE_WINDOW_FRESH_MAX_AGE_SECONDS:
+        binding_ages = [
+            metadata[window_name]["age_seconds"]
+            for window_name in _USAGE_FRESHNESS_BINDING_WINDOWS
+            if window_name in metadata
+        ]
+        if (
+            len(binding_ages) < len(_USAGE_FRESHNESS_BINDING_WINDOWS)
+            or max(binding_ages) > _USAGE_WINDOW_FRESH_MAX_AGE_SECONDS
+        ):
             all_fresh = False
         if min(ages) <= _USAGE_WINDOW_AGING_MAX_AGE_SECONDS:
             any_within_degraded_window = True
