@@ -6477,6 +6477,123 @@ class TestBalancedRoutingExit:
             assert runtime.router is not None
             assert runtime.router.pin_count() == 0
 
+    def test_exit_persistence_failure_aborts_and_leaves_epoch_and_pins_intact(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Crash contract (T-20, fix for gap G-3): a settings-persistence
+        failure during exit must abort BEFORE anything balanced-only is
+        touched -- the PUT returns 500, the runtime resumes "active", and
+        the epoch id and its durable pins are exactly as they were, still
+        serving requests under balanced with the same pins.
+        """
+        _balanced_env(monkeypatch, tmp_path)
+        account_id = _register_balanced_ready_account()
+
+        def handler(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={"id": "msg_1"})
+
+        def _boom(*_args: Any, **_kwargs: Any) -> None:
+            raise server.ConfigError("simulated disk-full settings write")
+
+        settings_file = tmp_path / "settings.json"
+        config = GatewayConfig(settings_file=settings_file, claude_account_id=account_id)
+        with _create_test_client(
+            monkeypatch, config=config, base_url="http://127.0.0.1:8787"
+        ) as client:
+            client.app.state.http_client = httpx.AsyncClient(
+                transport=httpx.MockTransport(handler)
+            )
+            enable = client.put(
+                "/admin/providers/claude/pool/routing", json={"mode": "balanced"}
+            )
+            assert enable.status_code == 200
+            runtime = client.app.state.claude_balanced_runtime
+            epoch_id_before = runtime.epoch_id
+
+            pinned = client.post("/v1/messages", json=_account_body())
+            assert pinned.status_code == 200
+            assert runtime.router is not None
+            assert runtime.router.pin_count() == 1
+
+            with monkeypatch.context() as fault:
+                fault.setattr(server, "update_settings_file", _boom)
+                failed = client.put(
+                    "/admin/providers/claude/pool/routing", json={"mode": "disabled"}
+                )
+
+            assert failed.status_code == 500
+            assert runtime.status == "active"
+            assert runtime.epoch_id == epoch_id_before
+            assert client.app.state.config.claude_account_routing_mode == "balanced"
+            saved = json.loads(settings_file.read_text(encoding="utf-8"))
+            assert saved["claude_account.routing"] == {"mode": "balanced"}
+
+            # The durable pin the persistence failure was supposed to leave
+            # untouched is still there, both in memory and at the durable
+            # layer -- a subsequent request keeps being served under
+            # balanced, reusing it rather than a fresh placement.
+            assert runtime._store is not None
+            session_key = derive_session_key(_account_body(), runtime.epoch_seed)
+            assert session_key is not None
+            assert runtime.router.get_pin(session_key.digest) is not None
+            assert runtime._store.get_pin(session_key.digest) is not None
+
+            served = client.post("/v1/messages", json=_account_body())
+            assert served.status_code == 200
+            assert runtime.router.pin_count() == 1
+
+    def test_exit_epoch_rotation_failure_after_persistence_surfaces_persistence_degraded(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Crash contract (T-20, fix for gap G-3): once `persist()` has
+        already committed the target mode, a subsequent epoch-rotation
+        failure must NOT roll back to balanced -- the exit still completes
+        under the target mode, with the cleanup failure only surfaced as
+        persistence_degraded.
+        """
+        _balanced_env(monkeypatch, tmp_path)
+        account_id = _register_balanced_ready_account()
+
+        def handler(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={"id": "msg_1"})
+
+        def _boom_rotate(*_args: Any, **_kwargs: Any) -> Any:
+            raise RuntimeError("simulated durable epoch rotation failure")
+
+        settings_file = tmp_path / "settings.json"
+        config = GatewayConfig(settings_file=settings_file, claude_account_id=account_id)
+        caplog.set_level(logging.WARNING, logger="claudex_gateway.claude_balanced_router")
+        with _create_test_client(
+            monkeypatch, config=config, base_url="http://127.0.0.1:8787"
+        ) as client:
+            client.app.state.http_client = httpx.AsyncClient(
+                transport=httpx.MockTransport(handler)
+            )
+            enable = client.put(
+                "/admin/providers/claude/pool/routing", json={"mode": "balanced"}
+            )
+            assert enable.status_code == 200
+            runtime = client.app.state.claude_balanced_runtime
+
+            with monkeypatch.context() as fault:
+                fault.setattr(ClaudePoolRuntimeStateStore, "rotate_epoch", _boom_rotate)
+                exited = client.put(
+                    "/admin/providers/claude/pool/routing", json={"mode": "disabled"}
+                )
+
+            assert exited.status_code == 200
+            assert exited.json() == {"mode": "disabled", "env_locked": False}
+            assert runtime.status == "disabled"
+            saved = json.loads(settings_file.read_text(encoding="utf-8"))
+            assert "claude_account.routing" not in saved
+
+        assert any(
+            "persistence_degraded" in record.getMessage() for record in caplog.records
+        )
+
 
 def test_balanced_request_during_controlled_exit_awaits_and_serves_under_target_mode(
     tmp_path: Path,

@@ -2585,23 +2585,42 @@ class ClaudeBalancedRuntime:
         except Exception:
             logger.warning("balanced usage poll driver tick failed", exc_info=True)
 
-    # -- intentional exit: drain, invalidate the epoch, publish the target mode -------
+    # -- intentional exit: drain, persist, invalidate the epoch, publish -------------
 
-    async def exit_mode(self, target_mode: str, *, publish: Callable[[], None]) -> None:
-        """Intentional balanced -> fallback/disabled exit (Step 4/Context) — distinct
-        from process shutdown (`shutdown_preserving_epoch`): this is the ONLY path that
-        rotates the epoch (invalidating every current-epoch pin) and marks it inactive,
-        so a later re-entry (`prepare_and_publish`) always starts a fresh epoch.
+    async def exit_mode(
+        self,
+        target_mode: str,
+        *,
+        persist: Callable[[], None] | None = None,
+        publish: Callable[[], None],
+    ) -> None:
+        """Intentional balanced -> fallback/disabled exit (Step 4/Context; reordered
+        by T-20, fix for gap G-3) — distinct from process shutdown
+        (`shutdown_preserving_epoch`): this is the ONLY path that rotates the epoch
+        (invalidating every current-epoch pin) and marks it inactive, so a later
+        re-entry (`prepare_and_publish`) always starts a fresh epoch.
 
         Sequence: mark draining (blocks new balanced entrants — `begin_request` only
-        admits while "active"), drain in-flight attempts, rotate the epoch durably
-        (waits for the rotation to commit), `publish()` — the coordinator hook that
-        persists+swaps `claude_account.routing` to `target_mode`, so a woken transition
-        waiter re-reads the ALREADY-published target mode — then wake every transition
-        waiter and close the store, discarding balanced-only state. The store is closed
-        (and balanced-only state discarded) even if `publish()` raises: the drain
-        already happened and cannot be undone, so this runtime cannot keep serving
-        either way.
+        admits while "active"), drain in-flight attempts, `persist()` — the
+        coordinator hook that durably writes `claude_account.routing` to
+        `target_mode`, omitted (`None`, the default) by callers with no settings
+        layer of their own — THEN rotate the epoch durably (waits for the
+        rotation to commit), THEN `publish()` — the coordinator hook that swaps
+        the in-memory published mode, so a woken transition waiter re-reads the
+        ALREADY-published target mode — then wake every transition waiter and
+        close the store, discarding balanced-only state.
+
+        Crash contract: `persist()` is the commit point. A failure raised by
+        `persist()` aborts the exit entirely — this runtime returns to "active"
+        with its epoch, store, and durable pins untouched, and the raised
+        exception propagates to the caller (the PUT handler returns 500 with the
+        mode unchanged). Once `persist()` has succeeded (or was omitted), the
+        target mode is authoritative and this runtime is committed to exiting no
+        matter what happens next: a subsequent epoch-rotation failure never
+        restores balanced — it is logged as `persistence_degraded` and the exit
+        continues — and the store is closed (balanced-only state discarded) even
+        if `publish()` itself raises, since the drain already happened and
+        cannot be undone.
         """
         if target_mode == "balanced":
             raise ValueError('exit_mode target_mode must not be "balanced"')
@@ -2612,11 +2631,34 @@ class ClaudeBalancedRuntime:
                 )
             self.status = "draining"
             self._transition_event.clear()
+            await self._drain_complete.wait()
+
             try:
-                await self._drain_complete.wait()
+                if persist is not None:
+                    persist()
+            except BaseException:
+                # Nothing balanced-only has been touched yet: resume serving
+                # under "active" with the epoch, store, and pins untouched.
+                self.status = "active"
+                self._transition_event.set()
+                raise
+
+            try:
                 store = self._store
                 assert store is not None
-                await store.rotate_epoch().wait_async()
+                try:
+                    await store.rotate_epoch().wait_async()
+                except Exception:
+                    # The target mode is already durably persisted -- the
+                    # commit point above already passed -- so a cleanup
+                    # failure here must never roll back to balanced; it only
+                    # degrades the epoch cleanup itself.
+                    logger.warning(
+                        "balanced exit: epoch rotation failed after the target "
+                        "mode was already persisted; continuing the exit with "
+                        "epoch cleanup persistence_degraded",
+                        exc_info=True,
+                    )
                 publish()
             finally:
                 # T-18 (Step 2): cancel+await the driver strictly before the
