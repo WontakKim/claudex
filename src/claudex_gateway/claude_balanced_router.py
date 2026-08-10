@@ -2442,6 +2442,7 @@ class ClaudeBalancedRuntime:
         accounts_root: Path,
         runtime_db_path: Path,
         persist: Callable[[], None],
+        entry: Literal["startup_restore", "admin_enable"],
         usage_cache: ClaudeAccountUsageCache | None = None,
     ) -> None:
         """Enable balanced routing (Step 4/Context).
@@ -2456,6 +2457,20 @@ class ClaudeBalancedRuntime:
         and including `persist()` itself tears the (partial) preparation down (closing
         any opened store) and leaves `status` "disabled" — the old mode keeps serving,
         exactly as if this call had never happened.
+
+        `entry` (T-22, fix for gap G-7) is the required call-site discriminator
+        between the two distinct reasons this class ever gets re-entered:
+        `"startup_restore"` is the daemon lifespan restoring an already-persisted
+        `"balanced"` mode across a process restart, which reuses the runtime DB's
+        existing epoch/pins exactly as `shutdown_preserving_epoch` left them.
+        `"admin_enable"` is every OTHER re-entry (an admin PUT transitioning into
+        balanced) and durably rotates the epoch — wiping every pin — right after
+        the store opens, before anything below restores from it: `exit_mode` is
+        the only path that ever invalidates an epoch, and its own rotation can
+        itself degrade (`persistence_degraded`) and leave the runtime DB holding
+        a stale, intentionally-exited epoch and its pins; an administrative
+        re-entry must never resurrect that state, so it always mints a fresh one
+        regardless of what the store still contains.
 
         `usage_cache` (T-13), when supplied, wires a fresh
         `ClaudeUsagePollCoordinator` for this runtime's `usage_poll_coordinator`
@@ -2472,6 +2487,13 @@ class ClaudeBalancedRuntime:
             store: ClaudePoolRuntimeStateStore | None = None
             try:
                 store = ClaudePoolRuntimeStateStore.open_(runtime_db_path)
+                if entry == "admin_enable":
+                    # Contract (b) (T-22, fix for gap G-7): mint a fresh epoch
+                    # (and wipe its pins) durably before anything below ever
+                    # reads or restores from the store, so a degraded exit's
+                    # stale epoch/pins can never be resurrected by a later
+                    # administrative re-entry.
+                    await store.rotate_epoch().wait_async()
                 for record in accounts:
                     if record.state != "ready":
                         continue
@@ -2595,10 +2617,11 @@ class ClaudeBalancedRuntime:
         publish: Callable[[], None],
     ) -> None:
         """Intentional balanced -> fallback/disabled exit (Step 4/Context; reordered
-        by T-20, fix for gap G-3) — distinct from process shutdown
-        (`shutdown_preserving_epoch`): this is the ONLY path that rotates the epoch
-        (invalidating every current-epoch pin) and marks it inactive, so a later
-        re-entry (`prepare_and_publish`) always starts a fresh epoch.
+        by T-20, fix for gap G-3; made cancellation-safe by T-22, fix for gap G-7)
+        — distinct from process shutdown (`shutdown_preserving_epoch`): this is the
+        ONLY path that rotates the epoch (invalidating every current-epoch pin) and
+        marks it inactive, so a later re-entry (`prepare_and_publish`) always starts
+        a fresh epoch.
 
         Sequence: mark draining (blocks new balanced entrants — `begin_request` only
         admits while "active"), drain in-flight attempts, `persist()` — the
@@ -2610,17 +2633,23 @@ class ClaudeBalancedRuntime:
         ALREADY-published target mode — then wake every transition waiter and
         close the store, discarding balanced-only state.
 
-        Crash contract: `persist()` is the commit point. A failure raised by
-        `persist()` aborts the exit entirely — this runtime returns to "active"
-        with its epoch, store, and durable pins untouched, and the raised
-        exception propagates to the caller (the PUT handler returns 500 with the
-        mode unchanged). Once `persist()` has succeeded (or was omitted), the
+        Crash/cancellation contract: `persist()` is the commit point, and
+        everything up to and including it is pre-commit. ANY `BaseException` —
+        including `asyncio.CancelledError`, which is not an `Exception` — raised
+        while draining or persisting aborts the exit entirely: this runtime
+        returns to "active" with the transition event set and its epoch, store,
+        and durable pins untouched, and the exception propagates to the caller
+        (the PUT handler returns 500 with the mode unchanged; a cancelled caller
+        sees its cancellation, with the runtime left cleanly "active" rather than
+        wedged "draining"). Once `persist()` has succeeded (or was omitted), the
         target mode is authoritative and this runtime is committed to exiting no
-        matter what happens next: a subsequent epoch-rotation failure never
-        restores balanced — it is logged as `persistence_degraded` and the exit
-        continues — and the store is closed (balanced-only state discarded) even
-        if `publish()` itself raises, since the drain already happened and
-        cannot be undone.
+        matter what happens next: finalization (rotate the epoch, degrading on
+        failure to `persistence_degraded` rather than rolling back to balanced,
+        then `publish()`, then stop+await the poll driver, close the store, and
+        land on "disabled") runs in a separate task shielded from the caller's
+        own cancellation, so it always completes even if the caller is cancelled
+        partway through; the caller's cancellation (if any) is re-raised only
+        once that finalization has finished.
         """
         if target_mode == "balanced":
             raise ValueError('exit_mode target_mode must not be "balanced"')
@@ -2631,50 +2660,73 @@ class ClaudeBalancedRuntime:
                 )
             self.status = "draining"
             self._transition_event.clear()
-            await self._drain_complete.wait()
-
             try:
+                await self._drain_complete.wait()
                 if persist is not None:
                     persist()
             except BaseException:
-                # Nothing balanced-only has been touched yet: resume serving
-                # under "active" with the epoch, store, and pins untouched.
+                # Pre-commit: nothing balanced-only has been touched yet (and
+                # persist(), if reached, never committed). Resume serving under
+                # "active" with the epoch, store, and pins untouched -- this
+                # also covers a cancellation delivered while still draining, so
+                # the runtime is never left wedged in "draining" with the
+                # transition event cleared.
                 self.status = "active"
                 self._transition_event.set()
                 raise
 
+            # Post-commit: persist() succeeded (or was omitted). Finalization
+            # must run to completion no matter what happens to the caller from
+            # here on, so it runs in its own task, shielded from the caller's
+            # cancellation; a cancellation delivered to the caller only
+            # surfaces again once finalization has actually finished.
+            finalize_task = asyncio.create_task(self._finalize_exit(publish))
             try:
-                store = self._store
-                assert store is not None
-                try:
-                    await store.rotate_epoch().wait_async()
-                except Exception:
-                    # The target mode is already durably persisted -- the
-                    # commit point above already passed -- so a cleanup
-                    # failure here must never roll back to balanced; it only
-                    # degrades the epoch cleanup itself.
-                    logger.warning(
-                        "balanced exit: epoch rotation failed after the target "
-                        "mode was already persisted; continuing the exit with "
-                        "epoch cleanup persistence_degraded",
-                        exc_info=True,
-                    )
-                publish()
-            finally:
-                # T-18 (Step 2): cancel+await the driver strictly before the
-                # store closes, so no in-flight or newly-scheduled poll tick
-                # can ever touch it once closed.
-                await self._stop_usage_poll_driver()
-                if self._store is not None:
-                    self._store.close()
-                self._store = None
-                self.router = None
-                self.usage_poll_coordinator = None
-                self._accounts_root = None
-                self.epoch_id = None
-                self.epoch_seed = b""
-                self.status = "disabled"
-                self._transition_event.set()
+                await asyncio.shield(finalize_task)
+            except asyncio.CancelledError:
+                await finalize_task
+                raise
+
+    async def _finalize_exit(self, publish: Callable[[], None]) -> None:
+        """`exit_mode`'s post-commit finalization (T-22, fix for gap G-7): rotate the
+        epoch (degrading, never rolling back, on failure), publish the target mode,
+        stop+await the poll driver, close the store, and reset to "disabled". Always
+        run inside `asyncio.shield` by its only caller, `exit_mode`, so it completes
+        exactly once `persist()` has committed, independent of the caller's own
+        cancellation.
+        """
+        try:
+            store = self._store
+            assert store is not None
+            try:
+                await store.rotate_epoch().wait_async()
+            except Exception:
+                # The target mode is already durably persisted -- the commit
+                # point already passed -- so a cleanup failure here must never
+                # roll back to balanced; it only degrades the epoch cleanup
+                # itself.
+                logger.warning(
+                    "balanced exit: epoch rotation failed after the target "
+                    "mode was already persisted; continuing the exit with "
+                    "epoch cleanup persistence_degraded",
+                    exc_info=True,
+                )
+            publish()
+        finally:
+            # T-18 (Step 2): cancel+await the driver strictly before the store
+            # closes, so no in-flight or newly-scheduled poll tick can ever
+            # touch it once closed.
+            await self._stop_usage_poll_driver()
+            if self._store is not None:
+                self._store.close()
+            self._store = None
+            self.router = None
+            self.usage_poll_coordinator = None
+            self._accounts_root = None
+            self.epoch_id = None
+            self.epoch_seed = b""
+            self.status = "disabled"
+            self._transition_event.set()
 
     # -- process shutdown: drain and close, preserving every persisted setting --------
 

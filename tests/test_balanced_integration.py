@@ -735,6 +735,7 @@ def test_disable_while_streaming_drains_the_in_flight_stream_before_epoch_rotati
             accounts_root=accounts_root,
             runtime_db_path=runtime_db_path,
             persist=lambda: published.__setitem__("mode", "balanced"),
+            entry="admin_enable",
         )
         assert runtime.router is not None
         session_key = SessionKey(digest=b"\x55" * 32, kind="content_hash")
