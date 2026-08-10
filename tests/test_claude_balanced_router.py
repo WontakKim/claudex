@@ -19,6 +19,7 @@ from claudex_gateway.claude_balanced_router import (
     CAPABILITY_EVIDENCE_TTL_SECONDS,
     AccountCandidate,
     ClaudeBalancedRouter,
+    ClaudeBalancedRuntime,
     ClaudeUsagePollCoordinator,
     FamilyGateOutcome,
     MigrationReservation,
@@ -2397,3 +2398,141 @@ def test_claude_unified_headers_module_never_touches_the_filesystem_when_reloade
 
     assert reloaded.RECOGNIZED_HEADERS == claude_unified_headers.RECOGNIZED_HEADERS
     assert reloaded.parse_unified_headers({"anthropic-ratelimit-five-hour-used": "50"}) == {}
+
+
+# ==========================================================================
+# `ClaudeBalancedRuntime.exit_mode` cancellation safety (T-22, fix for gap
+# G-7(a)): everything before a successful `persist()` is pre-commit -- ANY
+# `BaseException`, including `asyncio.CancelledError`, restores "active"
+# with the epoch/store untouched; everything after is finalization, run in
+# a cancellation-shielded task so it always completes even if the caller
+# is cancelled partway through.
+# ==========================================================================
+
+
+def test_exit_mode_cancelled_while_draining_restores_active_with_epoch_and_store_untouched(
+    tmp_path: Path,
+) -> None:
+    """A cancellation delivered while `exit_mode` is still awaiting drain
+    completion -- strictly before the pre-commit `persist()` call -- must
+    never leave the runtime wedged "draining": it resumes "active" with the
+    transition event set and the epoch/store exactly as they were, and a
+    subsequent balanced request is admitted and served normally.
+    """
+
+    async def scenario() -> None:
+        runtime = ClaudeBalancedRuntime()
+        await runtime.prepare_and_publish(
+            accounts=[],
+            accounts_root=tmp_path,
+            runtime_db_path=tmp_path / "runtime.sqlite3",
+            persist=lambda: None,
+            entry="admin_enable",
+        )
+        assert runtime.status == "active"
+        epoch_id_before = runtime.epoch_id
+        epoch_seed_before = runtime.epoch_seed
+        store_before = runtime._store
+
+        # A slot held open, as if an in-flight balanced dispatch were still
+        # relaying bytes -- `exit_mode` blocks draining on it.
+        assert runtime.begin_request()
+
+        exit_task = asyncio.create_task(runtime.exit_mode("disabled", publish=lambda: None))
+        await asyncio.sleep(0)
+        assert runtime.status == "draining"
+
+        exit_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await exit_task
+
+        # Restored to "active", cleanly -- never wedged "draining", and
+        # nothing balanced-only was touched.
+        assert runtime.status == "active"
+        assert runtime._transition_event.is_set()
+        assert runtime.epoch_id == epoch_id_before
+        assert runtime.epoch_seed == epoch_seed_before
+        assert runtime._store is store_before
+
+        # The held-open slot finishes, and a subsequent request is admitted
+        # and served balanced exactly as if the cancelled exit never happened.
+        runtime.end_request()
+        assert runtime.begin_request()
+        try:
+            assert runtime.router is not None
+            placement = runtime.router.place_session(
+                session_key=SessionKey(digest=b"\x11" * 32, kind="content_hash"),
+                model="claude-sonnet-5",
+                candidates=[AccountCandidate(account_id="acct-a", account_incarnation_id="inc-a")],
+                seed=runtime.epoch_seed,
+            )
+            assert placement.created
+            assert placement.account_id == "acct-a"
+        finally:
+            runtime.end_request()
+
+    asyncio.run(scenario())
+
+
+def test_exit_mode_cancelled_after_persist_still_finalizes_before_the_cancellation_surfaces(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A cancellation delivered AFTER `exit_mode`'s `persist()` commit point --
+    here, while post-commit finalization is awaiting the epoch rotation --
+    must never truncate finalization: `publish()` still runs, the store still
+    closes, and `status` still lands on "disabled"; only once all of that has
+    actually completed does the cancellation surface back to the caller.
+    """
+    rotate_gate = asyncio.Event()
+
+    class _GatedPendingWrite:
+        async def wait_async(self) -> None:
+            await rotate_gate.wait()
+
+    def _gated_rotate_epoch(self: ClaudePoolRuntimeStateStore) -> _GatedPendingWrite:
+        return _GatedPendingWrite()
+
+    async def scenario() -> None:
+        runtime = ClaudeBalancedRuntime()
+        await runtime.prepare_and_publish(
+            accounts=[],
+            accounts_root=tmp_path,
+            runtime_db_path=tmp_path / "runtime.sqlite3",
+            persist=lambda: None,
+            entry="admin_enable",
+        )
+        assert runtime.status == "active"
+
+        monkeypatch.setattr(ClaudePoolRuntimeStateStore, "rotate_epoch", _gated_rotate_epoch)
+        published: list[str] = []
+
+        exit_task = asyncio.create_task(
+            runtime.exit_mode("disabled", publish=lambda: published.append("disabled"))
+        )
+        # Let exit_mode drain (nothing held open) and persist (a no-op),
+        # then reach the gated rotate_epoch await inside its shielded
+        # post-commit finalization.
+        for _ in range(20):
+            await asyncio.sleep(0)
+        assert published == []  # finalization hasn't reached publish() yet
+
+        exit_task.cancel()
+        for _ in range(20):
+            await asyncio.sleep(0)
+        # The caller's cancellation was shielded off finalization: it is
+        # still in flight, blocked on the gated rotation, not yet done.
+        assert not exit_task.done()
+        assert published == []
+        assert runtime.status == "draining"
+
+        # Let the rotation complete -- finalization can now run to completion.
+        rotate_gate.set()
+        with pytest.raises(asyncio.CancelledError):
+            await exit_task
+
+        assert published == ["disabled"]
+        assert runtime.status == "disabled"
+        assert runtime._store is None
+        assert runtime.router is None
+
+    asyncio.run(scenario())

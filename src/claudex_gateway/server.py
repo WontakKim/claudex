@@ -3056,6 +3056,7 @@ async def _handle_admin_claude_routing_put(request: Request) -> JSONResponse:
                     accounts_root=paths.accounts_dir("claude"),
                     runtime_db_path=paths.claude_account_pool_runtime_db(),
                     persist=_persist_balanced,
+                    entry="admin_enable",
                     usage_cache=request.app.state.claude_account_usage_cache,
                 )
             except BalancedPrepareError as exc:
@@ -4108,6 +4109,7 @@ def create_app(config: GatewayConfig, daemon_nonce: str | None = None) -> Starle
                                 accounts_root=paths.accounts_dir("claude"),
                                 runtime_db_path=paths.claude_account_pool_runtime_db(),
                                 persist=lambda: None,
+                                entry="startup_restore",
                                 usage_cache=app.state.claude_account_usage_cache,
                             )
                             logger.info(

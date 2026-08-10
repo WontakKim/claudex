@@ -6491,7 +6491,11 @@ class TestBalancedRoutingExit:
             assert reentered.status_code == 200
             assert runtime.status == "active"
             assert runtime.epoch_id != epoch_id_1
-            assert runtime.epoch_id == epoch_id_after_exit
+            # T-22 (fix for gap G-7): the admin re-entry path durably mints its
+            # OWN fresh epoch, independent of the one `exit_mode` already
+            # rotated to above -- it never simply reuses whatever the store
+            # happens to hold.
+            assert runtime.epoch_id != epoch_id_after_exit
             assert runtime.router is not None
             assert runtime.router.pin_count() == 0
 
@@ -6612,6 +6616,83 @@ class TestBalancedRoutingExit:
             "persistence_degraded" in record.getMessage() for record in caplog.records
         )
 
+    def test_admin_reenable_after_degraded_exit_rotation_mints_a_fresh_epoch_and_drops_the_old_pin(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Gap G-7(b) regression: `exit_mode`'s own epoch rotation can fail
+        (`persistence_degraded`, exercised above) and leave the runtime DB
+        holding the exited epoch's id/seed and its durable pin. A later admin
+        re-enable must never resurrect that epoch or pin --
+        `prepare_and_publish`'s `entry="admin_enable"` branch durably mints a
+        fresh epoch (wiping pins) before it ever restores from the store,
+        regardless of what the store still contains.
+        """
+        _balanced_env(monkeypatch, tmp_path)
+        account_id = _register_balanced_ready_account()
+
+        def handler(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={"id": "msg_1"})
+
+        def _boom_rotate(*_args: Any, **_kwargs: Any) -> Any:
+            raise RuntimeError("simulated durable epoch rotation failure")
+
+        settings_file = tmp_path / "settings.json"
+        config = GatewayConfig(settings_file=settings_file, claude_account_id=account_id)
+        with _create_test_client(
+            monkeypatch, tmp_path, config=config, base_url="http://127.0.0.1:8787"
+        ) as client:
+            client.app.state.http_client = httpx.AsyncClient(
+                transport=httpx.MockTransport(handler)
+            )
+            enable = client.put(
+                "/admin/providers/claude/pool/routing", json={"mode": "balanced"}
+            )
+            assert enable.status_code == 200
+            runtime = client.app.state.claude_balanced_runtime
+            old_epoch_id = runtime.epoch_id
+
+            pinned = client.post("/v1/messages", json=_account_body())
+            assert pinned.status_code == 200
+            assert runtime.router is not None
+            assert runtime.router.pin_count() == 1
+            session_key = derive_session_key(_account_body(), runtime.epoch_seed)
+            assert session_key is not None
+            old_pin_digest = session_key.digest
+
+            with monkeypatch.context() as fault:
+                fault.setattr(ClaudePoolRuntimeStateStore, "rotate_epoch", _boom_rotate)
+                exited = client.put(
+                    "/admin/providers/claude/pool/routing", json={"mode": "disabled"}
+                )
+            assert exited.status_code == 200
+            assert runtime.status == "disabled"
+
+            # The degraded exit's own rotation never ran -- the runtime DB
+            # still durably holds the "exited" epoch id and its pin, exactly
+            # the resurrection precondition gap G-7(b) describes.
+            runtime_db_path = paths.claude_account_pool_runtime_db()
+            inspect_store = ClaudePoolRuntimeStateStore.open_(runtime_db_path)
+            try:
+                assert inspect_store.balanced_epoch_id == old_epoch_id
+                assert inspect_store.get_pin(old_pin_digest) is not None
+            finally:
+                inspect_store.close()
+
+            reentered = client.put(
+                "/admin/providers/claude/pool/routing", json={"mode": "balanced"}
+            )
+            assert reentered.status_code == 200
+            new_runtime = client.app.state.claude_balanced_runtime
+            assert new_runtime.status == "active"
+            # A durably fresh epoch -- never the exited one the degraded
+            # rotation left behind.
+            assert new_runtime.epoch_id != old_epoch_id
+            assert new_runtime.router is not None
+            assert new_runtime.router.pin_count() == 0
+            assert new_runtime.router.get_pin(old_pin_digest) is None
+            assert new_runtime._store is not None
+            assert new_runtime._store.get_pin(old_pin_digest) is None
+
 
 def test_balanced_request_during_controlled_exit_awaits_and_serves_under_target_mode(
     tmp_path: Path,
@@ -6653,6 +6734,7 @@ def test_balanced_request_during_controlled_exit_awaits_and_serves_under_target_
             accounts_root=accounts_root,
             runtime_db_path=tmp_path / "runtime.sqlite3",
             persist=lambda: published.__setitem__("mode", "balanced"),
+            entry="admin_enable",
         )
         assert runtime.status == "active"
 
@@ -7207,6 +7289,7 @@ def test_balanced_concurrent_same_session_request_awaits_the_pending_durability_
             accounts_root=paths.accounts_dir("claude"),
             runtime_db_path=paths.claude_account_pool_runtime_db(),
             persist=lambda: None,
+            entry="admin_enable",
         )
         body = _balanced_body(_new_session_id())
 
