@@ -29,6 +29,8 @@ from claudex_gateway.claude_auth import CLAUDE_TOKEN_URL
 from claudex_gateway.claude_balanced_router import (
     ClaudeBalancedRouter,
     ClaudeBalancedRuntime,
+    ClaudeUsagePollCoordinator,
+    UsagePollAccount,
     derive_session_key,
 )
 from claudex_gateway.claude_pool_runtime_state import (
@@ -7443,3 +7445,527 @@ def test_balanced_successful_2xx_records_eligible_capability_evidence_for_the_re
             account_incarnation_id=record.account_incarnation_id,
             account_profile_fingerprint=fingerprint,
         )
+
+
+# ---------------------------------------------------------------------------
+# Balanced usage poll coordinator, refresh isolation, mode-safe usage API
+# (T-13): budget/fairness/cooldown/anti-starvation fake-clock unit tests
+# (Step 7), plus HTTP-level balanced/fallback/disabled endpoint tests (Steps
+# 4-6, 8-9).
+# ---------------------------------------------------------------------------
+
+
+class _FakeMonotonicClock:
+    """A controllable stand-in for `time.monotonic` (and `time.time`) --
+    no real sleeping. Reused as both `clock` and `wall_clock` below: the
+    coordinator's tests only need consistent, deterministic numbers, not a
+    realistic monotonic/wall split.
+    """
+
+    def __init__(self, start: float = 1_000.0) -> None:
+        self.now = start
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+class _FakeUsagePollFetch:
+    """Records fetch order and replays per-account queued responses -- the
+    coordinator's own fake stand-in for the real per-account usage probe.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+        self.responses: dict[str, list[tuple[dict[str, Any], float | None]]] = {}
+
+    def queue(self, account_id: str, result: dict[str, Any], retry_after: float | None = None) -> None:
+        self.responses.setdefault(account_id, []).append((result, retry_after))
+
+    async def __call__(self, account_id: str) -> tuple[dict[str, Any], float | None]:
+        self.calls.append(account_id)
+        return self.responses[account_id].pop(0)
+
+
+def _fake_usage_ok(*, session_percent: float = 10.0, weekly_percent: float = 20.0) -> dict[str, Any]:
+    return {
+        "provider": "claude",
+        "status": "ok",
+        "error": None,
+        "session": {"used_percent": session_percent, "resets_at": None},
+        "weekly": {"used_percent": weekly_percent, "resets_at": None},
+        "fable_weekly": None,
+    }
+
+
+def _fake_usage_err(message: str) -> dict[str, Any]:
+    return {"provider": "claude", "status": "error", "error": message, "session": None}
+
+
+class _RecordingUsageObservationStore:
+    """Duck-typed stand-in for `ClaudePoolRuntimeStateStore.upsert_usage_observation`
+    -- records what the coordinator submits, with none of the real store's
+    background-thread persistence timing.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+    def upsert_usage_observation(self, **kwargs: Any) -> None:
+        self.calls.append(kwargs)
+
+
+def _make_usage_poll_coordinator(
+    *, clock: _FakeMonotonicClock, fetch: _FakeUsagePollFetch, store: Any = None
+) -> tuple[ClaudeUsagePollCoordinator, ClaudeAccountUsageCache, ClaudeBalancedRouter]:
+    cache = ClaudeAccountUsageCache(fetch, clock=clock)
+    router = ClaudeBalancedRouter(balanced_epoch_id="epoch-1", clock=clock, wall_clock=clock)
+    coordinator = ClaudeUsagePollCoordinator(
+        cache=cache, router=router, store=store, clock=clock, wall_clock=clock
+    )
+    return coordinator, cache, router
+
+
+class TestUsagePollCoordinatorScheduling:
+    """Fake-clock coordinator unit tests (T-13 Step 7): budget enforcement,
+    missing-window priority, fairness after failure, global cooldown, manual
+    coalescing/rate limiting, and full-sweep progress under manual refreshes.
+    """
+
+    def test_coordinator_enforces_the_actual_call_budget(self) -> None:
+        # Two DIFFERENT accounts, both never observed -- this isolates the
+        # coordinator's own 30s call budget from the cache's own (120s,
+        # unrelated) per-account TTL: "b" stays due the whole time, so its
+        # own due-ness can never explain a budget_wait here.
+        clock = _FakeMonotonicClock()
+        fetch = _FakeUsagePollFetch()
+        fetch.queue("a", _fake_usage_ok())
+        coordinator, _cache, _router = _make_usage_poll_coordinator(clock=clock, fetch=fetch)
+
+        first = asyncio.run(coordinator.run_due_poll(["a", "b"]))
+        second = asyncio.run(coordinator.run_due_poll(["a", "b"]))
+
+        assert first.outcome == "fetched"
+        assert first.account_id == "a"
+        assert second.outcome == "budget_wait"
+        assert fetch.calls == ["a"]
+
+        clock.advance(30.0)
+        fetch.queue("b", _fake_usage_ok())
+        third = asyncio.run(coordinator.run_due_poll(["a", "b"]))
+        assert third.outcome == "fetched"
+        assert third.account_id == "b"
+        assert fetch.calls == ["a", "b"]
+
+    def test_missing_window_accounts_are_serviced_before_already_observed_ones(self) -> None:
+        clock = _FakeMonotonicClock()
+        fetch = _FakeUsagePollFetch()
+        fetch.queue("warm", _fake_usage_ok())
+        coordinator, cache, _router = _make_usage_poll_coordinator(clock=clock, fetch=fetch)
+        asyncio.run(cache.get(["warm"]))  # seeds "warm" with a fresh observation
+        fetch.queue("cold", _fake_usage_ok())
+
+        tick = asyncio.run(coordinator.run_due_poll(["warm", "cold"]))
+
+        assert tick.outcome == "fetched"
+        assert tick.account_id == "cold"
+
+    def test_a_failing_account_does_not_starve_the_rest_of_the_pool(self) -> None:
+        clock = _FakeMonotonicClock()
+        fetch = _FakeUsagePollFetch()
+        for _ in range(4):
+            fetch.queue("a", _fake_usage_err("usage API returned 500: boom"))
+        fetch.queue("b", _fake_usage_ok())
+        coordinator, _cache, _router = _make_usage_poll_coordinator(clock=clock, fetch=fetch)
+
+        serviced: list[str | None] = []
+        for _ in range(4):
+            serviced.append(asyncio.run(coordinator.run_due_poll(["a", "b"])).account_id)
+            clock.advance(30.0)
+
+        assert "b" in serviced
+        assert fetch.calls.count("b") == 1
+        assert fetch.calls.count("a") >= 1
+
+    def test_global_cooldown_is_reported_and_blocks_the_whole_tick(self) -> None:
+        clock = _FakeMonotonicClock()
+        fetch = _FakeUsagePollFetch()
+        fetch.queue("a", _fake_usage_err("usage API rate-limited (429); try again shortly"), 45.0)
+        coordinator, _cache, _router = _make_usage_poll_coordinator(clock=clock, fetch=fetch)
+
+        first = asyncio.run(coordinator.run_due_poll(["a", "b"]))
+        assert first.outcome == "fetched"  # a's own call opened the cooldown
+
+        clock.advance(30.0)
+        second = asyncio.run(coordinator.run_due_poll(["a", "b"]))
+        assert second.outcome == "cooldown"
+        assert fetch.calls == ["a"]
+
+    def test_manual_refresh_coalesces_per_account_and_is_globally_rate_limited(self) -> None:
+        clock = _FakeMonotonicClock()
+        fetch = _FakeUsagePollFetch()
+        coordinator, _cache, _router = _make_usage_poll_coordinator(clock=clock, fetch=fetch)
+
+        assert coordinator.request_manual_refresh("a") is True
+        assert coordinator.request_manual_refresh("a") is True  # coalesced, not a new enqueue
+        assert coordinator.diagnostics().manual_enqueued_count == 1
+
+        assert coordinator.request_manual_refresh("b") is False  # globally rate-limited
+        assert coordinator.diagnostics().manual_rate_limited_count == 1
+
+        clock.advance(300.0)
+        assert coordinator.request_manual_refresh("b") is True
+        assert coordinator.diagnostics().manual_enqueued_count == 2
+
+    def test_manual_refresh_never_fetches_inline(self) -> None:
+        clock = _FakeMonotonicClock()
+        fetch = _FakeUsagePollFetch()
+        coordinator, _cache, _router = _make_usage_poll_coordinator(clock=clock, fetch=fetch)
+
+        assert coordinator.request_manual_refresh("a") is True
+
+        assert fetch.calls == []
+        assert coordinator.is_manual_refresh_pending("a") is True
+
+    def test_manual_refresh_only_consumes_a_slot_after_an_automatic_account_is_serviced(
+        self,
+    ) -> None:
+        clock = _FakeMonotonicClock()
+        fetch = _FakeUsagePollFetch()
+        fetch.queue("auto", _fake_usage_ok())
+        coordinator, cache, _router = _make_usage_poll_coordinator(clock=clock, fetch=fetch)
+        asyncio.run(cache.get(["manual_target"]))  # already fresh -- never automatically due
+        coordinator.request_manual_refresh("manual_target")
+
+        # Nothing automatic has been serviced by THIS coordinator yet -- the
+        # very first tick must claim the one genuinely due account ("auto"),
+        # not the pending manual one.
+        first = asyncio.run(coordinator.run_due_poll(["auto", "manual_target"]))
+        assert first.outcome == "fetched"
+        assert first.account_id == "auto"
+        assert first.manual is False
+
+        # Now that an automatic account has been serviced, and nothing else
+        # is due (both accounts are within their own TTL), the next tick
+        # claims the pending manual one -- forcing a fresh fetch despite it.
+        fetch.queue("manual_target", _fake_usage_ok())
+        clock.advance(30.0)
+        second = asyncio.run(coordinator.run_due_poll(["auto", "manual_target"]))
+        assert second.outcome == "fetched"
+        assert second.account_id == "manual_target"
+        assert second.manual is True
+        assert coordinator.is_manual_refresh_pending("manual_target") is False
+
+    def test_full_sweep_still_makes_progress_under_repeated_manual_refresh_requests(
+        self,
+    ) -> None:
+        clock = _FakeMonotonicClock()
+        fetch = _FakeUsagePollFetch()
+        coordinator, _cache, _router = _make_usage_poll_coordinator(clock=clock, fetch=fetch)
+        accounts = ["a", "b", "c"]
+        for account_id in accounts:
+            fetch.queue(account_id, _fake_usage_ok())
+        coordinator.request_manual_refresh("a")
+
+        # Exactly one tick per account -- within the cache's own 120s TTL, so
+        # nothing here is re-fetched merely because it aged out.
+        for _ in range(len(accounts)):
+            asyncio.run(coordinator.run_due_poll(accounts))
+            clock.advance(30.0)
+            coordinator.request_manual_refresh("b")  # rate-limited every time; harmless either way
+
+        # The full automatic sweep completed -- every ready account actually
+        # got polled, not just whichever one a manual request kept naming.
+        assert set(fetch.calls) == set(accounts)
+        assert coordinator.diagnostics().fetched_count == len(accounts)
+
+    def test_a_successful_fetch_feeds_the_router_observation_view(self) -> None:
+        clock = _FakeMonotonicClock()
+        fetch = _FakeUsagePollFetch()
+        fetch.queue("a", _fake_usage_ok(session_percent=42.0, weekly_percent=17.0))
+        coordinator, _cache, router = _make_usage_poll_coordinator(clock=clock, fetch=fetch)
+
+        tick = asyncio.run(coordinator.run_due_poll(["a"]))
+
+        assert tick.outcome == "fetched"
+        assert router.observations.window_pressure("a", "five_hour", now=clock.now) == 42.0
+        assert router.observations.window_pressure("a", "seven_day", now=clock.now) == 17.0
+
+    def test_a_successful_fetch_persists_a_durable_usage_observation_row(self) -> None:
+        clock = _FakeMonotonicClock()
+        fetch = _FakeUsagePollFetch()
+        fetch.queue("a", _fake_usage_ok(session_percent=55.0, weekly_percent=12.0))
+        store = _RecordingUsageObservationStore()
+        coordinator, _cache, _router = _make_usage_poll_coordinator(clock=clock, fetch=fetch, store=store)
+        accounts = {
+            "a": UsagePollAccount(
+                account_id="a", account_incarnation_id="inc-1", account_profile_fingerprint="fp-1"
+            )
+        }
+
+        tick = asyncio.run(coordinator.run_due_poll(["a"], accounts=accounts))
+
+        assert tick.outcome == "fetched"
+        by_window = {call["window"]: call for call in store.calls}
+        assert by_window["five_hour"]["used_percent"] == 55.0
+        assert by_window["five_hour"]["account_incarnation_id"] == "inc-1"
+        assert by_window["five_hour"]["account_profile_fingerprint"] == "fp-1"
+        assert by_window["seven_day"]["used_percent"] == 12.0
+
+    def test_durable_persistence_is_skipped_without_a_profile_fingerprint(self) -> None:
+        clock = _FakeMonotonicClock()
+        fetch = _FakeUsagePollFetch()
+        fetch.queue("a", _fake_usage_ok())
+        store = _RecordingUsageObservationStore()
+        coordinator, _cache, router = _make_usage_poll_coordinator(clock=clock, fetch=fetch, store=store)
+        accounts = {
+            "a": UsagePollAccount(
+                account_id="a", account_incarnation_id="inc-1", account_profile_fingerprint=None
+            )
+        }
+
+        asyncio.run(coordinator.run_due_poll(["a"], accounts=accounts))
+
+        assert store.calls == []
+        # The router's in-memory observation view is still fed regardless.
+        assert router.observations.window_pressure("a", "five_hour", now=clock.now) is not None
+
+
+class TestBalancedUsageCoordinatorEndpoints:
+    """HTTP-level coverage (T-13 Steps 4-6, 8-9): active balanced usage reads
+    are cache-only and never call upstream, manual refresh returns `queued`
+    without fetching inline, and fallback/disabled mode keeps the pre-existing
+    fetch path/envelope and never surfaces a stranded `queued` indication.
+    """
+
+    def test_pool_usage_active_balanced_mode_never_calls_upstream(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        _balanced_env(monkeypatch, tmp_path)
+        account_id, _access_token = _register_balanced_accounts(1)[0]
+        calls: list[str] = []
+
+        async def spy_fetch(http_client: Any, manager: Any) -> tuple[dict[str, Any], None]:
+            calls.append(account_id)
+            return ({"provider": "claude", "status": "ok", "error": None}, None)
+
+        monkeypatch.setattr(server, "fetch_claude_account_usage", spy_fetch)
+
+        def handler(_request: httpx.Request) -> httpx.Response:
+            raise AssertionError("no /v1/messages traffic in this test")
+
+        with _create_test_client(
+            monkeypatch, config=GatewayConfig(), base_url="http://127.0.0.1:8787"
+        ) as client:
+            _enable_balanced(client, handler)
+            response = client.get("/admin/providers/claude/pool/usage")
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["accounts"][account_id]["status"] == "unavailable"
+        assert payload["accounts"][account_id]["windows"] == {}
+        assert payload["accounts"][account_id]["queued"] is False
+        assert calls == []
+
+    def test_manual_refresh_returns_queued_without_fetching_in_active_balanced_mode(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        _balanced_env(monkeypatch, tmp_path)
+        account_id, _access_token = _register_balanced_accounts(1)[0]
+        calls: list[str] = []
+
+        async def spy_fetch(http_client: Any, manager: Any) -> tuple[dict[str, Any], None]:
+            calls.append(account_id)
+            return ({"provider": "claude", "status": "ok", "error": None}, None)
+
+        monkeypatch.setattr(server, "fetch_claude_account_usage", spy_fetch)
+
+        def handler(_request: httpx.Request) -> httpx.Response:
+            raise AssertionError("no /v1/messages traffic in this test")
+
+        with _create_test_client(
+            monkeypatch, config=GatewayConfig(), base_url="http://127.0.0.1:8787"
+        ) as client:
+            runtime = _enable_balanced(client, handler)
+            response = client.get(
+                "/admin/providers/claude/pool/usage",
+                params={"account": account_id, "refresh": "1"},
+            )
+            assert runtime.usage_poll_coordinator is not None
+            pending = runtime.usage_poll_coordinator.is_manual_refresh_pending(account_id)
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["queued"] is True
+        assert payload["accounts"][account_id]["queued"] is True
+        assert pending is True
+        assert calls == []
+
+    def test_manual_refresh_is_inert_outside_active_balanced_mode(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setenv("HOME", str(tmp_path / "home"))
+        client = _create_test_client(
+            monkeypatch,
+            config=GatewayConfig(settings_file=tmp_path / "settings.json"),
+            base_url=_ADMIN_BASE,
+        )
+        account_id = _register_serving_account()
+
+        async def fake_fetch(http_client: Any, manager: Any) -> tuple[dict[str, Any], None]:
+            return ({"provider": "claude", "status": "ok", "error": None}, None)
+
+        monkeypatch.setattr(server, "fetch_claude_account_usage", fake_fetch)
+
+        with client:
+            response = client.get(
+                "/admin/providers/claude/pool/usage",
+                params={"account": account_id, "refresh": "1"},
+            )
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert "queued" not in payload
+        assert "queued" not in payload["accounts"][account_id]
+
+    def test_pool_usage_disabled_mode_preserves_the_existing_envelope_and_fetch_path(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setenv("HOME", str(tmp_path / "home"))
+        client = _create_test_client(
+            monkeypatch,
+            config=GatewayConfig(settings_file=tmp_path / "settings.json"),
+            base_url=_ADMIN_BASE,
+        )
+        account_id = _register_serving_account()
+        calls: list[str] = []
+
+        async def spy_fetch(http_client: Any, manager: Any) -> tuple[dict[str, Any], None]:
+            calls.append(account_id)
+            return ({"provider": "claude", "status": "ok", "error": None}, None)
+
+        monkeypatch.setattr(server, "fetch_claude_account_usage", spy_fetch)
+
+        with client:
+            response = client.get("/admin/providers/claude/pool/usage")
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert set(payload) == {"accounts", "fetched_at"}
+        assert payload["accounts"][account_id] == {
+            "provider": "claude",
+            "status": "ok",
+            "error": None,
+        }
+        assert calls == [account_id]  # an equivalent uncached read DOES hit upstream
+
+    def test_pool_usage_fallback_mode_preserves_the_existing_envelope_and_fetch_path(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setenv("HOME", str(tmp_path / "home"))
+        client = _create_test_client(
+            monkeypatch,
+            config=GatewayConfig(
+                settings_file=tmp_path / "settings.json", claude_account_routing_mode="fallback"
+            ),
+            base_url=_ADMIN_BASE,
+        )
+        account_id = _register_serving_account()
+        calls: list[str] = []
+
+        async def spy_fetch(http_client: Any, manager: Any) -> tuple[dict[str, Any], None]:
+            calls.append(account_id)
+            return ({"provider": "claude", "status": "ok", "error": None}, None)
+
+        monkeypatch.setattr(server, "fetch_claude_account_usage", spy_fetch)
+
+        with client:
+            response = client.get("/admin/providers/claude/pool/usage")
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert set(payload) == {"accounts", "fetched_at"}
+        envelope = payload["accounts"][account_id]
+        assert "queued" not in envelope
+        assert "windows" not in envelope
+        assert calls == [account_id]
+
+    def test_pool_status_usage_freshness_is_none_outside_balanced_mode(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setenv("HOME", str(tmp_path / "home"))
+        client = _create_test_client(
+            monkeypatch,
+            config=GatewayConfig(settings_file=tmp_path / "settings.json"),
+            base_url=_ADMIN_BASE,
+        )
+        _register_serving_account()
+
+        with client:
+            response = client.get("/admin/providers/claude/pool/status")
+
+        payload = response.json()
+        assert payload["usage_freshness"] is None
+        assert payload["usage_diagnostics"] is None
+
+    def test_pool_status_reports_degraded_usage_freshness_before_any_observation(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        _balanced_env(monkeypatch, tmp_path)
+        _register_balanced_accounts(1)
+
+        def handler(_request: httpx.Request) -> httpx.Response:
+            raise AssertionError("no /v1/messages traffic in this test")
+
+        with _create_test_client(
+            monkeypatch, config=GatewayConfig(), base_url="http://127.0.0.1:8787"
+        ) as client:
+            _enable_balanced(client, handler)
+            response = client.get("/admin/providers/claude/pool/status")
+
+        payload = response.json()
+        assert payload["usage_freshness"] == "degraded"
+        assert payload["usage_diagnostics"]["persistence_degraded"] is False
+        assert payload["usage_diagnostics"]["coordinator"]["fetched_count"] == 0
+
+    def test_pool_status_reports_fresh_usage_freshness_once_every_window_is_recent(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        _balanced_env(monkeypatch, tmp_path)
+        account_id = _register_balanced_ready_account()
+
+        async def fake_fetch(http_client: Any, manager: Any) -> tuple[dict[str, Any], None]:
+            return (
+                {
+                    "provider": "claude",
+                    "status": "ok",
+                    "error": None,
+                    "session": {"used_percent": 10.0, "resets_at": None},
+                    "weekly": {"used_percent": 5.0, "resets_at": None},
+                    "fable_weekly": None,
+                },
+                None,
+            )
+
+        monkeypatch.setattr(server, "fetch_claude_account_usage", fake_fetch)
+
+        def handler(_request: httpx.Request) -> httpx.Response:
+            raise AssertionError("no /v1/messages traffic in this test")
+
+        with _create_test_client(
+            monkeypatch, config=GatewayConfig(), base_url="http://127.0.0.1:8787"
+        ) as client:
+            # Populate the cache through the ordinary (still-disabled-mode)
+            # fetch path first -- the SAME cache instance survives the mode
+            # switch below, so this seeds a fresh observation without a live
+            # poll coordinator loop.
+            seeded = client.get("/admin/providers/claude/pool/usage")
+            assert seeded.json()["accounts"][account_id]["status"] == "ok"
+
+            _enable_balanced(client, handler)
+            response = client.get("/admin/providers/claude/pool/status")
+
+        payload = response.json()
+        assert payload["usage_freshness"] == "fresh"

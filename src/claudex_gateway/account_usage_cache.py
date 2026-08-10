@@ -17,7 +17,7 @@ import logging
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 from claudex_gateway.usage import _provider_result
 
@@ -51,6 +51,21 @@ class _Entry:
     fetched_at: float
     ok: bool
     windows: dict[str, _WindowObservation] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class PollResult:
+    """One coordinator-driven poll attempt's outcome (T-13 Step 1): which of
+    this cache's own three internal decisions served `result` for a single
+    account -- an actual upstream call (`"fetched"`), the existing entry
+    still within its own TTL/failure-backoff window (`"cache_hit"`), or the
+    shared Retry-After cooldown suppressing the attempt (`"cooldown"`).
+    `get`/`peek`/`peek_with_metadata` are entirely unaffected by this type's
+    existence; they keep their exact prior behavior and signatures.
+    """
+
+    source: Literal["fetched", "cache_hit", "cooldown"]
+    result: dict[str, Any]
 
 
 class ClaudeAccountUsageCache:
@@ -147,12 +162,53 @@ class ClaudeAccountUsageCache:
         }
         return entry.result, metadata
 
-    async def _refresh(self, account_id: str) -> dict[str, Any]:
-        # Re-check under the lock: a concurrent get() may have refreshed this
-        # account, or started a cooldown, while we waited.
+    async def poll(self, account_id: str, *, force: bool = False) -> PollResult:
+        """Coordinator-facing single-account attempt (T-13 Step 1).
+
+        Reuses this cache's own freshness/backoff/cooldown decisions exactly
+        as `get` would for a single id, but reports WHICH decision served the
+        result instead of only the envelope -- so a caller with its own
+        scheduling cadence (the balanced poll coordinator) can tell whether
+        this call actually consumed a real upstream request. `force=True`
+        (the coordinator's manual-refresh path) skips this cache's own
+        TTL/failure-backoff freshness gate -- an on-demand refresh must be
+        able to fetch again even though the last one is still "fresh" -- but
+        never bypasses the shared Retry-After cooldown, which is a hard
+        upstream constraint, not a scheduling preference. WHEN to call this
+        for a given account is entirely the caller's business; this only
+        ever reports what happened.
+        """
         now = self._clock()
         entry = self._entries.get(account_id)
-        if entry is not None and self._is_fresh(entry, now):
+        if not force and entry is not None and self._is_fresh(entry, now):
+            return PollResult(source="cache_hit", result=entry.result)
+        async with self._lock:
+            now = self._clock()
+            entry = self._entries.get(account_id)
+            if not force and entry is not None and self._is_fresh(entry, now):
+                return PollResult(source="cache_hit", result=entry.result)
+            if now < self._not_before:
+                result = (
+                    entry.result
+                    if entry is not None
+                    else _provider_result(
+                        "claude",
+                        status="error",
+                        error="usage API rate-limited; retrying after the cooldown",
+                    )
+                )
+                return PollResult(source="cooldown", result=result)
+            result = await self._refresh(account_id, force=force)
+            return PollResult(source="fetched", result=result)
+
+    async def _refresh(self, account_id: str, *, force: bool = False) -> dict[str, Any]:
+        # Re-check under the lock: a concurrent get() may have refreshed this
+        # account, or started a cooldown, while we waited. `force` (only ever
+        # passed by `poll`) skips this re-check too -- a manual refresh must
+        # still fetch even if a concurrent caller just did.
+        now = self._clock()
+        entry = self._entries.get(account_id)
+        if not force and entry is not None and self._is_fresh(entry, now):
             return entry.result
         if now < self._not_before:
             if entry is not None:

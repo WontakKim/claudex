@@ -56,6 +56,7 @@ from claudex_gateway.claude_balanced_router import (
     BalancedPrepareError,
     ClaudeBalancedRouter,
     ClaudeBalancedRuntime,
+    ClaudeUsagePollCoordinator,
     NoEligibleAccountError,
     SessionKey,
     binding_windows,
@@ -3006,6 +3007,7 @@ async def _handle_admin_claude_routing_put(request: Request) -> JSONResponse:
                     accounts_root=paths.accounts_dir("claude"),
                     runtime_db_path=paths.claude_account_pool_runtime_db(),
                     persist=_persist_balanced,
+                    usage_cache=request.app.state.claude_account_usage_cache,
                 )
             except BalancedPrepareError as exc:
                 return JSONResponse(
@@ -3051,11 +3053,85 @@ async def _handle_admin_claude_routing_put(request: Request) -> JSONResponse:
     return JSONResponse(_claude_routing_payload(new_config))
 
 
+# --------------------------------------------------------------------------
+# Balanced-mode usage isolation (T-13): while balanced routing is the
+# currently PUBLISHED and ACTIVE mode, usage reads are cache-only (never
+# `ClaudeAccountUsageCache.get`/upstream) and manual refresh only ever
+# enqueues on the coordinator -- fallback/disabled mode is entirely
+# untouched by any of this and keeps the pre-existing fetch path/envelope.
+# --------------------------------------------------------------------------
+
+_USAGE_WINDOW_FRESH_MAX_AGE_SECONDS = 5 * 60
+_USAGE_WINDOW_AGING_MAX_AGE_SECONDS = 30 * 60
+
+
+def _active_balanced_runtime(request: Request) -> ClaudeBalancedRuntime | None:
+    """The live runtime iff "balanced" is the currently PUBLISHED routing mode
+    AND the runtime itself is active -- the exact isolation boundary Steps
+    4/5/6 draw between balanced-only usage behavior and every other mode. A
+    non-balanced request must never see this as non-`None` (Step 5's "never
+    queued for a coordinator that is not running").
+    """
+    config: GatewayConfig = request.app.state.config
+    if config.claude_account_routing_mode != "balanced":
+        return None
+    runtime: ClaudeBalancedRuntime = request.app.state.claude_balanced_runtime
+    return runtime if runtime.status == "active" else None
+
+
+def _usage_window_state(age_seconds: float) -> str:
+    """Per-window freshness label for the balanced-mode usage read (Step 4)."""
+    if age_seconds <= _USAGE_WINDOW_FRESH_MAX_AGE_SECONDS:
+        return "fresh"
+    if age_seconds <= _USAGE_WINDOW_AGING_MAX_AGE_SECONDS:
+        return "aging"
+    return "stale"
+
+
+def _compute_usage_freshness(
+    ready_ids: list[str], cache: ClaudeAccountUsageCache, *, persistence_degraded: bool
+) -> tuple[str, dict[str, Any]]:
+    """Step 6's aggregate `usage_freshness` plus per-account diagnostics.
+
+    `"fresh"`: every ready account's every observed binding window is at
+    most 5 minutes old. `"degraded"`: persistence is degraded, or no window
+    across the whole ready set is at most 30 minutes old. Otherwise
+    `"partial"`.
+    """
+    per_account: dict[str, Any] = {}
+    all_fresh = True
+    any_within_degraded_window = False
+    for account_id in ready_ids:
+        peeked = cache.peek_with_metadata(account_id)
+        if peeked is None or not peeked[1]:
+            all_fresh = False
+            per_account[account_id] = {"oldest_age_seconds": None, "window_count": 0}
+            continue
+        _, metadata = peeked
+        ages = [window["age_seconds"] for window in metadata.values()]
+        per_account[account_id] = {
+            "oldest_age_seconds": max(ages),
+            "window_count": len(ages),
+        }
+        if max(ages) > _USAGE_WINDOW_FRESH_MAX_AGE_SECONDS:
+            all_fresh = False
+        if min(ages) <= _USAGE_WINDOW_AGING_MAX_AGE_SECONDS:
+            any_within_degraded_window = True
+
+    if persistence_degraded or (ready_ids and not any_within_degraded_window):
+        return "degraded", per_account
+    if all_fresh:
+        return "fresh", per_account
+    return "partial", per_account
+
+
 async def _handle_admin_claude_pool_status(request: Request) -> JSONResponse:
     """Per-account routing state: what the serving chain would see right now.
 
     This is telemetry over the registry plus the daemon-memory cooldown
-    tracker — never the configured pin, which lives at pool/serving.
+    tracker — never the configured pin, which lives at pool/serving. While
+    balanced routing is active, this also carries the balanced `usage_freshness`
+    diagnostic (Step 6); in every other mode both fields are `None`.
     """
     denied = _admin_guard(request)
     if denied is not None:
@@ -3092,7 +3168,30 @@ async def _handle_admin_claude_pool_status(request: Request) -> JSONResponse:
             )
         else:
             members.append({"account_id": record.id, "routing_state": "ready"})
-    return JSONResponse({"members": members})
+
+    usage_freshness: str | None = None
+    usage_diagnostics: dict[str, Any] | None = None
+    runtime = _active_balanced_runtime(request)
+    if runtime is not None:
+        ready_ids = [record.id for record in records if record.state == "ready"]
+        cache: ClaudeAccountUsageCache = request.app.state.claude_account_usage_cache
+        persistence_degraded = runtime.router.persistence_degraded if runtime.router is not None else True
+        usage_freshness, per_account = _compute_usage_freshness(
+            ready_ids, cache, persistence_degraded=persistence_degraded
+        )
+        coordinator = runtime.usage_poll_coordinator
+        usage_diagnostics = {
+            "persistence_degraded": persistence_degraded,
+            "accounts": per_account,
+            "coordinator": vars(coordinator.diagnostics()) if coordinator is not None else None,
+        }
+    return JSONResponse(
+        {
+            "members": members,
+            "usage_freshness": usage_freshness,
+            "usage_diagnostics": usage_diagnostics,
+        }
+    )
 
 
 # --------------------------------------------------------------------------
@@ -3333,12 +3432,22 @@ def _cooling_down_until_millis(tracker: AccountCooldownTracker, account_id: str)
 
 
 async def _handle_admin_claude_accounts_usage(request: Request) -> JSONResponse:
-    """Per-account usage, served through the TTL cache.
+    """Per-account usage.
 
-    needs-reauth rows get a synthesized "unavailable" without touching the
-    network — a dead refresh token cannot succeed, and the usage API's rate
-    budget is precious. There is deliberately no force-refresh parameter;
-    the UI shows data age from each result's `updated_at` instead.
+    Fallback/disabled mode (and balanced published but not yet/no-longer
+    active) is served exactly as before, through the TTL cache's fetch path
+    — unchanged envelope, TTL/backoff/global-cooldown semantics, no
+    force-refresh; needs-reauth rows get a synthesized "unavailable" without
+    touching the network.
+
+    Active balanced mode is cache-only (T-13 Step 4): it never calls
+    `cache.get`/upstream, reading `peek_with_metadata` instead and reporting
+    each window's age/source/reset/state. A `?refresh` request in this mode
+    (Step 5) enqueues a coalesced, globally rate-limited manual poll on the
+    balanced coordinator and reports it as `queued` in the response — it
+    never fetches inline, and cached data is returned immediately either
+    way. `?refresh` outside active balanced mode is inert: a non-balanced
+    request must never be queued for a coordinator that is not running.
     """
     denied = _admin_guard(request)
     if denied is not None:
@@ -3365,6 +3474,59 @@ async def _handle_admin_claude_accounts_usage(request: Request) -> JSONResponse:
             )
     ready_ids = [record.id for record in records if record.state == "ready"]
     cache: ClaudeAccountUsageCache = request.app.state.claude_account_usage_cache
+    runtime = _active_balanced_runtime(request)
+
+    if runtime is not None:
+        refresh_requested = request.query_params.get("refresh") is not None
+        coordinator = runtime.usage_poll_coordinator
+        results: dict[str, Any] = {}
+        for account_id in ready_ids:
+            if refresh_requested and coordinator is not None:
+                coordinator.request_manual_refresh(account_id)
+            peeked = cache.peek_with_metadata(account_id)
+            if peeked is None:
+                envelope = _provider_result(
+                    "claude",
+                    status="unavailable",
+                    error="no usage observation yet; the balanced poll coordinator "
+                    "has not polled this account",
+                )
+                windows: dict[str, Any] = {}
+            else:
+                envelope = dict(peeked[0])
+                windows = {
+                    window_name: {
+                        "age_seconds": metadata["age_seconds"],
+                        "source": metadata["source"],
+                        "reset_at": metadata["reset_at"],
+                        "state": _usage_window_state(metadata["age_seconds"]),
+                    }
+                    for window_name, metadata in peeked[1].items()
+                }
+            envelope["windows"] = windows
+            envelope["queued"] = (
+                coordinator.is_manual_refresh_pending(account_id) if coordinator is not None else False
+            )
+            results[account_id] = envelope
+        for record in records:
+            if record.state != "ready":
+                results[record.id] = {
+                    **_provider_result(
+                        "claude",
+                        status="unavailable",
+                        error="account needs re-authentication; log in again from the dashboard",
+                    ),
+                    "windows": {},
+                    "queued": False,
+                }
+        return JSONResponse(
+            {
+                "accounts": results,
+                "fetched_at": time.time(),
+                "queued": any(account["queued"] for account in results.values()),
+            }
+        )
+
     results = await cache.get(ready_ids)
     for record in records:
         if record.state != "ready":
@@ -3877,6 +4039,7 @@ def create_app(config: GatewayConfig, daemon_nonce: str | None = None) -> Starle
                                 accounts_root=paths.accounts_dir("claude"),
                                 runtime_db_path=paths.claude_account_pool_runtime_db(),
                                 persist=lambda: None,
+                                usage_cache=app.state.claude_account_usage_cache,
                             )
                             logger.info(
                                 "balanced routing runtime restored (epoch=%s)",
