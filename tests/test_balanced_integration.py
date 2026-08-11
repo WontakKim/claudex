@@ -51,7 +51,6 @@ from claudex_gateway.claude_pool_runtime_state import (
 )
 from claudex_gateway.config import GatewayConfig
 from claudex_gateway.grok_auth import GrokCredentials
-from claudex_gateway.kimi_auth import KimiCredentials
 
 import claudex_gateway.server as server
 
@@ -80,19 +79,6 @@ class _FakeCodexClient:
         return None
 
 
-class _AvailableKimiAuthManager:
-    def __init__(self, *_args: Any, **_kwargs: Any) -> None:
-        pass
-
-    async def get_credentials(self, force_refresh: bool = False) -> KimiCredentials:
-        return KimiCredentials(access_token="kimi-token", device_id="device-1", account="kimi-user-1")
-
-
-class _FakeKimiClient:
-    def __init__(self, *_args: Any, **_kwargs: Any) -> None:
-        pass
-
-
 class _AvailableGrokAuthManager:
     def __init__(self, *_args: Any, **_kwargs: Any) -> None:
         pass
@@ -114,8 +100,6 @@ def _create_test_client(
 ) -> TestClient:
     monkeypatch.setattr(server, "CodexAuthManager", _AvailableCodexAuthManager)
     monkeypatch.setattr(server, "CodexClient", _FakeCodexClient)
-    monkeypatch.setattr(server, "KimiAuthManager", _AvailableKimiAuthManager)
-    monkeypatch.setattr(server, "KimiClient", _FakeKimiClient)
     monkeypatch.setattr(server, "GrokAuthManager", _AvailableGrokAuthManager)
     monkeypatch.setattr(server, "GrokClient", _FakeGrokClient)
     return TestClient(server.create_app(config or GatewayConfig()), base_url=base_url)

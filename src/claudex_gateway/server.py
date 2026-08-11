@@ -95,8 +95,6 @@ from claudex_gateway.config import (
     update_settings_file,
     validate_model_map,
 )
-from claudex_gateway.kimi_auth import KimiAuthError, KimiAuthManager
-from claudex_gateway.kimi_client import KimiClient, KimiUpstreamError
 from claudex_gateway.translate import (
     CodexToClaudeStreamTranslator,
     TranslationError,
@@ -114,7 +112,6 @@ from claudex_gateway.usage import (
     fetch_claude_account_usage,
     fetch_claude_usage,
     fetch_codex_usage,
-    fetch_kimi_usage,
     fetch_grok_usage,
 )
 from claudex_gateway.grok_auth import GrokAuthError, GrokAuthManager
@@ -137,8 +134,8 @@ _PASSTHROUGH_SKIP_RESPONSE_HEADERS = frozenset(
     {"content-length", "content-encoding", "transfer-encoding", "connection"}
 )
 
-# A managed relay (Kimi, or a registered Claude account) replaces the
-# client's Anthropic credentials with the gateway's own Bearer token, so both
+# A managed relay (a registered Claude account) replaces the client's
+# Anthropic credentials with the gateway's own Bearer token, so both
 # credential header forms are dropped.
 _MANAGED_RELAY_SKIP_REQUEST_HEADERS = _PASSTHROUGH_SKIP_REQUEST_HEADERS | {
     "authorization",
@@ -1548,8 +1545,6 @@ async def _handle_messages(request: Request) -> JSONResponse | StreamingResponse
     if route is None:
         logger.info("%s -> anthropic passthrough", model or "?")
         return await _passthrough_to_anthropic(request, raw_body, claude_request)
-    if route.provider == "kimi":
-        return await _relay_to_kimi(request, claude_request, route.model)
     return await _relay_via_responses_backend(request, claude_request, route)
 
 
@@ -2036,194 +2031,6 @@ async def _aggregate_claude_response(
     return JSONResponse(message)
 
 
-def _kimi_request_headers(request: Request) -> dict[str, str]:
-    """Forward the client's headers with the gateway's OAuth identity.
-
-    The caller is real Claude Code, so its own fingerprint and beta headers
-    are kept; only credentials are replaced (by KimiClient) and the OAuth
-    beta is guaranteed to be present.
-    """
-    headers = {
-        key: value
-        for key, value in request.headers.items()
-        if key.lower() not in _MANAGED_RELAY_SKIP_REQUEST_HEADERS
-    }
-    headers.setdefault("anthropic-version", "2023-06-01")
-    betas = [beta.strip() for beta in headers.get("anthropic-beta", "").split(",") if beta.strip()]
-    if _OAUTH_BETA not in betas:
-        betas.append(_OAUTH_BETA)
-    headers["anthropic-beta"] = ",".join(betas)
-    return headers
-
-
-def _kimi_upstream_error_to_claude(exc: KimiUpstreamError) -> tuple[int, dict[str, Any]]:
-    if exc.status_code == 401:
-        # A post-retry 401 means the gateway's credential is bad, not the
-        # client's; relaying it verbatim would trigger a Claude Code re-auth.
-        return 401, _claude_error_body(
-            "authentication_error",
-            f"Kimi rejected the gateway credentials: {_upstream_error_message(exc.body)}; "
-            "run `kimi login` again",
-        )
-    with contextlib.suppress(json.JSONDecodeError):
-        parsed = json.loads(exc.body)
-        if isinstance(parsed, dict) and parsed.get("type") == "error":
-            # Kimi speaks the Anthropic error shape natively; relay it.
-            return exc.status_code, parsed
-    error_type = _STATUS_TO_CLAUDE_ERROR_TYPE.get(exc.status_code, "api_error")
-    return exc.status_code, _claude_error_body(error_type, _upstream_error_message(exc.body))
-
-
-def _rewrite_message_start_data(line: str, requested_model: str) -> str:
-    data = line[5:].strip()
-    try:
-        parsed = json.loads(data)
-    except json.JSONDecodeError:
-        return line
-    message = parsed.get("message") if isinstance(parsed, dict) else None
-    if not isinstance(message, dict) or "model" not in message:
-        return line
-    message["model"] = requested_model
-    return "data: " + json.dumps(parsed, ensure_ascii=False)
-
-
-async def _rewrite_kimi_sse(
-    upstream_response: httpx.Response, requested_model: str
-) -> AsyncIterator[bytes]:
-    """Relay complete Kimi SSE events, restoring the requested model in message_start.
-
-    Owns upstream_response: Starlette never closes body iterators, so every
-    exit — exhaustion, error, or client disconnect unwinding through this
-    generator — must release the Kimi HTTP stream here.
-    """
-    current_event = ""
-    event_lines: list[str] = []
-    try:
-        async for line in upstream_response.aiter_lines():
-            if line.startswith("event:"):
-                current_event = line[6:].strip()
-            elif current_event == "message_start" and line.startswith("data:"):
-                line = _rewrite_message_start_data(line, requested_model)
-            event_lines.append(line)
-            if line:
-                continue
-            yield ("\n".join(event_lines) + "\n").encode()
-            event_lines.clear()
-            current_event = ""
-            # Buffered upstream lines can otherwise cause repeated writes before
-            # Starlette gets a turn to cancel this task on client disconnect.
-            await asyncio.sleep(0)
-        if event_lines:
-            yield ("\n".join(event_lines) + "\n").encode()
-    except httpx.HTTPError as exc:
-        if event_lines:
-            yield ("\n".join(event_lines) + "\n").encode()
-            await asyncio.sleep(0)
-        logger.warning("kimi stream aborted: %r", exc)
-        yield _format_sse(
-            "error", _claude_error_body("api_error", f"kimi stream aborted: {exc!r}")
-        ).encode()
-    finally:
-        await upstream_response.aclose()
-
-
-async def _relay_to_kimi(
-    request: Request, claude_request: dict[str, Any], kimi_model: str
-) -> Response:
-    """Relay a Messages request to the Kimi coding backend near-verbatim.
-
-    Kimi's coding endpoint speaks the Anthropic Messages API natively, so only
-    the model name is rewritten on the way out and restored on the way back;
-    validation stays with Kimi, exactly like the Anthropic passthrough.
-    """
-    kimi_client: KimiClient = request.app.state.kimi_client
-    requested_model = str(claude_request.get("model", ""))
-    outgoing = dict(claude_request)
-    outgoing["model"] = kimi_model
-    logger.info(
-        "%s -> kimi:%s (stream=%s, messages=%d)",
-        requested_model or "?",
-        kimi_model,
-        bool(claude_request.get("stream")),
-        len(claude_request.get("messages") or []),
-    )
-
-    try:
-        upstream_response = await kimi_client.send_messages(
-            json.dumps(outgoing, ensure_ascii=False).encode(), _kimi_request_headers(request)
-        )
-    except KimiUpstreamError as exc:
-        status_code, body = _kimi_upstream_error_to_claude(exc)
-        logger.warning("kimi upstream error %s: %s", exc.status_code, exc.body[:500])
-        return JSONResponse(body, status_code=status_code)
-    except KimiAuthError as exc:
-        return JSONResponse(_claude_error_body("authentication_error", str(exc)), status_code=401)
-    except httpx.HTTPError as exc:
-        logger.warning("kimi backend unreachable: %r", exc)
-        return JSONResponse(
-            _claude_error_body("api_error", f"failed to reach the Kimi backend: {exc!r}"),
-            status_code=502,
-        )
-
-    response_headers = {
-        key: value
-        for key, value in upstream_response.headers.items()
-        if key.lower() not in _PASSTHROUGH_SKIP_RESPONSE_HEADERS
-    }
-    if claude_request.get("stream"):
-        return StreamingResponse(
-            _rewrite_kimi_sse(upstream_response, requested_model),
-            headers=response_headers,
-        )
-
-    try:
-        payload = await upstream_response.aread()
-    finally:
-        await upstream_response.aclose()
-    try:
-        parsed = json.loads(payload)
-    except json.JSONDecodeError:
-        # Not a message body we can rewrite; relay it untouched.
-        return Response(payload, headers=response_headers)
-    if isinstance(parsed, dict) and "model" in parsed:
-        parsed["model"] = requested_model
-        payload = json.dumps(parsed, ensure_ascii=False).encode()
-    return Response(payload, headers=response_headers)
-
-
-async def _count_tokens_via_kimi(
-    request: Request, body: dict[str, Any], kimi_model: str
-) -> JSONResponse | None:
-    """Forward count_tokens to Kimi's native counter; None means fall back.
-
-    Token counting is advisory (Claude Code's context display), so any Kimi
-    failure degrades to the local estimate instead of failing the request.
-    """
-    kimi_client: KimiClient = request.app.state.kimi_client
-    outgoing = dict(body)
-    outgoing["model"] = kimi_model
-    try:
-        upstream_response = await kimi_client.count_tokens(
-            json.dumps(outgoing, ensure_ascii=False).encode(), _kimi_request_headers(request)
-        )
-    except (KimiAuthError, KimiUpstreamError, httpx.HTTPError) as exc:
-        logger.warning("kimi count_tokens failed, falling back to estimate: %s", exc)
-        return None
-    try:
-        payload = await upstream_response.aread()
-    except httpx.HTTPError as exc:
-        logger.warning("kimi count_tokens failed, falling back to estimate: %s", exc)
-        return None
-    finally:
-        await upstream_response.aclose()
-    try:
-        parsed = json.loads(payload)
-    except json.JSONDecodeError:
-        logger.warning("kimi count_tokens returned a non-JSON body; falling back to estimate")
-        return None
-    return JSONResponse(parsed)
-
-
 async def _handle_count_tokens(request: Request) -> JSONResponse | StreamingResponse:
     unauthorized = _require_local_token(request, claude_error=True)
     if unauthorized is not None:
@@ -2240,16 +2047,11 @@ async def _handle_count_tokens(request: Request) -> JSONResponse | StreamingResp
     route = _route_for_request(config, body)
     if route is None:
         return await _passthrough_to_anthropic(request, raw_body, body)
-    if route.provider == "kimi":
-        counted = await _count_tokens_via_kimi(request, body, route.model)
-        if counted is not None:
-            return counted
 
     # Rough characters/4 estimate: mapped prompts must not be sent to
     # Anthropic just to be counted, and no Codex tokenizer or token-count
-    # endpoint is available (Kimi's native counter is preferred above but
-    # may be down). Good enough for Claude Code's context-usage display;
-    # not exact for billing or hard context-limit decisions.
+    # endpoint is available. Good enough for Claude Code's context-usage
+    # display; not exact for billing or hard context-limit decisions.
     estimated = max(len(json.dumps(body, ensure_ascii=False)) // 4, 1)
     return JSONResponse({"input_tokens": estimated})
 
@@ -2275,7 +2077,6 @@ async def _handle_hello(request: Request) -> JSONResponse:
 async def _handle_health(request: Request) -> JSONResponse:
     config: GatewayConfig = request.app.state.config
     codex_auth_manager: CodexAuthManager = request.app.state.codex_auth_manager
-    kimi_auth_manager: KimiAuthManager = request.app.state.kimi_auth_manager
     grok_auth_manager: GrokAuthManager = request.app.state.grok_auth_manager
     providers: dict[str, dict[str, Any]] = {}
 
@@ -2294,17 +2095,6 @@ async def _handle_health(request: Request) -> JSONResponse:
     # that provider, so setups not using it keep reporting healthy. The flag
     # is exposed so the dashboard can render an unused login failure as
     # neutral, not error.
-    kimi_required = config.maps_to_provider("kimi")
-    try:
-        kimi_credentials = await kimi_auth_manager.get_credentials()
-        providers["kimi"] = {
-            "status": "ok",
-            "required": kimi_required,
-            "account": kimi_credentials.account,
-        }
-    except KimiAuthError as exc:
-        providers["kimi"] = {"status": "error", "detail": str(exc), "required": kimi_required}
-
     grok_required = config.maps_to_provider("grok")
     try:
         grok_credentials = await grok_auth_manager.get_credentials()
@@ -2319,7 +2109,6 @@ async def _handle_health(request: Request) -> JSONResponse:
 
     is_ready = (
         providers["codex"]["status"] == "ok"
-        and (providers["kimi"]["status"] == "ok" or not kimi_required)
         and (providers["grok"]["status"] == "ok" or not grok_required)
     )
     return JSONResponse(
@@ -2368,7 +2157,6 @@ def _mapping_payload(config: GatewayConfig) -> dict[str, Any]:
         },
         "codex_home": str(config.codex_home),
         "grok_home": str(config.grok_home),
-        "kimi_code_home": str(config.kimi_code_home),
     }
 
 
@@ -2512,16 +2300,16 @@ async def _handle_admin_usage(request: Request) -> JSONResponse:
 
     Each provider answers from its own usage endpoint with the local CLI
     credentials (see usage.py); a failure on one side never masks the other.
-    ?provider=claude|codex|kimi|grok refreshes a single card; without it all run.
+    ?provider=claude|codex|grok refreshes a single card; without it all run.
     """
     denied = _admin_guard(request)
     if denied is not None:
         return denied
     provider = request.query_params.get("provider")
-    if provider not in (None, "claude", "codex", "kimi", "grok"):
+    if provider not in (None, "claude", "codex", "grok"):
         return JSONResponse(
             _openai_error_body(
-                "invalid_request_error", "provider must be one of: claude, codex, kimi, grok"
+                "invalid_request_error", "provider must be one of: claude, codex, grok"
             ),
             status_code=400,
         )
@@ -2531,10 +2319,6 @@ async def _handle_admin_usage(request: Request) -> JSONResponse:
     if provider in (None, "codex"):
         probes["codex"] = fetch_codex_usage(
             request.app.state.http_client, request.app.state.codex_auth_manager
-        )
-    if provider in (None, "kimi"):
-        probes["kimi"] = fetch_kimi_usage(
-            request.app.state.http_client, request.app.state.kimi_auth_manager
         )
     if provider in (None, "grok"):
         probes["grok"] = fetch_grok_usage(
@@ -3862,7 +3646,7 @@ async def _handle_admin_codex_models(request: Request) -> JSONResponse:
 async def _handle_admin_grok_models(request: Request) -> JSONResponse:
     """Relay Grok's live model catalog (IDs only) for model_map authoring.
 
-    Same convenience role as the Codex/Kimi catalog endpoints: the gateway
+    Same convenience role as the Codex catalog endpoint: the gateway
     never validates map targets against the list, so this only feeds the
     dashboard's add-node suggestions.
     """
@@ -3888,38 +3672,6 @@ async def _handle_admin_grok_models(request: Request) -> JSONResponse:
             status_code=502,
         )
     return JSONResponse({"models": models})
-
-
-async def _handle_admin_kimi_models(request: Request) -> JSONResponse:
-    """Relay Kimi's live model catalog verbatim for model_map authoring.
-
-    The gateway never validates map targets against a model list — values
-    after the kimi: prefix bypass untouched so newly released models work
-    without a gateway update. This endpoint only exists as a convenience
-    source of valid IDs (and future dashboard presets).
-    """
-    denied = _admin_guard(request)
-    if denied is not None:
-        return denied
-    kimi_client: KimiClient = request.app.state.kimi_client
-    try:
-        catalog = await kimi_client.list_models()
-    except KimiAuthError as exc:
-        return JSONResponse(
-            _openai_error_body("authentication_error", str(exc)), status_code=401
-        )
-    except KimiUpstreamError as exc:
-        error_type = _STATUS_TO_OPENAI_ERROR_TYPE.get(exc.status_code, "server_error")
-        return JSONResponse(
-            _openai_error_body(error_type, _upstream_error_message(exc.body)),
-            status_code=exc.status_code,
-        )
-    except httpx.HTTPError as exc:
-        return JSONResponse(
-            _openai_error_body("server_error", f"failed to reach the Kimi backend: {exc}"),
-            status_code=502,
-        )
-    return JSONResponse(catalog)
 
 
 _CONNECTION_TEST_TIMEOUT = 30.0
@@ -3962,30 +3714,6 @@ async def _probe_grok_route(grok_client: GrokClient, target: str) -> str:
     return model if isinstance(model, str) else target
 
 
-async def _probe_kimi_route(kimi_client: KimiClient, target_model: str) -> str:
-    claude_request = {
-        "model": target_model,
-        "max_tokens": 16,
-        "messages": [{"role": "user", "content": "ping"}],
-    }
-    headers = {
-        "content-type": "application/json",
-        "anthropic-version": "2023-06-01",
-        "anthropic-beta": _OAUTH_BETA,
-    }
-    response = await kimi_client.send_messages(json.dumps(claude_request).encode(), headers)
-    try:
-        payload = await response.aread()
-    finally:
-        await response.aclose()
-    try:
-        parsed = json.loads(payload)
-    except json.JSONDecodeError:
-        return target_model
-    model = parsed.get("model") if isinstance(parsed, dict) else None
-    return model if isinstance(model, str) else target_model
-
-
 async def _handle_admin_connection_test(request: Request) -> JSONResponse:
     """Send one minimal request through the gateway to verify a target model id.
 
@@ -4025,7 +3753,7 @@ async def _handle_admin_connection_test(request: Request) -> JSONResponse:
         )
 
     # The target carries the same provider-prefix syntax as model_map values,
-    # so the dashboard's test box works for kimi: targets with no UI change.
+    # so the dashboard's test box works for grok: targets with no UI change.
     try:
         route = parse_route_target(target)
     except ConfigError as exc:
@@ -4034,16 +3762,14 @@ async def _handle_admin_connection_test(request: Request) -> JSONResponse:
         )
 
     try:
-        if route.provider == "kimi":
-            probe = _probe_kimi_route(request.app.state.kimi_client, route.model)
-        elif route.provider == "grok":
+        if route.provider == "grok":
             probe = _probe_grok_route(request.app.state.grok_client, route.model)
         else:
             probe = _probe_codex_route(request.app.state.codex_client, route.model)
         response_model = await asyncio.wait_for(probe, _CONNECTION_TEST_TIMEOUT)
-    except (CodexUpstreamError, KimiUpstreamError, GrokUpstreamError) as exc:
+    except (CodexUpstreamError, GrokUpstreamError) as exc:
         return result(False, exc.status_code, _upstream_error_message(exc.body))
-    except (CodexAuthError, KimiAuthError, GrokAuthError) as exc:
+    except (CodexAuthError, GrokAuthError) as exc:
         return result(False, 401, str(exc))
     except TimeoutError:
         return result(False, None, f"no response within {_CONNECTION_TEST_TIMEOUT:.0f}s")
@@ -4076,7 +3802,6 @@ def create_app(config: GatewayConfig, daemon_nonce: str | None = None) -> Starle
             try:
                 async with httpx.AsyncClient(timeout=_UPSTREAM_TIMEOUT) as http_client:
                     codex_auth_manager = CodexAuthManager(config.codex_home / "auth.json", http_client)
-                    kimi_auth_manager = KimiAuthManager(config.kimi_code_home, http_client)
                     grok_auth_manager = GrokAuthManager(config.grok_home / "auth.json", http_client)
                     app.state.config = config
                     app.state.admin_lock = asyncio.Lock()
@@ -4090,8 +3815,6 @@ def create_app(config: GatewayConfig, daemon_nonce: str | None = None) -> Starle
                     app.state.compaction_reroute_sequence = 0
                     app.state.codex_auth_manager = codex_auth_manager
                     app.state.codex_client = CodexClient(codex_auth_manager, http_client)
-                    app.state.kimi_auth_manager = kimi_auth_manager
-                    app.state.kimi_client = KimiClient(kimi_auth_manager, http_client)
                     app.state.grok_auth_manager = grok_auth_manager
                     app.state.grok_client = GrokClient(grok_auth_manager, http_client)
                     app.state.http_client = http_client
@@ -4136,13 +3859,6 @@ def create_app(config: GatewayConfig, daemon_nonce: str | None = None) -> Starle
                         )
                     except CodexAuthError as exc:
                         logger.warning("codex direction unavailable: %s", exc)
-
-                    if config.maps_to_provider("kimi"):
-                        try:
-                            await kimi_auth_manager.get_credentials()
-                            logger.info("kimi credentials ready")
-                        except KimiAuthError as exc:
-                            logger.warning("kimi direction unavailable: %s", exc)
 
                     if config.maps_to_provider("grok"):
                         try:
@@ -4199,9 +3915,6 @@ def create_app(config: GatewayConfig, daemon_nonce: str | None = None) -> Starle
                 "/admin/providers/codex/reset-credit",
                 _handle_admin_codex_reset_credit,
                 methods=["POST"],
-            ),
-            Route(
-                "/admin/providers/kimi/models", _handle_admin_kimi_models, methods=["GET"]
             ),
             Route(
                 "/admin/providers/grok/models", _handle_admin_grok_models, methods=["GET"]

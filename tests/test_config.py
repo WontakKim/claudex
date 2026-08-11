@@ -158,10 +158,6 @@ class TestMappedRoute:
         config = GatewayConfig(model_map={"haiku": "codex:gpt-5.6-luna"})
         assert config.mapped_route("claude-haiku-4-5") == RouteTarget("codex", "gpt-5.6-luna")
 
-    def test_kimi_prefix_routes_to_kimi(self) -> None:
-        config = GatewayConfig(model_map={"opus": "kimi:k2.5"})
-        assert config.mapped_route("claude-opus-5") == RouteTarget("kimi", "k2.5")
-
     def test_grok_prefix_routes_to_grok(self) -> None:
         config = GatewayConfig(model_map={"opus": "grok:grok-4.5"})
         assert config.mapped_route("claude-opus-5") == RouteTarget("grok", "grok-4.5")
@@ -175,9 +171,9 @@ class TestMappedRoute:
 
     def test_longest_substring_key_wins_over_map_order(self) -> None:
         config = GatewayConfig(
-            model_map={"claude": "codex:gpt-5.5", "claude-haiku": "kimi:k2.5"}
+            model_map={"claude": "codex:gpt-5.5", "claude-haiku": "grok:grok-4.5"}
         )
-        assert config.mapped_route("claude-haiku-4-5") == RouteTarget("kimi", "k2.5")
+        assert config.mapped_route("claude-haiku-4-5") == RouteTarget("grok", "grok-4.5")
         assert config.mapped_route("claude-fable-5") == RouteTarget("codex", "gpt-5.5")
 
     def test_exact_match_beats_substring_keys(self) -> None:
@@ -196,10 +192,10 @@ class TestMappedRoute:
         assert config.mapped_route("") is None
 
     def test_maps_to_provider(self) -> None:
-        config = GatewayConfig(model_map={"opus": "kimi:k2.5", "haiku": "codex:gpt-5.6-luna"})
-        assert config.maps_to_provider("kimi")
+        config = GatewayConfig(model_map={"opus": "grok:grok-4.5", "haiku": "codex:gpt-5.6-luna"})
+        assert config.maps_to_provider("grok")
         assert config.maps_to_provider("codex")
-        assert not GatewayConfig(model_map={"haiku": "codex:gpt-5.6-luna"}).maps_to_provider("kimi")
+        assert not GatewayConfig(model_map={"haiku": "codex:gpt-5.6-luna"}).maps_to_provider("grok")
 
 
 class TestRouteTargetValidation:
@@ -209,26 +205,24 @@ class TestRouteTargetValidation:
             GatewayConfig.from_env()
 
     def test_unknown_prefix_fails_at_load(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv("CLAUDEX_MODEL_MAP", '{"opus": "kim:k2.5"}')
-        with pytest.raises(ConfigError, match="unknown provider prefix 'kim'"):
+        monkeypatch.setenv("CLAUDEX_MODEL_MAP", '{"opus": "codx:gpt-5.6-sol"}')
+        with pytest.raises(ConfigError, match="unknown provider prefix 'codx'"):
             GatewayConfig.from_env()
 
     def test_empty_model_after_prefix_fails_at_load(self, tmp_path: Path) -> None:
         settings_file = tmp_path / "settings.json"
         settings_file.write_text(
-            json.dumps({"model_map": {"opus": "kimi:"}}), encoding="utf-8"
+            json.dumps({"model_map": {"opus": "grok:"}}), encoding="utf-8"
         )
         with pytest.raises(ConfigError, match="names no model after the provider prefix"):
             GatewayConfig.load(settings_file)
 
-    def test_cli_credential_locations(self) -> None:
-        config = GatewayConfig()
-        assert config.kimi_code_home == Path.home() / ".kimi-code"
-        assert config.grok_home == Path.home() / ".grok"
+    def test_cli_credential_location(self) -> None:
+        assert GatewayConfig().grok_home == Path.home() / ".grok"
 
-    def test_kimi_code_home_env_override(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv("KIMI_CODE_HOME", "~/kimi-code-alt")
-        assert GatewayConfig.from_env().kimi_code_home == Path.home() / "kimi-code-alt"
+    def test_grok_home_env_override(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("GROK_HOME", "~/grok-alt")
+        assert GatewayConfig.from_env().grok_home == Path.home() / "grok-alt"
 
 
 class TestParseCompactionModel:

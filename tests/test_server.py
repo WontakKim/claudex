@@ -44,8 +44,6 @@ from claudex_gateway.codex_client import (
     CodexUpstreamError,
 )
 from claudex_gateway.config import GatewayConfig
-from claudex_gateway.kimi_auth import KimiCredentials
-from claudex_gateway.kimi_client import KimiClient, KimiUpstreamError
 from claudex_gateway.grok_auth import GrokCredentials
 from claudex_gateway.grok_client import GrokClient, GrokUpstreamError
 from claudex_gateway.translate import translate_claude_request_to_codex
@@ -76,26 +74,6 @@ class FakeCodexClient:
 
     async def context_window(self, model: str) -> int | None:
         return None
-
-
-class AvailableKimiAuthManager:
-    def __init__(self, *_args: Any, **_kwargs: Any) -> None:
-        pass
-
-    async def get_credentials(self, force_refresh: bool = False) -> KimiCredentials:
-        return KimiCredentials(
-            access_token="kimi-token", device_id="device-1", account="kimi-user-1"
-        )
-
-
-class MissingKimiAuthManager(AvailableKimiAuthManager):
-    async def get_credentials(self, force_refresh: bool = False) -> KimiCredentials:
-        raise server.KimiAuthError("no Kimi credentials; run `kimi login` first")
-
-
-class FakeKimiClient:
-    def __init__(self, *_args: Any, **_kwargs: Any) -> None:
-        pass
 
 
 class AvailableGrokAuthManager:
@@ -135,8 +113,6 @@ def _create_test_client(
     config: GatewayConfig | None = None,
     codex_auth: type = AvailableCodexAuthManager,
     codex_client: type = FakeCodexClient,
-    kimi_auth: type = AvailableKimiAuthManager,
-    kimi_client: type = FakeKimiClient,
     grok_auth: type = AvailableGrokAuthManager,
     grok_client: type = FakeGrokClient,
     base_url: str = "http://testserver",
@@ -151,8 +127,6 @@ def _create_test_client(
         monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setattr(server, "CodexAuthManager", codex_auth)
     monkeypatch.setattr(server, "CodexClient", codex_client)
-    monkeypatch.setattr(server, "KimiAuthManager", kimi_auth)
-    monkeypatch.setattr(server, "KimiClient", kimi_client)
     monkeypatch.setattr(server, "GrokAuthManager", grok_auth)
     monkeypatch.setattr(server, "GrokClient", grok_client)
     return TestClient(server.create_app(config or GatewayConfig()), base_url=base_url)
@@ -196,7 +170,6 @@ def test_health_reports_ok_with_codex_credentials(
                 "account": "account",
                 "email": "codex@example.com",
             },
-            "kimi": {"status": "ok", "required": False, "account": "kimi-user-1"},
             "grok": {
                 "status": "ok",
                 "required": False,
@@ -216,33 +189,6 @@ def test_health_reports_error_without_codex_credentials(
     assert health.status_code == 503
     assert health.json()["status"] == "error"
     assert health.json()["providers"]["codex"]["status"] == "error"
-
-
-def test_health_stays_ok_without_kimi_credentials_when_map_has_no_kimi_route(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    with _create_test_client(monkeypatch, tmp_path, kimi_auth=MissingKimiAuthManager) as client:
-        health = client.get("/health")
-
-    assert health.status_code == 200
-    assert health.json()["status"] == "ok"
-    assert health.json()["providers"]["kimi"]["status"] == "error"
-    assert health.json()["providers"]["kimi"]["required"] is False
-
-
-def test_health_reports_error_without_kimi_credentials_when_map_routes_to_kimi(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    config = GatewayConfig(model_map={"opus": "kimi:k2.5"})
-    with _create_test_client(
-        monkeypatch, tmp_path, config=config, kimi_auth=MissingKimiAuthManager
-    ) as client:
-        health = client.get("/health")
-
-    assert health.status_code == 503
-    assert health.json()["status"] == "error"
-    assert health.json()["providers"]["kimi"]["status"] == "error"
-    assert health.json()["providers"]["kimi"]["required"] is True
 
 
 def test_health_stays_ok_without_grok_credentials_when_map_has_no_grok_route(
@@ -352,8 +298,6 @@ class StubCodexClient:
 def _gateway(
     config: GatewayConfig,
     anthropic_handler,
-    kimi_handler=None,
-    kimi_auth: Any | None = None,
     grok_client: Any | None = None,
     codex_context_window: int | None = None,
     codex_error: CodexUpstreamError | None = None,
@@ -369,15 +313,6 @@ def _gateway(
     app.state.http_client = httpx.AsyncClient(
         transport=httpx.MockTransport(anthropic_handler)
     )
-    if kimi_handler is not None or kimi_auth is not None:
-        app.state.kimi_client = KimiClient(
-            kimi_auth or AvailableKimiAuthManager(),
-            httpx.AsyncClient(
-                transport=httpx.MockTransport(
-                    kimi_handler or (lambda request: httpx.Response(500))
-                )
-            ),
-        )
     if grok_client is not None:
         app.state.grok_client = grok_client
     return TestClient(app), stub
@@ -813,407 +748,8 @@ def test_count_tokens_estimates_locally_for_mapped_model() -> None:
     assert captured == []
 
 
-# --- /v1/messages routing: kimi-mapped models relay to the Kimi backend ---
-
-
-def _kimi_config() -> GatewayConfig:
-    return GatewayConfig(model_map={"opus": "kimi:k2.5"})
-
-
 def _failing_anthropic_handler(request: httpx.Request) -> httpx.Response:
     return httpx.Response(500, json={"error": "unexpected anthropic passthrough"})
-
-
-def test_kimi_mapped_model_relays_with_model_rewrite() -> None:
-    captured: list[httpx.Request] = []
-
-    def kimi_handler(request: httpx.Request) -> httpx.Response:
-        captured.append(request)
-        return httpx.Response(
-            200,
-            json={"id": "msg_1", "type": "message", "model": "k2.5", "content": []},
-            headers={"request-id": "req_kimi"},
-        )
-
-    client, stub = _gateway(_kimi_config(), _failing_anthropic_handler, kimi_handler)
-
-    response = client.post(
-        "/v1/messages",
-        content=json.dumps(_message_body("claude-opus-4-6")),
-        headers={
-            "content-type": "application/json",
-            "authorization": "Bearer sk-ant-oat01-test",
-            "x-api-key": "sk-ant-key",
-            "anthropic-beta": "claude-code-20250219",
-            "anthropic-version": "2023-06-01",
-        },
-    )
-
-    assert response.status_code == 200
-    assert response.json()["id"] == "msg_1"
-    # The gateway reports the requested Claude model, not the Kimi target.
-    assert response.json()["model"] == "claude-opus-4-6"
-    assert response.headers["request-id"] == "req_kimi"
-    assert stub.payloads == []
-    (upstream,) = captured
-    assert str(upstream.url) == "https://api.kimi.com/coding/v1/messages?beta=true"
-    assert upstream.headers["authorization"] == "Bearer kimi-token"
-    assert "x-api-key" not in upstream.headers
-    assert upstream.headers["anthropic-beta"] == "claude-code-20250219,oauth-2025-04-20"
-    assert upstream.headers["anthropic-version"] == "2023-06-01"
-    assert json.loads(upstream.content)["model"] == "k2.5"
-
-
-def test_kimi_oauth_beta_is_not_duplicated() -> None:
-    seen: dict[str, str] = {}
-
-    def kimi_handler(request: httpx.Request) -> httpx.Response:
-        seen["beta"] = request.headers["anthropic-beta"]
-        return httpx.Response(200, json={"type": "message", "model": "k2.5"})
-
-    client, _ = _gateway(_kimi_config(), _failing_anthropic_handler, kimi_handler)
-
-    client.post(
-        "/v1/messages",
-        json=_message_body("claude-opus-4-6"),
-        headers={"anthropic-beta": "oauth-2025-04-20,claude-code-20250219"},
-    )
-
-    assert seen["beta"] == "oauth-2025-04-20,claude-code-20250219"
-
-
-def test_kimi_stream_rewrites_only_message_start() -> None:
-    sse_body = (
-        b'event: message_start\n'
-        b'data: {"type":"message_start","message":{"id":"msg_1","model":"k2.5"}}\n'
-        b"\n"
-        b'event: content_block_delta\n'
-        b'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}\n'
-        b"\n"
-        b'event: message_stop\n'
-        b'data: {"type":"message_stop"}\n'
-        b"\n"
-    )
-
-    def kimi_handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(
-            200, content=sse_body, headers={"content-type": "text/event-stream"}
-        )
-
-    client, _ = _gateway(_kimi_config(), _failing_anthropic_handler, kimi_handler)
-
-    body = _message_body("claude-opus-4-6")
-    body["stream"] = True
-    response = client.post("/v1/messages", json=body)
-
-    assert response.status_code == 200
-    assert response.headers["content-type"] == "text/event-stream"
-    lines = response.content.decode().split("\n")
-    assert lines[0] == "event: message_start"
-    message_start = json.loads(lines[1].removeprefix("data: "))
-    assert message_start["message"]["model"] == "claude-opus-4-6"
-    # Every line outside message_start is relayed byte-identical.
-    assert (
-        'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}'
-        in lines
-    )
-    assert 'data: {"type":"message_stop"}' in lines
-
-
-def test_kimi_stream_yields_complete_sse_events() -> None:
-    sse_body = (
-        b'event: message_start\n'
-        b'data: {"type":"message_start","message":{"model":"k3"}}\n'
-        b"\n"
-        b'event: content_block_delta\n'
-        b'data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"hi"}}\n'
-        b"\n"
-        b'event: message_stop\n'
-        b'data: {"type":"message_stop"}\n'
-    )
-
-    async def scenario() -> list[bytes]:
-        response = httpx.Response(200, content=sse_body)
-        return [
-            chunk
-            async for chunk in server._rewrite_kimi_sse(response, "claude-fable-5")
-        ]
-
-    chunks = asyncio.run(scenario())
-
-    assert len(chunks) == 3
-    assert chunks[0].endswith(b"\n\n")
-    assert b'"model": "claude-fable-5"' in chunks[0]
-    assert chunks[1] == (
-        b'event: content_block_delta\n'
-        b'data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"hi"}}\n'
-        b"\n"
-    )
-    assert chunks[2] == b'event: message_stop\ndata: {"type":"message_stop"}\n'
-
-
-def test_kimi_stream_cancellation_interrupts_buffered_events() -> None:
-    closed = False
-    sse_body = b"".join(
-        f'event: content_block_delta\ndata: {{"index":{index}}}\n\n'.encode()
-        for index in range(20)
-    )
-
-    class BufferedStream(httpx.AsyncByteStream):
-        async def __aiter__(self) -> AsyncIterator[bytes]:
-            yield sse_body
-
-        async def aclose(self) -> None:
-            nonlocal closed
-            closed = True
-
-    async def scenario() -> list[bytes]:
-        response = httpx.Response(200, stream=BufferedStream())
-        chunks: list[bytes] = []
-        first_chunk_seen = asyncio.Event()
-
-        async def consume() -> None:
-            async for chunk in server._rewrite_kimi_sse(response, "claude-fable-5"):
-                chunks.append(chunk)
-                first_chunk_seen.set()
-
-        task = asyncio.create_task(consume())
-        await first_chunk_seen.wait()
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
-        return chunks
-
-    chunks = asyncio.run(scenario())
-
-    assert chunks == [b'event: content_block_delta\ndata: {"index":0}\n\n']
-    assert closed is True
-
-
-def test_kimi_stream_client_reset_stops_closed_socket_writes(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    upstream_closed = threading.Event()
-
-    class BurstStream(httpx.AsyncByteStream):
-        async def __aiter__(self) -> AsyncIterator[bytes]:
-            yield b"".join(
-                f'event: content_block_delta\ndata: {{"index":{index}}}\n\n'.encode()
-                for index in range(20)
-            )
-
-        async def aclose(self) -> None:
-            upstream_closed.set()
-
-    class BurstKimiClient:
-        async def send_messages(
-            self, _body: bytes, _headers: dict[str, str]
-        ) -> httpx.Response:
-            return httpx.Response(
-                200,
-                headers={"content-type": "text/event-stream"},
-                stream=BurstStream(),
-            )
-
-    config = GatewayConfig(model_map={"fable": "kimi:k3"})
-    app = server.create_app(config)
-    app.state.config = config
-    app.state.compaction_last_reroute = None
-    app.state.compaction_reroute_sequence = 0
-    app.state.kimi_client = BurstKimiClient()
-
-    listener = socket.socket()
-    listener.bind(("127.0.0.1", 0))
-    listener.listen()
-    port = listener.getsockname()[1]
-    uvicorn_server = uvicorn.Server(
-        uvicorn.Config(app, log_level="error", lifespan="off", access_log=False)
-    )
-
-    def run_server() -> None:
-        asyncio.run(uvicorn_server.serve(sockets=[listener]))
-
-    server_thread = threading.Thread(target=run_server, daemon=True)
-    caplog.set_level(logging.WARNING, logger="asyncio")
-    try:
-        server_thread.start()
-        startup_deadline = time.monotonic() + 2
-        while not uvicorn_server.started and time.monotonic() < startup_deadline:
-            time.sleep(0.001)
-        assert uvicorn_server.started
-
-        body = json.dumps(
-            {
-                "model": "claude-fable-5",
-                "max_tokens": 16,
-                "stream": True,
-                "messages": [{"role": "user", "content": "hi"}],
-            }
-        ).encode()
-        request = (
-            b"POST /v1/messages HTTP/1.1\r\n"
-            + f"Host: 127.0.0.1:{port}\r\n".encode()
-            + b"Content-Type: application/json\r\n"
-            + f"Content-Length: {len(body)}\r\n".encode()
-            + b"Connection: close\r\n\r\n"
-            + body
-        )
-        with socket.create_connection(("127.0.0.1", port), timeout=2) as client:
-            client.sendall(request)
-            client.setsockopt(
-                socket.SOL_SOCKET,
-                socket.SO_LINGER,
-                struct.pack("ii", 1, 0),
-            )
-
-        assert upstream_closed.wait(2)
-    finally:
-        uvicorn_server.should_exit = True
-        server_thread.join(timeout=2)
-        listener.close()
-
-    assert not server_thread.is_alive()
-    assert not any(
-        record.name == "asyncio"
-        and record.getMessage() == "socket.send() raised exception."
-        for record in caplog.records
-    )
-
-
-def test_kimi_missing_credentials_return_401_with_login_guidance() -> None:
-    client, _ = _gateway(
-        _kimi_config(), _failing_anthropic_handler, kimi_auth=MissingKimiAuthManager()
-    )
-
-    response = client.post("/v1/messages", json=_message_body("claude-opus-4-6"))
-
-    assert response.status_code == 401
-    assert response.json()["error"]["type"] == "authentication_error"
-    assert "kimi login" in response.json()["error"]["message"]
-
-
-def test_kimi_anthropic_shaped_error_is_relayed_with_status() -> None:
-    error_body = {"type": "error", "error": {"type": "rate_limit_error", "message": "slow down"}}
-
-    def kimi_handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(429, json=error_body)
-
-    client, _ = _gateway(_kimi_config(), _failing_anthropic_handler, kimi_handler)
-
-    response = client.post("/v1/messages", json=_message_body("claude-opus-4-6"))
-
-    assert response.status_code == 429
-    assert response.json() == error_body
-
-
-def test_kimi_overflow_shaped_error_is_forwarded_verbatim() -> None:
-    """Kimi's relay is untouched by design: no numeric overflow rewrite applies."""
-    error_body = {
-        "type": "error",
-        "error": {
-            "type": "invalid_request_error",
-            "message": "Your input exceeds the context window of this model.",
-        },
-    }
-
-    def kimi_handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(400, json=error_body)
-
-    client, _ = _gateway(_kimi_config(), _failing_anthropic_handler, kimi_handler)
-
-    response = client.post("/v1/messages", json=_message_body("claude-opus-4-6"))
-
-    assert response.status_code == 400
-    assert response.json() == error_body
-    assert "prompt is too long" not in response.json()["error"]["message"]
-
-
-def test_kimi_persistent_401_blames_gateway_credentials() -> None:
-    attempts: list[str] = []
-
-    def kimi_handler(request: httpx.Request) -> httpx.Response:
-        attempts.append(request.headers["authorization"])
-        return httpx.Response(401, json={"error": {"message": "token expired"}})
-
-    client, _ = _gateway(_kimi_config(), _failing_anthropic_handler, kimi_handler)
-
-    response = client.post("/v1/messages", json=_message_body("claude-opus-4-6"))
-
-    # One retry with force-refreshed credentials, then a gateway-side 401 so
-    # Claude Code does not re-auth its own Anthropic session.
-    assert len(attempts) == 2
-    assert response.status_code == 401
-    message = response.json()["error"]["message"]
-    assert "token expired" in message
-    assert "kimi login" in message
-
-
-def test_kimi_unreachable_returns_502() -> None:
-    def kimi_handler(request: httpx.Request) -> httpx.Response:
-        raise httpx.ConnectError("connection refused")
-
-    client, _ = _gateway(_kimi_config(), _failing_anthropic_handler, kimi_handler)
-
-    response = client.post("/v1/messages", json=_message_body("claude-opus-4-6"))
-
-    assert response.status_code == 502
-    assert response.json()["error"]["type"] == "api_error"
-    assert "Kimi" in response.json()["error"]["message"]
-
-
-def test_kimi_route_skips_codex_only_validation() -> None:
-    # Kimi is the Messages authority for its own contract, exactly like the
-    # Anthropic passthrough; a missing max_tokens is Kimi's call to reject.
-    captured: list[httpx.Request] = []
-
-    def kimi_handler(request: httpx.Request) -> httpx.Response:
-        captured.append(request)
-        return httpx.Response(200, json={"type": "message", "model": "k2.5"})
-
-    client, _ = _gateway(_kimi_config(), _failing_anthropic_handler, kimi_handler)
-
-    body = _message_body("claude-opus-4-6")
-    del body["max_tokens"]
-    response = client.post("/v1/messages", json=body)
-
-    assert response.status_code == 200
-    assert len(captured) == 1
-
-
-def test_count_tokens_forwards_to_kimi_for_kimi_model() -> None:
-    captured: list[httpx.Request] = []
-
-    def kimi_handler(request: httpx.Request) -> httpx.Response:
-        captured.append(request)
-        return httpx.Response(200, json={"input_tokens": 42})
-
-    client, _ = _gateway(_kimi_config(), _failing_anthropic_handler, kimi_handler)
-
-    response = client.post(
-        "/v1/messages/count_tokens", json=_message_body("claude-opus-4-6")
-    )
-
-    assert response.status_code == 200
-    assert response.json() == {"input_tokens": 42}
-    (upstream,) = captured
-    assert str(upstream.url) == (
-        "https://api.kimi.com/coding/v1/messages/count_tokens?beta=true"
-    )
-    assert json.loads(upstream.content)["model"] == "k2.5"
-
-
-def test_count_tokens_falls_back_to_estimate_when_kimi_fails() -> None:
-    def kimi_handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(500, content=b"boom")
-
-    client, _ = _gateway(_kimi_config(), _failing_anthropic_handler, kimi_handler)
-
-    response = client.post(
-        "/v1/messages/count_tokens", json=_message_body("claude-opus-4-6")
-    )
-
-    assert response.status_code == 200
-    assert response.json()["input_tokens"] > 0
 
 
 # --- /v1/messages routing: grok-mapped models go to the Grok Responses backend ---
@@ -1747,33 +1283,6 @@ def test_compaction_trigger_reroutes_grok_mapped_request() -> None:
     assert record["outcome"] == "rerouted"
     assert record["mapped_model"] == "grok:grok-4.5"
     assert record["target_model"] == _COMPACTION_CANONICAL_TARGET
-
-
-def test_compaction_trigger_never_engages_for_kimi_mapped_requests() -> None:
-    body = _compaction_body("claude-opus-4-6")
-    captured: list[httpx.Request] = []
-
-    def anthropic_handler(request: httpx.Request) -> httpx.Response:
-        captured.append(request)
-        return httpx.Response(500, json={"error": "unexpected anthropic call"})
-
-    kimi_calls: list[httpx.Request] = []
-
-    def kimi_handler(request: httpx.Request) -> httpx.Response:
-        kimi_calls.append(request)
-        return httpx.Response(
-            200, json={"id": "msg_1", "type": "message", "model": "k2.5", "content": []}
-        )
-
-    config = _compaction_config({"opus": "kimi:k2.5"})
-    client, _ = _gateway(config, anthropic_handler, kimi_handler)
-
-    response = client.post("/v1/messages", json=body, headers=_ANTHROPIC_CREDENTIAL_HEADERS)
-
-    assert response.status_code == 200
-    assert captured == []
-    assert len(kimi_calls) == 1
-    assert client.app.state.compaction_last_reroute is None
 
 
 def test_compaction_trigger_never_engages_for_unmapped_passthrough() -> None:
@@ -2742,20 +2251,20 @@ class TestAdminMappingApi:
         monkeypatch.delenv("CLAUDEX_MODEL_MAP", raising=False)
         with self._admin_client(monkeypatch, tmp_path) as client:
             accepted = client.put(
-                "/admin/settings/mapping", json={"model_map": {"opus": "kimi:k2.5"}}
+                "/admin/settings/mapping", json={"model_map": {"opus": "grok:grok-4.5"}}
             )
             bare_value = client.put(
                 "/admin/settings/mapping", json={"model_map": {"opus": "gpt-5.6-sol"}}
             )
             empty_model = client.put(
-                "/admin/settings/mapping", json={"model_map": {"opus": "kimi:"}}
+                "/admin/settings/mapping", json={"model_map": {"opus": "grok:"}}
             )
             unknown_prefix = client.put(
-                "/admin/settings/mapping", json={"model_map": {"opus": "kim:k2.5"}}
+                "/admin/settings/mapping", json={"model_map": {"opus": "codx:gpt-5.6-sol"}}
             )
 
         assert accepted.status_code == 200
-        assert accepted.json()["model_map"] == {"opus": "kimi:k2.5"}
+        assert accepted.json()["model_map"] == {"opus": "grok:grok-4.5"}
         assert bare_value.status_code == 400
         assert "no provider prefix" in bare_value.json()["error"]["message"]
         assert empty_model.status_code == 400
@@ -2799,7 +2308,6 @@ class TestAdminMappingApi:
 
         assert payload["env_locked"] == {"model_map": "CLAUDEX_MODEL_MAP"}
         assert payload["codex_home"].endswith(".codex")
-        assert payload["kimi_code_home"].endswith(".kimi-code")
         assert payload["grok_home"].endswith(".grok")
 
 
@@ -3619,15 +3127,11 @@ def test_admin_usage_returns_all_providers(monkeypatch: pytest.MonkeyPatch, tmp_
     async def fake_codex(http_client: Any, auth_manager: Any) -> dict[str, Any]:
         return {"provider": "codex", "status": "unavailable", "error": "no creds"}
 
-    async def fake_kimi(http_client: Any, auth_manager: Any) -> dict[str, Any]:
-        return {"provider": "kimi", "status": "ok", "error": None}
-
     async def fake_grok(http_client: Any, auth_manager: Any) -> dict[str, Any]:
         return {"provider": "grok", "status": "ok", "error": None}
 
     monkeypatch.setattr(server, "fetch_claude_usage", fake_claude)
     monkeypatch.setattr(server, "fetch_codex_usage", fake_codex)
-    monkeypatch.setattr(server, "fetch_kimi_usage", fake_kimi)
     monkeypatch.setattr(server, "fetch_grok_usage", fake_grok)
     with _create_test_client(monkeypatch, tmp_path, base_url="http://127.0.0.1:8787") as client:
         response = client.get("/admin/usage")
@@ -3636,7 +3140,6 @@ def test_admin_usage_returns_all_providers(monkeypatch: pytest.MonkeyPatch, tmp_
     body = response.json()
     assert body["claude"]["status"] == "ok"
     assert body["codex"]["status"] == "unavailable"
-    assert body["kimi"]["status"] == "ok"
     assert body["grok"]["status"] == "ok"
     assert body["fetched_at"] > 0
 
@@ -3655,15 +3158,11 @@ def test_admin_usage_single_provider_skips_the_others(
     async def codex_must_not_run(http_client: Any, auth_manager: Any) -> dict[str, Any]:
         raise AssertionError("codex probe ran for ?provider=claude")
 
-    async def kimi_must_not_run(http_client: Any, auth_manager: Any) -> dict[str, Any]:
-        raise AssertionError("kimi probe ran for ?provider=claude")
-
     async def grok_must_not_run(http_client: Any, auth_manager: Any) -> dict[str, Any]:
         raise AssertionError("grok probe ran for ?provider=claude")
 
     monkeypatch.setattr(server, "fetch_claude_usage", fake_claude)
     monkeypatch.setattr(server, "fetch_codex_usage", codex_must_not_run)
-    monkeypatch.setattr(server, "fetch_kimi_usage", kimi_must_not_run)
     monkeypatch.setattr(server, "fetch_grok_usage", grok_must_not_run)
     with _create_test_client(monkeypatch, tmp_path, base_url="http://127.0.0.1:8787") as client:
         response = client.get("/admin/usage", params={"provider": "claude"})
@@ -3672,7 +3171,6 @@ def test_admin_usage_single_provider_skips_the_others(
     body = response.json()
     assert body["claude"]["status"] == "ok"
     assert "codex" not in body
-    assert "kimi" not in body
     assert "grok" not in body
 
 
@@ -3781,7 +3279,7 @@ def test_dashboard_usage_merged_into_status_cards(monkeypatch: pytest.MonkeyPatc
     assert 'id="tab-usage"' not in page
     assert 'id="usage-body-claude"' in page
     assert 'id="usage-body-codex"' in page
-    assert 'id="usage-body-kimi"' in page
+    assert 'id="usage-body-grok"' in page
     assert "/admin/usage" in page
     # The usage hooks sit inside the Status section, not a sibling tab.
     assert page.index('id="tab-status"') < page.index('id="usage-body-codex"')
@@ -3827,16 +3325,14 @@ def test_dashboard_settings_tab_leads_and_holds_compaction(
 def test_dashboard_optional_providers_hidden_until_detected(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    # Kimi and Grok are extensions: their Status cards and the Router
-    # add-node provider buttons ship hidden and are revealed from /health
-    # only when a local login is detected — or when the map already routes
-    # to them, where hiding a required-login error would mislead. The gating
-    # is cosmetic only; routing, settings.json, and the admin API are
-    # untouched.
+    # Grok is an extension: its Status card and the Router add-node provider
+    # button ship hidden and are revealed from /health only when a local
+    # login is detected — or when the map already routes to it, where hiding
+    # a required-login error would mislead. The gating is cosmetic only;
+    # routing, settings.json, and the admin API are untouched.
     with _create_test_client(monkeypatch, tmp_path) as client:
         page = client.get("/").text
 
-    assert '<div class="card provider-hidden" id="card-kimi">' in page
     assert '<div class="card provider-hidden" id="card-grok">' in page
     # Codex is built in and never hides.
     assert 'id="card-codex"' not in page
@@ -3858,19 +3354,19 @@ def test_dashboard_plan_and_credits_read_inside_the_card(
     # part of the card they qualify, so the hooks and the chip style are gone.
     assert "usage-chips" not in page
     assert "uplan" not in page
-    for provider in ("Claude", "Codex", "Kimi"):
+    for provider in ("Claude", "Codex", "Grok"):
         assert f"<h2>{provider} Status</h2>" in page
 
     # The plan always precedes the quota bars it qualifies.
-    for provider in ("claude", "codex", "kimi"):
+    for provider in ("claude", "codex", "grok"):
         assert f'id="usage-plan-{provider}"' in page
         assert page.index(f'id="usage-plan-{provider}"') < page.index(
             f'id="usage-body-{provider}"'
         )
-    # Codex and Kimi read it inside the login-status box, above the state
+    # Codex and Grok read it inside the login-status box, above the state
     # line. That line is its own element precisely so a health render can
     # rewrite the status without wiping the plan the usage probe put there.
-    for provider in ("codex", "kimi"):
+    for provider in ("codex", "grok"):
         assert (
             page.index(f'id="{provider}-stat"')
             < page.index(f'id="usage-plan-{provider}"')
@@ -3901,7 +3397,7 @@ def test_dashboard_status_cards_load_as_skeletons(
     assert ".sk{" in page and "color:transparent" in page
     # Both status boxes seed one before any request goes out, and the usage
     # bodies are filled synchronously at boot rather than starting empty.
-    for provider in ("codex", "kimi"):
+    for provider in ("codex", "grok"):
         assert f'id="{provider}-statline"><span class="sk">' in page
     assert 'renderUsageProvider(p,null)' in page
 
@@ -3986,7 +3482,7 @@ def test_dashboard_has_no_hardcoded_codex_model_snapshot(
     # via buildColumns.
     assert "CODEX_FALLBACK" not in page
     assert "gpt-5" not in page
-    assert "CATALOG={codex:[],kimi:[],grok:[]}" in page
+    assert "CATALOG={codex:[],grok:[]}" in page
 
 
 def test_dashboard_board_shows_only_referenced_targets(
@@ -4000,9 +3496,8 @@ def test_dashboard_board_shows_only_referenced_targets(
     # stages; the catalogs survive purely as autocomplete for that box.
     assert "concat(Object.values(DIR.mapping),addedTargets)" in page
     assert 'list="add-catalog"' in page
-    # All provider catalogs feed it, so the dashboard depends on the Kimi
-    # and Grok endpoints too — not just the Codex one.
-    assert '"/admin/providers/kimi/models"' in page
+    # All provider catalogs feed it, so the dashboard depends on the Grok
+    # endpoint too — not just the Codex one.
     assert '"/admin/providers/grok/models"' in page
 
 
@@ -4453,30 +3948,6 @@ class RejectingCodexClient(FakeCodexClient):
         raise CodexUpstreamError(400, '{"error":{"message":"model_not_found"}}')
 
 
-class CatalogKimiClient(FakeKimiClient):
-    async def list_models(self) -> Any:
-        return {"data": [{"id": "k2.5"}, {"id": "k3"}]}
-
-
-class FailingCatalogKimiClient(FakeKimiClient):
-    async def list_models(self) -> Any:
-        raise KimiUpstreamError(401, '{"error":{"message":"token expired"}}')
-
-
-class ProbeKimiClient(FakeKimiClient):
-    async def send_messages(self, body: bytes, headers: dict[str, str]) -> httpx.Response:
-        # The probe must send the raw model with the prefix already removed.
-        assert json.loads(body)["model"] == "k3"
-        return httpx.Response(200, json={"type": "message", "model": "k3"})
-
-
-class RejectingKimiClient(FakeKimiClient):
-    async def send_messages(self, body: bytes, headers: dict[str, str]) -> httpx.Response:
-        raise KimiUpstreamError(
-            404, '{"type":"error","error":{"type":"not_found_error","message":"model not found"}}'
-        )
-
-
 class ProbeGrokClient(FakeGrokClient):
     async def stream_responses(
         self, payload: dict[str, Any], session_id: str
@@ -4558,32 +4029,6 @@ class TestAdminDashboardApi:
         with _create_test_client(monkeypatch, tmp_path, codex_client=CatalogCodexClient) as client:
             assert client.get("/admin/providers/codex/models").status_code == 403
 
-    def test_kimi_models_relays_catalog_verbatim(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-    ) -> None:
-        # The catalog passes through unshaped: the map bypasses model IDs
-        # untouched, so the raw backend answer is the preset source.
-        with self._client(monkeypatch, tmp_path, kimi_client=CatalogKimiClient) as client:
-            response = client.get("/admin/providers/kimi/models")
-
-        assert response.status_code == 200
-        assert response.json() == {"data": [{"id": "k2.5"}, {"id": "k3"}]}
-
-    def test_kimi_models_relays_upstream_error(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-    ) -> None:
-        with self._client(monkeypatch, tmp_path, kimi_client=FailingCatalogKimiClient) as client:
-            response = client.get("/admin/providers/kimi/models")
-
-        assert response.status_code == 401
-        assert response.json()["error"]["message"] == "token expired"
-
-    def test_kimi_models_refuses_foreign_host(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-    ) -> None:
-        with _create_test_client(monkeypatch, tmp_path, kimi_client=CatalogKimiClient) as client:
-            assert client.get("/admin/providers/kimi/models").status_code == 403
-
     def test_grok_models_returns_catalog_ids(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
@@ -4633,35 +4078,6 @@ class TestAdminDashboardApi:
 
         assert response.status_code == 400
         assert "no provider prefix" in response.json()["error"]["message"]
-
-    def test_connection_test_kimi_target_probes_kimi(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-    ) -> None:
-        with self._client(monkeypatch, tmp_path, kimi_client=ProbeKimiClient) as client:
-            response = client.post(
-                "/admin/test",
-                json={"target": "kimi:k3"},
-            )
-
-        assert response.status_code == 200
-        result = response.json()
-        assert result["ok"] is True
-        assert result["status"] == 200
-        assert result["response_model"] == "k3"
-
-    def test_connection_test_reports_kimi_error(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-    ) -> None:
-        with self._client(monkeypatch, tmp_path, kimi_client=RejectingKimiClient) as client:
-            response = client.post(
-                "/admin/test",
-                json={"target": "kimi:k3"},
-            )
-
-        result = response.json()
-        assert result["ok"] is False
-        assert result["status"] == 404
-        assert "model not found" in result["detail"]
 
     def test_connection_test_grok_target_probes_grok(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -5869,7 +5285,6 @@ class TestAdminClaudeAccountsApi:
         ("POST", "/admin/claude-accounts/login/confirm"),
         ("GET", "/admin/codex/models"),
         ("POST", "/admin/codex/reset-credit"),
-        ("GET", "/admin/kimi/models"),
         ("GET", "/admin/grok/models"),
     ],
 )

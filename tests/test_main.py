@@ -313,9 +313,9 @@ def test_unknown_argument_prints_usage_and_exits_2(tmp_path: Path) -> None:
 
 
 def test_login_subcommand_is_gone(tmp_path: Path) -> None:
-    # Provider logins belong to the CLIs (`codex`/`kimi`/`grok` login); the
+    # Provider logins belong to the CLIs (`codex`/`grok` login); the
     # gateway only reuses their credential stores.
-    for arguments in (["login"], ["login", "kimi"], ["login", "grok"]):
+    for arguments in (["login"], ["login", "codex"], ["login", "grok"]):
         result = _run_cli(_gateway_env(tmp_path, _free_port()), *arguments)
         assert result.returncode == 2
         assert "usage: claudex-gateway" in result.stderr

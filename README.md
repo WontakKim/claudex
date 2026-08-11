@@ -1,16 +1,15 @@
 # claudex-gateway
 
 A lightweight local gateway that runs mapped Claude Code models on the OpenAI
-Codex, Kimi, or Grok backend and relays everything else to Anthropic untouched.
+Codex or Grok backend and relays everything else to Anthropic untouched.
 
 ```text
 Claude Code ── "codex:" mapped ───▶ claudex-gateway ── Codex Responses API ─▶ Codex
-Claude Code ── "kimi:" mapped ────▶ claudex-gateway ── near-verbatim relay ─▶ Kimi coding API
 Claude Code ── "grok:" mapped ────▶ claudex-gateway ── Grok Responses API ──▶ Grok
 Claude Code ── unmapped model ────▶ claudex-gateway ── verbatim relay ──────▶ Anthropic API
 ```
 
-Mapped models run on Codex, Kimi, or Grok; everything else goes to Anthropic
+Mapped models run on Codex or Grok; everything else goes to Anthropic
 untouched.
 
 ## What it does
@@ -26,26 +25,20 @@ untouched.
   results (with 64-char-safe names for long MCP tool namespaces), usage,
   stop reasons, and native web search; mid-conversation `system` messages
   keep operator authority as Responses `developer` messages.
-- Relays models mapped with a `kimi:` prefix to Kimi's coding endpoint
-  (`api.kimi.com/coding`), which speaks the Anthropic Messages API natively —
-  no schema translation, only the model name is rewritten out and restored,
-  and the client's credentials are replaced with the Kimi Code CLI's OAuth
-  token.
 - Routes models mapped with a `grok:` prefix to the Grok Responses backend
   (`cli-chat-proxy.grok.com`) through the same translation layer as Codex,
   minus the payload fields Grok rejects and with reasoning effort clamped to
   the model's supported levels.
-- Answers as the Claude model the client requested — the Codex, Kimi, or Grok
+- Answers as the Claude model the client requested — the Codex or Grok
   target model never appears on the Anthropic wire, so Claude Code heuristics
   keyed on model names keep working.
-- Serves `GET /health` with the readiness state of the Codex, Kimi, and Grok
+- Serves `GET /health` with the readiness state of the Codex and Grok
   upstreams.
 - Serves a runtime dashboard at `GET /` for editing the model map, checking
   provider health, and testing model connections before wiring them.
 - Reuses each provider's CLI login — no gateway-side auth: the Codex CLI's
-  `~/.codex/auth.json`, the Kimi Code CLI's `~/.kimi-code` credential store,
-  and the Grok CLI's `~/.grok/auth.json`, each refreshed in place like the
-  CLI itself does.
+  `~/.codex/auth.json` and the Grok CLI's `~/.grok/auth.json`, each
+  refreshed in place like the CLI itself does.
 
 Two Anthropic contract points cannot be preserved on the Codex path and are
 explicit choices, not bugs:
@@ -57,16 +50,13 @@ explicit choices, not bugs:
   characters/4 estimate. Mapped prompts are never sent to Anthropic just to
   be counted and no Codex tokenizer is available, so treat the number as a
   rough gauge for context-usage display, not an exact count for billing or
-  hard limits. Kimi-mapped models use Kimi's native counter (falling back to
-  the same estimate when it is unavailable), and unmapped models pass through
-  to Anthropic's real counter.
+  hard limits. Unmapped models pass through to Anthropic's real counter.
 
 ## Requirements
 
 - Python 3.11+ and [uv](https://docs.astral.sh/uv/)
 - For Codex targets: a logged-in [Codex CLI](https://github.com/openai/codex)
   (`codex login`)
-- For Kimi targets: a logged-in Kimi Code CLI (`kimi login`)
 - For Grok targets: a logged-in [Grok CLI](https://github.com/xai-org/grok-build)
   (`grok login`)
 - For `claudex-gateway account add` (interactive): the `claude` CLI on
@@ -136,42 +126,6 @@ To run only some Claude models on Codex and keep the rest on the real
 Anthropic API, see
 [Mixing Claude and Codex models](#mixing-claude-and-codex-models).
 
-### Claude Code → Kimi
-
-The gateway reuses the Kimi Code CLI login — no gateway-side login step.
-With the CLI logged in (`kimi login`, tokens at
-`~/.kimi-code/credentials/kimi-code.json`), route models to Kimi with a
-`kimi:` prefix in the map:
-
-```json
-{
-  "model_map": {"opus": "kimi:k3", "haiku": "codex:gpt-5.6-luna"}
-}
-```
-
-Every value names its provider (`codex:`, `kimi:`, or `grok:`); a bare model
-name is rejected at boot and on `PUT`, so an entry always says which backend
-serves it. Kimi's coding endpoint speaks the
-Anthropic Messages API natively, so requests and responses — streaming and
-non-streaming, thinking, tool use — are relayed as-is; only the model name
-and credentials are swapped.
-
-The model ID after `kimi:` bypasses the gateway untouched: it is sent to Kimi
-exactly as written and never validated against a model list, so a newly
-released model works the moment Kimi ships it — no gateway update needed. The
-authoritative list of valid IDs is Kimi's own live catalog, which the gateway
-exposes for map authoring (and as the preset source for the future dashboard):
-
-```sh
-curl http://127.0.0.1:8787/admin/providers/kimi/models
-```
-
-The endpoint requires a logged-in Kimi Code CLI and honors the same
-`CLAUDEX_LOCAL_TOKEN` and Host guard as the other admin routes; the response
-is Kimi's catalog verbatim, unshaped by the gateway. Copy the `id` exactly —
-the catalog mixes naming styles (e.g. `kimi-for-coding` next to `k3`), which
-is precisely why the gateway refuses to normalize them.
-
 ### Claude Code → Grok
 
 The gateway reuses the Grok CLI login — no gateway-side login step. With the
@@ -185,7 +139,9 @@ CLI logged in (`grok login`, tokens at `~/.grok/auth.json`, or
 }
 ```
 
-Grok speaks the same Responses API family as the Codex backend, so requests
+Every value names its provider (`codex:` or `grok:`); a bare model name is
+rejected at boot and on `PUT`, so an entry always says which backend serves
+it. Grok speaks the same Responses API family as the Codex backend, so requests
 reuse the full Claude → Responses translation (streaming and non-streaming,
 thinking, tool use); only the wire quirks differ. On the way out the gateway
 drops the fields Grok rejects (`previous_response_id`, `stream_options`,
@@ -392,11 +348,10 @@ stays available for one-off overrides.
 | --- | --- | --- |
 | `CLAUDEX_HOST` | `127.0.0.1` | Bind address |
 | `CLAUDEX_PORT` | `8787` | Bind port |
-| `CLAUDEX_MODEL_MAP` | empty | JSON mapping of Claude names, exact or substring, to provider-prefixed target models — `codex:`-prefixed values run on Codex, `kimi:`-prefixed values on Kimi, `grok:`-prefixed values on Grok; unmapped models are relayed verbatim to Anthropic |
+| `CLAUDEX_MODEL_MAP` | empty | JSON mapping of Claude names, exact or substring, to provider-prefixed target models — `codex:`-prefixed values run on Codex, `grok:`-prefixed values on Grok; unmapped models are relayed verbatim to Anthropic |
 | `CLAUDEX_REASONING_EFFORT` | derived | Force `minimal`, `low`, `medium`, `high`, `xhigh`, or `max` on Codex requests |
 | `CODEX_HOME` | `~/.codex` | Directory containing Codex `auth.json` |
 | `GROK_HOME` | `~/.grok` | Directory containing the Grok CLI's `auth.json` |
-| `KIMI_CODE_HOME` | `~/.kimi-code` | Directory containing the Kimi Code CLI's credential store |
 | `CLAUDEX_LOG_LEVEL` | `info` | Process log verbosity: `debug`, `info`, `warning`, or `error`; editable at runtime from the dashboard |
 | `CLAUDEX_LOCAL_TOKEN` | unset | Bearer token required by the model request routes and the admin/dashboard routes when set; mandatory for non-loopback binds. See [the passthrough interaction](#mixing-claude-and-codex-models) |
 | `CLAUDEX_COMPACTION_MODEL` | unset | `compaction.model` setting: opt-in `claude:<model-id>` reroute target for oversized Claude Code compaction requests; unset (default) disables the reroute entirely. See [Compaction reroute](#compaction-reroute) |
@@ -406,9 +361,9 @@ stays available for one-off overrides.
 ### settings.json
 
 The settings key for each variable is its environment name minus the
-`CLAUDEX_` prefix, lowercased (the CLI-home variables — `CODEX_HOME`,
-`GROK_HOME`, `KIMI_CODE_HOME` — having no prefix, keep their full names as
-`codex_home` / `grok_home` / `kimi_code_home`). Values use native JSON types,
+`CLAUDEX_` prefix, lowercased (the CLI-home variables — `CODEX_HOME` and
+`GROK_HOME` — having no prefix, keep their full names as
+`codex_home` / `grok_home`). Values use native JSON types,
 so the model map is a plain object instead of JSON-in-a-string:
 
 ```json
@@ -479,22 +434,18 @@ Opening `http://127.0.0.1:8787/` in a browser serves a dashboard on top of
 the same admin API: the Settings tab holds gateway settings behind a
 category rail (currently a single General category with the
 [compaction reroute](#compaction-reroute) target), the Status tab shows each
-provider's login state and subscription usage — the Kimi and Grok cards (and
-their Router add-node buttons) appear only when a local login is detected or
-the model map already routes to them; hiding is cosmetic and never affects
+provider's login state and subscription usage — the Grok card (and
+its Router add-node button) appears only when a local login is detected or
+the model map already routes to it; hiding is cosmetic and never affects
 routing or `settings.json` — the Log tab tails the gateway's recent
 log lines (`GET /admin/logs`) and holds the runtime log-level control
 (`PUT /admin/settings/log-level`, applied immediately and persisted), and the Router
 tab is a canvas editor — drag a port to wire a model, Apply to `PUT` the
 map, and use the connection test box (`POST /admin/test`) to send one
 minimal request through the gateway before wiring a new model id. The board
-turns view-only when `CLAUDEX_MODEL_MAP` overrides the map, and the Codex
-column is loaded from the live Codex model catalog
-(`GET /admin/providers/codex/models`). The dashboard predates the Kimi direction — its
-model column is Codex-only and `kimi:`-prefixed targets show up as plain
-values, though the connection test understands the prefix and probes the
-right backend; a redesign is planned separately and will draw its Kimi
-presets from `GET /admin/providers/kimi/models`.
+turns view-only when `CLAUDEX_MODEL_MAP` overrides the map, and the add-node
+suggestions are loaded from the live model catalogs
+(`GET /admin/providers/codex/models`, `GET /admin/providers/grok/models`).
 
 When `CLAUDEX_LOCAL_TOKEN` is set, the dashboard prompts for the token once
 per page load and keeps it in memory for the lifetime of that page only — it
@@ -503,10 +454,10 @@ URL, browser storage, or logs. A wrong token triggers exactly one re-prompt.
 
 ### Model mapping examples
 
-Route Claude Code model names to Codex, Kimi, and Grok models:
+Route Claude Code model names to Codex and Grok models:
 
 ```sh
-CLAUDEX_MODEL_MAP='{"fable":"grok:grok-4.5","opus":"kimi:k3","sonnet":"codex:gpt-5.6-terra","haiku":"codex:gpt-5.6-luna"}' \
+CLAUDEX_MODEL_MAP='{"fable":"grok:grok-4.5","sonnet":"codex:gpt-5.6-terra","haiku":"codex:gpt-5.6-luna"}' \
   uv run claudex-gateway
 ```
 
@@ -514,11 +465,11 @@ Keys match exactly first, then as substrings, where the longest matching key
 wins (`claude-haiku` beats a catch-all `claude`). A request with no match is
 relayed verbatim to Anthropic. Values with an unknown provider prefix (or an
 empty model after the prefix) are rejected at startup and by the mapping API,
-so a typo like `"kim:k2.5"` fails loudly instead of surfacing as a baffling
-upstream error.
+so a typo like `"grk:grok-4.5"` fails loudly instead of surfacing as a
+baffling upstream error.
 
 `GET /health` returns `200` with `status: "ok"` when the Codex credential is
-usable and — only if the map routes to Kimi — the Kimi credential too;
+usable and — only if the map routes to Grok — the Grok credential too;
 otherwise it returns `503` with `status: "error"`. Each provider's state is
 always listed under `providers`.
 

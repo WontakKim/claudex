@@ -1,7 +1,7 @@
 [project]
 name = "claudex-gateway"
-version = "0.3.0"
-description = "Local gateway that runs Claude Code models on Codex, Kimi, or Grok backends."
+version = "0.4.0"
+description = "Local gateway that runs Claude Code models on Codex or Grok backends."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [

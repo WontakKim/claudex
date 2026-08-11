@@ -17,7 +17,7 @@ DEFAULT_PORT = 8787
 # Providers a model_map value may target. Every value must name one via a
 # "provider:" prefix — bare model names are rejected so a map entry always
 # says which backend serves it.
-KNOWN_ROUTE_PROVIDERS = ("codex", "kimi", "grok")
+KNOWN_ROUTE_PROVIDERS = ("codex", "grok")
 
 VALID_REASONING_EFFORTS = ("minimal", "low", "medium", "high", "xhigh", "max")
 
@@ -25,7 +25,7 @@ VALID_LOG_LEVELS = ("debug", "info", "warning", "error")
 
 # Settings-file key for every supported variable: the environment variable
 # name minus its CLAUDEX_ prefix, lowercased (the CLI-home variables —
-# CODEX_HOME, GROK_HOME, KIMI_CODE_HOME — having no prefix, keep their full
+# CODEX_HOME and GROK_HOME — having no prefix, keep their full
 # names). New configuration must be registered here to be loadable from
 # either source; _read_settings_file rejects unknown keys so typos fail at
 # boot instead of being silently ignored.
@@ -36,7 +36,6 @@ SETTINGS_KEYS: dict[str, str] = {
     "reasoning_effort": "CLAUDEX_REASONING_EFFORT",
     "codex_home": "CODEX_HOME",
     "grok_home": "GROK_HOME",
-    "kimi_code_home": "KIMI_CODE_HOME",
     "local_token": "CLAUDEX_LOCAL_TOKEN",
     "log_level": "CLAUDEX_LOG_LEVEL",
     # Opt-in: which Claude model oversized compaction requests are rerouted
@@ -70,13 +69,13 @@ class RouteTarget:
 
 
 def parse_route_target(value: str) -> RouteTarget:
-    """Parse a model_map value like "codex:gpt-5.6-luna" or "kimi:k2.5".
+    """Parse a model_map value like "codex:gpt-5.6-luna" or "grok:grok-5".
 
     The provider prefix is mandatory: a bare model name is rejected rather
     than defaulted to Codex, so every map entry says which backend serves it.
     Only the first colon separates the provider prefix, so upstream model
     names containing colons remain expressible. Unknown prefixes are rejected
-    rather than treated as literal model names — a typo like "kim:k2.5" must
+    rather than treated as literal model names — a typo like "grk:grok-5" must
     fail at boot, not surface as a baffling upstream 404.
     """
     if ":" not in value:
@@ -183,16 +182,12 @@ def parse_claude_account_routing(value: object) -> str:
     return mode
 
 
-def _default_kimi_code_home() -> Path:
-    return Path.home() / ".kimi-code"
-
-
 @dataclass(frozen=True)
 class GatewayConfig:
     host: str = DEFAULT_HOST
     port: int = DEFAULT_PORT
     # Maps a Claude model name (exact or substring, e.g. "haiku") to a target
-    # model prefixed with its provider ("codex:gpt-5.6-luna", "kimi:k2.5").
+    # model prefixed with its provider ("codex:gpt-5.6-luna", "grok:grok-5").
     # Unmapped models are relayed verbatim to Anthropic, so there is no
     # default target — the map alone decides what runs where.
     model_map: dict[str, str] = field(default_factory=dict)
@@ -202,9 +197,6 @@ class GatewayConfig:
     # Where the Grok CLI login (`grok login`) lives; mirrors the CLI's own
     # GROK_HOME. auth.json sits directly inside.
     grok_home: Path = field(default_factory=lambda: Path.home() / ".grok")
-    # Where the Kimi Code CLI login (`kimi login`) lives; mirrors the CLI's
-    # own KIMI_CODE_HOME. credentials/kimi-code.json sits inside.
-    kimi_code_home: Path = field(default_factory=_default_kimi_code_home)
     local_token: str | None = None
     log_level: str = "info"
     # Raw "claude:<canonical-model-id>" value naming the Claude model to
@@ -275,9 +267,6 @@ class GatewayConfig:
 
         codex_home = _path_setting("codex_home", settings, Path.home() / ".codex")
         grok_home = _path_setting("grok_home", settings, Path.home() / ".grok")
-        kimi_code_home = _path_setting(
-            "kimi_code_home", settings, _default_kimi_code_home()
-        )
 
         value, label = _resolve("host", settings)
         if value is None:
@@ -367,7 +356,6 @@ class GatewayConfig:
             reasoning_effort_override=effort,
             codex_home=codex_home,
             grok_home=grok_home,
-            kimi_code_home=kimi_code_home,
             local_token=local_token,
             log_level=log_level,
             compaction_model=compaction_model,

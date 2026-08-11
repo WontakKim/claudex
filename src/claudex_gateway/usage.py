@@ -4,9 +4,7 @@ Adopts Orca's approach: read the local CLI credentials and call each
 provider's own usage endpoint directly — gateway traffic plays no part.
 Claude usage comes from the Anthropic OAuth usage API with the Claude Code
 credentials (macOS Keychain or ~/.claude/.credentials.json); Codex usage
-comes from the ChatGPT backend with the gateway's own Codex credentials;
-Kimi usage comes from the coding backend's usages endpoint with the
-gateway's own Kimi OAuth credentials.
+comes from the ChatGPT backend with the gateway's own Codex credentials.
 
 The probes are advisory: they never raise, returning a status dict whose
 "status" field is "ok", "unavailable" (no usable credentials), or "error"
@@ -36,7 +34,6 @@ from claudex_gateway.claude_auth import (
     ClaudeAccountReauthRequiredError,
 )
 from claudex_gateway.codex_auth import CodexAuthManager, CodexCredentials
-from claudex_gateway.kimi_auth import KimiAuthManager
 from claudex_gateway.grok_auth import GrokAuthManager, GrokCredentials
 
 logger = logging.getLogger(__name__)
@@ -56,8 +53,6 @@ _CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
 _CODEX_RESET_CONSUME_URL = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume"
 # Outcome codes the backend answers a consume request with (mirrors Orca).
 _CODEX_RESET_OUTCOMES = ("reset", "nothing_to_reset", "no_credit", "already_redeemed")
-
-_KIMI_USAGE_URL = "https://api.kimi.com/coding/v1/usages"
 
 _USAGE_TIMEOUT = httpx.Timeout(10.0)
 
@@ -582,159 +577,6 @@ async def consume_codex_reset_credit(
     return {"status": "ok", "outcome": code, "error": None}
 
 
-# ---------------------------------------------------------------------------
-# Kimi usage — payload mapping mirrors Orca's kimi-fetcher
-# ---------------------------------------------------------------------------
-
-
-def _to_float(value: Any) -> float | None:
-    """Kimi reports quota numbers as strings ("100"); accept ints/floats too."""
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, (int, float)):
-        return float(value)
-    if isinstance(value, str):
-        try:
-            return float(value)
-        except ValueError:
-            return None
-    return None
-
-
-def _kimi_window_minutes(window: Any) -> float | None:
-    """Convert a limits[] window ({duration, timeUnit}) to minutes."""
-    if not isinstance(window, dict):
-        return None
-    duration = _to_float(window.get("duration"))
-    if duration is None:
-        return None
-    unit = str(window.get("timeUnit") or "").upper()
-    if "SECOND" in unit:
-        return duration / 60
-    if "HOUR" in unit:
-        return duration * 60
-    if "DAY" in unit:
-        return duration * 60 * 24
-    # MINUTE and unrecognized units both read as minutes (mirrors Orca).
-    return duration
-
-
-def _map_kimi_quota(raw: Any, window_minutes: float | None) -> dict[str, Any] | None:
-    """Map a Kimi quota detail ({limit, used|remaining, resetTime}) to a window."""
-    if not isinstance(raw, dict):
-        return None
-    limit = _to_float(raw.get("limit"))
-    used = _to_float(raw.get("used"))
-    if used is None:
-        # Older responses only carry remaining; used = limit - remaining.
-        remaining = _to_float(raw.get("remaining"))
-        if remaining is not None and limit is not None:
-            used = limit - remaining
-    if limit is None or limit <= 0 or used is None:
-        return None
-    # The CLI has shipped both resetTime and resetAt spellings.
-    resets_at = _reset_epoch_seconds(raw.get("resetTime") or raw.get("resetAt"))
-    return {
-        "used_percent": min(100.0, max(0.0, used / limit * 100)),
-        "window_minutes": window_minutes,
-        "resets_at": resets_at,
-    }
-
-
-def _map_kimi_session_window(limits: Any) -> dict[str, Any] | None:
-    """Pick the limits[] entry closest to a 5-hour session (mirrors Orca)."""
-    if not isinstance(limits, list):
-        return None
-    best: dict[str, Any] | None = None
-    best_distance = math.inf
-    for entry in limits:
-        if not isinstance(entry, dict):
-            continue
-        minutes = _kimi_window_minutes(entry.get("window")) or _SESSION_WINDOW_MINUTES
-        mapped = _map_kimi_quota(entry.get("detail"), minutes)
-        if mapped is None:
-            continue
-        distance = abs(minutes - _SESSION_WINDOW_MINUTES)
-        if best is None or distance < best_distance:
-            best, best_distance = mapped, distance
-    return best
-
-
-async def fetch_kimi_usage(
-    http_client: httpx.AsyncClient, auth_manager: KimiAuthManager
-) -> dict[str, Any]:
-    """Fetch Kimi For Coding quota via the coding backend's usages endpoint.
-
-    Orca reads the Kimi CLI's credentials read-only; the gateway owns its
-    OAuth tokens, so the auth manager's refresh path applies as usual.
-    """
-    try:
-        credentials = await auth_manager.get_credentials()
-    except Exception as exc:  # KimiAuthError and anything the file layer raises
-        return _provider_result("kimi", status="unavailable", error=str(exc))
-    try:
-        # Bearer token + Accept only; the endpoint authenticates by token.
-        response = await http_client.get(
-            _KIMI_USAGE_URL,
-            headers={
-                "Authorization": f"Bearer {credentials.access_token}",
-                "Accept": "application/json",
-            },
-            timeout=_USAGE_TIMEOUT,
-        )
-    except httpx.HTTPError as exc:
-        logger.warning("kimi usage fetch failed: %s", exc)
-        return _provider_result(
-            "kimi", status="error", error=f"failed to reach the Kimi usage API: {exc}"
-        )
-    if response.status_code == 401:
-        return _provider_result(
-            "kimi",
-            status="error",
-            error="Kimi access token rejected (401); run `kimi login` again",
-        )
-    if response.status_code != 200:
-        return _provider_result(
-            "kimi",
-            status="error",
-            error=f"usage API returned {response.status_code}: {response.text[:200]}",
-        )
-    try:
-        data = response.json()
-    except json.JSONDecodeError:
-        return _provider_result(
-            "kimi", status="error", error="usage API returned a non-JSON body"
-        )
-    if not isinstance(data, dict):
-        return _provider_result(
-            "kimi", status="error", error="usage API returned an unexpected payload"
-        )
-    # The top-level usage block is the weekly quota; limits[] carries the
-    # shorter rolling windows, of which the 5-hour one is the session view.
-    session = _map_kimi_session_window(data.get("limits"))
-    weekly = _map_kimi_quota(data.get("usage"), _WEEKLY_WINDOW_MINUTES)
-    if session is None and weekly is None:
-        return _provider_result(
-            "kimi", status="error", error="usage response did not include quota windows"
-        )
-    user = data.get("user")
-    membership = user.get("membership") if isinstance(user, dict) else None
-    level = membership.get("level") if isinstance(membership, dict) else None
-    plan_type = (
-        level.removeprefix("LEVEL_").lower()
-        if isinstance(level, str) and level.startswith("LEVEL_")
-        else None
-    )
-    return _provider_result(
-        "kimi",
-        status="ok",
-        error=None,
-        session=session,
-        weekly=weekly,
-        plan_type=plan_type,
-    )
-
-
 # --- Grok --------------------------------------------------------------------
 # Mirrors Orca's grok-fetcher: the chat-proxy billing endpoint is read with
 # the Grok CLI's OAuth session; the credits view carries the weekly window,
@@ -745,6 +587,20 @@ _GROK_BILLING_URL = "https://cli-chat-proxy.grok.com/v1/billing"
 _GROK_BILLING_CREDITS_URL = _GROK_BILLING_URL + "?format=credits"
 _XAI_TOKEN_AUTH_VALUE = "xai-grok-cli"
 _MONTHLY_WINDOW_MINUTES = 43200
+
+
+def _to_float(value: Any) -> float | None:
+    """Accept quota numbers as strings ("100") as well as ints/floats."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value)
+        except ValueError:
+            return None
+    return None
 
 
 def _grok_billing_headers(credentials: GrokCredentials) -> dict[str, str]:

@@ -269,7 +269,7 @@ body.env-locked .applybar{display:none!important}
 .route-link:hover{text-decoration:underline}
 .comp-custom{display:none;margin-top:10px}
 .comp-custom.show{display:block}
-/* Optional providers (kimi/grok) ship hidden and are revealed by /health:
+/* Optional providers (grok) ship hidden and are revealed by /health:
    local auth detected, or the map already routes to them (a required login
    failure must stay visible). Codex is built in and never hides. */
 .provider-hidden{display:none}
@@ -546,22 +546,6 @@ button.primary:disabled{opacity:.5;cursor:default}
         </div>
         <div class="ubody" id="usage-body-codex"></div>
       </div>
-      <div class="card provider-hidden" id="card-kimi">
-        <div class="ucard-h">
-          <h2>Kimi Status</h2>
-          <button class="urefresh" data-provider="kimi">갱신</button>
-        </div>
-        <div class="sub">게이트웨이가 사용하는 Kimi 로그인 상태와 자격증명 위치입니다. 사용량은 로컬 자격증명으로 직접 조회하며 게이트웨이 트래픽과 무관합니다.</div>
-        <div class="stat" id="kimi-stat">
-          <div class="cardplan" id="usage-plan-kimi"><b class="sk">STANDARD</b></div>
-          <div class="statline" id="kimi-statline"><span class="sk">OK · 계정으로 로그인됨</span><div class="codeblock"><span class="sk">account-placeholder</span></div></div>
-        </div>
-        <div class="kv">
-          <span class="kvh">ENV</span><span class="kvh">VALUE</span>
-          <span class="k"><code>KIMI_CODE_HOME</code></span><span class="v" id="kv-kimi-auth">—</span>
-        </div>
-        <div class="ubody" id="usage-body-kimi"></div>
-      </div>
       <div class="card provider-hidden" id="card-grok">
         <div class="ucard-h">
           <h2>Grok Status</h2>
@@ -630,12 +614,12 @@ button.primary:disabled{opacity:.5;cursor:default}
 <script>
 var CLAUDE_KEYS=["fable","opus","sonnet","haiku"];
 /* Mirrors config.KNOWN_ROUTE_PROVIDERS: every target value names its provider
-   with a "codex:"/"kimi:"/"grok:" style prefix; bare model names are invalid. */
-var ROUTE_PROVIDERS=["codex","kimi","grok"];
+   with a "codex:"/"grok:" style prefix; bare model names are invalid. */
+var ROUTE_PROVIDERS=["codex","grok"];
 /* Live model IDs per provider. Purely autocomplete for the add-node box —
    the gateway never validates map values against a catalog, so an
    unreachable one only costs suggestions. */
-var CATALOG={codex:[],kimi:[],grok:[]};
+var CATALOG={codex:[],grok:[]};
 /* Curated compaction reroute targets, in the dashboard's <select> order.
    "claude-haiku" is deliberately never a curated choice here. */
 var COMPACTION_CURATED_MODELS=["claude-sonnet-5","claude-opus-5","claude-fable-5"];
@@ -662,8 +646,8 @@ var DIR={
   LIVE:{},mapping:{},sources:[],targets:[],sel:null
 };
 function uniq(ids){var seen={};return ids.filter(function(id){if(!id||seen[id])return false;seen[id]=true;return true})}
-/* Codex answers {models:[slug]}; Kimi relays its backend's catalog verbatim,
-   which uses the Anthropic {data:[{id}]} shape. Accept either, ignore the rest. */
+/* Codex answers {models:[slug]}; other catalogs may use the Anthropic
+   {data:[{id}]} shape. Accept either, ignore the rest. */
 function catalogIds(body){
   var list=body&&(Array.isArray(body.models)?body.models:Array.isArray(body.data)?body.data:null);
   if(!list)return[];
@@ -701,15 +685,11 @@ function codexIcon(s){return '<svg viewBox="0 0 24 24" width="'+s+'" height="'+s
   '<rect x="2" y="2" width="20" height="20" rx="5" fill="var(--text)"/>'+
   '<g stroke="var(--canvas)" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round">'+
   '<polyline points="7,9 11,12 7,15"/><line x1="13" y1="15.5" x2="17" y2="15.5"/></g></svg>'}
-function kimiIcon(s){return '<svg viewBox="0 0 24 24" width="'+s+'" height="'+s+'" aria-hidden="true">'+
-  '<rect x="2" y="2" width="20" height="20" rx="5" fill="var(--text)"/>'+
-  '<path transform="translate(4.5 4.5) scale(.625)" fill="var(--canvas)" '+
-  'd="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>'}
 function grokIcon(s){return '<svg viewBox="0 0 24 24" width="'+s+'" height="'+s+'" aria-hidden="true">'+
   '<rect x="2" y="2" width="20" height="20" rx="5" fill="var(--text)"/>'+
   '<g stroke="var(--canvas)" stroke-width="2.4" stroke-linecap="round">'+
   '<line x1="7" y1="7" x2="17" y2="17"/><line x1="17" y1="7" x2="7" y2="17"/></g></svg>'}
-function providerIcon(provider,s){return provider==="kimi"?kimiIcon(s):provider==="grok"?grokIcon(s):codexIcon(s)}
+function providerIcon(provider,s){return provider==="grok"?grokIcon(s):codexIcon(s)}
 var X_ICON='<svg viewBox="0 0 24 24" width="10" height="10" fill="none" stroke="#fff" stroke-width="3.5" '+
   'stroke-linecap="round" aria-hidden="true"><line x1="6" y1="6" x2="18" y2="18"/><line x1="18" y1="6" x2="6" y2="18"/></svg>';
 var drag=null,move=null,panning=null,pan={x:0,y:0},zoom=1;
@@ -1130,14 +1110,14 @@ function renderStatLine(provider,state,title,html){
   if(title)box.title=title;else box.removeAttribute("title");
   document.getElementById(provider+"-statline").innerHTML=html;
 }
-/* Purely cosmetic gating for first-run clarity: kimi/grok are extensions, so
-   their Status cards and Router add-node buttons only appear when /health
-   reports a detected local login — or when the map already routes to them,
+/* Purely cosmetic gating for first-run clarity: grok is an extension, so
+   its Status card and Router add-node button only appear when /health
+   reports a detected local login — or when the map already routes to it,
    where hiding a required-login error would mislead. Nothing functional
    changes: routing, the admin API, and settings.json edits work regardless. */
-var PROVIDER_VISIBLE={kimi:false,grok:false};
+var PROVIDER_VISIBLE={grok:false};
 function setProviderVisibility(h){
-  ["kimi","grok"].forEach(function(p){
+  ["grok"].forEach(function(p){
     var info=((h||{}).providers||{})[p]||{};
     var visible=info.status==="ok"||info.required===true;
     PROVIDER_VISIBLE[p]=visible;
@@ -1160,24 +1140,6 @@ function renderProviderCards(h){
       '<div class="codeblock"><span class="tx">$ codex login</span>'+
       '<button class="cp" id="codex-login-copy" title="복사"></button></div>');
     wireCopy(document.getElementById("codex-login-copy"),"codex login");
-  }
-  var kimi=(h.providers||{}).kimi||{};
-  if(kimi.status==="ok"){
-    renderStatLine("kimi","okv",null,'● OK <span class="detail">Kimi 계정으로 로그인됨</span>'+
-      (kimi.account?'<div class="codeblock">'+esc(String(kimi.account))+"</div>":""));
-  }else if(kimi.required===false){
-    // kimi: 라우트가 없으면 로그인 여부가 readiness와 무관하므로 에러가 아닌 중립으로.
-    renderStatLine("kimi","",kimi.detail||"",
-      '● 미사용 <span class="detail">모델 맵에 kimi: 타겟이 없어 로그인하지 않아도 됩니다</span>'+
-      '<div class="codeblock"><span class="tx">$ kimi login</span>'+
-      '<button class="cp" id="kimi-login-copy" title="복사"></button></div>');
-    wireCopy(document.getElementById("kimi-login-copy"),"kimi login");
-  }else{
-    renderStatLine("kimi","err",kimi.detail||"",
-      '● ERROR <span class="detail">Kimi 로그인이 필요합니다</span>'+
-      '<div class="codeblock"><span class="tx">$ kimi login</span>'+
-      '<button class="cp" id="kimi-login-copy" title="복사"></button></div>');
-    wireCopy(document.getElementById("kimi-login-copy"),"kimi login");
   }
   var grok=(h.providers||{}).grok||{};
   if(grok.status==="ok"){
@@ -1202,7 +1164,6 @@ function renderProviderCards(h){
 }
 function renderFacts(p){
   document.getElementById("kv-codex-home").textContent=p.codex_home||"—";
-  document.getElementById("kv-kimi-auth").textContent=p.kimi_code_home||"—";
   document.getElementById("kv-grok-home").textContent=p.grok_home||"—";
 }
 function renderLogLevel(p){
@@ -2245,7 +2206,7 @@ function restoreUsageButtons(providers){
 }
 /* provider 없이 호출하면 보이는 카드 일괄 갱신(탭 진입 시), 있으면 해당 카드만. */
 function fetchUsage(provider){
-  var targets=provider?[provider]:["claude","codex","kimi","grok"].filter(function(p){
+  var targets=provider?[provider]:["claude","codex","grok"].filter(function(p){
     return PROVIDER_VISIBLE[p]!==false;
   });
   if(!provider)targets.forEach(function(p){renderUsageProvider(p,null)});
@@ -2356,7 +2317,7 @@ function boot(){
   // Fill the usage bodies before the first request goes out: an empty body
   // would paint short and then grow, which is the jump the skeleton exists
   // to remove.
-  ["claude","codex","kimi","grok"].forEach(function(p){renderUsageProvider(p,null)});
+  ["claude","codex","grok"].forEach(function(p){renderUsageProvider(p,null)});
   document.getElementById("ct-in-icon").innerHTML=codexIcon(14);
   jfetch("/api/hello").then(function(hello){
     authRequired=!!(hello.body&&hello.body.local_auth_required);
@@ -2365,7 +2326,6 @@ function boot(){
       jfetch("/admin/settings/mapping"),
       jfetch("/health"),
       jfetch("/admin/providers/codex/models"),
-      jfetch("/admin/providers/kimi/models"),
       jfetch("/admin/providers/grok/models"),
       jfetch("/admin/settings/log-level"),
       jfetch("/admin/settings/compaction"),
@@ -2373,8 +2333,8 @@ function boot(){
     ]);
   }).then(function(results){
     var mapping=results[0],health=results[1];
-    var codexCatalog=results[2],kimiCatalog=results[3],grokCatalog=results[4],loglevel=results[5];
-    var compactionResp=results[6],routingResp=results[7];
+    var codexCatalog=results[2],grokCatalog=results[3],loglevel=results[4];
+    var compactionResp=results[5],routingResp=results[6];
     if(loglevel.ok)renderLogLevel(loglevel.body);
     if(compactionResp.ok){
       renderCompactionState(compactionResp.body);
@@ -2397,10 +2357,9 @@ function boot(){
       showToast('<span class="chip chip-err">ERROR</span><span class="lat">'+mapping.status+
         '</span><br>GET /admin/settings/mapping<br><span class="dim">'+esc(errDetail(mapping.body))+"</span>",true);
     }
-    // A catalog only feeds the add-node suggestions, and Kimi's routinely 401s
-    // when the gateway has no Kimi login, so failures stay silent here.
+    // A catalog only feeds the add-node suggestions, and it can 401 when the
+    // gateway has no matching login, so failures stay silent here.
     if(codexCatalog.ok)CATALOG.codex=catalogIds(codexCatalog.body);
-    if(kimiCatalog.ok)CATALOG.kimi=catalogIds(kimiCatalog.body);
     if(grokCatalog.ok)CATALOG.grok=catalogIds(grokCatalog.body);
     DIR.mapping=Object.assign({},DIR.LIVE);
     if(health.body&&health.body.providers){
