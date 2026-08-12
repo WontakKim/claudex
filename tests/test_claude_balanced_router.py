@@ -75,6 +75,13 @@ def _reference_session_key_digest(seed: bytes, kind: bytes, canonical_utf8: byte
     return hmac.new(seed, frame, hashlib.sha256).digest()
 
 
+def _reference_pin_key_digest(seed: bytes, logical_digest: bytes, family: bytes) -> bytes:
+    framed = b""
+    for field in (logical_digest, family):
+        framed += len(field).to_bytes(8, "big") + field
+    return hmac.new(seed, b"claudex-pin-key-v2" + b"\x00" + framed, hashlib.sha256).digest()
+
+
 # ---------------------------------------------------------------------------
 # Usage poll coordinator (T-18, fix for gap G-1): the public mirror the
 # runtime-owned background driver reads to pace its own loop.
@@ -1885,17 +1892,42 @@ def test_session_key_salts_the_pin_digest_by_family_and_shares_the_scoring_diges
 
     default_key = derive_session_key(body, seed, "default")
     fable_key = derive_session_key(body, seed, "fable")
-    default_again = derive_session_key(body, seed, "default")
 
-    assert default_key is not None and fable_key is not None and default_again is not None
+    assert default_key is not None and fable_key is not None
     assert default_key.digest != fable_key.digest
-    assert default_key.digest == default_again.digest
     assert default_key.scoring_digest == fable_key.scoring_digest
-    # The pin domain is separated from the logical session-key domain.
     assert default_key.digest != default_key.scoring_digest
+    assert default_key.digest == _reference_pin_key_digest(
+        seed, default_key.scoring_digest, b"default"
+    )
+    assert fable_key.digest == _reference_pin_key_digest(seed, fable_key.scoring_digest, b"fable")
     assert (default_key.family, fable_key.family) == ("default", "fable")
     with pytest.raises(ValueError):
         derive_session_key(body, seed, "sonnet")
+
+
+def test_place_session_rejects_a_family_mismatched_model() -> None:
+    seed = b"seed-family-guard"
+    router = _make_router()
+    fable_key = derive_session_key(_family_test_body(), seed, "fable")
+    default_key = derive_session_key(_family_test_body(), seed, "default")
+    assert fable_key is not None and default_key is not None
+    candidates = [_candidate("acct-a")]
+
+    with pytest.raises(ValueError):
+        router.place_session(
+            session_key=fable_key, model="claude-sonnet-5", candidates=candidates, seed=seed
+        )
+    with pytest.raises(ValueError):
+        router.place_session(
+            session_key=default_key, model="claude-fable-5", candidates=candidates, seed=seed
+        )
+
+    hand_built_key = SessionKey(digest=b"\x40" * 32, kind="content_hash")
+    placement = router.place_session(
+        session_key=hand_built_key, model="claude-fable-5", candidates=candidates, seed=seed
+    )
+    assert placement.created
 
 
 def test_equal_family_weights_co_locate_both_family_pins_of_one_session() -> None:
@@ -1913,15 +1945,105 @@ def test_equal_family_weights_co_locate_both_family_pins_of_one_session() -> Non
         session_key=fable_key, model="claude-fable-5", candidates=candidates, seed=seed
     )
 
-    assert fable_placement.created  # a second pin, not a hit on the default pin
+    assert fable_placement.created
     assert fable_placement.account_id == default_placement.account_id
     assert router.pin_count() == 2
 
 
+def test_cross_family_migrations_update_only_their_own_pin() -> None:
+    seed = b"seed-cross-family-migrations"
+    router = _make_router()
+    default_key = derive_session_key(_family_test_body(), seed, "default")
+    fable_key = derive_session_key(_family_test_body(), seed, "fable")
+    assert default_key is not None and fable_key is not None
+    candidates = [_candidate(account_id) for account_id in ("acct-a", "acct-b", "acct-c")]
+    source_candidates = [candidates[0]]
+
+    router.place_session(
+        session_key=default_key,
+        model="claude-sonnet-5",
+        candidates=source_candidates,
+        seed=seed,
+    )
+    router.place_session(
+        session_key=fable_key,
+        model="claude-fable-5",
+        candidates=source_candidates,
+        seed=seed,
+    )
+    default_reservation, default_is_owner = router.acquire_migration_reservation(
+        default_key.digest,
+        source_account="acct-a",
+        source_generation=0,
+        target_account="acct-b",
+        attempt_id="default-owner",
+    )
+    fable_reservation, fable_is_owner = router.acquire_migration_reservation(
+        fable_key.digest,
+        source_account="acct-a",
+        source_generation=0,
+        target_account="acct-c",
+        attempt_id="fable-owner",
+    )
+    assert default_is_owner and fable_is_owner
+
+    default_outcome, default_pin, _default_barrier = router.commit_at_headers(
+        default_key.digest,
+        attempt_id="default-owner",
+        source_account="acct-a",
+        source_generation=0,
+        target_account="acct-b",
+        target_account_incarnation_id="inc-acct-b",
+    )
+
+    assert default_outcome == "committed"
+    assert default_pin is not None
+    assert (default_pin.account_id, default_pin.generation) == ("acct-b", 1)
+    fable_pin = router.get_pin(fable_key.digest)
+    assert fable_pin is not None
+    assert (fable_pin.account_id, fable_pin.generation) == ("acct-a", 0)
+    assert default_reservation.outcome == "committed"
+    assert router.get_migration_reservation(fable_key.digest) is fable_reservation
+
+    fable_outcome, fable_pin, _fable_barrier = router.commit_at_headers(
+        fable_key.digest,
+        attempt_id="fable-owner",
+        source_account="acct-a",
+        source_generation=0,
+        target_account="acct-c",
+        target_account_incarnation_id="inc-acct-c",
+    )
+
+    assert fable_outcome == "committed"
+    assert fable_pin is not None
+    final_default_pin = router.get_pin(default_key.digest)
+    assert final_default_pin is not None
+    assert (final_default_pin.account_id, final_default_pin.generation) == ("acct-b", 1)
+    assert (fable_pin.account_id, fable_pin.generation) == ("acct-c", 1)
+
+
+def test_account_removal_deletes_both_family_pins_for_one_session() -> None:
+    seed = b"seed-cross-family-removal"
+    router = _make_router()
+    default_key = derive_session_key(_family_test_body(), seed, "default")
+    fable_key = derive_session_key(_family_test_body(), seed, "fable")
+    assert default_key is not None and fable_key is not None
+    candidates = [_candidate("acct-a")]
+
+    router.place_session(
+        session_key=default_key, model="claude-sonnet-5", candidates=candidates, seed=seed
+    )
+    router.place_session(
+        session_key=fable_key, model="claude-fable-5", candidates=candidates, seed=seed
+    )
+
+    router.remove_account("acct-a", "inc-acct-a")
+
+    assert router.get_pin(default_key.digest) is None
+    assert router.get_pin(fable_key.digest) is None
+
+
 def test_fable_family_cooldown_diverges_only_the_fable_pin() -> None:
-    # The haiku-first scenario: the default pin lands first; its account then
-    # becomes fable-cooled; the fable pin must land on the other account
-    # while the default pin keeps its account and generation.
     seed = b"seed-diverge"
     clock = _FakeClock()
     router = _make_router(clock=clock)

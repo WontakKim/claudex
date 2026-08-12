@@ -528,6 +528,31 @@ def test_older_unsupported_schema_is_quarantined_and_replaced_with_a_fresh_store
     assert len(quarantined) == 1
 
 
+def test_schema_v1_pin_rows_are_quarantined_on_open(tmp_path: Path) -> None:
+    path = tmp_path / "runtime.sqlite3"
+    store = ClaudePoolRuntimeStateStore.open_(path)
+    pin_kwargs = _pin_kwargs(balanced_epoch_id=store.balanced_epoch_id, model_family="fable")
+    store.upsert_pin(**pin_kwargs).wait(timeout=5)
+    store.close()
+
+    conn = sqlite3.connect(str(path))
+    conn.execute("UPDATE meta SET value = '1' WHERE key = 'schema_version'")
+    conn.commit()
+    conn.close()
+
+    reopened = ClaudePoolRuntimeStateStore.open_(path)
+    try:
+        assert reopened.get_pin(pin_kwargs["session_key_digest"]) is None
+        assert reopened.pin_count() == 0
+        restored = reopened.restore(RestoreValidationContext(now_utc=time.time()))
+        assert restored.pins == {}
+    finally:
+        reopened.close()
+
+    quarantined = list(tmp_path.glob("runtime.sqlite3.quarantined-*"))
+    assert len(quarantined) == 1
+
+
 def test_quarantine_moves_wal_and_shm_siblings_together(tmp_path: Path) -> None:
     path = tmp_path / "runtime.sqlite3"
     store = ClaudePoolRuntimeStateStore.open_(path, debounce_seconds=5.0)

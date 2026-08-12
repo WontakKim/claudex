@@ -1364,6 +1364,12 @@ class ClaudeBalancedRouter:
         """The atomic pick+pin-insert critical section: entirely synchronous (no `await`),
         so no other coroutine can interleave between the pick and the pin-map insert.
         """
+        family = quota_family(model)
+        if session_key.family and session_key.family != family:
+            raise ValueError(
+                f"session key family {session_key.family!r} does not match the model's quota family {family!r}"
+            )
+
         now = self._clock() if now is None else now
         self.purge_expired_pins(now=now)
 
@@ -1388,7 +1394,6 @@ class ClaudeBalancedRouter:
         if not eligible:
             raise NoEligibleAccountError("no eligible account is available to place this session")
 
-        family = quota_family(model)
         if self._is_cold_start(eligible_by_id, all_by_id, family, serving_account_id, now=now):
             chosen_id = serving_account_id
             assert chosen_id is not None

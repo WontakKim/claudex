@@ -7035,6 +7035,43 @@ def test_balanced_quota_429_migrates_commits_and_cools_down_the_source(
         assert not client.app.state.claude_account_cooldowns.is_cooling(target_id)
 
 
+def test_balanced_migration_hop_uses_the_scoring_digest(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _balanced_env(monkeypatch, tmp_path)
+    _register_balanced_accounts(2)
+    tokens_by_call: list[str] = []
+    recorded_digests: list[bytes] = []
+    original_pick_account = server._balanced_pick_account
+
+    def recording_pick_account(*args: Any, **kwargs: Any) -> str:
+        recorded_digests.append(kwargs["session_key_digest"])
+        return original_pick_account(*args, **kwargs)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        tokens_by_call.append(request.headers["authorization"])
+        if len(tokens_by_call) == 1:
+            return _quota_429()
+        return httpx.Response(200, json={"id": "msg_1"})
+
+    with _create_test_client(
+        monkeypatch, tmp_path, config=GatewayConfig(), base_url="http://127.0.0.1:8787"
+    ) as client:
+        runtime = _enable_balanced(client, handler)
+        monkeypatch.setattr(server, "_balanced_pick_account", recording_pick_account)
+        body = _balanced_body(_new_session_id())
+
+        response = client.post("/v1/messages", json=body)
+
+        assert response.status_code == 200
+        assert len(tokens_by_call) == 2
+        session_key = derive_session_key(body, runtime.epoch_seed, "fable")
+        assert session_key is not None
+        assert recorded_digests
+        assert all(digest == session_key.scoring_digest for digest in recorded_digests)
+        assert all(digest != session_key.digest for digest in recorded_digests)
+
+
 def test_balanced_migration_target_preheader_failure_tries_the_next_candidate(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -7437,6 +7474,69 @@ def test_balanced_count_tokens_follows_the_pin_without_refresh_or_router_state_c
         assert runtime.router.pin_count() == pin_count_before
         assert dict(runtime.router.migration_outcome_counts) == migration_counts_before
         assert runtime.router.in_flight_count(account_id) == in_flight_before
+
+
+def test_balanced_count_tokens_resolves_the_same_family_pin_as_messages(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _balanced_env(monkeypatch, tmp_path)
+    _account_id, access_token = _register_balanced_accounts(1)[0]
+    count_calls: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/count_tokens"):
+            count_calls.append(request)
+            return httpx.Response(200, json={"input_tokens": 7})
+        return httpx.Response(200, json={"id": "msg_1"})
+
+    with _create_test_client(
+        monkeypatch, tmp_path, config=GatewayConfig(), base_url="http://127.0.0.1:8787"
+    ) as client:
+        _enable_balanced(client, handler)
+        body = _balanced_body(_new_session_id())
+        pinned = client.post("/v1/messages", json=body)
+        assert pinned.status_code == 200
+
+        def fail_fallback_pick(*args: Any, **kwargs: Any) -> str:
+            raise AssertionError("fallback pick must not run")
+
+        monkeypatch.setattr(server, "_balanced_pick_account", fail_fallback_pick)
+        counted = client.post("/v1/messages/count_tokens", json=body)
+
+        assert counted.status_code == 200
+        assert len(count_calls) == 1
+        assert count_calls[0].headers["authorization"] == f"Bearer {access_token}"
+
+
+def test_balanced_count_tokens_fallback_uses_the_scoring_digest(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _balanced_env(monkeypatch, tmp_path)
+    _register_balanced_accounts(1)
+    recorded_digests: list[bytes] = []
+    original_pick_account = server._balanced_pick_account
+
+    def recording_pick_account(*args: Any, **kwargs: Any) -> str:
+        recorded_digests.append(kwargs["session_key_digest"])
+        return original_pick_account(*args, **kwargs)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"input_tokens": 7})
+
+    with _create_test_client(
+        monkeypatch, tmp_path, config=GatewayConfig(), base_url="http://127.0.0.1:8787"
+    ) as client:
+        runtime = _enable_balanced(client, handler)
+        monkeypatch.setattr(server, "_balanced_pick_account", recording_pick_account)
+        body = _balanced_body(_new_session_id())
+
+        response = client.post("/v1/messages/count_tokens", json=body)
+
+        assert response.status_code == 200
+        session_key = derive_session_key(body, runtime.epoch_seed, "fable")
+        assert session_key is not None
+        assert recorded_digests == [session_key.scoring_digest]
+        assert recorded_digests[0] != session_key.digest
 
 
 def test_balanced_count_tokens_never_creates_a_pin_or_a_cooldown(
