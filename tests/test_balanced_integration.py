@@ -36,6 +36,7 @@ import pytest
 from starlette.testclient import TestClient
 
 from claudex_gateway import claude_accounts, paths
+from claudex_gateway.claude_ambient_account import AmbientClaudeAuthManager
 from claudex_gateway.claude_balanced_router import (
     CAPABILITY_CLASSIFIER_VERSION,
     AccountCandidate,
@@ -158,6 +159,71 @@ def _register_balanced_ready_account(
     return record.id
 
 
+def _write_ambient_login(
+    tmp_path: Path,
+    *,
+    email: str = "ambient@example.com",
+    organization_uuid: str = "org-ambient",
+    expires_at: float | None = None,
+) -> None:
+    home = tmp_path / "home"
+    claude_home = home / ".claude"
+    claude_home.mkdir(parents=True, exist_ok=True)
+    account_uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+    (home / ".claude.json").write_text(
+        json.dumps(
+            {
+                "oauthAccount": {
+                    "emailAddress": email,
+                    "organizationUuid": organization_uuid,
+                    "accountUuid": account_uuid,
+                    "organizationType": "claude_max",
+                    "organizationRateLimitTier": "default_claude_max_5x",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    (claude_home / ".credentials.json").write_text(
+        json.dumps(
+            {
+                "claudeAiOauth": {
+                    "accessToken": "ambient-access-1",
+                    "expiresAt": (
+                        (time.time() + 3600) * 1000
+                        if expires_at is None
+                        else expires_at
+                    ),
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def _capture_balanced_candidate_ids(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> set[str]:
+    captured: set[str] = set()
+
+    async def capture_records(
+        _request: Any,
+        _raw_body: bytes,
+        _parsed_body: Any,
+        _runtime: ClaudeBalancedRuntime,
+        records_by_id: dict[str, Any],
+        _session_key: SessionKey,
+        _model: str,
+    ) -> Any:
+        captured.update(records_by_id)
+        return server.JSONResponse({"captured": True})
+
+    monkeypatch.setattr(server, "_serve_balanced_pinned_message", capture_records)
+    response = client.post("/v1/messages", json=_balanced_body(str(uuid.uuid4())))
+    assert response.status_code == 200
+    return captured
+
+
 def _message_body(model: str) -> dict[str, Any]:
     return {"model": model, "max_tokens": 16, "messages": [{"role": "user", "content": "hi"}]}
 
@@ -192,6 +258,148 @@ class _FakeClock:
 
     def advance(self, seconds: float) -> None:
         self.value += seconds
+
+
+# ===========================================================================
+# Ambient local login membership
+# ===========================================================================
+
+
+def test_distinct_ambient_login_joins_balanced_candidates_and_serves_request(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _balanced_env(monkeypatch, tmp_path)
+    registered_id = _register_balanced_ready_account()
+    _write_ambient_login(tmp_path)
+    message_authorizations: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/oauth/usage":
+            return httpx.Response(200, json={})
+        message_authorizations.append(request.headers["authorization"])
+        return httpx.Response(200, json={"id": "msg_ambient"})
+
+    with _create_test_client(monkeypatch, base_url="http://127.0.0.1:8787") as client:
+        runtime = _enable_balanced(client, handler)
+        provider = client.app.state.claude_ambient_accounts
+        member = provider.pool_member()
+        assert member is not None
+
+        records = claude_accounts.load_registry()
+        records_by_id = {record.id: record for record in records}
+        records_by_id[member.record.id] = member.record
+        candidates = server._balanced_candidates(
+            records_by_id.values(), runtime.router, family="default", now=time.monotonic()
+        )
+        assert {candidate.account_id for candidate in candidates} == {
+            registered_id,
+            member.record.id,
+        }
+
+        for _ in range(100):
+            body = _balanced_body(str(uuid.uuid4()))
+            session_key = derive_session_key(body, runtime.epoch_seed, "default")
+            selected_id = server._balanced_pick_account(
+                runtime.router,
+                session_key_digest=session_key.scoring_digest_or_default,
+                model=body["model"],
+                candidates=candidates,
+                seed=runtime.epoch_seed,
+            )
+            if selected_id == member.record.id:
+                break
+        else:
+            pytest.fail("could not derive a session routed to the ambient account")
+
+        response = client.post("/v1/messages", json=body)
+        assert response.status_code == 200
+        assert message_authorizations == ["Bearer ambient-access-1"]
+        pin = runtime.router.get_pin(session_key.digest)
+        assert pin is not None and pin.account_id == member.record.id
+
+
+def test_registered_duplicate_identity_suppresses_ambient_candidate(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _balanced_env(monkeypatch, tmp_path)
+    registered_id = _register_balanced_ready_account(email="same@example.com")
+    _write_ambient_login(
+        tmp_path, email="same@example.com", organization_uuid="org-1"
+    )
+
+    with _create_test_client(
+        monkeypatch, base_url="http://127.0.0.1:8787"
+    ) as client:
+        _enable_balanced(client, lambda _request: httpx.Response(200, json={}))
+        provider = client.app.state.claude_ambient_accounts
+        member = provider.pool_member()
+        assert member is not None
+
+        candidate_ids = _capture_balanced_candidate_ids(client, monkeypatch)
+        assert candidate_ids == {registered_id}
+        assert member.record.id not in candidate_ids
+
+
+def test_include_local_login_false_suppresses_ambient_candidate(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _balanced_env(monkeypatch, tmp_path)
+    registered_id = _register_balanced_ready_account()
+    _write_ambient_login(tmp_path)
+    settings_file = tmp_path / "settings.json"
+    settings_file.write_text(
+        json.dumps(
+            {
+                "claude_account.routing": {
+                    "mode": "disabled",
+                    "include_local_login": False,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with _create_test_client(
+        monkeypatch,
+        config=GatewayConfig.load(settings_file),
+        base_url="http://127.0.0.1:8787",
+    ) as client:
+        assert client.app.state.claude_ambient_accounts is None
+        _enable_balanced(client, lambda _request: httpx.Response(200, json={}))
+        candidate_ids = _capture_balanced_candidate_ids(client, monkeypatch)
+        assert candidate_ids == {registered_id}
+
+
+def test_stale_ambient_credentials_do_not_create_balanced_candidate(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _balanced_env(monkeypatch, tmp_path)
+    registered_id = _register_balanced_ready_account()
+    _write_ambient_login(tmp_path, expires_at=(time.time() - 60) * 1000)
+
+    with _create_test_client(
+        monkeypatch, base_url="http://127.0.0.1:8787"
+    ) as client:
+        _enable_balanced(client, lambda _request: httpx.Response(200, json={}))
+        provider = client.app.state.claude_ambient_accounts
+        assert provider.pool_member() is None
+        assert _capture_balanced_candidate_ids(client, monkeypatch) == {registered_id}
+
+
+def test_auth_manager_routes_ambient_id_without_caching_directory_manager(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _balanced_env(monkeypatch, tmp_path)
+    _write_ambient_login(tmp_path)
+    app = server.create_app(GatewayConfig())
+    provider = app.state.claude_ambient_accounts
+    member = provider.pool_member()
+    assert member is not None
+
+    manager = server._claude_account_auth_manager(app.state, member.record.id)
+
+    assert isinstance(manager, AmbientClaudeAuthManager)
+    assert app.state.claude_account_auth_managers == {}
 
 
 # ===========================================================================

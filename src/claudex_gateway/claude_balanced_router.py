@@ -2462,6 +2462,9 @@ class ClaudeBalancedRuntime:
         # without a `usage_cache` (every direct, non-HTTP caller keeps this
         # optional; server.py's real routing handler always supplies one).
         self.usage_poll_coordinator: ClaudeUsagePollCoordinator | None = None
+        self.ambient_usage_poll_supplier: (
+            Callable[[Sequence[AccountRecord]], UsagePollAccount | None] | None
+        ) = None
 
         self._store: ClaudePoolRuntimeStateStore | None = None
         # T-18 (fix for gap G-1): the background driver that actually calls
@@ -2680,6 +2683,11 @@ class ClaudeBalancedRuntime:
                             accounts_root / record.id
                         ),
                     )
+            if self.ambient_usage_poll_supplier is not None:
+                ambient_account = self.ambient_usage_poll_supplier(records)
+                if ambient_account is not None:
+                    ready_ids.append(ambient_account.account_id)
+                    accounts[ambient_account.account_id] = ambient_account
             await coordinator.run_due_poll(ready_ids, accounts=accounts)
         except asyncio.CancelledError:
             raise

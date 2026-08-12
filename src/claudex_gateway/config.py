@@ -144,19 +144,27 @@ def parse_claude_account_id(value: str) -> str:
 VALID_CLAUDE_ACCOUNT_ROUTING_MODES = ("disabled", "fallback", "balanced")
 
 
-def parse_claude_account_routing(value: object) -> str:
-    """Parse a claude_account.routing value into its routing mode.
+@dataclass(frozen=True)
+class ClaudeAccountRoutingPolicy:
+    """A parsed claude_account.routing policy document."""
+
+    mode: str
+    include_local_login: bool = True
+
+
+def parse_claude_account_routing(value: object) -> ClaudeAccountRoutingPolicy:
+    """Parse a claude_account.routing value into its routing policy.
 
     The setting is a policy document — {"mode": "fallback"} — so a mode can
-    carry its own config blocks without renaming the key. The settings file
-    holds the document itself; the environment variable holds it
-    JSON-encoded, with an empty string meaning disabled like the other
-    opt-in settings. "balanced" is the weighted-HRW pool-wide routing mode
-    (design v2), constructed and persisted the same way as "fallback".
+    carry its own config without renaming the key. The settings file holds the
+    document itself; the environment variable holds it JSON-encoded, with an
+    empty string meaning disabled like the other opt-in settings. "balanced"
+    is the weighted-HRW pool-wide routing mode (design v2), constructed and
+    persisted the same way as "fallback".
     """
     if isinstance(value, str):
         if not value:
-            return "disabled"
+            return ClaudeAccountRoutingPolicy(mode="disabled")
         try:
             value = json.loads(value)
         except json.JSONDecodeError as exc:
@@ -169,18 +177,26 @@ def parse_claude_account_routing(value: object) -> str:
             f'{{"mode": "fallback"}}, got {value!r}'
         )
     mode = value.get("mode")
-    unknown = sorted(set(value) - {"mode"})
+    include_local_login = value.get("include_local_login", True)
+    unknown = sorted(set(value) - {"mode", "include_local_login"})
     if unknown:
         raise ConfigError(
             f"claude account routing has unknown keys: {', '.join(map(str, unknown))}; "
-            "valid keys: mode"
+            "valid keys: mode, include_local_login"
         )
     if mode not in VALID_CLAUDE_ACCOUNT_ROUTING_MODES:
         raise ConfigError(
             "claude account routing mode must be one of "
             f"{', '.join(VALID_CLAUDE_ACCOUNT_ROUTING_MODES)}, got {mode!r}"
         )
-    return mode
+    if not isinstance(include_local_login, bool):
+        raise ConfigError(
+            "claude account routing include_local_login must be a JSON boolean, "
+            f"got {include_local_login!r}"
+        )
+    return ClaudeAccountRoutingPolicy(
+        mode=mode, include_local_login=include_local_login
+    )
 
 
 def _default_kimi_code_home() -> Path:
@@ -221,6 +237,8 @@ class GatewayConfig:
     # order; "balanced" spreads sessions across the registered pool by
     # weighted HRW, served through a ClaudeBalancedRuntime.
     claude_account_routing_mode: str = "disabled"
+    # Whether balanced routing includes the local Claude login in its pool.
+    claude_account_include_local_login: bool = True
     # Where settings are read from and where runtime changes are persisted.
     settings_file: Path = field(default_factory=paths.settings_file)
 
@@ -350,15 +368,18 @@ class GatewayConfig:
         if value is None:
             if label == env_name:
                 claude_account_routing_mode = "disabled"
+                claude_account_include_local_login = True
             else:
                 # The key is present in the settings file (e.g. JSON null) —
                 # that must not be conflated with "not configured".
                 raise ConfigError(f"{label} must be a JSON object, got {value!r}")
         else:
             try:
-                claude_account_routing_mode = parse_claude_account_routing(value)
+                routing_policy = parse_claude_account_routing(value)
             except ConfigError as exc:
                 raise ConfigError(f"{label}: {exc}") from exc
+            claude_account_routing_mode = routing_policy.mode
+            claude_account_include_local_login = routing_policy.include_local_login
 
         return cls(
             host=host,
@@ -373,6 +394,7 @@ class GatewayConfig:
             compaction_model=compaction_model,
             claude_account_id=claude_account_id,
             claude_account_routing_mode=claude_account_routing_mode,
+            claude_account_include_local_login=claude_account_include_local_login,
             settings_file=settings_file,
         )
 

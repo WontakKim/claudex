@@ -386,9 +386,9 @@ class TestClaudeAccountRoutingSetting:
 
     def test_absent_key_defaults_to_disabled(self, tmp_path: Path) -> None:
         settings_file = self._write(tmp_path, {})
-        assert (
-            GatewayConfig.load(settings_file).claude_account_routing_mode == "disabled"
-        )
+        config = GatewayConfig.load(settings_file)
+        assert config.claude_account_routing_mode == "disabled"
+        assert config.claude_account_include_local_login is True
 
     def test_file_document_sets_the_mode(self, tmp_path: Path) -> None:
         settings_file = self._write(
@@ -424,6 +424,20 @@ class TestClaudeAccountRoutingSetting:
         monkeypatch.setenv("CLAUDEX_CLAUDE_ACCOUNT_ROUTING", '{"mode": "balanced"}')
         assert GatewayConfig.from_env().claude_account_routing_mode == "balanced"
 
+    def test_explicit_false_excludes_local_login(self, tmp_path: Path) -> None:
+        settings_file = self._write(
+            tmp_path,
+            {
+                "claude_account.routing": {
+                    "mode": "balanced",
+                    "include_local_login": False,
+                }
+            },
+        )
+        config = GatewayConfig.load(settings_file)
+        assert config.claude_account_routing_mode == "balanced"
+        assert config.claude_account_include_local_login is False
+
     def test_balanced_mode_still_rejects_unknown_keys(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -451,6 +465,19 @@ class TestClaudeAccountRoutingSetting:
         with pytest.raises(ConfigError, match="unknown keys: weights"):
             GatewayConfig.load(settings_file)
 
+    def test_non_boolean_include_local_login_is_rejected(self, tmp_path: Path) -> None:
+        settings_file = self._write(
+            tmp_path,
+            {
+                "claude_account.routing": {
+                    "mode": "balanced",
+                    "include_local_login": "yes",
+                }
+            },
+        )
+        with pytest.raises(ConfigError, match="must be a JSON boolean"):
+            GatewayConfig.load(settings_file)
+
     def test_missing_mode_key_is_rejected(self, tmp_path: Path) -> None:
         settings_file = self._write(tmp_path, {"claude_account.routing": {}})
         with pytest.raises(
@@ -474,10 +501,20 @@ class TestClaudeAccountRoutingSetting:
             GatewayConfig.from_env()
 
     def test_parse_returns_disabled_for_explicit_disabled_document(self) -> None:
-        assert parse_claude_account_routing({"mode": "disabled"}) == "disabled"
+        policy = parse_claude_account_routing({"mode": "disabled"})
+        assert policy.mode == "disabled"
 
-    def test_parse_returns_balanced_for_explicit_balanced_document(self) -> None:
-        assert parse_claude_account_routing({"mode": "balanced"}) == "balanced"
+    def test_parse_returns_balanced_policy_with_local_login_default(self) -> None:
+        policy = parse_claude_account_routing({"mode": "balanced"})
+        assert policy.mode == "balanced"
+        assert policy.include_local_login is True
+
+    def test_parse_returns_balanced_policy_without_local_login(self) -> None:
+        policy = parse_claude_account_routing(
+            {"mode": "balanced", "include_local_login": False}
+        )
+        assert policy.mode == "balanced"
+        assert policy.include_local_login is False
 
     @staticmethod
     def _write(tmp_path: Path, payload: object) -> Path:

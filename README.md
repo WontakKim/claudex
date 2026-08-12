@@ -311,9 +311,17 @@ expires — the client never has to handle the rate limit itself as long as
 any account has quota left.
 
 The mode is the `claude_account.routing` settings key — a policy document
-like `{"mode": "fallback"}`, leaving room for future modes (a usage-
-balancing `balanced` is reserved and refused until implemented) — managed
-at runtime through `/admin/providers/claude/pool/routing`:
+like `{"mode": "fallback"}` or `{"mode": "balanced"}` — managed at runtime
+through `/admin/providers/claude/pool/routing`. Its optional
+`include_local_login` key defaults to `true` and applies only to balanced
+routing.
+
+In balanced mode, the machine's own Claude Code login automatically joins
+the pool. The gateway reads its current credential without modifying or
+refreshing it, leaving the CLI as the sole token refresher and avoiding the
+single-use refresh-token race that could log one process out. A matching
+registered identity takes precedence; set `"include_local_login": false` in
+the policy document to opt out.
 
 ```sh
 curl http://127.0.0.1:8787/admin/providers/claude/pool/routing
@@ -401,7 +409,7 @@ stays available for one-off overrides.
 | `CLAUDEX_LOCAL_TOKEN` | unset | Bearer token required by the model request routes and the admin/dashboard routes when set; mandatory for non-loopback binds. See [the passthrough interaction](#mixing-claude-and-codex-models) |
 | `CLAUDEX_COMPACTION_MODEL` | unset | `compaction.model` setting: opt-in `claude:<model-id>` reroute target for oversized Claude Code compaction requests; unset (default) disables the reroute entirely. See [Compaction reroute](#compaction-reroute) |
 | `CLAUDEX_CLAUDE_ACCOUNT_ID` | unset | `claude_account.id` setting: id of the registered Claude account that serves Anthropic passthrough traffic; unset (default) forwards client credentials untouched. See [Serving with a registered account](#serving-with-a-registered-account-account-use) |
-| `CLAUDEX_CLAUDE_ACCOUNT_ROUTING` | unset | `claude_account.routing` setting as a JSON-encoded policy document, e.g. `{"mode": "fallback"}`; unset or empty (default) keeps multi-account routing disabled. See [Ordered fallback across registered accounts](#ordered-fallback-across-registered-accounts) |
+| `CLAUDEX_CLAUDE_ACCOUNT_ROUTING` | unset | `claude_account.routing` setting as a JSON-encoded policy document, e.g. `{"mode": "fallback"}` or `{"mode": "balanced", "include_local_login": false}`; `include_local_login` defaults to `true` and controls local Claude Code login participation in balanced mode only. Unset or empty keeps multi-account routing disabled. See [Ordered fallback across registered accounts](#ordered-fallback-across-registered-accounts) |
 
 ### settings.json
 

@@ -45,6 +45,11 @@ from claudex_gateway.claude_accounts import (
     mark_account_needs_reauth,
     remove_account,
 )
+from claudex_gateway.claude_ambient_account import (
+    AmbientAccountProvider,
+    AmbientClaudeAuthManager,
+    is_duplicate_identity,
+)
 from claudex_gateway.claude_auth import (
     ClaudeAccountAuthError,
     ClaudeAccountAuthManager,
@@ -59,6 +64,7 @@ from claudex_gateway.claude_balanced_router import (
     ClaudeUsagePollCoordinator,
     NoEligibleAccountError,
     SessionKey,
+    UsagePollAccount,
     binding_windows,
     capability_key,
     derive_session_key,
@@ -355,6 +361,7 @@ async def _passthrough_to_anthropic(
         return await _passthrough_with_claude_account(
             request, raw_body, parsed_body, config.claude_account_id
         )
+    logger.info("anthropic passthrough: verbatim client credentials for %s", request.url.path)
     headers = {
         key: value
         for key, value in request.headers.items()
@@ -441,19 +448,33 @@ def _claude_account_unavailable(message: str) -> JSONResponse:
     return JSONResponse(_claude_error_body("api_error", message), status_code=503)
 
 
-async def _mark_account_needs_reauth_best_effort(account_id: str) -> None:
+def _account_profile_fingerprint(app_state: Any, account_id: str) -> str | None:
+    provider: AmbientAccountProvider | None = app_state.claude_ambient_accounts
+    if provider is not None and provider.is_ambient_account_id(account_id):
+        member = provider.pool_member()
+        return member.profile_fingerprint if member is not None else None
+    return load_account_profile_fingerprint(paths.accounts_dir("claude") / account_id)
+
+
+async def _mark_account_needs_reauth_best_effort(app_state: Any, account_id: str) -> None:
     """Persist needs-reauth for `account_id`, never failing the caller.
 
     A concurrent `account remove` (AccountNotFoundError) or a registry I/O
     problem must not mask the response the caller is about to return.
     """
+    provider: AmbientAccountProvider | None = app_state.claude_ambient_accounts
+    if provider is not None and provider.is_ambient_account_id(account_id):
+        logger.debug("not marking ambient claude account %s needs-reauth", account_id)
+        return
     try:
         await asyncio.to_thread(mark_account_needs_reauth, account_id)
     except AccountRegistryError as exc:
         logger.warning("could not mark claude account %s needs-reauth: %s", account_id, exc)
 
 
-def _claude_account_auth_manager(app_state: Any, account_id: str) -> ClaudeAccountAuthManager:
+def _claude_account_auth_manager(
+    app_state: Any, account_id: str
+) -> ClaudeAccountAuthManager | AmbientClaudeAuthManager:
     """Return the cached per-account manager, creating it on first use.
 
     Managers are keyed by account id so a `use`-switch mid-flight gets a
@@ -461,6 +482,9 @@ def _claude_account_auth_manager(app_state: Any, account_id: str) -> ClaudeAccou
     old account keep theirs. No lock is needed: there is no await between
     the lookup and the insert.
     """
+    provider: AmbientAccountProvider | None = app_state.claude_ambient_accounts
+    if provider is not None and provider.is_ambient_account_id(account_id):
+        return provider.auth_manager()
     managers: dict[str, ClaudeAccountAuthManager] = app_state.claude_account_auth_managers
     manager = managers.get(account_id)
     if manager is None:
@@ -615,7 +639,7 @@ async def _attempt_with_account(
     try:
         credentials = await manager.get_credentials()
     except ClaudeAccountReauthRequiredError as exc:
-        await _mark_account_needs_reauth_best_effort(account_id)
+        await _mark_account_needs_reauth_best_effort(request.app.state, account_id)
         return _FailedAttempt(
             _claude_account_unavailable(
                 f"claude account {account_id} needs re-authentication: {exc}; "
@@ -624,10 +648,22 @@ async def _attempt_with_account(
             )
         )
     except ClaudeAccountAuthError as exc:
+        logger.info(
+            "claude relay: account %.8s (%s) unusable, trying next: %s",
+            account_id,
+            record.email,
+            exc,
+        )
         return _FailedAttempt(
             _claude_account_unavailable(f"claude account {account_id} is unusable: {exc}")
         )
 
+    logger.info(
+        "claude relay: attempting %s with account %.8s (%s)",
+        request.url.path,
+        account_id,
+        record.email,
+    )
     content = _rewrite_metadata_account_uuid(raw_body, parsed_body, credentials.account_uuid)
     try:
         upstream_response = await _send_to_anthropic(
@@ -638,7 +674,7 @@ async def _attempt_with_account(
             try:
                 credentials = await manager.get_credentials(force_refresh=True)
             except ClaudeAccountReauthRequiredError as exc:
-                await _mark_account_needs_reauth_best_effort(account_id)
+                await _mark_account_needs_reauth_best_effort(request.app.state, account_id)
                 return _FailedAttempt(
                     _claude_account_unavailable(
                         f"claude account {account_id} needs re-authentication: {exc}; "
@@ -647,6 +683,12 @@ async def _attempt_with_account(
                     )
                 )
             except ClaudeAccountAuthError as exc:
+                logger.info(
+                    "claude relay: account %.8s (%s) unusable, trying next: %s",
+                    account_id,
+                    record.email,
+                    exc,
+                )
                 return _FailedAttempt(
                     _claude_account_unavailable(
                         f"claude account {account_id} was rejected and could not be "
@@ -669,7 +711,7 @@ async def _attempt_with_account(
         # A freshly refreshed token that Anthropic still rejects is durably
         # dead — only a human re-login recovers it, which is what the
         # needs-reauth state means.
-        await _mark_account_needs_reauth_best_effort(account_id)
+        await _mark_account_needs_reauth_best_effort(request.app.state, account_id)
         return _FailedAttempt(
             JSONResponse(
                 _claude_error_body(
@@ -710,6 +752,13 @@ async def _attempt_with_account(
         await commit_hook(upstream_response)
     if on_response is not None:
         await on_response(upstream_response)
+    logger.info(
+        "claude relay: account %.8s (%s) serving %s -> upstream %s",
+        account_id,
+        record.email,
+        request.url.path,
+        upstream_response.status_code,
+    )
     return _relay_anthropic_response(upstream_response, on_finished=on_relay_complete)
 
 
@@ -720,6 +769,7 @@ async def _attempt_with_account(
 
 
 async def _install_balanced_quota_cooldown(
+    app_state: Any,
     router: ClaudeBalancedRouter,
     *,
     account_id: str,
@@ -739,7 +789,7 @@ async def _install_balanced_quota_cooldown(
     gate = router.classify_cooldown_scope(
         account_id=account_id, model=model, upstream_status_code=429, now=now
     )
-    fingerprint = load_account_profile_fingerprint(paths.accounts_dir("claude") / account_id)
+    fingerprint = _account_profile_fingerprint(app_state, account_id)
     if gate.scope == "family":
         assert gate.family_deadline is not None
         pending_write = router.install_cooldown(
@@ -768,6 +818,7 @@ async def _install_balanced_quota_cooldown(
 
 
 async def _record_balanced_capability_evidence(
+    app_state: Any,
     router: ClaudeBalancedRouter,
     *,
     account_id: str,
@@ -780,7 +831,7 @@ async def _record_balanced_capability_evidence(
     successful 2xx for the exact capability key — `classify_capability_evidence`
     itself is the one true gate (never `denied`, never inferred across keys).
     """
-    fingerprint = load_account_profile_fingerprint(paths.accounts_dir("claude") / account_id)
+    fingerprint = _account_profile_fingerprint(app_state, account_id)
     if fingerprint is None:
         return
     router.classify_capability_evidence(
@@ -794,6 +845,7 @@ async def _record_balanced_capability_evidence(
 
 
 async def _ingest_balanced_unified_headers(
+    app_state: Any,
     router: ClaudeBalancedRouter,
     *,
     account_id: str,
@@ -814,7 +866,7 @@ async def _ingest_balanced_unified_headers(
         return
     if not claude_unified_headers.RECOGNIZED_HEADERS:
         return
-    fingerprint = load_account_profile_fingerprint(paths.accounts_dir("claude") / account_id)
+    fingerprint = _account_profile_fingerprint(app_state, account_id)
     router.ingest_unified_response_headers(
         upstream_response.headers,
         account_id=account_id,
@@ -1138,6 +1190,21 @@ async def _passthrough_with_balanced_pool(
         return _claude_account_unavailable(f"cannot read the claude account registry: {exc}")
 
     records_by_id = {record.id: record for record in records}
+    provider: AmbientAccountProvider | None = request.app.state.claude_ambient_accounts
+    if provider is not None:
+        member = provider.pool_member()
+        if member is not None and not is_duplicate_identity(member, records):
+            records_by_id[member.record.id] = member.record
+            logger.debug(
+                "balanced: ambient account %.8s (%s) joined the candidate set",
+                member.record.id,
+                member.record.email,
+            )
+        elif member is not None:
+            logger.debug(
+                "balanced: ambient login %s suppressed, registered account has the same identity",
+                member.record.email,
+            )
     model = parsed_body.get("model") if isinstance(parsed_body, dict) else None
     model = model if isinstance(model, str) else ""
     # The routing identity is frozen here, once per request: the same model
@@ -1202,6 +1269,7 @@ async def _serve_balanced_stateless_message(
             cooldown_seconds: float, *, _account_id: str = record.id, _incarnation: str = record.account_incarnation_id
         ) -> None:
             await _install_balanced_quota_cooldown(
+                request.app.state,
                 router,
                 account_id=_account_id,
                 account_incarnation_id=_incarnation,
@@ -1216,6 +1284,7 @@ async def _serve_balanced_stateless_message(
             _incarnation: str = record.account_incarnation_id,
         ) -> None:
             await _record_balanced_capability_evidence(
+                request.app.state,
                 router,
                 account_id=_account_id,
                 account_incarnation_id=_incarnation,
@@ -1223,6 +1292,7 @@ async def _serve_balanced_stateless_message(
                 upstream_response=upstream_response,
             )
             await _ingest_balanced_unified_headers(
+                request.app.state,
                 router,
                 account_id=_account_id,
                 account_incarnation_id=_incarnation,
@@ -1382,6 +1452,7 @@ async def _serve_balanced_pinned_message(
                 _incarnation: str = target_record.account_incarnation_id,
             ) -> None:
                 await _install_balanced_quota_cooldown(
+                    request.app.state,
                     router,
                     account_id=_account_id,
                     account_incarnation_id=_incarnation,
@@ -1396,6 +1467,7 @@ async def _serve_balanced_pinned_message(
                 _incarnation: str = target_record.account_incarnation_id,
             ) -> None:
                 await _record_balanced_capability_evidence(
+                    request.app.state,
                     router,
                     account_id=_account_id,
                     account_incarnation_id=_incarnation,
@@ -1403,6 +1475,7 @@ async def _serve_balanced_pinned_message(
                     upstream_response=upstream_response,
                 )
                 await _ingest_balanced_unified_headers(
+                    request.app.state,
                     router,
                     account_id=_account_id,
                     account_incarnation_id=_incarnation,
@@ -3323,7 +3396,7 @@ def _account_usage_fetch(app_state: Any) -> Any:
         try:
             return await fetch_claude_account_usage(app_state.http_client, manager)
         except ClaudeAccountReauthRequiredError:
-            await _mark_account_needs_reauth_best_effort(account_id)
+            await _mark_account_needs_reauth_best_effort(app_state, account_id)
             return (
                 _provider_result(
                     "claude",
@@ -4301,6 +4374,9 @@ def create_app(config: GatewayConfig, daemon_nonce: str | None = None) -> Starle
     # Initialized here (not in the lifespan) so the dict exists even when a
     # test drives the app without entering the lifespan context.
     app.state.claude_account_auth_managers = {}
+    app.state.claude_ambient_accounts = (
+        AmbientAccountProvider() if config.claude_account_include_local_login else None
+    )
     # Dashboard login session slot (single concurrent session) and the
     # per-account usage cache — the fetch closure resolves http_client from
     # app.state at call time, so wiring here works with or without the
@@ -4318,4 +4394,23 @@ def create_app(config: GatewayConfig, daemon_nonce: str | None = None) -> Starle
     # rather than crashing, even for a test that drives the app without
     # entering the lifespan context.
     app.state.claude_balanced_runtime = ClaudeBalancedRuntime()
+
+    def _ambient_usage_poll_supplier(
+        records: Sequence[AccountRecord],
+    ) -> UsagePollAccount | None:
+        provider: AmbientAccountProvider | None = app.state.claude_ambient_accounts
+        if provider is None:
+            return None
+        member = provider.pool_member()
+        if member is None or is_duplicate_identity(member, records):
+            return None
+        return UsagePollAccount(
+            account_id=member.record.id,
+            account_incarnation_id=member.record.account_incarnation_id,
+            account_profile_fingerprint=member.profile_fingerprint,
+        )
+
+    app.state.claude_balanced_runtime.ambient_usage_poll_supplier = (
+        _ambient_usage_poll_supplier
+    )
     return app
