@@ -6555,7 +6555,7 @@ class TestBalancedRoutingExit:
             # layer -- a subsequent request keeps being served under
             # balanced, reusing it rather than a fresh placement.
             assert runtime._store is not None
-            session_key = derive_session_key(_account_body(), runtime.epoch_seed)
+            session_key = derive_session_key(_account_body(), runtime.epoch_seed, "fable")
             assert session_key is not None
             assert runtime.router.get_pin(session_key.digest) is not None
             assert runtime._store.get_pin(session_key.digest) is not None
@@ -6655,7 +6655,7 @@ class TestBalancedRoutingExit:
             assert pinned.status_code == 200
             assert runtime.router is not None
             assert runtime.router.pin_count() == 1
-            session_key = derive_session_key(_account_body(), runtime.epoch_seed)
+            session_key = derive_session_key(_account_body(), runtime.epoch_seed, "fable")
             assert session_key is not None
             old_pin_digest = session_key.digest
 
@@ -6946,7 +6946,7 @@ def test_balanced_new_session_pins_and_serves_with_a_durable_pin(
         assert calls[0].headers["authorization"] == f"Bearer {access_token}"
         assert runtime.router.pin_count() == 1
 
-        session_key = derive_session_key(body, runtime.epoch_seed)
+        session_key = derive_session_key(body, runtime.epoch_seed, "fable")
         assert session_key is not None
         pin = runtime.router.get_pin(session_key.digest)
         assert pin is not None
@@ -7025,7 +7025,7 @@ def test_balanced_quota_429_migrates_commits_and_cools_down_the_source(
         source_id = next(aid for aid, token in accounts if f"Bearer {token}" == source_token)
         target_id = next(aid for aid, token in accounts if f"Bearer {token}" == target_token)
 
-        session_key = derive_session_key(body, runtime.epoch_seed)
+        session_key = derive_session_key(body, runtime.epoch_seed, "fable")
         pin = runtime.router.get_pin(session_key.digest)
         assert pin is not None
         assert pin.account_id == target_id
@@ -7095,7 +7095,7 @@ def test_balanced_post_2xx_midstream_failure_relays_sse_error_and_retains_the_co
 
         target_token = tokens_by_call[1]
         target_id = next(aid for aid, token in accounts if f"Bearer {token}" == target_token)
-        session_key = derive_session_key(body, runtime.epoch_seed)
+        session_key = derive_session_key(body, runtime.epoch_seed, "fable")
         pin = runtime.router.get_pin(session_key.digest)
         assert pin is not None
         assert pin.account_id == target_id
@@ -7416,7 +7416,7 @@ def test_balanced_count_tokens_follows_the_pin_without_refresh_or_router_state_c
         pinned = client.post("/v1/messages", json=body)
         assert pinned.status_code == 200
 
-        session_key = derive_session_key(body, runtime.epoch_seed)
+        session_key = derive_session_key(body, runtime.epoch_seed, "fable")
         pin_before = runtime.router.get_pin(session_key.digest)
         assert pin_before is not None
         last_seen_before = pin_before.last_seen_monotonic

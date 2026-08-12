@@ -219,6 +219,23 @@ def test_pin_upsert_overwrites_existing_row(store_factory) -> None:
     assert pin.generation == 1
 
 
+def test_pin_round_trip_preserves_model_family(store_factory) -> None:
+    store = store_factory()
+    kwargs = _pin_kwargs(
+        session_key_digest=b"digest-family",
+        balanced_epoch_id=store.balanced_epoch_id,
+        model_family="fable",
+    )
+    store.upsert_pin(**kwargs).wait(timeout=5)
+
+    pin = store.get_pin(b"digest-family")
+    assert pin is not None
+    assert pin.model_family == "fable"
+
+    restore_result = store.restore(RestoreValidationContext(now_utc=time.time()))
+    assert restore_result.pins[b"digest-family"].model_family == "fable"
+
+
 def test_pin_delete_round_trip(store_factory) -> None:
     store = store_factory()
     digest = b"digest-3"

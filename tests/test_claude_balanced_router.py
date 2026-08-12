@@ -107,13 +107,13 @@ def test_uuid_branch_is_case_insensitive_and_yields_the_same_digest() -> None:
     lower_body = {"metadata": {"user_id": _claude_code_user_id(lower)}}
     upper_body = {"metadata": {"user_id": _claude_code_user_id(upper)}}
 
-    lower_key = derive_session_key(lower_body, seed)
-    upper_key = derive_session_key(upper_body, seed)
+    lower_key = derive_session_key(lower_body, seed, "default")
+    upper_key = derive_session_key(upper_body, seed, "default")
 
     assert lower_key is not None and upper_key is not None
     assert lower_key.kind == upper_key.kind == "uuid"
     assert lower_key.digest == upper_key.digest
-    assert lower_key.digest == _reference_session_key_digest(
+    assert lower_key.scoring_digest == _reference_session_key_digest(
         seed, b"uuid", lower.encode("utf-8")
     )
 
@@ -126,7 +126,7 @@ def test_non_rfc4122_variant_falls_back_to_content_hash_branch() -> None:
         "messages": [{"role": "user", "content": "hello"}],
     }
 
-    key = derive_session_key(body, seed)
+    key = derive_session_key(body, seed, "default")
 
     assert key is not None
     assert key.kind == "content_hash"
@@ -140,7 +140,7 @@ def test_whitespace_padded_uuid_is_rejected_and_falls_back_to_content_hash() -> 
         "messages": [{"role": "user", "content": "hello"}],
     }
 
-    key = derive_session_key(body, seed)
+    key = derive_session_key(body, seed, "default")
 
     assert key is not None
     assert key.kind == "content_hash"
@@ -153,8 +153,8 @@ def test_content_hash_digest_is_deterministic_and_key_order_independent() -> Non
     body_a = {"messages": [message_in_order]}
     body_b = {"messages": [message_reordered]}
 
-    key_a = derive_session_key(body_a, seed)
-    key_b = derive_session_key(body_b, seed)
+    key_a = derive_session_key(body_a, seed, "default")
+    key_b = derive_session_key(body_b, seed, "default")
 
     assert key_a is not None and key_b is not None
     assert key_a.kind == key_b.kind == "content_hash"
@@ -166,7 +166,7 @@ def test_content_hash_digest_is_deterministic_and_key_order_independent() -> Non
         ensure_ascii=False,
         allow_nan=False,
     ).encode("utf-8")
-    assert key_a.digest == _reference_session_key_digest(
+    assert key_a.scoring_digest == _reference_session_key_digest(
         seed, b"content_hash", expected_canonical_utf8
     )
 
@@ -175,8 +175,8 @@ def test_no_user_message_and_no_metadata_yields_no_session_key() -> None:
     seed = b"seed-no-session-key"
     body = {"messages": [{"role": "assistant", "content": "hi there"}]}
 
-    assert derive_session_key(body, seed) is None
-    assert derive_session_key({}, seed) is None
+    assert derive_session_key(body, seed, "default") is None
+    assert derive_session_key({}, seed, "default") is None
 
 
 def test_uuid_and_content_hash_digests_differ_for_identical_underlying_string() -> None:
@@ -1868,6 +1868,149 @@ def test_restored_cooldowns_carry_a_wall_deadline(tmp_path: Any) -> None:
         assert router.account_cooldown_deadline("acct-a", now=5_100.0, wall_now=now_utc + 3_601.0) is None
     finally:
         store.close()
+
+
+# -- family-dimension pins: salted identity, correlated HRW ------------------
+
+_FAMILY_TEST_SESSION_ID = "3fa85f64-5717-4562-b3fc-2c963f66afa6"
+
+
+def _family_test_body() -> dict[str, Any]:
+    return {"metadata": {"user_id": _claude_code_user_id(_FAMILY_TEST_SESSION_ID)}}
+
+
+def test_session_key_salts_the_pin_digest_by_family_and_shares_the_scoring_digest() -> None:
+    seed = b"seed-family-salt"
+    body = _family_test_body()
+
+    default_key = derive_session_key(body, seed, "default")
+    fable_key = derive_session_key(body, seed, "fable")
+    default_again = derive_session_key(body, seed, "default")
+
+    assert default_key is not None and fable_key is not None and default_again is not None
+    assert default_key.digest != fable_key.digest
+    assert default_key.digest == default_again.digest
+    assert default_key.scoring_digest == fable_key.scoring_digest
+    # The pin domain is separated from the logical session-key domain.
+    assert default_key.digest != default_key.scoring_digest
+    assert (default_key.family, fable_key.family) == ("default", "fable")
+    with pytest.raises(ValueError):
+        derive_session_key(body, seed, "sonnet")
+
+
+def test_equal_family_weights_co_locate_both_family_pins_of_one_session() -> None:
+    seed = b"seed-colocate"
+    router = _make_router()
+    default_key = derive_session_key(_family_test_body(), seed, "default")
+    fable_key = derive_session_key(_family_test_body(), seed, "fable")
+    assert default_key is not None and fable_key is not None
+    candidates = [_candidate("acct-a"), _candidate("acct-b")]
+
+    default_placement = router.place_session(
+        session_key=default_key, model="claude-sonnet-5", candidates=candidates, seed=seed
+    )
+    fable_placement = router.place_session(
+        session_key=fable_key, model="claude-fable-5", candidates=candidates, seed=seed
+    )
+
+    assert fable_placement.created  # a second pin, not a hit on the default pin
+    assert fable_placement.account_id == default_placement.account_id
+    assert router.pin_count() == 2
+
+
+def test_fable_family_cooldown_diverges_only_the_fable_pin() -> None:
+    # The haiku-first scenario: the default pin lands first; its account then
+    # becomes fable-cooled; the fable pin must land on the other account
+    # while the default pin keeps its account and generation.
+    seed = b"seed-diverge"
+    clock = _FakeClock()
+    router = _make_router(clock=clock)
+    now = clock()
+    default_key = derive_session_key(_family_test_body(), seed, "default")
+    fable_key = derive_session_key(_family_test_body(), seed, "fable")
+    assert default_key is not None and fable_key is not None
+    account_ids = ["acct-a", "acct-b"]
+
+    default_placement = router.place_session(
+        session_key=default_key,
+        model="claude-haiku-4-5",
+        candidates=[_candidate(account_id) for account_id in account_ids],
+        seed=seed,
+        now=now,
+    )
+    cooled = default_placement.account_id
+    surviving = next(account_id for account_id in account_ids if account_id != cooled)
+    router.install_cooldown(
+        account_id=cooled,
+        account_incarnation_id=f"inc-{cooled}",
+        account_profile_fingerprint=None,
+        scope="family",
+        model_family="fable",
+        deadline=now + 3600.0,
+        reason="fable_family_gate_satisfied",
+    )
+
+    fable_candidates = [
+        _candidate(
+            account_id,
+            family_cooldown_until=router.family_cooldown_deadline(account_id, "fable", now=now),
+        )
+        for account_id in account_ids
+    ]
+    fable_placement = router.place_session(
+        session_key=fable_key, model="claude-fable-5", candidates=fable_candidates, seed=seed, now=now
+    )
+
+    assert fable_placement.account_id == surviving
+    default_pin = router.get_pin(default_key.digest)
+    assert default_pin is not None
+    assert default_pin.account_id == cooled
+    assert default_pin.generation == 0
+
+
+def test_family_pins_of_one_session_expire_independently() -> None:
+    seed = b"seed-ttl"
+    clock = _FakeClock()
+    router = _make_router(clock=clock, pin_ttl_uuid_seconds=100.0)
+    default_key = derive_session_key(_family_test_body(), seed, "default")
+    fable_key = derive_session_key(_family_test_body(), seed, "fable")
+    assert default_key is not None and fable_key is not None
+    candidates = [_candidate("acct-a")]
+
+    router.place_session(session_key=default_key, model="claude-sonnet-5", candidates=candidates, seed=seed)
+    clock.advance(60.0)
+    router.place_session(session_key=fable_key, model="claude-fable-5", candidates=candidates, seed=seed)
+
+    clock.advance(50.0)  # past the default pin's TTL, within the fable pin's
+    router.purge_expired_pins()
+    assert router.get_pin(default_key.digest) is None
+    assert router.get_pin(fable_key.digest) is not None
+
+
+def test_account_scope_cooldown_excludes_the_account_for_every_family() -> None:
+    seed = b"seed-account-scope"
+    clock = _FakeClock()
+    router = _make_router(clock=clock)
+    now = clock()
+    router.install_cooldown(
+        account_id="acct-a",
+        account_incarnation_id="inc-acct-a",
+        account_profile_fingerprint=None,
+        scope="account",
+        deadline=now + 3600.0,
+        reason="quota",
+    )
+
+    for family, model in (("default", "claude-sonnet-5"), ("fable", "claude-fable-5")):
+        key = derive_session_key(_family_test_body(), seed, family)
+        assert key is not None
+        candidate = _candidate(
+            "acct-a", account_cooldown_until=router.account_cooldown_deadline("acct-a", now=now)
+        )
+        with pytest.raises(NoEligibleAccountError):
+            router.place_session(
+                session_key=key, model=model, candidates=[candidate], seed=seed, now=now
+            )
 
 
 # -- capability evidence: eligible-only, TTL'd, no cross-key inference -------

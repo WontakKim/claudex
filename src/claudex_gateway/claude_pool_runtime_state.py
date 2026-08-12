@@ -57,7 +57,12 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 1
+# Covers the pin-key ABI as well as the table shapes: pins are keyed by a
+# quota-family-salted digest (`claude_balanced_router._PIN_KEY_DOMAIN`), so
+# any change to that derivation must bump this version — `open_` then
+# quarantines the older database wholesale instead of restoring rows keyed
+# under a different ABI into the live pin map and cold-start counts.
+SCHEMA_VERSION = 2
 
 # Step 5's mandated timings: coalesced observation/capability (and every
 # other ordinary row) write flushes within one second; a pin's last_seen
@@ -73,7 +78,8 @@ CREATE TABLE pins (
   session_key_digest BLOB PRIMARY KEY, key_kind TEXT NOT NULL CHECK (key_kind IN ('uuid','content_hash')),
   account_id TEXT NOT NULL, account_incarnation_id TEXT NOT NULL,
   last_seen_utc REAL NOT NULL, expires_at_utc REAL NOT NULL,
-  generation INTEGER NOT NULL CHECK (generation >= 0), balanced_epoch_id TEXT NOT NULL
+  generation INTEGER NOT NULL CHECK (generation >= 0), balanced_epoch_id TEXT NOT NULL,
+  model_family TEXT NOT NULL DEFAULT ''
 ) WITHOUT ROWID;
 CREATE INDEX pins_by_account ON pins(account_id);
 CREATE TABLE cooldowns (
@@ -121,6 +127,9 @@ class PinRow:
     expires_at_utc: float
     generation: int
     balanced_epoch_id: str
+    # Diagnostic metadata only — the family is already baked into the salted
+    # `session_key_digest` and is never part of any key or validation.
+    model_family: str = ""
 
 
 @dataclass(frozen=True)
@@ -497,6 +506,7 @@ class ClaudePoolRuntimeStateStore:
         expires_at_utc: float,
         generation: int,
         balanced_epoch_id: str,
+        model_family: str = "",
         high_priority: bool = False,
     ) -> PendingWrite:
         if key_kind not in ("uuid", "content_hash"):
@@ -508,8 +518,9 @@ class ClaudePoolRuntimeStateStore:
             conn.execute(
                 """
                 INSERT INTO pins (session_key_digest, key_kind, account_id, account_incarnation_id,
-                                   last_seen_utc, expires_at_utc, generation, balanced_epoch_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                                   last_seen_utc, expires_at_utc, generation, balanced_epoch_id,
+                                   model_family)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT (session_key_digest) DO UPDATE SET
                     key_kind = excluded.key_kind,
                     account_id = excluded.account_id,
@@ -517,7 +528,8 @@ class ClaudePoolRuntimeStateStore:
                     last_seen_utc = excluded.last_seen_utc,
                     expires_at_utc = excluded.expires_at_utc,
                     generation = excluded.generation,
-                    balanced_epoch_id = excluded.balanced_epoch_id
+                    balanced_epoch_id = excluded.balanced_epoch_id,
+                    model_family = excluded.model_family
                 """,
                 (
                     session_key_digest,
@@ -528,6 +540,7 @@ class ClaudePoolRuntimeStateStore:
                     expires_at_utc,
                     generation,
                     balanced_epoch_id,
+                    model_family,
                 ),
             )
 
@@ -578,7 +591,7 @@ class ClaudePoolRuntimeStateStore:
         with self._read_connection() as conn:
             row = conn.execute(
                 "SELECT session_key_digest, key_kind, account_id, account_incarnation_id, "
-                "last_seen_utc, expires_at_utc, generation, balanced_epoch_id "
+                "last_seen_utc, expires_at_utc, generation, balanced_epoch_id, model_family "
                 "FROM pins WHERE session_key_digest = ?",
                 (session_key_digest,),
             ).fetchone()
@@ -874,7 +887,7 @@ class ClaudePoolRuntimeStateStore:
         stale_pin_digests: list[bytes] = []
         for row in conn.execute(
             "SELECT session_key_digest, key_kind, account_id, account_incarnation_id, "
-            "last_seen_utc, expires_at_utc, generation, balanced_epoch_id FROM pins"
+            "last_seen_utc, expires_at_utc, generation, balanced_epoch_id, model_family FROM pins"
         ):
             pin = PinRow(*row)
             if pin.expires_at_utc <= ctx.now_utc:

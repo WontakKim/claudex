@@ -68,16 +68,44 @@ from claudex_gateway.claude_unified_headers import (
 logger = logging.getLogger(__name__)
 
 _SESSION_KEY_DOMAIN = b"claudex-session-key-v1"
+# The pin identity is the LOGICAL session digest salted with the request's
+# quota family, so one Claude Code session carries one independent pin per
+# family (correlated-HRW design). The domain version is part of the pin-key
+# ABI: bumping it requires bumping `claude_pool_runtime_state.SCHEMA_VERSION`
+# so pre-existing rows are quarantined rather than left as unreachable
+# entries that would distort the LRU and cold-start counts.
+_PIN_KEY_DOMAIN = b"claudex-pin-key-v2"
 _HRW_DOMAIN = b"claudex-balanced-hrw-v1"
 _STATELESS_REQUEST_DOMAIN = b"claudex-stateless-request-v1"
+
+# `quota_family` is a closed enum and part of the pin-key ABI: adding a
+# family (or moving a model between families) creates new pin identities.
+_QUOTA_FAMILIES = ("default", "fable")
 
 
 @dataclass(frozen=True)
 class SessionKey:
-    """A domain-separated session-affinity digest and the branch that produced it."""
+    """A domain-separated session-affinity identity and the branch that produced it.
+
+    `digest` is the family-salted PIN identity: it keys the pin map,
+    reservations, migration CAS, and the durable `pins` rows. Requests of
+    different quota families in one logical session deliberately stop
+    contending on it. `scoring_digest` is the family-agnostic LOGICAL
+    session digest used for weighted-HRW scoring, so that when family
+    weights are equal both families of one session co-locate on the same
+    account, diverging only under family-specific pressure or cooldowns.
+    An empty `scoring_digest` means "same as `digest`" (hand-built keys in
+    tests); read it through `scoring_digest_or_default`.
+    """
 
     digest: bytes
     kind: Literal["uuid", "content_hash"]
+    scoring_digest: bytes = b""
+    family: str = ""
+
+    @property
+    def scoring_digest_or_default(self) -> bytes:
+        return self.scoring_digest or self.digest
 
 
 def _hmac_sha256(seed: bytes, message: bytes) -> bytes:
@@ -156,14 +184,29 @@ def _content_hash_session_key(body: dict[str, Any], seed: bytes) -> SessionKey |
     return SessionKey(digest=digest, kind="content_hash")
 
 
-def derive_session_key(body: dict[str, Any], seed: bytes) -> SessionKey | None:
-    """Derive a session-affinity key for `body`, or None when it is unpinnable.
+def derive_session_key(body: dict[str, Any], seed: bytes, family: str) -> SessionKey | None:
+    """Derive the (session, quota family) affinity key for `body`, or None when unpinnable.
 
     Tries the uuid branch first (Claude Code's own `session_id`), then falls
-    back to hashing the first user message. Returns None only when neither
-    branch has anything to hash.
+    back to hashing the first user message; either branch yields the LOGICAL
+    session digest. The returned key's pin `digest` is that logical digest
+    salted with `family` under `_PIN_KEY_DOMAIN`, while `scoring_digest`
+    stays the unsalted logical digest (see `SessionKey`). `family` must be
+    one of `quota_family`'s closed enum values — it is baked into durable
+    pin identities, so a stray value would silently mint a new key space.
+    Returns None only when neither branch has anything to hash.
     """
-    return _uuid_session_key(body, seed) or _content_hash_session_key(body, seed)
+    if family not in _QUOTA_FAMILIES:
+        raise ValueError(f"invalid quota family: {family!r}")
+    logical = _uuid_session_key(body, seed) or _content_hash_session_key(body, seed)
+    if logical is None:
+        return None
+    pin_digest = _hmac_sha256(
+        seed, _PIN_KEY_DOMAIN + b"\x00" + _length_prefixed(logical.digest, family.encode("utf-8"))
+    )
+    return SessionKey(
+        digest=pin_digest, kind=logical.kind, scoring_digest=logical.digest, family=family
+    )
 
 
 def hrw_unit_interval(seed: bytes, session_key_digest: bytes, account_id: str) -> float:
@@ -849,6 +892,9 @@ class PinEntry:
     expires_at_monotonic: float
     migration_reserved: bool = False
     pending_durability: PendingDurabilityBarrier | None = None
+    # Diagnostic metadata only — the family is already baked into the salted
+    # `session_key_digest` and never participates in any key or decision.
+    model_family: str = ""
 
 
 @dataclass(frozen=True)
@@ -1348,10 +1394,12 @@ class ClaudeBalancedRouter:
             assert chosen_id is not None
         else:
             weights = self._candidate_weights(eligible, family, now=now)
+            # Score with the LOGICAL digest (correlated HRW): equal family
+            # weights co-locate one session's family pins on one account.
             chosen_id = pick_weighted_hrw(
                 weights=weights,
                 seed=seed,
-                session_key_digest=session_key.digest,
+                session_key_digest=session_key.scoring_digest_or_default,
                 serving_account_id=serving_account_id,
             )
 
@@ -1367,6 +1415,7 @@ class ClaudeBalancedRouter:
             last_seen_monotonic=now,
             expires_at_monotonic=now + self._pin_ttl_seconds(session_key.kind),
             pending_durability=barrier,
+            model_family=session_key.family,
         )
         self._pins[session_key.digest] = entry
         return PlacementResult(
@@ -1407,6 +1456,7 @@ class ClaudeBalancedRouter:
                 expires_at_utc=self._wall_clock() + (entry.expires_at_monotonic - self._clock()),
                 generation=entry.generation,
                 balanced_epoch_id=self.balanced_epoch_id,
+                model_family=entry.model_family,
                 high_priority=True,
             )
             await pending_write.wait_async()
@@ -1480,6 +1530,7 @@ class ClaudeBalancedRouter:
                     row.expires_at_utc, wall_now=wall_now, monotonic_now=monotonic_now
                 ),
                 pending_durability=None,
+                model_family=row.model_family,
             )
         self._restored_any_valid_pin = bool(restore_result.pins)
 

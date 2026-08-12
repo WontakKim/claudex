@@ -222,7 +222,7 @@ def test_graceful_restart_preserves_the_same_session_pin_across_two_app_instance
         runtime = _enable_balanced(client, handler)
         response = client.post("/v1/messages", json=body)
         assert response.status_code == 200
-        session_key = derive_session_key(body, runtime.epoch_seed)
+        session_key = derive_session_key(body, runtime.epoch_seed, "default")
         pinned_account_id = runtime.router.get_pin(session_key.digest).account_id
         epoch_id_1 = runtime.epoch_id
 
@@ -232,7 +232,7 @@ def test_graceful_restart_preserves_the_same_session_pin_across_two_app_instance
     ) as client:
         runtime2 = client.app.state.claude_balanced_runtime
         assert runtime2.epoch_id == epoch_id_1
-        session_key2 = derive_session_key(body, runtime2.epoch_seed)
+        session_key2 = derive_session_key(body, runtime2.epoch_seed, "default")
         pin = runtime2.router.get_pin(session_key2.digest)
         assert pin is not None
         assert pin.account_id == pinned_account_id
@@ -266,7 +266,7 @@ def test_mode_exit_rotates_the_epoch_so_a_later_reentry_never_restores_the_old_p
         body = _balanced_body(str(uuid.uuid4()))
         response = client.post("/v1/messages", json=body)
         assert response.status_code == 200
-        old_session_key = derive_session_key(body, runtime.epoch_seed)
+        old_session_key = derive_session_key(body, runtime.epoch_seed, "default")
         assert runtime.router.get_pin(old_session_key.digest) is not None
 
         exited = client.put("/admin/providers/claude/pool/routing", json={"mode": "disabled"})
@@ -278,7 +278,7 @@ def test_mode_exit_rotates_the_epoch_so_a_later_reentry_never_restores_the_old_p
         assert new_runtime.epoch_id != old_epoch_id
         assert new_runtime.router.pin_count() == 0
 
-        new_session_key = derive_session_key(body, new_runtime.epoch_seed)
+        new_session_key = derive_session_key(body, new_runtime.epoch_seed, "default")
         assert new_session_key.digest != old_session_key.digest
         assert new_runtime.router.get_pin(new_session_key.digest) is None
 
@@ -340,7 +340,7 @@ def test_abrupt_crash_analog_leaves_the_durably_committed_pin_intact_without_gra
     body = _balanced_body(str(uuid.uuid4()))
     response = client.post("/v1/messages", json=body)
     assert response.status_code == 200
-    session_key = derive_session_key(body, runtime.epoch_seed)
+    session_key = derive_session_key(body, runtime.epoch_seed, "default")
     pinned_account_id = runtime.router.get_pin(session_key.digest).account_id
 
     # No `shutdown_preserving_epoch`, no WAL checkpoint, no released pool

@@ -1140,8 +1140,13 @@ async def _passthrough_with_balanced_pool(
     records_by_id = {record.id: record for record in records}
     model = parsed_body.get("model") if isinstance(parsed_body, dict) else None
     model = model if isinstance(model, str) else ""
+    # The routing identity is frozen here, once per request: the same model
+    # string (and therefore the same quota family) feeds the key derivation
+    # and every downstream placement/cooldown decision.
     session_key = (
-        derive_session_key(parsed_body, runtime.epoch_seed) if isinstance(parsed_body, dict) else None
+        derive_session_key(parsed_body, runtime.epoch_seed, quota_family(model))
+        if isinstance(parsed_body, dict)
+        else None
     )
 
     if request.url.path.endswith("/count_tokens"):
@@ -1456,7 +1461,7 @@ async def _serve_balanced_pinned_message(
         try:
             next_target = _balanced_pick_account(
                 router,
-                session_key_digest=digest,
+                session_key_digest=session_key.scoring_digest_or_default,
                 model=model,
                 candidates=candidates,
                 seed=runtime.epoch_seed,
@@ -1510,8 +1515,8 @@ async def _serve_balanced_count_tokens(
                 )
                 return outcome.response if isinstance(outcome, _FailedAttempt) else outcome
 
-    digest = (
-        session_key.digest
+    scoring_digest = (
+        session_key.scoring_digest_or_default
         if session_key is not None
         else derive_stateless_routing_digest(runtime.epoch_seed, secrets.token_bytes(32))
     )
@@ -1519,7 +1524,11 @@ async def _serve_balanced_count_tokens(
     candidates = _balanced_candidates(records_by_id.values(), router, family=family, now=time.monotonic())
     try:
         account_id = _balanced_pick_account(
-            router, session_key_digest=digest, model=model, candidates=candidates, seed=runtime.epoch_seed
+            router,
+            session_key_digest=scoring_digest,
+            model=model,
+            candidates=candidates,
+            seed=runtime.epoch_seed,
         )
     except NoEligibleAccountError:
         return _balanced_all_cooling_response(records_by_id, router, family=family, chain_exhausted_429=None)
