@@ -774,9 +774,26 @@ CAPABILITY_EVIDENCE_TTL_SECONDS = 3600.0
 
 @dataclass
 class _CooldownEntry:
+    # One deadline per clock; the entry expires when EITHER passes. The
+    # monotonic deadline bounds the cooldown against wall-clock jumps; the
+    # wall deadline bounds it against the monotonic clock pausing while the
+    # machine sleeps (macOS `time.monotonic` does not advance during sleep).
     deadline_monotonic: float
+    deadline_wall: float
     account_incarnation_id: str
     reason: str
+
+
+def _entry_cooldown_deadline(entry: _CooldownEntry | None, now: float, wall_now: float) -> float | None:
+    """The entry's effective monotonic deadline — the earlier of its two
+    deadlines, re-expressed on the monotonic clock — or `None` when the entry
+    is absent or either deadline has passed."""
+    if entry is None:
+        return None
+    remaining = min(entry.deadline_monotonic - now, entry.deadline_wall - wall_now)
+    if remaining <= 0.0:
+        return None
+    return now + remaining
 
 
 @dataclass(frozen=True)
@@ -1473,6 +1490,7 @@ class ClaudeBalancedRouter:
             )
             entry = _CooldownEntry(
                 deadline_monotonic=monotonic_now + clamped_remaining,
+                deadline_wall=wall_now + clamped_remaining,
                 account_incarnation_id=cooldown_row.account_incarnation_id,
                 reason=cooldown_row.reason,
             )
@@ -1533,13 +1551,18 @@ class ClaudeBalancedRouter:
         """Install a cooldown (account-wide, or Fable family-scoped when
         `scope == "family"`), in-memory and — when both a store and a profile
         fingerprint are available — durably, always HIGH PRIORITY (design v2
-        §5.5's "cooldown installation" bullet). `deadline` is monotonic.
+        §5.5's "cooldown installation" bullet). `deadline` is monotonic; the
+        entry's wall deadline is derived from it (see `_CooldownEntry`).
         Returns the store's `PendingWrite`, or `None` when nothing was
         submitted (no store, or no fingerprint yet).
         """
         now = self._clock() if now is None else now
+        wall_now = self._wall_clock() if wall_now is None else wall_now
         entry = _CooldownEntry(
-            deadline_monotonic=deadline, account_incarnation_id=account_incarnation_id, reason=reason
+            deadline_monotonic=deadline,
+            deadline_wall=wall_now + (deadline - now),
+            account_incarnation_id=account_incarnation_id,
+            reason=reason,
         )
         if scope == "account":
             self._account_cooldowns[account_id] = entry
@@ -1548,38 +1571,38 @@ class ClaudeBalancedRouter:
 
         if self._store is None or account_profile_fingerprint is None:
             return None
-        wall_now = self._wall_clock() if wall_now is None else wall_now
         return self._store.upsert_cooldown(
             account_id=account_id,
             scope=scope,
             model_family=model_family,
             account_incarnation_id=account_incarnation_id,
             account_profile_fingerprint=account_profile_fingerprint,
-            deadline_utc=wall_now + (deadline - now),
+            deadline_utc=entry.deadline_wall,
             reason=reason,
             evidence=evidence,
             updated_at_utc=wall_now,
             high_priority=True,
         )
 
-    def account_cooldown_deadline(self, account_id: str, *, now: float | None = None) -> float | None:
-        """The account-wide cooldown's monotonic deadline, or `None` when absent/expired."""
+    def account_cooldown_deadline(
+        self, account_id: str, *, now: float | None = None, wall_now: float | None = None
+    ) -> float | None:
+        """The account-wide cooldown's monotonic deadline, or `None` when absent
+        or expired on either clock. The returned value reflects the earlier of
+        the entry's two deadlines, expressed on the monotonic clock."""
         now = self._clock() if now is None else now
-        entry = self._account_cooldowns.get(account_id)
-        if entry is None or entry.deadline_monotonic <= now:
-            return None
-        return entry.deadline_monotonic
+        wall_now = self._wall_clock() if wall_now is None else wall_now
+        return _entry_cooldown_deadline(self._account_cooldowns.get(account_id), now, wall_now)
 
     def family_cooldown_deadline(
-        self, account_id: str, model_family: str, *, now: float | None = None
+        self, account_id: str, model_family: str, *, now: float | None = None, wall_now: float | None = None
     ) -> float | None:
         """The `(account_id, model_family)` cooldown's monotonic deadline, or `None`
-        when absent/expired."""
+        when absent or expired on either clock. The returned value reflects the
+        earlier of the entry's two deadlines, expressed on the monotonic clock."""
         now = self._clock() if now is None else now
-        entry = self._family_cooldowns.get((account_id, model_family))
-        if entry is None or entry.deadline_monotonic <= now:
-            return None
-        return entry.deadline_monotonic
+        wall_now = self._wall_clock() if wall_now is None else wall_now
+        return _entry_cooldown_deadline(self._family_cooldowns.get((account_id, model_family)), now, wall_now)
 
     # -- capability evidence: eligible-only, TTL'd (§5.5, adjudication G) ----
 

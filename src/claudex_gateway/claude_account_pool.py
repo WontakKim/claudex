@@ -44,7 +44,14 @@ _USAGE_EXHAUSTED_PERCENT = 99.0
 
 
 class AccountCooldownTracker:
-    """In-memory per-account cooldown deadlines on a monotonic clock.
+    """In-memory per-account cooldown deadlines on monotonic AND wall clocks.
+
+    Each mark records one deadline per clock, and the cooldown expires when
+    EITHER passes. The monotonic deadline bounds the cooldown against wall-
+    clock jumps; the wall deadline bounds it against the monotonic clock
+    pausing while the machine sleeps (macOS `time.monotonic` does not advance
+    during sleep, so a monotonic-only deadline overshoots the real reset by
+    however long the machine slept).
 
     Expired deadlines are pruned lazily, which is also what makes fail-back
     automatic: an expired entry simply stops excluding its account from the
@@ -52,22 +59,29 @@ class AccountCooldownTracker:
     awaits between reading and writing the deadline map.
     """
 
-    def __init__(self, clock: Callable[[], float] = time.monotonic) -> None:
+    def __init__(
+        self,
+        clock: Callable[[], float] = time.monotonic,
+        wall_clock: Callable[[], float] = time.time,
+    ) -> None:
         self._clock = clock
-        self._deadlines: dict[str, float] = {}
+        self._wall_clock = wall_clock
+        self._deadlines: dict[str, tuple[float, float]] = {}
 
     def mark(self, account_id: str, seconds: float) -> None:
         """Start (or replace) a cooldown of `seconds` for `account_id`."""
-        self._deadlines[account_id] = self._clock() + max(0.0, seconds)
+        duration = max(0.0, seconds)
+        self._deadlines[account_id] = (self._clock() + duration, self._wall_clock() + duration)
 
     def is_cooling(self, account_id: str) -> bool:
         return self.remaining_seconds(account_id) > 0.0
 
     def remaining_seconds(self, account_id: str) -> float:
-        deadline = self._deadlines.get(account_id)
-        if deadline is None:
+        deadlines = self._deadlines.get(account_id)
+        if deadlines is None:
             return 0.0
-        remaining = deadline - self._clock()
+        deadline_monotonic, deadline_wall = deadlines
+        remaining = min(deadline_monotonic - self._clock(), deadline_wall - self._wall_clock())
         if remaining <= 0.0:
             del self._deadlines[account_id]
             return 0.0

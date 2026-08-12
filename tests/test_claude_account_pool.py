@@ -75,15 +75,18 @@ def test_remaining_seconds_counts_down_and_floors_at_zero() -> None:
 
 def test_min_remaining_seconds_across_accounts_and_none_when_idle() -> None:
     clock = FakeClock()
-    tracker = AccountCooldownTracker(clock=clock)
+    wall_clock = FakeClock(2_000_000.0)
+    tracker = AccountCooldownTracker(clock=clock, wall_clock=wall_clock)
 
     assert tracker.min_remaining_seconds() is None
     tracker.mark("a", 30.0)
     tracker.mark("b", 10.0)
     assert tracker.min_remaining_seconds() == 10.0
     clock.advance(15.0)
+    wall_clock.advance(15.0)
     assert tracker.min_remaining_seconds() == 15.0
     clock.advance(20.0)
+    wall_clock.advance(20.0)
     assert tracker.min_remaining_seconds() is None
 
 
@@ -105,6 +108,42 @@ def test_expired_entries_are_pruned_lazily() -> None:
     clock.advance(10.0)
     assert tracker.remaining_seconds("a") == 0.0
     assert "a" not in tracker._deadlines
+
+
+def test_wall_deadline_expires_cooldown_while_monotonic_clock_is_paused() -> None:
+    # macOS sleep: the monotonic clock stands still while wall time runs past
+    # the real reset. The wall deadline must end the cooldown regardless.
+    clock = FakeClock()
+    wall_clock = FakeClock(2_000_000.0)
+    tracker = AccountCooldownTracker(clock=clock, wall_clock=wall_clock)
+
+    tracker.mark("a", 3_600.0)
+    wall_clock.advance(3_601.0)
+    clock.advance(100.0)
+    assert not tracker.is_cooling("a")
+    assert "a" not in tracker._deadlines
+
+
+def test_monotonic_deadline_still_bounds_cooldown_when_wall_clock_jumps_backward() -> None:
+    clock = FakeClock()
+    wall_clock = FakeClock(2_000_000.0)
+    tracker = AccountCooldownTracker(clock=clock, wall_clock=wall_clock)
+
+    tracker.mark("a", 60.0)
+    wall_clock.advance(-500.0)
+    clock.advance(61.0)
+    assert not tracker.is_cooling("a")
+
+
+def test_remaining_seconds_reports_the_smaller_of_both_clocks() -> None:
+    clock = FakeClock()
+    wall_clock = FakeClock(2_000_000.0)
+    tracker = AccountCooldownTracker(clock=clock, wall_clock=wall_clock)
+
+    tracker.mark("a", 3_600.0)
+    clock.advance(100.0)
+    wall_clock.advance(200.0)
+    assert tracker.remaining_seconds("a") == 3_400.0
 
 
 # ---------------------------------------------------------------------------

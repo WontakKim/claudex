@@ -1777,6 +1777,99 @@ def test_family_scoped_cooldown_blocks_fable_placements_but_leaves_default_famil
     assert placement.account_id == "acct-a"
 
 
+# -- cooldown expiry on either clock (sleep-paused monotonic guard) ----------
+
+
+def test_wall_deadline_expires_cooldowns_while_monotonic_clock_is_paused() -> None:
+    # macOS sleep: the monotonic clock stands still while wall time runs past
+    # the real reset. The wall deadline must end the cooldown regardless.
+    clock = _FakeClock()
+    wall_clock = _FakeClock(2_000_000.0)
+    router = _make_router(clock=clock, wall_clock=wall_clock)
+    now = clock()
+    router.install_cooldown(
+        account_id="acct-a",
+        account_incarnation_id="inc-acct-a",
+        account_profile_fingerprint=None,
+        scope="account",
+        deadline=now + 126_000.0,
+        reason="fable_weekly_not_saturated",
+    )
+    router.install_cooldown(
+        account_id="acct-a",
+        account_incarnation_id="inc-acct-a",
+        account_profile_fingerprint=None,
+        scope="family",
+        model_family="fable",
+        deadline=now + 126_000.0,
+        reason="fable_family_gate_satisfied",
+    )
+
+    wall_clock.advance(126_001.0)
+    clock.advance(3_600.0)  # the machine was awake for only an hour of it
+
+    assert router.account_cooldown_deadline("acct-a") is None
+    assert router.family_cooldown_deadline("acct-a", "fable") is None
+
+
+def test_cooldown_deadline_reflects_the_earlier_of_both_clocks() -> None:
+    clock = _FakeClock()
+    wall_clock = _FakeClock(2_000_000.0)
+    router = _make_router(clock=clock, wall_clock=wall_clock)
+    router.install_cooldown(
+        account_id="acct-a",
+        account_incarnation_id="inc-acct-a",
+        account_profile_fingerprint=None,
+        scope="account",
+        deadline=clock() + 3_600.0,
+        reason="quota",
+    )
+
+    clock.advance(100.0)
+    wall_clock.advance(200.0)
+
+    # Wall remaining (3400s) is now the smaller: the reported monotonic
+    # deadline shrinks to match it.
+    assert router.account_cooldown_deadline("acct-a") == pytest.approx(clock() + 3_400.0)
+
+    clock.advance(3_500.0)  # monotonic deadline passes while wall has time left
+    wall_clock.advance(100.0)
+    assert router.account_cooldown_deadline("acct-a") is None
+
+
+def test_restored_cooldowns_carry_a_wall_deadline(tmp_path: Any) -> None:
+    db_path = tmp_path / "runtime.sqlite3"
+    store = ClaudePoolRuntimeStateStore.open_(db_path, debounce_seconds=0.0)
+    try:
+        now_utc = 1_700_000_000.0
+        pending_write = store.upsert_cooldown(
+            account_id="acct-a",
+            scope="account",
+            model_family="",
+            account_incarnation_id="inc-acct-a",
+            account_profile_fingerprint="fp-a",
+            deadline_utc=now_utc + 3_600.0,
+            reason="quota",
+            evidence="",
+            updated_at_utc=now_utc,
+            high_priority=True,
+        )
+        pending_write.wait(timeout=5.0)
+        restore_result = store.restore(RestoreValidationContext(now_utc=now_utc))
+
+        router = _make_router(balanced_epoch_id=store.balanced_epoch_id)
+        router.restore_from_store(restore_result, now=5_000.0, wall_now=now_utc)
+
+        assert router.account_cooldown_deadline(
+            "acct-a", now=5_010.0, wall_now=now_utc + 10.0
+        ) == pytest.approx(5_010.0 + 3_590.0)
+        # Sleep drift after restore: wall passes the deadline while the
+        # monotonic clock has barely moved.
+        assert router.account_cooldown_deadline("acct-a", now=5_100.0, wall_now=now_utc + 3_601.0) is None
+    finally:
+        store.close()
+
+
 # -- capability evidence: eligible-only, TTL'd, no cross-key inference -------
 
 
