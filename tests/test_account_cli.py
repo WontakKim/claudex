@@ -665,7 +665,7 @@ def test_account_use_writes_settings_when_no_daemon(
     output = capsys.readouterr().out
     assert f"account use: user@example.com ({record.id})" in output
     saved = json.loads(_settings_path().read_text(encoding="utf-8"))
-    assert saved["claude_account.id"] == record.id
+    assert saved["claude_account"]["id"] == record.id
 
 
 def test_account_use_resolves_email_to_id(
@@ -678,7 +678,7 @@ def test_account_use_resolves_email_to_id(
 
     assert exit_code == 0
     saved = json.loads(_settings_path().read_text(encoding="utf-8"))
-    assert saved["claude_account.id"] == record.id
+    assert saved["claude_account"]["id"] == record.id
 
 
 def test_account_use_off_removes_the_settings_key(
@@ -693,7 +693,7 @@ def test_account_use_off_removes_the_settings_key(
     assert exit_code == 0
     assert "account use: off" in capsys.readouterr().out
     saved = json.loads(_settings_path().read_text(encoding="utf-8"))
-    assert "claude_account.id" not in saved
+    assert "claude_account" not in saved
 
 
 def test_account_use_unknown_target_fails_without_touching_settings(

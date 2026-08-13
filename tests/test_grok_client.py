@@ -9,7 +9,7 @@ from typing import Any
 import httpx
 import pytest
 
-from claudex_gateway.context_window_cache import ContextWindowCache
+from claudex_gateway.model_catalog_cache import ModelCatalogCache
 from claudex_gateway.grok_auth import GrokAuthError, GrokCredentials
 from claudex_gateway.grok_client import (
     GROK_MODELS_URL,
@@ -41,6 +41,7 @@ class TestSanitizeGrokPayload:
             previous_response_id="resp_1",
             prompt_cache_retention="24h",
             safety_identifier="safe",
+            service_tier="priority",
             stream_options={"include_usage": True},
             stop=["END"],
         )
@@ -51,6 +52,7 @@ class TestSanitizeGrokPayload:
             "previous_response_id",
             "prompt_cache_retention",
             "safety_identifier",
+            "service_tier",
             "stream_options",
             "stop",
         ):
@@ -254,7 +256,7 @@ class TestContextWindow:
     @staticmethod
     def _client_with_fake_clock(http_client: httpx.AsyncClient, clock: _FakeClock) -> GrokClient:
         client = GrokClient(_FakeAuthManager(), http_client)
-        client._context_windows = ContextWindowCache(
+        client._context_windows = ModelCatalogCache(
             client._fetch_context_windows,
             expected_errors=(GrokAuthError, GrokUpstreamError, httpx.HTTPError),
             clock=clock,

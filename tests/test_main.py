@@ -855,7 +855,7 @@ def test_compact_set_no_listener_writes_settings_file_directly(
     exit_code = gateway_main._compact_main(["set", "claude:claude-opus-5"])
     assert exit_code == 0
     saved = json.loads(config.settings_file.read_text(encoding="utf-8"))
-    assert saved == {"compaction.model": "claude:claude-opus-5"}
+    assert saved == {"compaction": {"model": "claude:claude-opus-5"}}
 
 
 def test_compact_set_foreign_writes_settings_file_directly(
@@ -865,7 +865,7 @@ def test_compact_set_foreign_writes_settings_file_directly(
     exit_code = gateway_main._compact_main(["set", "claude:claude-sonnet-5"])
     assert exit_code == 0
     saved = json.loads(config.settings_file.read_text(encoding="utf-8"))
-    assert saved == {"compaction.model": "claude:claude-sonnet-5"}
+    assert saved == {"compaction": {"model": "claude:claude-sonnet-5"}}
 
 
 def test_compact_off_no_listener_writes_settings_file_directly_via_deletion(
@@ -880,7 +880,7 @@ def test_compact_off_no_listener_writes_settings_file_directly_via_deletion(
     assert exit_code == 0
     saved = json.loads(config.settings_file.read_text(encoding="utf-8"))
     assert saved == {"port": 9000}
-    assert "compaction.model" not in saved
+    assert "compaction" not in saved
 
 
 def test_compact_off_foreign_writes_settings_file_directly_via_deletion(
@@ -894,7 +894,7 @@ def test_compact_off_foreign_writes_settings_file_directly_via_deletion(
     exit_code = gateway_main._compact_main(["off"])
     assert exit_code == 0
     saved = json.loads(config.settings_file.read_text(encoding="utf-8"))
-    assert "compaction.model" not in saved
+    assert "compaction" not in saved
     # `off` deletes the key rather than ever persisting a JSON null.
     assert "null" not in settings_file.read_text(encoding="utf-8")
 
@@ -1065,7 +1065,7 @@ def test_compact_set_identified_404_non_json_falls_back_with_restart_warning(
     assert exit_code == 0
     assert "restart" in err.lower()
     saved = json.loads(config.settings_file.read_text(encoding="utf-8"))
-    assert saved == {"compaction.model": "claude:claude-opus-5"}
+    assert saved == {"compaction": {"model": "claude:claude-opus-5"}}
 
 
 def test_compact_off_identified_405_non_json_falls_back_with_restart_warning(
@@ -1086,7 +1086,7 @@ def test_compact_off_identified_405_non_json_falls_back_with_restart_warning(
     assert exit_code == 0
     assert "restart" in err.lower()
     saved = json.loads(settings_file.read_text(encoding="utf-8"))
-    assert "compaction.model" not in saved
+    assert "compaction" not in saved
 
 
 def test_compact_show_identified_405_falls_back_with_may_differ_note(

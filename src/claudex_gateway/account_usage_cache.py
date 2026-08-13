@@ -6,7 +6,7 @@ the per-account probe with a success TTL, a per-account failure backoff, a
 single lock that serializes every upstream fetch (so N accounts never hit the
 endpoint concurrently), and a global cooldown honoring a 429's Retry-After —
 during which stale results are served and nothing touches the network.
-Modeled on ``ContextWindowCache``; per-key entries and the rate-limit gate
+Modeled on ``ModelCatalogCache``; per-key entries and the rate-limit gate
 are the additions.
 """
 

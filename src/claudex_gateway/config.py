@@ -20,6 +20,7 @@ DEFAULT_PORT = 8787
 KNOWN_ROUTE_PROVIDERS = ("codex", "kimi", "grok")
 
 VALID_REASONING_EFFORTS = ("minimal", "low", "medium", "high", "xhigh", "max")
+VALID_CODEX_SERVICE_TIERS = ("fast",)
 
 VALID_LOG_LEVELS = ("debug", "info", "warning", "error")
 
@@ -34,6 +35,10 @@ SETTINGS_KEYS: dict[str, str] = {
     "port": "CLAUDEX_PORT",
     "model_map": "CLAUDEX_MODEL_MAP",
     "reasoning_effort": "CLAUDEX_REASONING_EFFORT",
+    # Opt-in: which Codex service tier mapped requests use. Absence of the key
+    # (or a resolved empty string) means the feature is disabled — there is no
+    # separate "enabled" flag.
+    "codex.service_tier": "CLAUDEX_CODEX_SERVICE_TIER",
     "codex_home": "CODEX_HOME",
     "grok_home": "GROK_HOME",
     "kimi_code_home": "KIMI_CODE_HOME",
@@ -214,6 +219,8 @@ class GatewayConfig:
     model_map: dict[str, str] = field(default_factory=dict)
     # When set, overrides the reasoning effort derived from the Claude request.
     reasoning_effort_override: str | None = None
+    # When set to "fast", opts supported Codex models into the Fast tier.
+    codex_service_tier: str | None = None
     codex_home: Path = field(default_factory=lambda: Path.home() / ".codex")
     # Where the Grok CLI login (`grok login`) lives; mirrors the CLI's own
     # GROK_HOME. auth.json sits directly inside.
@@ -289,6 +296,19 @@ class GatewayConfig:
             raise ConfigError(
                 f"{label} must be one of {', '.join(VALID_REASONING_EFFORTS)}, "
                 f"got {effort!r}"
+            )
+
+        value, label = _resolve("codex.service_tier", settings)
+        if value is not None and not isinstance(value, str):
+            raise ConfigError(f"{label} must be a string, got {value!r}")
+        codex_service_tier = value or None
+        if (
+            codex_service_tier is not None
+            and codex_service_tier not in VALID_CODEX_SERVICE_TIERS
+        ):
+            raise ConfigError(
+                f"{label} must be one of {', '.join(VALID_CODEX_SERVICE_TIERS)}, "
+                f"got {codex_service_tier!r}"
             )
 
         codex_home = _path_setting("codex_home", settings, Path.home() / ".codex")
@@ -386,6 +406,7 @@ class GatewayConfig:
             port=port,
             model_map=model_map,
             reasoning_effort_override=effort,
+            codex_service_tier=codex_service_tier,
             codex_home=codex_home,
             grok_home=grok_home,
             kimi_code_home=kimi_code_home,
@@ -425,13 +446,49 @@ def _read_settings_file(path: Path) -> dict[str, object]:
         raise ConfigError(f"settings file {path} is not valid JSON: {exc}") from exc
     if not isinstance(parsed, dict):
         raise ConfigError(f"settings file {path} must contain a JSON object")
-    unknown = sorted(set(parsed) - set(SETTINGS_KEYS))
+    group_names = {
+        key.split(".", 1)[0] for key in SETTINGS_KEYS if "." in key
+    }
+    unknown = sorted(set(parsed) - set(SETTINGS_KEYS) - group_names)
     if unknown:
         raise ConfigError(
             f"settings file {path} has unknown keys: {', '.join(unknown)}; "
             f"valid keys: {', '.join(SETTINGS_KEYS)}"
         )
-    return parsed
+
+    settings = {
+        key: value for key, value in parsed.items() if key in SETTINGS_KEYS
+    }
+    for group_name, group_value in parsed.items():
+        if group_name in SETTINGS_KEYS:
+            continue
+        valid_group_keys = sorted(
+            key for key in SETTINGS_KEYS if key.startswith(f"{group_name}.")
+        )
+        if not isinstance(group_value, dict):
+            raise ConfigError(
+                f'settings file {path} key "{group_name}" must contain a JSON object; '
+                f"valid keys: {', '.join(valid_group_keys)}"
+            )
+        flattened = {
+            f"{group_name}.{subkey}": value
+            for subkey, value in group_value.items()
+        }
+        unknown_group_keys = sorted(set(flattened) - set(valid_group_keys))
+        if unknown_group_keys:
+            raise ConfigError(
+                f"settings file {path} has unknown keys: "
+                f"{', '.join(unknown_group_keys)}; "
+                f"valid keys: {', '.join(valid_group_keys)}"
+            )
+        duplicated = sorted(set(flattened) & set(settings))
+        if duplicated:
+            raise ConfigError(
+                f"settings file {path} has duplicate settings keys: "
+                f"{', '.join(duplicated)}"
+            )
+        settings.update(flattened)
+    return settings
 
 
 def update_settings_file(
@@ -462,10 +519,25 @@ def update_settings_file(
     settings.update(updates)
     for key in deletions:
         settings.pop(key, None)
+
+    rendered: dict[str, object] = {}
+    for key, value in settings.items():
+        group_name, separator, subkey = key.partition(".")
+        if not separator:
+            rendered[key] = value
+            continue
+        group = rendered.setdefault(group_name, {})
+        if not isinstance(group, dict):
+            raise ConfigError(
+                f"cannot persist settings group {group_name!r} because it conflicts "
+                "with a top-level settings key"
+            )
+        group[subkey] = value
+
     path.parent.mkdir(parents=True, exist_ok=True)
     staging_file = path.with_name(path.name + ".tmp")
     staging_file.write_text(
-        json.dumps(settings, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+        json.dumps(rendered, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
     )
     os.replace(staging_file, path)
 

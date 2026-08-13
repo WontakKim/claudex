@@ -426,8 +426,10 @@ def translate_claude_request_to_codex(
     claude_request: dict[str, Any],
     codex_model: str,
     reasoning_effort_override: str | None = None,
+    *,
+    service_tier: str | None = None,
 ) -> dict[str, Any]:
-    """Build a Codex Responses API payload from an Anthropic Messages API request."""
+    """Build a Codex Responses API payload, optionally with a service tier."""
     name_map = build_tool_name_shortening_map(claude_request)
 
     payload: dict[str, Any] = {
@@ -443,6 +445,8 @@ def translate_claude_request_to_codex(
         "include": ["reasoning.encrypted_content"],
         "prompt_cache_key": derive_session_id(claude_request),
     }
+    if service_tier is not None:
+        payload["service_tier"] = service_tier
 
     tools = _translate_tools(claude_request, name_map)
     # An empty tools list means "no tools": neither field may go out, since

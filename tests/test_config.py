@@ -22,6 +22,26 @@ def test_max_reasoning_effort_is_accepted(monkeypatch: pytest.MonkeyPatch) -> No
     assert GatewayConfig.from_env().reasoning_effort_override == "max"
 
 
+def test_codex_fast_service_tier_is_accepted_from_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CLAUDEX_CODEX_SERVICE_TIER", "fast")
+    assert GatewayConfig.from_env().codex_service_tier == "fast"
+
+
+def test_invalid_codex_service_tier_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CLAUDEX_CODEX_SERVICE_TIER", "priority")
+    with pytest.raises(ConfigError, match="CLAUDEX_CODEX_SERVICE_TIER"):
+        GatewayConfig.from_env()
+
+
+def test_empty_codex_service_tier_env_disables_feature(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CLAUDEX_CODEX_SERVICE_TIER", "")
+    assert GatewayConfig.from_env().codex_service_tier is None
+
+
 def test_log_level_is_normalized(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("CLAUDEX_LOG_LEVEL", "DEBUG")
     assert GatewayConfig.from_env().log_level == "debug"
@@ -86,6 +106,104 @@ class TestSettingsFile:
         settings_file = self._write(tmp_path, {"reasoning_effort": "low"})
         monkeypatch.setenv("CLAUDEX_REASONING_EFFORT", "high")
         assert GatewayConfig.load(settings_file).reasoning_effort_override == "high"
+
+    def test_codex_fast_service_tier_applies_from_settings_file(
+        self, tmp_path: Path
+    ) -> None:
+        settings_file = self._write(tmp_path, {"codex.service_tier": "fast"})
+        assert GatewayConfig.load(settings_file).codex_service_tier == "fast"
+
+    def test_nested_registry_groups_apply_from_settings_file(
+        self, tmp_path: Path
+    ) -> None:
+        settings_file = self._write(
+            tmp_path,
+            {
+                "codex": {"service_tier": "fast"},
+                "compaction": {"model": "claude:claude-opus-5"},
+                "claude_account": {"routing": {"mode": "fallback"}},
+            },
+        )
+
+        config = GatewayConfig.load(settings_file)
+
+        assert config.codex_service_tier == "fast"
+        assert config.compaction_model == "claude:claude-opus-5"
+        assert config.claude_account_routing_mode == "fallback"
+
+    def test_duplicate_flat_and_nested_registry_key_fails(
+        self, tmp_path: Path
+    ) -> None:
+        settings_file = self._write(
+            tmp_path,
+            {
+                "codex.service_tier": "fast",
+                "codex": {"service_tier": "fast"},
+            },
+        )
+
+        with pytest.raises(ConfigError, match="codex\\.service_tier"):
+            GatewayConfig.load(settings_file)
+
+    def test_unknown_nested_registry_key_fails(self, tmp_path: Path) -> None:
+        settings_file = self._write(tmp_path, {"codex": {"tier": "fast"}})
+
+        with pytest.raises(
+            ConfigError, match="unknown keys: codex\\.tier.*codex\\.service_tier"
+        ):
+            GatewayConfig.load(settings_file)
+
+    def test_non_object_registry_group_fails(self, tmp_path: Path) -> None:
+        settings_file = self._write(tmp_path, {"codex": "fast"})
+
+        with pytest.raises(ConfigError, match='key "codex" must contain a JSON object'):
+            GatewayConfig.load(settings_file)
+
+    def test_update_renders_dotted_key_as_nested_group(self, tmp_path: Path) -> None:
+        settings_file = self._write(tmp_path, {})
+
+        update_settings_file(settings_file, {"codex.service_tier": "fast"})
+
+        assert json.loads(settings_file.read_text(encoding="utf-8")) == {
+            "codex": {"service_tier": "fast"}
+        }
+
+    def test_update_migrates_legacy_dotted_keys_and_preserves_other_keys(
+        self, tmp_path: Path
+    ) -> None:
+        settings_file = self._write(
+            tmp_path,
+            {
+                "codex.service_tier": "fast",
+                "compaction.model": "claude:claude-opus-5",
+                "port": 9090,
+            },
+        )
+
+        update_settings_file(settings_file, {"log_level": "debug"})
+
+        assert json.loads(settings_file.read_text(encoding="utf-8")) == {
+            "codex": {"service_tier": "fast"},
+            "compaction": {"model": "claude:claude-opus-5"},
+            "port": 9090,
+            "log_level": "debug",
+        }
+
+    def test_deleting_last_group_key_removes_group(self, tmp_path: Path) -> None:
+        settings_file = self._write(
+            tmp_path, {"compaction": {"model": "claude:claude-opus-5"}}
+        )
+
+        update_settings_file(settings_file, {}, deletions=("compaction.model",))
+
+        assert json.loads(settings_file.read_text(encoding="utf-8")) == {}
+
+    def test_codex_service_tier_env_overrides_settings_file(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        settings_file = self._write(tmp_path, {"codex.service_tier": "invalid"})
+        monkeypatch.setenv("CLAUDEX_CODEX_SERVICE_TIER", "fast")
+        assert GatewayConfig.load(settings_file).codex_service_tier == "fast"
 
     def test_empty_env_still_overrides(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path

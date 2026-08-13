@@ -3,14 +3,20 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from typing import Any
 
 import httpx
 import pytest
 
 from claudex_gateway.codex_auth import CodexAuthError, CodexCredentials
-from claudex_gateway.codex_client import CODEX_MODELS_URL, CodexClient, CodexUpstreamError
-from claudex_gateway.context_window_cache import ContextWindowCache
+from claudex_gateway.codex_client import (
+    CODEX_MODELS_URL,
+    CODEX_RESPONSES_URL,
+    CodexClient,
+    CodexUpstreamError,
+)
+from claudex_gateway.model_catalog_cache import ModelCatalogCache
 
 
 class _FakeAuthManager:
@@ -23,12 +29,24 @@ class _FakeAuthManager:
 
 
 _CATALOG_MODELS: list[dict[str, Any]] = [
-    {"slug": "gpt-5.6-sol", "context_window": 272000},
-    {"slug": "gpt-5.3-codex-spark", "context_window": 128000},
+    {
+        "slug": "gpt-5.6-sol",
+        "context_window": 272000,
+        "service_tiers": [
+            {"id": "priority", "name": "Fast", "description": "Faster responses"}
+        ],
+    },
+    {"slug": "gpt-5.3-codex-spark", "context_window": 128000, "service_tiers": []},
     {"slug": "gpt-5.4", "context_window": 272000, "max_context_window": 1000000},
+    {"slug": "malformed-tier-list", "context_window": 64000, "service_tiers": [None, "priority"]},
+    {"slug": "malformed-tiers", "context_window": 64000, "service_tiers": {"id": "priority"}},
     {"slug": "gpt-5.6-hidden", "context_window": 64000, "visibility": "hide"},
     {"slug": "no-window-field"},
-    {"slug": "string-window", "context_window": "272000"},
+    {
+        "slug": "string-window",
+        "context_window": "272000",
+        "service_tiers": [{"id": "priority"}],
+    },
     {"slug": "bool-window", "context_window": True},
     {"slug": "zero-window", "context_window": 0},
     {"slug": "negative-window", "context_window": -1},
@@ -48,12 +66,21 @@ def _catalog_handler(calls: dict[str, int]) -> Any:
     return handler
 
 
+def _sse(events: list[dict[str, Any]]) -> bytes:
+    chunks = b"".join(f"data: {json.dumps(event)}\n\n".encode() for event in events)
+    return chunks + b"data: [DONE]\n\n"
+
+
+async def _collect(client: CodexClient, payload: dict[str, Any]) -> list[dict[str, Any]]:
+    return [event async for event in client.stream_responses(payload, "session-1")]
+
+
 class _FakeClock:
     """A controllable stand-in for `time.monotonic`, advanced explicitly.
 
     CodexClient exposes no public clock-injection parameter, so forcing the
     cache's 900s TTL to expire without a real sleep requires replacing the
-    client's private `_context_windows` cache with one built from this fake
+    client's private `_catalog_entries` cache with one built from this fake
     clock (see `_codex_client_with_fake_clock` below).
     """
 
@@ -69,8 +96,8 @@ class _FakeClock:
 
 def _codex_client_with_fake_clock(http_client: httpx.AsyncClient, clock: _FakeClock) -> CodexClient:
     client = CodexClient(_FakeAuthManager(), http_client)
-    client._context_windows = ContextWindowCache(
-        client._fetch_context_windows,
+    client._catalog_entries = ModelCatalogCache(
+        client._fetch_catalog_entries,
         expected_errors=(CodexAuthError, CodexUpstreamError, httpx.HTTPError),
         clock=clock,
     )
@@ -88,6 +115,73 @@ def _malformed_catalog_response(kind: str) -> httpx.Response:
     if kind == "non_list_models":
         return httpx.Response(200, json={"models": {"not": "a-list"}})
     raise ValueError(f"unknown malformed-catalog kind: {kind}")
+
+
+def test_supports_fast_tier_from_catalog() -> None:
+    calls = {"n": 0}
+
+    async def scenario() -> bool:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(_catalog_handler(calls))
+        ) as http_client:
+            client = CodexClient(_FakeAuthManager(), http_client)
+            return await client.supports_fast_tier("gpt-5.6-sol")
+
+    assert asyncio.run(scenario()) is True
+
+
+@pytest.mark.parametrize(
+    "slug",
+    [
+        "gpt-5.3-codex-spark",
+        "gpt-5.4",
+        "malformed-tier-list",
+        "malformed-tiers",
+        "does-not-exist",
+    ],
+)
+def test_supports_fast_tier_is_false_when_not_advertised(slug: str) -> None:
+    calls = {"n": 0}
+
+    async def scenario() -> bool:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(_catalog_handler(calls))
+        ) as http_client:
+            client = CodexClient(_FakeAuthManager(), http_client)
+            return await client.supports_fast_tier(slug)
+
+    assert asyncio.run(scenario()) is False
+
+
+def test_catalog_fetch_serves_context_window_and_fast_tier() -> None:
+    calls = {"n": 0}
+
+    async def scenario() -> tuple[int | None, bool]:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(_catalog_handler(calls))
+        ) as http_client:
+            client = CodexClient(_FakeAuthManager(), http_client)
+            window = await client.context_window("gpt-5.6-sol")
+            supports_fast_tier = await client.supports_fast_tier("gpt-5.6-sol")
+            return window, supports_fast_tier
+
+    assert asyncio.run(scenario()) == (272000, True)
+    assert calls["n"] == 1
+
+
+def test_invalid_window_model_still_resolves_fast_tier() -> None:
+    calls = {"n": 0}
+
+    async def scenario() -> tuple[int | None, bool]:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(_catalog_handler(calls))
+        ) as http_client:
+            client = CodexClient(_FakeAuthManager(), http_client)
+            window = await client.context_window("string-window")
+            supports_fast_tier = await client.supports_fast_tier("string-window")
+            return window, supports_fast_tier
+
+    assert asyncio.run(scenario()) == (None, True)
 
 
 def test_context_window_returns_window_for_exact_slug_match() -> None:
@@ -185,8 +279,8 @@ def test_structural_failure_after_success_serves_stale_value() -> None:
             # past the TTL without a real sleep. (Setting it to absolute 0.0
             # only reads as expired when monotonic uptime exceeds the TTL —
             # false on a freshly booted CI runner.)
-            client._context_windows._snapshot_time -= (
-                client._context_windows._ttl_seconds + 1
+            client._catalog_entries._snapshot_time -= (
+                client._catalog_entries._ttl_seconds + 1
             )
             second = await client.context_window("gpt-5.6-sol")
             return first, second
@@ -230,10 +324,10 @@ def test_non_json_decode_failure_degrades_like_structural_failure() -> None:
             client = CodexClient(_FakeAuthManager(), http_client)
             cold = await client.context_window("gpt-5.6-sol")
             # Clear the failure backoff so the next lookup refreshes.
-            client._context_windows._failure_time = None
+            client._catalog_entries._failure_time = None
             warm = await client.context_window("gpt-5.6-sol")
-            client._context_windows._snapshot_time -= (
-                client._context_windows._ttl_seconds + 1
+            client._catalog_entries._snapshot_time -= (
+                client._catalog_entries._ttl_seconds + 1
             )
             stale = await client.context_window("gpt-5.6-sol")
             return cold, warm, stale
@@ -313,6 +407,51 @@ def test_list_models_fetches_fresh_after_context_window_populated_cache() -> Non
     assert "gpt-5.6-sol" in models
     assert "gpt-5.6-hidden" not in models
     assert calls["n"] == 2
+
+
+def test_stream_responses_sends_fast_tier_routing_hint() -> None:
+    captured: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(
+            200,
+            content=_sse([{"type": "response.created", "response": {"id": "r1"}}]),
+            headers={"content-type": "text/event-stream"},
+        )
+
+    async def scenario() -> list[dict[str, Any]]:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+            return await _collect(
+                CodexClient(_FakeAuthManager(), http_client),
+                {"model": "gpt-5.6-sol", "service_tier": "priority"},
+            )
+
+    events = asyncio.run(scenario())
+
+    assert events == [{"type": "response.created", "response": {"id": "r1"}}]
+    (request,) = captured
+    assert str(request.url) == CODEX_RESPONSES_URL
+    assert request.headers["x-codex-routing-hint"] == (
+        "model=gpt-5.6-sol;tier=priority"
+    )
+
+
+def test_stream_responses_omits_routing_hint_without_service_tier() -> None:
+    captured: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(200, content=_sse([]))
+
+    async def scenario() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+            await _collect(CodexClient(_FakeAuthManager(), http_client), {"model": "gpt-5.6-sol"})
+
+    asyncio.run(scenario())
+
+    (request,) = captured
+    assert "x-codex-routing-hint" not in request.headers
 
 
 def test_list_models_raises_upstream_error_on_non_200() -> None:

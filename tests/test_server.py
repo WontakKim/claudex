@@ -77,6 +77,9 @@ class FakeCodexClient:
     async def context_window(self, model: str) -> int | None:
         return None
 
+    async def supports_fast_tier(self, model: str) -> bool:
+        return False
+
 
 class AvailableKimiAuthManager:
     def __init__(self, *_args: Any, **_kwargs: Any) -> None:
@@ -333,15 +336,20 @@ class StubCodexClient:
         self,
         context_window: int | None = None,
         error: CodexUpstreamError | None = None,
+        supports_fast_tier: bool = False,
     ) -> None:
         self.payloads: list[dict[str, Any]] = []
         self.context_window_calls: list[str] = []
         self._context_window = context_window
         self._error = error or CodexUpstreamError(503, "stub codex upstream")
+        self._supports_fast_tier = supports_fast_tier
 
     async def context_window(self, model: str) -> int | None:
         self.context_window_calls.append(model)
         return self._context_window
+
+    async def supports_fast_tier(self, model: str) -> bool:
+        return self._supports_fast_tier
 
     async def stream_responses(self, payload: dict[str, Any], session_id: str):
         self.payloads.append(payload)
@@ -357,6 +365,7 @@ def _gateway(
     grok_client: Any | None = None,
     codex_context_window: int | None = None,
     codex_error: CodexUpstreamError | None = None,
+    codex_supports_fast_tier: bool = False,
 ) -> tuple[TestClient, StubCodexClient]:
     app = server.create_app(config)
     # The lifespan requires real Codex credentials, so set the state directly
@@ -364,7 +373,9 @@ def _gateway(
     app.state.config = config
     app.state.compaction_last_reroute = None
     app.state.compaction_reroute_sequence = 0
-    stub = StubCodexClient(codex_context_window, codex_error)
+    stub = StubCodexClient(
+        codex_context_window, codex_error, codex_supports_fast_tier
+    )
     app.state.codex_client = stub
     app.state.http_client = httpx.AsyncClient(
         transport=httpx.MockTransport(anthropic_handler)
@@ -529,6 +540,82 @@ def test_mapped_model_routes_to_codex() -> None:
     assert captured == []
 
 
+def test_codex_fast_tier_is_sent_for_supported_model(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    config = GatewayConfig(
+        model_map={"opus": "codex:gpt-5.6-sol"}, codex_service_tier="fast"
+    )
+    client, stub = _gateway(
+        config,
+        _failing_anthropic_handler,
+        codex_supports_fast_tier=True,
+    )
+    caplog.set_level(logging.INFO, logger="claudex_gateway.server")
+
+    response = client.post("/v1/messages", json=_message_body("claude-opus-4-6"))
+
+    assert response.status_code == 503
+    assert stub.payloads[0]["service_tier"] == "priority"
+    assert any(
+        record.name == "claudex_gateway.server"
+        and record.levelno == logging.INFO
+        and "tier=priority" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+def test_codex_fast_tier_is_omitted_for_unsupported_model(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    config = GatewayConfig(
+        model_map={"opus": "codex:gpt-5.6-sol"}, codex_service_tier="fast"
+    )
+    client, stub = _gateway(config, _failing_anthropic_handler)
+    caplog.set_level(logging.DEBUG, logger="claudex_gateway.server")
+
+    response = client.post("/v1/messages", json=_message_body("claude-opus-4-6"))
+
+    assert response.status_code == 503
+    assert "service_tier" not in stub.payloads[0]
+    assert any(
+        record.name == "claudex_gateway.server"
+        and record.levelno == logging.DEBUG
+        and record.getMessage()
+        == "fast tier requested but the codex catalog does not advertise it for gpt-5.6-sol"
+        for record in caplog.records
+    )
+    assert any(
+        record.name == "claudex_gateway.server"
+        and record.levelno == logging.INFO
+        and "tier=standard" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+def test_codex_fast_tier_is_omitted_when_disabled(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    config = GatewayConfig(model_map={"opus": "codex:gpt-5.6-sol"})
+    client, stub = _gateway(
+        config,
+        _failing_anthropic_handler,
+        codex_supports_fast_tier=True,
+    )
+    caplog.set_level(logging.INFO, logger="claudex_gateway.server")
+
+    response = client.post("/v1/messages", json=_message_body("claude-opus-4-6"))
+
+    assert response.status_code == 503
+    assert "service_tier" not in stub.payloads[0]
+    assert any(
+        record.name == "claudex_gateway.server"
+        and record.levelno == logging.INFO
+        and "tier=standard" in record.getMessage()
+        for record in caplog.records
+    )
+
+
 def test_codex_pre_stream_overflow_uses_catalog_context_window() -> None:
     config = GatewayConfig(model_map={"opus": "codex:gpt-5.6-sol"})
     client, _ = _gateway(
@@ -668,7 +755,7 @@ def test_non_streaming_mid_stream_overflow_reports_numbers() -> None:
 
 def test_context_window_cache_is_reused_across_requests() -> None:
     # Proves the relay reuses the lifespan-owned client and its
-    # ContextWindowCache instead of constructing a fresh one per request:
+    # ModelCatalogCache instead of constructing a fresh one per request:
     # two mapped requests through the same app fetch the catalog exactly
     # once (within the cache's TTL) while still hitting the upstream model
     # endpoint once per request.
@@ -1273,6 +1360,20 @@ def test_grok_mapped_model_streams_translated_response() -> None:
     assert payload["reasoning"]["effort"] == "medium"
 
 
+def test_grok_route_omits_codex_fast_service_tier() -> None:
+    stub = StubGrokClient()
+    client, _ = _gateway(
+        _grok_config(codex_service_tier="fast"),
+        _failing_anthropic_handler,
+        grok_client=stub,
+    )
+
+    response = client.post("/v1/messages", json=_message_body("claude-opus-4-6"))
+
+    assert response.status_code == 503
+    assert "service_tier" not in stub.payloads[0]
+
+
 def test_grok_route_strips_reasoning_for_non_thinking_model() -> None:
     stub = StubGrokClient()
     client, _ = _gateway(
@@ -1686,13 +1787,20 @@ def test_compaction_reroute_fallback_translates_untouched_original_body_once(
     received: list[dict[str, Any]] = []
 
     def recording_translate(
-        claude_request: dict[str, Any], upstream_model: str, reasoning_effort_override: str | None
+        claude_request: dict[str, Any],
+        upstream_model: str,
+        reasoning_effort_override: str | None,
+        *,
+        service_tier: str | None = None,
     ) -> dict[str, Any]:
         # A deep, JSON-round-tripped copy: proves equality without ever
         # aliasing the mutable dict the caller still holds.
         received.append(json.loads(json.dumps(claude_request)))
         return translate_claude_request_to_codex(
-            claude_request, upstream_model, reasoning_effort_override
+            claude_request,
+            upstream_model,
+            reasoning_effort_override,
+            service_tier=service_tier,
         )
 
     monkeypatch.setattr(server, "translate_claude_request_to_codex", recording_translate)
@@ -2117,13 +2225,20 @@ def test_compaction_stream_reroute_fallback_translates_untouched_original_body_w
     received: list[dict[str, Any]] = []
 
     def recording_translate(
-        claude_request: dict[str, Any], upstream_model: str, reasoning_effort_override: str | None
+        claude_request: dict[str, Any],
+        upstream_model: str,
+        reasoning_effort_override: str | None,
+        *,
+        service_tier: str | None = None,
     ) -> dict[str, Any]:
         # A deep, JSON-round-tripped copy: proves equality without ever
         # aliasing the mutable dict the caller still holds.
         received.append(json.loads(json.dumps(claude_request)))
         return translate_claude_request_to_codex(
-            claude_request, upstream_model, reasoning_effort_override
+            claude_request,
+            upstream_model,
+            reasoning_effort_override,
+            service_tier=service_tier,
         )
 
     monkeypatch.setattr(server, "translate_claude_request_to_codex", recording_translate)
@@ -2981,7 +3096,10 @@ class TestAdminCompactionApi:
         }
         assert reread.json()["model"] == "claude:claude-opus-5"
         saved = json.loads(settings_file.read_text(encoding="utf-8"))
-        assert saved == {"port": 9317, "compaction.model": "claude:claude-opus-5"}
+        assert saved == {
+            "port": 9317,
+            "compaction": {"model": "claude:claude-opus-5"},
+        }
 
     def test_put_hot_swaps_live_config_for_subsequent_requests(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -3012,7 +3130,7 @@ class TestAdminCompactionApi:
         assert reread.json()["model"] is None
         saved = json.loads(settings_file.read_text(encoding="utf-8"))
         assert saved == {"port": 1234}
-        assert "compaction.model" not in saved
+        assert "compaction" not in saved
 
     def test_put_enable_then_disable_changes_the_live_reroute_trigger(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -3356,7 +3474,7 @@ class TestAdminClaudeAccountApi:
         assert reread.json()["account_id"] == account_id
         assert config_after.claude_account_id == account_id
         saved = json.loads(settings_file.read_text(encoding="utf-8"))
-        assert saved == {"port": 9317, "claude_account.id": account_id}
+        assert saved == {"port": 9317, "claude_account": {"id": account_id}}
 
     def test_put_null_is_rejected_pointing_at_delete(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -3392,7 +3510,7 @@ class TestAdminClaudeAccountApi:
         assert response.status_code == 200
         assert response.json() == {"account_id": None, "env_locked": False}
         assert config_after.claude_account_id is None
-        assert "claude_account.id" not in json.loads(settings_file.read_text())
+        assert "claude_account" not in json.loads(settings_file.read_text())
 
     def test_delete_when_already_clear_is_a_no_op_200(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -3521,7 +3639,7 @@ class TestAdminClaudeRoutingApi:
         assert response.json() == {"mode": "fallback", "env_locked": False}
         assert config_after.claude_account_routing_mode == "fallback"
         saved = json.loads(settings_file.read_text(encoding="utf-8"))
-        assert saved == {"claude_account.routing": {"mode": "fallback"}}
+        assert saved == {"claude_account": {"routing": {"mode": "fallback"}}}
 
     def test_put_disabled_removes_the_settings_key(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -3542,7 +3660,7 @@ class TestAdminClaudeRoutingApi:
         assert response.status_code == 200
         assert response.json() == {"mode": "disabled", "env_locked": False}
         assert config_after.claude_account_routing_mode == "disabled"
-        assert "claude_account.routing" not in json.loads(settings_file.read_text())
+        assert "claude_account" not in json.loads(settings_file.read_text())
 
     def test_put_balanced_with_unknown_keys_is_rejected(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -6260,7 +6378,7 @@ class TestBalancedRoutingEnable:
         assert epoch_id_while_active is not None
         assert router_while_active is not None
         saved = json.loads(settings_file.read_text(encoding="utf-8"))
-        assert saved == {"claude_account.routing": {"mode": "balanced"}}
+        assert saved == {"claude_account": {"routing": {"mode": "balanced"}}}
 
     def test_put_balanced_rejects_invalid_account_uuid(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -6470,7 +6588,7 @@ class TestBalancedRoutingExit:
             # completed rather than erroring.
             assert served_after_exit.status_code == 200
             saved = json.loads(settings_file.read_text(encoding="utf-8"))
-            assert "claude_account.routing" not in saved
+            assert "claude_account" not in saved
 
             # The exited epoch's pins are gone at the persistence layer too --
             # not just discarded in memory with this runtime instance.
@@ -6548,7 +6666,7 @@ class TestBalancedRoutingExit:
             assert runtime.epoch_id == epoch_id_before
             assert client.app.state.config.claude_account_routing_mode == "balanced"
             saved = json.loads(settings_file.read_text(encoding="utf-8"))
-            assert saved["claude_account.routing"] == {"mode": "balanced"}
+            assert saved["claude_account"]["routing"] == {"mode": "balanced"}
 
             # The durable pin the persistence failure was supposed to leave
             # untouched is still there, both in memory and at the durable
@@ -6610,7 +6728,7 @@ class TestBalancedRoutingExit:
             assert exited.json() == {"mode": "disabled", "env_locked": False}
             assert runtime.status == "disabled"
             saved = json.loads(settings_file.read_text(encoding="utf-8"))
-            assert "claude_account.routing" not in saved
+            assert "claude_account" not in saved
 
         assert any(
             "persistence_degraded" in record.getMessage() for record in caplog.records
