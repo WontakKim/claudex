@@ -46,8 +46,9 @@ untouched.
   keyed on model names keep working.
 - Serves `GET /health` with the readiness state of the Codex, Kimi, and Grok
   upstreams.
-- Serves a runtime dashboard at `GET /` for editing the model map, checking
-  provider health, and testing model connections before wiring them.
+- Serves a runtime dashboard at `GET /` for editing the model map, toggling
+  Codex Fast mode, checking provider health, and testing model connections
+  before wiring them.
 - Reuses each provider's CLI login — no gateway-side auth: the Codex CLI's
   `~/.codex/auth.json`, the Kimi Code CLI's `~/.kimi-code` credential store,
   and the Grok CLI's `~/.grok/auth.json`, each refreshed in place like the

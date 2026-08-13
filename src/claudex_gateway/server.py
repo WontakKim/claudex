@@ -95,6 +95,7 @@ from claudex_gateway.compaction import (
 from claudex_gateway.config import (
     SETTINGS_KEYS,
     VALID_CLAUDE_ACCOUNT_ROUTING_MODES,
+    VALID_CODEX_SERVICE_TIERS,
     VALID_LOG_LEVELS,
     ConfigError,
     GatewayConfig,
@@ -2862,6 +2863,102 @@ async def _handle_admin_compaction_put(request: Request) -> JSONResponse:
     return JSONResponse(_compaction_payload(new_config, request.app.state))
 
 
+_CODEX_KEYS = ("service_tier",)
+
+
+def _codex_payload(config: GatewayConfig) -> dict[str, Any]:
+    """Pinned {service_tier, env_locked} envelope for /admin/settings/codex.
+
+    `service_tier` is the raw supported tier (or None), so a GET/PUT
+    round-trip is loss-free. `env_locked` mirrors the compaction envelope:
+    true whenever CLAUDEX_CODEX_SERVICE_TIER is present in the environment,
+    including an empty value.
+    """
+    env_name = SETTINGS_KEYS["codex.service_tier"]
+    return {
+        "service_tier": config.codex_service_tier,
+        "env_locked": os.environ.get(env_name) is not None,
+    }
+
+
+async def _handle_admin_codex_get(request: Request) -> JSONResponse:
+    denied = _admin_guard(request)
+    if denied is not None:
+        return denied
+    return JSONResponse(_codex_payload(request.app.state.config))
+
+
+async def _handle_admin_codex_put(request: Request) -> JSONResponse:
+    denied = _admin_guard(request) or _require_json_content_type(request)
+    if denied is not None:
+        return denied
+
+    body, error = await _read_json_object(request, _openai_error_body)
+    if error is not None or body is None:
+        return error
+    unknown = sorted(set(body) - set(_CODEX_KEYS))
+    if unknown:
+        return JSONResponse(
+            _openai_error_body(
+                "invalid_request_error",
+                f"unknown keys: {', '.join(unknown)}; "
+                f"supported: {', '.join(_CODEX_KEYS)}",
+            ),
+            status_code=400,
+        )
+    if "service_tier" not in body:
+        return JSONResponse(
+            _openai_error_body(
+                "invalid_request_error", "provide 'service_tier' ('fast' or null)"
+            ),
+            status_code=400,
+        )
+
+    value = body["service_tier"]
+    if value is not None and (
+        not isinstance(value, str) or value not in VALID_CODEX_SERVICE_TIERS
+    ):
+        return JSONResponse(
+            _openai_error_body(
+                "invalid_request_error",
+                "service_tier must be null or one of: "
+                f"{', '.join(VALID_CODEX_SERVICE_TIERS)}",
+            ),
+            status_code=400,
+        )
+
+    env_name = SETTINGS_KEYS["codex.service_tier"]
+    if os.environ.get(env_name) is not None:
+        return JSONResponse(
+            _openai_error_body(
+                "invalid_request_error",
+                f"{env_name} is set in the gateway's environment and overrides "
+                f"codex.service_tier; unset it to manage the setting at runtime",
+            ),
+            status_code=409,
+        )
+
+    async with request.app.state.admin_lock:
+        config: GatewayConfig = request.app.state.config
+        try:
+            if value is None:
+                update_settings_file(
+                    config.settings_file, {}, deletions=("codex.service_tier",)
+                )
+            else:
+                update_settings_file(config.settings_file, {"codex.service_tier": value})
+        except (ConfigError, OSError) as exc:
+            return JSONResponse(
+                _openai_error_body(
+                    "server_error", f"could not persist settings: {exc}"
+                ),
+                status_code=500,
+            )
+        new_config = replace(config, codex_service_tier=value)
+        request.app.state.config = new_config
+    return JSONResponse(_codex_payload(new_config))
+
+
 # The single runtime-editable field on the claude-account admin surface.
 _CLAUDE_ACCOUNT_KEYS = ("account_id",)
 
@@ -4291,6 +4388,8 @@ def create_app(config: GatewayConfig, daemon_nonce: str | None = None) -> Starle
             Route(
                 "/admin/settings/compaction", _handle_admin_compaction_put, methods=["PUT"]
             ),
+            Route("/admin/settings/codex", _handle_admin_codex_get, methods=["GET"]),
+            Route("/admin/settings/codex", _handle_admin_codex_put, methods=["PUT"]),
             Route(
                 "/admin/providers/codex/models",
                 _handle_admin_codex_models,
