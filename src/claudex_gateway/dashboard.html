@@ -262,9 +262,12 @@ body.env-locked .applybar{display:none!important}
    so it carries its own lock indicator rather than reusing .lockband, which
    is wired to body.env-locked (the map's own env-lock flag). */
 .complock{display:none;margin-bottom:14px;border:1px solid var(--err);border-radius:8px;color:var(--err);padding:10px 14px;font-size:14px}
-#compaction-card.locked .complock,#routing-card.locked .complock{display:block}
+#compaction-card.locked .complock,#codex-card.locked .complock,#routing-card.locked .complock{display:block}
 #comp-select,#routing-select{font:600 14px var(--sans);background:var(--inset);border:1.5px solid transparent;border-radius:6px;padding:9px 10px;color:var(--text)}
 #comp-select:disabled,#routing-select:disabled{opacity:.55;cursor:default}
+.fast-option{display:flex;align-items:center;gap:9px;flex:1;background:var(--inset);border-radius:6px;padding:9px 10px;font:600 14px var(--sans);cursor:pointer}
+.fast-option input{margin:0;accent-color:var(--accent)}
+#codex-card.locked .fast-option{opacity:.55;cursor:default}
 .route-link{color:var(--accent);text-decoration:none}
 .route-link:hover{text-decoration:underline}
 .comp-custom{display:none;margin-top:10px}
@@ -291,7 +294,7 @@ body.env-locked .applybar{display:none!important}
 .srow .desc{font-size:13.5px;color:var(--muted);margin-top:8px}
 .srow .ctrow select,.srow .ctrow .ctnode{flex:1;min-width:0}
 .srow .cthint{font-size:11px;color:color-mix(in srgb,var(--muted) 70%,transparent)}
-#compaction-card.locked,#routing-card.locked{border-left:3px solid var(--err);padding-left:14px;margin-left:-17px}
+#compaction-card.locked,#codex-card.locked,#routing-card.locked{border-left:3px solid var(--err);padding-left:14px;margin-left:-17px}
 /* Settings categories: one .scard visible at a time, switched by the rail
    (data-cat on the section). */
 .scard{display:none}
@@ -438,6 +441,21 @@ button.primary:disabled{opacity:.5;cursor:default}
             </div>
           </div>
           <!-- compaction-section:end -->
+          <!-- codex-section:start -->
+          <div class="srow" id="codex-card">
+            <div>
+              <div class="name">Codex Fast mode</div>
+            </div>
+            <div>
+              <div class="complock" id="codex-lockband"><b>LOCKED</b> — <code id="codex-lock-env"></code> takes precedence. Codex Fast mode is read-only.</div>
+              <div class="ctrow">
+                <label class="fast-option" for="codex-fast"><input type="checkbox" id="codex-fast"> Enable Codex Fast mode</label>
+                <button id="codex-apply">Apply</button>
+              </div>
+              <div class="cthint">Fast runs supported Codex models with priority processing (~1.5x speed) at ~2–2.5x usage burn; models whose catalog does not advertise Fast silently stay standard.</div>
+            </div>
+          </div>
+          <!-- codex-section:end -->
           <!-- routing-section:start -->
           <div class="srow" id="routing-card">
             <div>
@@ -1374,6 +1392,71 @@ document.getElementById("comp-custom-input").addEventListener("input",function()
   COMP.draftCustom=this.value;
 });
 document.getElementById("comp-apply").addEventListener("click",applyCompaction);
+/* --- Codex Fast service tier --------------------------------------------- */
+var CODEX={envName:"CLAUDEX_CODEX_SERVICE_TIER",locked:false,serviceTier:null,draft:false};
+function isCodexEnvelope(body){
+  return !!body&&typeof body.env_locked==="boolean"&&
+    (body.service_tier===null||body.service_tier==="fast");
+}
+function renderCodex(){
+  document.getElementById("codex-card").classList.toggle("locked",CODEX.locked);
+  document.getElementById("codex-lock-env").textContent=CODEX.envName;
+  var checkbox=document.getElementById("codex-fast");
+  checkbox.checked=CODEX.draft;
+  checkbox.disabled=CODEX.locked;
+  var btn=document.getElementById("codex-apply");
+  btn.disabled=CODEX.locked||CODEX.draft===(CODEX.serviceTier==="fast");
+  btn.textContent="Apply";
+}
+function renderCodexState(body){
+  CODEX.serviceTier=body.service_tier;
+  CODEX.locked=!!body.env_locked;
+  CODEX.draft=body.service_tier==="fast";
+  renderCodex();
+}
+function applyCodex(){
+  var btn=document.getElementById("codex-apply");
+  if(CODEX.locked||btn.disabled)return;
+  btn.disabled=true;btn.textContent="…";
+  jfetch("/admin/settings/codex",{
+    method:"PUT",
+    headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({service_tier:CODEX.draft?"fast":null})
+  }).then(function(r){
+    if(r.status===409){
+      CODEX.locked=true;
+      renderCodex();
+      showToast('<span class="chip chip-err">LOCKED</span><span class="lat">409</span><br>'+esc(CODEX.envName)+
+        '<br><span class="dim">'+esc(errDetail(r.body))+"</span>",true);
+      jfetch("/admin/settings/codex").then(function(g){
+        if(g.ok&&isCodexEnvelope(g.body)){
+          renderCodexState(g.body);
+        }else{
+          CODEX.locked=true;
+          renderCodex();
+          showToast('<span class="chip chip-err">ERROR</span><br>Codex Fast refresh<br><span class="dim">could not load current state</span>',true);
+        }
+      });
+      return;
+    }
+    if(!r.ok){
+      renderCodex();
+      showToast('<span class="chip chip-err">ERROR</span><span class="lat">'+r.status+"</span><br>Codex Fast"+
+        '<br><span class="dim">'+esc(errDetail(r.body))+"</span>",true);
+      return;
+    }
+    renderCodexState(r.body);
+    showToast('<span class="chip chip-ok">APPLIED</span><br>Codex Fast → '+(r.body.service_tier==="fast"?"Enabled":"Disabled"),false);
+  }).catch(function(){
+    renderCodex();
+    showToast('<span class="chip chip-err">ERROR</span><br>Codex Fast<br><span class="dim">gateway unreachable</span>',true);
+  });
+}
+document.getElementById("codex-fast").addEventListener("change",function(){
+  CODEX.draft=this.checked;
+  renderCodex();
+});
+document.getElementById("codex-apply").addEventListener("click",applyCodex);
 /* --- account-pool routing mode (claude_account.routing) -------------------
    Same envelope discipline as the compaction card: adopt {mode, env_locked}
    from every successful response, 409 flips the local lock and re-syncs from
@@ -2369,18 +2452,26 @@ function boot(){
       jfetch("/admin/providers/grok/models"),
       jfetch("/admin/settings/log-level"),
       jfetch("/admin/settings/compaction"),
+      jfetch("/admin/settings/codex"),
       jfetch("/admin/providers/claude/pool/routing")
     ]);
   }).then(function(results){
     var mapping=results[0],health=results[1];
     var codexCatalog=results[2],kimiCatalog=results[3],grokCatalog=results[4],loglevel=results[5];
-    var compactionResp=results[6],routingResp=results[7];
+    var compactionResp=results[6],codexResp=results[7],routingResp=results[8];
     if(loglevel.ok)renderLogLevel(loglevel.body);
     if(compactionResp.ok){
       renderCompactionState(compactionResp.body);
     }else{
       showToast('<span class="chip chip-err">ERROR</span><span class="lat">'+compactionResp.status+
         '</span><br>GET /admin/settings/compaction<br><span class="dim">'+esc(errDetail(compactionResp.body))+"</span>",true);
+    }
+    if(codexResp.ok&&isCodexEnvelope(codexResp.body)){
+      renderCodexState(codexResp.body);
+    }else{
+      renderCodex();
+      showToast('<span class="chip chip-err">ERROR</span><span class="lat">'+codexResp.status+
+        '</span><br>GET /admin/settings/codex<br><span class="dim">'+esc(errDetail(codexResp.body))+"</span>",true);
     }
     if(routingResp.ok&&isRoutingEnvelope(routingResp.body)){
       renderRoutingState(routingResp.body);

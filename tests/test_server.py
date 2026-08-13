@@ -3408,6 +3408,133 @@ class TestAdminCompactionApi:
         assert not (tmp_path / "settings.json").exists()
 
 
+class TestAdminCodexApi:
+    """GET/PUT /admin/settings/codex — Codex Fast service tier."""
+
+    @staticmethod
+    def _admin_client(
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        **config_kwargs: Any,
+    ) -> TestClient:
+        monkeypatch.delenv("CLAUDEX_CODEX_SERVICE_TIER", raising=False)
+        config = GatewayConfig(settings_file=tmp_path / "settings.json", **config_kwargs)
+        return _create_test_client(
+            monkeypatch, tmp_path, config=config, base_url="http://127.0.0.1:8787"
+        )
+
+    def test_get_returns_default_state(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        with self._admin_client(monkeypatch, tmp_path) as client:
+            response = client.get("/admin/settings/codex")
+
+        assert response.status_code == 200
+        assert response.json() == {"service_tier": None, "env_locked": False}
+
+    def test_put_fast_persists_and_hot_swaps_live_config(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        settings_file = tmp_path / "settings.json"
+        settings_file.write_text('{"port": 9317}', encoding="utf-8")
+        with self._admin_client(monkeypatch, tmp_path) as client:
+            response = client.put(
+                "/admin/settings/codex", json={"service_tier": "fast"}
+            )
+            config_after = client.app.state.config
+            reread = client.get("/admin/settings/codex")
+
+        assert response.status_code == 200
+        assert response.json() == {"service_tier": "fast", "env_locked": False}
+        assert reread.json() == {"service_tier": "fast", "env_locked": False}
+        assert config_after.codex_service_tier == "fast"
+        assert json.loads(settings_file.read_text(encoding="utf-8")) == {
+            "port": 9317,
+            "codex": {"service_tier": "fast"},
+        }
+
+    def test_put_null_removes_key_and_hot_swaps_live_config(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        settings_file = tmp_path / "settings.json"
+        settings_file.write_text(
+            json.dumps({"port": 9317, "codex": {"service_tier": "fast"}}),
+            encoding="utf-8",
+        )
+        with self._admin_client(
+            monkeypatch, tmp_path, codex_service_tier="fast"
+        ) as client:
+            response = client.put(
+                "/admin/settings/codex", json={"service_tier": None}
+            )
+            config_after = client.app.state.config
+            reread = client.get("/admin/settings/codex")
+
+        assert response.status_code == 200
+        assert response.json() == {"service_tier": None, "env_locked": False}
+        assert reread.json() == {"service_tier": None, "env_locked": False}
+        assert config_after.codex_service_tier is None
+        saved = json.loads(settings_file.read_text(encoding="utf-8"))
+        assert saved == {"port": 9317}
+        assert "codex" not in saved
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            {"service_tier": "priority"},
+            {"service_tier": 123},
+            {},
+        ],
+    )
+    def test_put_rejects_invalid_body(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        body: dict[str, Any],
+    ) -> None:
+        with self._admin_client(monkeypatch, tmp_path) as client:
+            response = client.put("/admin/settings/codex", json=body)
+
+        assert response.status_code == 400
+        assert "error" in response.json()
+        assert not (tmp_path / "settings.json").exists()
+
+    @pytest.mark.parametrize("env_value", ["fast", ""])
+    def test_env_override_locks_get_and_put(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        env_value: str,
+    ) -> None:
+        monkeypatch.setenv("CLAUDEX_CODEX_SERVICE_TIER", env_value)
+        config = GatewayConfig(settings_file=tmp_path / "settings.json")
+        with _create_test_client(
+            monkeypatch, tmp_path, config=config, base_url="http://127.0.0.1:8787"
+        ) as client:
+            get_response = client.get("/admin/settings/codex")
+            put_response = client.put(
+                "/admin/settings/codex", json={"service_tier": "fast"}
+            )
+
+        assert get_response.json() == {"service_tier": None, "env_locked": True}
+        assert put_response.status_code == 409
+        assert "CLAUDEX_CODEX_SERVICE_TIER" in put_response.json()["error"]["message"]
+        assert not (tmp_path / "settings.json").exists()
+
+    def test_get_and_put_require_local_token_when_configured(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        with self._admin_client(monkeypatch, tmp_path, local_token="secret") as client:
+            get_response = client.get("/admin/settings/codex")
+            put_response = client.put(
+                "/admin/settings/codex", json={"service_tier": "fast"}
+            )
+
+        assert get_response.status_code == 401
+        assert put_response.status_code == 401
+        assert not (tmp_path / "settings.json").exists()
+
+
 class TestAdminClaudeAccountApi:
     """GET/PUT /admin/providers/claude/pool/serving — serving-account selection, mirroring
     /admin/settings/compaction. The shared bearer/Host guard paths are exhaustively
@@ -4325,6 +4452,46 @@ def test_dashboard_compaction_409_refresh_failure_stays_locked(
     assert "r.body.last_reroute" not in locked_branch
 
 
+def _codex_section(page: str) -> str:
+    start = page.index("<!-- codex-section:start -->")
+    end = page.index("<!-- codex-section:end -->")
+    return page[start:end]
+
+
+def test_dashboard_codex_fast_card_wires_apply_flow_and_env_lock(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        page = client.get("/").text
+
+    section = _codex_section(page)
+    assert page.index('id="compaction-card"') < page.index('id="codex-card"')
+    assert 'type="checkbox" id="codex-fast"' in section
+    assert 'id="codex-apply"' in section
+    assert "~1.5x speed" in section
+    assert "~2–2.5x usage burn" in section
+    assert "silently stay standard" in section
+    assert "CLAUDEX_CODEX_SERVICE_TIER" in page
+    assert 'jfetch("/admin/settings/codex")' in page
+    assert 'jfetch("/admin/settings/codex",{' in page
+    assert 'JSON.stringify({service_tier:CODEX.draft?"fast":null})' in page
+    assert "checkbox.disabled=CODEX.locked" in page
+    assert "btn.disabled=CODEX.locked||CODEX.draft===(CODEX.serviceTier===\"fast\")" in page
+
+
+def test_dashboard_codex_fast_fetched_in_parallel_boot_sequence(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        page = client.get("/").text
+
+    boot_start = page.index("function boot(){")
+    promise_all = page.index("Promise.all([", boot_start)
+    promise_all_end = page.index("]);", promise_all)
+    parallel_calls = page[promise_all:promise_all_end]
+    assert 'jfetch("/admin/settings/codex")' in parallel_calls
+
+
 def test_dashboard_settings_rail_switches_categories(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -4480,8 +4647,8 @@ def test_dashboard_routing_locked_renders_readonly(
     assert "CLAUDEX_CLAUDE_ACCOUNT_ROUTING" in page
     assert 'id="routing-lock-env"' in page
     assert (
-        "#compaction-card.locked .complock,#routing-card.locked .complock{display:block}"
-        in page
+        "#compaction-card.locked .complock,#codex-card.locked .complock,"
+        "#routing-card.locked .complock{display:block}" in page
     )
     apply_fn = page[
         page.index("function applyRouting(){") : page.index(
