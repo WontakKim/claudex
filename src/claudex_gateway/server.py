@@ -1706,6 +1706,11 @@ async def _relay_via_responses_backend(
             # back to the standard tier rather than blocking the request.
             if await client.supports_fast_tier(upstream_model):
                 service_tier = CODEX_FAST_TIER_WIRE_VALUE
+            else:
+                logger.debug(
+                    "fast tier requested but the codex catalog does not advertise it for %s",
+                    upstream_model,
+                )
         payload = translate_claude_request_to_codex(
             claude_request,
             upstream_model,
@@ -1720,12 +1725,13 @@ async def _relay_via_responses_backend(
         payload = sanitize_grok_payload(payload, upstream_model)
     session_id = payload["prompt_cache_key"]
     logger.info(
-        "%s -> %s:%s (stream=%s, effort=%s, messages=%d, tools=%d)",
+        "%s -> %s:%s (stream=%s, effort=%s, tier=%s, messages=%d, tools=%d)",
         claude_request.get("model", "?"),
         provider,
         upstream_model,
         bool(claude_request.get("stream")),
         (payload.get("reasoning") or {}).get("effort", "-"),
+        payload.get("service_tier") or "standard",
         len(claude_request.get("messages") or []),
         len(payload.get("tools") or []),
     )

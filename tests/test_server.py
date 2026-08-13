@@ -540,7 +540,9 @@ def test_mapped_model_routes_to_codex() -> None:
     assert captured == []
 
 
-def test_codex_fast_tier_is_sent_for_supported_model() -> None:
+def test_codex_fast_tier_is_sent_for_supported_model(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     config = GatewayConfig(
         model_map={"opus": "codex:gpt-5.6-sol"}, codex_service_tier="fast"
     )
@@ -549,37 +551,69 @@ def test_codex_fast_tier_is_sent_for_supported_model() -> None:
         _failing_anthropic_handler,
         codex_supports_fast_tier=True,
     )
+    caplog.set_level(logging.INFO, logger="claudex_gateway.server")
 
     response = client.post("/v1/messages", json=_message_body("claude-opus-4-6"))
 
     assert response.status_code == 503
     assert stub.payloads[0]["service_tier"] == "priority"
+    assert any(
+        record.name == "claudex_gateway.server"
+        and record.levelno == logging.INFO
+        and "tier=priority" in record.getMessage()
+        for record in caplog.records
+    )
 
 
-def test_codex_fast_tier_is_omitted_for_unsupported_model() -> None:
+def test_codex_fast_tier_is_omitted_for_unsupported_model(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     config = GatewayConfig(
         model_map={"opus": "codex:gpt-5.6-sol"}, codex_service_tier="fast"
     )
     client, stub = _gateway(config, _failing_anthropic_handler)
+    caplog.set_level(logging.DEBUG, logger="claudex_gateway.server")
 
     response = client.post("/v1/messages", json=_message_body("claude-opus-4-6"))
 
     assert response.status_code == 503
     assert "service_tier" not in stub.payloads[0]
+    assert any(
+        record.name == "claudex_gateway.server"
+        and record.levelno == logging.DEBUG
+        and record.getMessage()
+        == "fast tier requested but the codex catalog does not advertise it for gpt-5.6-sol"
+        for record in caplog.records
+    )
+    assert any(
+        record.name == "claudex_gateway.server"
+        and record.levelno == logging.INFO
+        and "tier=standard" in record.getMessage()
+        for record in caplog.records
+    )
 
 
-def test_codex_fast_tier_is_omitted_when_disabled() -> None:
+def test_codex_fast_tier_is_omitted_when_disabled(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     config = GatewayConfig(model_map={"opus": "codex:gpt-5.6-sol"})
     client, stub = _gateway(
         config,
         _failing_anthropic_handler,
         codex_supports_fast_tier=True,
     )
+    caplog.set_level(logging.INFO, logger="claudex_gateway.server")
 
     response = client.post("/v1/messages", json=_message_body("claude-opus-4-6"))
 
     assert response.status_code == 503
     assert "service_tier" not in stub.payloads[0]
+    assert any(
+        record.name == "claudex_gateway.server"
+        and record.levelno == logging.INFO
+        and "tier=standard" in record.getMessage()
+        for record in caplog.records
+    )
 
 
 def test_codex_pre_stream_overflow_uses_catalog_context_window() -> None:
