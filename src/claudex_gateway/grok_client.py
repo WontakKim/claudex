@@ -14,7 +14,7 @@ from typing import Any
 
 import httpx
 
-from claudex_gateway.context_window_cache import ContextWindowCache
+from claudex_gateway.model_catalog_cache import ModelCatalogCache
 from claudex_gateway.grok_auth import GrokAuthError, GrokAuthManager, GrokCredentials
 
 GROK_RESPONSES_URL = "https://cli-chat-proxy.grok.com/v1/responses"
@@ -32,6 +32,7 @@ _GROK_UNSUPPORTED_FIELDS = (
     "previous_response_id",
     "prompt_cache_retention",
     "safety_identifier",
+    "service_tier",
     "stream_options",
     "stop",
 )
@@ -105,7 +106,7 @@ class GrokClient:
     def __init__(self, auth_manager: GrokAuthManager, http_client: httpx.AsyncClient) -> None:
         self._auth_manager = auth_manager
         self._http_client = http_client
-        self._context_windows = ContextWindowCache(
+        self._context_windows: ModelCatalogCache[int] = ModelCatalogCache(
             self._fetch_context_windows,
             expected_errors=(GrokAuthError, GrokUpstreamError, httpx.HTTPError),
         )

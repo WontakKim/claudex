@@ -82,7 +82,11 @@ from claudex_gateway.claude_login_session import (
 )
 from claudex_gateway.locking import try_file_lock
 from claudex_gateway.codex_auth import CodexAuthError, CodexAuthManager
-from claudex_gateway.codex_client import CodexClient, CodexUpstreamError
+from claudex_gateway.codex_client import (
+    CODEX_FAST_TIER_WIRE_VALUE,
+    CodexClient,
+    CodexUpstreamError,
+)
 from claudex_gateway.compaction import (
     build_reroute_headers,
     build_reroute_payload,
@@ -1696,8 +1700,17 @@ async def _relay_via_responses_backend(
                     return reroute_response
 
     try:
+        service_tier = None
+        if provider == "codex" and config.codex_service_tier == "fast":
+            # Fast is optional: unknown models and failed catalog refreshes fall
+            # back to the standard tier rather than blocking the request.
+            if await client.supports_fast_tier(upstream_model):
+                service_tier = CODEX_FAST_TIER_WIRE_VALUE
         payload = translate_claude_request_to_codex(
-            claude_request, upstream_model, config.reasoning_effort_override
+            claude_request,
+            upstream_model,
+            config.reasoning_effort_override,
+            service_tier=service_tier,
         )
     except TranslationError as exc:
         return JSONResponse(

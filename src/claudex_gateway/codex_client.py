@@ -4,15 +4,18 @@ from __future__ import annotations
 
 import json
 from collections.abc import AsyncIterator
+from dataclasses import dataclass
 from typing import Any
 
 import httpx
 
 from claudex_gateway.codex_auth import CodexAuthError, CodexAuthManager, CodexCredentials
-from claudex_gateway.context_window_cache import ContextWindowCache
+from claudex_gateway.model_catalog_cache import ModelCatalogCache
 
 CODEX_RESPONSES_URL = "https://chatgpt.com/backend-api/codex/responses"
 CODEX_MODELS_URL = "https://chatgpt.com/backend-api/codex/models"
+# The UI name is "Fast", but the wire keeps the legacy pre-rename value.
+CODEX_FAST_TIER_WIRE_VALUE = "priority"
 
 # Mirrors the header set CLIProxyAPI sends; the backend rejects unknown clients
 # and silently downgrades gpt-5.6-luna requests from clients older than 0.144.0.
@@ -31,12 +34,18 @@ class CodexUpstreamError(Exception):
         self.body = body
 
 
+@dataclass(frozen=True)
+class CodexModelEntry:
+    context_window: int | None
+    supports_fast_tier: bool
+
+
 class CodexClient:
     def __init__(self, auth_manager: CodexAuthManager, http_client: httpx.AsyncClient) -> None:
         self._auth_manager = auth_manager
         self._http_client = http_client
-        self._context_windows = ContextWindowCache(
-            self._fetch_context_windows,
+        self._catalog_entries: ModelCatalogCache[CodexModelEntry] = ModelCatalogCache(
+            self._fetch_catalog_entries,
             expected_errors=(CodexAuthError, CodexUpstreamError, httpx.HTTPError),
         )
 
@@ -73,23 +82,35 @@ class CodexClient:
 
     async def context_window(self, model: str) -> int | None:
         """Return the cached context-window size for ``model``, or ``None``."""
-        return await self._context_windows.get(model)
+        entry = await self._catalog_entries.get(model)
+        return entry.context_window if entry else None
 
-    async def _fetch_context_windows(self) -> dict[str, int]:
-        """Resolve a slug -> context-window map from the raw, unfiltered catalog."""
+    async def supports_fast_tier(self, model: str) -> bool:
+        """Return whether the live catalog lists the Fast tier for ``model``."""
+        entry = await self._catalog_entries.get(model)
+        return entry.supports_fast_tier if entry is not None else False
+
+    async def _fetch_catalog_entries(self) -> dict[str, CodexModelEntry]:
+        """Resolve slug -> catalog entries from the raw, unfiltered catalog."""
         models = await self._fetch_model_entries()
-        windows: dict[str, int] = {}
+        entries: dict[str, CodexModelEntry] = {}
         for model in models:
             if not isinstance(model, dict):
                 continue
             slug = model.get("slug")
             if not isinstance(slug, str) or not slug:
                 continue
-            window = self._coerce_context_window(model.get("context_window"))
-            if window is None:
-                continue
-            windows[slug] = window
-        return windows
+            service_tiers = model.get("service_tiers")
+            supports_fast_tier = isinstance(service_tiers, list) and any(
+                isinstance(tier, dict)
+                and tier.get("id") == CODEX_FAST_TIER_WIRE_VALUE
+                for tier in service_tiers
+            )
+            entries[slug] = CodexModelEntry(
+                context_window=self._coerce_context_window(model.get("context_window")),
+                supports_fast_tier=supports_fast_tier,
+            )
+        return entries
 
     async def _fetch_model_entries(self) -> list[Any]:
         """GET the Codex model catalog and return its raw ``models`` list.
@@ -113,7 +134,7 @@ class CodexClient:
         except ValueError as exc:
             # ValueError covers JSONDecodeError, UnicodeDecodeError, and the
             # int-conversion digit limit — every decode failure must surface
-            # as a structural catalog failure the context-window cache can
+            # as a structural catalog failure the model-catalog cache can
             # treat as a failed refresh.
             raise CodexUpstreamError(502, "codex models response is not valid JSON") from exc
         if not isinstance(parsed, dict):
@@ -157,6 +178,9 @@ class CodexClient:
                 "Session_id": session_id,
             }
         )
+        service_tier = payload.get("service_tier")
+        if service_tier:
+            headers["x-codex-routing-hint"] = f"model={payload['model']};tier={service_tier}"
 
         async with self._http_client.stream(
             "POST", CODEX_RESPONSES_URL, json=payload, headers=headers

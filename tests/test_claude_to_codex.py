@@ -32,6 +32,7 @@ def test_basic_request_shape() -> None:
     assert payload["reasoning"] == {"effort": "medium", "summary": "auto"}
     assert "tools" not in payload
     assert "parallel_tool_calls" not in payload
+    assert "service_tier" not in payload
 
     developer, user = payload["input"]
     assert developer == {
@@ -44,6 +45,22 @@ def test_basic_request_shape() -> None:
         "role": "user",
         "content": [{"type": "input_text", "text": "hello"}],
     }
+
+
+def test_service_tier_is_included_when_set() -> None:
+    payload = translate_claude_request_to_codex(
+        {"messages": []}, codex_model="gpt-5.5", service_tier="priority"
+    )
+
+    assert payload["service_tier"] == "priority"
+
+
+def test_service_tier_is_omitted_by_default() -> None:
+    payload = translate_claude_request_to_codex(
+        {"messages": []}, codex_model="gpt-5.5"
+    )
+
+    assert "service_tier" not in payload
 
 
 def test_system_attribution_block_is_dropped() -> None:

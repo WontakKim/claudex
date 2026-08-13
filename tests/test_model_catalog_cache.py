@@ -1,4 +1,4 @@
-"""Tests for the TTL context-window cache with stale-on-error backoff."""
+"""Tests for the TTL model-catalog cache with stale-on-error backoff."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ from typing import Any
 
 import pytest
 
-from claudex_gateway.context_window_cache import ContextWindowCache
+from claudex_gateway.model_catalog_cache import ModelCatalogCache
 
 
 class FetchError(Exception):
@@ -59,7 +59,7 @@ def test_fresh_hit_skips_fetch() -> None:
     clock = FakeClock()
     fetch = FakeFetch()
     fetch.queue_result({"model-a": 128_000})
-    cache = ContextWindowCache(fetch, expected_errors=(FetchError,), clock=clock)
+    cache = ModelCatalogCache(fetch, expected_errors=(FetchError,), clock=clock)
 
     async def scenario() -> tuple[int | None, int | None]:
         first = await cache.get("model-a")
@@ -78,7 +78,7 @@ def test_expiry_triggers_exactly_one_fetch() -> None:
     fetch = FakeFetch()
     fetch.queue_result({"model-a": 128_000})
     fetch.queue_result({"model-a": 256_000})
-    cache = ContextWindowCache(fetch, expected_errors=(FetchError,), ttl_seconds=900.0, clock=clock)
+    cache = ModelCatalogCache(fetch, expected_errors=(FetchError,), ttl_seconds=900.0, clock=clock)
 
     async def scenario() -> tuple[int | None, int | None]:
         first = await cache.get("model-a")
@@ -98,7 +98,7 @@ def test_stale_value_served_when_refresh_fails() -> None:
     fetch = FakeFetch()
     fetch.queue_result({"model-a": 128_000})
     fetch.queue_error(FetchError("catalog unavailable"))
-    cache = ContextWindowCache(fetch, expected_errors=(FetchError,), ttl_seconds=900.0, clock=clock)
+    cache = ModelCatalogCache(fetch, expected_errors=(FetchError,), ttl_seconds=900.0, clock=clock)
 
     async def scenario() -> tuple[int | None, int | None]:
         first = await cache.get("model-a")
@@ -119,7 +119,7 @@ def test_backoff_window_suppresses_refetch_then_allows_it_after_elapsing() -> No
     fetch.queue_result({"model-a": 128_000})
     fetch.queue_error(FetchError("catalog unavailable"))
     fetch.queue_result({"model-a": 256_000})
-    cache = ContextWindowCache(
+    cache = ModelCatalogCache(
         fetch,
         expected_errors=(FetchError,),
         ttl_seconds=900.0,
@@ -148,7 +148,7 @@ def test_cold_cache_failure_returns_none() -> None:
     clock = FakeClock()
     fetch = FakeFetch()
     fetch.queue_error(FetchError("catalog unavailable"))
-    cache = ContextWindowCache(fetch, expected_errors=(FetchError,), clock=clock)
+    cache = ModelCatalogCache(fetch, expected_errors=(FetchError,), clock=clock)
 
     result = asyncio.run(cache.get("model-a"))
 
@@ -160,7 +160,7 @@ def test_concurrent_cold_gets_share_one_in_flight_fetch() -> None:
     clock = FakeClock()
     fetch = FakeFetch()
     fetch.queue_result({"model-a": 128_000})
-    cache = ContextWindowCache(fetch, expected_errors=(FetchError,), clock=clock)
+    cache = ModelCatalogCache(fetch, expected_errors=(FetchError,), clock=clock)
 
     async def scenario() -> tuple[int | None, int | None]:
         return await asyncio.gather(cache.get("model-a"), cache.get("model-a"))
@@ -178,7 +178,7 @@ def test_successful_refresh_replaces_previously_stale_snapshot() -> None:
     fetch.queue_result({"model-a": 128_000})
     fetch.queue_error(FetchError("catalog unavailable"))
     fetch.queue_result({"model-a": 256_000, "model-b": 64_000})
-    cache = ContextWindowCache(
+    cache = ModelCatalogCache(
         fetch,
         expected_errors=(FetchError,),
         ttl_seconds=900.0,
@@ -206,7 +206,7 @@ def test_unexpected_exception_propagates_out_of_get() -> None:
     clock = FakeClock()
     fetch = FakeFetch()
     fetch.queue_error(OtherError("boom"))
-    cache = ContextWindowCache(fetch, expected_errors=(FetchError,), clock=clock)
+    cache = ModelCatalogCache(fetch, expected_errors=(FetchError,), clock=clock)
 
     with pytest.raises(OtherError):
         asyncio.run(cache.get("model-a"))
@@ -216,7 +216,7 @@ def test_absent_model_returns_none() -> None:
     clock = FakeClock()
     fetch = FakeFetch()
     fetch.queue_result({"model-a": 128_000})
-    cache = ContextWindowCache(fetch, expected_errors=(FetchError,), clock=clock)
+    cache = ModelCatalogCache(fetch, expected_errors=(FetchError,), clock=clock)
 
     result = asyncio.run(cache.get("model-unknown"))
 
@@ -229,7 +229,7 @@ def test_cancellation_propagates_even_when_expected_errors_would_catch_it() -> N
     fetch = FakeFetch()
     fetch.queue_error(asyncio.CancelledError())
     fetch.queue_result({"model-a": 128_000})
-    cache = ContextWindowCache(fetch, expected_errors=(BaseException,), clock=clock)
+    cache = ModelCatalogCache(fetch, expected_errors=(BaseException,), clock=clock)
 
     with pytest.raises(asyncio.CancelledError):
         asyncio.run(cache.get("model-a"))

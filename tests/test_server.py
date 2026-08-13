@@ -77,6 +77,9 @@ class FakeCodexClient:
     async def context_window(self, model: str) -> int | None:
         return None
 
+    async def supports_fast_tier(self, model: str) -> bool:
+        return False
+
 
 class AvailableKimiAuthManager:
     def __init__(self, *_args: Any, **_kwargs: Any) -> None:
@@ -333,15 +336,20 @@ class StubCodexClient:
         self,
         context_window: int | None = None,
         error: CodexUpstreamError | None = None,
+        supports_fast_tier: bool = False,
     ) -> None:
         self.payloads: list[dict[str, Any]] = []
         self.context_window_calls: list[str] = []
         self._context_window = context_window
         self._error = error or CodexUpstreamError(503, "stub codex upstream")
+        self._supports_fast_tier = supports_fast_tier
 
     async def context_window(self, model: str) -> int | None:
         self.context_window_calls.append(model)
         return self._context_window
+
+    async def supports_fast_tier(self, model: str) -> bool:
+        return self._supports_fast_tier
 
     async def stream_responses(self, payload: dict[str, Any], session_id: str):
         self.payloads.append(payload)
@@ -357,6 +365,7 @@ def _gateway(
     grok_client: Any | None = None,
     codex_context_window: int | None = None,
     codex_error: CodexUpstreamError | None = None,
+    codex_supports_fast_tier: bool = False,
 ) -> tuple[TestClient, StubCodexClient]:
     app = server.create_app(config)
     # The lifespan requires real Codex credentials, so set the state directly
@@ -364,7 +373,9 @@ def _gateway(
     app.state.config = config
     app.state.compaction_last_reroute = None
     app.state.compaction_reroute_sequence = 0
-    stub = StubCodexClient(codex_context_window, codex_error)
+    stub = StubCodexClient(
+        codex_context_window, codex_error, codex_supports_fast_tier
+    )
     app.state.codex_client = stub
     app.state.http_client = httpx.AsyncClient(
         transport=httpx.MockTransport(anthropic_handler)
@@ -529,6 +540,48 @@ def test_mapped_model_routes_to_codex() -> None:
     assert captured == []
 
 
+def test_codex_fast_tier_is_sent_for_supported_model() -> None:
+    config = GatewayConfig(
+        model_map={"opus": "codex:gpt-5.6-sol"}, codex_service_tier="fast"
+    )
+    client, stub = _gateway(
+        config,
+        _failing_anthropic_handler,
+        codex_supports_fast_tier=True,
+    )
+
+    response = client.post("/v1/messages", json=_message_body("claude-opus-4-6"))
+
+    assert response.status_code == 503
+    assert stub.payloads[0]["service_tier"] == "priority"
+
+
+def test_codex_fast_tier_is_omitted_for_unsupported_model() -> None:
+    config = GatewayConfig(
+        model_map={"opus": "codex:gpt-5.6-sol"}, codex_service_tier="fast"
+    )
+    client, stub = _gateway(config, _failing_anthropic_handler)
+
+    response = client.post("/v1/messages", json=_message_body("claude-opus-4-6"))
+
+    assert response.status_code == 503
+    assert "service_tier" not in stub.payloads[0]
+
+
+def test_codex_fast_tier_is_omitted_when_disabled() -> None:
+    config = GatewayConfig(model_map={"opus": "codex:gpt-5.6-sol"})
+    client, stub = _gateway(
+        config,
+        _failing_anthropic_handler,
+        codex_supports_fast_tier=True,
+    )
+
+    response = client.post("/v1/messages", json=_message_body("claude-opus-4-6"))
+
+    assert response.status_code == 503
+    assert "service_tier" not in stub.payloads[0]
+
+
 def test_codex_pre_stream_overflow_uses_catalog_context_window() -> None:
     config = GatewayConfig(model_map={"opus": "codex:gpt-5.6-sol"})
     client, _ = _gateway(
@@ -668,7 +721,7 @@ def test_non_streaming_mid_stream_overflow_reports_numbers() -> None:
 
 def test_context_window_cache_is_reused_across_requests() -> None:
     # Proves the relay reuses the lifespan-owned client and its
-    # ContextWindowCache instead of constructing a fresh one per request:
+    # ModelCatalogCache instead of constructing a fresh one per request:
     # two mapped requests through the same app fetch the catalog exactly
     # once (within the cache's TTL) while still hitting the upstream model
     # endpoint once per request.
@@ -1273,6 +1326,20 @@ def test_grok_mapped_model_streams_translated_response() -> None:
     assert payload["reasoning"]["effort"] == "medium"
 
 
+def test_grok_route_omits_codex_fast_service_tier() -> None:
+    stub = StubGrokClient()
+    client, _ = _gateway(
+        _grok_config(codex_service_tier="fast"),
+        _failing_anthropic_handler,
+        grok_client=stub,
+    )
+
+    response = client.post("/v1/messages", json=_message_body("claude-opus-4-6"))
+
+    assert response.status_code == 503
+    assert "service_tier" not in stub.payloads[0]
+
+
 def test_grok_route_strips_reasoning_for_non_thinking_model() -> None:
     stub = StubGrokClient()
     client, _ = _gateway(
@@ -1686,13 +1753,20 @@ def test_compaction_reroute_fallback_translates_untouched_original_body_once(
     received: list[dict[str, Any]] = []
 
     def recording_translate(
-        claude_request: dict[str, Any], upstream_model: str, reasoning_effort_override: str | None
+        claude_request: dict[str, Any],
+        upstream_model: str,
+        reasoning_effort_override: str | None,
+        *,
+        service_tier: str | None = None,
     ) -> dict[str, Any]:
         # A deep, JSON-round-tripped copy: proves equality without ever
         # aliasing the mutable dict the caller still holds.
         received.append(json.loads(json.dumps(claude_request)))
         return translate_claude_request_to_codex(
-            claude_request, upstream_model, reasoning_effort_override
+            claude_request,
+            upstream_model,
+            reasoning_effort_override,
+            service_tier=service_tier,
         )
 
     monkeypatch.setattr(server, "translate_claude_request_to_codex", recording_translate)
@@ -2117,13 +2191,20 @@ def test_compaction_stream_reroute_fallback_translates_untouched_original_body_w
     received: list[dict[str, Any]] = []
 
     def recording_translate(
-        claude_request: dict[str, Any], upstream_model: str, reasoning_effort_override: str | None
+        claude_request: dict[str, Any],
+        upstream_model: str,
+        reasoning_effort_override: str | None,
+        *,
+        service_tier: str | None = None,
     ) -> dict[str, Any]:
         # A deep, JSON-round-tripped copy: proves equality without ever
         # aliasing the mutable dict the caller still holds.
         received.append(json.loads(json.dumps(claude_request)))
         return translate_claude_request_to_codex(
-            claude_request, upstream_model, reasoning_effort_override
+            claude_request,
+            upstream_model,
+            reasoning_effort_override,
+            service_tier=service_tier,
         )
 
     monkeypatch.setattr(server, "translate_claude_request_to_codex", recording_translate)

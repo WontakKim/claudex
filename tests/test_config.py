@@ -22,6 +22,26 @@ def test_max_reasoning_effort_is_accepted(monkeypatch: pytest.MonkeyPatch) -> No
     assert GatewayConfig.from_env().reasoning_effort_override == "max"
 
 
+def test_codex_fast_service_tier_is_accepted_from_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CLAUDEX_CODEX_SERVICE_TIER", "fast")
+    assert GatewayConfig.from_env().codex_service_tier == "fast"
+
+
+def test_invalid_codex_service_tier_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CLAUDEX_CODEX_SERVICE_TIER", "priority")
+    with pytest.raises(ConfigError, match="CLAUDEX_CODEX_SERVICE_TIER"):
+        GatewayConfig.from_env()
+
+
+def test_empty_codex_service_tier_env_disables_feature(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CLAUDEX_CODEX_SERVICE_TIER", "")
+    assert GatewayConfig.from_env().codex_service_tier is None
+
+
 def test_log_level_is_normalized(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("CLAUDEX_LOG_LEVEL", "DEBUG")
     assert GatewayConfig.from_env().log_level == "debug"
@@ -86,6 +106,19 @@ class TestSettingsFile:
         settings_file = self._write(tmp_path, {"reasoning_effort": "low"})
         monkeypatch.setenv("CLAUDEX_REASONING_EFFORT", "high")
         assert GatewayConfig.load(settings_file).reasoning_effort_override == "high"
+
+    def test_codex_fast_service_tier_applies_from_settings_file(
+        self, tmp_path: Path
+    ) -> None:
+        settings_file = self._write(tmp_path, {"codex.service_tier": "fast"})
+        assert GatewayConfig.load(settings_file).codex_service_tier == "fast"
+
+    def test_codex_service_tier_env_overrides_settings_file(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        settings_file = self._write(tmp_path, {"codex.service_tier": "invalid"})
+        monkeypatch.setenv("CLAUDEX_CODEX_SERVICE_TIER", "fast")
+        assert GatewayConfig.load(settings_file).codex_service_tier == "fast"
 
     def test_empty_env_still_overrides(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
