@@ -3062,7 +3062,10 @@ class TestAdminCompactionApi:
         }
         assert reread.json()["model"] == "claude:claude-opus-5"
         saved = json.loads(settings_file.read_text(encoding="utf-8"))
-        assert saved == {"port": 9317, "compaction.model": "claude:claude-opus-5"}
+        assert saved == {
+            "port": 9317,
+            "compaction": {"model": "claude:claude-opus-5"},
+        }
 
     def test_put_hot_swaps_live_config_for_subsequent_requests(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -3093,7 +3096,7 @@ class TestAdminCompactionApi:
         assert reread.json()["model"] is None
         saved = json.loads(settings_file.read_text(encoding="utf-8"))
         assert saved == {"port": 1234}
-        assert "compaction.model" not in saved
+        assert "compaction" not in saved
 
     def test_put_enable_then_disable_changes_the_live_reroute_trigger(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -3437,7 +3440,7 @@ class TestAdminClaudeAccountApi:
         assert reread.json()["account_id"] == account_id
         assert config_after.claude_account_id == account_id
         saved = json.loads(settings_file.read_text(encoding="utf-8"))
-        assert saved == {"port": 9317, "claude_account.id": account_id}
+        assert saved == {"port": 9317, "claude_account": {"id": account_id}}
 
     def test_put_null_is_rejected_pointing_at_delete(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -3473,7 +3476,7 @@ class TestAdminClaudeAccountApi:
         assert response.status_code == 200
         assert response.json() == {"account_id": None, "env_locked": False}
         assert config_after.claude_account_id is None
-        assert "claude_account.id" not in json.loads(settings_file.read_text())
+        assert "claude_account" not in json.loads(settings_file.read_text())
 
     def test_delete_when_already_clear_is_a_no_op_200(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -3602,7 +3605,7 @@ class TestAdminClaudeRoutingApi:
         assert response.json() == {"mode": "fallback", "env_locked": False}
         assert config_after.claude_account_routing_mode == "fallback"
         saved = json.loads(settings_file.read_text(encoding="utf-8"))
-        assert saved == {"claude_account.routing": {"mode": "fallback"}}
+        assert saved == {"claude_account": {"routing": {"mode": "fallback"}}}
 
     def test_put_disabled_removes_the_settings_key(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -3623,7 +3626,7 @@ class TestAdminClaudeRoutingApi:
         assert response.status_code == 200
         assert response.json() == {"mode": "disabled", "env_locked": False}
         assert config_after.claude_account_routing_mode == "disabled"
-        assert "claude_account.routing" not in json.loads(settings_file.read_text())
+        assert "claude_account" not in json.loads(settings_file.read_text())
 
     def test_put_balanced_with_unknown_keys_is_rejected(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -6341,7 +6344,7 @@ class TestBalancedRoutingEnable:
         assert epoch_id_while_active is not None
         assert router_while_active is not None
         saved = json.loads(settings_file.read_text(encoding="utf-8"))
-        assert saved == {"claude_account.routing": {"mode": "balanced"}}
+        assert saved == {"claude_account": {"routing": {"mode": "balanced"}}}
 
     def test_put_balanced_rejects_invalid_account_uuid(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -6551,7 +6554,7 @@ class TestBalancedRoutingExit:
             # completed rather than erroring.
             assert served_after_exit.status_code == 200
             saved = json.loads(settings_file.read_text(encoding="utf-8"))
-            assert "claude_account.routing" not in saved
+            assert "claude_account" not in saved
 
             # The exited epoch's pins are gone at the persistence layer too --
             # not just discarded in memory with this runtime instance.
@@ -6629,7 +6632,7 @@ class TestBalancedRoutingExit:
             assert runtime.epoch_id == epoch_id_before
             assert client.app.state.config.claude_account_routing_mode == "balanced"
             saved = json.loads(settings_file.read_text(encoding="utf-8"))
-            assert saved["claude_account.routing"] == {"mode": "balanced"}
+            assert saved["claude_account"]["routing"] == {"mode": "balanced"}
 
             # The durable pin the persistence failure was supposed to leave
             # untouched is still there, both in memory and at the durable
@@ -6691,7 +6694,7 @@ class TestBalancedRoutingExit:
             assert exited.json() == {"mode": "disabled", "env_locked": False}
             assert runtime.status == "disabled"
             saved = json.loads(settings_file.read_text(encoding="utf-8"))
-            assert "claude_account.routing" not in saved
+            assert "claude_account" not in saved
 
         assert any(
             "persistence_degraded" in record.getMessage() for record in caplog.records

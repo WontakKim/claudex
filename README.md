@@ -35,7 +35,7 @@ untouched.
   (`cli-chat-proxy.grok.com`) through the same translation layer as Codex,
   minus the payload fields Grok rejects and with reasoning effort clamped to
   the model's supported levels.
-- Opts into Codex Fast mode with `"codex.service_tier": "fast"` in
+- Opts into Codex Fast mode with `"codex": { "service_tier": "fast" }` in
   `settings.json` or `CLAUDEX_CODEX_SERVICE_TIER=fast`; the gateway sends
   Responses `service_tier: "priority"` only when the live model catalog
   advertises Fast, while unknown or unsupported models silently stay standard.
