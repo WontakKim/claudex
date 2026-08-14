@@ -28,7 +28,7 @@ from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
 import claudex_gateway
-from claudex_gateway import claude_unified_headers, paths
+from claudex_gateway import paths
 from claudex_gateway.account_usage_cache import ClaudeAccountUsageCache
 from claudex_gateway.claude_account_pool import (
     _DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS,
@@ -854,39 +854,6 @@ async def _record_balanced_capability_evidence(
     )
 
 
-async def _ingest_balanced_unified_headers(
-    app_state: Any,
-    router: ClaudeBalancedRouter,
-    *,
-    account_id: str,
-    account_incarnation_id: str,
-    model: str,
-    upstream_response: httpx.Response,
-) -> None:
-    """Balanced-mode unified-header ingestion (T-15): merge the responding
-    account's own upstream 2xx `anthropic-ratelimit-*` headers into the
-    router's live usage state before any byte relays. A non-2xx response is
-    never a source of usage data, and the currently-empty, committed
-    `claude_unified_headers.RECOGNIZED_HEADERS` table (no T-14 capture was
-    available at commit time) makes every call inert until it is
-    regenerated — checked here first so an inert build never pays the
-    fingerprint lookup below on every request.
-    """
-    if upstream_response.status_code // 100 != 2:
-        return
-    if not claude_unified_headers.RECOGNIZED_HEADERS:
-        return
-    fingerprint = _account_profile_fingerprint(app_state, account_id)
-    router.ingest_unified_response_headers(
-        upstream_response.headers,
-        account_id=account_id,
-        serving_account_id=account_id,
-        account_incarnation_id=account_incarnation_id,
-        account_profile_fingerprint=fingerprint,
-        model=model,
-    )
-
-
 async def _passthrough_with_claude_account(
     request: Request, raw_body: bytes, parsed_body: Any, serving_account_id: str
 ) -> Response:
@@ -1301,14 +1268,6 @@ async def _serve_balanced_stateless_message(
                 model=model,
                 upstream_response=upstream_response,
             )
-            await _ingest_balanced_unified_headers(
-                request.app.state,
-                router,
-                account_id=_account_id,
-                account_incarnation_id=_incarnation,
-                model=model,
-                upstream_response=upstream_response,
-            )
 
         router.begin_attempt(account_id)
         try:
@@ -1477,14 +1436,6 @@ async def _serve_balanced_pinned_message(
                 _incarnation: str = target_record.account_incarnation_id,
             ) -> None:
                 await _record_balanced_capability_evidence(
-                    request.app.state,
-                    router,
-                    account_id=_account_id,
-                    account_incarnation_id=_incarnation,
-                    model=model,
-                    upstream_response=upstream_response,
-                )
-                await _ingest_balanced_unified_headers(
                     request.app.state,
                     router,
                     account_id=_account_id,

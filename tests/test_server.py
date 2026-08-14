@@ -22,7 +22,7 @@ import uvicorn
 from starlette.testclient import TestClient
 
 import claudex_gateway.server as server
-from claudex_gateway import claude_accounts, claude_unified_headers, compaction, paths
+from claudex_gateway import claude_accounts, compaction, paths
 from claudex_gateway.account_usage_cache import ClaudeAccountUsageCache
 from claudex_gateway.claude_account_pool import AccountCooldownTracker
 from claudex_gateway.claude_auth import CLAUDE_TOKEN_URL
@@ -8402,109 +8402,6 @@ def test_balanced_successful_2xx_records_eligible_capability_evidence_for_the_re
             account_incarnation_id=record.account_incarnation_id,
             account_profile_fingerprint=fingerprint,
         )
-
-
-# ---------------------------------------------------------------------------
-# Unified-header ingestion from a generated static wire table (T-15): serve-
-# path wiring proof at the HTTP layer. `claude_unified_headers.RECOGNIZED_HEADERS`
-# is the committed, currently EMPTY table (no T-14 capture was available at
-# commit time), so the positive fixture-driven half below is an explicit
-# deferred skip rather than a silently vacuous pass; the inert-while-empty
-# half runs for real in this environment.
-# ---------------------------------------------------------------------------
-
-
-def test_balanced_unified_header_ingestion_is_inert_while_the_recognized_table_is_empty(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """Step 3's serve-path wiring runs on every balanced 2xx, but with the
-    committed `RECOGNIZED_HEADERS` table still empty it must be a byte-for-byte
-    no-op — even headers shaped like the real Anthropic unified wire names
-    never populate any observation.
-    """
-    assert claude_unified_headers.RECOGNIZED_HEADERS == {}
-    _balanced_env(monkeypatch, tmp_path)
-    account_id, _access_token = _register_balanced_accounts(1)[0]
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(
-            200,
-            json={"id": "msg_1"},
-            headers={
-                "anthropic-ratelimit-unified-status": "allowed",
-                "anthropic-ratelimit-unified-reset": "9999999999",
-                "anthropic-ratelimit-unified-fallback-percentage": "42",
-            },
-        )
-
-    with _create_test_client(
-        monkeypatch, tmp_path, config=GatewayConfig(), base_url="http://127.0.0.1:8787"
-    ) as client:
-        runtime = _enable_balanced(client, handler)
-        router = runtime.router
-        assert router is not None
-
-        response = client.post("/v1/messages", json=_balanced_body(_new_session_id()))
-        assert response.status_code == 200
-
-        now = time.monotonic()
-        assert router.observations.window_pressure(account_id, "five_hour", now=now) is None
-        assert router.observations.window_pressure(account_id, "seven_day", now=now) is None
-        assert router.observations.window_pressure(account_id, "fable_weekly", now=now) is None
-
-
-def test_balanced_unified_header_ingestion_updates_observations_from_the_recognized_table_or_skip(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """Positive fixture-driven half of Step 6: once a live T-14 capture
-    regenerates `claude_unified_headers.RECOGNIZED_HEADERS` with real entries,
-    a balanced 2xx carrying those exact header names must merge into the
-    router's live observations. Deferred with an explicit skip -- never a
-    silently vacuous pass -- while the committed table is still empty.
-    """
-    if not claude_unified_headers.RECOGNIZED_HEADERS:
-        pytest.skip(
-            "deferred: claude_unified_headers.RECOGNIZED_HEADERS is the committed empty "
-            "table (no T-14 capture was available at commit time); this positive-path "
-            "assertion activates once a live capture regenerates it with real entries"
-        )
-
-    _balanced_env(monkeypatch, tmp_path)
-    account_id, _access_token = _register_balanced_accounts(1)[0]
-
-    synthetic_headers: dict[str, str] = {}
-    for name, descriptor in claude_unified_headers.RECOGNIZED_HEADERS.items():
-        if descriptor.field == "used_percent":
-            synthetic_headers[name] = "42"
-        elif descriptor.field == "status":
-            synthetic_headers[name] = "allowed"
-        elif descriptor.field == "reset":
-            synthetic_headers[name] = "9999999999"
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"id": "msg_1"}, headers=synthetic_headers)
-
-    with _create_test_client(
-        monkeypatch, tmp_path, config=GatewayConfig(), base_url="http://127.0.0.1:8787"
-    ) as client:
-        runtime = _enable_balanced(client, handler)
-        router = runtime.router
-        assert router is not None
-
-        response = client.post(
-            "/v1/messages", json=_balanced_body(_new_session_id(), model="claude-sonnet-5")
-        )
-        assert response.status_code == 200
-
-        touched_windows = {
-            descriptor.window
-            for descriptor in claude_unified_headers.RECOGNIZED_HEADERS.values()
-            if descriptor.field == "used_percent" and descriptor.window != "fable_weekly"
-        }
-        assert touched_windows, "expected at least one non-fable used_percent window in the real table"
-        now = time.monotonic()
-        for window in touched_windows:
-            assert router.observations.window_pressure(account_id, window, now=now) is not None
 
 
 # ---------------------------------------------------------------------------
