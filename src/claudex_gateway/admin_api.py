@@ -915,20 +915,19 @@ async def _handle_admin_claude_routing_put(request: Request) -> JSONResponse:
 
     Enabling ("disabled"/"fallback" -> "balanced") and intentionally exiting
     ("balanced" -> "disabled"/"fallback") balanced routing are both
-    transactional under `admin_lock` (T-10 Step 5): enabling prepares the
-    complete `ClaudeBalancedRuntime` — opening the runtime store, restoring
-    its state, constructing the router, and verifying every ready account's
-    T-3 profile_fingerprint — while the OLD mode keeps serving, and persists
-    settings only once every check passes, immediately before publishing the
-    prepared runtime; a failure at any point tears preparation down and
-    leaves the old mode untouched. Exiting drains in-flight balanced
-    dispatch, durably PERSISTS the target mode first (T-20, fix for gap
-    G-3 — a failure here aborts the exit, leaving the runtime "active" with
-    its epoch and pins untouched and this handler returning 500 with the
-    mode unchanged), THEN rotates (invalidates) the epoch, THEN publishes
-    the target mode in memory before waking any request that arrived
-    mid-transition. Switching between "disabled" and "fallback" is
-    unaffected — the pre-existing settings-file swap.
+    transactional under `admin_lock`. Enabling prepares the complete
+    `ClaudeBalancedRuntime` — opening the runtime store, restoring its state,
+    constructing the router, and verifying every ready account's
+    `profile_fingerprint` — while the old mode keeps serving. Settings are
+    persisted only once every check passes, immediately before publishing the
+    prepared runtime; a failure at any point tears preparation down and leaves
+    the old mode untouched. Exiting drains in-flight balanced dispatch and
+    durably persists the target mode first. A persistence failure aborts the
+    exit, leaving the runtime active with its epoch and pins untouched and this
+    handler returning 500 with the mode unchanged. After persistence succeeds,
+    the runtime rotates the epoch and publishes the target mode in memory before
+    waking requests that arrived mid-transition. Switching between "disabled"
+    and "fallback" uses the settings-file swap directly.
     """
     denied = _admin_guard(request) or _require_json_content_type(request)
     if denied is not None:
@@ -1053,11 +1052,9 @@ async def _handle_admin_claude_routing_put(request: Request) -> JSONResponse:
 
 
 # --------------------------------------------------------------------------
-# Balanced-mode usage isolation (T-13): while balanced routing is the
-# currently PUBLISHED and ACTIVE mode, usage reads are cache-only (never
-# `ClaudeAccountUsageCache.get`/upstream) and manual refresh only ever
-# enqueues on the coordinator -- fallback/disabled mode is entirely
-# untouched by any of this and keeps the pre-existing fetch path/envelope.
+# While balanced routing is the published and active mode, usage reads are
+# cache-only and manual refresh only enqueues on the coordinator. Fallback and
+# disabled modes retain the direct fetch path and response envelope.
 # --------------------------------------------------------------------------
 
 _USAGE_WINDOW_FRESH_MAX_AGE_SECONDS = 5 * 60
@@ -1065,11 +1062,11 @@ _USAGE_WINDOW_AGING_MAX_AGE_SECONDS = 30 * 60
 
 
 def _active_balanced_runtime(request: Request) -> ClaudeBalancedRuntime | None:
-    """The live runtime iff "balanced" is the currently PUBLISHED routing mode
-    AND the runtime itself is active -- the exact isolation boundary Steps
-    4/5/6 draw between balanced-only usage behavior and every other mode. A
-    non-balanced request must never see this as non-`None` (Step 5's "never
-    queued for a coordinator that is not running").
+    """Return the live runtime only when balanced mode is published and active.
+
+    This boundary keeps balanced-only usage behavior out of every other mode;
+    a non-balanced request must never enqueue work for a coordinator that is
+    not running.
     """
     config: GatewayConfig = request.app.state.config
     if config.claude_account_routing_mode != "balanced":
@@ -1254,8 +1251,8 @@ def _local_claude_login_fields() -> dict[str, Any] | None:
     Read from the CLI's own config file (`~/.claude.json`, or
     `$CLAUDE_CONFIG_DIR/.claude.json` when the override is set): the same
     `oauthAccount` block a capture snapshots — identity and plan metadata,
-    never secrets. The dashboard's accounts screen shows it as the "로컬
-    CLI 로그인" hero, which is informational only and unrelated to serving.
+    never secrets. The dashboard presents this informational snapshot as the
+    local CLI login; it does not affect request serving.
     Missing or malformed files degrade to None (no local login).
     """
     override = os.environ.get("CLAUDE_CONFIG_DIR")
@@ -1431,14 +1428,14 @@ async def _handle_admin_claude_accounts_usage(request: Request) -> JSONResponse:
     force-refresh; needs-reauth rows get a synthesized "unavailable" without
     touching the network.
 
-    Active balanced mode is cache-only (T-13 Step 4): it never calls
-    `cache.get`/upstream, reading `peek_with_metadata` instead and reporting
-    each window's age/source/reset/state. A `?refresh` request in this mode
-    (Step 5) enqueues a coalesced, globally rate-limited manual poll on the
-    balanced coordinator and reports it as `queued` in the response — it
-    never fetches inline, and cached data is returned immediately either
-    way. `?refresh` outside active balanced mode is inert: a non-balanced
-    request must never be queued for a coordinator that is not running.
+    Active balanced mode is cache-only: it never calls `cache.get` or the
+    upstream, instead reading `peek_with_metadata` and reporting each window's
+    age, source, reset time, and state. A `?refresh` request in this mode
+    enqueues a coalesced, globally rate-limited manual poll on the balanced
+    coordinator and reports it as `queued` in the response. It never fetches
+    inline, and cached data is returned immediately either way. `?refresh`
+    outside active balanced mode is inert: a non-balanced request must never be
+    queued for a coordinator that is not running.
     """
     denied = _admin_guard(request)
     if denied is not None:

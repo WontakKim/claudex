@@ -203,9 +203,9 @@ async def _passthrough_to_anthropic(
     whole pool, serving account first (see `_passthrough_with_claude_pool`).
     The "balanced" mode is checked first, ahead of the claude_account.id
     gate: it spreads sessions across the whole registered pool by weighted
-    HRW and never falls through to single-account/fallback routing (T-10
-    Step 6) — only through an active `ClaudeBalancedRuntime`, or the
-    reserved fail-closed 503.
+    HRW and never falls through to single-account or fallback routing. It
+    dispatches only through an active `ClaudeBalancedRuntime`, otherwise it
+    returns the reserved fail-closed 503.
     """
     config: GatewayConfig = request.app.state.config
     if config.claude_account_routing_mode == "balanced":
@@ -257,8 +257,8 @@ def _relay_anthropic_response(
 ) -> StreamingResponse:
     """Relay an open Anthropic response verbatim, owning its lifetime.
 
-    `on_finished` (T-11), when given, runs synchronously once the body iterator
-    is fully done -- success, mid-stream failure, or cancellation alike -- right
+    `on_finished`, when given, runs synchronously once the body iterator is
+    fully done -- success, mid-stream failure, or cancellation alike -- right
     alongside closing `upstream_response`; the balanced runner uses it to release
     a migrated attempt's migration token only once the whole stream terminates,
     not merely once its 2xx headers commit.
@@ -424,25 +424,20 @@ async def _attempt_with_account(
     an account-specific failure: it streams back verbatim with zero cooldown
     bookkeeping, exactly like any other upstream status.
 
-    `commit_hook`/`on_relay_complete` (T-11) are the balanced runner's minimal
-    extension for the migration commit protocol: when this attempt is about to
-    relay (every path that reaches the final `_relay_anthropic_response` call,
-    not the 401/429-failover branches above), `commit_hook` — if given — is
-    awaited with the still-open `upstream_response` before any byte is
-    forwarded, and `on_relay_complete` is threaded through as the relay's
-    `on_finished` hook. Both default to `None`, which reproduces the prior
-    behavior exactly.
+    `commit_hook` and `on_relay_complete` implement the balanced runner's
+    migration commit protocol. On every path that reaches the final
+    `_relay_anthropic_response` call, `commit_hook` is awaited with the open
+    `upstream_response` before any byte is forwarded, and `on_relay_complete`
+    becomes the relay's `on_finished` hook. The 401 and 429 failover branches
+    do not invoke either hook.
 
-    `on_quota_429`/`on_response` (T-12) are the balanced runner's own minimal
-    extension: `on_quota_429`, if given, is awaited with the just-derived
-    `cooldown_seconds` right after this account-specific 429 marks the shared
-    in-memory tracker (unchanged, fallback-mode behavior) — the balanced
-    caller uses it to classify the design v2 §6.4 family gate and install the
-    resulting cooldown durably. `on_response`, if given, is awaited with the
-    still-open `upstream_response` at the same point as `commit_hook` — the
-    balanced caller uses it to record eligible capability evidence on an
-    explicit 2xx (adjudication G). Both default to `None`, which reproduces
-    the prior behavior exactly.
+    `on_quota_429`, when given, is awaited with the derived cooldown immediately
+    after an account-specific 429 marks the shared in-memory tracker. Balanced
+    routing uses it to select the cooldown scope and persist the result.
+    `on_response`, when given, is awaited with the open upstream response at
+    the same point as `commit_hook`; balanced routing uses it to record eligible
+    capability evidence from an explicit 2xx. All hooks default to `None`, so
+    non-balanced callers need no special handling.
     """
     account_id = record.id
     manager = server_support._claude_account_auth_manager(request.app.state, account_id)
@@ -573,8 +568,7 @@ async def _attempt_with_account(
 
 
 # ==========================================================================
-# Balanced-mode durable cooldowns and capability evidence (T-12, design v2
-# §6.4/§5.5, adjudication G)
+# Balanced-mode durable cooldowns and capability evidence
 # ==========================================================================
 
 
@@ -587,13 +581,13 @@ async def _install_balanced_quota_cooldown(
     model: str,
     cooldown_seconds: float,
 ) -> None:
-    """Balanced-mode 429 cooldown installation: classify the Fable family gate
-    (design v2 §6.4) before choosing scope. A FAMILY-scoped cooldown uses the
-    gate's own Fable reset as its deadline; otherwise the SAME account-wide
-    `cooldown_seconds` the shared in-memory tracker was just marked with
-    drives the deadline. Always awaits the durable write (§5.5: cooldown
-    installation is high priority) so a restart never repeats a burst of
-    429s against an account that just cooled down.
+    """Install and persist a balanced-mode cooldown after an upstream 429.
+
+    The Fable family gate is evaluated before choosing scope. A family-scoped
+    cooldown uses the Fable reset as its deadline; otherwise the same
+    account-wide `cooldown_seconds` applied to the shared in-memory tracker
+    drives the deadline. The high-priority durable write is awaited so a
+    restart does not repeat a burst of 429s against a cooling account.
     """
     now = time.monotonic()
     gate = router.classify_cooldown_scope(
@@ -636,10 +630,11 @@ async def _record_balanced_capability_evidence(
     model: str,
     upstream_response: httpx.Response,
 ) -> None:
-    """Balanced-mode successful-2xx capability-evidence recording (adjudication
-    G): v1 records ONLY `eligible` evidence, and only from an explicit
-    successful 2xx for the exact capability key — `classify_capability_evidence`
-    itself is the one true gate (never `denied`, never inferred across keys).
+    """Record balanced-mode capability evidence from a successful 2xx.
+
+    Only `eligible` evidence for the exact capability key is recorded.
+    `classify_capability_evidence` is the authoritative gate; this path never
+    records `denied` evidence or infers evidence across keys.
     """
     fingerprint = server_support._account_profile_fingerprint(app_state, account_id)
     if fingerprint is None:
@@ -765,18 +760,17 @@ async def _passthrough_with_claude_pool(
     return first_failure
 
 
-# The transition-aware wait loop (Step 6) re-checks at most this many times: one
-# controlled acquiring/draining transition settling is the expected case, so this only
-# bounds a pathological back-to-back-transitions edge case from spinning forever.
+# One acquiring or draining transition should settle the request. This limit
+# prevents pathological back-to-back transitions from spinning forever.
 _BALANCED_TRANSITION_WAIT_LIMIT = 4
 
 
 def _balanced_routing_not_active() -> JSONResponse:
-    """The reserved 503 for the *inconsistent* state (Step 6): claude_account.routing
-    persisted/published as "balanced" with no usable balanced runtime, outside a
-    controlled acquiring/draining transition. Never used merely because a controlled
-    transition is in flight — those requests await it and dispatch under the
-    post-transition mode instead (`_passthrough_with_claude_balanced`).
+    """Return the reserved 503 for an inconsistent balanced-routing state.
+
+    This means `claude_account.routing` is published as "balanced" with no
+    usable runtime outside a controlled transition. Requests arriving during
+    a transition wait and dispatch under the resulting mode instead.
     """
     return _claude_account_unavailable("balanced routing is not active")
 
@@ -784,7 +778,7 @@ def _balanced_routing_not_active() -> JSONResponse:
 async def _passthrough_with_claude_balanced(
     request: Request, raw_body: bytes, parsed_body: Any
 ) -> Response:
-    """Dispatch fail-closed and transition-aware through the balanced runtime (Step 6).
+    """Dispatch fail-closed and transition-aware through the balanced runtime.
 
     Only an active `ClaudeBalancedRuntime` ever serves this mode. A request that
     arrives while a controlled enable ("acquiring") or exit ("draining") transition is
@@ -814,8 +808,7 @@ async def _passthrough_with_claude_balanced(
 
 
 # ==========================================================================
-# Balanced serve-path chain runner (T-11): §4.5 commit-at-headers protocol
-# and §6.5 exhaustion responses, analogous to `_passthrough_with_claude_pool`.
+# Balanced serve-path retries, commit-at-headers, and exhaustion responses
 # ==========================================================================
 
 
@@ -824,12 +817,11 @@ def _balanced_candidates(
 ) -> list[AccountCandidate]:
     """One `AccountCandidate` per registered account for a request's whole retry chain.
 
-    `account_cooldown_until`/`family_cooldown_until` are absolute monotonic
-    deadlines read from the router's OWN durable cooldown state (T-12) — the
-    balanced-mode fallback pool's shared in-memory `AccountCooldownTracker` is
-    no longer consulted for balanced eligibility (it stays account-wide-only
-    and fallback-mode-only, design v2 §6.4). `capability_denied` stays at its
-    default: v1 never records `denied` capability evidence (adjudication G).
+    `account_cooldown_until` and `family_cooldown_until` are absolute monotonic
+    deadlines read from the router's durable cooldown state. Balanced routing
+    never consults the fallback pool's account-wide, in-memory
+    `AccountCooldownTracker`. `capability_denied` remains false because the
+    current classifier records only `eligible` capability evidence.
     """
     candidates = []
     for record in records:
@@ -893,10 +885,10 @@ def _balanced_pick_account(
 def _balanced_eligible_candidate_set(
     records_by_id: Mapping[str, AccountRecord]
 ) -> list[AccountRecord]:
-    """§6.5's spec-gate-pinned candidate set `C`: registered AND ready AND
-    capability-not-denied, ignoring cooldowns. `capability_denied` never fires in
-    v1 (only `eligible` capability evidence is ever recorded, adjudication G), so
-    every registered, ready account currently qualifies.
+    """Return registered, ready, capability-eligible accounts, ignoring cooldowns.
+
+    The current classifier records only `eligible` capability evidence, so
+    every registered, ready account qualifies.
     """
     return [record for record in records_by_id.values() if record.state == "ready"]
 
@@ -908,14 +900,13 @@ def _balanced_all_cooling_response(
     family: str,
     chain_exhausted_429: Response | None,
 ) -> Response:
-    """§6.5: a retry chain (or an initial placement) found no eligible candidate.
+    """Respond after a retry chain or initial placement finds no eligible account.
 
-    A chain that just exhausted on a real upstream 429 relays THAT response verbatim.
-    Otherwise this synthesizes the local Anthropic-compatible 429, with
-    `Retry-After` clamped to the earliest `unblock_at` over the candidate set `C` — a
-    disabled (not ready) or capability-denied account never enters `C`, so its own
-    cooldown deadline, however soon, can never shorten `Retry-After` — or, when `C`
-    is empty, the adjudicated 503.
+    A chain that exhausted on a real upstream 429 relays that response
+    verbatim. Otherwise this synthesizes an Anthropic-compatible 429 with
+    `Retry-After` based on the earliest unblock time among registered, ready,
+    capability-eligible accounts. A disabled or capability-denied account
+    cannot shorten that value. An empty candidate set returns 503.
     """
     if chain_exhausted_429 is not None:
         return chain_exhausted_429
@@ -929,8 +920,8 @@ def _balanced_all_cooling_response(
         )
     now = time.monotonic()
 
-    # unblock_at(a, family) = max(account-wide deadline, family deadline) or now
-    # (§6.5); the per-account MAX across scopes, then the MIN across accounts.
+    # An account unblocks at the later of its account-wide and family
+    # deadlines; Retry-After uses the earliest unblock time across accounts.
     def _unblock_at(record: AccountRecord) -> float:
         account_deadline = router.account_cooldown_deadline(record.id, now=now) or now
         family_deadline = router.family_cooldown_deadline(record.id, family, now=now) or now
@@ -951,14 +942,13 @@ def _balanced_all_cooling_response(
 async def _passthrough_with_balanced_pool(
     request: Request, raw_body: bytes, parsed_body: Any, runtime: ClaudeBalancedRuntime
 ) -> Response:
-    """Serve one request through an active balanced runtime (T-11).
+    """Serve one request through an active balanced runtime.
 
-    Mirrors `_passthrough_with_claude_pool`'s read-through registry pattern (no cache,
-    so CLI/dashboard account changes take effect immediately). The session key is
-    derived from the parsed body BEFORE `_rewrite_metadata_account_uuid`'s mutation
-    (that rewrite only ever happens later, inside `_attempt_with_account`).
-    `/v1/messages/count_tokens` follows the council-pinned rule instead of this
-    function's own placement/migration flow: see `_serve_balanced_count_tokens`.
+    The registry is read through without a cache, so CLI and dashboard account
+    changes take effect immediately. The session key is derived from the parsed
+    body before `_rewrite_metadata_account_uuid` mutates it. Token-count requests
+    use `_serve_balanced_count_tokens` instead of this placement and migration
+    flow.
     """
     assert runtime.router is not None
     try:
@@ -1014,9 +1004,10 @@ async def _serve_balanced_stateless_message(
     records_by_id: Mapping[str, AccountRecord],
     model: str,
 ) -> Response:
-    """No session key is derivable: weighted-HRW routing over one fresh stateless
-    digest (T-4 `derive_stateless_routing_digest`), reused across this request's
-    whole retry chain and never persisted — no pin-map entry is ever created.
+    """Route an unpinnable request using one fresh stateless HRW digest.
+
+    The digest is reused for the request's complete retry chain, never
+    persisted, and never inserted into the pin map.
     """
     router = runtime.router
     assert router is not None
@@ -1096,16 +1087,15 @@ async def _serve_balanced_pinned_message(
     session_key: SessionKey,
     model: str,
 ) -> Response:
-    """Place or follow `session_key`'s pin, then serve it with the full §4.2-§4.5
-    migration chain: every request resolving a pin generation awaits its
-    `pending_durability` barrier before an upstream attempt; a §4.2 migration
-    trigger (quota 429, already cooling, removed/disabled, or a positively
-    classified account-specific auth failure — `_attempt_with_account`'s own
-    `_FailedAttempt` classification) creates a reservation + migration-attempt
-    token and retries the next eligible account (retry-chain exclusion); the
-    target's upstream 2xx headers run the T-8 commit section and await the
-    durable pin write before ANY downstream byte is forwarded; once 2xx is
-    relayed there is no cross-account retry.
+    """Place or follow `session_key`'s pin, then serve its migration chain.
+
+    Every request resolving a pin generation awaits its `pending_durability`
+    barrier before an upstream attempt. A quota 429, existing cooldown,
+    removed or disabled account, or classified account-specific auth failure
+    creates a reservation and migration-attempt token before retrying another
+    eligible account. The target's upstream 2xx headers commit the migration
+    and await the durable pin write before any downstream byte is forwarded.
+    Once a 2xx response is relayed, no cross-account retry occurs.
     """
     router = runtime.router
     assert router is not None
@@ -1258,10 +1248,9 @@ async def _serve_balanced_pinned_message(
                         on_response=_on_response,
                     )
                 except BaseException:
-                    # Cancellation (or any other failure) before this owner's
-                    # response was ever constructed: the streaming relay's own
-                    # `on_finished` hook never gets a chance to run, so release the
-                    # reservation/token here instead (T-8 Step 3).
+                    # If this owner fails before constructing a response, the
+                    # streaming relay's `on_finished` hook cannot run. Release the
+                    # reservation and migration token here instead.
                     router.resolve_migration_owner_terminal(
                         digest, attempt_id=owner_attempt_id, outcome="terminal_failure"
                     )
@@ -1287,7 +1276,7 @@ async def _serve_balanced_pinned_message(
         else:
             chain_429 = None
 
-        # --- §4.2 migration trigger -----------------------------------------
+        # --- Migration reservation and next-target selection ----------------
         if owner_attempt_id is not None:
             router.resolve_migration_preheader_failure(digest, attempt_id=owner_attempt_id)
             owner_attempt_id = None
@@ -1330,10 +1319,12 @@ async def _serve_balanced_count_tokens(
     session_key: SessionKey | None,
     model: str,
 ) -> Response:
-    """Council-pinned count_tokens rule: follow an existing pin (no `last_seen`
-    refresh) when one resolves, else fall back to the same stateless-digest
-    placement — NEVER creating a pin, reservation, cooldown, or capability
-    evidence, and never retrying across accounts (`rate_limit_failover=False`).
+    """Serve token counting without mutating balanced-routing state.
+
+    Follow an existing pin without refreshing `last_seen`; otherwise use
+    stateless-digest placement. This path never creates a pin, reservation,
+    cooldown, or capability evidence, and never retries across accounts
+    (`rate_limit_failover=False`).
     """
     router = runtime.router
     assert router is not None

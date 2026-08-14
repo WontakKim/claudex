@@ -1,4 +1,4 @@
-"""Starlette application composition root for the gateway."""
+"""Starlette composition root for the local multi-provider Claude Code gateway."""
 
 from __future__ import annotations
 
@@ -55,7 +55,7 @@ class _LogBufferHandler(logging.Handler):
                     "message": message,
                 }
             )
-        except Exception:  # noqa: BLE001 - a logging handler must never raise
+        except Exception:  # A logging handler must never propagate errors.
             self.handleError(record)
 
 
@@ -64,10 +64,9 @@ def create_app(config: GatewayConfig, daemon_nonce: str | None = None) -> Starle
     async def lifespan(app: Starlette) -> AsyncIterator[None]:
         # Every daemon capable of serving the Claude account pool — disabled,
         # fallback, or balanced routing mode alike — takes this lease before
-        # any endpoint is exposed and holds it for the process lifetime;
-        # routing-mode transitions never acquire or release it (Adjudication
-        # C). This is the same nonblocking exclusive lock used to serialize
-        # `account login`.
+        # any endpoint is exposed and holds it for the process lifetime.
+        # Routing-mode transitions never acquire or release it. This is the
+        # same nonblocking exclusive lock used to serialize `account login`.
         pool_dir = paths.claude_account_pool_dir()
         pool_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         claude_pool_lease = try_file_lock(paths.claude_account_pool_lock())
@@ -110,12 +109,11 @@ def create_app(config: GatewayConfig, daemon_nonce: str | None = None) -> Starle
                     app.state.http_client = http_client
 
                     if config.claude_account_routing_mode == "balanced":
-                        # A persisted "balanced" setting is prepared right here, after
-                        # the pool lease is held and `app.state.config` already reads
-                        # "balanced" -- a request racing this window sees `status ==
-                        # "acquiring"` and awaits it (T-10 Step 6), never a stale mode.
-                        # `persist` is a no-op: settings are already on disk, which is
-                        # exactly why this runs.
+                        # Restore a persisted balanced setting only after the pool lease
+                        # is held. A request racing this window sees `status ==
+                        # "acquiring"`, waits for the transition, and then re-reads the
+                        # published mode. `persist` is a no-op because the setting is
+                        # already on disk.
                         try:
                             await app.state.claude_balanced_runtime.prepare_and_publish(
                                 accounts=list_accounts(),
@@ -181,10 +179,10 @@ def create_app(config: GatewayConfig, daemon_nonce: str | None = None) -> Starle
         finally:
             # Process shutdown while settings remain "balanced" preserves the
             # persisted mode, epoch id/seed, pins, observations, cooldowns, and
-            # capability evidence (T-10 Step 4) -- distinct from an intentional
-            # `exit_mode`, which invalidates them. This must run before the T-9
-            # lease releases, so no other process can open the runtime store
-            # while this one is still draining/closing it.
+            # capability evidence. Unlike shutdown, an intentional `exit_mode`
+            # invalidates them. Finalization must complete before the process
+            # lease is released, so another process cannot open the runtime store
+            # while this one is still draining or closing it.
             await app.state.claude_balanced_runtime.shutdown_preserving_epoch()
             app.state.claude_pool_lease.release()
 
@@ -198,9 +196,9 @@ def create_app(config: GatewayConfig, daemon_nonce: str | None = None) -> Starle
             ),
             Route("/api/hello", admin_api._handle_hello, methods=["GET"]),
             Route("/health", admin_api._handle_health, methods=["GET"]),
-            # Admin tree (confirmed design, .docs/research/admin-api-reorg-gptpro.md):
-            # settings/* for gateway-wide settings, providers/{p}/* for each
-            # backend's own surface, top-level logs/usage/test as cross-cutting
+            # Admin routes use settings/* for gateway-wide settings and
+            # providers/{p}/* for each backend's own surface, with top-level
+            # logs/usage/test as cross-cutting
             # observability. No aliases: old paths 404.
             Route("/admin/settings/mapping", admin_api._handle_admin_mapping_get, methods=["GET"]),
             Route("/admin/settings/mapping", admin_api._handle_admin_mapping_put, methods=["PUT"]),
@@ -339,11 +337,11 @@ def create_app(config: GatewayConfig, daemon_nonce: str | None = None) -> Starle
         fetch=server_support._account_usage_fetch(app.state)
     )
     # Rate-limit cooldowns are ephemeral runtime state and live only in this
-    # process — the registry records exclusively durable facts (design §8).
+    # process; the registry records durable facts only.
     app.state.claude_account_cooldowns = AccountCooldownTracker()
-    # Starts "disabled" — a persisted "balanced" mode is prepared+published
-    # during lifespan startup (after the T-9 pool lease is held); set here
-    # (not in the lifespan) so it exists, and balanced dispatch fails closed
+    # Starts "disabled" — a persisted "balanced" mode is prepared and
+    # published during lifespan startup after the pool lease is held. It is
+    # initialized here so balanced dispatch fails closed
     # rather than crashing, even for a test that drives the app without
     # entering the lifespan context.
     app.state.claude_balanced_runtime = ClaudeBalancedRuntime()

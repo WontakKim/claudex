@@ -55,13 +55,12 @@ class _Entry:
 
 @dataclass(frozen=True)
 class PollResult:
-    """One coordinator-driven poll attempt's outcome (T-13 Step 1): which of
-    this cache's own three internal decisions served `result` for a single
-    account -- an actual upstream call (`"fetched"`), the existing entry
-    still within its own TTL/failure-backoff window (`"cache_hit"`), or the
-    shared Retry-After cooldown suppressing the attempt (`"cooldown"`).
-    `get`/`peek`/`peek_with_metadata` are entirely unaffected by this type's
-    existence; they keep their exact prior behavior and signatures.
+    """Outcome of one coordinator-driven poll attempt.
+
+    `source` identifies which cache decision served `result` for one account:
+    an actual upstream call (`"fetched"`), an entry still within its
+    TTL/failure-backoff window (`"cache_hit"`), or the shared Retry-After
+    cooldown suppressing the attempt (`"cooldown"`).
     """
 
     source: Literal["fetched", "cache_hit", "cooldown"]
@@ -163,7 +162,7 @@ class ClaudeAccountUsageCache:
         return entry.result, metadata
 
     async def poll(self, account_id: str, *, force: bool = False) -> PollResult:
-        """Coordinator-facing single-account attempt (T-13 Step 1).
+        """Attempt one account using the cache's freshness and cooldown rules.
 
         Reuses this cache's own freshness/backoff/cooldown decisions exactly
         as `get` would for a single id, but reports WHICH decision served the

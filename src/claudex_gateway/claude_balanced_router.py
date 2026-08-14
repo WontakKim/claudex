@@ -1,8 +1,8 @@
 """Domain-separated session-key derivation for balanced (session-affinity) routing.
 
-Design v2 §2.4/§5.1 (adjudications Q3, H): session keys are HMAC-SHA256
-digests under the durable per-deployment epoch seed. Raw Claude Code UUIDs
-and message content are never stored — only the digest. Two branches decide
+Session keys are HMAC-SHA256 digests under the durable per-deployment epoch
+seed. Raw Claude Code UUIDs and message content are never stored — only the
+digest. Two branches decide
 what gets hashed, tried in order:
 
 * uuid — Claude Code's `metadata.user_id` is a JSON string embedding a
@@ -21,15 +21,15 @@ A request with neither a usable `session_id` nor a first user message has no
 session key at all — the caller must treat it as unpinnable and route it
 statelessly via `derive_stateless_routing_digest`.
 
-`hrw_unit_interval` (§2.4) is the separate rendezvous-hashing (Highest
-Random Weight) sample: a per-(session, account) digest reduced to a
+`hrw_unit_interval` is the separate rendezvous-hashing (Highest Random
+Weight) sample: a per-(session, account) digest reduced to a
 uniformly distributed point in the open interval (0, 1), so the account with
 the largest sample can be picked without keeping any pin-map state.
 
-The rest of this module (design v2 §2, §5.1-§5.3) is the balanced picker
-core built on top of the above: `ObservationView` turns per-window usage
-readings into freshness-ladder-adjusted pressures, `quota_family` and the
-positive-set / amended-emergency weight formulas turn pressures into a
+The rest of this module implements the balanced picker core.
+`ObservationView` turns per-window usage readings into
+freshness-ladder-adjusted pressures, `quota_family` and the
+positive-set and emergency weight formulas turn pressures into a
 weighted-HRW draw, and `ClaudeBalancedRouter.place_session` performs the
 atomic pick-and-pin critical section against an in-memory, TTL/LRU-bounded
 pin map with a cancellation-safe `pending_durability` barrier for the
@@ -207,10 +207,10 @@ def derive_session_key(body: dict[str, Any], seed: bytes, family: str) -> Sessio
 def hrw_unit_interval(seed: bytes, session_key_digest: bytes, account_id: str) -> float:
     """Map (seed, session_key_digest, account_id) onto the open interval (0, 1).
 
-    Highest-Random-Weight sampling (design v2 §2.4) routes a session to the
-    account with the largest sample; the mapping is deterministic and needs
-    no stored state to keep a session pinned to the same account run after
-    run. `mac`'s high 53 bits give the full double-precision mantissa worth
+    Highest-Random-Weight sampling routes a session to the account with the
+    largest sample. The deterministic mapping needs no stored state to keep a
+    session pinned to the same account across runs. `mac`'s high 53 bits give
+    the full double-precision mantissa worth
     of entropy, offset by 0.5 so the interval stays strictly open.
     """
     mac = _hmac_sha256(
@@ -234,10 +234,10 @@ def derive_stateless_routing_digest(seed: bytes, nonce: bytes) -> bytes:
 
 
 # ==========================================================================
-# Balanced picker core (design v2 §2, §5.1-§5.3)
+# Balanced picker core
 # ==========================================================================
 
-# -- freshness ladder / unknown_floor (design v2 §2) -----------------------
+# -- freshness ladder and unknown floor ------------------------------------
 
 _FRESH_EXACT_SECONDS = 5 * 60
 _FRESH_PLUS5_SECONDS = 15 * 60
@@ -260,16 +260,15 @@ _IN_FLIGHT_PRESSURE_WEIGHT = 2.0
 _NON_FABLE_WINDOWS: tuple[str, ...] = ("five_hour", "seven_day")
 _FABLE_WINDOWS: tuple[str, ...] = ("five_hour", "seven_day", "fable_weekly")
 
-# `ClaudeAccountUsageCache.peek_with_metadata` (T-6) window names -> this
-# module's binding-window names (also `ClaudePoolRuntimeStateStore`'s
-# `usage_observations.window` values).
+# Map `ClaudeAccountUsageCache.peek_with_metadata` window names to the
+# binding-window names also stored in `usage_observations.window`.
 _PEEK_WINDOW_TO_BINDING: dict[str, str] = {
     "session": "five_hour",
     "weekly": "seven_day",
     "fable_weekly": "fable_weekly",
 }
 
-# Pin map (design v2 §5.1)
+# Pin-map bounds
 DEFAULT_PIN_TTL_UUID_SECONDS = 5 * 3600
 DEFAULT_PIN_TTL_CONTENT_HASH_SECONDS = 30 * 60
 DEFAULT_PIN_MAP_MAX_ENTRIES = 10_000
@@ -299,7 +298,7 @@ def _bounded_token_present(lowered: str, token: str) -> bool:
 
 
 def quota_family(model: str) -> str:
-    """The binding-window family a `model` id belongs to (adjudication G).
+    """Return the binding-window family for a model id.
 
     The ASCII case-insensitive token "fable", bounded on each side by the
     string's start/end or a non-alphanumeric (ASCII) character, selects the
@@ -311,15 +310,14 @@ def quota_family(model: str) -> str:
     return "fable" if _bounded_token_present(model.lower(), "fable") else "default"
 
 
-# `ClaudePoolRuntimeStateStore.capability_evidence.capability_key` (§5.5,
-# adjudication G): the bounded, case-insensitive family token a model id
-# carries, else the exact (lowercased) model id itself. Checked in this
-# fixed order — real model ids never carry more than one of these tokens.
+# Capability evidence uses the bounded, case-insensitive family token a model
+# id carries, otherwise the exact lowercased model id. Tokens are checked in
+# fixed order; real model ids never carry more than one of these tokens.
 _CAPABILITY_KEY_TOKENS: tuple[str, ...] = ("fable", "opus", "sonnet", "haiku")
 
 
 def capability_key(model: str) -> str:
-    """The capability-evidence key a `model` id is classified under (adjudication G).
+    """Return the capability-evidence key for a model id.
 
     A bounded (never a larger word's substring), case-insensitive match
     against `_CAPABILITY_KEY_TOKENS` wins; every other model id falls back to
@@ -334,14 +332,14 @@ def capability_key(model: str) -> str:
 
 
 def binding_windows(family: str) -> tuple[str, ...]:
-    """Design v2 §2: non-Fable accounts bind on `[five_hour, seven_day]`; Fable adds `fable_weekly`."""
+    """Return the usage windows that bind the requested quota family."""
     return _FABLE_WINDOWS if family == "fable" else _NON_FABLE_WINDOWS
 
 
 def freshness_adjusted_pressure(
     used_percent: float, age_seconds: float, *, reset_passed: bool
 ) -> float | None:
-    """Design v2 §2's freshness ladder, or `None` for UNKNOWN.
+    """Apply the freshness ladder, returning `None` for an unknown reading.
 
     <=5 min: the exact reading. 5-15 min: +5 percentage points. 15-30 min:
     +10 percentage points. Anything older than 30 minutes — or a window
@@ -373,7 +371,7 @@ def unknown_floor(complete_pressures: Sequence[float]) -> float:
 
 
 def _wall_to_monotonic(wall_value: float, *, wall_now: float, monotonic_now: float) -> float:
-    """Design v2 §5.2: convert a stored wall-clock timestamp into the router's monotonic domain."""
+    """Convert a stored wall-clock timestamp into the router's monotonic domain."""
     return monotonic_now + (wall_value - wall_now)
 
 
@@ -395,8 +393,8 @@ class _WarningSignal:
 @dataclass(frozen=True)
 class RealWindowReading:
     """One window's REAL (never `unknown_floor`, never inferred) freshness-
-    adjusted reading, plus its raw age — `ObservationView.real_window_reading`'s
-    result, consumed by the design v2 §6.4 family gate.
+    adjusted reading, plus its raw age. The family cooldown gate consumes
+    this value directly.
     """
 
     adjusted_pressure: float
@@ -406,10 +404,10 @@ class RealWindowReading:
 class ObservationView:
     """Per-account, per-window usage observations feeding pressure computation.
 
-    Fed from two sources (design v2 §2): periodic `peek_with_metadata`-shaped
-    polls and directly ingested, source-tagged observations — both go
-    through `ingest_window`, which keeps only the latest reading per
-    `(account_id, window)`. `ingest_allowed_warning` separately retains the
+    Periodic `peek_with_metadata`-shaped polls and directly ingested,
+    source-tagged observations both go through `ingest_window`, which keeps
+    only the latest reading per `(account_id, window)`.
+    `ingest_allowed_warning` separately retains the
     upstream "allowed: warning" signal a fresh matching-reset-identity
     window observation can haircut against. Every timestamp lives in one
     caller-supplied clock domain (the owning router's monotonic clock);
@@ -471,9 +469,9 @@ class ObservationView:
         """The window's own freshness-adjusted pressure, but ONLY when a REAL
         observation exists and is at most `max_age_seconds` old — `None` for
         anything else (missing, aged out, or its reset already passed). Reads the
-        raw stored observation directly, never `unknown_floor`-substituted and
-        never emergency-weighted — the design v2 §6.4 family gate's own
-        REAL/fresh requirement.
+        raw stored observation directly, never `unknown_floor`-substituted or
+        emergency-weighted, because the family gate requires a real, fresh
+        observation.
         """
         observation = self._windows.get((account_id, window))
         if observation is None:
@@ -506,7 +504,7 @@ def warning_factor(view: ObservationView, account_id: str, windows: Sequence[str
     return 1.0
 
 
-# -- weight computation: positive-set rule + amended emergency branch ------
+# -- weight computation: positive-set rule + emergency branch ------
 
 
 def account_headroom(pressure: float, in_flight: int) -> float:
@@ -515,7 +513,7 @@ def account_headroom(pressure: float, in_flight: int) -> float:
 
 
 def emergency_capacity(pressure: float, factor: float) -> float:
-    """`C0 = max(1, (100 - P) x factor)`: the amended emergency branch's capacity floor.
+    """`C0 = max(1, (100 - P) x factor)`: the emergency branch's capacity floor.
 
     Only reached when every eligible candidate's ordinary weight is zero
     (the positive-set is empty): it guarantees a strictly positive input to
@@ -528,7 +526,7 @@ def emergency_capacity(pressure: float, factor: float) -> float:
 
 
 def emergency_weight(pressure: float, factor: float, in_flight: int) -> float:
-    """`W = C0^2 / (C0 + 2M)`: the amended emergency branch's weight."""
+    """`W = C0^2 / (C0 + 2M)`: the emergency branch's weight."""
     C0 = emergency_capacity(pressure, factor)
     return (C0 * C0) / (C0 + _IN_FLIGHT_PRESSURE_WEIGHT * in_flight)
 
@@ -547,7 +545,7 @@ def select_weights(
     warning_factor(a)` is positive, every zero-weight candidate is dropped
     (a zero-weight account is never scored while a positive-weight one
     exists) and the positive ones are returned as-is. Only when the
-    positive-set is empty does the amended emergency branch (`C0`,
+    positive-set is empty does the emergency branch (`C0`,
     `emergency_weight`) run, for every candidate.
     """
     ordinary_weights = {
@@ -567,7 +565,7 @@ def select_weights(
 
 
 def resolve_tie_break(tied_account_ids: Sequence[str], *, serving_account_id: str | None) -> str:
-    """§2's tie rule: the serving pin wins if it is one of the tied accounts, else the lexically smallest id."""
+    """Prefer a tied serving pin, otherwise return the lexically smallest id."""
     if serving_account_id is not None and serving_account_id in tied_account_ids:
         return serving_account_id
     return min(tied_account_ids)
@@ -634,9 +632,9 @@ def is_eligible_candidate(
     return True
 
 
-# -- Fable family-scoped cooldown gate (design v2 §6.4, §5.5) ---------------
+# -- Fable family-scoped cooldown gate --------------------------------------
 
-# All in percentage points / seconds, exactly as design v2 §6.4 states them.
+# Thresholds are percentage points; observation age is measured in seconds.
 _FAMILY_GATE_MAX_OBSERVATION_AGE_SECONDS = 15 * 60
 _FAMILY_GATE_FABLE_WEEKLY_MIN_PERCENT = 99.0
 _FAMILY_GATE_FIVE_HOUR_MAX_PERCENT = 70.0
@@ -661,16 +659,18 @@ def classify_balanced_cooldown_scope(
     upstream_status_code: int,
     now: float,
 ) -> FamilyGateOutcome:
-    """Design v2 §6.4's family gate: a FAMILY-scoped cooldown (keyed
-    account+family) installs only when ALL SIX hold, each checked
-    independently — a single failing condition falls all the way back to
+    """Classify whether a cooldown can be scoped to the Fable family.
+
+    A family-scoped cooldown keyed by account and family installs only when
+    all six conditions hold. Each is checked independently, and a single
+    failing condition falls all the way back to
     account-wide, never a partial family scope:
 
     1. the request's model family is "fable";
     2. the account-specific failure is an ACTUAL upstream quota 429;
-    3. `fable_weekly`'s reading is REAL and fresh (§6.4: never
-       `unknown_floor`, never an emergency weight, never inferred; here,
-       present and <=15 min old) with an adjusted pressure >=99%;
+    3. `fable_weekly` has a real, fresh reading that is never an
+       `unknown_floor`, emergency weight, or inferred value; here it must be
+       present, at most 15 minutes old, and adjusted to at least 99%;
     4. `five_hour`'s reading is REAL/fresh with an adjusted pressure <=70%;
     5. `seven_day`'s reading is REAL/fresh with an adjusted pressure <=70%;
     6. the Fable reset is present and still in the future — it becomes the
@@ -709,17 +709,15 @@ def classify_balanced_cooldown_scope(
     return FamilyGateOutcome("family", "fable_family_gate_satisfied", family_deadline=reset_at)
 
 
-# -- durable cooldowns and capability evidence (design v2 §5.5, §6.4, adjudication G) --
+# -- durable cooldowns and capability evidence -----------------------------
 
-# New-cooldown derivation keeps the pre-existing [5s, 7d] clamp (unchanged,
-# `claude_account_pool.rate_limit_cooldown_seconds`); a RESTORED cooldown's
-# remaining duration gets its own, looser [1s, 7d] clamp (§5.5).
+# New cooldowns use `claude_account_pool.rate_limit_cooldown_seconds`'s
+# [5s, 7d] clamp. Restored cooldowns use a looser [1s, 7d] clamp.
 _COOLDOWN_RESTORE_MIN_SECONDS = 1.0
 _COOLDOWN_RESTORE_MAX_SECONDS = 7 * 24 * 3600.0
 
-# Capability evidence: state is always "eligible" here — v1 never writes
-# "denied" (§5.5/§6.4/adjudication G) — under a fixed classifier version and
-# a 1h TTL.
+# Capability evidence is always "eligible" under a fixed classifier version
+# and a one-hour TTL; this classifier never writes "denied" evidence.
 CAPABILITY_CLASSIFIER_VERSION = "v1"
 CAPABILITY_EVIDENCE_TTL_SECONDS = 3600.0
 
@@ -756,16 +754,16 @@ class _CapabilityEvidenceEntry:
     expires_at_monotonic: float
 
 
-# -- pin map (design v2 §5.1-§5.3) ------------------------------------------
+# -- pin map ---------------------------------------------------------------
 
 
 class PendingDurabilityBarrier:
     """A cancellation-safe, resolve-exactly-once gate for one pin generation's durable write.
 
-    Spec-gate ruling (§5.3): every request resolving this pin generation —
-    not just its creator — awaits `wait()`, which shields the underlying
-    event so a waiter's own cancellation can never cancel (or double-fire)
-    the barrier's resolution, before starting an upstream attempt.
+    Every request resolving this pin generation, not just its creator, awaits
+    `wait()`, which shields the underlying event so a waiter's own cancellation
+    can never cancel or double-fire the barrier's resolution before starting
+    an upstream attempt.
     `resolve()` runs exactly once, whether the durable write succeeded or
     failed; a second call is a no-op.
     """
@@ -819,7 +817,6 @@ class PlacementResult:
 
 
 # -- migration machinery: reservations, waiters, tokens, generation CAS -----
-# (design v2 §4.3-§4.5, §5.7)
 
 MigrationOutcome = Literal[
     "pending",
@@ -836,18 +833,15 @@ CommitOutcome = Literal["committed", "cas_lost", "target_removed"]
 
 @dataclass
 class MigrationReservation:
-    """One migration reservation per session generation (design v2 §4.3), attempt-owned
-    and cancellation-safe.
+    """One attempt-owned, cancellation-safe reservation per session generation.
 
-    Created in the same no-await critical section as its migration-attempt token
-    (`ClaudeBalancedRouter.acquire_migration_reservation`). `resolved_event` (an
-    `asyncio.Event`) plus the stored `outcome` is the resolution primitive every waiter
-    awaits through `asyncio.shield` — cancelling one waiter never cancels, and never
-    double-fires, the shared event. `outcome` starts `"pending"` and is set exactly once
-    by the owner-terminal path after it verifies `owner_attempt_id`; once terminal it is
-    immutable — a second attempted resolution is always a no-op (enforced by the router).
-    Never persisted (§4.3): reservations refer to live tasks and cancellation scopes that
-    die with the process.
+    The reservation is created in the same no-await critical section as its
+    migration-attempt token. `resolved_event` and the stored `outcome` form the
+    resolution primitive every waiter awaits through `asyncio.shield`, so
+    cancelling one waiter cannot cancel or double-fire the shared event.
+    `outcome` starts `"pending"` and becomes immutable after the owner-terminal
+    path verifies `owner_attempt_id` and resolves it. Reservations are never
+    persisted because they refer to live tasks and cancellation scopes.
     """
 
     source_account: str
@@ -859,7 +853,7 @@ class MigrationReservation:
 
 
 class ClaudeBalancedRouter:
-    """Design v2 §2/§5's balanced picker core: pressures, weighted HRW, pin map.
+    """Balanced picker state for pressures, weighted HRW, and the pin map.
 
     Owns the in-memory `ObservationView`, the `digest -> PinEntry` pin map
     (TTLs, LRU eviction, exactly-once-decrementing counters), each
@@ -867,11 +861,11 @@ class ClaudeBalancedRouter:
     `place_session` pick+pin-insert critical section — synchronous
     end-to-end (no `await`), so nothing can interleave between picking an
     account and inserting its pin. Durable persistence (the
-    `pending_durability` barrier and the coalesced `last_seen` refresh,
-    §5.3) goes through an optional `ClaudePoolRuntimeStateStore`. It also
-    owns the design v2 §4.3-§4.5/§5.7 migration machinery: per-session-
-    generation reservations, their `asyncio.shield`-based waiter protocol,
-    migration-attempt tokens keyed by attempt id (the §2.4 `M(a)` term),
+    `pending_durability` barrier and the coalesced `last_seen` refresh)
+    goes through an optional `ClaudePoolRuntimeStateStore`. It also owns the
+    migration machinery: per-session-generation reservations, their
+    `asyncio.shield`-based waiter protocol,
+    migration-attempt tokens keyed by attempt id (the `M(a)` in-flight term),
     the generation/owner CAS performed at upstream 2xx headers
     (`commit_at_headers`), and the account-removal transition matrix.
     Reservations and tokens are NEVER persisted and always start empty.
@@ -913,9 +907,8 @@ class ClaudeBalancedRouter:
         # space) — the "soft bound" being exceeded.
         self.soft_bound_overflow_count = 0
 
-        # Migration machinery (design v2 §4.3-§4.5, §5.7): reservations and
-        # tokens are NEVER persisted, so both always start empty here —
-        # there is no restore path for either.
+        # Reservations and migration tokens are process-local and never
+        # persisted, so both start empty and have no restore path.
         self._reservations: dict[bytes, MigrationReservation] = {}
         self._migration_tokens: dict[str, str] = {}
         self._removed_accounts: set[str] = set()
@@ -923,12 +916,12 @@ class ClaudeBalancedRouter:
         self.migration_cas_lost = 0
         self.migration_commit_rejected_target_removed = 0
 
-        # Durable cooldowns (design v2 §6.4/§5.5): account-wide by default,
-        # Fable family-scoped only when `classify_cooldown_scope` says so.
+        # Durable cooldowns are account-wide by default and Fable-family
+        # scoped only when `classify_cooldown_scope` says so.
         self._account_cooldowns: dict[str, _CooldownEntry] = {}
         self._family_cooldowns: dict[tuple[str, str], _CooldownEntry] = {}
-        # Capability evidence (§5.5, adjudication G): keyed by the EXACT
-        # `(account_id, capability_key)` pair — never inferred across keys.
+        # Capability evidence is keyed by the exact
+        # `(account_id, capability_key)` pair and never inferred across keys.
         self._capability_evidence: dict[tuple[str, str], _CapabilityEvidenceEntry] = {}
         # `remove_account`'s durable incarnation-scoped deletion, keyed by
         # incarnation so a caller can await its completion afterward.
@@ -951,7 +944,7 @@ class ClaudeBalancedRouter:
     def ingest_usage_peek(
         self, account_id: str, peeked: tuple[dict[str, Any], dict[str, dict[str, Any]]] | None
     ) -> None:
-        """Adapt `ClaudeAccountUsageCache.peek_with_metadata`'s shape (T-6) into `ObservationView`."""
+        """Adapt cached usage metadata into the router's `ObservationView`."""
         if peeked is None:
             return
         envelope, metadata = peeked
@@ -993,7 +986,7 @@ class ClaudeBalancedRouter:
         reset_in_seconds: float | None = None,
         reset_identity: str | None = None,
     ) -> None:
-        """Directly ingest one source-tagged window observation (design v2 §2)."""
+        """Directly ingest one source-tagged window observation."""
         now = self._clock()
         reset_at = now + reset_in_seconds if reset_in_seconds is not None else None
         self.observations.ingest_window(
@@ -1050,7 +1043,7 @@ class ClaudeBalancedRouter:
         in_flight = {account_id: self.in_flight_count(account_id) for account_id in account_ids}
         return select_weights(account_ids, pressures=pressures, warning_factors=warning_factors, in_flight=in_flight)
 
-    # -- cold start (design v2 §2.4) -----------------------------------------
+    # -- cold start ---------------------------------------------------------
 
     def _is_cold_start(
         self,
@@ -1106,7 +1099,7 @@ class ClaudeBalancedRouter:
         return len(expired)
 
     def remove_pin(self, digest: bytes) -> bool:
-        """Explicit external removal (e.g. account removal, §5.7)."""
+        """Remove an externally invalidated pin, such as for account removal."""
         return self._remove_pin(digest, reason="removed") is not None
 
     def _remove_pin(self, digest: bytes, *, reason: str) -> PinEntry | None:
@@ -1167,7 +1160,7 @@ class ClaudeBalancedRouter:
         entry.expires_at_monotonic = now + self._pin_ttl_seconds(entry.key_kind)
         return True
 
-    # -- atomic pick + pin-insert (design v2 §5.1) ---------------------------
+    # -- atomic pick and pin insertion --------------------------------------
 
     def place_session(
         self,
@@ -1251,7 +1244,7 @@ class ClaudeBalancedRouter:
             durability_barrier=barrier,
         )
 
-    # -- durable persistence (design v2 §5.3) --------------------------------
+    # -- durable persistence ------------------------------------------------
 
     async def submit_new_pin_durability(self, digest: bytes) -> None:
         """Submit the initial pin's HIGH-PRIORITY durable write and resolve its barrier.
@@ -1297,7 +1290,7 @@ class ClaudeBalancedRouter:
         await entry.pending_durability.wait()
 
     async def refresh_pin_durable_last_seen(self, digest: bytes) -> None:
-        """§5.3's durable `last_seen` refresh, coalesced <=1/60s per pin by the store itself."""
+        """Refresh durable `last_seen`, coalesced to at most once per minute per pin."""
         entry = self._pins.get(digest)
         if entry is None or self._store is None:
             return
@@ -1309,7 +1302,7 @@ class ClaudeBalancedRouter:
         except Exception:
             self.persistence_degraded = True
 
-    # -- restore-from-store initialization (design v2 §5.2, §5.5) -----------
+    # -- restore from the runtime store -------------------------------------
 
     def restore_from_store(
         self, restore_result: RestoreResult, *, now: float | None = None, wall_now: float | None = None
@@ -1320,8 +1313,8 @@ class ClaudeBalancedRouter:
         `restore_result.pins` already excludes expired and epoch-mismatched
         rows (`ClaudePoolRuntimeStateStore.restore`); every remaining row is
         durable, so it carries no `pending_durability` barrier. Cooldowns and
-        capability evidence get the same wall->monotonic conversion, each with
-        its own §5.5 restore clamp/validation; a restored cooldown's remaining
+        capability evidence get the same wall-to-monotonic conversion, each
+        with its own restore clamp and validation. A cooldown's remaining
         duration clamps to `[1s, 7d]`, and a restored capability row is kept
         only while it is still `eligible`, still carries a TTL, is not yet
         expired, and matches this build's `CAPABILITY_CLASSIFIER_VERSION` (the
@@ -1376,7 +1369,7 @@ class ClaudeBalancedRouter:
 
         for (account_id, capability_key_value), capability_row in restore_result.capability_evidence.items():
             if capability_row.state != "eligible" or capability_row.expires_at_utc is None:
-                continue  # v1 never trusts a restored denial; eligible evidence always carries a TTL
+                continue  # Restored denials are ignored; eligible evidence requires a TTL.
             if capability_row.classifier_version != CAPABILITY_CLASSIFIER_VERSION:
                 continue
             expires_at_monotonic = _wall_to_monotonic(
@@ -1393,7 +1386,7 @@ class ClaudeBalancedRouter:
 
         return len(self._pins)
 
-    # -- cooldowns: account-wide default, Fable family-scoped gate (§6.4) ----
+    # -- account-wide and Fable family-scoped cooldowns ---------------------
 
     def classify_cooldown_scope(
         self, *, account_id: str, model: str, upstream_status_code: int, now: float | None = None
@@ -1425,9 +1418,9 @@ class ClaudeBalancedRouter:
     ) -> Any:
         """Install a cooldown (account-wide, or Fable family-scoped when
         `scope == "family"`), in-memory and — when both a store and a profile
-        fingerprint are available — durably, always HIGH PRIORITY (design v2
-        §5.5's "cooldown installation" bullet). `deadline` is monotonic; the
-        entry's wall deadline is derived from it (see `_CooldownEntry`).
+        fingerprint are available — durably and at high priority. `deadline`
+        is monotonic; the entry's wall deadline is derived from it (see
+        `_CooldownEntry`).
         Returns the store's `PendingWrite`, or `None` when nothing was
         submitted (no store, or no fingerprint yet).
         """
@@ -1479,7 +1472,7 @@ class ClaudeBalancedRouter:
         wall_now = self._wall_clock() if wall_now is None else wall_now
         return _entry_cooldown_deadline(self._family_cooldowns.get((account_id, model_family)), now, wall_now)
 
-    # -- capability evidence: eligible-only, TTL'd (§5.5, adjudication G) ----
+    # -- eligible-only capability evidence with TTLs -----------------------
 
     def classify_capability_evidence(
         self,
@@ -1493,11 +1486,11 @@ class ClaudeBalancedRouter:
         now: float | None = None,
         wall_now: float | None = None,
     ) -> None:
-        """Design v2 adjudication G / §6.4: v1 records ONLY `eligible` evidence,
-        and only from an EXPLICIT successful 2xx for the EXACT `capability_key`
-        — any other status (403/404/400/other 4xx, 5xx, ...) records nothing at
-        all. `denied` is never written in v1 (the model-ineligible migration
-        trigger stays dormant).
+        """Record `eligible` evidence only for an explicit successful 2xx.
+
+        Evidence applies to the exact `capability_key`. Every other status
+        records nothing, and this classifier never writes `denied` evidence,
+        so the model-ineligible migration trigger remains dormant.
         """
         if status_code // 100 != 2:
             return
@@ -1552,12 +1545,13 @@ class ClaudeBalancedRouter:
             return False
         return True
 
-    # -- migration reservations and waiters (design v2 §4.3) -----------------
+    # -- migration reservations and waiters --------------------------------
 
     def get_migration_reservation(self, digest: bytes) -> MigrationReservation | None:
-        """The no-await critical-section read a waiter's loop starts with (§4.3 step 1):
-        the current reservation reference for `digest`, or `None` if no migration is
-        in flight for this session.
+        """Read the current reservation without awaiting.
+
+        A waiter's loop starts with this critical-section read. It returns
+        `None` when no migration is in flight for the session.
         """
         return self._reservations.get(digest)
 
@@ -1570,18 +1564,14 @@ class ClaudeBalancedRouter:
         target_account: str,
         attempt_id: str,
     ) -> tuple[MigrationReservation, bool]:
-        """The atomic reservation+token acquisition critical section (§4.3-§4.4):
-        entirely synchronous (no `await`), the same single-event-loop discipline as
-        `place_session`, so no other coroutine can interleave between the check and
-        the insert.
+        """Atomically acquire a migration reservation and attempt token.
 
-        If a reservation is already pending for `digest`, returns THAT reservation and
-        `False` — this caller becomes a WAITER on the existing migration; concurrent
-        same-session requests wait and re-read, they never pick an independent target
-        (§4.3). Otherwise this caller becomes the OWNER: a fresh pending reservation and
-        its migration-attempt token (keyed by `attempt_id`, created in the SAME critical
-        section, §4.4) are inserted, the pin is marked `migration_reserved` so eviction
-        cannot reclaim it mid-migration, and `(reservation, True)` is returned.
+        This critical section is entirely synchronous, so no coroutine can
+        interleave between the check and insert. If a pending reservation
+        exists, return it with `False`; this caller waits and re-reads routing
+        state rather than selecting an independent target. Otherwise create a
+        reservation and attempt token in the same critical section, protect
+        the pin from eviction, and return the reservation with `True`.
         """
         existing = self._reservations.get(digest)
         if existing is not None and existing.outcome == "pending":
@@ -1599,19 +1589,21 @@ class ClaudeBalancedRouter:
         return reservation, True
 
     async def wait_for_migration_reservation(self, reservation: MigrationReservation) -> None:
-        """§4.3's waiter protocol step 2: `await asyncio.shield(...)` on the reservation's
-        event, so a waiter's own cancellation can never cancel — or double-fire — the
-        shared resolution. The caller re-enters the critical section and re-reads all
-        routing state afterward (steps 3-4); it never trusts the stale target embedded
-        in the (by-then-cleared) reservation it just waited on.
+        """Wait for a migration reservation without exposing its shared event.
+
+        `asyncio.shield` prevents a waiter's cancellation from cancelling or
+        double-firing the shared resolution. Afterward the caller re-enters the
+        critical section and re-reads routing state instead of trusting the
+        reservation's potentially stale target.
         """
         await asyncio.shield(reservation.resolved_event.wait())
 
     def resolve_migration_reservation(
         self, digest: bytes, *, attempt_id: str, outcome: MigrationOutcome
     ) -> bool:
-        """The no-await, idempotent core of every owner-terminal path (§4.3): verify
-        `owner_attempt_id`, record the (from-here-immutable) outcome, clear the
+        """Resolve an owner-terminal path idempotently without awaiting.
+
+        Verify `owner_attempt_id`, record the immutable outcome, clear the
         reservation, un-protect the pin from eviction, then set its event exactly once.
         Returns `True` only when THIS call performed the transition; a reservation that
         is missing, already resolved, or owned by a different attempt is a no-op that
@@ -1631,15 +1623,16 @@ class ClaudeBalancedRouter:
         reservation.resolved_event.set()
         return True
 
-    # -- migration-attempt tokens: M(a) (design v2 §4.4) ---------------------
+    # -- migration-attempt tokens and in-flight counts ---------------------
 
     def migration_token_target(self, attempt_id: str) -> str | None:
         """The live token's target account for `attempt_id`, or `None` if released/absent."""
         return self._migration_tokens.get(attempt_id)
 
     def release_migration_token(self, attempt_id: str) -> str | None:
-        """`migration_tokens.pop(attempt_id, None)` — inherently idempotent (§4.4): the
-        first call releases the token and decrements the target's `M(a)`; every later
+        """Release a migration token idempotently.
+
+        The first call decrements the target's `M(a)`; every later
         call for the same `attempt_id` is a no-op that returns `None`.
         """
         target_account = self._migration_tokens.pop(attempt_id, None)
@@ -1650,13 +1643,14 @@ class ClaudeBalancedRouter:
     def resolve_migration_owner_terminal(
         self, digest: bytes, *, attempt_id: str, outcome: MigrationOutcome
     ) -> bool:
-        """The ONE idempotent owner-terminal API (Steps 2-3): every owner exit path —
-        request cancellation, timeout, mode drain, an exception raised before response
-        headers, target rejection, CAS loss, or success — funnels through this. Entirely
-        synchronous (no `await`), so it is safe to call from a `finally` block while
-        reservation state is mutated: no cancellation can interrupt the transition
-        between ownership verification and event signaling. Resolves the owned
-        reservation to `outcome` (a no-op if it is not pending, not owned by
+        """Resolve every migration-owner terminal path idempotently.
+
+        Every owner exit — cancellation, timeout, mode drain, an exception
+        before response headers, target rejection, CAS loss, or success —
+        funnels through this synchronous method. It is safe to call from a
+        `finally` block because no cancellation can interrupt the transition
+        between ownership verification and event signaling. It resolves the
+        owned reservation to `outcome` (a no-op if it is not pending, not owned by
         `attempt_id`, or was already resolved by an earlier explicit terminal path such
         as `commit_at_headers`), then releases the attempt's migration token exactly
         once (a no-op if already released). Returns whether THIS call resolved the
@@ -1673,19 +1667,17 @@ class ClaudeBalancedRouter:
         attempt_id: str,
         outcome: MigrationOutcome = "retryable_preheader_failure",
     ) -> bool:
-        """Design v2 §4.4's terminal ordering for a pre-header quota/eligibility failure:
-        ① classify the response, ② install the cooldown/capability evidence in memory,
-        and ③ fence the target are the caller's own responsibility, run BEFORE calling
-        this (so a woken waiter re-reads state that already reflects them); this method
-        performs ④ resolve the reservation and wake waiters and ⑤ release the migration
-        token, synchronously and without an intervening await, via
-        `resolve_migration_owner_terminal`. ⑥ persistence/diagnostics are scheduled by
-        the caller AFTER this returns.
+        """Resolve a pre-header quota or eligibility failure in safe order.
 
-        Also applies §5.7 case 2's follow-up clause: if this reservation's source
-        account was separately marked removed (`remove_account`), the now-orphaned
-        source pin is deleted too, so a later request places fresh instead of reusing a
-        pin to a removed account.
+        Before calling this method, the caller must classify the response,
+        update in-memory cooldown or capability evidence, and fence the target.
+        This ensures woken waiters re-read updated state. The method then
+        resolves the reservation, wakes waiters, and releases the migration
+        token synchronously. Persistence and diagnostics are scheduled only
+        after it returns.
+
+        If `remove_account` separately marked the source account removed, this
+        also deletes the orphaned source pin so later requests place afresh.
         """
         reservation = self._reservations.get(digest)
         source_account = reservation.source_account if reservation is not None else None
@@ -1694,7 +1686,7 @@ class ClaudeBalancedRouter:
             self.remove_pin(digest)
         return resolved_now
 
-    # -- commit point: upstream 2xx headers (design v2 §4.5) -----------------
+    # -- commit point at upstream 2xx headers -------------------------------
 
     def commit_at_headers(
         self,
@@ -1708,16 +1700,16 @@ class ClaudeBalancedRouter:
         target_still_registered: bool = True,
         ingest_headers: Callable[[], None] | None = None,
     ) -> tuple[CommitOutcome, PinEntry | None, PendingDurabilityBarrier | None]:
-        """ONE no-await critical section performing design v2 §4.5's commit at the
-        target's upstream 2xx headers. Reservation resolution happens HERE — never
-        deferred to stream completion:
+        """Commit a migration at upstream 2xx headers without awaiting.
 
-        1. `ingest_headers()` (if supplied) — the caller's own ratelimit-header
-           ingestion hook (§3.2), run first so the fresh observation is visible before
-           anything else in this section reads pressure/eligibility state;
-        2. validate target membership (§5.7 case 4: the target was removed by the time
-           its 2xx headers arrived) — on failure: outcome `target_removed`, the
-           reservation resolves and wakes waiters, no pin is touched;
+        Reservation resolution happens here and is never deferred to stream
+        completion:
+
+        1. Run `ingest_headers()`, when supplied, before anything else reads
+           pressure or eligibility state.
+        2. Validate target membership. If the target was removed before its 2xx
+           headers arrived, resolve the reservation as `target_removed`, wake
+           waiters, and leave the pin untouched.
         3. the generation/owner CAS: `pin.account_id == source_account`,
            `pin.generation == source_generation`,
            `reservation.owner_attempt_id == attempt_id` — on failure: outcome
@@ -1728,16 +1720,17 @@ class ClaudeBalancedRouter:
            reservation is cleared, and its event is set exactly once — outcome
            `committed`.
 
-        The migration-attempt TOKEN is untouched here by design (§4.4/Step 5): it
-        survives until the caller releases it (`resolve_migration_owner_terminal` /
-        `release_migration_token`) from the attempt's common `finally`, once the
-        upstream body/stream terminates — `M(target_account)` stays incremented for the
-        whole streamed response, not just until these headers commit.
+        The migration-attempt token remains live until the caller releases it
+        through `resolve_migration_owner_terminal` or `release_migration_token`
+        from the attempt's common `finally` after the upstream body or stream
+        terminates. `M(target_account)` stays incremented for the whole streamed
+        response, not just until these headers commit.
 
-        Returns `(outcome, pin, barrier)`. On `committed`, the caller awaits `barrier`'s
-        high-priority durability completion (`submit_new_pin_durability` /
-        `await_pin_durability`, T-7 semantics) OUTSIDE this critical section, before
-        forwarding any downstream byte; same-session waiters re-read the pin and await
+        Returns `(outcome, pin, barrier)`. On `committed`, the caller awaits the
+        barrier's high-priority durability completion through
+        `submit_new_pin_durability` and `await_pin_durability` outside this
+        critical section before forwarding any downstream byte. Same-session
+        waiters re-read the pin and await
         that same barrier before sending upstream.
         """
         if ingest_headers is not None:
@@ -1775,24 +1768,24 @@ class ClaudeBalancedRouter:
         self.resolve_migration_reservation(digest, attempt_id=attempt_id, outcome="committed")
         return "committed", pin, barrier
 
-    # -- account removal transition matrix (design v2 §5.7) ------------------
+    # -- account removal transition matrix ---------------------------------
 
     def remove_account(self, account_id: str, incarnation: str) -> dict[str, int]:
-        """§5.7's account-removal transition matrix, cases 1-5 (case 4 is handled at
-        commit time by `commit_at_headers`'s `target_still_registered` check, since it
-        depends on whether upstream 2xx already arrived). Never bulk-resets migration
-        tokens or the in-flight counters underneath them — an owned token is released
-        exactly once, only by its own attempt's own terminal cleanup (case 3: "removed
-        exactly once by terminal cleanup"), not by this batch operation; the mandatory
-        lazy per-lookup/pre-commit membership re-check remains the correctness
-        backstop. Returns a per-case removal count for diagnostics.
+        """Apply the account-removal transition matrix.
 
-        Also drops every in-memory cooldown/capability-evidence entry keyed to
-        `account_id`, and submits a HIGH-PRIORITY durable deletion of every row
-        (pins, cooldowns, usage observations, capability evidence) belonging to
-        `incarnation` (`ClaudePoolRuntimeStateStore.delete_all_for_incarnation`,
-        §5.7) — scoped precisely by incarnation id, so a reused `account_id`
-        under a later, different incarnation is never touched. Await
+        Target removal after upstream headers is handled at commit time by
+        `commit_at_headers`'s `target_still_registered` check because it
+        depends on whether upstream 2xx already arrived. This operation never
+        bulk-resets migration tokens or their in-flight counters. Each owned
+        token is released exactly once by its attempt's terminal cleanup, and
+        lazy membership checks remain the correctness backstop. The returned
+        counts describe each removal outcome.
+
+        The operation also drops in-memory cooldown and capability-evidence
+        entries for `account_id`, then submits a high-priority durable deletion
+        of every pin, cooldown, usage observation, and capability-evidence row
+        belonging to `incarnation`. Incarnation scoping ensures a later account
+        that reuses `account_id` is never touched. Await
         `await_account_removal_durability(incarnation)` for that deletion to
         complete.
         """
@@ -1871,9 +1864,11 @@ class ClaudeBalancedRouter:
 
 
 # ==========================================================================
-# Balanced usage poll coordinator (T-13): the only caller of the per-account
-# usage cache's real upstream fetch while balanced routing is active.
+# Balanced usage poll coordinator
 # ==========================================================================
+
+# This coordinator is the only caller that performs per-account usage fetches
+# while balanced routing is active.
 
 # Budget: at most one actual upstream call per this many seconds, burst one
 # (no credit banking -- a call arriving before the interval elapses is
@@ -1905,8 +1900,10 @@ class PollTickResult:
 
 @dataclass(frozen=True)
 class UsagePollAccount:
-    """One ready account's identity for a coordinator tick (Step 3): exactly
-    the fields `ClaudePoolRuntimeStateStore.upsert_usage_observation` needs
+    """Identity fields needed to persist a ready account's usage observation.
+
+    These are exactly the fields
+    `ClaudePoolRuntimeStateStore.upsert_usage_observation` needs
     to persist a durable observation row for it.
     `account_profile_fingerprint` is `None` when the account has not
     captured one yet (mirrors `_install_balanced_quota_cooldown`'s own lazy
@@ -1921,7 +1918,7 @@ class UsagePollAccount:
 
 @dataclass
 class _AccountPollDiagnostics:
-    """Per-account diagnostics (Step 3), updated only by an actual fetch."""
+    """Per-account diagnostics updated only by an actual fetch."""
 
     last_outcome: str | None = None
     last_polled_monotonic: float | None = None
@@ -1931,7 +1928,7 @@ class _AccountPollDiagnostics:
 
 @dataclass(frozen=True)
 class UsagePollDiagnostics:
-    """Aggregate coordinator counters (Step 3's "aggregate diagnostics")."""
+    """Aggregate usage poll coordinator diagnostics."""
 
     fetched_count: int
     cache_hit_count: int
@@ -1945,9 +1942,10 @@ class UsagePollDiagnostics:
 
 
 class ClaudeUsagePollCoordinator:
-    """Design v2's balanced-mode usage poll coordinator (T-13 Steps 2-3): the
-    ONLY caller of `ClaudeAccountUsageCache`'s real upstream fetch while
-    balanced routing is active.
+    """Coordinate balanced-mode usage polling under a global fetch budget.
+
+    This is the only caller of `ClaudeAccountUsageCache` that performs real
+    upstream fetches while balanced routing is active.
 
     `run_due_poll` performs AT MOST ONE actual upstream call per invocation
     (sequential scheduling) and never more than one per
@@ -2016,10 +2014,9 @@ class ClaudeUsagePollCoordinator:
 
     @property
     def poll_interval_seconds(self) -> float:
-        """The scheduling budget passed in at construction (Step 1 grounding
-        for `ClaudeBalancedRuntime`'s background driver, which paces its own
-        loop against this exact value): at most one actual upstream call per
-        this many seconds.
+        """Return the fetch interval used by the runtime's background driver.
+
+        The coordinator permits at most one actual upstream call per interval.
         """
         return self._poll_interval_seconds
 
@@ -2048,7 +2045,7 @@ class ClaudeUsagePollCoordinator:
     def is_manual_refresh_pending(self, account_id: str) -> bool:
         return account_id in self._pending_manual
 
-    # -- diagnostics (Step 3) -------------------------------------------------
+    # -- diagnostics --------------------------------------------------------
 
     def _diagnostic(self, account_id: str) -> _AccountPollDiagnostics:
         return self._diagnostics.setdefault(account_id, _AccountPollDiagnostics())
@@ -2107,9 +2104,8 @@ class ClaudeUsagePollCoordinator:
 
         `ready_account_ids` is re-supplied every call (the caller's own
         registry snapshot) -- the coordinator keeps no membership state of
-        its own. `accounts`, when supplied, additionally persists a
-        successful observation durably (Step 3); omitted, only the
-        in-memory router ingestion happens.
+        its own. When supplied, `accounts` also persists a successful
+        observation; otherwise only in-memory router ingestion occurs.
         """
         now = self._clock() if now is None else now
         if (
@@ -2184,8 +2180,8 @@ class ClaudeUsagePollCoordinator:
     ) -> None:
         """Feed the fresh observation into the router's in-memory
         `ObservationView` (always) and, when a store and this account's
-        identity are both available, submit a durable row per window (Step
-        3) -- fire-and-forget, exactly like `classify_capability_evidence`'s
+        identity are both available, submit one durable row per window as a
+        fire-and-forget write, like `classify_capability_evidence`'s
         own low-priority store write: the router's in-memory state (which
         the picker actually reads) is already updated synchronously above,
         so nothing waits on this.
@@ -2226,7 +2222,7 @@ class ClaudeUsagePollCoordinator:
 
 
 # ==========================================================================
-# Runtime lifecycle (T-10): ClaudeBalancedRuntime
+# Balanced routing runtime lifecycle
 # ==========================================================================
 
 BalancedRuntimeStatus = Literal["disabled", "acquiring", "active", "draining"]
@@ -2234,7 +2230,7 @@ BalancedRuntimeStatus = Literal["disabled", "acquiring", "active", "draining"]
 
 class BalancedPrepareError(RuntimeError):
     """Raised by `ClaudeBalancedRuntime.prepare_and_publish` when the runtime cannot be
-    safely readied: a ready account carries no valid T-3 profile fingerprint. The
+    safely readied because a ready account has no valid profile fingerprint. The
     caller (server.py's PUT routing handler) reports this to the admin client;
     preparation is always torn down first, so the previous routing mode is left
     untouched.
@@ -2250,22 +2246,23 @@ class ClaudeBalancedRuntime:
     hasn't flipped to "balanced" yet), "active" (`store`/`router` are live and
     `begin_request` admits new dispatch slots), "draining" (an intentional exit or
     process shutdown is underway — no new slot is admitted, in-flight ones are
-    awaited). `wait_for_transition` is the spec-gate-ruling primitive (Step 6) a
-    request arriving mid-transition awaits before re-reading the published routing
-    mode and dispatching under it: the transition event is cleared for the whole
+    awaited). A request arriving mid-transition awaits `wait_for_transition`
+    before re-reading the published routing mode and dispatching under it. The
+    transition event is cleared for the whole
     "acquiring"/"draining" window and only set once the new state is fully published,
     so a woken waiter never observes a stale mode.
 
-    `persist`/`publish` are the coordinator hooks (Step 3) the server layer supplies so
-    this class can enforce the exact ordering its two distinct lifecycle operations
-    need without owning `GatewayConfig` or the settings file itself: enabling persists
-    settings before the prepared runtime is published (`prepare_and_publish`); exiting
-    persists+publishes the target mode before waking transition waiters (`exit_mode`).
+    The server layer supplies `persist` and `publish` hooks so this class can
+    enforce the ordering its two distinct lifecycle operations require without
+    owning `GatewayConfig` or the settings file itself: enabling persists settings
+    before the prepared runtime is published (`prepare_and_publish`); exiting
+    persists and publishes the target mode before waking transition waiters
+    (`exit_mode`).
     Process shutdown (`shutdown_preserving_epoch`) takes no hook at all — it never
     touches persisted settings or epoch metadata, so a restart can restore them.
 
-    In-flight accounting (`begin_request`/`end_request`, also Step 3) is this class's
-    own request-slot counter, entirely independent of `ClaudeBalancedRouter`'s
+    `begin_request` and `end_request` maintain this class's request-slot
+    counter, entirely independent of `ClaudeBalancedRouter`'s
     per-account `M(a)` attempt counting: it exists purely so the drain step of
     `exit_mode`/`shutdown_preserving_epoch` has something to wait on.
     """
@@ -2275,8 +2272,8 @@ class ClaudeBalancedRuntime:
         self.epoch_id: str | None = None
         self.epoch_seed: bytes = b""
         self.router: ClaudeBalancedRouter | None = None
-        # The T-13 usage poll coordinator: exists only while this runtime is
-        # "active" (Context) -- `None` in "disabled"/"acquiring"/"draining",
+        # The usage poll coordinator exists only while this runtime is active;
+        # it is `None` in "disabled", "acquiring", or "draining",
         # and also `None` in "active" when `prepare_and_publish` was called
         # without a `usage_cache` (every direct, non-HTTP caller keeps this
         # optional; server.py's real routing handler always supplies one).
@@ -2286,9 +2283,9 @@ class ClaudeBalancedRuntime:
         ) = None
 
         self._store: ClaudePoolRuntimeStateStore | None = None
-        # T-18 (fix for gap G-1): the background driver that actually calls
-        # `usage_poll_coordinator.run_due_poll` while this runtime is
-        # "active" -- `None` whenever no coordinator is driving (every status
+        # The background driver calls `usage_poll_coordinator.run_due_poll`
+        # while this runtime is "active" -- `None` whenever no coordinator is
+        # driving (every status
         # other than "active", or "active" without a `usage_cache`).
         self._usage_poll_driver_task: asyncio.Task[None] | None = None
         self._accounts_root: Path | None = None
@@ -2301,10 +2298,11 @@ class ClaudeBalancedRuntime:
 
     @property
     def epoch_active(self) -> bool:
-        """This class's own "is the current epoch live" flag (Step 4's "mark the epoch
-        inactive"): true only in "active" status. `ClaudePoolRuntimeStateStore`'s own
-        `epoch_active` meta column (T-5) has no public setter and is never written by
-        this class — this is an in-memory concept, computed from `status` alone.
+        """Return whether this runtime's current epoch is live in memory.
+
+        This is true only while status is "active". The runtime store's
+        `epoch_active` metadata has no public setter and is never written by
+        this class; this property is computed from `status` alone.
         """
         return self.status == "active"
 
@@ -2346,11 +2344,11 @@ class ClaudeBalancedRuntime:
         entry: Literal["startup_restore", "admin_enable"],
         usage_cache: ClaudeAccountUsageCache | None = None,
     ) -> None:
-        """Enable balanced routing (Step 4/Context).
+        """Prepare and atomically publish balanced routing.
 
         Opens and validates the runtime store, restores its state, constructs the
-        router, and verifies every *ready* account carries a valid T-3 profile
-        fingerprint — all while the OLD mode remains published, so traffic is
+        router, and verifies every ready account has a valid profile
+        fingerprint while the old mode remains published, so traffic is
         unaffected until every check passes. `persist()` — the coordinator hook that
         persists+swaps `claude_account.routing` to "balanced" — is invoked exactly
         once, after every check passes and strictly before this runtime is published
@@ -2359,8 +2357,7 @@ class ClaudeBalancedRuntime:
         any opened store) and leaves `status` "disabled" — the old mode keeps serving,
         exactly as if this call had never happened.
 
-        `entry` (T-22, fix for gap G-7) is the required call-site discriminator
-        between the two distinct reasons this class ever gets re-entered:
+        `entry` distinguishes the two supported reasons for preparing a runtime:
         `"startup_restore"` is the daemon lifespan restoring an already-persisted
         `"balanced"` mode across a process restart, which reuses the runtime DB's
         existing epoch/pins exactly as `shutdown_preserving_epoch` left them.
@@ -2373,8 +2370,8 @@ class ClaudeBalancedRuntime:
         re-entry must never resurrect that state, so it always mints a fresh one
         regardless of what the store still contains.
 
-        `usage_cache` (T-13), when supplied, wires a fresh
-        `ClaudeUsagePollCoordinator` for this runtime's `usage_poll_coordinator`
+        When supplied, `usage_cache` creates a fresh
+        `ClaudeUsagePollCoordinator` for this runtime
         against the same router/store this call just prepared -- omitted, that
         attribute stays `None` (every non-server caller of this method).
         """
@@ -2389,9 +2386,9 @@ class ClaudeBalancedRuntime:
             try:
                 store = ClaudePoolRuntimeStateStore.open_(runtime_db_path)
                 if entry == "admin_enable":
-                    # Contract (b) (T-22, fix for gap G-7): mint a fresh epoch
-                    # (and wipe its pins) durably before anything below ever
-                    # reads or restores from the store, so a degraded exit's
+                    # Administrative enablement must mint a fresh epoch and
+                    # wipe its pins durably before anything below reads or
+                    # restores from the store, so a degraded exit's
                     # stale epoch/pins can never be resurrected by a later
                     # administrative re-entry.
                     await store.rotate_epoch().wait_async()
@@ -2435,11 +2432,12 @@ class ClaudeBalancedRuntime:
             finally:
                 self._transition_event.set()
 
-    # -- usage poll driver (T-18, fix for gap G-1): runs while "active" ---------------
+    # -- usage poll driver: runs while active -------------------------------
 
     def _start_usage_poll_driver(self) -> None:
-        """Start the background driver task (Step 1) once this runtime is published
-        "active" -- a no-op when `prepare_and_publish` was called without a
+        """Start the background poll driver after the runtime becomes active.
+
+        This is a no-op when `prepare_and_publish` was called without a
         `usage_cache`, so `usage_poll_coordinator` is `None` and nothing needs
         driving. Must only be called from inside the `_lifecycle_lock` critical
         section that just set `status = "active"`.
@@ -2449,8 +2447,9 @@ class ClaudeBalancedRuntime:
         self._usage_poll_driver_task = asyncio.create_task(self._run_usage_poll_driver())
 
     async def _stop_usage_poll_driver(self) -> None:
-        """Cancel and await the driver task, if one is running (Step 2). MUST be
-        awaited before the store closes in both `exit_mode` and
+        """Cancel and await the poll driver if it is running.
+
+        This must finish before the store closes in both `exit_mode` and
         `shutdown_preserving_epoch`, so no poll tick can ever touch a closed store.
         """
         task = self._usage_poll_driver_task
@@ -2464,10 +2463,12 @@ class ClaudeBalancedRuntime:
             pass
 
     async def _run_usage_poll_driver(self) -> None:
-        """The driver's sequential loop (Step 1): the first tick runs immediately
-        (the coordinator's warm-up-on-enable, Context), then it sleeps for the
-        coordinator's own scheduling budget before trying again, forever, until
-        `_stop_usage_poll_driver` cancels it. Re-reads `usage_poll_coordinator`
+        """Run the poll driver sequentially until it is cancelled.
+
+        The first tick runs immediately to warm the coordinator, then the loop
+        sleeps for the coordinator's own scheduling budget before trying again.
+        It runs until `_stop_usage_poll_driver` cancels it and re-reads
+        `usage_poll_coordinator`
         every iteration rather than capturing it once, so it stops cleanly the
         moment the attribute is cleared instead of racing a stale reference.
         """
@@ -2522,9 +2523,9 @@ class ClaudeBalancedRuntime:
         persist: Callable[[], None] | None = None,
         publish: Callable[[], None],
     ) -> None:
-        """Intentional balanced -> fallback/disabled exit (Step 4/Context; reordered
-        by T-20, fix for gap G-3; made cancellation-safe by T-22, fix for gap G-7)
-        — distinct from process shutdown (`shutdown_preserving_epoch`): this is the
+        """Exit balanced mode intentionally for fallback or disabled routing.
+
+        Unlike process shutdown (`shutdown_preserving_epoch`), this is the
         ONLY path that rotates the epoch (invalidating every current-epoch pin) and
         marks it inactive, so a later re-entry (`prepare_and_publish`) always starts
         a fresh epoch.
@@ -2594,8 +2595,9 @@ class ClaudeBalancedRuntime:
                 raise
 
     async def _finalize_exit(self, publish: Callable[[], None]) -> None:
-        """`exit_mode`'s post-commit finalization (T-22, fix for gap G-7): rotate the
-        epoch (degrading, never rolling back, on failure), publish the target mode,
+        """Complete `exit_mode` after its settings commit.
+
+        Rotate the epoch without rolling back on failure, publish the target mode,
         stop+await the poll driver, close the store, and reset to "disabled". Always
         run inside `asyncio.shield` by its only caller, `exit_mode`, so it completes
         exactly once `persist()` has committed, independent of the caller's own
@@ -2619,9 +2621,8 @@ class ClaudeBalancedRuntime:
                 )
             publish()
         finally:
-            # T-18 (Step 2): cancel+await the driver strictly before the store
-            # closes, so no in-flight or newly-scheduled poll tick can ever
-            # touch it once closed.
+            # Cancel and await the driver before closing the store so no
+            # in-flight or newly scheduled poll tick can touch it once closed.
             await self._stop_usage_poll_driver()
             if self._store is not None:
                 self._store.close()
@@ -2637,8 +2638,9 @@ class ClaudeBalancedRuntime:
     # -- process shutdown: drain and close, preserving every persisted setting --------
 
     async def shutdown_preserving_epoch(self) -> None:
-        """Process-lifetime finalization (Step 4/Context): drains and closes exactly
-        like `exit_mode`, but never rotates the epoch, never touches persisted
+        """Drain and close the runtime while preserving the current epoch.
+
+        Unlike `exit_mode`, this never rotates the epoch or touches persisted
         settings, and takes no coordinator hook — so a restart's `prepare_and_publish`
         finds the SAME epoch id/seed/pins/observations/cooldowns/capability evidence
         right where this left them. A no-op when balanced routing was never prepared
@@ -2652,9 +2654,9 @@ class ClaudeBalancedRuntime:
             try:
                 await self._drain_complete.wait()
             finally:
-                # T-18 (Step 2): same cancel-before-close ordering as
-                # `exit_mode` -- process shutdown must not race a poll tick
-                # against the store it is about to close either.
+                # Use the same cancel-before-close ordering as `exit_mode`;
+                # process shutdown must not race a poll tick against the store
+                # it is about to close either.
                 await self._stop_usage_poll_driver()
                 if self._store is not None:
                     self._store.close()
