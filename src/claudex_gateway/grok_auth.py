@@ -22,13 +22,15 @@ from typing import Any
 
 import httpx
 
+from claudex_gateway.upstream_errors import UpstreamAuthError
+
 XAI_ISSUER = "https://auth.x.ai"
 
 # Refresh the access token this many seconds before its recorded expiry.
 _EXPIRY_SKEW_SECONDS = 300
 
 
-class GrokAuthError(Exception):
+class GrokAuthError(UpstreamAuthError):
     """Raised when Grok credentials are missing or cannot be refreshed."""
 
 

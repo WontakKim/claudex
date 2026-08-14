@@ -13,19 +13,18 @@ from typing import Any
 import httpx
 
 from claudex_gateway.kimi_auth import KimiAuthManager, KimiCredentials
+from claudex_gateway.upstream_errors import UpstreamError
 
 KIMI_MESSAGES_URL = "https://api.kimi.com/coding/v1/messages"
 KIMI_COUNT_TOKENS_URL = "https://api.kimi.com/coding/v1/messages/count_tokens"
 KIMI_MODELS_URL = "https://api.kimi.com/coding/v1/models"
 
 
-class KimiUpstreamError(Exception):
+class KimiUpstreamError(UpstreamError):
     """Raised when the Kimi backend returns a non-success HTTP response."""
 
     def __init__(self, status_code: int, body: str) -> None:
-        super().__init__(f"kimi upstream returned {status_code}: {body[:2000]}")
-        self.status_code = status_code
-        self.body = body
+        super().__init__(status_code, body, "kimi")
 
 
 class KimiClient:

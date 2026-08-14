@@ -11,6 +11,7 @@ import httpx
 
 from claudex_gateway.codex_auth import CodexAuthError, CodexAuthManager, CodexCredentials
 from claudex_gateway.model_catalog_cache import ModelCatalogCache
+from claudex_gateway.upstream_errors import UpstreamError
 
 CODEX_RESPONSES_URL = "https://chatgpt.com/backend-api/codex/responses"
 CODEX_MODELS_URL = "https://chatgpt.com/backend-api/codex/models"
@@ -25,13 +26,11 @@ _CODEX_ORIGINATOR = "codex-tui"
 _CODEX_CLIENT_VERSION = "0.146.0"
 
 
-class CodexUpstreamError(Exception):
+class CodexUpstreamError(UpstreamError):
     """Raised when the Codex backend returns a non-success HTTP response."""
 
     def __init__(self, status_code: int, body: str) -> None:
-        super().__init__(f"codex upstream returned {status_code}: {body[:2000]}")
-        self.status_code = status_code
-        self.body = body
+        super().__init__(status_code, body, "codex")
 
 
 @dataclass(frozen=True)

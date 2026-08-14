@@ -16,6 +16,7 @@ import httpx
 
 from claudex_gateway.model_catalog_cache import ModelCatalogCache
 from claudex_gateway.grok_auth import GrokAuthError, GrokAuthManager, GrokCredentials
+from claudex_gateway.upstream_errors import UpstreamError
 
 GROK_RESPONSES_URL = "https://cli-chat-proxy.grok.com/v1/responses"
 GROK_MODELS_URL = "https://cli-chat-proxy.grok.com/v1/models"
@@ -62,13 +63,11 @@ _GROK_EFFORT_MAP = {
 }
 
 
-class GrokUpstreamError(Exception):
+class GrokUpstreamError(UpstreamError):
     """Raised when the Grok backend returns a non-success HTTP response."""
 
     def __init__(self, status_code: int, body: str) -> None:
-        super().__init__(f"grok upstream returned {status_code}: {body[:2000]}")
-        self.status_code = status_code
-        self.body = body
+        super().__init__(status_code, body, "grok")
 
 
 def _coerce_context_window(value: Any) -> int | None:

@@ -130,6 +130,7 @@ from claudex_gateway.usage import (
 )
 from claudex_gateway.grok_auth import GrokAuthError, GrokAuthManager
 from claudex_gateway.grok_client import GrokClient, GrokUpstreamError, sanitize_grok_payload
+from claudex_gateway.upstream_errors import UpstreamAuthError, UpstreamError
 
 logger = logging.getLogger(__name__)
 
@@ -227,7 +228,7 @@ def _upstream_error_code(body: str) -> str | None:
 
 
 def _upstream_error_to_claude(
-    exc: CodexUpstreamError | GrokUpstreamError,
+    exc: UpstreamError,
     *,
     claude_request: dict[str, Any] | None = None,
     context_window: int | None = None,
@@ -1754,7 +1755,7 @@ async def _relay_via_responses_backend(
                 _claude_error_body("api_error", f"{provider} stream ended without any events"),
                 status_code=502,
             )
-    except (CodexUpstreamError, GrokUpstreamError) as exc:
+    except UpstreamError as exc:
         status_code, body = _upstream_error_to_claude(
             exc, claude_request=claude_request, context_window=context_window
         )
@@ -1762,7 +1763,7 @@ async def _relay_via_responses_backend(
             "%s upstream error %s: %s", provider, exc.status_code, body["error"]["message"]
         )
         return JSONResponse(body, status_code=status_code)
-    except (CodexAuthError, GrokAuthError) as exc:
+    except UpstreamAuthError as exc:
         return JSONResponse(_claude_error_body("authentication_error", str(exc)), status_code=401)
     except httpx.HTTPError as exc:
         logger.warning("%s backend unreachable: %r", provider, exc)
@@ -2079,16 +2080,16 @@ async def _translate_claude_sse(
         async for event in upstream_events:
             for event_name, payload in translator.translate_event(event):
                 yield _format_sse(event_name, payload)
-    except (CodexUpstreamError, GrokUpstreamError) as exc:
+    except UpstreamError as exc:
         _, body = _upstream_error_to_claude(
             exc, claude_request=claude_request, context_window=context_window
         )
         yield _format_sse("error", body)
-    except (CodexAuthError, GrokAuthError, httpx.HTTPError) as exc:
+    except (UpstreamAuthError, httpx.HTTPError) as exc:
         logger.warning("responses stream aborted: %s", exc)
         error_type = (
             "authentication_error"
-            if isinstance(exc, (CodexAuthError, GrokAuthError))
+            if isinstance(exc, UpstreamAuthError)
             else "api_error"
         )
         yield _format_sse("error", _claude_error_body(error_type, str(exc)))
@@ -2112,12 +2113,12 @@ async def _aggregate_claude_response(
                     status_code = 400 if error_type == "invalid_request_error" else 502
                     return JSONResponse(payload, status_code=status_code)
                 claude_events.append(translated)
-    except (CodexUpstreamError, GrokUpstreamError) as exc:
+    except UpstreamError as exc:
         status_code, body = _upstream_error_to_claude(
             exc, claude_request=claude_request, context_window=context_window
         )
         return JSONResponse(body, status_code=status_code)
-    except (CodexAuthError, GrokAuthError) as exc:
+    except UpstreamAuthError as exc:
         return JSONResponse(_claude_error_body("authentication_error", str(exc)), status_code=401)
     except httpx.HTTPError as exc:
         logger.warning("responses stream aborted: %r", exc)
@@ -2308,7 +2309,7 @@ async def _count_tokens_via_kimi(
         upstream_response = await kimi_client.count_tokens(
             json.dumps(outgoing, ensure_ascii=False).encode(), _kimi_request_headers(request)
         )
-    except (KimiAuthError, KimiUpstreamError, httpx.HTTPError) as exc:
+    except (UpstreamAuthError, UpstreamError, httpx.HTTPError) as exc:
         logger.warning("kimi count_tokens failed, falling back to estimate: %s", exc)
         return None
     try:
@@ -4239,9 +4240,9 @@ async def _handle_admin_connection_test(request: Request) -> JSONResponse:
         else:
             probe = _probe_codex_route(request.app.state.codex_client, route.model)
         response_model = await asyncio.wait_for(probe, _CONNECTION_TEST_TIMEOUT)
-    except (CodexUpstreamError, KimiUpstreamError, GrokUpstreamError) as exc:
+    except UpstreamError as exc:
         return result(False, exc.status_code, _upstream_error_message(exc.body))
-    except (CodexAuthError, KimiAuthError, GrokAuthError) as exc:
+    except UpstreamAuthError as exc:
         return result(False, 401, str(exc))
     except TimeoutError:
         return result(False, None, f"no response within {_CONNECTION_TEST_TIMEOUT:.0f}s")

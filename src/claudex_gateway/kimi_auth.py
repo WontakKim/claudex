@@ -25,6 +25,7 @@ from typing import Any
 import httpx
 
 import claudex_gateway
+from claudex_gateway.upstream_errors import UpstreamAuthError
 
 KIMI_TOKEN_URL = "https://auth.kimi.com/api/oauth/token"
 KIMI_CLIENT_ID = "17e5f671-d194-4dfb-9706-5516cb48c098"
@@ -33,7 +34,7 @@ KIMI_CLIENT_ID = "17e5f671-d194-4dfb-9706-5516cb48c098"
 _EXPIRY_SKEW_SECONDS = 300
 
 
-class KimiAuthError(Exception):
+class KimiAuthError(UpstreamAuthError):
     """Raised when Kimi credentials are missing or cannot be obtained."""
 
 

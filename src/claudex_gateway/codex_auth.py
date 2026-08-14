@@ -21,6 +21,8 @@ from typing import Any
 
 import httpx
 
+from claudex_gateway.upstream_errors import UpstreamAuthError
+
 OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token"
 OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 
@@ -28,7 +30,7 @@ OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 _EXPIRY_SKEW_SECONDS = 300
 
 
-class CodexAuthError(Exception):
+class CodexAuthError(UpstreamAuthError):
     """Raised when Codex credentials are missing or cannot be refreshed."""
 
 
