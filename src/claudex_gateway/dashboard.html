@@ -1,5 +1,5 @@
 <!doctype html>
-<!-- Runtime dashboard for the single Claude Code → Codex direction. -->
+<!-- Runtime dashboard for routing Claude Code models across multiple providers. -->
 <html lang="ko">
 <head>
 <meta charset="utf-8">
@@ -300,7 +300,7 @@ body.env-locked .applybar{display:none!important}
 .scard{display:none}
 #tab-settings[data-cat="general"] #scard-general,
 #tab-settings[data-cat="accounts"] #scard-accounts{display:block}
-/* Claude accounts (Settings > Claude 계정) — mirrors the confirmed probe
+/* Claude accounts (Settings > Claude Accounts) — mirrors the confirmed probe
    _design-probes/_accounts-final.html; deviations are bugs. */
 .acct-head{display:flex;align-items:flex-start;justify-content:space-between;gap:14px}
 .acct-head h2{margin:0}
@@ -379,7 +379,7 @@ button.primary:disabled{opacity:.5;cursor:default}
 /* Serving-selection env lock: same banner pattern as the compaction card. */
 .acctlock{display:none;margin-top:14px;border:1px solid var(--err);border-radius:8px;color:var(--err);padding:10px 14px;font-size:14px}
 #scard-accounts.locked .acctlock{display:block}
-/* Login modal (계정 추가): wider than the confirm dialog, code input always
+/* Login modal (Add Account): wider than the confirm dialog, code input always
    visible, no backdrop/Escape close — a silent close would leak a live
    CLI login child. */
 .modal.wide{width:min(560px,100%)}
@@ -660,15 +660,11 @@ var CATALOG={codex:[],kimi:[],grok:[]};
 /* Curated compaction reroute targets, in the dashboard's <select> order.
    "claude-haiku" is deliberately never a curated choice here. */
 var COMPACTION_CURATED_MODELS=["claude-sonnet-5","claude-opus-5","claude-fable-5"];
-/* Reads config.parse_route_target's shape: only the first colon splits the
-   prefix, so upstream names containing colons survive. A bare or unknown-
-   prefixed value (e.g. a pre-prefix settings file) still renders as Codex so
-   the board stays usable — the server rejects it on Apply. */
+/* Reads config.parse_route_target's shape: the first colon separates the
+   provider prefix from the complete model portion, including later colons. */
 function routeOf(value){
   var at=String(value).indexOf(":");
-  if(at<0)return{provider:"codex",model:value};
   var prefix=value.slice(0,at);
-  if(ROUTE_PROVIDERS.indexOf(prefix)<0)return{provider:"codex",model:value};
   return{provider:prefix,model:value.slice(at+1)};
 }
 function routeValue(provider,model){return provider+":"+model}
@@ -932,7 +928,7 @@ board.addEventListener("pointerdown",function(ev){
       Object.keys(DIR.mapping).forEach(function(k){if(DIR.mapping[k]===tid)delete DIR.mapping[k]});
       addedTargets=addedTargets.filter(function(id){return id!==tid});
     }else{
-      delete DIR.mapping[xbtn.dataset.k];   // 고정 키: 연결만 끊기 (LIVE였다면 REMOVED + undo)
+      delete DIR.mapping[xbtn.dataset.k];   // Fixed key: disconnect only (if LIVE, REMOVED + undo).
     }
     if(DIR.sel&&!(DIR.sel in DIR.mapping))DIR.sel=null;
     document.getElementById("wdel").classList.remove("show");
@@ -1219,7 +1215,7 @@ function renderProviderCards(h){
     renderStatLine("kimi","okv",null,'● OK <span class="detail">Kimi 계정으로 로그인됨</span>'+
       (kimi.account?'<div class="codeblock">'+esc(String(kimi.account))+"</div>":""));
   }else if(kimi.required===false){
-    // kimi: 라우트가 없으면 로그인 여부가 readiness와 무관하므로 에러가 아닌 중립으로.
+    // Kimi login does not affect readiness without a route, so use a neutral state.
     renderStatLine("kimi","",kimi.detail||"",
       '● 미사용 <span class="detail">모델 맵에 kimi: 타겟이 없어 로그인하지 않아도 됩니다</span>'+
       '<div class="codeblock"><span class="tx">$ kimi login</span>'+
@@ -1239,7 +1235,7 @@ function renderProviderCards(h){
       (grok.auth_mode!=="api_key"&&grok.account
         ?'<div class="codeblock">'+esc(String(grok.account))+"</div>":""));
   }else if(grok.required===false){
-    // grok: 라우트가 없으면 로그인 여부가 readiness와 무관하므로 에러가 아닌 중립으로.
+    // Grok login does not affect readiness without a route, so use a neutral state.
     renderStatLine("grok","",grok.detail||"",
       '● 미사용 <span class="detail">모델 맵에 grok: 타겟이 없어 로그인하지 않아도 됩니다</span>'+
       '<div class="codeblock"><span class="tx">$ grok login</span>'+
@@ -1281,7 +1277,7 @@ function renderLogLevel(p){
   });
 }
 var logTimer=null,logLive=false;
-/* The poll runs only while the Log tab is visible AND 라이브 is toggled on. */
+/* The poll runs only while the Log tab is visible and Live is toggled on. */
 function syncLogTimer(){
   var active=logLive&&document.body.dataset.tab==="log";
   if(active&&!logTimer)logTimer=setInterval(fetchLogs,2000);
@@ -1506,7 +1502,7 @@ document.getElementById("codex-apply").addEventListener("click",applyCodex);
 /* --- account-pool routing mode (claude_account.routing) -------------------
    Same envelope discipline as the compaction card: adopt {mode, env_locked}
    from every successful response, 409 flips the local lock and re-syncs from
-   a fresh GET. 적용 stays inert while the draft equals the live mode. */
+   a fresh GET. Apply stays inert while the draft equals the live mode. */
 var ROUTING={envName:"CLAUDEX_CLAUDE_ACCOUNT_ROUTING",locked:false,mode:"disabled",draft:"disabled"};
 var ROUTING_LABELS={disabled:"Disabled",fallback:"Fallback",balanced:"Balanced"};
 var ROUTING_HINTS={
@@ -1600,12 +1596,12 @@ document.querySelectorAll("#tab-settings .rail-item").forEach(function(a){
     setSettingsCat((this.getAttribute("href")||"").split("/")[1]);
   });
 });
-/* --- Claude accounts (Settings > Claude 계정) -----------------------------
+/* --- Claude accounts (Settings > Claude Accounts) -------------------------
    Mirrors _design-probes/_accounts-final.html. The registry GET paints the
    rows immediately; per-account usage and the local hero's usage fill in
    async. Rows expand independently — opening one never closes another — and
    the open set survives re-renders. No interval polling: fetch on entry,
-   the hero's 갱신 button, and after a login succeeds. */
+   the hero's Refresh button, and after a login succeeds. */
 var ACCT_ENV="CLAUDEX_CLAUDE_ACCOUNT_ID";
 var ACCT={rows:[],serving:null,local:null,locked:false,usage:{},open:{},removeArmed:{},localUsage:null,routing:{},usageFreshness:null};
 function attr(s){return esc(s).replace(/"/g,"&quot;")}
@@ -1624,9 +1620,9 @@ function fmtAgo(epochSec){
   var m=Math.max(0,Math.round((Date.now()/1000-epochSec)/60));
   return m<1?"방금":m<60?m+"분 전":Math.floor(m/60)+"시간 "+(m%60)+"분 전";
 }
-/* Same "N분 전" phrasing as fmtAgo, but for a pool/usage window's own
-   age_seconds duration rather than an epoch timestamp — this is the
-   per-window observation age, not the whole envelope's updated_at. */
+/* Uses the same relative-time phrasing as fmtAgo, but for a pool/usage
+   window's own age_seconds duration rather than an epoch timestamp — this is
+   the per-window observation age, not the whole envelope's updated_at. */
 function fmtAge(ageSeconds){
   if(typeof ageSeconds!=="number")return"—";
   var m=Math.max(0,Math.round(ageSeconds/60));
@@ -1860,8 +1856,8 @@ function fetchAccounts(){
   });
 }
 function setServingAccount(accountId){
-  /* Selecting pins via PUT; 해제 clears via DELETE (a null PUT is refused).
-     Both answer with the same {account_id, env_locked} envelope. */
+  /* Selecting pins uses PUT; clearing uses DELETE because a null PUT is
+     refused. Both answer with the same {account_id, env_locked} envelope. */
   (accountId
     ?jfetch("/admin/providers/claude/pool/serving",{
       method:"PUT",
@@ -2279,7 +2275,7 @@ function fitView(){
     maxY=Math.max(maxY,n.offsetTop+n.offsetHeight);
   });
   var W=board.clientWidth,H=board.clientHeight;
-  var padTop=18,padBottom=66;   // 하단 플로팅 줌 툴바를 피한다
+  var padTop=18,padBottom=66;   // Leave room for the floating zoom toolbar at the bottom.
   var usable=H-padTop-padBottom;
   zoom=Math.max(.4,Math.min(1,usable/(maxY-minY)));
   pan.x=(W-W*zoom)/2;
@@ -2379,7 +2375,7 @@ function renderUsageProvider(provider,data){
   }
   var meta='<div class="umeta">마지막 갱신 '+fmtLogTs(data.updated_at||Date.now()/1000)+"</div>";
   if(data.status==="ok"){
-    // 응답에 없는 윈도우(예: Codex의 5시간)는 행 자체를 만들지 않는다.
+    // Do not render rows for windows absent from the response, such as Codex's five-hour window.
     var rows=(data.session?usageWindowHtml("5시간 윈도우",data.session):"")+
       (data.weekly?usageWindowHtml("주간 윈도우",data.weekly):"")+
       (data.fable_weekly?usageWindowHtml("Fable 주간",data.fable_weekly):"")+
@@ -2400,8 +2396,9 @@ function restoreUsageButtons(providers){
     if(btn){btn.disabled=false;btn.textContent="갱신"}
   });
 }
-/* provider 없이 호출하면 보이는 카드 일괄 갱신(탭 진입 시), 있으면 해당 카드만.
-   This list stays built-in-only because custom providers have no usage API. */
+/* Without a provider, refresh all visible cards on tab entry; with one,
+   refresh only that card. This list stays built-in-only because custom
+   providers have no usage API. */
 function fetchUsage(provider){
   var targets=provider?[provider]:["claude","codex","kimi","grok"].filter(function(p){
     return PROVIDER_VISIBLE[p]!==false;
