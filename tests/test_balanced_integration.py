@@ -33,6 +33,7 @@ from typing import Any
 
 import httpx
 import pytest
+from starlette.responses import JSONResponse
 from starlette.testclient import TestClient
 
 from claudex_gateway import claude_accounts, paths
@@ -54,7 +55,9 @@ from claudex_gateway.config import GatewayConfig
 from claudex_gateway.grok_auth import GrokCredentials
 from claudex_gateway.kimi_auth import KimiCredentials
 
+import claudex_gateway.relay as relay
 import claudex_gateway.server as server
+import claudex_gateway.server_support as server_support
 
 # ---------------------------------------------------------------------------
 # Fakes/fixtures mirroring test_server.py's `_create_test_client` exactly --
@@ -216,9 +219,9 @@ def _capture_balanced_candidate_ids(
         _model: str,
     ) -> Any:
         captured.update(records_by_id)
-        return server.JSONResponse({"captured": True})
+        return JSONResponse({"captured": True})
 
-    monkeypatch.setattr(server, "_serve_balanced_pinned_message", capture_records)
+    monkeypatch.setattr(relay, "_serve_balanced_pinned_message", capture_records)
     response = client.post("/v1/messages", json=_balanced_body(str(uuid.uuid4())))
     assert response.status_code == 200
     return captured
@@ -288,7 +291,7 @@ def test_distinct_ambient_login_joins_balanced_candidates_and_serves_request(
         records = claude_accounts.load_registry()
         records_by_id = {record.id: record for record in records}
         records_by_id[member.record.id] = member.record
-        candidates = server._balanced_candidates(
+        candidates = relay._balanced_candidates(
             records_by_id.values(), runtime.router, family="default", now=time.monotonic()
         )
         assert {candidate.account_id for candidate in candidates} == {
@@ -299,7 +302,7 @@ def test_distinct_ambient_login_joins_balanced_candidates_and_serves_request(
         for _ in range(100):
             body = _balanced_body(str(uuid.uuid4()))
             session_key = derive_session_key(body, runtime.epoch_seed, "default")
-            selected_id = server._balanced_pick_account(
+            selected_id = relay._balanced_pick_account(
                 runtime.router,
                 session_key_digest=session_key.scoring_digest_or_default,
                 model=body["model"],
@@ -396,7 +399,7 @@ def test_auth_manager_routes_ambient_id_without_caching_directory_manager(
     member = provider.pool_member()
     assert member is not None
 
-    manager = server._claude_account_auth_manager(app.state, member.record.id)
+    manager = server_support._claude_account_auth_manager(app.state, member.record.id)
 
     assert isinstance(manager, AmbientClaudeAuthManager)
     assert app.state.claude_account_auth_managers == {}

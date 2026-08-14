@@ -22,6 +22,7 @@ import uvicorn
 from starlette.testclient import TestClient
 
 import claudex_gateway.admin_api as admin_api
+import claudex_gateway.relay as relay
 import claudex_gateway.server as server
 import claudex_gateway.server_support as server_support
 from claudex_gateway import claude_accounts, compaction, paths
@@ -51,12 +52,16 @@ from claudex_gateway.kimi_client import KimiClient, KimiUpstreamError
 from claudex_gateway.openai_compatible_client import OpenAICompatibleUpstreamError
 from claudex_gateway.grok_auth import GrokCredentials
 from claudex_gateway.grok_client import GrokClient, GrokUpstreamError
+from claudex_gateway.relay import (
+    _CompactionStreamRelay,
+    _OwnedStreamingResponse,
+    _aggregate_claude_response,
+    _rewrite_kimi_sse,
+    _translate_claude_sse,
+    _upstream_error_to_claude,
+)
 from claudex_gateway.translate import translate_claude_request_to_codex
 from claudex_gateway.translate.codex_to_claude import estimate_overflow_prompt_tokens
-
-# The balanced integration suite still reaches this shared helper through its
-# imported server module; keep that test lookup aligned without a production re-export.
-setattr(server, "_claude_account_auth_manager", server_support._claude_account_auth_manager)
 
 
 class AvailableCodexAuthManager:
@@ -217,7 +222,7 @@ def test_route_ownership_matches_surface_modules() -> None:
         if route.path in admin_paths or route.path.startswith("/admin/"):
             assert route.endpoint.__module__ == "claudex_gateway.admin_api"
         elif route.path in {"/v1/messages", "/v1/messages/count_tokens"}:
-            assert route.endpoint.__module__ == "claudex_gateway.server"
+            assert route.endpoint.__module__ == "claudex_gateway.relay"
 
 
 def test_messages_routes_enforce_local_bearer_token(
@@ -416,7 +421,7 @@ def _overflow_error_body(message: str) -> str:
 
 
 def test_context_overflow_http_error_is_rewritten_for_claude_compaction() -> None:
-    status_code, body = server._upstream_error_to_claude(
+    status_code, body = _upstream_error_to_claude(
         _upstream_error(
             400,
             {
@@ -434,7 +439,7 @@ def test_context_overflow_http_error_is_rewritten_for_claude_compaction() -> Non
 
 
 def test_context_overflow_forces_400_regardless_of_upstream_status() -> None:
-    status_code, body = server._upstream_error_to_claude(
+    status_code, body = _upstream_error_to_claude(
         _upstream_error(413, {"message": "Request exceeds the maximum context length."})
     )
     assert status_code == 400
@@ -443,7 +448,7 @@ def test_context_overflow_forces_400_regardless_of_upstream_status() -> None:
 
 
 def test_non_overflow_error_passes_through_unchanged() -> None:
-    status_code, body = server._upstream_error_to_claude(
+    status_code, body = _upstream_error_to_claude(
         _upstream_error(429, {"type": "rate_limit_error", "message": "slow down"})
     )
     assert status_code == 429
@@ -1149,7 +1154,7 @@ def test_kimi_stream_yields_complete_sse_events() -> None:
         response = httpx.Response(200, content=sse_body)
         return [
             chunk
-            async for chunk in server._rewrite_kimi_sse(response, "claude-fable-5")
+            async for chunk in _rewrite_kimi_sse(response, "claude-fable-5")
         ]
 
     chunks = asyncio.run(scenario())
@@ -1186,7 +1191,7 @@ def test_kimi_stream_cancellation_interrupts_buffered_events() -> None:
         first_chunk_seen = asyncio.Event()
 
         async def consume() -> None:
-            async for chunk in server._rewrite_kimi_sse(response, "claude-fable-5"):
+            async for chunk in _rewrite_kimi_sse(response, "claude-fable-5"):
                 chunks.append(chunk)
                 first_chunk_seen.set()
 
@@ -1463,7 +1468,8 @@ def test_custom_provider_route_uses_custom_client_without_builtin_payload_mutati
     def unexpected_grok_sanitizer(payload: dict[str, Any], model: str) -> dict[str, Any]:
         raise AssertionError("Grok sanitizer must not run for a custom provider")
 
-    monkeypatch.setattr(server, "sanitize_grok_payload", unexpected_grok_sanitizer)
+    monkeypatch.setattr(relay, "sanitize_grok_payload", unexpected_grok_sanitizer)
+    assert relay.sanitize_grok_payload is unexpected_grok_sanitizer
     client, codex_stub = _gateway(
         config,
         _failing_anthropic_handler,
@@ -1939,7 +1945,8 @@ def test_compaction_reroute_success_never_calls_translation(
     def _boom(*_args: Any, **_kwargs: Any) -> Any:
         raise AssertionError("translation must not run when the reroute succeeds")
 
-    monkeypatch.setattr(server, "translate_claude_request_to_codex", _boom)
+    monkeypatch.setattr(relay, "translate_claude_request_to_codex", _boom)
+    assert relay.translate_claude_request_to_codex is _boom
 
     body = _compaction_body("claude-opus-4-6")
     window = estimate_overflow_prompt_tokens(body) - 1
@@ -1983,7 +1990,7 @@ def test_compaction_reroute_fallback_translates_untouched_original_body_once(
             service_tier=service_tier,
         )
 
-    monkeypatch.setattr(server, "translate_claude_request_to_codex", recording_translate)
+    monkeypatch.setattr(relay, "translate_claude_request_to_codex", recording_translate)
 
     body = _compaction_body("claude-opus-4-6", thinking_block=True)
     window = estimate_overflow_prompt_tokens(body) - 1
@@ -2088,8 +2095,8 @@ def test_compaction_trigger_absent_setting_never_runs_signal_a_or_estimator(
 ) -> None:
     signal_calls = {"count": 0}
     estimate_calls = {"count": 0}
-    real_is_compaction_request = server.is_compaction_request
-    real_estimate = server.estimate_overflow_prompt_tokens
+    real_is_compaction_request = relay.is_compaction_request
+    real_estimate = relay.estimate_overflow_prompt_tokens
 
     def counting_is_compaction_request(*args: Any, **kwargs: Any) -> bool:
         signal_calls["count"] += 1
@@ -2099,8 +2106,10 @@ def test_compaction_trigger_absent_setting_never_runs_signal_a_or_estimator(
         estimate_calls["count"] += 1
         return real_estimate(*args, **kwargs)
 
-    monkeypatch.setattr(server, "is_compaction_request", counting_is_compaction_request)
-    monkeypatch.setattr(server, "estimate_overflow_prompt_tokens", counting_estimate)
+    monkeypatch.setattr(relay, "is_compaction_request", counting_is_compaction_request)
+    monkeypatch.setattr(relay, "estimate_overflow_prompt_tokens", counting_estimate)
+    assert relay.is_compaction_request is counting_is_compaction_request
+    assert relay.estimate_overflow_prompt_tokens is counting_estimate
 
     body = _compaction_body("claude-opus-4-6")
     config = GatewayConfig(model_map={"opus": "codex:gpt-5.1-codex-max"})  # compaction_model unset
@@ -2118,13 +2127,14 @@ def test_compaction_trigger_non_signal_body_never_runs_estimator(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     estimate_calls = {"count": 0}
-    real_estimate = server.estimate_overflow_prompt_tokens
+    real_estimate = relay.estimate_overflow_prompt_tokens
 
     def counting_estimate(*args: Any, **kwargs: Any) -> int:
         estimate_calls["count"] += 1
         return real_estimate(*args, **kwargs)
 
-    monkeypatch.setattr(server, "estimate_overflow_prompt_tokens", counting_estimate)
+    monkeypatch.setattr(relay, "estimate_overflow_prompt_tokens", counting_estimate)
+    assert relay.estimate_overflow_prompt_tokens is counting_estimate
 
     config = _compaction_config({"opus": "codex:gpt-5.1-codex-max"})
     client, stub = _gateway(config, _failing_anthropic_handler, codex_context_window=10)
@@ -2204,13 +2214,14 @@ def test_compaction_trigger_rejects_boolean_catalog_window(
     # bool is an int subclass; the trigger's window check must exclude it
     # explicitly rather than trusting a bare isinstance(x, int).
     estimate_calls = {"count": 0}
-    real_estimate = server.estimate_overflow_prompt_tokens
+    real_estimate = relay.estimate_overflow_prompt_tokens
 
     def counting_estimate(*args: Any, **kwargs: Any) -> int:
         estimate_calls["count"] += 1
         return real_estimate(*args, **kwargs)
 
-    monkeypatch.setattr(server, "estimate_overflow_prompt_tokens", counting_estimate)
+    monkeypatch.setattr(relay, "estimate_overflow_prompt_tokens", counting_estimate)
+    assert relay.estimate_overflow_prompt_tokens is counting_estimate
 
     body = _compaction_body("claude-opus-4-6")
     captured: list[httpx.Request] = []
@@ -2421,7 +2432,7 @@ def test_compaction_stream_reroute_fallback_translates_untouched_original_body_w
             service_tier=service_tier,
         )
 
-    monkeypatch.setattr(server, "translate_claude_request_to_codex", recording_translate)
+    monkeypatch.setattr(relay, "translate_claude_request_to_codex", recording_translate)
 
     body = _compaction_body("claude-opus-4-6", thinking_block=True)
     body["stream"] = True
@@ -2552,7 +2563,7 @@ def test_relay_compaction_stream_explicit_close_closes_upstream_response() -> No
         200, stream=stream, headers={"content-type": "text/event-stream"}
     )
     app_state = SimpleNamespace(compaction_last_reroute=None, compaction_reroute_sequence=0)
-    sequence = server._assign_compaction_reroute(
+    sequence = relay._assign_compaction_reroute(
         app_state,
         outcome="rerouted",
         target_model=_COMPACTION_CANONICAL_TARGET,
@@ -2563,10 +2574,10 @@ def test_relay_compaction_stream_explicit_close_closes_upstream_response() -> No
     )
 
     async def scenario() -> None:
-        relay = server._CompactionStreamRelay(upstream_response, app_state, sequence)
-        first = await anext(relay)
+        stream_relay = _CompactionStreamRelay(upstream_response, app_state, sequence)
+        first = await anext(stream_relay)
         assert first == b"event: a\ndata: {}\n\n"
-        await relay.aclose()
+        await stream_relay.aclose()
 
     asyncio.run(scenario())
 
@@ -2596,7 +2607,7 @@ def test_relay_compaction_stream_cancellation_closes_upstream_response() -> None
         200, stream=stream, headers={"content-type": "text/event-stream"}
     )
     app_state = SimpleNamespace(compaction_last_reroute=None, compaction_reroute_sequence=0)
-    sequence = server._assign_compaction_reroute(
+    sequence = relay._assign_compaction_reroute(
         app_state,
         outcome="rerouted",
         target_model=_COMPACTION_CANONICAL_TARGET,
@@ -2608,7 +2619,7 @@ def test_relay_compaction_stream_cancellation_closes_upstream_response() -> None
     first_chunk_seen = asyncio.Event()
 
     async def consume() -> None:
-        async for _chunk in server._CompactionStreamRelay(upstream_response, app_state, sequence):
+        async for _chunk in _CompactionStreamRelay(upstream_response, app_state, sequence):
             first_chunk_seen.set()
 
     async def scenario() -> None:
@@ -2632,7 +2643,7 @@ def test_relay_compaction_stream_stale_failure_does_not_clobber_newer_record() -
     # record (sequence N+1); only afterward does request A's stream fail.
     app_state = SimpleNamespace(compaction_last_reroute=None, compaction_reroute_sequence=0)
 
-    sequence_a = server._assign_compaction_reroute(
+    sequence_a = relay._assign_compaction_reroute(
         app_state,
         outcome="rerouted",
         target_model=_COMPACTION_CANONICAL_TARGET,
@@ -2641,7 +2652,7 @@ def test_relay_compaction_stream_stale_failure_does_not_clobber_newer_record() -
         context_window=50,
         detail=None,
     )
-    server._assign_compaction_reroute(
+    relay._assign_compaction_reroute(
         app_state,
         outcome="rerouted",
         target_model=_COMPACTION_CANONICAL_TARGET,
@@ -2660,7 +2671,7 @@ def test_relay_compaction_stream_stale_failure_does_not_clobber_newer_record() -
     )
 
     async def drain() -> None:
-        async for _chunk in server._CompactionStreamRelay(
+        async for _chunk in _CompactionStreamRelay(
             upstream_response, app_state, sequence_a
         ):
             pass
@@ -2687,7 +2698,7 @@ def test_relay_compaction_stream_records_midstream_error_before_terminal_chunk_i
         200, stream=stream, headers={"content-type": "text/event-stream"}
     )
     app_state = _committed_relay_state()
-    sequence = server._assign_compaction_reroute(
+    sequence = relay._assign_compaction_reroute(
         app_state,
         outcome="rerouted",
         target_model=_COMPACTION_CANONICAL_TARGET,
@@ -2698,16 +2709,16 @@ def test_relay_compaction_stream_records_midstream_error_before_terminal_chunk_i
     )
 
     async def scenario() -> None:
-        relay = server._CompactionStreamRelay(upstream_response, app_state, sequence)
-        assert await anext(relay) == b"event: message_start\ndata: {}\n\n"
-        terminal = await anext(relay)
+        stream_relay = _CompactionStreamRelay(upstream_response, app_state, sequence)
+        assert await anext(stream_relay) == b"event: message_start\ndata: {}\n\n"
+        terminal = await anext(stream_relay)
         assert terminal.startswith(b"\n\nevent: error\n")
         # No further __anext__: the record must already be upgraded and the
         # upstream response already released.
         assert app_state.compaction_last_reroute["outcome"] == "midstream_error"
         assert app_state.compaction_last_reroute["detail"] == "read_error"
         assert stream.closed is True
-        await relay.aclose()
+        await stream_relay.aclose()
 
     asyncio.run(scenario())
 
@@ -2720,7 +2731,7 @@ def test_relay_compaction_stream_aclose_before_first_iteration_closes_upstream()
         200, stream=stream, headers={"content-type": "text/event-stream"}
     )
     app_state = _committed_relay_state()
-    sequence = server._assign_compaction_reroute(
+    sequence = relay._assign_compaction_reroute(
         app_state,
         outcome="rerouted",
         target_model=_COMPACTION_CANONICAL_TARGET,
@@ -2731,8 +2742,8 @@ def test_relay_compaction_stream_aclose_before_first_iteration_closes_upstream()
     )
 
     async def scenario() -> None:
-        relay = server._CompactionStreamRelay(upstream_response, app_state, sequence)
-        await relay.aclose()
+        stream_relay = _CompactionStreamRelay(upstream_response, app_state, sequence)
+        await stream_relay.aclose()
 
     asyncio.run(scenario())
 
@@ -2751,7 +2762,7 @@ def test_owned_streaming_response_closes_iterator_when_send_fails_mid_stream() -
         200, stream=stream, headers={"content-type": "text/event-stream"}
     )
     app_state = _committed_relay_state()
-    sequence = server._assign_compaction_reroute(
+    sequence = relay._assign_compaction_reroute(
         app_state,
         outcome="rerouted",
         target_model=_COMPACTION_CANONICAL_TARGET,
@@ -2760,8 +2771,8 @@ def test_owned_streaming_response_closes_iterator_when_send_fails_mid_stream() -
         context_window=5,
         detail=None,
     )
-    relay = server._CompactionStreamRelay(upstream_response, app_state, sequence)
-    response = server._OwnedStreamingResponse(relay, media_type="text/event-stream")
+    stream_relay = _CompactionStreamRelay(upstream_response, app_state, sequence)
+    response = _OwnedStreamingResponse(stream_relay, media_type="text/event-stream")
 
     body_messages_sent = 0
 
@@ -2811,7 +2822,7 @@ def test_closing_the_sse_generator_finalizes_the_upstream_generator() -> None:
     )
 
     async def scenario() -> None:
-        sse = server._translate_claude_sse({"model": "claude-opus-4-6"}, upstream)
+        sse = _translate_claude_sse({"model": "claude-opus-4-6"}, upstream)
         first = await anext(sse)
         assert "message_start" in first
         assert flags["closed"] is False
@@ -2833,7 +2844,7 @@ def test_cancellation_mid_stream_finalizes_the_upstream_generator() -> None:
             flags["closed"] = True
 
     async def consume() -> None:
-        async for _chunk in server._translate_claude_sse({}, hanging_upstream()):
+        async for _chunk in _translate_claude_sse({}, hanging_upstream()):
             first_chunk_seen.set()
 
     async def scenario() -> None:
@@ -2859,7 +2870,7 @@ def test_aggregation_error_return_finalizes_the_upstream_generator() -> None:
         ],
     )
 
-    response = asyncio.run(server._aggregate_claude_response({}, upstream))
+    response = asyncio.run(_aggregate_claude_response({}, upstream))
 
     assert response.status_code == 502
     assert flags["closed"] is True
@@ -3261,7 +3272,7 @@ class TestAdminCompactionApi:
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         with self._admin_client(monkeypatch, tmp_path) as client:
-            server._assign_compaction_reroute(
+            relay._assign_compaction_reroute(
                 client.app.state,
                 outcome="rerouted",
                 target_model="claude-opus-5",
@@ -7306,7 +7317,7 @@ def test_balanced_request_during_controlled_exit_awaits_and_serves_under_target_
 ) -> None:
     """Step 6/8's spec-gate ruling, exercised directly against
     `ClaudeBalancedRuntime` (the exact primitives
-    `server._passthrough_with_claude_balanced` dispatches through): a request
+    `relay._passthrough_with_claude_balanced` dispatches through): a request
     arriving while `exit_mode` is draining awaits the transition, then observes
     the ALREADY-published target mode -- never a 503 merely because the
     controlled transition was in flight.
@@ -7357,7 +7368,7 @@ def test_balanced_request_during_controlled_exit_awaits_and_serves_under_target_
         assert runtime.status == "draining"
 
         async def waiting_dispatch() -> str:
-            # Mirrors server._passthrough_with_claude_balanced's transition-await
+            # Mirrors relay._passthrough_with_claude_balanced's transition-await
             # branch: wait, then re-read the published mode.
             await runtime.wait_for_transition()
             return published["mode"]
@@ -7649,7 +7660,7 @@ def test_balanced_migration_hop_uses_the_scoring_digest(
     _register_balanced_accounts(2)
     tokens_by_call: list[str] = []
     recorded_digests: list[bytes] = []
-    original_pick_account = server._balanced_pick_account
+    original_pick_account = relay._balanced_pick_account
 
     def recording_pick_account(*args: Any, **kwargs: Any) -> str:
         recorded_digests.append(kwargs["session_key_digest"])
@@ -7665,7 +7676,7 @@ def test_balanced_migration_hop_uses_the_scoring_digest(
         monkeypatch, tmp_path, config=GatewayConfig(), base_url="http://127.0.0.1:8787"
     ) as client:
         runtime = _enable_balanced(client, handler)
-        monkeypatch.setattr(server, "_balanced_pick_account", recording_pick_account)
+        monkeypatch.setattr(relay, "_balanced_pick_account", recording_pick_account)
         body = _balanced_body(_new_session_id())
 
         response = client.post("/v1/messages", json=body)
@@ -7970,7 +7981,7 @@ def test_balanced_unpinnable_retry_chain_reuses_one_stateless_digest_and_creates
     _balanced_env(monkeypatch, tmp_path)
     _register_balanced_accounts(2)
     digest_calls: list[bytes] = []
-    original_derive_stateless_routing_digest = server.derive_stateless_routing_digest
+    original_derive_stateless_routing_digest = relay.derive_stateless_routing_digest
 
     def spy_derive_stateless_routing_digest(seed: bytes, nonce: bytes) -> bytes:
         digest = original_derive_stateless_routing_digest(seed, nonce)
@@ -7978,7 +7989,7 @@ def test_balanced_unpinnable_retry_chain_reuses_one_stateless_digest_and_creates
         return digest
 
     monkeypatch.setattr(
-        server, "derive_stateless_routing_digest", spy_derive_stateless_routing_digest
+        relay, "derive_stateless_routing_digest", spy_derive_stateless_routing_digest
     )
 
     tokens_by_call: list[str] = []
@@ -8009,7 +8020,7 @@ def test_balanced_unpinnable_separate_requests_get_independent_stateless_digests
     _balanced_env(monkeypatch, tmp_path)
     _register_balanced_accounts(1)
     digest_calls: list[bytes] = []
-    original_derive_stateless_routing_digest = server.derive_stateless_routing_digest
+    original_derive_stateless_routing_digest = relay.derive_stateless_routing_digest
 
     def spy_derive_stateless_routing_digest(seed: bytes, nonce: bytes) -> bytes:
         digest = original_derive_stateless_routing_digest(seed, nonce)
@@ -8017,7 +8028,7 @@ def test_balanced_unpinnable_separate_requests_get_independent_stateless_digests
         return digest
 
     monkeypatch.setattr(
-        server, "derive_stateless_routing_digest", spy_derive_stateless_routing_digest
+        relay, "derive_stateless_routing_digest", spy_derive_stateless_routing_digest
     )
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -8107,7 +8118,8 @@ def test_balanced_count_tokens_resolves_the_same_family_pin_as_messages(
         def fail_fallback_pick(*args: Any, **kwargs: Any) -> str:
             raise AssertionError("fallback pick must not run")
 
-        monkeypatch.setattr(server, "_balanced_pick_account", fail_fallback_pick)
+        monkeypatch.setattr(relay, "_balanced_pick_account", fail_fallback_pick)
+        assert relay._balanced_pick_account is fail_fallback_pick
         counted = client.post("/v1/messages/count_tokens", json=body)
 
         assert counted.status_code == 200
@@ -8121,7 +8133,7 @@ def test_balanced_count_tokens_fallback_uses_the_scoring_digest(
     _balanced_env(monkeypatch, tmp_path)
     _register_balanced_accounts(1)
     recorded_digests: list[bytes] = []
-    original_pick_account = server._balanced_pick_account
+    original_pick_account = relay._balanced_pick_account
 
     def recording_pick_account(*args: Any, **kwargs: Any) -> str:
         recorded_digests.append(kwargs["session_key_digest"])
@@ -8134,7 +8146,7 @@ def test_balanced_count_tokens_fallback_uses_the_scoring_digest(
         monkeypatch, tmp_path, config=GatewayConfig(), base_url="http://127.0.0.1:8787"
     ) as client:
         runtime = _enable_balanced(client, handler)
-        monkeypatch.setattr(server, "_balanced_pick_account", recording_pick_account)
+        monkeypatch.setattr(relay, "_balanced_pick_account", recording_pick_account)
         body = _balanced_body(_new_session_id())
 
         response = client.post("/v1/messages/count_tokens", json=body)
