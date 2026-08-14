@@ -11,9 +11,8 @@ import stat
 import subprocess
 import sys
 import uuid
-from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Callable, Iterator
+from typing import Any, Callable
 
 import pytest
 
@@ -52,8 +51,8 @@ def _write_raw_registry(rows: list[Any]) -> None:
     (root / "registry.json").write_text(json.dumps(rows), encoding="utf-8")
 
 
-def _legacy_row(**overrides: Any) -> dict[str, Any]:
-    """The one recognized legacy (pre-incarnation-identity) 8-key row shape."""
+def _eight_key_row(**overrides: Any) -> dict[str, Any]:
+    """A registry row missing both required incarnation identity fields."""
     row: dict[str, Any] = {
         "id": str(uuid.uuid4()),
         "email": "user@example.com",
@@ -69,9 +68,9 @@ def _legacy_row(**overrides: Any) -> dict[str, Any]:
 
 
 def _base_row(**overrides: Any) -> dict[str, Any]:
-    """The current (post-migration) 10-key row shape."""
+    """The exact current 10-key row shape."""
     row: dict[str, Any] = {
-        **_legacy_row(),
+        **_eight_key_row(),
         "accountIncarnationId": str(uuid.uuid4()),
         "upstreamAccountUuid": None,
     }
@@ -522,146 +521,20 @@ def test_empty_registry_array_is_valid_current_state_and_not_rewritten() -> None
     assert _registry_path().stat().st_mtime_ns == mtime_before
 
 
-def test_load_registry_rejects_mixed_legacy_and_current_rows() -> None:
-    _write_raw_registry([_legacy_row(), _base_row()])
-    mtime_before = _registry_path().stat().st_mtime_ns
+def test_load_registry_rejects_exact_eight_key_row_without_mutating_file() -> None:
+    _write_raw_registry([_eight_key_row()])
+    registry_path = _registry_path()
+    bytes_before = registry_path.read_bytes()
+    mtime_before = registry_path.stat().st_mtime_ns
 
-    with pytest.raises(claude_accounts.AccountRegistryError):
+    with pytest.raises(claude_accounts.AccountRegistryError) as exc_info:
         claude_accounts.load_registry()
 
-    assert _registry_path().stat().st_mtime_ns == mtime_before  # rejected, never rewritten
-
-
-# --------------------------------------------------------------------------
-# Legacy schema migration: classification, atomic rewrite, and race safety
-# --------------------------------------------------------------------------
-
-
-def test_load_registry_migrates_legacy_registry_and_rewrites_atomically() -> None:
-    _write_raw_registry([_legacy_row(email="a@example.com"), _legacy_row(email="b@example.com")])
-
-    migrated = claude_accounts.load_registry()
-
-    assert {record.email for record in migrated} == {"a@example.com", "b@example.com"}
-    incarnation_ids = [record.account_incarnation_id for record in migrated]
-    assert len(set(incarnation_ids)) == 2  # each row gets its own fresh incarnation
-    for incarnation_id in incarnation_ids:
-        uuid.UUID(incarnation_id)  # a canonical uuid was actually assigned
-    # No account directory exists for either row, so the upstream uuid
-    # cannot be established — the migration must not fail or invent one.
-    assert all(record.upstream_account_uuid is None for record in migrated)
-
-    on_disk = json.loads(_registry_path().read_text())
-    assert all(set(row) == set(_base_row()) for row in on_disk)  # rewritten to the current schema
-    # The atomic writer's own staging file must never survive a successful write.
-    assert not any(
-        entry.name.startswith(".registry.json.tmp-") for entry in _accounts_root().iterdir()
-    )
-
-
-def test_load_registry_migration_derives_upstream_uuid_from_account_directory() -> None:
-    legacy_id = str(uuid.uuid4())
-    _write_raw_registry([_legacy_row(id=legacy_id)])
-    account_dir = _accounts_root() / legacy_id
-    account_dir.mkdir(mode=0o700)
-    upstream_uuid = str(uuid.uuid4())
-    (account_dir / "oauth-account.json").write_text(
-        json.dumps({"accountUuid": upstream_uuid}), encoding="utf-8"
-    )
-
-    [migrated] = claude_accounts.load_registry()
-
-    assert migrated.upstream_account_uuid == upstream_uuid
-
-
-def test_load_registry_migration_is_idempotent_and_does_not_rewrite_again() -> None:
-    _write_raw_registry([_legacy_row()])
-    first = claude_accounts.load_registry()
-    mtime_after_migration = _registry_path().stat().st_mtime_ns
-
-    second = claude_accounts.load_registry()
-
-    assert _registry_path().stat().st_mtime_ns == mtime_after_migration
-    assert [r.account_incarnation_id for r in second] == [r.account_incarnation_id for r in first]
-
-
-def test_load_registry_migration_race_double_check_returns_the_winner_without_rewriting(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A concurrent writer finishes migrating the exact same legacy registry
-    between this loader's lock-free legacy classification and its own lock
-    acquisition. Detecting legacy data before the lock is only advisory: the
-    loader must re-read and reclassify under the lock, see the winning
-    current-schema data, and return it as-is — never re-migrate (a second,
-    different set of incarnation ids) or rewrite over the winner."""
-    legacy_id = str(uuid.uuid4())
-    _write_raw_registry([_legacy_row(id=legacy_id)])
-    winning_row = {
-        **_legacy_row(id=legacy_id),
-        "accountIncarnationId": str(uuid.uuid4()),
-        "upstreamAccountUuid": None,
-    }
-    real_file_lock = claude_accounts.file_lock
-
-    @contextmanager
-    def _racing_file_lock(path: Path) -> Iterator[None]:
-        # Simulate another process completing the identical migration right
-        # here: after this test's own lock-free classification (already
-        # done, above, before `load_registry` ever calls `file_lock`) and
-        # before this process's own lock acquisition (about to happen).
-        _write_raw_registry([winning_row])
-        with real_file_lock(path):
-            yield
-
-    monkeypatch.setattr(claude_accounts, "file_lock", _racing_file_lock)
-
-    [record] = claude_accounts.load_registry()
-
-    assert record.account_incarnation_id == winning_row["accountIncarnationId"]
-    # Never rewritten: the winner's exact row content stands unmodified.
-    assert json.loads(_registry_path().read_text()) == [winning_row]
-
-
-_LOAD_SCRIPT = """
-import sys
-from claudex_gateway import claude_accounts as ca
-
-records = ca.load_registry()
-print(",".join(sorted(f"{r.id}:{r.account_incarnation_id}" for r in records)))
-"""
-
-
-def test_concurrent_legacy_registry_loaders_converge_on_one_migration(tmp_path: Path) -> None:
-    legacy_id = str(uuid.uuid4())
-    _write_raw_registry([_legacy_row(id=legacy_id)])
-    env = _child_env(tmp_path)
-
-    p1 = subprocess.Popen(
-        [sys.executable, "-c", _LOAD_SCRIPT],
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    p2 = subprocess.Popen(
-        [sys.executable, "-c", _LOAD_SCRIPT],
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    out1, err1 = p1.communicate(timeout=30)
-    out2, err2 = p2.communicate(timeout=30)
-    assert p1.returncode == 0, (out1, err1)
-    assert p2.returncode == 0, (out2, err2)
-
-    # Both loaders must converge on exactly one migration's winning
-    # incarnation id for the row, whichever process actually won the lock.
-    assert out1 == out2
-
-    on_disk = json.loads(_registry_path().read_text())
-    assert len(on_disk) == 1
-    assert set(on_disk[0]) == set(_base_row())
+    detail = str(exc_info.value)
+    assert "accountIncarnationId" in detail
+    assert "upstreamAccountUuid" in detail
+    assert registry_path.read_bytes() == bytes_before
+    assert registry_path.stat().st_mtime_ns == mtime_before
 
 
 # --------------------------------------------------------------------------
