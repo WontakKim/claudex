@@ -8,3 +8,5 @@ dist/
 build/
 .playwright-cli/
 .docs/
+_design-probes/
+.DS_Store
