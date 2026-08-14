@@ -548,8 +548,10 @@ command](#compact-command) is a CLI front end for this same API.
 
 Opening `http://127.0.0.1:8787/` in a browser serves a dashboard on top of
 the same admin API: the Settings tab holds gateway settings behind a
-category rail (currently a single General category with the
-[compaction reroute](#compaction-reroute) target), the Status tab shows each
+category rail (the General category contains the
+[compaction reroute](#compaction-reroute) target, Codex Fast mode, and Claude
+account routing controls; the Claude accounts category contains
+registered-account management), the Status tab shows each
 provider's login state and subscription usage — the Kimi and Grok cards (and
 their Router add-node buttons) appear only when a local login is detected or
 the model map already routes to them; hiding is cosmetic and never affects
