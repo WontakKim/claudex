@@ -167,7 +167,7 @@ The model ID after `kimi:` bypasses the gateway untouched: it is sent to Kimi
 exactly as written and never validated against a model list, so a newly
 released model works the moment Kimi ships it — no gateway update needed. The
 authoritative list of valid IDs is Kimi's own live catalog, which the gateway
-exposes for map authoring (and as the preset source for the future dashboard):
+exposes for map authoring and the Router's add-node suggestions:
 
 ```sh
 curl http://127.0.0.1:8787/admin/providers/kimi/models
@@ -559,13 +559,14 @@ log lines (`GET /admin/logs`) and holds the runtime log-level control
 tab is a canvas editor — drag a port to wire a model, Apply to `PUT` the
 map, and use the connection test box (`POST /admin/test`) to send one
 minimal request through the gateway before wiring a new model id. The board
-turns view-only when `CLAUDEX_MODEL_MAP` overrides the map, and the Codex
-column is loaded from the live Codex model catalog
-(`GET /admin/providers/codex/models`). The dashboard predates the Kimi direction — its
-model column is Codex-only and `kimi:`-prefixed targets show up as plain
-values, though the connection test understands the prefix and probes the
-right backend; a redesign is planned separately and will draw its Kimi
-presets from `GET /admin/providers/kimi/models`.
+turns view-only when `CLAUDEX_MODEL_MAP` overrides the map and renders mapped
+or staged targets as provider-prefixed nodes for the built-in Codex, Kimi, and
+Grok providers plus configured custom providers. Add-node suggestions are
+backed by live catalogs loaded from `GET /admin/providers/codex/models`,
+`GET /admin/providers/kimi/models`, and `GET /admin/providers/grok/models`;
+each configured custom provider loads
+`GET /admin/providers/custom/{name}/models`. Catalog failures only remove
+suggestions, and manually entered model IDs remain valid.
 
 When `CLAUDEX_LOCAL_TOKEN` is set, the dashboard prompts for the token once
 per page load and keeps it in memory for the lifetime of that page only — it
