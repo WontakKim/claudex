@@ -408,6 +408,7 @@ stays available for one-off overrides.
 | `CLAUDEX_HOST` | `127.0.0.1` | Bind address |
 | `CLAUDEX_PORT` | `8787` | Bind port |
 | `CLAUDEX_MODEL_MAP` | empty | JSON mapping of Claude names, exact or substring, to provider-prefixed target models — `codex:`-prefixed values run on Codex, `kimi:`-prefixed values on Kimi, `grok:`-prefixed values on Grok; unmapped models are relayed verbatim to Anthropic |
+| `CLAUDEX_CUSTOM_PROVIDERS` | empty | JSON-encoded custom-provider document; an empty string means no custom providers. See [Custom providers](#custom-providers) |
 | `CLAUDEX_REASONING_EFFORT` | derived | Force `minimal`, `low`, `medium`, `high`, `xhigh`, or `max` on Codex requests |
 | `CODEX_HOME` | `~/.codex` | Directory containing Codex `auth.json` |
 | `GROK_HOME` | `~/.grok` | Directory containing the Grok CLI's `auth.json` |
@@ -434,6 +435,61 @@ so the model map is a plain object instead of JSON-in-a-string:
 
 The file is optional and validated at startup: unknown keys and wrongly typed
 values abort the boot so a typo cannot be silently ignored.
+
+### Custom providers
+
+Custom providers register additional OpenAI-compatible Responses upstreams under
+their own model-map prefixes. Define them in `~/.claudex/settings.json`:
+
+```json
+{
+  "model_map": {
+    "haiku": "wrtn:gpt-5.5"
+  },
+  "custom_providers": {
+    "openai_compatible": {
+      "wrtn": {
+        "wire_api": "responses",
+        "base_url": "https://model.wrtn.club/api/v1",
+        "api_key": "sk-arena-..."
+      }
+    }
+  }
+}
+```
+
+The `openai_compatible` family contains named provider entries. All three entry
+fields are required:
+
+- `wire_api` must be exactly `"responses"`; Chat Completions upstreams are not
+  supported.
+- `base_url` must use HTTPS. Plain HTTP is allowed only for a loopback host. The
+  URL may include a path prefix such as `/api/v1`; the gateway appends
+  `/responses` and `/models`.
+- `api_key` is a non-empty static literal. Custom providers do not use OAuth or
+  refresh their credentials.
+
+Provider names must match `^[a-z][a-z0-9-]{0,31}$`. The names `codex`, `kimi`,
+`grok`, `claude`, and `anthropic` are reserved. A map entry such as
+`"haiku": "wrtn:gpt-5.5"` sends that Claude model through the existing OpenAI
+Responses translation path to the `wrtn` provider.
+
+Custom providers are edited in `settings.json` only — the dashboard has no
+provider CRUD — and a daemon restart is required before changes take effect.
+`CLAUDEX_CUSTOM_PROVIDERS` can supply the same object stored under
+`custom_providers` as JSON-encoded text; `CLAUDEX_CUSTOM_PROVIDERS=''` means no
+custom providers.
+
+Behavioral boundaries to know:
+
+- The translated payload is sent exactly as produced: there is no provider
+  sanitizer, `max_output_tokens` injection, or reasoning-effort clamping.
+- Context-overflow phrase detection may not recognize a translated upstream's
+  wording. Compaction rerouting still works from the context window reported by
+  the provider's model catalog.
+- An upstream `401` surfaces as an upstream error; there is no credential refresh
+  or retry.
+- The dashboard has no usage or billing card for custom providers.
 
 ### Runtime mapping API
 
