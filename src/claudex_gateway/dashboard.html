@@ -648,9 +648,11 @@ button.primary:disabled{opacity:.5;cursor:default}
 </div>
 <script>
 var CLAUDE_KEYS=["fable","opus","sonnet","haiku"];
-/* Mirrors config.KNOWN_ROUTE_PROVIDERS: every target value names its provider
-   with a "codex:"/"kimi:"/"grok:" style prefix; bare model names are invalid. */
-var ROUTE_PROVIDERS=["codex","kimi","grok"];
+/* Every target value names its provider with a prefix. Custom provider names
+   join the built-ins once the mapping payload arrives. */
+var BUILTIN_ROUTE_PROVIDERS=["codex","kimi","grok"];
+var ROUTE_PROVIDERS=BUILTIN_ROUTE_PROVIDERS.slice();
+var CUSTOM_PROVIDERS=[];
 /* Live model IDs per provider. Purely autocomplete for the add-node box —
    the gateway never validates map values against a catalog, so an
    unreachable one only costs suggestions. */
@@ -728,7 +730,12 @@ function grokIcon(s){return '<svg viewBox="0 0 24 24" width="'+s+'" height="'+s+
   '<rect x="2" y="2" width="20" height="20" rx="5" fill="var(--text)"/>'+
   '<g stroke="var(--canvas)" stroke-width="2.4" stroke-linecap="round">'+
   '<line x1="7" y1="7" x2="17" y2="17"/><line x1="17" y1="7" x2="7" y2="17"/></g></svg>'}
-function providerIcon(provider,s){return provider==="kimi"?kimiIcon(s):provider==="grok"?grokIcon(s):codexIcon(s)}
+function customProviderIcon(s){return '<svg viewBox="0 0 24 24" width="'+s+'" height="'+s+'" aria-hidden="true">'+
+  '<rect x="2" y="2" width="20" height="20" rx="5" fill="var(--text)"/>'+
+  '<g fill="var(--canvas)"><circle cx="7" cy="12" r="1.5"/><circle cx="12" cy="12" r="1.5"/>'+
+  '<circle cx="17" cy="12" r="1.5"/></g></svg>'}
+function providerIcon(provider,s){return provider==="kimi"?kimiIcon(s):provider==="grok"?grokIcon(s):
+  provider==="codex"?codexIcon(s):customProviderIcon(s)}
 var X_ICON='<svg viewBox="0 0 24 24" width="10" height="10" fill="none" stroke="#fff" stroke-width="3.5" '+
   'stroke-linecap="round" aria-hidden="true"><line x1="6" y1="6" x2="18" y2="18"/><line x1="18" y1="6" x2="6" y2="18"/></svg>';
 var drag=null,move=null,panning=null,pan={x:0,y:0},zoom=1;
@@ -1149,16 +1156,43 @@ function renderStatLine(provider,state,title,html){
   if(title)box.title=title;else box.removeAttribute("title");
   document.getElementById(provider+"-statline").innerHTML=html;
 }
+function configureCustomProviders(providers){
+  CUSTOM_PROVIDERS=Array.isArray(providers)?providers.filter(function(p){return p&&p.name}):[];
+  ROUTE_PROVIDERS=BUILTIN_ROUTE_PROVIDERS.concat(CUSTOM_PROVIDERS.map(function(p){return p.name}));
+  CUSTOM_PROVIDERS.forEach(function(provider){
+    var name=provider.name;
+    CATALOG[name]=[];
+    PROVIDER_VISIBLE[name]=true;
+    if(!document.querySelector('#add-prov button[data-p="'+name+'"]')){
+      document.getElementById("add-prov").insertAdjacentHTML("beforeend",
+        '<button data-p="'+name+'" class="provider-hidden">'+esc(name)+"</button>");
+    }
+    if(!document.getElementById("card-"+name)){
+      var card=document.createElement("div");
+      card.className="card provider-hidden";
+      card.id="card-"+name;
+      card.innerHTML='<div class="ucard-h"><h2>'+esc(name)+' Status</h2></div>'+
+        '<div class="sub">설정된 OpenAI 호환 Responses API 프로바이더의 연결 상태입니다.</div>'+
+        '<div class="stat" id="'+name+'-stat"><div class="statline" id="'+name+'-statline">'+
+        '<span class="sk">OK · Responses API 연결됨</span></div></div>';
+      document.getElementById("tab-status").appendChild(card);
+    }
+    jfetch("/admin/providers/custom/"+encodeURIComponent(name)+"/models").then(function(r){
+      if(r.ok)CATALOG[name]=catalogIds(r.body);
+      if(addProvider===name&&document.getElementById("add-form").classList.contains("open"))renderAddForm();
+    }).catch(function(){
+      CATALOG[name]=[];
+    });
+  });
+}
 /* Purely cosmetic gating for first-run clarity: kimi/grok are extensions, so
-   their Status cards and Router add-node buttons only appear when /health
-   reports a detected local login — or when the map already routes to them,
-   where hiding a required-login error would mislead. Nothing functional
-   changes: routing, the admin API, and settings.json edits work regardless. */
+   they appear only when detected or required. A custom provider was explicitly
+   configured and therefore remains visible even when its health probe fails. */
 var PROVIDER_VISIBLE={kimi:false,grok:false};
 function setProviderVisibility(h){
-  ["kimi","grok"].forEach(function(p){
+  ROUTE_PROVIDERS.filter(function(p){return p!=="codex"}).forEach(function(p){
     var info=((h||{}).providers||{})[p]||{};
-    var visible=info.status==="ok"||info.required===true;
+    var visible=BUILTIN_ROUTE_PROVIDERS.indexOf(p)<0||info.status==="ok"||info.required===true;
     PROVIDER_VISIBLE[p]=visible;
     var card=document.getElementById("card-"+p);
     if(card)card.classList.toggle("provider-hidden",!visible);
@@ -1218,6 +1252,17 @@ function renderProviderCards(h){
       '<button class="cp" id="grok-login-copy" title="복사"></button></div>');
     wireCopy(document.getElementById("grok-login-copy"),"grok login");
   }
+  CUSTOM_PROVIDERS.forEach(function(provider){
+    var name=provider.name,info=(h.providers||{})[name]||{};
+    if(info.status==="ok"){
+      renderStatLine(name,"okv",null,'● OK <span class="detail">Responses API 연결됨</span>');
+    }else if(info.required===false){
+      renderStatLine(name,"",info.detail||"",'● 미사용 <span class="detail">모델 맵에 '+esc(name)+
+        ': 타겟이 없어 연결 실패가 준비 상태와 무관합니다</span>');
+    }else{
+      renderStatLine(name,"err",info.detail||"",'● ERROR <span class="detail">Responses API 연결 실패</span>');
+    }
+  });
 }
 function renderFacts(p){
   document.getElementById("kv-codex-home").textContent=p.codex_home||"—";
@@ -2355,7 +2400,8 @@ function restoreUsageButtons(providers){
     if(btn){btn.disabled=false;btn.textContent="갱신"}
   });
 }
-/* provider 없이 호출하면 보이는 카드 일괄 갱신(탭 진입 시), 있으면 해당 카드만. */
+/* provider 없이 호출하면 보이는 카드 일괄 갱신(탭 진입 시), 있으면 해당 카드만.
+   This list stays built-in-only because custom providers have no usage API. */
 function fetchUsage(provider){
   var targets=provider?[provider]:["claude","codex","kimi","grok"].filter(function(p){
     return PROVIDER_VISIBLE[p]!==false;
@@ -2512,6 +2558,7 @@ function boot(){
     if(mapping.ok){
       DIR.LIVE=mapping.body.model_map||{};
       DIR.locked=!!(mapping.body.env_locked||{}).model_map;
+      configureCustomProviders(mapping.body.custom_providers);
       renderFacts(mapping.body);
     }else{
       showToast('<span class="chip chip-err">ERROR</span><span class="lat">'+mapping.status+
