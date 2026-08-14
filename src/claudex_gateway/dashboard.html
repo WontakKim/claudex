@@ -368,6 +368,7 @@ button.ghost{font:600 13px var(--sans);border:1.5px solid var(--line);background
 button.ghost:hover{background:var(--inset)}
 button.ghost.danger{border-color:color-mix(in srgb,var(--err) 55%,transparent);color:var(--err)}
 button.ghost.danger:hover{background:var(--err-soft)}
+button.ghost.danger.armed{background:var(--err);color:#fff}
 button.ghost:disabled{opacity:.5;cursor:default}
 button.ghost:disabled:hover{background:var(--panel)}
 button.primary{font:600 13px var(--sans);border:0;background:var(--accent);color:#fff;border-radius:6px;padding:8px 15px;cursor:pointer}
@@ -1561,7 +1562,7 @@ document.querySelectorAll("#tab-settings .rail-item").forEach(function(a){
    the open set survives re-renders. No interval polling: fetch on entry,
    the hero's 갱신 button, and after a login succeeds. */
 var ACCT_ENV="CLAUDEX_CLAUDE_ACCOUNT_ID";
-var ACCT={rows:[],serving:null,local:null,locked:false,usage:{},open:{},localUsage:null,routing:{},usageFreshness:null};
+var ACCT={rows:[],serving:null,local:null,locked:false,usage:{},open:{},removeArmed:{},localUsage:null,routing:{},usageFreshness:null};
 function attr(s){return esc(s).replace(/"/g,"&quot;")}
 function planLabel(planType){
   // claude_max -> MAX, claude_pro -> PRO; an absent plan renders as a dash.
@@ -1647,8 +1648,7 @@ function acctDetailHtml(row,serving){
     :serving
       ?'<button type="button" class="ghost" data-act="unserve"'+(ACCT.locked?" disabled":"")+'>서빙 해제</button>'
       :'<button type="button" class="primary" data-act="serve"'+(ACCT.locked?" disabled":"")+'>이 계정으로 서빙</button>';
-  // Removal stays a CLI-only operation; the button mirrors the probe but is
-  // inert with the command it defers to.
+  // Account removal is available unless the account is the active serving pin.
   var member=ACCT.routing[row.id];
   var coolnote=member&&member.routing_state==="cooldown"
     ?'<div class="coolnote">사용량 한도(429)로 쿨다운 중입니다.'+
@@ -1656,7 +1656,8 @@ function acctDetailHtml(row,serving){
     :"";
   return coolnote+'<div class="ad-grid"><div>'+acctUsageHtml(row)+'</div><div>'+kv+'</div>'+
     '<div class="actions">'+primary+'<span class="spacer"></span>'+
-    '<button type="button" class="ghost danger" disabled title="대시보드 제거는 지원하지 않습니다 — CLI: claudex-gateway account remove '+attr(row.id)+'">제거</button></div></div>';
+    '<button type="button" class="ghost danger" data-act="remove"'+
+      (serving?' disabled title="서빙 핀을 먼저 해제해야 제거할 수 있습니다"':"")+'>제거</button></div></div>';
 }
 function acctRowHtml(row){
   var serving=row.id===ACCT.serving;
@@ -1686,6 +1687,7 @@ function renderPoolFreshness(){
   if(label){pill.className="pill "+ACCT.usageFreshness;pill.textContent=label}
 }
 function renderAcctList(){
+  ACCT.removeArmed={};
   document.getElementById("acct-count").textContent=String(ACCT.rows.length);
   document.getElementById("acct-lock-env").textContent=ACCT_ENV;
   document.getElementById("scard-accounts").classList.toggle("locked",ACCT.locked);
@@ -1844,6 +1846,23 @@ function setServingAccount(accountId){
     showToast('<span class="chip chip-err">ERROR</span><br>서빙 계정 변경<br><span class="dim">gateway unreachable</span>',true);
   });
 }
+function removeAccount(accountId){
+  var account=ACCT.rows.find(function(row){return row.id===accountId});
+  jfetch("/admin/providers/claude/accounts/"+encodeURIComponent(accountId),{method:"DELETE"}).then(function(r){
+    if(!r.ok){
+      showToast('<span class="chip chip-err">ERROR</span><span class="lat">'+r.status+
+        '</span><br>계정 제거<br><span class="dim">'+esc(errDetail(r.body))+"</span>",true);
+      if(r.status===404)fetchAccounts();
+      else renderAcctList();
+      return;
+    }
+    showToast('<span class="chip chip-ok">REMOVED</span><br>'+esc(account?account.email:accountId)+" 제거됨",false);
+    fetchAccounts();
+  }).catch(function(){
+    renderAcctList();
+    showToast('<span class="chip chip-err">ERROR</span><br>계정 제거<br><span class="dim">gateway unreachable</span>',true);
+  });
+}
 document.getElementById("acct-list").addEventListener("click",function(e){
   var btn=e.target.closest("button");
   if(btn){
@@ -1853,6 +1872,16 @@ document.getElementById("acct-list").addEventListener("click",function(e){
     if(btn.dataset.act==="serve")setServingAccount(id);
     else if(btn.dataset.act==="unserve")setServingAccount(null);
     else if(btn.dataset.act==="relogin")openLoginModal();
+    else if(btn.dataset.act==="remove"){
+      if(!ACCT.removeArmed[id]){
+        ACCT.removeArmed[id]=true;
+        btn.classList.add("armed");btn.textContent="정말 제거";
+      }else{
+        delete ACCT.removeArmed[id];
+        btn.disabled=true;btn.textContent="…";
+        removeAccount(id);
+      }
+    }
     return;
   }
   var row=e.target.closest(".arow");

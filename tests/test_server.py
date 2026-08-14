@@ -4584,8 +4584,8 @@ def test_dashboard_serving_selection_reuses_the_singular_admin_endpoint(
     assert "#scard-accounts.locked .acctlock{display:block}" in page
     assert "이 계정으로 서빙" in page
     assert "서빙 해제" in page
-    # Removal stays CLI-only: the probe's danger button ships inert.
-    assert "claudex-gateway account remove" in page
+    # Removal uses the account endpoint; the serving pin guard stays visible in the UI.
+    assert 'jfetch("/admin/providers/claude/accounts/"+encodeURIComponent(accountId),{method:"DELETE"})' in page
 
 
 def test_dashboard_routing_section_wires_endpoint(
