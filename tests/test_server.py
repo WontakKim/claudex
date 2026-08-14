@@ -21,7 +21,9 @@ import pytest
 import uvicorn
 from starlette.testclient import TestClient
 
+import claudex_gateway.admin_api as admin_api
 import claudex_gateway.server as server
+import claudex_gateway.server_support as server_support
 from claudex_gateway import claude_accounts, compaction, paths
 from claudex_gateway.account_usage_cache import ClaudeAccountUsageCache
 from claudex_gateway.claude_account_pool import AccountCooldownTracker
@@ -51,6 +53,10 @@ from claudex_gateway.grok_auth import GrokCredentials
 from claudex_gateway.grok_client import GrokClient, GrokUpstreamError
 from claudex_gateway.translate import translate_claude_request_to_codex
 from claudex_gateway.translate.codex_to_claude import estimate_overflow_prompt_tokens
+
+# The balanced integration suite still reaches this shared helper through its
+# imported server module; keep that test lookup aligned without a production re-export.
+setattr(server, "_claude_account_auth_manager", server_support._claude_account_auth_manager)
 
 
 class AvailableCodexAuthManager:
@@ -198,6 +204,20 @@ def _create_test_client(
     monkeypatch.setattr(server, "GrokClient", grok_client)
     monkeypatch.setattr(server, "OpenAICompatibleClient", custom_client)
     return TestClient(server.create_app(config or GatewayConfig()), base_url=base_url)
+
+
+def test_route_ownership_matches_surface_modules() -> None:
+    app = server.create_app(GatewayConfig())
+    routes = [route for route in app.routes if hasattr(route, "endpoint")]
+    admin_paths = {"/", "/favicon.ico", "/api/hello", "/health"}
+    assert admin_paths <= {route.path for route in routes}
+    assert any(route.path.startswith("/admin/") for route in routes)
+
+    for route in routes:
+        if route.path in admin_paths or route.path.startswith("/admin/"):
+            assert route.endpoint.__module__ == "claudex_gateway.admin_api"
+        elif route.path in {"/v1/messages", "/v1/messages/count_tokens"}:
+            assert route.endpoint.__module__ == "claudex_gateway.server"
 
 
 def test_messages_routes_enforce_local_bearer_token(
@@ -3158,7 +3178,7 @@ class TestAdminLogLevel:
     ) -> None:
         saved_levels = {
             name: logging.getLogger(name).level
-            for name in server._LOG_LEVEL_LOGGER_NAMES
+            for name in admin_api._LOG_LEVEL_LOGGER_NAMES
         }
         try:
             with self._admin_client(monkeypatch, tmp_path) as client:
@@ -3603,10 +3623,10 @@ class TestAdminCompactionApi:
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         def boom(*_args: Any, **_kwargs: Any) -> None:
-            raise server.ConfigError("disk full")
+            raise admin_api.ConfigError("disk full")
 
         with self._admin_client(monkeypatch, tmp_path) as client:
-            monkeypatch.setattr(server, "update_settings_file", boom)
+            monkeypatch.setattr(admin_api, "update_settings_file", boom)
             response = client.put(
                 "/admin/settings/compaction", json={"model": "claude:claude-opus-5"}
             )
@@ -4070,22 +4090,28 @@ def test_admin_logs_refuses_foreign_host(monkeypatch: pytest.MonkeyPatch, tmp_pa
 
 
 def test_admin_usage_returns_all_providers(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    calls: list[str] = []
+
     async def fake_claude(http_client: Any) -> dict[str, Any]:
+        calls.append("claude")
         return {"provider": "claude", "status": "ok", "error": None}
 
     async def fake_codex(http_client: Any, auth_manager: Any) -> dict[str, Any]:
+        calls.append("codex")
         return {"provider": "codex", "status": "unavailable", "error": "no creds"}
 
     async def fake_kimi(http_client: Any, auth_manager: Any) -> dict[str, Any]:
+        calls.append("kimi")
         return {"provider": "kimi", "status": "ok", "error": None}
 
     async def fake_grok(http_client: Any, auth_manager: Any) -> dict[str, Any]:
+        calls.append("grok")
         return {"provider": "grok", "status": "ok", "error": None}
 
-    monkeypatch.setattr(server, "fetch_claude_usage", fake_claude)
-    monkeypatch.setattr(server, "fetch_codex_usage", fake_codex)
-    monkeypatch.setattr(server, "fetch_kimi_usage", fake_kimi)
-    monkeypatch.setattr(server, "fetch_grok_usage", fake_grok)
+    monkeypatch.setattr(admin_api, "fetch_claude_usage", fake_claude)
+    monkeypatch.setattr(admin_api, "fetch_codex_usage", fake_codex)
+    monkeypatch.setattr(admin_api, "fetch_kimi_usage", fake_kimi)
+    monkeypatch.setattr(admin_api, "fetch_grok_usage", fake_grok)
     with _create_test_client(monkeypatch, tmp_path, base_url="http://127.0.0.1:8787") as client:
         response = client.get("/admin/usage")
 
@@ -4096,6 +4122,7 @@ def test_admin_usage_returns_all_providers(monkeypatch: pytest.MonkeyPatch, tmp_
     assert body["kimi"]["status"] == "ok"
     assert body["grok"]["status"] == "ok"
     assert body["fetched_at"] > 0
+    assert calls == ["claude", "codex", "kimi", "grok"]
 
 
 def test_admin_usage_refuses_foreign_host(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -4118,10 +4145,10 @@ def test_admin_usage_single_provider_skips_the_others(
     async def grok_must_not_run(http_client: Any, auth_manager: Any) -> dict[str, Any]:
         raise AssertionError("grok probe ran for ?provider=claude")
 
-    monkeypatch.setattr(server, "fetch_claude_usage", fake_claude)
-    monkeypatch.setattr(server, "fetch_codex_usage", codex_must_not_run)
-    monkeypatch.setattr(server, "fetch_kimi_usage", kimi_must_not_run)
-    monkeypatch.setattr(server, "fetch_grok_usage", grok_must_not_run)
+    monkeypatch.setattr(admin_api, "fetch_claude_usage", fake_claude)
+    monkeypatch.setattr(admin_api, "fetch_codex_usage", codex_must_not_run)
+    monkeypatch.setattr(admin_api, "fetch_kimi_usage", kimi_must_not_run)
+    monkeypatch.setattr(admin_api, "fetch_grok_usage", grok_must_not_run)
     with _create_test_client(monkeypatch, tmp_path, base_url="http://127.0.0.1:8787") as client:
         response = client.get("/admin/usage", params={"provider": "claude"})
 
@@ -4153,7 +4180,7 @@ def _record_reset_keys(
         keys.append(redeem_request_id)
         return remaining.pop(0)
 
-    monkeypatch.setattr(server, "consume_codex_reset_credit", fake_consume)
+    monkeypatch.setattr(admin_api, "consume_codex_reset_credit", fake_consume)
     return keys
 
 
@@ -4200,7 +4227,7 @@ def test_admin_reset_credit_is_guarded_like_every_other_admin_write(
     def must_not_run(*args: Any, **kwargs: Any) -> None:
         raise AssertionError("a guarded request reached the ChatGPT backend")
 
-    monkeypatch.setattr(server, "consume_codex_reset_credit", must_not_run)
+    monkeypatch.setattr(admin_api, "consume_codex_reset_credit", must_not_run)
 
     # Foreign Host header (DNS-rebinding guard).
     with _create_test_client(monkeypatch, tmp_path) as client:
@@ -4223,7 +4250,7 @@ def test_admin_reset_credit_is_never_reachable_by_GET(
     def must_not_run(*args: Any, **kwargs: Any) -> None:
         raise AssertionError("a GET spent a reset credit")
 
-    monkeypatch.setattr(server, "consume_codex_reset_credit", must_not_run)
+    monkeypatch.setattr(admin_api, "consume_codex_reset_credit", must_not_run)
     with _create_test_client(monkeypatch, tmp_path, base_url="http://127.0.0.1:8787") as client:
         assert client.get("/admin/providers/codex/reset-credit").status_code == 405
 
@@ -6239,7 +6266,7 @@ class TestAdminClaudeAccountsApi:
             calls.append(account_id)
             return ({"provider": "claude", "status": "ok", "error": None}, None)
 
-        monkeypatch.setattr(server, "fetch_claude_account_usage", fake_fetch)
+        monkeypatch.setattr(server_support, "fetch_claude_account_usage", fake_fetch)
 
         with client:
             first = client.get("/admin/providers/claude/pool/usage")
@@ -6260,7 +6287,7 @@ class TestAdminClaudeAccountsApi:
         async def fail_fetch(http_client: Any, manager: Any) -> None:
             raise AssertionError("needs-reauth accounts must not fetch usage")
 
-        monkeypatch.setattr(server, "fetch_claude_account_usage", fail_fetch)
+        monkeypatch.setattr(server_support, "fetch_claude_account_usage", fail_fetch)
 
         with client:
             response = client.get("/admin/providers/claude/pool/usage")
@@ -6911,7 +6938,7 @@ class TestBalancedRoutingEnable:
             monkeypatch, tmp_path, config=config, base_url="http://127.0.0.1:8787"
         ) as client:
             with monkeypatch.context() as fault:
-                fault.setattr(server, "update_settings_file", _boom)
+                fault.setattr(admin_api, "update_settings_file", _boom)
                 failed = client.put(
                     "/admin/providers/claude/pool/routing", json={"mode": "balanced"}
                 )
@@ -7095,7 +7122,7 @@ class TestBalancedRoutingExit:
             return httpx.Response(200, json={"id": "msg_1"})
 
         def _boom(*_args: Any, **_kwargs: Any) -> None:
-            raise server.ConfigError("simulated disk-full settings write")
+            raise admin_api.ConfigError("simulated disk-full settings write")
 
         settings_file = tmp_path / "settings.json"
         config = GatewayConfig(settings_file=settings_file, claude_account_id=account_id)
@@ -7118,7 +7145,7 @@ class TestBalancedRoutingExit:
             assert runtime.router.pin_count() == 1
 
             with monkeypatch.context() as fault:
-                fault.setattr(server, "update_settings_file", _boom)
+                fault.setattr(admin_api, "update_settings_file", _boom)
                 failed = client.put(
                     "/admin/providers/claude/pool/routing", json={"mode": "disabled"}
                 )
@@ -8708,7 +8735,7 @@ class TestBalancedUsageCoordinatorEndpoints:
             calls.append(account_id)
             return ({"provider": "claude", "status": "ok", "error": None}, None)
 
-        monkeypatch.setattr(server, "fetch_claude_account_usage", spy_fetch)
+        monkeypatch.setattr(server_support, "fetch_claude_account_usage", spy_fetch)
 
         def handler(_request: httpx.Request) -> httpx.Response:
             raise AssertionError("no /v1/messages traffic in this test")
@@ -8740,7 +8767,7 @@ class TestBalancedUsageCoordinatorEndpoints:
             calls.append(account_id)
             return ({"provider": "claude", "status": "ok", "error": None}, None)
 
-        monkeypatch.setattr(server, "fetch_claude_account_usage", spy_fetch)
+        monkeypatch.setattr(server_support, "fetch_claude_account_usage", spy_fetch)
 
         def handler(_request: httpx.Request) -> httpx.Response:
             raise AssertionError("no /v1/messages traffic in this test")
@@ -8780,7 +8807,7 @@ class TestBalancedUsageCoordinatorEndpoints:
         async def fake_fetch(http_client: Any, manager: Any) -> tuple[dict[str, Any], None]:
             return ({"provider": "claude", "status": "ok", "error": None}, None)
 
-        monkeypatch.setattr(server, "fetch_claude_account_usage", fake_fetch)
+        monkeypatch.setattr(server_support, "fetch_claude_account_usage", fake_fetch)
 
         with client:
             response = client.get(
@@ -8809,7 +8836,7 @@ class TestBalancedUsageCoordinatorEndpoints:
             calls.append(account_id)
             return ({"provider": "claude", "status": "ok", "error": None}, None)
 
-        monkeypatch.setattr(server, "fetch_claude_account_usage", spy_fetch)
+        monkeypatch.setattr(server_support, "fetch_claude_account_usage", spy_fetch)
 
         with client:
             response = client.get("/admin/providers/claude/pool/usage")
@@ -8842,7 +8869,7 @@ class TestBalancedUsageCoordinatorEndpoints:
             calls.append(account_id)
             return ({"provider": "claude", "status": "ok", "error": None}, None)
 
-        monkeypatch.setattr(server, "fetch_claude_account_usage", spy_fetch)
+        monkeypatch.setattr(server_support, "fetch_claude_account_usage", spy_fetch)
 
         with client:
             response = client.get("/admin/providers/claude/pool/usage")
@@ -8917,7 +8944,7 @@ class TestBalancedUsageCoordinatorEndpoints:
                 None,
             )
 
-        monkeypatch.setattr(server, "fetch_claude_account_usage", fake_fetch)
+        monkeypatch.setattr(server_support, "fetch_claude_account_usage", fake_fetch)
 
         def handler(_request: httpx.Request) -> httpx.Response:
             raise AssertionError("no /v1/messages traffic in this test")
@@ -8962,7 +8989,7 @@ class TestBalancedUsageCoordinatorEndpoints:
                 None,
             )
 
-        monkeypatch.setattr(server, "fetch_claude_account_usage", fake_fetch)
+        monkeypatch.setattr(server_support, "fetch_claude_account_usage", fake_fetch)
 
         def handler(_request: httpx.Request) -> httpx.Response:
             raise AssertionError("no /v1/messages traffic in this test")
@@ -9003,7 +9030,7 @@ class TestBalancedUsageCoordinatorEndpoints:
                 None,
             )
 
-        monkeypatch.setattr(server, "fetch_claude_account_usage", fake_fetch)
+        monkeypatch.setattr(server_support, "fetch_claude_account_usage", fake_fetch)
 
         def handler(_request: httpx.Request) -> httpx.Response:
             raise AssertionError("no /v1/messages traffic in this test")
