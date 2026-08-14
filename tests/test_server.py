@@ -43,9 +43,10 @@ from claudex_gateway.codex_client import (
     CodexClient,
     CodexUpstreamError,
 )
-from claudex_gateway.config import GatewayConfig
+from claudex_gateway.config import GatewayConfig, OpenAICompatibleProvider
 from claudex_gateway.kimi_auth import KimiCredentials
 from claudex_gateway.kimi_client import KimiClient, KimiUpstreamError
+from claudex_gateway.openai_compatible_client import OpenAICompatibleUpstreamError
 from claudex_gateway.grok_auth import GrokCredentials
 from claudex_gateway.grok_client import GrokClient, GrokUpstreamError
 from claudex_gateway.translate import translate_claude_request_to_codex
@@ -122,6 +123,42 @@ class FakeGrokClient:
         return None
 
 
+_CUSTOM_API_KEY = "sk-custom-secret"
+
+
+def _custom_provider() -> OpenAICompatibleProvider:
+    return OpenAICompatibleProvider(
+        wire_api="responses",
+        base_url="https://models.example/api/v1",
+        api_key=_CUSTOM_API_KEY,
+    )
+
+
+class FakeOpenAICompatibleClient:
+    def __init__(
+        self,
+        name: str,
+        provider: OpenAICompatibleProvider,
+        *_args: Any,
+        **_kwargs: Any,
+    ) -> None:
+        self.name = name
+        self.provider = provider
+
+    async def list_models(self) -> list[str]:
+        return ["gpt-5.5"]
+
+    async def context_window(self, model: str) -> int | None:
+        return None
+
+
+class FailingOpenAICompatibleClient(FakeOpenAICompatibleClient):
+    async def list_models(self) -> list[str]:
+        raise OpenAICompatibleUpstreamError(
+            503, '{"error":{"message":"catalog unavailable"}}', self.name
+        )
+
+
 # The real HOME this process started with, captured before any test ever
 # monkeypatches it -- lets `_create_test_client` tell a still-real HOME
 # (a naive test that never isolated it) apart from one a caller already
@@ -142,6 +179,7 @@ def _create_test_client(
     kimi_client: type = FakeKimiClient,
     grok_auth: type = AvailableGrokAuthManager,
     grok_client: type = FakeGrokClient,
+    custom_client: type = FakeOpenAICompatibleClient,
     base_url: str = "http://testserver",
 ) -> TestClient:
     # T-9's lifespan acquires the process-lifetime claude account pool lease
@@ -158,6 +196,7 @@ def _create_test_client(
     monkeypatch.setattr(server, "KimiClient", kimi_client)
     monkeypatch.setattr(server, "GrokAuthManager", grok_auth)
     monkeypatch.setattr(server, "GrokClient", grok_client)
+    monkeypatch.setattr(server, "OpenAICompatibleClient", custom_client)
     return TestClient(server.create_app(config or GatewayConfig()), base_url=base_url)
 
 
@@ -275,6 +314,71 @@ def test_health_reports_error_without_grok_credentials_when_map_routes_to_grok(
     assert health.json()["providers"]["grok"]["required"] is True
 
 
+def test_health_reports_ready_custom_provider(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config = GatewayConfig(
+        model_map={"opus": "wrtn:gpt-5.5"},
+        custom_providers={"wrtn": _custom_provider()},
+    )
+    with _create_test_client(monkeypatch, tmp_path, config=config) as client:
+        health = client.get("/health")
+
+    assert health.status_code == 200
+    assert health.json()["providers"]["wrtn"] == {
+        "status": "ok",
+        "required": True,
+    }
+
+
+def test_health_reports_error_when_required_custom_provider_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config = GatewayConfig(
+        model_map={"opus": "wrtn:gpt-5.5"},
+        custom_providers={"wrtn": _custom_provider()},
+    )
+    with _create_test_client(
+        monkeypatch,
+        tmp_path,
+        config=config,
+        custom_client=FailingOpenAICompatibleClient,
+    ) as client:
+        health = client.get("/health")
+
+    assert health.status_code == 503
+    assert health.json()["status"] == "error"
+    assert health.json()["providers"]["wrtn"]["status"] == "error"
+    assert health.json()["providers"]["wrtn"]["required"] is True
+
+
+def test_health_stays_ready_when_unrequired_custom_provider_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config = GatewayConfig(custom_providers={"wrtn": _custom_provider()})
+    with _create_test_client(
+        monkeypatch,
+        tmp_path,
+        config=config,
+        custom_client=FailingOpenAICompatibleClient,
+    ) as client:
+        health = client.get("/health")
+
+    assert health.status_code == 200
+    assert health.json()["status"] == "ok"
+    assert health.json()["providers"]["wrtn"]["status"] == "error"
+    assert health.json()["providers"]["wrtn"]["required"] is False
+
+
+def test_health_without_custom_providers_keeps_builtin_provider_payload(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        health = client.get("/health")
+
+    assert list(health.json()["providers"]) == ["codex", "kimi", "grok"]
+
+
 def _upstream_error(status_code: int, error: dict) -> CodexUpstreamError:
     return CodexUpstreamError(status_code, json.dumps({"error": error}))
 
@@ -363,6 +467,7 @@ def _gateway(
     kimi_handler=None,
     kimi_auth: Any | None = None,
     grok_client: Any | None = None,
+    custom_provider_clients: dict[str, Any] | None = None,
     codex_context_window: int | None = None,
     codex_error: CodexUpstreamError | None = None,
     codex_supports_fast_tier: bool = False,
@@ -391,6 +496,7 @@ def _gateway(
         )
     if grok_client is not None:
         app.state.grok_client = grok_client
+    app.state.custom_provider_clients = custom_provider_clients or {}
     return TestClient(app), stub
 
 
@@ -1301,6 +1407,60 @@ def test_count_tokens_falls_back_to_estimate_when_kimi_fails() -> None:
 
     assert response.status_code == 200
     assert response.json()["input_tokens"] > 0
+
+
+# --- /v1/messages routing: custom providers use the Responses backend ---
+
+
+class StubOpenAICompatibleClient:
+    def __init__(self) -> None:
+        self.payloads: list[dict[str, Any]] = []
+        self.context_window_calls: list[str] = []
+
+    async def context_window(self, model: str) -> int | None:
+        self.context_window_calls.append(model)
+        return None
+
+    async def stream_responses(
+        self, payload: dict[str, Any], session_id: str
+    ) -> AsyncIterator[dict[str, Any]]:
+        self.payloads.append(payload)
+        raise OpenAICompatibleUpstreamError(503, "stub custom upstream", "wrtn")
+        yield
+
+
+def test_custom_provider_route_uses_custom_client_without_builtin_payload_mutations(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    custom_stub = StubOpenAICompatibleClient()
+    config = GatewayConfig(
+        model_map={"opus": "wrtn:gpt-5.5"},
+        custom_providers={"wrtn": _custom_provider()},
+        reasoning_effort_override="max",
+        codex_service_tier="fast",
+    )
+
+    def unexpected_grok_sanitizer(payload: dict[str, Any], model: str) -> dict[str, Any]:
+        raise AssertionError("Grok sanitizer must not run for a custom provider")
+
+    monkeypatch.setattr(server, "sanitize_grok_payload", unexpected_grok_sanitizer)
+    client, codex_stub = _gateway(
+        config,
+        _failing_anthropic_handler,
+        custom_provider_clients={"wrtn": custom_stub},
+        codex_supports_fast_tier=True,
+    )
+
+    response = client.post("/v1/messages", json=_message_body("claude-opus-4-6"))
+
+    assert response.status_code == 503
+    assert codex_stub.payloads == []
+    assert custom_stub.context_window_calls == ["gpt-5.5"]
+    (payload,) = custom_stub.payloads
+    assert payload["model"] == "gpt-5.5"
+    assert payload["reasoning"]["effort"] == "max"
+    assert "service_tier" not in payload
+    assert "max_output_tokens" not in payload
 
 
 # --- /v1/messages routing: grok-mapped models go to the Grok Responses backend ---
@@ -2799,6 +2959,35 @@ class TestAdminMappingApi:
         assert response.status_code == 200
         assert response.json()["model_map"] == {"haiku": "codex:gpt-5.6-luna"}
 
+    def test_get_includes_custom_provider_metadata_without_api_key(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        with self._admin_client(
+            monkeypatch,
+            tmp_path,
+            custom_providers={"wrtn": _custom_provider()},
+        ) as client:
+            response = client.get("/admin/settings/mapping")
+
+        assert response.status_code == 200
+        assert response.json()["custom_providers"] == [
+            {
+                "name": "wrtn",
+                "wire_api": "responses",
+                "base_url": "https://models.example/api/v1",
+            }
+        ]
+        assert "api_key" not in response.text
+        assert _CUSTOM_API_KEY not in response.text
+
+    def test_get_without_custom_providers_keeps_existing_payload_shape(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        with self._admin_client(monkeypatch, tmp_path) as client:
+            response = client.get("/admin/settings/mapping")
+
+        assert "custom_providers" not in response.json()
+
     def test_put_updates_runtime_and_persists(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
@@ -2877,6 +3066,29 @@ class TestAdminMappingApi:
         assert "names no model" in empty_model.json()["error"]["message"]
         assert unknown_prefix.status_code == 400
         assert "unknown provider prefix" in unknown_prefix.json()["error"]["message"]
+
+    def test_put_accepts_custom_provider_prefix_and_rejects_unknown_prefix(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.delenv("CLAUDEX_MODEL_MAP", raising=False)
+        with self._admin_client(
+            monkeypatch,
+            tmp_path,
+            custom_providers={"wrtn": _custom_provider()},
+        ) as client:
+            accepted = client.put(
+                "/admin/settings/mapping",
+                json={"model_map": {"opus": "wrtn:gpt-5.5"}},
+            )
+            rejected = client.put(
+                "/admin/settings/mapping",
+                json={"model_map": {"opus": "other:gpt-5.5"}},
+            )
+
+        assert accepted.status_code == 200
+        assert accepted.json()["model_map"] == {"opus": "wrtn:gpt-5.5"}
+        assert rejected.status_code == 400
+        assert "unknown provider prefix" in rejected.json()["error"]["message"]
 
     def test_put_rejects_unknown_and_empty_bodies(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -4788,6 +5000,29 @@ class RejectingGrokClient(FakeGrokClient):
         raise GrokUpstreamError(400, '{"error":{"message":"model_not_found"}}')
 
 
+class CatalogOpenAICompatibleClient(FakeOpenAICompatibleClient):
+    async def list_models(self) -> list[str]:
+        return ["gpt-5.5", "gemini-3.1-pro"]
+
+
+class ProbeOpenAICompatibleClient(FakeOpenAICompatibleClient):
+    async def stream_responses(
+        self, payload: dict[str, Any], session_id: str
+    ) -> AsyncIterator[dict[str, Any]]:
+        yield {"type": "response.created", "response": {"model": payload["model"]}}
+
+
+class RejectingOpenAICompatibleClient(FakeOpenAICompatibleClient):
+    async def stream_responses(
+        self, payload: dict[str, Any], session_id: str
+    ) -> AsyncIterator[dict[str, Any]]:
+        if False:
+            yield {}
+        raise OpenAICompatibleUpstreamError(
+            400, '{"error":{"message":"model_not_found"}}', self.name
+        )
+
+
 def test_codex_client_list_models_filters_hidden_models() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.url.params["client_version"] == "0.146.0"
@@ -4893,6 +5128,31 @@ class TestAdminDashboardApi:
         with _create_test_client(monkeypatch, tmp_path, grok_client=CatalogGrokClient) as client:
             assert client.get("/admin/providers/grok/models").status_code == 403
 
+    def test_custom_provider_models_returns_catalog_ids(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        config = GatewayConfig(custom_providers={"wrtn": _custom_provider()})
+        with self._client(
+            monkeypatch,
+            tmp_path,
+            config=config,
+            custom_client=CatalogOpenAICompatibleClient,
+        ) as client:
+            response = client.get("/admin/providers/custom/wrtn/models")
+
+        assert response.status_code == 200
+        assert response.json() == {"models": ["gpt-5.5", "gemini-3.1-pro"]}
+
+    def test_custom_provider_models_returns_404_for_unknown_name(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        config = GatewayConfig(custom_providers={"wrtn": _custom_provider()})
+        with self._client(monkeypatch, tmp_path, config=config) as client:
+            response = client.get("/admin/providers/custom/other/models")
+
+        assert response.status_code == 404
+        assert "not configured" in response.json()["error"]["message"]
+
     def test_connection_test_ok(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         with self._client(monkeypatch, tmp_path, codex_client=ProbeCodexClient) as client:
             response = client.post(
@@ -4976,6 +5236,41 @@ class TestAdminDashboardApi:
         assert result["ok"] is False
         assert result["status"] == 400
         assert "model_not_found" in result["detail"]
+
+    def test_connection_test_custom_target_probes_custom_provider(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        config = GatewayConfig(custom_providers={"wrtn": _custom_provider()})
+        with self._client(
+            monkeypatch,
+            tmp_path,
+            config=config,
+            custom_client=ProbeOpenAICompatibleClient,
+        ) as client:
+            response = client.post("/admin/test", json={"target": "wrtn:gpt-5.5"})
+
+        assert response.status_code == 200
+        result = response.json()
+        assert result["ok"] is True
+        assert result["status"] == 200
+        assert result["response_model"] == "gpt-5.5"
+
+    def test_connection_test_reports_custom_provider_error(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        config = GatewayConfig(custom_providers={"wrtn": _custom_provider()})
+        with self._client(
+            monkeypatch,
+            tmp_path,
+            config=config,
+            custom_client=RejectingOpenAICompatibleClient,
+        ) as client:
+            response = client.post("/admin/test", json={"target": "wrtn:gpt-nope"})
+
+        result = response.json()
+        assert result["ok"] is False
+        assert result["status"] == 400
+        assert result["detail"] == "model_not_found"
 
     def test_connection_test_rejects_unknown_prefix(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path

@@ -108,6 +108,10 @@ from claudex_gateway.config import (
 )
 from claudex_gateway.kimi_auth import KimiAuthError, KimiAuthManager
 from claudex_gateway.kimi_client import KimiClient, KimiUpstreamError
+from claudex_gateway.openai_compatible_client import (
+    OpenAICompatibleClient,
+    OpenAICompatibleUpstreamError,
+)
 from claudex_gateway.translate import (
     CodexToClaudeStreamTranslator,
     TranslationError,
@@ -1644,14 +1648,14 @@ async def _handle_messages(request: Request) -> JSONResponse | StreamingResponse
 async def _relay_via_responses_backend(
     request: Request, claude_request: dict[str, Any], route: RouteTarget
 ) -> JSONResponse | StreamingResponse:
-    """Relay a Messages request to a Responses-API backend (Codex or Grok).
+    """Relay a Messages request to a Responses-API backend.
 
-    Both providers consume the same translated payload and produce the same
-    SSE event family, so one path serves both; the Grok direction only adds
-    its payload sanitizer on the way out.
+    Codex, Grok, and custom providers consume the same translated payload and
+    produce the same SSE event family, so one path serves all of them; only the
+    Grok direction adds its payload sanitizer on the way out.
 
-    Before translation, a Codex/Grok mapped request also carries the
-    compaction reroute trigger: when `config.compaction_model` is set, the
+    Before translation, a Responses-mapped request also carries the compaction
+    reroute trigger: when `config.compaction_model` is set, the
     body is a detected Claude Code compaction request (Signal A), and the
     mapped model's catalog context window is a real (non-bool) integer the
     estimated prompt overflows, the request is diverted to
@@ -1672,8 +1676,11 @@ async def _relay_via_responses_backend(
             _claude_error_body("invalid_request_error", validation_error), status_code=400
         )
 
-    if provider == "grok":
-        client: CodexClient | GrokClient = request.app.state.grok_client
+    custom_client = request.app.state.custom_provider_clients.get(provider)
+    if custom_client is not None:
+        client: CodexClient | GrokClient | OpenAICompatibleClient = custom_client
+    elif provider == "grok":
+        client = request.app.state.grok_client
     else:
         client = request.app.state.codex_client
 
@@ -2420,10 +2427,22 @@ async def _handle_health(request: Request) -> JSONResponse:
     except GrokAuthError as exc:
         providers["grok"] = {"status": "error", "detail": str(exc), "required": grok_required}
 
+    custom_providers_ready = True
+    for name, custom_client in request.app.state.custom_provider_clients.items():
+        required = config.maps_to_provider(name)
+        try:
+            await custom_client.list_models()
+            providers[name] = {"status": "ok", "required": required}
+        except (UpstreamError, httpx.HTTPError) as exc:
+            providers[name] = {"status": "error", "detail": str(exc), "required": required}
+            if required:
+                custom_providers_ready = False
+
     is_ready = (
         providers["codex"]["status"] == "ok"
         and (providers["kimi"]["status"] == "ok" or not kimi_required)
         and (providers["grok"]["status"] == "ok" or not grok_required)
+        and custom_providers_ready
     )
     return JSONResponse(
         {"status": "ok" if is_ready else "error", "providers": providers},
@@ -2461,7 +2480,7 @@ def _admin_guard(request: Request) -> JSONResponse | None:
 
 
 def _mapping_payload(config: GatewayConfig) -> dict[str, Any]:
-    return {
+    payload: dict[str, Any] = {
         "model_map": config.model_map,
         # The dashboard renders the board view-only while the corresponding
         # environment variable overrides the settings file.
@@ -2473,6 +2492,16 @@ def _mapping_payload(config: GatewayConfig) -> dict[str, Any]:
         "grok_home": str(config.grok_home),
         "kimi_code_home": str(config.kimi_code_home),
     }
+    if config.custom_providers:
+        payload["custom_providers"] = [
+            {
+                "name": name,
+                "wire_api": provider.wire_api,
+                "base_url": provider.base_url,
+            }
+            for name, provider in config.custom_providers.items()
+        ]
+    return payload
 
 
 async def _handle_admin_mapping_get(request: Request) -> JSONResponse:
@@ -4093,6 +4122,39 @@ async def _handle_admin_grok_models(request: Request) -> JSONResponse:
     return JSONResponse({"models": models})
 
 
+async def _handle_admin_custom_models(request: Request) -> JSONResponse:
+    """Relay a configured custom provider's live model catalog."""
+    denied = _admin_guard(request)
+    if denied is not None:
+        return denied
+    name = request.path_params["name"]
+    config: GatewayConfig = request.app.state.config
+    if name not in config.custom_providers:
+        return JSONResponse(
+            _openai_error_body(
+                "not_found_error", f"custom provider {name!r} is not configured"
+            ),
+            status_code=404,
+        )
+    custom_client: OpenAICompatibleClient = request.app.state.custom_provider_clients[name]
+    try:
+        models = await custom_client.list_models()
+    except OpenAICompatibleUpstreamError as exc:
+        error_type = _STATUS_TO_OPENAI_ERROR_TYPE.get(exc.status_code, "server_error")
+        return JSONResponse(
+            _openai_error_body(error_type, _upstream_error_message(exc.body)),
+            status_code=exc.status_code,
+        )
+    except httpx.HTTPError as exc:
+        return JSONResponse(
+            _openai_error_body(
+                "server_error", f"failed to reach custom provider {name!r}: {exc}"
+            ),
+            status_code=502,
+        )
+    return JSONResponse({"models": models})
+
+
 async def _handle_admin_kimi_models(request: Request) -> JSONResponse:
     """Relay Kimi's live model catalog verbatim for model_map authoring.
 
@@ -4165,6 +4227,30 @@ async def _probe_grok_route(grok_client: GrokClient, target: str) -> str:
     return model if isinstance(model, str) else target
 
 
+async def _probe_custom_route(
+    custom_client: OpenAICompatibleClient, provider_name: str, target: str
+) -> str:
+    claude_request = {
+        "max_tokens": 16,
+        "messages": [{"role": "user", "content": "ping"}],
+    }
+    payload = translate_claude_request_to_codex(claude_request, target, "low")
+    events = custom_client.stream_responses(payload, payload["prompt_cache_key"])
+    try:
+        first_event = await anext(events, None)
+    finally:
+        await events.aclose()
+    if first_event is None:
+        raise OpenAICompatibleUpstreamError(
+            502,
+            f"custom provider {provider_name!r} stream ended without any events",
+            provider_name,
+        )
+    response = first_event.get("response") if isinstance(first_event, dict) else None
+    model = response.get("model") if isinstance(response, dict) else None
+    return model if isinstance(model, str) else target
+
+
 async def _probe_kimi_route(kimi_client: KimiClient, target_model: str) -> str:
     claude_request = {
         "model": target_model,
@@ -4228,11 +4314,10 @@ async def _handle_admin_connection_test(request: Request) -> JSONResponse:
         )
 
     # The target carries the same provider-prefix syntax as model_map values,
-    # so the dashboard's test box works for kimi: targets with no UI change.
+    # so the dashboard's test box works for every configured route.
+    config: GatewayConfig = request.app.state.config
     try:
-        route = parse_route_target(
-            target, request.app.state.config.route_providers
-        )
+        route = parse_route_target(target, config.route_providers)
     except ConfigError as exc:
         return JSONResponse(
             _openai_error_body("invalid_request_error", str(exc)), status_code=400
@@ -4243,6 +4328,12 @@ async def _handle_admin_connection_test(request: Request) -> JSONResponse:
             probe = _probe_kimi_route(request.app.state.kimi_client, route.model)
         elif route.provider == "grok":
             probe = _probe_grok_route(request.app.state.grok_client, route.model)
+        elif route.provider in config.custom_providers:
+            probe = _probe_custom_route(
+                request.app.state.custom_provider_clients[route.provider],
+                route.provider,
+                route.model,
+            )
         else:
             probe = _probe_codex_route(request.app.state.codex_client, route.model)
         response_model = await asyncio.wait_for(probe, _CONNECTION_TEST_TIMEOUT)
@@ -4299,6 +4390,12 @@ def create_app(config: GatewayConfig, daemon_nonce: str | None = None) -> Starle
                     app.state.kimi_client = KimiClient(kimi_auth_manager, http_client)
                     app.state.grok_auth_manager = grok_auth_manager
                     app.state.grok_client = GrokClient(grok_auth_manager, http_client)
+                    custom_provider_clients: dict[str, OpenAICompatibleClient] = {}
+                    for name, provider in config.custom_providers.items():
+                        custom_provider_clients[name] = OpenAICompatibleClient(
+                            name, provider, http_client
+                        )
+                    app.state.custom_provider_clients = custom_provider_clients
                     app.state.http_client = http_client
 
                     if config.claude_account_routing_mode == "balanced":
@@ -4356,6 +4453,17 @@ def create_app(config: GatewayConfig, daemon_nonce: str | None = None) -> Starle
                         except GrokAuthError as exc:
                             logger.warning("grok direction unavailable: %s", exc)
 
+                    for name, custom_client in custom_provider_clients.items():
+                        if not config.maps_to_provider(name):
+                            continue
+                        try:
+                            models = await custom_client.list_models()
+                            logger.info(
+                                "custom provider '%s' ready (%d models)", name, len(models)
+                            )
+                        except Exception as exc:
+                            logger.warning("custom provider '%s' unavailable: %s", name, exc)
+
                     yield
             finally:
                 logging.getLogger().removeHandler(log_buffer)
@@ -4412,6 +4520,11 @@ def create_app(config: GatewayConfig, daemon_nonce: str | None = None) -> Starle
             ),
             Route(
                 "/admin/providers/grok/models", _handle_admin_grok_models, methods=["GET"]
+            ),
+            Route(
+                "/admin/providers/custom/{name}/models",
+                _handle_admin_custom_models,
+                methods=["GET"],
             ),
             Route(
                 "/admin/providers/claude/local",
@@ -4495,6 +4608,8 @@ def create_app(config: GatewayConfig, daemon_nonce: str | None = None) -> Starle
         lifespan=lifespan,
     )
     app.state.daemon_nonce = daemon_nonce
+    # Lifespan replaces this with one client per configured custom provider.
+    app.state.custom_provider_clients = {}
     # Lazily-created ClaudeAccountAuthManager per registered account id.
     # Initialized here (not in the lifespan) so the dict exists even when a
     # test drives the app without entering the lifespan context.
