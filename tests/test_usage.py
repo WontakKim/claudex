@@ -198,24 +198,30 @@ def test_fetch_claude_usage_maps_fable_weekly_from_scoped_limits(
     assert result["fable_weekly"]["resets_at"] == expected
 
 
-def test_map_fable_weekly_window_falls_back_to_legacy_fields() -> None:
-    data = {"fable_weekly": {"utilization": 55, "resets_at": 1754600000}}
-    window = usage._map_fable_weekly_window(data)
-    assert window["used_percent"] == 55.0
-    assert window["resets_at"] == 1754600000.0
+@pytest.mark.parametrize(
+    "field_name", ["fable_weekly", "fable_seven_day", "seven_day_fable"]
+)
+def test_flat_fable_quota_fields_are_ignored(field_name: str) -> None:
+    data = {field_name: {"utilization": 55, "resets_at": 1754600000}}
 
-    assert usage._map_fable_weekly_window({}) is None
-    # A scoped limit for another model is not Fable's.
-    other_model = {
+    assert usage._map_fable_weekly_window(data) is None
+
+
+def test_map_fable_weekly_window_ignores_malformed_or_nonmatching_limits() -> None:
+    assert usage._map_fable_weekly_window({"limits": "malformed"}) is None
+    data = {
         "limits": [
+            None,
+            {"kind": "weekly_scoped", "percent": 10, "scope": {}},
             {
                 "kind": "weekly_scoped",
                 "percent": 10,
                 "scope": {"model": {"display_name": "Opus"}},
-            }
+            },
         ]
     }
-    assert usage._map_fable_weekly_window(other_model) is None
+
+    assert usage._map_fable_weekly_window(data) is None
 
 
 def test_fetch_claude_usage_without_credentials_is_unavailable(
