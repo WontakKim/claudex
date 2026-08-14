@@ -12,13 +12,8 @@ Storage layout, all rooted at `paths.accounts_dir("claude")`::
 
 Row JSON (exact key set, camelCase): `id`, `email`, `organizationUuid`,
 `organizationName`, `createdAt`, `updatedAt`, `lastAuthenticatedAt`, `state`,
-`accountIncarnationId`, `upstreamAccountUuid`. The last two are the current
-schema (10 keys); a pre-existing 8-key registry (no incarnation identity) is
-the one recognized legacy schema and is migrated in place, once, the first
-time it is read — see `load_registry` and `_migrate_legacy_registry`. Every
-other row shape (an unknown key set, or a registry mixing legacy and current
-rows) is rejected outright: this loader never guesses at a schema variant it
-does not exactly recognize.
+`accountIncarnationId`, `upstreamAccountUuid`. This exact 10-key schema is the
+only supported persisted format; every other row shape is rejected outright.
 
 `accountIncarnationId` is a random id assigned once per "distinct login" and
 never reused: it survives ordinary reauthentication (same or newly-learned
@@ -78,10 +73,7 @@ _STATE_READY = "ready"
 _STATE_NEEDS_REAUTH = "needs-reauth"
 _VALID_STATES = (_STATE_READY, _STATE_NEEDS_REAUTH)
 
-# The one recognized legacy schema: every registry row before this module
-# gained incarnation identity. `_migrate_legacy_registry` is the only code
-# path that ever reads or writes this shape.
-_LEGACY_ROW_KEYS = (
+_ROW_KEYS = (
     "id",
     "email",
     "organizationUuid",
@@ -90,11 +82,9 @@ _LEGACY_ROW_KEYS = (
     "updatedAt",
     "lastAuthenticatedAt",
     "state",
+    "accountIncarnationId",
+    "upstreamAccountUuid",
 )
-_LEGACY_ROW_KEYS_SET = frozenset(_LEGACY_ROW_KEYS)
-
-# The current schema: the legacy fields plus incarnation identity.
-_ROW_KEYS = _LEGACY_ROW_KEYS + ("accountIncarnationId", "upstreamAccountUuid")
 _ROW_KEYS_SET = frozenset(_ROW_KEYS)
 
 _CONTROL_CHARACTER_PATTERN = re.compile(r"[\x00-\x1f\x7f]")
@@ -162,31 +152,15 @@ def load_registry() -> list[AccountRecord]:
 
     Returns an empty list when the file does not exist, or when it exists
     and holds an empty JSON array — both are valid current state and are
-    never rewritten just to be read. This is otherwise a plain read: no
-    lock is taken and no crash recovery runs (both are the concern of the
-    mutating operations below), matching an atomically-replaced file a
-    reader can always see in either its old or new complete state.
-
-    The one exception is a registry classified as exact *legacy* schema
-    (see the module docstring): that classification, made without the
-    lock, is only advisory, since a concurrent writer could be migrating
-    (or otherwise replacing) the file at this exact moment. In that case
-    only, the write lock is acquired and the file is re-read and
-    reclassified from scratch before anything is migrated — see
-    `_load_and_migrate_if_needed`.
+    never rewritten just to be read. This is a plain read: no lock is taken
+    and no crash recovery runs (both are the concern of the mutating
+    operations below), matching an atomically-replaced file a reader can
+    always see in either its old or new complete state.
     """
     accounts_root = paths.accounts_dir(_PROVIDER)
     registry_path = _registry_path(accounts_root)
     parsed = _read_registry_array(registry_path)
-    if not parsed:
-        return []
-    if _classify_registry_schema(parsed) != "legacy":
-        # Either exact current schema (parse it directly) or invalid/mixed
-        # (let the strict per-row parser raise with its specific
-        # diagnostic instead of guessing here).
-        return _parse_current_rows(parsed, path=registry_path)
-    with file_lock(_lock_path(accounts_root)):
-        return _load_and_migrate_if_needed(accounts_root, registry_path)
+    return _parse_current_rows(parsed, path=registry_path)
 
 
 def list_accounts() -> list[AccountRecord]:
@@ -574,10 +548,8 @@ def _read_registry_array(path: Path) -> list[object]:
     """Read `registry.json` into its raw, un-row-validated JSON array.
 
     A missing file degrades to `[]` (absent registry is valid current
-    state). Malformed JSON or a non-array root is a file-level error, raised
-    here regardless of row schema — row-level (and schema-classification)
-    validation happens once the caller knows whether it is looking at an
-    empty, legacy, or current array.
+    state). Malformed JSON or a non-array root is a file-level error; strict
+    row validation is handled by `_parse_current_rows`.
     """
     if not path.exists():
         return []
@@ -592,35 +564,6 @@ def _read_registry_array(path: Path) -> list[object]:
     if not isinstance(parsed, list):
         raise AccountRegistryError(f"registry {path} must contain a JSON array")
     return parsed
-
-
-def _classify_row_schema(row: object) -> str:
-    """Classify one raw row by its exact key set alone (no value
-    validation): `"current"`, `"legacy"`, or `"invalid"` for anything else,
-    including a non-object row."""
-    if not isinstance(row, dict):
-        return "invalid"
-    keys = set(row)
-    if keys == _ROW_KEYS_SET:
-        return "current"
-    if keys == _LEGACY_ROW_KEYS_SET:
-        return "legacy"
-    return "invalid"
-
-
-def _classify_registry_schema(parsed: list[object]) -> str:
-    """Classify a non-empty parsed registry array: `"current"` when every
-    row is exact current schema, `"legacy"` when every row is exact legacy
-    schema, `"invalid"` otherwise — including a registry that mixes the two
-    schemas. Callers handle the empty-array case themselves; it is not a
-    schema classification, it is already-valid current state.
-    """
-    schemas = {_classify_row_schema(row) for row in parsed}
-    if schemas == {"current"}:
-        return "current"
-    if schemas == {"legacy"}:
-        return "legacy"
-    return "invalid"
 
 
 def _register_unique_or_raise(
@@ -643,10 +586,7 @@ def _register_unique_or_raise(
 
 
 def _parse_current_rows(parsed: list[object], *, path: Path) -> list[AccountRecord]:
-    """Strictly parse an array already known (or believed, pending the
-    per-row key check inside `_parse_row`) to be exact current schema —
-    this is also where a not-exactly-legacy, not-exactly-current array ends
-    up, so its per-row diagnostics double as the "invalid/mixed" error."""
+    """Strictly parse rows using the exact current schema."""
     records: list[AccountRecord] = []
     seen_ids: set[str] = set()
     seen_identities: set[tuple[str, str | None]] = set()
@@ -686,9 +626,11 @@ def _check_row_keys(
 def _validate_shared_fields(
     row: dict[str, Any], *, path: Path, index: int
 ) -> tuple[str, str, str | None, str | None, int, int, int, str]:
-    """Validate the 8 fields shared by the legacy and current schemas.
+    """Validate the registry fields other than incarnation identity.
+
     Returns `(id, email, organizationUuid, organizationName, createdAt,
-    updatedAt, lastAuthenticatedAt, state)`."""
+    updatedAt, lastAuthenticatedAt, state)`.
+    """
     try:
         record_id = _validate_id(row["id"])
         email = _normalize_email(row["email"])
@@ -753,100 +695,6 @@ def _parse_row(row: object, *, path: Path, index: int) -> AccountRecord:
         account_incarnation_id=account_incarnation_id,
         upstream_account_uuid=upstream_account_uuid,
     )
-
-
-def _parse_legacy_row_fields(
-    row: object, *, path: Path, index: int
-) -> tuple[str, str, str | None, str | None, int, int, int, str]:
-    """Strictly parse one exact legacy-schema (8-key) row. Used only by
-    `_migrate_legacy_registry`, on data already reclassified as exact
-    legacy under the write lock."""
-    checked = _check_row_keys(row, _LEGACY_ROW_KEYS_SET, path=path, index=index)
-    return _validate_shared_fields(checked, path=path, index=index)
-
-
-def _load_and_migrate_if_needed(
-    accounts_root: Path, registry_path: Path
-) -> list[AccountRecord]:
-    """Read, classify, and — only for an exact legacy-schema registry —
-    migrate `registry.json` to the current schema.
-
-    Callers must already hold `registry.lock`: this performs the actual
-    disk read (and, for a legacy registry, the migration write) without
-    acquiring the lock itself, so both `load_registry`'s double-checked
-    migration and every mutating operation's own `_recover` share one exact
-    classify-and-migrate implementation.
-    """
-    parsed = _read_registry_array(registry_path)
-    if not parsed:
-        return []
-    if _classify_registry_schema(parsed) != "legacy":
-        return _parse_current_rows(parsed, path=registry_path)
-    return _migrate_legacy_registry(accounts_root, registry_path, parsed)
-
-
-def _migrate_legacy_registry(
-    accounts_root: Path, registry_path: Path, parsed: list[object]
-) -> list[AccountRecord]:
-    """Migrate a registry array already reclassified as exact legacy schema
-    to the current schema: assign each row a fresh incarnation id, derive
-    its canonical upstream account uuid from its own account directory when
-    possible, and atomically rewrite `registry.json`.
-
-    Callers must already hold `registry.lock` and must have just
-    reclassified `parsed` as exact legacy (never trust an earlier,
-    lock-free classification here). The migrated result is round-tripped
-    through the same strict current-schema parser normal reads use before
-    it is ever written, so a bug here can never persist data the loader
-    itself would refuse to read back.
-    """
-    legacy_rows: list[tuple[str, str, str | None, str | None, int, int, int, str]] = []
-    seen_ids: set[str] = set()
-    seen_identities: set[tuple[str, str | None]] = set()
-    for index, row in enumerate(parsed):
-        fields = _parse_legacy_row_fields(row, path=registry_path, index=index)
-        record_id, email, organization_uuid = fields[0], fields[1], fields[2]
-        _register_unique_or_raise(
-            record_id,
-            (email, organization_uuid),
-            seen_ids,
-            seen_identities,
-            path=registry_path,
-            index=index,
-        )
-        legacy_rows.append(fields)
-
-    migrated = [
-        AccountRecord(
-            id=record_id,
-            email=email,
-            organization_uuid=organization_uuid,
-            organization_name=organization_name,
-            created_at=created_at,
-            updated_at=updated_at,
-            last_authenticated_at=last_authenticated_at,
-            state=state,
-            account_incarnation_id=str(uuid.uuid4()),
-            upstream_account_uuid=_read_upstream_account_uuid_from_disk(
-                accounts_root, record_id
-            ),
-        )
-        for (
-            record_id,
-            email,
-            organization_uuid,
-            organization_name,
-            created_at,
-            updated_at,
-            last_authenticated_at,
-            state,
-        ) in legacy_rows
-    ]
-
-    rows = [record.to_row() for record in migrated]
-    validated = _parse_current_rows(rows, path=registry_path)
-    _write_json_atomic(registry_path, rows)
-    return validated
 
 
 def _reject_control_characters(value: str, *, field: str) -> None:
@@ -949,32 +797,6 @@ def _derive_upstream_account_uuid(oauth_payload: dict[str, Any]) -> str | None:
     `add_account`/`update_account_credentials` time, from the same
     `oauth_payload` dict that gets persisted to `oauth-account.json`."""
     return _canonicalize_upstream_uuid(oauth_payload.get("accountUuid"))
-
-
-def _read_upstream_account_uuid_from_disk(accounts_root: Path, record_id: str) -> str | None:
-    """Best-effort read of the canonical upstream account uuid from a
-    legacy row's own `oauth-account.json`, for `_migrate_legacy_registry`.
-
-    `record_id` has already passed `_validate_id` (a canonical UUID string)
-    before this is ever called, so joining it under `accounts_root` never
-    escapes the accounts directory — the same canonicalize-then-join
-    pattern `remove_account` and `_parse_row` already rely on. Mirrors
-    `ClaudeAccountAuthManager._load_account_uuid`'s missing/malformed
-    degrade-to-`None` behavior: a legacy row still gets a fresh incarnation
-    even when its upstream uuid cannot be established.
-    """
-    oauth_account_path = accounts_root / record_id / _OAUTH_ACCOUNT_FILENAME
-    try:
-        raw_text = oauth_account_path.read_text(encoding="utf-8")
-    except OSError:
-        return None
-    try:
-        parsed = json.loads(raw_text)
-    except json.JSONDecodeError:
-        return None
-    if not isinstance(parsed, dict):
-        return None
-    return _derive_upstream_account_uuid(parsed)
 
 
 def _resolve_reauth_incarnation(
@@ -1219,11 +1041,8 @@ def _recover(accounts_root: Path) -> list[AccountRecord]:
     touching anything else. Only once an existing registry has been
     successfully parsed and validated does tombstone reconciliation run.
 
-    Every caller already holds `registry.lock`, so a legacy-schema registry
-    encountered here is migrated directly (no separate lock-acquire dance is
-    needed — see `_load_and_migrate_if_needed`): a mutation must never fail
-    just because the registry has not yet been read once through
-    `load_registry`.
+    Every caller already holds `registry.lock`, preserving the complete
+    read/check/write lock scope required by mutations.
     """
     _sweep_staging_directories(accounts_root)
 
@@ -1237,7 +1056,8 @@ def _recover(accounts_root: Path) -> list[AccountRecord]:
             )
         return []
 
-    records = _load_and_migrate_if_needed(accounts_root, registry_path)
+    parsed = _read_registry_array(registry_path)
+    records = _parse_current_rows(parsed, path=registry_path)
     _reconcile_tombstones(accounts_root, records)
     _report_orphaned_directories(accounts_root, records)
     return records
