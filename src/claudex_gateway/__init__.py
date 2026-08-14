@@ -1,4 +1,4 @@
-"""Local gateway that runs Claude Code models on the Codex backend."""
+"""Local multi-provider gateway for Claude Code requests."""
 
 import importlib.metadata
 

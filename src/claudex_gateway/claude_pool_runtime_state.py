@@ -1,8 +1,8 @@
-"""SQLite-backed runtime-state store for the Claude account pool (schema v1).
+"""SQLite-backed runtime-state store for balanced Claude account routing.
 
-Design v2 §5.5 plus adjudications A/B: one SQLite database, at the path the
-caller supplies (production uses ``paths.claude_account_pool_runtime_db()``),
-holds every piece of state the balanced router needs to survive a restart —
+One database, at the path the caller supplies (production uses
+``paths.claude_account_pool_runtime_db()``), holds every piece of state the
+balanced router needs to survive a restart —
 session pins, account cooldowns, usage observations, and capability
 evidence — behind a single serialized writer thread. The database runs in
 WAL journal mode with ``synchronous=FULL`` (a commit is not acknowledged

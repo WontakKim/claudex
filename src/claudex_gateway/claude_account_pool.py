@@ -1,19 +1,18 @@
-"""Ordered-fallback serving pool over the registered Claude accounts.
+"""Cooldown tracking and ordered fallback for registered Claude accounts.
 
-v1 rolling (design doc §4–7, simplified by owner decision): every request is
-served with the admin-selected serving account; when it is rate-limited the
-gateway cools it down in memory and fails over to the next ready account in
-registration order, failing back automatically once the cooldown expires.
-Session-affinity balancing (§5) is a later phase.
+In fallback mode, every request first uses the admin-selected serving
+account. When that account is rate-limited, the gateway cools it down in
+memory and tries the next ready account in registration order, failing back
+automatically once the cooldown expires. Balanced session-affinity routing
+is owned by ``claude_balanced_router`` and does not use this tracker for
+eligibility.
 
-Cooling-down is ephemeral runtime state and lives only in this process —
-the registry records exclusively durable facts (design doc §8 amendment).
-
-The cooldown deadline is derived from the best signal a 429 offers. The
-empirical shape (.docs/research/claude-429-shape.md): OAuth quota rejections
-carry NO Retry-After header, NO ratelimit headers, and NO reset timestamp in
-the body — the cached usage envelope is the only accurate source, and a short
-default keeps the pool self-healing when even that is absent.
+Cooldowns in this module are process-local; the registry stores durable facts
+only. A cooldown deadline is derived from the best signal a 429 provides.
+OAuth quota rejections commonly omit Retry-After, rate-limit headers, and a
+body reset timestamp, so the cached usage envelope is the most accurate
+fallback. A short default keeps the pool self-healing when no reset signal is
+available.
 """
 
 from __future__ import annotations

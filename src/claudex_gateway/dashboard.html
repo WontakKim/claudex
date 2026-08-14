@@ -300,8 +300,7 @@ body.env-locked .applybar{display:none!important}
 .scard{display:none}
 #tab-settings[data-cat="general"] #scard-general,
 #tab-settings[data-cat="accounts"] #scard-accounts{display:block}
-/* Claude accounts (Settings > Claude Accounts) — mirrors the confirmed probe
-   _design-probes/_accounts-final.html; deviations are bugs. */
+/* The Claude account header keeps identity details and actions aligned. */
 .acct-head{display:flex;align-items:flex-start;justify-content:space-between;gap:14px}
 .acct-head h2{margin:0}
 .acct-head .sub{margin:4px 0 0}
@@ -1597,9 +1596,9 @@ document.querySelectorAll("#tab-settings .rail-item").forEach(function(a){
   });
 });
 /* --- Claude accounts (Settings > Claude Accounts) -------------------------
-   Mirrors _design-probes/_accounts-final.html. The registry GET paints the
-   rows immediately; per-account usage and the local hero's usage fill in
-   async. Rows expand independently — opening one never closes another — and
+   The registry GET paints rows immediately; per-account usage and the local
+   login summary fill in asynchronously. Rows expand independently — opening
+   one never closes another — and
    the open set survives re-renders. No interval polling: fetch on entry,
    the hero's Refresh button, and after a login succeeds. */
 var ACCT_ENV="CLAUDEX_CLAUDE_ACCOUNT_ID";
@@ -1666,7 +1665,7 @@ function acctUsageHtml(row){
     return'<div class="unavail">사용량을 불러올 수 없습니다.'+
       (u.error?'<span class="hint">'+esc(u.error)+"</span>":"")+"</div>";
   var rows=usageWindowsHtml(u);
-  // A queued manual refresh (balanced mode, T-13 Step 5) never fetches
+  // A queued manual refresh (balanced mode, T-/**/13 Step 5) never fetches
   // inline — it must render as "queued", not silently claim a completed
   // refresh, until the coordinator's next poll actually lands.
   var queuedHtml=u.queued?'<div class="ureset queued">사용량 새로고침 대기 중 — 다음 폴링에 반영됩니다</div>':"";
@@ -1783,8 +1782,8 @@ function fetchAccountUsage(){
     renderAcctList();
   }).catch(function(){settle("gateway unreachable")});
 }
-/* Manual refresh (balanced mode only, T-13 Step 5): `?refresh` enqueues a
-   coalesced, rate-limited poll on the balanced coordinator and returns
+/* In balanced mode, `?refresh` enqueues a coalesced, rate-limited poll on
+   the balanced coordinator and returns
    whatever is already cached immediately either way — it never fetches
    inline. A queued request renders via acctUsageHtml's own u.queued check;
    this only needs to adopt the response and surface it wasn't ignored. */

@@ -1,5 +1,4 @@
-"""Persistent registry of registered Claude accounts (Orca-style model: account
-metadata apart from secrets — design: `.docs/design/multi-account-pool.md` §2/§7).
+"""Persistent registry of Claude accounts with metadata kept separate from secrets.
 
 Storage layout, all rooted at `paths.accounts_dir("claude")`::
 
@@ -24,8 +23,8 @@ valid `upstreamAccountUuid` than the one already on file — see
 `oauth-account.json`'s `accountUuid`, or `None` when it cannot be
 established; once known, it is never erased by a later capture that fails.
 
-Registry mutations (`add_account`, `remove_account`) happen only from CLI
-processes and are serialized across processes by `locking.file_lock` on
+Registry mutations (`add_account`, `remove_account`) are serialized across
+processes by `locking.file_lock` on
 `registry.lock`, held for the complete read/check/write of each mutation.
 `add_account` stages the new account directory under a `.staging-<uuid4>`
 name and installs it atomically before the registry is ever allowed to
