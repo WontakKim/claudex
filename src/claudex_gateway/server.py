@@ -2541,7 +2541,11 @@ async def _handle_admin_mapping_put(request: Request) -> JSONResponse:
                 status_code=400,
             )
         try:
-            updates[key] = validate_model_map(key, value)
+            updates[key] = validate_model_map(
+                key,
+                value,
+                known_providers=request.app.state.config.route_providers,
+            )
         except ConfigError as exc:
             return JSONResponse(
                 _openai_error_body("invalid_request_error", str(exc)),
@@ -4226,7 +4230,9 @@ async def _handle_admin_connection_test(request: Request) -> JSONResponse:
     # The target carries the same provider-prefix syntax as model_map values,
     # so the dashboard's test box works for kimi: targets with no UI change.
     try:
-        route = parse_route_target(target)
+        route = parse_route_target(
+            target, request.app.state.config.route_providers
+        )
     except ConfigError as exc:
         return JSONResponse(
             _openai_error_body("invalid_request_error", str(exc)), status_code=400

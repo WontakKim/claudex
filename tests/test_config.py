@@ -6,8 +6,10 @@ from pathlib import Path
 import pytest
 
 from claudex_gateway.config import (
+    BUILTIN_ROUTE_PROVIDERS,
     ConfigError,
     GatewayConfig,
+    OpenAICompatibleProvider,
     RouteTarget,
     parse_claude_account_id,
     parse_claude_account_routing,
@@ -264,6 +266,202 @@ class TestSettingsFile:
         assert config.codex_home == Path.home() / ".codex-alt"
 
 
+class TestCustomProviders:
+    @staticmethod
+    def _write(tmp_path: Path, payload: object) -> Path:
+        settings_file = tmp_path / "settings.json"
+        settings_file.write_text(json.dumps(payload), encoding="utf-8")
+        return settings_file
+
+    @staticmethod
+    def _entry(**overrides: object) -> dict[str, object]:
+        entry: dict[str, object] = {
+            "wire_api": "responses",
+            "base_url": "https://model.example/api/v1",
+            "api_key": "secret-key",
+        }
+        entry.update(overrides)
+        return entry
+
+    @classmethod
+    def _payload(
+        cls,
+        *,
+        name: str = "wrtn",
+        entry: object | None = None,
+    ) -> dict[str, object]:
+        if entry is None:
+            entry = cls._entry()
+        return {
+            "custom_providers": {
+                "openai_compatible": {
+                    name: entry,
+                }
+            }
+        }
+
+    def test_file_dict_form_is_parsed(self, tmp_path: Path) -> None:
+        config = GatewayConfig.load(self._write(tmp_path, self._payload()))
+
+        assert config.custom_providers == {
+            "wrtn": OpenAICompatibleProvider(
+                wire_api="responses",
+                base_url="https://model.example/api/v1",
+                api_key="secret-key",
+            )
+        }
+        assert config.route_providers == (*BUILTIN_ROUTE_PROVIDERS, "wrtn")
+
+    def test_env_json_string_form_is_parsed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        document = self._payload()["custom_providers"]
+        monkeypatch.setenv("CLAUDEX_CUSTOM_PROVIDERS", json.dumps(document))
+
+        assert GatewayConfig.from_env().custom_providers == {
+            "wrtn": OpenAICompatibleProvider(
+                wire_api="responses",
+                base_url="https://model.example/api/v1",
+                api_key="secret-key",
+            )
+        }
+
+    def test_empty_env_means_no_custom_providers(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        settings_file = self._write(tmp_path, self._payload())
+        monkeypatch.setenv("CLAUDEX_CUSTOM_PROVIDERS", "")
+
+        assert GatewayConfig.load(settings_file).custom_providers == {}
+
+    def test_unknown_family_fails_at_boot(self, tmp_path: Path) -> None:
+        settings_file = self._write(
+            tmp_path,
+            {"custom_providers": {"anthropic_compatible": {}}},
+        )
+
+        with pytest.raises(
+            ConfigError,
+            match=(
+                "unknown families: anthropic_compatible.*"
+                "valid families: openai_compatible"
+            ),
+        ):
+            GatewayConfig.load(settings_file)
+
+    def test_unknown_entry_key_fails_at_boot(self, tmp_path: Path) -> None:
+        settings_file = self._write(
+            tmp_path,
+            self._payload(entry=self._entry(timeout_seconds=30)),
+        )
+
+        with pytest.raises(ConfigError, match="unknown keys: timeout_seconds"):
+            GatewayConfig.load(settings_file)
+
+    def test_missing_required_field_fails_at_boot(self, tmp_path: Path) -> None:
+        entry = self._entry()
+        del entry["api_key"]
+        settings_file = self._write(tmp_path, self._payload(entry=entry))
+
+        with pytest.raises(ConfigError, match="missing required keys: api_key"):
+            GatewayConfig.load(settings_file)
+
+    def test_chat_wire_api_fails_with_specific_message(self, tmp_path: Path) -> None:
+        settings_file = self._write(
+            tmp_path,
+            self._payload(entry=self._entry(wire_api="chat")),
+        )
+
+        with pytest.raises(ConfigError) as error:
+            GatewayConfig.load(settings_file)
+
+        message = str(error.value)
+        assert "chat completions upstreams are not supported" in message
+        assert "only 'responses' is valid" in message
+
+    def test_non_https_non_loopback_base_url_fails_at_boot(
+        self, tmp_path: Path
+    ) -> None:
+        settings_file = self._write(
+            tmp_path,
+            self._payload(
+                entry=self._entry(base_url="http://model.example/api/v1")
+            ),
+        )
+
+        with pytest.raises(
+            ConfigError, match="https is required except for http loopback"
+        ):
+            GatewayConfig.load(settings_file)
+
+    def test_http_loopback_base_url_is_allowed(self, tmp_path: Path) -> None:
+        settings_file = self._write(
+            tmp_path,
+            self._payload(
+                entry=self._entry(base_url="http://127.0.0.1:8080/api/v1")
+            ),
+        )
+
+        provider = GatewayConfig.load(settings_file).custom_providers["wrtn"]
+
+        assert provider.base_url == "http://127.0.0.1:8080/api/v1"
+
+    def test_trailing_slashes_are_stripped(self, tmp_path: Path) -> None:
+        settings_file = self._write(
+            tmp_path,
+            self._payload(
+                entry=self._entry(base_url="https://model.example/api/v1///")
+            ),
+        )
+
+        provider = GatewayConfig.load(settings_file).custom_providers["wrtn"]
+
+        assert provider.base_url == "https://model.example/api/v1"
+
+    def test_empty_api_key_fails_at_boot(self, tmp_path: Path) -> None:
+        settings_file = self._write(
+            tmp_path,
+            self._payload(entry=self._entry(api_key="")),
+        )
+
+        with pytest.raises(ConfigError, match="api_key must be a non-empty string"):
+            GatewayConfig.load(settings_file)
+
+    def test_reserved_provider_name_fails_at_boot(self, tmp_path: Path) -> None:
+        settings_file = self._write(tmp_path, self._payload(name="codex"))
+
+        with pytest.raises(
+            ConfigError, match="custom provider name 'codex' is reserved"
+        ):
+            GatewayConfig.load(settings_file)
+
+    def test_invalid_provider_name_fails_at_boot(self, tmp_path: Path) -> None:
+        settings_file = self._write(tmp_path, self._payload(name="Wrtn"))
+
+        with pytest.raises(
+            ConfigError, match="custom provider name 'Wrtn' is invalid"
+        ):
+            GatewayConfig.load(settings_file)
+
+    def test_model_map_unknown_prefix_fails_at_boot(self, tmp_path: Path) -> None:
+        payload = self._payload()
+        payload["model_map"] = {"haiku": "missing:gpt-5.5"}
+        settings_file = self._write(tmp_path, payload)
+
+        with pytest.raises(ConfigError, match="unknown provider prefix 'missing'"):
+            GatewayConfig.load(settings_file)
+
+    def test_model_map_custom_prefix_succeeds(self, tmp_path: Path) -> None:
+        payload = self._payload()
+        payload["model_map"] = {"haiku": "wrtn:gpt-5.5"}
+        config = GatewayConfig.load(self._write(tmp_path, payload))
+
+        assert config.mapped_route("claude-haiku-4-5") == RouteTarget(
+            "wrtn", "gpt-5.5"
+        )
+        assert config.maps_to_provider("wrtn")
+
+
 class TestMappedRoute:
     def test_bare_value_is_rejected(self) -> None:
         # A programmatically built config bypasses load-time validation, so
@@ -365,7 +563,7 @@ class TestParseCompactionModel:
         # Locked contract: "claude" must never become a valid model_map route
         # provider, so parse_route_target keeps rejecting it.
         with pytest.raises(ConfigError, match="unknown provider prefix 'claude'"):
-            parse_route_target("claude:claude-opus-5")
+            parse_route_target("claude:claude-opus-5", BUILTIN_ROUTE_PROVIDERS)
 
 
 class TestCompactionModelSetting:
