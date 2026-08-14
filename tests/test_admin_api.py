@@ -1677,7 +1677,7 @@ def test_dashboard_status_cards_load_as_skeletons(
     with _create_test_client(monkeypatch, tmp_path) as client:
         page = client.get("/").text
 
-    # The cards used to render a one-line "확인 중…" that the loaded content
+    # The cards used to render a one-line "Checking…" status that loaded content
     # then pushed apart. They now ship a skeleton of the same shape instead,
     # so nothing moves when the probes answer.
     assert "확인 중" not in page
@@ -2062,8 +2062,8 @@ def test_dashboard_settings_rail_switches_categories(
 def test_dashboard_accounts_card_mirrors_the_final_probe(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    # Composition per _design-probes/_accounts-final.html: the local CLI hero
-    # leads (the only boxed area), then the 등록 계정 caption with the add
+    # The local CLI hero leads as the only boxed area, then the registered accounts
+    # caption with the add
     # button, then dense flat rows that expand independently.
     with _create_test_client(monkeypatch, tmp_path) as client:
         page = client.get("/").text
@@ -2113,7 +2113,7 @@ def test_dashboard_accounts_fetch_paints_registry_before_usage(
 def test_dashboard_serving_selection_reuses_the_singular_admin_endpoint(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    # 사용/해제 go through the existing PUT /admin/providers/claude/pool/serving; a 409
+    # Serving and unserving go through the existing PUT /admin/providers/claude/pool/serving; a 409
     # env-lock renders the lockband and disables the buttons.
     with _create_test_client(monkeypatch, tmp_path) as client:
         page = client.get("/").text
@@ -2765,7 +2765,7 @@ class TestAdminClaudeAccountsApi:
     def test_local_reports_the_ambient_login_identity(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        # The dashboard's 로컬 CLI 로그인 hero reads this block: identity and
+        # The dashboard's local CLI login hero reads this block: identity and
         # plan metadata from the CLI's own ~/.claude.json — never secrets.
         monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
         client = self._client(monkeypatch, tmp_path)
