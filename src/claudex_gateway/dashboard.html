@@ -1646,9 +1646,8 @@ function routingBadgeHtml(accountId){
 var ACCT_USAGE_SKELETON='<div class="uwin" aria-hidden="true"><div class="uwin-h"><span class="sk">세션 윈도우</span></div>'+
   '<div class="ubar"></div><div class="ureset"><span class="sk">0요일 00:00 리셋 (0시간 0분 후)</span></div></div>';
 function usageWindowsHtml(u){
-  // Outside active balanced mode, pool/usage carries no windows map — u.windows
-  // is then undefined and every lookup below falls back to "no metadata",
-  // rendering exactly as it did before T-16.
+  // Outside active balanced mode, pool/usage carries no windows map. Each
+  // metadata lookup therefore falls back to "no metadata".
   var w=u.windows||{};
   return(u.session?usageWindowHtml("세션 윈도우",u.session,true,w.session):"")+
     (u.weekly?usageWindowHtml("주간 윈도우",u.weekly,true,w.weekly):"")+
@@ -1665,9 +1664,8 @@ function acctUsageHtml(row){
     return'<div class="unavail">사용량을 불러올 수 없습니다.'+
       (u.error?'<span class="hint">'+esc(u.error)+"</span>":"")+"</div>";
   var rows=usageWindowsHtml(u);
-  // A queued manual refresh (balanced mode, T-/**/13 Step 5) never fetches
-  // inline — it must render as "queued", not silently claim a completed
-  // refresh, until the coordinator's next poll actually lands.
+  // A queued manual refresh never fetches inline. It renders as "queued"
+  // until the coordinator's next poll completes the refresh.
   var queuedHtml=u.queued?'<div class="ureset queued">사용량 새로고침 대기 중 — 다음 폴링에 반영됩니다</div>':"";
   return(rows||'<div class="ureset">표시되는 윈도우가 없습니다</div>')+queuedHtml+
     '<div class="age">사용량 <b>'+esc(fmtAgo(u.updated_at))+'</b> 기준</div>';
