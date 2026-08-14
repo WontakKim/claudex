@@ -130,11 +130,7 @@ def _map_claude_window(raw: Any, window_minutes: int) -> dict[str, Any] | None:
 
 
 def _map_fable_weekly_window(data: dict[str, Any]) -> dict[str, Any] | None:
-    """Extract Fable's model-scoped weekly quota, separate from the shared 7-day window.
-
-    Model quotas moved to the structured limits[] entries; the legacy flat
-    fable_* fields are kept as fallbacks for older responses (mirrors Orca).
-    """
+    """Extract Fable's model-scoped weekly quota from structured limits[] entries."""
     limits = data.get("limits")
     scoped = None
     if isinstance(limits, list):
@@ -153,10 +149,6 @@ def _map_fable_weekly_window(data: dict[str, Any]) -> dict[str, Any] | None:
             {"used_percentage": scoped.get("percent"), "resets_at": scoped.get("resets_at")},
             _WEEKLY_WINDOW_MINUTES,
         )
-        if mapped is not None:
-            return mapped
-    for legacy_field in ("fable_weekly", "fable_seven_day", "seven_day_fable"):
-        mapped = _map_claude_window(data.get(legacy_field), _WEEKLY_WINDOW_MINUTES)
         if mapped is not None:
             return mapped
     return None
