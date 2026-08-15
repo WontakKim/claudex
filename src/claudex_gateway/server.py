@@ -14,9 +14,49 @@ import httpx
 from starlette.applications import Starlette
 from starlette.routing import Route
 
-from claudex_gateway import admin_api, paths, server_support
-from claudex_gateway.relay import endpoints as relay_endpoints
+from claudex_gateway import paths, server_support
 from claudex_gateway.account_usage_cache import ClaudeAccountUsageCache
+from claudex_gateway.admin.accounts import (
+    _handle_admin_claude_account_delete,
+    _handle_admin_claude_accounts_get,
+    _handle_admin_claude_accounts_usage,
+    _handle_admin_claude_local_get,
+    _handle_admin_claude_login_code_post,
+    _handle_admin_claude_login_delete,
+    _handle_admin_claude_login_get,
+    _handle_admin_claude_login_post,
+    _handle_admin_claude_login_replace_post,
+    _handle_admin_claude_pool_status,
+)
+from claudex_gateway.admin.common import _handle_health, _handle_hello
+from claudex_gateway.admin.settings import (
+    _handle_admin_claude_routing_get,
+    _handle_admin_claude_routing_put,
+    _handle_admin_claude_serving_delete,
+    _handle_admin_claude_serving_get,
+    _handle_admin_claude_serving_put,
+    _handle_admin_codex_get,
+    _handle_admin_codex_put,
+    _handle_admin_compaction_get,
+    _handle_admin_compaction_put,
+    _handle_admin_log_level_get,
+    _handle_admin_log_level_put,
+    _handle_admin_mapping_get,
+    _handle_admin_mapping_put,
+)
+from claudex_gateway.admin.system import (
+    _handle_admin_codex_models,
+    _handle_admin_codex_reset_credit,
+    _handle_admin_connection_test,
+    _handle_admin_custom_models,
+    _handle_admin_grok_models,
+    _handle_admin_kimi_models,
+    _handle_admin_logs,
+    _handle_admin_usage,
+    _handle_dashboard,
+    _handle_favicon,
+)
+from claudex_gateway.relay import endpoints as relay_endpoints
 from claudex_gateway.claude_account_pool import AccountCooldownTracker
 from claudex_gateway.claude_accounts import AccountRecord, list_accounts
 from claudex_gateway.claude_ambient_account import AmbientAccountProvider, is_duplicate_identity
@@ -190,135 +230,135 @@ def create_app(config: GatewayConfig, daemon_nonce: str | None = None) -> Starle
 
     app = Starlette(
         routes=[
-            Route("/", admin_api._handle_dashboard, methods=["GET"]),
-            Route("/favicon.ico", admin_api._handle_favicon, methods=["GET"]),
+            Route("/", _handle_dashboard, methods=["GET"]),
+            Route("/favicon.ico", _handle_favicon, methods=["GET"]),
             Route("/v1/messages", relay_endpoints._handle_messages, methods=["POST"]),
             Route(
                 "/v1/messages/count_tokens",
                 relay_endpoints._handle_count_tokens,
                 methods=["POST"],
             ),
-            Route("/api/hello", admin_api._handle_hello, methods=["GET"]),
-            Route("/health", admin_api._handle_health, methods=["GET"]),
+            Route("/api/hello", _handle_hello, methods=["GET"]),
+            Route("/health", _handle_health, methods=["GET"]),
             # Admin routes use settings/* for gateway-wide settings and
             # providers/{p}/* for each backend's own surface, with top-level
             # logs/usage/test as cross-cutting
             # observability. No aliases: old paths 404.
-            Route("/admin/settings/mapping", admin_api._handle_admin_mapping_get, methods=["GET"]),
-            Route("/admin/settings/mapping", admin_api._handle_admin_mapping_put, methods=["PUT"]),
+            Route("/admin/settings/mapping", _handle_admin_mapping_get, methods=["GET"]),
+            Route("/admin/settings/mapping", _handle_admin_mapping_put, methods=["PUT"]),
             Route(
-                "/admin/settings/log-level", admin_api._handle_admin_log_level_get, methods=["GET"]
+                "/admin/settings/log-level", _handle_admin_log_level_get, methods=["GET"]
             ),
             Route(
-                "/admin/settings/log-level", admin_api._handle_admin_log_level_put, methods=["PUT"]
+                "/admin/settings/log-level", _handle_admin_log_level_put, methods=["PUT"]
             ),
             Route(
-                "/admin/settings/compaction", admin_api._handle_admin_compaction_get, methods=["GET"]
+                "/admin/settings/compaction", _handle_admin_compaction_get, methods=["GET"]
             ),
             Route(
-                "/admin/settings/compaction", admin_api._handle_admin_compaction_put, methods=["PUT"]
+                "/admin/settings/compaction", _handle_admin_compaction_put, methods=["PUT"]
             ),
-            Route("/admin/settings/codex", admin_api._handle_admin_codex_get, methods=["GET"]),
-            Route("/admin/settings/codex", admin_api._handle_admin_codex_put, methods=["PUT"]),
+            Route("/admin/settings/codex", _handle_admin_codex_get, methods=["GET"]),
+            Route("/admin/settings/codex", _handle_admin_codex_put, methods=["PUT"]),
             Route(
                 "/admin/providers/codex/models",
-                admin_api._handle_admin_codex_models,
+                _handle_admin_codex_models,
                 methods=["GET"],
             ),
             Route(
                 "/admin/providers/codex/reset-credit",
-                admin_api._handle_admin_codex_reset_credit,
+                _handle_admin_codex_reset_credit,
                 methods=["POST"],
             ),
             Route(
-                "/admin/providers/kimi/models", admin_api._handle_admin_kimi_models, methods=["GET"]
+                "/admin/providers/kimi/models", _handle_admin_kimi_models, methods=["GET"]
             ),
             Route(
-                "/admin/providers/grok/models", admin_api._handle_admin_grok_models, methods=["GET"]
+                "/admin/providers/grok/models", _handle_admin_grok_models, methods=["GET"]
             ),
             Route(
                 "/admin/providers/custom/{name}/models",
-                admin_api._handle_admin_custom_models,
+                _handle_admin_custom_models,
                 methods=["GET"],
             ),
             Route(
                 "/admin/providers/claude/local",
-                admin_api._handle_admin_claude_local_get,
+                _handle_admin_claude_local_get,
                 methods=["GET"],
             ),
             Route(
                 "/admin/providers/claude/accounts",
-                admin_api._handle_admin_claude_accounts_get,
+                _handle_admin_claude_accounts_get,
                 methods=["GET"],
             ),
             Route(
                 "/admin/providers/claude/accounts/{account_id}",
-                admin_api._handle_admin_claude_account_delete,
+                _handle_admin_claude_account_delete,
                 methods=["DELETE"],
             ),
             Route(
                 "/admin/providers/claude/login",
-                admin_api._handle_admin_claude_login_get,
+                _handle_admin_claude_login_get,
                 methods=["GET"],
             ),
             Route(
                 "/admin/providers/claude/login",
-                admin_api._handle_admin_claude_login_post,
+                _handle_admin_claude_login_post,
                 methods=["POST"],
             ),
             Route(
                 "/admin/providers/claude/login",
-                admin_api._handle_admin_claude_login_delete,
+                _handle_admin_claude_login_delete,
                 methods=["DELETE"],
             ),
             Route(
                 "/admin/providers/claude/login/code",
-                admin_api._handle_admin_claude_login_code_post,
+                _handle_admin_claude_login_code_post,
                 methods=["POST"],
             ),
             Route(
                 "/admin/providers/claude/login/replace",
-                admin_api._handle_admin_claude_login_replace_post,
+                _handle_admin_claude_login_replace_post,
                 methods=["POST"],
             ),
             Route(
                 "/admin/providers/claude/pool/serving",
-                admin_api._handle_admin_claude_serving_get,
+                _handle_admin_claude_serving_get,
                 methods=["GET"],
             ),
             Route(
                 "/admin/providers/claude/pool/serving",
-                admin_api._handle_admin_claude_serving_put,
+                _handle_admin_claude_serving_put,
                 methods=["PUT"],
             ),
             Route(
                 "/admin/providers/claude/pool/serving",
-                admin_api._handle_admin_claude_serving_delete,
+                _handle_admin_claude_serving_delete,
                 methods=["DELETE"],
             ),
             Route(
                 "/admin/providers/claude/pool/routing",
-                admin_api._handle_admin_claude_routing_get,
+                _handle_admin_claude_routing_get,
                 methods=["GET"],
             ),
             Route(
                 "/admin/providers/claude/pool/routing",
-                admin_api._handle_admin_claude_routing_put,
+                _handle_admin_claude_routing_put,
                 methods=["PUT"],
             ),
             Route(
                 "/admin/providers/claude/pool/status",
-                admin_api._handle_admin_claude_pool_status,
+                _handle_admin_claude_pool_status,
                 methods=["GET"],
             ),
             Route(
                 "/admin/providers/claude/pool/usage",
-                admin_api._handle_admin_claude_accounts_usage,
+                _handle_admin_claude_accounts_usage,
                 methods=["GET"],
             ),
-            Route("/admin/logs", admin_api._handle_admin_logs, methods=["GET"]),
-            Route("/admin/usage", admin_api._handle_admin_usage, methods=["GET"]),
-            Route("/admin/test", admin_api._handle_admin_connection_test, methods=["POST"]),
+            Route("/admin/logs", _handle_admin_logs, methods=["GET"]),
+            Route("/admin/usage", _handle_admin_usage, methods=["GET"]),
+            Route("/admin/test", _handle_admin_connection_test, methods=["POST"]),
         ],
         lifespan=lifespan,
     )

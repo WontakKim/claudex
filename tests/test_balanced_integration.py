@@ -47,6 +47,7 @@ from claudex_gateway.config import GatewayConfig
 from claudex_gateway.grok_auth import GrokCredentials
 from claudex_gateway.kimi_auth import KimiCredentials
 
+import claudex_gateway.admin.settings as admin_settings
 import claudex_gateway.relay.balanced as relay_balanced
 import claudex_gateway.server as server
 import claudex_gateway.server_support as server_support
@@ -237,6 +238,13 @@ def _balanced_body(session_id: str, *, model: str = "claude-sonnet-5") -> dict[s
 
 
 def _enable_balanced(client: TestClient, handler: Any) -> ClaudeBalancedRuntime:
+    routing_put = next(
+        route
+        for route in client.app.routes
+        if route.path == "/admin/providers/claude/pool/routing"
+        and route.methods == {"PUT"}
+    )
+    assert routing_put.endpoint is admin_settings._handle_admin_claude_routing_put
     client.app.state.http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     response = client.put("/admin/providers/claude/pool/routing", json={"mode": "balanced"})
     assert response.status_code == 200, response.text

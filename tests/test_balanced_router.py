@@ -263,7 +263,7 @@ def test_balanced_import_inventory_and_dependency_directions() -> None:
     edges: dict[str, set[str]] = {}
     forbidden_consumers = {
         "claudex_gateway.relay",
-        "claudex_gateway.admin_api",
+        "claudex_gateway.admin",
         "claudex_gateway.server",
     }
 

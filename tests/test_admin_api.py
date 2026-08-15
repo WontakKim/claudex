@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import json
 import logging
@@ -15,7 +16,10 @@ import httpx
 import pytest
 from starlette.testclient import TestClient
 
-import claudex_gateway.admin_api as admin_api
+import claudex_gateway.admin.accounts as admin_accounts
+import claudex_gateway.admin.common as admin_common
+import claudex_gateway.admin.settings as admin_settings
+import claudex_gateway.admin.system as admin_system
 import claudex_gateway.server as server
 import claudex_gateway.server_support as server_support
 from claudex_gateway import claude_accounts, compaction, paths
@@ -25,12 +29,264 @@ from claudex_gateway.codex_client import (
     CodexClient,
     CodexUpstreamError,
 )
-from claudex_gateway.config import GatewayConfig, OpenAICompatibleProvider
+from claudex_gateway.config import ConfigError, GatewayConfig, OpenAICompatibleProvider
 from claudex_gateway.grok_auth import GrokCredentials
 from claudex_gateway.grok_client import GrokClient, GrokUpstreamError
 from claudex_gateway.kimi_auth import KimiCredentials
 from claudex_gateway.kimi_client import KimiClient, KimiUpstreamError
 from claudex_gateway.openai_compatible_client import OpenAICompatibleUpstreamError
+
+
+_ADMIN_SOURCE_ROOT = Path(__file__).resolve().parents[1] / "src" / "claudex_gateway" / "admin"
+_ADMIN_MODULE_NAMES = ("common", "settings", "accounts", "system")
+_ADMIN_MODULE_PATHS = {
+    "common": "claudex_gateway.admin.common",
+    "settings": "claudex_gateway.admin.settings",
+    "accounts": "claudex_gateway.admin.accounts",
+    "system": "claudex_gateway.admin.system",
+}
+_ADMIN_IMPORTED_MODULES = {
+    "common": admin_common,
+    "settings": admin_settings,
+    "accounts": admin_accounts,
+    "system": admin_system,
+}
+_ADMIN_FUNCTION_MANIFEST = {
+    "common": {
+        "_read_json_object",
+        "_handle_hello",
+        "_handle_health",
+        "_admin_guard",
+        "_require_json_content_type",
+    },
+    "settings": {
+        "_mapping_payload",
+        "_handle_admin_mapping_get",
+        "_handle_admin_mapping_put",
+        "_apply_log_level",
+        "_log_level_payload",
+        "_handle_admin_log_level_get",
+        "_handle_admin_log_level_put",
+        "_compaction_payload",
+        "_handle_admin_compaction_get",
+        "_handle_admin_compaction_put",
+        "_codex_payload",
+        "_handle_admin_codex_get",
+        "_handle_admin_codex_put",
+        "_claude_account_payload",
+        "_handle_admin_claude_serving_get",
+        "_claude_account_env_locked",
+        "_handle_admin_claude_serving_put",
+        "_handle_admin_claude_serving_delete",
+        "_claude_routing_payload",
+        "_handle_admin_claude_routing_get",
+        "_persist_claude_routing_mode",
+        "_handle_admin_claude_routing_put",
+    },
+    "accounts": {
+        "_active_balanced_runtime",
+        "_usage_window_state",
+        "_compute_usage_freshness",
+        "_handle_admin_claude_pool_status",
+        "_require_login_attempt",
+        "_local_claude_login_fields",
+        "_account_plan_fields",
+        "_handle_admin_claude_accounts_get",
+        "_handle_admin_claude_local_get",
+        "_handle_admin_claude_account_delete",
+        "_cooling_down_until_millis",
+        "_handle_admin_claude_accounts_usage",
+        "_handle_admin_claude_login_get",
+        "_handle_admin_claude_login_post",
+        "_handle_admin_claude_login_code_post",
+        "_handle_admin_claude_login_replace_post",
+        "_handle_admin_claude_login_delete",
+    },
+    "system": {
+        "_handle_admin_logs",
+        "_handle_admin_usage",
+        "_handle_admin_codex_reset_credit",
+        "_handle_dashboard",
+        "_handle_favicon",
+        "_handle_admin_codex_models",
+        "_handle_admin_grok_models",
+        "_handle_admin_custom_models",
+        "_handle_admin_kimi_models",
+        "_probe_codex_route",
+        "_probe_grok_route",
+        "_probe_custom_route",
+        "_probe_kimi_route",
+        "_handle_admin_connection_test",
+    },
+}
+_ADMIN_CONSTANT_MANIFEST = {
+    "settings": {
+        "_ADMIN_MAP_KEYS",
+        "_LOG_LEVEL_LOGGER_NAMES",
+        "_COMPACTION_KEYS",
+        "_CODEX_KEYS",
+        "_CLAUDE_ACCOUNT_KEYS",
+        "_CLAUDE_ROUTING_KEYS",
+    },
+    "accounts": {
+        "_USAGE_WINDOW_FRESH_MAX_AGE_SECONDS",
+        "_USAGE_WINDOW_AGING_MAX_AGE_SECONDS",
+        "_USAGE_FRESHNESS_BINDING_WINDOWS",
+        "_CLAUDE_LOGIN_CODE_KEYS",
+        "_CLAUDE_LOGIN_REPLACE_KEYS",
+        "_LOGIN_ATTEMPT_HEADER",
+        "_CONTROL_CHARACTER_PATTERN",
+    },
+    "system": {
+        "_STATUS_TO_OPENAI_ERROR_TYPE",
+        "_FAVICON_SVG",
+        "_CONNECTION_TEST_TIMEOUT",
+    },
+}
+
+
+def _admin_module_trees() -> dict[str, ast.Module]:
+    return {
+        module_name: ast.parse(
+            (_ADMIN_SOURCE_ROOT / f"{module_name}.py").read_text(encoding="utf-8")
+        )
+        for module_name in _ADMIN_MODULE_NAMES
+    }
+
+
+def _admin_top_level_functions(tree: ast.Module) -> set[str]:
+    return {
+        node.name
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+    }
+
+
+def _admin_top_level_assignments(tree: ast.Module) -> set[str]:
+    definitions: set[str] = set()
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            definitions.update(
+                target.id for target in node.targets if isinstance(target, ast.Name)
+            )
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            definitions.add(node.target.id)
+    return definitions
+
+
+def _admin_sibling_dependencies(tree: ast.Module) -> set[str]:
+    package_name = "claudex_gateway.admin"
+    dependencies: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported_modules = [alias.name for alias in node.names]
+        elif isinstance(node, ast.ImportFrom):
+            imported_base = node.module or ""
+            if imported_base == package_name:
+                dependencies.update(
+                    alias.name for alias in node.names if alias.name in _ADMIN_MODULE_NAMES
+                )
+            imported_modules = [imported_base]
+        else:
+            continue
+        for imported_module in imported_modules:
+            prefix = f"{package_name}."
+            if not imported_module.startswith(prefix):
+                continue
+            sibling_name = imported_module.removeprefix(prefix).partition(".")[0]
+            if sibling_name in _ADMIN_MODULE_NAMES:
+                dependencies.add(sibling_name)
+    return dependencies
+
+
+def _admin_imported_modules(tree: ast.Module) -> set[str]:
+    imported_modules: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported_modules.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            imported_modules.add(node.module)
+    return imported_modules
+
+
+def _assert_admin_imports_are_used(module_name: str, tree: ast.Module) -> None:
+    loaded_names = {
+        node.id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)
+    }
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            aliases = [
+                (alias.asname or alias.name.split(".")[0], alias.name)
+                for alias in node.names
+            ]
+        elif isinstance(node, ast.ImportFrom):
+            if node.module == "__future__":
+                continue
+            aliases = [(alias.asname or alias.name, alias.name) for alias in node.names]
+        else:
+            continue
+        for local_name, imported_name in aliases:
+            assert imported_name != "*", f"{module_name}: wildcard import"
+            assert local_name in loaded_names, f"{module_name}: unused import {imported_name}"
+
+
+def test_admin_symbols_have_one_canonical_owner() -> None:
+    trees = _admin_module_trees()
+    function_definitions = {
+        module_name: _admin_top_level_functions(tree)
+        for module_name, tree in trees.items()
+    }
+    assignment_definitions = {
+        module_name: _admin_top_level_assignments(tree)
+        for module_name, tree in trees.items()
+    }
+
+    assert function_definitions == _ADMIN_FUNCTION_MANIFEST
+    for expected_owner, symbols in _ADMIN_CONSTANT_MANIFEST.items():
+        for symbol in symbols:
+            actual_owners = [
+                module_name
+                for module_name, definitions in assignment_definitions.items()
+                if symbol in definitions
+            ]
+            assert actual_owners == [expected_owner], (
+                symbol,
+                expected_owner,
+                actual_owners,
+            )
+
+    init_tree = ast.parse((_ADMIN_SOURCE_ROOT / "__init__.py").read_text(encoding="utf-8"))
+    init_body = list(init_tree.body)
+    if (
+        init_body
+        and isinstance(init_body[0], ast.Expr)
+        and isinstance(init_body[0].value, ast.Constant)
+        and isinstance(init_body[0].value.value, str)
+    ):
+        init_body.pop(0)
+    assert not init_body
+    assert {
+        module_name: module.__name__
+        for module_name, module in _ADMIN_IMPORTED_MODULES.items()
+    } == _ADMIN_MODULE_PATHS
+
+
+def test_admin_import_inventory_and_dependency_directions() -> None:
+    trees = _admin_module_trees()
+    edges: dict[str, set[str]] = {}
+    for module_name, tree in trees.items():
+        _assert_admin_imports_are_used(module_name, tree)
+        edges[module_name] = _admin_sibling_dependencies(tree)
+        assert "claudex_gateway.server" not in _admin_imported_modules(tree)
+
+    assert edges == {
+        "common": set(),
+        "settings": {"common"},
+        "accounts": {"common"},
+        "system": {"common"},
+    }
 
 
 class AvailableCodexAuthManager:
@@ -548,7 +804,7 @@ class TestAdminLogLevel:
     ) -> None:
         saved_levels = {
             name: logging.getLogger(name).level
-            for name in admin_api._LOG_LEVEL_LOGGER_NAMES
+            for name in admin_settings._LOG_LEVEL_LOGGER_NAMES
         }
         try:
             with self._admin_client(monkeypatch, tmp_path) as client:
@@ -925,10 +1181,10 @@ class TestAdminCompactionApi:
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         def boom(*_args: Any, **_kwargs: Any) -> None:
-            raise admin_api.ConfigError("disk full")
+            raise ConfigError("disk full")
 
         with self._admin_client(monkeypatch, tmp_path) as client:
-            monkeypatch.setattr(admin_api, "update_settings_file", boom)
+            monkeypatch.setattr(admin_settings, "update_settings_file", boom)
             response = client.put(
                 "/admin/settings/compaction", json={"model": "claude:claude-opus-5"}
             )
@@ -1410,10 +1666,10 @@ def test_admin_usage_returns_all_providers(monkeypatch: pytest.MonkeyPatch, tmp_
         calls.append("grok")
         return {"provider": "grok", "status": "ok", "error": None}
 
-    monkeypatch.setattr(admin_api, "fetch_claude_usage", fake_claude)
-    monkeypatch.setattr(admin_api, "fetch_codex_usage", fake_codex)
-    monkeypatch.setattr(admin_api, "fetch_kimi_usage", fake_kimi)
-    monkeypatch.setattr(admin_api, "fetch_grok_usage", fake_grok)
+    monkeypatch.setattr(admin_system, "fetch_claude_usage", fake_claude)
+    monkeypatch.setattr(admin_system, "fetch_codex_usage", fake_codex)
+    monkeypatch.setattr(admin_system, "fetch_kimi_usage", fake_kimi)
+    monkeypatch.setattr(admin_system, "fetch_grok_usage", fake_grok)
     with _create_test_client(monkeypatch, tmp_path, base_url="http://127.0.0.1:8787") as client:
         response = client.get("/admin/usage")
 
@@ -1447,10 +1703,10 @@ def test_admin_usage_single_provider_skips_the_others(
     async def grok_must_not_run(http_client: Any, auth_manager: Any) -> dict[str, Any]:
         raise AssertionError("grok probe ran for ?provider=claude")
 
-    monkeypatch.setattr(admin_api, "fetch_claude_usage", fake_claude)
-    monkeypatch.setattr(admin_api, "fetch_codex_usage", codex_must_not_run)
-    monkeypatch.setattr(admin_api, "fetch_kimi_usage", kimi_must_not_run)
-    monkeypatch.setattr(admin_api, "fetch_grok_usage", grok_must_not_run)
+    monkeypatch.setattr(admin_system, "fetch_claude_usage", fake_claude)
+    monkeypatch.setattr(admin_system, "fetch_codex_usage", codex_must_not_run)
+    monkeypatch.setattr(admin_system, "fetch_kimi_usage", kimi_must_not_run)
+    monkeypatch.setattr(admin_system, "fetch_grok_usage", grok_must_not_run)
     with _create_test_client(monkeypatch, tmp_path, base_url="http://127.0.0.1:8787") as client:
         response = client.get("/admin/usage", params={"provider": "claude"})
 
@@ -1482,7 +1738,7 @@ def _record_reset_keys(
         keys.append(redeem_request_id)
         return remaining.pop(0)
 
-    monkeypatch.setattr(admin_api, "consume_codex_reset_credit", fake_consume)
+    monkeypatch.setattr(admin_system, "consume_codex_reset_credit", fake_consume)
     return keys
 
 
@@ -1529,7 +1785,7 @@ def test_admin_reset_credit_is_guarded_like_every_other_admin_write(
     def must_not_run(*args: Any, **kwargs: Any) -> None:
         raise AssertionError("a guarded request reached the ChatGPT backend")
 
-    monkeypatch.setattr(admin_api, "consume_codex_reset_credit", must_not_run)
+    monkeypatch.setattr(admin_system, "consume_codex_reset_credit", must_not_run)
 
     # Foreign Host header (DNS-rebinding guard).
     with _create_test_client(monkeypatch, tmp_path) as client:
@@ -1552,7 +1808,7 @@ def test_admin_reset_credit_is_never_reachable_by_GET(
     def must_not_run(*args: Any, **kwargs: Any) -> None:
         raise AssertionError("a GET spent a reset credit")
 
-    monkeypatch.setattr(admin_api, "consume_codex_reset_credit", must_not_run)
+    monkeypatch.setattr(admin_system, "consume_codex_reset_credit", must_not_run)
     with _create_test_client(monkeypatch, tmp_path, base_url="http://127.0.0.1:8787") as client:
         assert client.get("/admin/providers/codex/reset-credit").status_code == 405
 
@@ -2483,6 +2739,13 @@ class TestAdminDashboardApi:
         assert "not configured" in response.json()["error"]["message"]
 
     def test_connection_test_ok(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        probed_targets: list[str] = []
+
+        async def fake_probe(_client: Any, target: str) -> str:
+            probed_targets.append(target)
+            return target
+
+        monkeypatch.setattr(admin_system, "_probe_codex_route", fake_probe)
         with self._client(monkeypatch, tmp_path, codex_client=ProbeCodexClient) as client:
             response = client.post(
                 "/admin/test",
@@ -2495,6 +2758,7 @@ class TestAdminDashboardApi:
         assert result["status"] == 200
         assert result["response_model"] == "gpt-5.6-luna"
         assert isinstance(result["latency_ms"], int)
+        assert probed_targets == ["gpt-5.6-luna"]
 
     def test_connection_test_rejects_bare_target(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -2511,6 +2775,13 @@ class TestAdminDashboardApi:
     def test_connection_test_kimi_target_probes_kimi(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
+        probed_targets: list[str] = []
+
+        async def fake_probe(_client: Any, target: str) -> str:
+            probed_targets.append(target)
+            return target
+
+        monkeypatch.setattr(admin_system, "_probe_kimi_route", fake_probe)
         with self._client(monkeypatch, tmp_path, kimi_client=ProbeKimiClient) as client:
             response = client.post(
                 "/admin/test",
@@ -2522,6 +2793,7 @@ class TestAdminDashboardApi:
         assert result["ok"] is True
         assert result["status"] == 200
         assert result["response_model"] == "k3"
+        assert probed_targets == ["k3"]
 
     def test_connection_test_reports_kimi_error(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -2540,6 +2812,13 @@ class TestAdminDashboardApi:
     def test_connection_test_grok_target_probes_grok(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
+        probed_targets: list[str] = []
+
+        async def fake_probe(_client: Any, target: str) -> str:
+            probed_targets.append(target)
+            return target
+
+        monkeypatch.setattr(admin_system, "_probe_grok_route", fake_probe)
         with self._client(monkeypatch, tmp_path, grok_client=ProbeGrokClient) as client:
             response = client.post(
                 "/admin/test",
@@ -2551,6 +2830,7 @@ class TestAdminDashboardApi:
         assert result["ok"] is True
         assert result["status"] == 200
         assert result["response_model"] == "grok-4.5"
+        assert probed_targets == ["grok-4.5"]
 
     def test_connection_test_reports_grok_error(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -2569,6 +2849,15 @@ class TestAdminDashboardApi:
     def test_connection_test_custom_target_probes_custom_provider(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
+        probed_targets: list[tuple[str, str]] = []
+
+        async def fake_probe(
+            _client: Any, provider_name: str, target: str
+        ) -> str:
+            probed_targets.append((provider_name, target))
+            return target
+
+        monkeypatch.setattr(admin_system, "_probe_custom_route", fake_probe)
         config = GatewayConfig(custom_providers={"wrtn": _custom_provider()})
         with self._client(
             monkeypatch,
@@ -2583,6 +2872,7 @@ class TestAdminDashboardApi:
         assert result["ok"] is True
         assert result["status"] == 200
         assert result["response_model"] == "gpt-5.5"
+        assert probed_targets == [("wrtn", "gpt-5.5")]
 
     def test_connection_test_reports_custom_provider_error(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path

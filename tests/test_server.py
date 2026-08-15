@@ -16,7 +16,8 @@ import httpx
 import pytest
 from starlette.testclient import TestClient
 
-import claudex_gateway.admin_api as admin_api
+import claudex_gateway.admin.settings as admin_settings
+import claudex_gateway.admin.system as admin_system
 import claudex_gateway.relay.openai_backend as relay_openai_backend
 import claudex_gateway.server as server
 import claudex_gateway.server_support as server_support
@@ -29,7 +30,7 @@ from claudex_gateway.balanced.selection import derive_session_key
 from claudex_gateway.balanced.state_model import RestoreValidationContext
 from claudex_gateway.balanced.state_store import ClaudePoolRuntimeStateStore
 from claudex_gateway.codex_client import CodexUpstreamError
-from claudex_gateway.config import GatewayConfig, OpenAICompatibleProvider
+from claudex_gateway.config import ConfigError, GatewayConfig, OpenAICompatibleProvider
 from claudex_gateway.kimi_auth import KimiCredentials
 from claudex_gateway.kimi_client import KimiClient, KimiUpstreamError
 from claudex_gateway.openai_compatible_client import OpenAICompatibleUpstreamError
@@ -186,17 +187,181 @@ def _create_test_client(
 
 
 def test_route_ownership_matches_surface_modules() -> None:
-    app = server.create_app(GatewayConfig())
-    routes = [route for route in app.routes if hasattr(route, "endpoint")]
-    admin_paths = {"/", "/favicon.ico", "/api/hello", "/health"}
-    assert admin_paths <= {route.path for route in routes}
-    assert any(route.path.startswith("/admin/") for route in routes)
+    def route_methods(*methods: str) -> frozenset[str]:
+        result = set(methods)
+        if "GET" in result:
+            result.add("HEAD")
+        return frozenset(result)
 
-    for route in routes:
-        if route.path in admin_paths or route.path.startswith("/admin/"):
-            assert route.endpoint.__module__ == "claudex_gateway.admin_api"
-        elif route.path in {"/v1/messages", "/v1/messages/count_tokens"}:
-            assert route.endpoint.__module__ == "claudex_gateway.relay.endpoints"
+    expected_admin_routes = {
+        ("/", route_methods("GET")): (
+            "claudex_gateway.admin.system",
+            "_handle_dashboard",
+        ),
+        ("/favicon.ico", route_methods("GET")): (
+            "claudex_gateway.admin.system",
+            "_handle_favicon",
+        ),
+        ("/api/hello", route_methods("GET")): (
+            "claudex_gateway.admin.common",
+            "_handle_hello",
+        ),
+        ("/health", route_methods("GET")): (
+            "claudex_gateway.admin.common",
+            "_handle_health",
+        ),
+        ("/admin/settings/mapping", route_methods("GET")): (
+            "claudex_gateway.admin.settings",
+            "_handle_admin_mapping_get",
+        ),
+        ("/admin/settings/mapping", route_methods("PUT")): (
+            "claudex_gateway.admin.settings",
+            "_handle_admin_mapping_put",
+        ),
+        ("/admin/settings/log-level", route_methods("GET")): (
+            "claudex_gateway.admin.settings",
+            "_handle_admin_log_level_get",
+        ),
+        ("/admin/settings/log-level", route_methods("PUT")): (
+            "claudex_gateway.admin.settings",
+            "_handle_admin_log_level_put",
+        ),
+        ("/admin/settings/compaction", route_methods("GET")): (
+            "claudex_gateway.admin.settings",
+            "_handle_admin_compaction_get",
+        ),
+        ("/admin/settings/compaction", route_methods("PUT")): (
+            "claudex_gateway.admin.settings",
+            "_handle_admin_compaction_put",
+        ),
+        ("/admin/settings/codex", route_methods("GET")): (
+            "claudex_gateway.admin.settings",
+            "_handle_admin_codex_get",
+        ),
+        ("/admin/settings/codex", route_methods("PUT")): (
+            "claudex_gateway.admin.settings",
+            "_handle_admin_codex_put",
+        ),
+        ("/admin/providers/codex/models", route_methods("GET")): (
+            "claudex_gateway.admin.system",
+            "_handle_admin_codex_models",
+        ),
+        ("/admin/providers/codex/reset-credit", route_methods("POST")): (
+            "claudex_gateway.admin.system",
+            "_handle_admin_codex_reset_credit",
+        ),
+        ("/admin/providers/kimi/models", route_methods("GET")): (
+            "claudex_gateway.admin.system",
+            "_handle_admin_kimi_models",
+        ),
+        ("/admin/providers/grok/models", route_methods("GET")): (
+            "claudex_gateway.admin.system",
+            "_handle_admin_grok_models",
+        ),
+        ("/admin/providers/custom/{name}/models", route_methods("GET")): (
+            "claudex_gateway.admin.system",
+            "_handle_admin_custom_models",
+        ),
+        ("/admin/providers/claude/local", route_methods("GET")): (
+            "claudex_gateway.admin.accounts",
+            "_handle_admin_claude_local_get",
+        ),
+        ("/admin/providers/claude/accounts", route_methods("GET")): (
+            "claudex_gateway.admin.accounts",
+            "_handle_admin_claude_accounts_get",
+        ),
+        ("/admin/providers/claude/accounts/{account_id}", route_methods("DELETE")): (
+            "claudex_gateway.admin.accounts",
+            "_handle_admin_claude_account_delete",
+        ),
+        ("/admin/providers/claude/login", route_methods("GET")): (
+            "claudex_gateway.admin.accounts",
+            "_handle_admin_claude_login_get",
+        ),
+        ("/admin/providers/claude/login", route_methods("POST")): (
+            "claudex_gateway.admin.accounts",
+            "_handle_admin_claude_login_post",
+        ),
+        ("/admin/providers/claude/login", route_methods("DELETE")): (
+            "claudex_gateway.admin.accounts",
+            "_handle_admin_claude_login_delete",
+        ),
+        ("/admin/providers/claude/login/code", route_methods("POST")): (
+            "claudex_gateway.admin.accounts",
+            "_handle_admin_claude_login_code_post",
+        ),
+        ("/admin/providers/claude/login/replace", route_methods("POST")): (
+            "claudex_gateway.admin.accounts",
+            "_handle_admin_claude_login_replace_post",
+        ),
+        ("/admin/providers/claude/pool/serving", route_methods("GET")): (
+            "claudex_gateway.admin.settings",
+            "_handle_admin_claude_serving_get",
+        ),
+        ("/admin/providers/claude/pool/serving", route_methods("PUT")): (
+            "claudex_gateway.admin.settings",
+            "_handle_admin_claude_serving_put",
+        ),
+        ("/admin/providers/claude/pool/serving", route_methods("DELETE")): (
+            "claudex_gateway.admin.settings",
+            "_handle_admin_claude_serving_delete",
+        ),
+        ("/admin/providers/claude/pool/routing", route_methods("GET")): (
+            "claudex_gateway.admin.settings",
+            "_handle_admin_claude_routing_get",
+        ),
+        ("/admin/providers/claude/pool/routing", route_methods("PUT")): (
+            "claudex_gateway.admin.settings",
+            "_handle_admin_claude_routing_put",
+        ),
+        ("/admin/providers/claude/pool/status", route_methods("GET")): (
+            "claudex_gateway.admin.accounts",
+            "_handle_admin_claude_pool_status",
+        ),
+        ("/admin/providers/claude/pool/usage", route_methods("GET")): (
+            "claudex_gateway.admin.accounts",
+            "_handle_admin_claude_accounts_usage",
+        ),
+        ("/admin/logs", route_methods("GET")): (
+            "claudex_gateway.admin.system",
+            "_handle_admin_logs",
+        ),
+        ("/admin/usage", route_methods("GET")): (
+            "claudex_gateway.admin.system",
+            "_handle_admin_usage",
+        ),
+        ("/admin/test", route_methods("POST")): (
+            "claudex_gateway.admin.system",
+            "_handle_admin_connection_test",
+        ),
+    }
+
+    app = server.create_app(GatewayConfig())
+    admin_paths = {path for path, _methods in expected_admin_routes}
+    admin_routes = [
+        route
+        for route in app.routes
+        if hasattr(route, "endpoint") and route.path in admin_paths
+    ]
+    assert len(admin_routes) == len(expected_admin_routes)
+    assert {
+        (route.path, frozenset(route.methods)): (
+            route.endpoint.__module__,
+            route.endpoint.__name__,
+        )
+        for route in admin_routes
+    } == expected_admin_routes
+
+    relay_routes = {
+        route.path: route.endpoint.__module__
+        for route in app.routes
+        if hasattr(route, "endpoint")
+        and route.path in {"/v1/messages", "/v1/messages/count_tokens"}
+    }
+    assert relay_routes == {
+        "/v1/messages": "claudex_gateway.relay.endpoints",
+        "/v1/messages/count_tokens": "claudex_gateway.relay.endpoints",
+    }
 
 
 def test_messages_routes_enforce_local_bearer_token(
@@ -480,7 +645,7 @@ def _record_reset_keys(
         keys.append(redeem_request_id)
         return remaining.pop(0)
 
-    monkeypatch.setattr(admin_api, "consume_codex_reset_credit", fake_consume)
+    monkeypatch.setattr(admin_system, "consume_codex_reset_credit", fake_consume)
     return keys
 
 
@@ -934,7 +1099,7 @@ class TestBalancedRoutingEnable:
             monkeypatch, tmp_path, config=config, base_url="http://127.0.0.1:8787"
         ) as client:
             with monkeypatch.context() as fault:
-                fault.setattr(admin_api, "update_settings_file", _boom)
+                fault.setattr(admin_settings, "update_settings_file", _boom)
                 failed = client.put(
                     "/admin/providers/claude/pool/routing", json={"mode": "balanced"}
                 )
@@ -1096,7 +1261,7 @@ class TestBalancedRoutingExit:
             return httpx.Response(200, json={"id": "msg_1"})
 
         def _boom(*_args: Any, **_kwargs: Any) -> None:
-            raise admin_api.ConfigError("simulated disk-full settings write")
+            raise ConfigError("simulated disk-full settings write")
 
         settings_file = tmp_path / "settings.json"
         config = GatewayConfig(settings_file=settings_file, claude_account_id=account_id)
@@ -1119,7 +1284,7 @@ class TestBalancedRoutingExit:
             assert runtime.router.pin_count() == 1
 
             with monkeypatch.context() as fault:
-                fault.setattr(admin_api, "update_settings_file", _boom)
+                fault.setattr(admin_settings, "update_settings_file", _boom)
                 failed = client.put(
                     "/admin/providers/claude/pool/routing", json={"mode": "disabled"}
                 )
