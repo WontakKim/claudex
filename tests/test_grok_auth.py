@@ -110,13 +110,16 @@ def test_expiring_token_is_refreshed_and_persisted(tmp_path: Path) -> None:
 
     assert counter["posts"] == 1
     assert credentials.access_token == "rotated-token"
-    persisted = json.loads(auth_file.read_text(encoding="utf-8"))[_SCOPE]
+    persisted_text = auth_file.read_text(encoding="utf-8")
+    persisted_store = json.loads(persisted_text)
+    persisted = persisted_store[_SCOPE]
     assert persisted["key"] == "rotated-token"
     assert persisted["refresh_token"] == "refresh-2"
     assert persisted["expires_at"] > _rfc3339_in(3600)
     # Untouched identity fields survive the rotation.
     assert persisted["email"] == "user@example.com"
     assert persisted["oidc_client_id"] == "client-1"
+    assert persisted_text == json.dumps(persisted_store, indent=2) + "\n"
 
 
 def test_concurrent_forced_refreshes_rotate_only_once(tmp_path: Path) -> None:

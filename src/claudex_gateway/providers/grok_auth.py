@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -22,6 +21,11 @@ from typing import Any
 
 import httpx
 
+from claudex_gateway.providers.auth_support import (
+    load_json_credentials,
+    refresh_when_still_stale,
+    replace_credentials_file,
+)
 from claudex_gateway.upstream_errors import UpstreamAuthError
 
 XAI_ISSUER = "https://auth.x.ai"
@@ -55,6 +59,11 @@ def _parse_expiry(value: object) -> float | None:
     return expiry.timestamp()
 
 
+def _entry_stale(entry: dict[str, Any]) -> bool:
+    expiry = _parse_expiry(entry.get("expires_at"))
+    return expiry is None or expiry - time.time() < _EXPIRY_SKEW_SECONDS
+
+
 def _rfc3339_in(seconds: float) -> str:
     expiry = datetime.now(timezone.utc) + timedelta(seconds=seconds)
     return expiry.isoformat(timespec="milliseconds").replace("+00:00", "Z")
@@ -69,8 +78,7 @@ class GrokAuthManager:
         self._refresh_lock = asyncio.Lock()
 
     async def get_credentials(self, force_refresh: bool = False) -> GrokCredentials:
-        store = self._load_auth_file()
-        scope, entry = _select_entry(store, self._auth_file)
+        store, scope, entry = self._load_selected()
 
         if entry.get("auth_mode") == "api_key":
             return GrokCredentials(
@@ -80,29 +88,17 @@ class GrokAuthManager:
                 user_id=entry.get("user_id"),
             )
 
-        expiry = _parse_expiry(entry.get("expires_at"))
-        needs_refresh = (
-            force_refresh
-            or expiry is None  # OAuth entries always carry an expiry; treat absence as stale
-            or expiry - time.time() < _EXPIRY_SKEW_SECONDS
-        )
+        needs_refresh = force_refresh or _entry_stale(entry)
         if needs_refresh:
-            # Remember which token looked stale: concurrent 401 retries all
-            # force-refresh, and only the first one holding the lock should
-            # actually rotate — with rotating refresh tokens a second POST
-            # for the same generation can invalidate the fresh credentials.
-            # The re-read also picks up a rotation the CLI itself just wrote.
-            stale_access_token = entry.get("key", "")
-            async with self._refresh_lock:
-                store = self._load_auth_file()
-                scope, entry = _select_entry(store, self._auth_file)
-                expiry = _parse_expiry(entry.get("expires_at"))
-                if (
-                    (force_refresh and entry.get("key", "") == stale_access_token)
-                    or expiry is None
-                    or expiry - time.time() < _EXPIRY_SKEW_SECONDS
-                ):
-                    store, entry = await self._refresh_tokens(store, scope, entry)
+            store, scope, entry = await refresh_when_still_stale(
+                self._refresh_lock,
+                force_refresh=force_refresh,
+                stale_token=entry.get("key", ""),
+                reload=self._load_selected,
+                token_of=lambda state: state[2].get("key", ""),
+                is_stale=lambda state: _entry_stale(state[2]),
+                refresh=self._refresh_selected,
+            )
 
         return GrokCredentials(
             access_token=entry["key"],
@@ -111,19 +107,26 @@ class GrokAuthManager:
         )
 
     def _load_auth_file(self) -> dict[str, Any]:
-        try:
-            raw = self._auth_file.read_text(encoding="utf-8")
-        except FileNotFoundError as exc:
-            raise GrokAuthError(
+        return load_json_credentials(
+            self._auth_file,
+            error_cls=GrokAuthError,
+            missing_message=(
                 f"{self._auth_file} not found; install the Grok CLI and run `grok login`"
-            ) from exc
-        try:
-            store = json.loads(raw)
-        except json.JSONDecodeError as exc:
-            raise GrokAuthError(f"{self._auth_file} is not valid JSON: {exc}") from exc
-        if not isinstance(store, dict):
-            raise GrokAuthError(f"{self._auth_file} has an unexpected format")
-        return store
+            ),
+            encoding="utf-8",
+        )
+
+    def _load_selected(self) -> tuple[dict[str, Any], str, dict[str, Any]]:
+        store = self._load_auth_file()
+        scope, entry = _select_entry(store, self._auth_file)
+        return store, scope, entry
+
+    async def _refresh_selected(
+        self, state: tuple[dict[str, Any], str, dict[str, Any]]
+    ) -> tuple[dict[str, Any], str, dict[str, Any]]:
+        store, scope, entry = state
+        new_store, new_entry = await self._refresh_tokens(store, scope, entry)
+        return new_store, scope, new_entry
 
     async def _refresh_tokens(
         self, store: dict[str, Any], scope: str, entry: dict[str, Any]
@@ -181,7 +184,12 @@ class GrokAuthManager:
 
         new_store = dict(store)
         new_store[scope] = new_entry
-        self._persist_auth_file(new_store)
+        replace_credentials_file(
+            self._auth_file,
+            temp_file=self._auth_file.with_name(self._auth_file.name + ".tmp"),
+            text=json.dumps(new_store, indent=2) + "\n",
+            encoding="utf-8",
+        )
         return new_store, new_entry
 
     async def _discover_token_endpoint(self, issuer: str) -> str:
@@ -202,12 +210,6 @@ class GrokAuthManager:
         if not isinstance(token_endpoint, str) or not token_endpoint:
             raise GrokAuthError(f"OIDC discovery response has no token_endpoint: {payload!r}")
         return token_endpoint
-
-    def _persist_auth_file(self, store: dict[str, Any]) -> None:
-        temp_file = self._auth_file.with_name(self._auth_file.name + ".tmp")
-        temp_file.write_text(json.dumps(store, indent=2) + "\n", encoding="utf-8")
-        os.chmod(temp_file, 0o600)
-        os.replace(temp_file, self._auth_file)
 
 
 def _select_entry(store: dict[str, Any], auth_file: Path) -> tuple[str, dict[str, Any]]:
