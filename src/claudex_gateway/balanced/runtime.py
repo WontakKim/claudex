@@ -14,8 +14,8 @@ from claudex_gateway.balanced.polling import ClaudeUsagePollCoordinator, UsagePo
 from claudex_gateway.balanced.router import ClaudeBalancedRouter
 from claudex_gateway.balanced.state_model import RestoreValidationContext
 from claudex_gateway.balanced.state_store import ClaudePoolRuntimeStateStore
-from claudex_gateway.claude_account_profile import load_account_profile_fingerprint
-from claudex_gateway.claude_accounts import AccountRecord, list_accounts
+from claudex_gateway.claude.account_profile import load_account_profile_fingerprint
+from claudex_gateway.claude.accounts import AccountRecord, list_accounts
 
 logger = logging.getLogger(__name__)
 

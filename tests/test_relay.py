@@ -28,10 +28,11 @@ import claudex_gateway.relay.balanced as relay_balanced
 import claudex_gateway.relay.openai_backend as relay_openai_backend
 import claudex_gateway.server as server
 import claudex_gateway.translate.context_overflow as context_overflow
-from claudex_gateway import claude_accounts, compaction, paths
+from claudex_gateway import compaction, paths
+from claudex_gateway.claude import accounts as claude_accounts
 from claudex_gateway.account_usage_cache import ClaudeAccountUsageCache
 from claudex_gateway.claude_account_pool import AccountCooldownTracker
-from claudex_gateway.claude_auth import CLAUDE_TOKEN_URL
+from claudex_gateway.claude.auth import CLAUDE_TOKEN_URL
 from claudex_gateway.balanced.router import ClaudeBalancedRouter
 from claudex_gateway.balanced.runtime import ClaudeBalancedRuntime
 from claudex_gateway.balanced.selection import derive_session_key
@@ -4532,7 +4533,7 @@ def test_balanced_successful_2xx_records_eligible_capability_evidence_for_the_re
         router = runtime.router
         assert router is not None
         record = next(r for r in claude_accounts.list_accounts() if r.id == account_id)
-        from claudex_gateway.claude_account_profile import load_account_profile_fingerprint
+        from claudex_gateway.claude.account_profile import load_account_profile_fingerprint
 
         fingerprint = load_account_profile_fingerprint(paths.accounts_dir("claude") / account_id)
         assert fingerprint is not None

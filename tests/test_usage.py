@@ -14,7 +14,7 @@ import pytest
 from claudex_gateway import claude_usage
 from claudex_gateway.usage import envelope as usage_envelope
 from claudex_gateway.usage import providers as provider_usage
-from claudex_gateway.claude_auth import (
+from claudex_gateway.claude.auth import (
     ClaudeAccountAuthError,
     ClaudeAccountCredentials,
     ClaudeAccountReauthRequiredError,

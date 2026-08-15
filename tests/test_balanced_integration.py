@@ -36,7 +36,8 @@ import pytest
 from starlette.responses import JSONResponse
 from starlette.testclient import TestClient
 
-from claudex_gateway import claude_accounts, paths
+from claudex_gateway import paths
+from claudex_gateway.claude import accounts as claude_accounts
 from claudex_gateway.claude_ambient_account import AmbientClaudeAuthManager
 from claudex_gateway.balanced.router import CAPABILITY_CLASSIFIER_VERSION, ClaudeBalancedRouter
 from claudex_gateway.balanced.runtime import ClaudeBalancedRuntime
@@ -918,7 +919,7 @@ def test_disable_while_streaming_drains_the_in_flight_stream_before_epoch_rotati
     not invalidate that stream's pin or rotate the epoch until the stream
     finishes.
     """
-    from claudex_gateway.claude_accounts import AccountRecord
+    from claudex_gateway.claude.accounts import AccountRecord
 
     account_id = "22222222-3333-4444-5555-666666666666"
     accounts_root = tmp_path / "accounts"

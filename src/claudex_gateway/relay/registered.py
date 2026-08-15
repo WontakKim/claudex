@@ -20,12 +20,12 @@ from claudex_gateway.claude_account_pool import (
     build_serving_chain,
     rate_limit_cooldown_seconds,
 )
-from claudex_gateway.claude_accounts import (
+from claudex_gateway.claude.accounts import (
     AccountRecord,
     AccountRegistryError,
     load_registry,
 )
-from claudex_gateway.claude_auth import (
+from claudex_gateway.claude.auth import (
     ClaudeAccountAuthError,
     ClaudeAccountReauthRequiredError,
 )

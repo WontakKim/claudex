@@ -23,7 +23,8 @@ import claudex_gateway.admin.settings as admin_settings
 import claudex_gateway.admin.system as admin_system
 import claudex_gateway.server as server
 import claudex_gateway.server_support as server_support
-from claudex_gateway import claude_accounts, compaction, paths
+from claudex_gateway import compaction, paths
+from claudex_gateway.claude import accounts as claude_accounts
 from claudex_gateway.providers.codex_client import (
     CODEX_MODELS_URL,
     CODEX_RESPONSES_URL,

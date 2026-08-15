@@ -18,7 +18,8 @@ import pytest
 
 import claudex_gateway.claude.account_model as claude_account_model
 import claudex_gateway.claude.account_store as claude_account_store
-from claudex_gateway import claude_accounts, paths
+from claudex_gateway import paths
+from claudex_gateway.claude import accounts as claude_accounts
 
 
 @pytest.fixture(autouse=True)
@@ -1095,7 +1096,7 @@ def test_orphaned_uuid_directory_is_preserved_and_reported(
 
 _ADD_SCRIPT = """
 import sys
-from claudex_gateway import claude_accounts as ca
+from claudex_gateway.claude import accounts as ca
 
 try:
     record = ca.add_account(sys.argv[1], None, None, {"accessToken": "at"}, None)
@@ -1175,7 +1176,7 @@ def crashing_rename(src, dst):
 
 os.rename = crashing_rename
 
-from claudex_gateway import claude_accounts as ca
+from claudex_gateway.claude import accounts as ca
 ca.remove_account(sys.argv[1])
 print("should not reach here")
 """
@@ -1194,7 +1195,7 @@ def crashing_replace(src, dst):
 
 os.replace = crashing_replace
 
-from claudex_gateway import claude_accounts as ca
+from claudex_gateway.claude import accounts as ca
 
 if sys.argv[1] == "add":
     ca.add_account(sys.argv[2], None, None, {"accessToken": "at"}, None)
@@ -1217,7 +1218,7 @@ def crashing_rename(src, dst):
 
 os.rename = crashing_rename
 
-from claudex_gateway import claude_accounts as ca
+from claudex_gateway.claude import accounts as ca
 ca.add_account(sys.argv[1], None, None, {"accessToken": "at"}, None)
 print("should not reach here")
 """

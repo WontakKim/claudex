@@ -12,13 +12,13 @@ from typing import Any
 import pytest
 
 import claudex_gateway.claude_ambient_account as ambient_module
-from claudex_gateway.claude_accounts import AccountRecord
+from claudex_gateway.claude.accounts import AccountRecord
 from claudex_gateway.claude_ambient_account import (
     AmbientAccountProvider,
     AmbientPoolMember,
     is_duplicate_identity,
 )
-from claudex_gateway.claude_auth import ClaudeAccountAuthError
+from claudex_gateway.claude.auth import ClaudeAccountAuthError
 from claudex_gateway.claude.capture_model import KeychainBackend
 
 _ACCOUNT_UUID = "226432ad-b115-4a79-a152-8420aacbd4b2"

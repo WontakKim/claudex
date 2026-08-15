@@ -11,7 +11,7 @@ from typing import Any
 import httpx
 import pytest
 
-from claudex_gateway.claude_auth import (
+from claudex_gateway.claude.auth import (
     CLAUDE_CLIENT_ID,
     CLAUDE_TOKEN_URL,
     ClaudeAccountAuthError,

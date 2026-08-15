@@ -13,10 +13,10 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 from claudex_gateway import paths
-from claudex_gateway.claude_account_profile import load_account_profile_fingerprint
-from claudex_gateway.claude_accounts import AccountRegistryError, mark_account_needs_reauth
+from claudex_gateway.claude.account_profile import load_account_profile_fingerprint
+from claudex_gateway.claude.accounts import AccountRegistryError, mark_account_needs_reauth
 from claudex_gateway.claude_ambient_account import AmbientAccountProvider, AmbientClaudeAuthManager
-from claudex_gateway.claude_auth import (
+from claudex_gateway.claude.auth import (
     ClaudeAccountAuthManager,
     ClaudeAccountReauthRequiredError,
 )

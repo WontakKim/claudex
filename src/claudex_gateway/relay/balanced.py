@@ -32,7 +32,7 @@ from claudex_gateway.balanced.selection import (
     select_weights,
     warning_factor,
 )
-from claudex_gateway.claude_accounts import (
+from claudex_gateway.claude.accounts import (
     AccountRecord,
     AccountRegistryError,
     load_registry,

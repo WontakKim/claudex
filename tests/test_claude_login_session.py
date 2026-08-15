@@ -21,7 +21,8 @@ from pathlib import Path
 
 import pytest
 
-from claudex_gateway import claude_accounts, paths
+from claudex_gateway import paths
+from claudex_gateway.claude import accounts as claude_accounts
 from claudex_gateway.claude_login_session import (
     ClaudeLoginSession,
     LoginSessionStateError,

@@ -17,7 +17,7 @@ from claudex_gateway.admin.common import (
     _require_json_content_type,
 )
 from claudex_gateway.balanced.runtime import BalancedPrepareError, ClaudeBalancedRuntime
-from claudex_gateway.claude_accounts import AccountRegistryError, list_accounts, load_registry
+from claudex_gateway.claude.accounts import AccountRegistryError, list_accounts, load_registry
 from claudex_gateway.config import (
     SETTINGS_KEYS,
     VALID_CLAUDE_ACCOUNT_ROUTING_MODES,

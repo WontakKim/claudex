@@ -60,7 +60,7 @@ from claudex_gateway.admin.system import (
 )
 from claudex_gateway.relay import endpoints as relay_endpoints
 from claudex_gateway.claude_account_pool import AccountCooldownTracker
-from claudex_gateway.claude_accounts import AccountRecord, list_accounts
+from claudex_gateway.claude.accounts import AccountRecord, list_accounts
 from claudex_gateway.claude_ambient_account import AmbientAccountProvider, is_duplicate_identity
 from claudex_gateway.balanced.polling import UsagePollAccount
 from claudex_gateway.balanced.runtime import ClaudeBalancedRuntime

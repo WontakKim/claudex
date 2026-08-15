@@ -22,9 +22,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .claude_account_profile import compute_account_profile_fingerprint
-from .claude_accounts import AccountRecord
-from .claude_auth import ClaudeAccountAuthError, ClaudeAccountCredentials
+from .claude.account_profile import compute_account_profile_fingerprint
+from .claude.accounts import AccountRecord
+from .claude.auth import ClaudeAccountAuthError, ClaudeAccountCredentials
 from .claude.capture_model import CaptureError, KeychainBackend
 from .claude.keychain import LEGACY_KEYCHAIN_SERVICE, SecurityKeychainBackend
 

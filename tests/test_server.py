@@ -21,7 +21,8 @@ import claudex_gateway.admin.system as admin_system
 import claudex_gateway.relay.openai_backend as relay_openai_backend
 import claudex_gateway.server as server
 import claudex_gateway.server_support as server_support
-from claudex_gateway import claude_accounts, compaction, paths
+from claudex_gateway import compaction, paths
+from claudex_gateway.claude import accounts as claude_accounts
 from claudex_gateway.account_usage_cache import ClaudeAccountUsageCache
 from claudex_gateway.balanced.polling import ClaudeUsagePollCoordinator, UsagePollAccount
 from claudex_gateway.balanced.router import ClaudeBalancedRouter
@@ -1458,7 +1459,7 @@ def test_balanced_request_during_controlled_exit_awaits_and_serves_under_target_
     the ALREADY-published target mode -- never a 503 merely because the
     controlled transition was in flight.
     """
-    from claudex_gateway.claude_accounts import AccountRecord
+    from claudex_gateway.claude.accounts import AccountRecord
     from claudex_gateway.balanced.runtime import ClaudeBalancedRuntime
 
     account_id = "22222222-3333-4444-5555-666666666666"

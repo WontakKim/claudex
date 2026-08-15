@@ -45,7 +45,8 @@ from typing import Any
 
 from pathlib import Path
 
-from claudex_gateway import claude_accounts, paths
+from claudex_gateway import paths
+from claudex_gateway.claude import accounts as claude_accounts
 from claudex_gateway.claude.capture import (
     LEGACY_STATE_UNAVAILABLE,
     LOGIN_LOCK_FILENAME,

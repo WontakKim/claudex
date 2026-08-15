@@ -7,7 +7,7 @@ import sys
 from datetime import datetime, timezone
 from typing import Any
 
-from claudex_gateway import claude_accounts
+from claudex_gateway.claude import accounts as claude_accounts
 from claudex_gateway.claude import capture as claude_capture
 from claudex_gateway.cli import admin_client
 from claudex_gateway.config import ConfigError, GatewayConfig, update_settings_file

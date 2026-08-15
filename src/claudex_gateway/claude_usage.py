@@ -23,7 +23,7 @@ from typing import Any
 
 import httpx
 
-from claudex_gateway.claude_auth import (
+from claudex_gateway.claude.auth import (
     ClaudeAccountAuthError,
     ClaudeAccountAuthManager,
     ClaudeAccountReauthRequiredError,

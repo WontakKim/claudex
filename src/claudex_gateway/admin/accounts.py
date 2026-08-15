@@ -22,7 +22,7 @@ from claudex_gateway.admin.common import (
 )
 from claudex_gateway.balanced.runtime import ClaudeBalancedRuntime
 from claudex_gateway.claude_account_pool import AccountCooldownTracker
-from claudex_gateway.claude_accounts import (
+from claudex_gateway.claude.accounts import (
     AccountNotFoundError,
     AccountRegistryError,
     list_accounts,
