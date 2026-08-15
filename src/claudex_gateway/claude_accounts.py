@@ -48,7 +48,9 @@ import uuid
 from dataclasses import replace
 from typing import Any
 
-from claudex_gateway import claude_account_model, claude_account_store, paths
+from claudex_gateway import paths
+from claudex_gateway.claude import account_model as claude_account_model
+from claudex_gateway.claude import account_store as claude_account_store
 from claudex_gateway.locking import file_lock
 
 AccountRecord = claude_account_model.AccountRecord

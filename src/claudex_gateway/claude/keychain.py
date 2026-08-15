@@ -7,7 +7,7 @@ import os
 import subprocess
 import unicodedata
 
-from claudex_gateway.claude_capture_model import CaptureError, KeychainBackend
+from .capture_model import CaptureError, KeychainBackend
 
 _SECURITY_BIN = "/usr/bin/security"
 # `security`'s documented exit status for "the specified item could not be

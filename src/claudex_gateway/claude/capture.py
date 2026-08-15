@@ -39,13 +39,8 @@ from pathlib import Path
 from typing import Any
 
 from claudex_gateway import locking, paths
-from claudex_gateway.claude_capture_model import (
-    CapturedAccount,
-    CaptureCancelled,
-    CaptureError,
-    KeychainBackend,
-)
-from claudex_gateway.claude_keychain import (
+from .capture_model import CapturedAccount, CaptureCancelled, CaptureError, KeychainBackend
+from .keychain import (
     LEGACY_KEYCHAIN_SERVICE,
     default_keychain_backend,
     keychain_account,

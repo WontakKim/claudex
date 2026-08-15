@@ -12,7 +12,7 @@ import uuid
 from pathlib import Path
 from typing import Any, NoReturn
 
-from claudex_gateway.claude_account_model import (
+from .account_model import (
     AccountRecord,
     AccountRegistryError,
     _is_canonical_uuid,

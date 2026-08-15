@@ -46,7 +46,7 @@ from typing import Any
 from pathlib import Path
 
 from claudex_gateway import claude_accounts, paths
-from claudex_gateway.claude_capture import (
+from claudex_gateway.claude.capture import (
     LEGACY_STATE_UNAVAILABLE,
     LOGIN_LOCK_FILENAME,
     capture_from_config_dir,
@@ -57,8 +57,8 @@ from claudex_gateway.claude_capture import (
     read_legacy_login_fingerprint,
     resolve_claude_executable,
 )
-from claudex_gateway.claude_capture_model import CaptureError
-from claudex_gateway.claude_keychain import default_keychain_backend
+from claudex_gateway.claude.capture_model import CaptureError
+from claudex_gateway.claude.keychain import default_keychain_backend
 from claudex_gateway.locking import FileLockHandle
 
 

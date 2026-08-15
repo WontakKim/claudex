@@ -36,7 +36,8 @@ from pathlib import Path
 
 import pytest
 
-from claudex_gateway import claude_accounts, claude_capture, paths
+from claudex_gateway import claude_accounts, paths
+from claudex_gateway.claude import capture as claude_capture
 from claudex_gateway.cli import accounts, admin_client, daemon
 
 # ---------------------------------------------------------------------------
