@@ -14,7 +14,6 @@ import asyncio
 import base64
 import binascii
 import json
-import os
 import platform
 import socket
 import time
@@ -25,6 +24,11 @@ from typing import Any
 import httpx
 
 import claudex_gateway
+from claudex_gateway.providers.auth_support import (
+    load_json_credentials,
+    refresh_when_still_stale,
+    replace_credentials_file,
+)
 from claudex_gateway.upstream_errors import UpstreamAuthError
 
 KIMI_TOKEN_URL = "https://auth.kimi.com/api/oauth/token"
@@ -82,23 +86,18 @@ class KimiAuthManager:
     async def get_credentials(self, force_refresh: bool = False) -> KimiCredentials:
         auth_data = self._load_credentials_file()
         access_token = auth_data.get("access_token", "")
-        if force_refresh or not access_token or _is_expiring(auth_data):
-            # Remember which token looked stale: concurrent 401 retries all
-            # force-refresh, and only the first one holding the lock should
-            # actually rotate — with rotating refresh tokens a second POST
-            # for the same generation can invalidate the fresh credentials.
-            # The re-read also picks up a rotation the CLI itself just wrote.
+        if force_refresh or _is_stale(auth_data):
             stale_access_token = access_token
-            async with self._refresh_lock:
-                auth_data = self._load_credentials_file()
-                access_token = auth_data.get("access_token", "")
-                if (
-                    (force_refresh and access_token == stale_access_token)
-                    or not access_token
-                    or _is_expiring(auth_data)
-                ):
-                    auth_data = await self._refresh_tokens(auth_data)
-                    access_token = auth_data.get("access_token", "")
+            auth_data = await refresh_when_still_stale(
+                self._refresh_lock,
+                force_refresh=force_refresh,
+                stale_token=stale_access_token,
+                reload=self._load_credentials_file,
+                token_of=lambda state: state.get("access_token", ""),
+                is_stale=_is_stale,
+                refresh=self._refresh_tokens,
+            )
+            access_token = auth_data.get("access_token", "")
         return KimiCredentials(
             access_token=access_token,
             device_id=self._load_device_id(),
@@ -106,20 +105,15 @@ class KimiAuthManager:
         )
 
     def _load_credentials_file(self) -> dict[str, Any]:
-        try:
-            raw = self._credentials_file.read_text(encoding="utf-8")
-        except FileNotFoundError as exc:
-            raise KimiAuthError(
+        return load_json_credentials(
+            self._credentials_file,
+            error_cls=KimiAuthError,
+            missing_message=(
                 f"no Kimi Code credentials at {self._credentials_file}; "
                 "run `kimi login` first"
-            ) from exc
-        try:
-            auth_data = json.loads(raw)
-        except json.JSONDecodeError as exc:
-            raise KimiAuthError(f"{self._credentials_file} is not valid JSON: {exc}") from exc
-        if not isinstance(auth_data, dict):
-            raise KimiAuthError(f"{self._credentials_file} has an unexpected format")
-        return auth_data
+            ),
+            encoding="utf-8",
+        )
 
     def _load_device_id(self) -> str | None:
         # A missing or unreadable device identity never blocks a request; the
@@ -182,14 +176,13 @@ class KimiAuthManager:
             # Without a fresh expiry the old one would claim the new token is
             # already stale; drop it and let the 401 retry path catch decay.
             new_auth.pop("expires_at", None)
-        self._persist_credentials_file(new_auth)
+        replace_credentials_file(
+            self._credentials_file,
+            temp_file=self._credentials_file.with_name(self._credentials_file.name + ".tmp"),
+            text=json.dumps(new_auth, indent=2) + "\n",
+            encoding="utf-8",
+        )
         return new_auth
-
-    def _persist_credentials_file(self, auth_data: dict[str, Any]) -> None:
-        temp_file = self._credentials_file.with_name(self._credentials_file.name + ".tmp")
-        temp_file.write_text(json.dumps(auth_data, indent=2) + "\n", encoding="utf-8")
-        os.chmod(temp_file, 0o600)
-        os.replace(temp_file, self._credentials_file)
 
 
 def _is_expiring(auth_data: dict[str, Any]) -> bool:
@@ -206,3 +199,7 @@ def _is_expiring(auth_data: dict[str, Any]) -> bool:
     if not isinstance(expires_at, (int, float)) or isinstance(expires_at, bool):
         return True
     return float(expires_at) - time.time() < _EXPIRY_SKEW_SECONDS
+
+
+def _is_stale(auth_data: dict[str, Any]) -> bool:
+    return not auth_data.get("access_token", "") or _is_expiring(auth_data)

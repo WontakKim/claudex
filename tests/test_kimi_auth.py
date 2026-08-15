@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import stat
 import time
 from pathlib import Path
 from typing import Any
@@ -93,13 +94,17 @@ def test_concurrent_forced_refreshes_rotate_only_once(tmp_path: Path) -> None:
     assert counter["posts"] == 1
     assert first.access_token == "rotated-token"
     assert second.access_token == "rotated-token"
-    persisted = json.loads((tmp_path / "credentials" / "kimi-code.json").read_text())
+    credentials_file = tmp_path / "credentials" / "kimi-code.json"
+    persisted_text = credentials_file.read_text(encoding="utf-8")
+    persisted = json.loads(persisted_text)
     assert persisted["access_token"] == "rotated-token"
     assert persisted["refresh_token"] == "refresh-2"
     # The CLI's record shape is preserved: epoch expiry plus the granted TTL.
     assert persisted["expires_at"] > time.time()
     assert persisted["expires_in"] == 900
     assert persisted["scope"] == "kimi-code"
+    assert persisted_text == json.dumps(persisted, indent=2) + "\n"
+    assert stat.S_IMODE(credentials_file.stat().st_mode) == 0o600
 
 
 def test_sequential_forced_refreshes_each_rotate(tmp_path: Path) -> None:
