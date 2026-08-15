@@ -108,6 +108,7 @@ _ADMIN_FUNCTION_MANIFEST = {
         "_handle_admin_logs",
         "_handle_admin_usage",
         "_handle_admin_codex_reset_credit",
+        "_serve_dashboard_asset",
         "_handle_dashboard",
         "_handle_dashboard_css",
         "_handle_dashboard_js",

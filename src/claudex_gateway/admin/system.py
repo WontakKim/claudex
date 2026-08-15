@@ -129,24 +129,22 @@ async def _handle_admin_codex_reset_credit(request: Request) -> JSONResponse:
     return JSONResponse(result)
 
 
-if True:
-
-    def _serve_dashboard_asset(basename: str, media_type: str) -> Response:
-        try:
-            text = (
-                importlib.resources.files("claudex_gateway")
-                .joinpath("dashboard", basename)
-                .read_text(encoding="utf-8")
-            )
-        except (FileNotFoundError, OSError) as exc:
-            logger.warning("dashboard asset unavailable: %s", exc)
-            return JSONResponse(
-                server_support._openai_error_body(
-                    "server_error", f"{basename} is missing from the package"
-                ),
-                status_code=500,
-            )
-        return Response(text, media_type=media_type)
+def _serve_dashboard_asset(basename: str, media_type: str) -> Response:
+    try:
+        text = (
+            importlib.resources.files("claudex_gateway")
+            .joinpath("dashboard", basename)
+            .read_text(encoding="utf-8")
+        )
+    except (FileNotFoundError, OSError) as exc:
+        logger.warning("dashboard asset unavailable: %s", exc)
+        return JSONResponse(
+            server_support._openai_error_body(
+                "server_error", f"{basename} is missing from the package"
+            ),
+            status_code=500,
+        )
+    return Response(text, media_type=media_type)
 
 
 async def _handle_dashboard(request: Request) -> Response:
