@@ -17,7 +17,7 @@ import pytest
 from starlette.testclient import TestClient
 
 import claudex_gateway.admin_api as admin_api
-import claudex_gateway.relay as relay
+import claudex_gateway.relay.openai_backend as relay_openai_backend
 import claudex_gateway.server as server
 import claudex_gateway.server_support as server_support
 from claudex_gateway import claude_accounts, compaction, paths
@@ -196,7 +196,7 @@ def test_route_ownership_matches_surface_modules() -> None:
         if route.path in admin_paths or route.path.startswith("/admin/"):
             assert route.endpoint.__module__ == "claudex_gateway.admin_api"
         elif route.path in {"/v1/messages", "/v1/messages/count_tokens"}:
-            assert route.endpoint.__module__ == "claudex_gateway.relay"
+            assert route.endpoint.__module__ == "claudex_gateway.relay.endpoints"
 
 
 def test_messages_routes_enforce_local_bearer_token(
@@ -397,7 +397,7 @@ class TestAdminCompactionApi:
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         with self._admin_client(monkeypatch, tmp_path) as client:
-            relay._assign_compaction_reroute(
+            relay_openai_backend._assign_compaction_reroute(
                 client.app.state,
                 outcome="rerouted",
                 target_model="claude-opus-5",

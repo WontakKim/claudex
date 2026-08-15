@@ -14,7 +14,8 @@ import httpx
 from starlette.applications import Starlette
 from starlette.routing import Route
 
-from claudex_gateway import admin_api, paths, relay, server_support
+from claudex_gateway import admin_api, paths, server_support
+from claudex_gateway.relay import endpoints as relay_endpoints
 from claudex_gateway.account_usage_cache import ClaudeAccountUsageCache
 from claudex_gateway.claude_account_pool import AccountCooldownTracker
 from claudex_gateway.claude_accounts import AccountRecord, list_accounts
@@ -191,9 +192,11 @@ def create_app(config: GatewayConfig, daemon_nonce: str | None = None) -> Starle
         routes=[
             Route("/", admin_api._handle_dashboard, methods=["GET"]),
             Route("/favicon.ico", admin_api._handle_favicon, methods=["GET"]),
-            Route("/v1/messages", relay._handle_messages, methods=["POST"]),
+            Route("/v1/messages", relay_endpoints._handle_messages, methods=["POST"]),
             Route(
-                "/v1/messages/count_tokens", relay._handle_count_tokens, methods=["POST"]
+                "/v1/messages/count_tokens",
+                relay_endpoints._handle_count_tokens,
+                methods=["POST"],
             ),
             Route("/api/hello", admin_api._handle_hello, methods=["GET"]),
             Route("/health", admin_api._handle_health, methods=["GET"]),

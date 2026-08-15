@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import json
 import logging
 import re
 import socket
 import struct
+import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -21,7 +24,8 @@ import pytest
 import uvicorn
 from starlette.testclient import TestClient
 
-import claudex_gateway.relay as relay
+import claudex_gateway.relay.balanced as relay_balanced
+import claudex_gateway.relay.openai_backend as relay_openai_backend
 import claudex_gateway.server as server
 import claudex_gateway.translate.context_overflow as context_overflow
 from claudex_gateway import claude_accounts, compaction, paths
@@ -43,15 +47,126 @@ from claudex_gateway.kimi_client import KimiClient
 from claudex_gateway.openai_compatible_client import OpenAICompatibleUpstreamError
 from claudex_gateway.grok_auth import GrokCredentials
 from claudex_gateway.grok_client import GrokUpstreamError
-from claudex_gateway.relay import (
+from claudex_gateway.relay.common import _upstream_error_to_claude
+from claudex_gateway.relay.kimi import _rewrite_kimi_sse
+from claudex_gateway.relay.openai_backend import (
     _CompactionStreamRelay,
     _OwnedStreamingResponse,
     _aggregate_claude_response,
-    _rewrite_kimi_sse,
     _translate_claude_sse,
-    _upstream_error_to_claude,
 )
 from claudex_gateway.translate import translate_claude_request_to_codex
+
+
+_RELAY_SYMBOL_MANIFEST = {
+    "common": {
+        "_upstream_error_code",
+        "_upstream_error_to_claude",
+        "_format_sse",
+        "_send_to_anthropic",
+        "_relay_anthropic_response",
+    },
+    "registered": {
+        "_claude_account_unavailable",
+        "_claude_account_request_headers",
+        "_rewrite_metadata_account_uuid",
+        "_FailedAttempt",
+        "_replay_buffered_response",
+        "_attempt_with_account",
+        "_passthrough_with_claude_account",
+        "_passthrough_with_claude_pool",
+    },
+    "balanced": {
+        "_install_balanced_quota_cooldown",
+        "_record_balanced_capability_evidence",
+        "_balanced_routing_not_active",
+        "_passthrough_with_claude_balanced",
+        "_balanced_candidates",
+        "_balanced_pick_account",
+        "_balanced_eligible_candidate_set",
+        "_balanced_all_cooling_response",
+        "_passthrough_with_balanced_pool",
+        "_serve_balanced_stateless_message",
+        "_serve_balanced_pinned_message",
+        "_serve_balanced_count_tokens",
+    },
+    "openai_backend": {
+        "_validate_mapped_claude_request",
+        "_relay_via_responses_backend",
+        "_rfc3339_now",
+        "_reject_nonfinite_json",
+        "_assign_compaction_reroute",
+        "_replace_compaction_reroute_if_current",
+        "_reroute_compaction",
+        "_CompactionStreamRelay",
+        "_OwnedStreamingResponse",
+        "_translate_claude_sse",
+        "_aggregate_claude_response",
+    },
+    "kimi": {
+        "_kimi_request_headers",
+        "_kimi_upstream_error_to_claude",
+        "_rewrite_message_start_data",
+        "_rewrite_kimi_sse",
+        "_relay_to_kimi",
+        "_count_tokens_via_kimi",
+    },
+    "endpoints": {
+        "_route_for_request",
+        "_passthrough_to_anthropic",
+        "_handle_messages",
+        "_handle_count_tokens",
+    },
+}
+_RELAY_MANIFEST_SYMBOLS = set().union(*_RELAY_SYMBOL_MANIFEST.values())
+
+
+def test_relay_symbol_manifest_has_one_canonical_owner() -> None:
+    package_root = Path(__file__).resolve().parents[1] / "src/claudex_gateway/relay"
+    node_types = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+    definitions_by_module = {
+        module_name: {
+            node.name
+            for node in ast.parse(
+                (package_root / f"{module_name}.py").read_text(encoding="utf-8")
+            ).body
+            if isinstance(node, node_types)
+        }
+        for module_name in _RELAY_SYMBOL_MANIFEST
+    }
+
+    assert len(_RELAY_MANIFEST_SYMBOLS) == 46
+    assert definitions_by_module == _RELAY_SYMBOL_MANIFEST
+    for symbol in _RELAY_MANIFEST_SYMBOLS:
+        owners = [
+            module_name
+            for module_name, definitions in definitions_by_module.items()
+            if symbol in definitions
+        ]
+        assert owners == [
+            next(
+                module_name
+                for module_name, expected in _RELAY_SYMBOL_MANIFEST.items()
+                if symbol in expected
+            )
+        ]
+
+
+def test_relay_imports_as_private_package_in_clean_subprocess() -> None:
+    moved_symbols = sorted(_RELAY_MANIFEST_SYMBOLS)
+    code = f"""
+import importlib.util
+from pathlib import Path
+
+import claudex_gateway.relay as relay
+import claudex_gateway.relay.endpoints
+
+spec = importlib.util.find_spec("claudex_gateway.relay")
+assert spec is not None and spec.submodule_search_locations is not None
+assert Path(relay.__file__).as_posix().endswith("relay/__init__.py")
+assert not [symbol for symbol in {moved_symbols!r} if hasattr(relay, symbol)]
+"""
+    subprocess.run([sys.executable, "-c", code], check=True)
 
 
 class AvailableCodexAuthManager:
@@ -1276,8 +1391,8 @@ def test_custom_provider_route_uses_custom_client_without_builtin_payload_mutati
     def unexpected_grok_sanitizer(payload: dict[str, Any], model: str) -> dict[str, Any]:
         raise AssertionError("Grok sanitizer must not run for a custom provider")
 
-    monkeypatch.setattr(relay, "sanitize_grok_payload", unexpected_grok_sanitizer)
-    assert relay.sanitize_grok_payload is unexpected_grok_sanitizer
+    monkeypatch.setattr(relay_openai_backend, "sanitize_grok_payload", unexpected_grok_sanitizer)
+    assert relay_openai_backend.sanitize_grok_payload is unexpected_grok_sanitizer
     client, codex_stub = _gateway(
         config,
         _failing_anthropic_handler,
@@ -1753,8 +1868,8 @@ def test_compaction_reroute_success_never_calls_translation(
     def _boom(*_args: Any, **_kwargs: Any) -> Any:
         raise AssertionError("translation must not run when the reroute succeeds")
 
-    monkeypatch.setattr(relay, "translate_claude_request_to_codex", _boom)
-    assert relay.translate_claude_request_to_codex is _boom
+    monkeypatch.setattr(relay_openai_backend, "translate_claude_request_to_codex", _boom)
+    assert relay_openai_backend.translate_claude_request_to_codex is _boom
 
     body = _compaction_body("claude-opus-4-6")
     window = context_overflow.estimate_overflow_prompt_tokens(body) - 1
@@ -1798,7 +1913,7 @@ def test_compaction_reroute_fallback_translates_untouched_original_body_once(
             service_tier=service_tier,
         )
 
-    monkeypatch.setattr(relay, "translate_claude_request_to_codex", recording_translate)
+    monkeypatch.setattr(relay_openai_backend, "translate_claude_request_to_codex", recording_translate)
 
     body = _compaction_body("claude-opus-4-6", thinking_block=True)
     window = context_overflow.estimate_overflow_prompt_tokens(body) - 1
@@ -1903,7 +2018,7 @@ def test_compaction_trigger_absent_setting_never_runs_signal_a_or_estimator(
 ) -> None:
     signal_calls = {"count": 0}
     estimate_calls = {"count": 0}
-    real_is_compaction_request = relay.is_compaction_request
+    real_is_compaction_request = relay_openai_backend.is_compaction_request
     real_estimate = context_overflow.estimate_overflow_prompt_tokens
 
     def counting_is_compaction_request(*args: Any, **kwargs: Any) -> bool:
@@ -1914,9 +2029,9 @@ def test_compaction_trigger_absent_setting_never_runs_signal_a_or_estimator(
         estimate_calls["count"] += 1
         return real_estimate(*args, **kwargs)
 
-    monkeypatch.setattr(relay, "is_compaction_request", counting_is_compaction_request)
+    monkeypatch.setattr(relay_openai_backend, "is_compaction_request", counting_is_compaction_request)
     monkeypatch.setattr(context_overflow, "estimate_overflow_prompt_tokens", counting_estimate)
-    assert relay.is_compaction_request is counting_is_compaction_request
+    assert relay_openai_backend.is_compaction_request is counting_is_compaction_request
     assert context_overflow.estimate_overflow_prompt_tokens is counting_estimate
 
     body = _compaction_body("claude-opus-4-6")
@@ -2240,7 +2355,7 @@ def test_compaction_stream_reroute_fallback_translates_untouched_original_body_w
             service_tier=service_tier,
         )
 
-    monkeypatch.setattr(relay, "translate_claude_request_to_codex", recording_translate)
+    monkeypatch.setattr(relay_openai_backend, "translate_claude_request_to_codex", recording_translate)
 
     body = _compaction_body("claude-opus-4-6", thinking_block=True)
     body["stream"] = True
@@ -2371,7 +2486,7 @@ def test_relay_compaction_stream_explicit_close_closes_upstream_response() -> No
         200, stream=stream, headers={"content-type": "text/event-stream"}
     )
     app_state = SimpleNamespace(compaction_last_reroute=None, compaction_reroute_sequence=0)
-    sequence = relay._assign_compaction_reroute(
+    sequence = relay_openai_backend._assign_compaction_reroute(
         app_state,
         outcome="rerouted",
         target_model=_COMPACTION_CANONICAL_TARGET,
@@ -2415,7 +2530,7 @@ def test_relay_compaction_stream_cancellation_closes_upstream_response() -> None
         200, stream=stream, headers={"content-type": "text/event-stream"}
     )
     app_state = SimpleNamespace(compaction_last_reroute=None, compaction_reroute_sequence=0)
-    sequence = relay._assign_compaction_reroute(
+    sequence = relay_openai_backend._assign_compaction_reroute(
         app_state,
         outcome="rerouted",
         target_model=_COMPACTION_CANONICAL_TARGET,
@@ -2451,7 +2566,7 @@ def test_relay_compaction_stream_stale_failure_does_not_clobber_newer_record() -
     # record (sequence N+1); only afterward does request A's stream fail.
     app_state = SimpleNamespace(compaction_last_reroute=None, compaction_reroute_sequence=0)
 
-    sequence_a = relay._assign_compaction_reroute(
+    sequence_a = relay_openai_backend._assign_compaction_reroute(
         app_state,
         outcome="rerouted",
         target_model=_COMPACTION_CANONICAL_TARGET,
@@ -2460,7 +2575,7 @@ def test_relay_compaction_stream_stale_failure_does_not_clobber_newer_record() -
         context_window=50,
         detail=None,
     )
-    relay._assign_compaction_reroute(
+    relay_openai_backend._assign_compaction_reroute(
         app_state,
         outcome="rerouted",
         target_model=_COMPACTION_CANONICAL_TARGET,
@@ -2506,7 +2621,7 @@ def test_relay_compaction_stream_records_midstream_error_before_terminal_chunk_i
         200, stream=stream, headers={"content-type": "text/event-stream"}
     )
     app_state = _committed_relay_state()
-    sequence = relay._assign_compaction_reroute(
+    sequence = relay_openai_backend._assign_compaction_reroute(
         app_state,
         outcome="rerouted",
         target_model=_COMPACTION_CANONICAL_TARGET,
@@ -2539,7 +2654,7 @@ def test_relay_compaction_stream_aclose_before_first_iteration_closes_upstream()
         200, stream=stream, headers={"content-type": "text/event-stream"}
     )
     app_state = _committed_relay_state()
-    sequence = relay._assign_compaction_reroute(
+    sequence = relay_openai_backend._assign_compaction_reroute(
         app_state,
         outcome="rerouted",
         target_model=_COMPACTION_CANONICAL_TARGET,
@@ -2570,7 +2685,7 @@ def test_owned_streaming_response_closes_iterator_when_send_fails_mid_stream() -
         200, stream=stream, headers={"content-type": "text/event-stream"}
     )
     app_state = _committed_relay_state()
-    sequence = relay._assign_compaction_reroute(
+    sequence = relay_openai_backend._assign_compaction_reroute(
         app_state,
         outcome="rerouted",
         target_model=_COMPACTION_CANONICAL_TARGET,
@@ -3703,7 +3818,7 @@ def test_balanced_repeat_request_reuses_the_existing_pin_without_a_new_placement
         created_flags.append(result.created)
         return result
 
-    monkeypatch.setattr(relay.ClaudeBalancedRouter, "place_session", spy_place_session)
+    monkeypatch.setattr(relay_balanced.ClaudeBalancedRouter, "place_session", spy_place_session)
 
     def handler(request: httpx.Request) -> httpx.Response:
         calls.append(request)
@@ -3773,7 +3888,7 @@ def test_balanced_migration_hop_uses_the_scoring_digest(
     _register_balanced_accounts(2)
     tokens_by_call: list[str] = []
     recorded_digests: list[bytes] = []
-    original_pick_account = relay._balanced_pick_account
+    original_pick_account = relay_balanced._balanced_pick_account
 
     def recording_pick_account(*args: Any, **kwargs: Any) -> str:
         recorded_digests.append(kwargs["session_key_digest"])
@@ -3789,7 +3904,7 @@ def test_balanced_migration_hop_uses_the_scoring_digest(
         monkeypatch, tmp_path, config=GatewayConfig(), base_url="http://127.0.0.1:8787"
     ) as client:
         runtime = _enable_balanced(client, handler)
-        monkeypatch.setattr(relay, "_balanced_pick_account", recording_pick_account)
+        monkeypatch.setattr(relay_balanced, "_balanced_pick_account", recording_pick_account)
         body = _balanced_body(_new_session_id())
 
         response = client.post("/v1/messages", json=body)
@@ -3973,7 +4088,7 @@ def test_balanced_non_streaming_request_commits_at_headers_before_body_relay(
         order.append(f"commit:{result[0]}")
         return result
 
-    monkeypatch.setattr(relay.ClaudeBalancedRouter, "commit_at_headers", spy_commit_at_headers)
+    monkeypatch.setattr(relay_balanced.ClaudeBalancedRouter, "commit_at_headers", spy_commit_at_headers)
 
     class _LoggingByteStream(httpx.AsyncByteStream):
         def __init__(self, body: bytes) -> None:
@@ -4094,7 +4209,7 @@ def test_balanced_unpinnable_retry_chain_reuses_one_stateless_digest_and_creates
     _balanced_env(monkeypatch, tmp_path)
     _register_balanced_accounts(2)
     digest_calls: list[bytes] = []
-    original_derive_stateless_routing_digest = relay.derive_stateless_routing_digest
+    original_derive_stateless_routing_digest = relay_balanced.derive_stateless_routing_digest
 
     def spy_derive_stateless_routing_digest(seed: bytes, nonce: bytes) -> bytes:
         digest = original_derive_stateless_routing_digest(seed, nonce)
@@ -4102,7 +4217,9 @@ def test_balanced_unpinnable_retry_chain_reuses_one_stateless_digest_and_creates
         return digest
 
     monkeypatch.setattr(
-        relay, "derive_stateless_routing_digest", spy_derive_stateless_routing_digest
+        relay_balanced,
+        "derive_stateless_routing_digest",
+        spy_derive_stateless_routing_digest,
     )
 
     tokens_by_call: list[str] = []
@@ -4133,7 +4250,7 @@ def test_balanced_unpinnable_separate_requests_get_independent_stateless_digests
     _balanced_env(monkeypatch, tmp_path)
     _register_balanced_accounts(1)
     digest_calls: list[bytes] = []
-    original_derive_stateless_routing_digest = relay.derive_stateless_routing_digest
+    original_derive_stateless_routing_digest = relay_balanced.derive_stateless_routing_digest
 
     def spy_derive_stateless_routing_digest(seed: bytes, nonce: bytes) -> bytes:
         digest = original_derive_stateless_routing_digest(seed, nonce)
@@ -4141,7 +4258,9 @@ def test_balanced_unpinnable_separate_requests_get_independent_stateless_digests
         return digest
 
     monkeypatch.setattr(
-        relay, "derive_stateless_routing_digest", spy_derive_stateless_routing_digest
+        relay_balanced,
+        "derive_stateless_routing_digest",
+        spy_derive_stateless_routing_digest,
     )
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -4231,8 +4350,8 @@ def test_balanced_count_tokens_resolves_the_same_family_pin_as_messages(
         def fail_fallback_pick(*args: Any, **kwargs: Any) -> str:
             raise AssertionError("fallback pick must not run")
 
-        monkeypatch.setattr(relay, "_balanced_pick_account", fail_fallback_pick)
-        assert relay._balanced_pick_account is fail_fallback_pick
+        monkeypatch.setattr(relay_balanced, "_balanced_pick_account", fail_fallback_pick)
+        assert relay_balanced._balanced_pick_account is fail_fallback_pick
         counted = client.post("/v1/messages/count_tokens", json=body)
 
         assert counted.status_code == 200
@@ -4246,7 +4365,7 @@ def test_balanced_count_tokens_fallback_uses_the_scoring_digest(
     _balanced_env(monkeypatch, tmp_path)
     _register_balanced_accounts(1)
     recorded_digests: list[bytes] = []
-    original_pick_account = relay._balanced_pick_account
+    original_pick_account = relay_balanced._balanced_pick_account
 
     def recording_pick_account(*args: Any, **kwargs: Any) -> str:
         recorded_digests.append(kwargs["session_key_digest"])
@@ -4259,7 +4378,7 @@ def test_balanced_count_tokens_fallback_uses_the_scoring_digest(
         monkeypatch, tmp_path, config=GatewayConfig(), base_url="http://127.0.0.1:8787"
     ) as client:
         runtime = _enable_balanced(client, handler)
-        monkeypatch.setattr(relay, "_balanced_pick_account", recording_pick_account)
+        monkeypatch.setattr(relay_balanced, "_balanced_pick_account", recording_pick_account)
         body = _balanced_body(_new_session_id())
 
         response = client.post("/v1/messages/count_tokens", json=body)

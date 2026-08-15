@@ -47,7 +47,7 @@ from claudex_gateway.config import GatewayConfig
 from claudex_gateway.grok_auth import GrokCredentials
 from claudex_gateway.kimi_auth import KimiCredentials
 
-import claudex_gateway.relay as relay
+import claudex_gateway.relay.balanced as relay_balanced
 import claudex_gateway.server as server
 import claudex_gateway.server_support as server_support
 
@@ -213,7 +213,9 @@ def _capture_balanced_candidate_ids(
         captured.update(records_by_id)
         return JSONResponse({"captured": True})
 
-    monkeypatch.setattr(relay, "_serve_balanced_pinned_message", capture_records)
+    monkeypatch.setattr(
+        relay_balanced, "_serve_balanced_pinned_message", capture_records
+    )
     response = client.post("/v1/messages", json=_balanced_body(str(uuid.uuid4())))
     assert response.status_code == 200
     return captured
@@ -283,7 +285,7 @@ def test_distinct_ambient_login_joins_balanced_candidates_and_serves_request(
         records = claude_accounts.load_registry()
         records_by_id = {record.id: record for record in records}
         records_by_id[member.record.id] = member.record
-        candidates = relay._balanced_candidates(
+        candidates = relay_balanced._balanced_candidates(
             records_by_id.values(), runtime.router, family="default", now=time.monotonic()
         )
         assert {candidate.account_id for candidate in candidates} == {
@@ -294,7 +296,7 @@ def test_distinct_ambient_login_joins_balanced_candidates_and_serves_request(
         for _ in range(100):
             body = _balanced_body(str(uuid.uuid4()))
             session_key = derive_session_key(body, runtime.epoch_seed, "default")
-            selected_id = relay._balanced_pick_account(
+            selected_id = relay_balanced._balanced_pick_account(
                 runtime.router,
                 session_key_digest=session_key.scoring_digest_or_default,
                 model=body["model"],
