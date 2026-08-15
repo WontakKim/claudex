@@ -2157,7 +2157,7 @@ def _compaction_apply_fn(page: str) -> str:
 
 def _lockable_apply_fn(page: str) -> str:
     start = page.index("function applyLockableSetting(config){")
-    end = page.index("/* --- Compaction reroute", start)
+    end = page.index("function applyCompaction(){", start)
     return page[start:end]
 
 
@@ -2341,9 +2341,11 @@ def test_dashboard_compaction_409_branch_refreshes_via_get_not_error_body(
     error_at = locked_branch.index("errDetail(r.body)")
     refresh_at = locked_branch.index("config.refresh()")
     assert lock_at < error_at < refresh_at
-    # The compaction wrapper provides the lock mutation and authenticated GET;
-    # the 409 response body itself is never passed to the state renderer.
-    assert "COMP.locked=true" in apply_fn
+    # The compaction wrapper actually routes through the shared helper and
+    # binds the lock mutation and authenticated GET to the config object; the
+    # 409 response body itself is never passed to the state renderer.
+    assert "applyLockableSetting({" in apply_fn
+    assert "lock:function(){COMP.locked=true}" in apply_fn
     assert 'refresh:function(){return jfetch("/admin/settings/compaction")}' in apply_fn
     assert "renderCompactionState(g.body)" in apply_fn
 
@@ -2361,21 +2363,34 @@ def test_dashboard_compaction_409_refresh_failure_stays_locked(
     shared_apply = _lockable_apply_fn(page)
     apply_fn = _compaction_apply_fn(page)
 
-    # The wrapper validates a successful, well-formed refresh envelope before
-    # handing it to renderCompactionState.
-    guard_at = apply_fn.index('typeof g.body.env_locked==="boolean"')
-    render_at = apply_fn.index("renderCompactionState(g.body)")
-    assert guard_at < render_at
-    assert "g.ok" in apply_fn[:render_at]
-    # The shared failure arm re-locks and re-renders instead of adopting the
-    # malformed body.
-    fresh_guard = shared_apply.index("if(config.isFresh(g)){")
-    adopt_at = shared_apply.index("config.adopt(g)", fresh_guard)
-    failure_arm = shared_apply[adopt_at:]
+    # All refresh invariants live inside the 409 branch itself: refresh, then
+    # the freshness guard, then the ONLY adopt in the branch, then a failure
+    # arm that re-locks and re-renders instead of adopting the malformed body.
+    branch_start = shared_apply.index("r.status===409")
+    branch_end = shared_apply.index("if(!r.ok){", branch_start)
+    locked_branch = shared_apply[branch_start:branch_end]
+    refresh_at = locked_branch.index("config.refresh()")
+    fresh_guard_at = locked_branch.index("if(config.isFresh(g)){", refresh_at)
+    adopt_at = locked_branch.index("config.adopt(g)", fresh_guard_at)
+    assert locked_branch.index("config.adopt(") == adopt_at
+    assert locked_branch.count("config.adopt(") == 1
+    failure_arm = locked_branch[adopt_at:]
     assert "config.lock()" in failure_arm
     assert "config.render()" in failure_arm
-    assert "COMP.locked=true" in apply_fn
-    assert "renderCompactionState(g.body)" in apply_fn
+    # The compaction wrapper routes through the shared helper and binds the
+    # envelope guard to isFresh and the state renderer to adopt, so a
+    # malformed refresh can never reach renderCompactionState.
+    assert "applyLockableSetting({" in apply_fn
+    is_fresh_body = apply_fn[
+        apply_fn.index("isFresh:function(g){") : apply_fn.index("adopt:function(g){")
+    ]
+    assert "g.ok" in is_fresh_body
+    assert 'typeof g.body.env_locked==="boolean"' in is_fresh_body
+    adopt_body = apply_fn[
+        apply_fn.index("adopt:function(g){") : apply_fn.index("envName:")
+    ]
+    assert "renderCompactionState(g.body)" in adopt_body
+    assert "lock:function(){COMP.locked=true}" in apply_fn
     locked_sources = shared_apply + apply_fn
     assert "r.body.model" not in locked_sources
     assert "r.body.env_locked" not in locked_sources
@@ -2616,9 +2631,18 @@ def test_dashboard_routing_locked_renders_readonly(
     )
     shared_apply = _lockable_apply_fn(page)
     apply_fn = _routing_apply_fn(page)
-    assert "r.status===409" in shared_apply
-    assert "config.lock()" in shared_apply
-    assert "ROUTING.locked=true" in apply_fn
+    branch_start = shared_apply.index("r.status===409")
+    branch_end = shared_apply.index("if(!r.ok){", branch_start)
+    assert "config.lock()" in shared_apply[branch_start:branch_end]
+    # The routing wrapper routes through the shared helper and binds its lock,
+    # refresh, and adopt callbacks to the config object.
+    assert "applyLockableSetting({" in apply_fn
+    assert "lock:function(){ROUTING.locked=true}" in apply_fn
+    assert (
+        'refresh:function(){return jfetch("/admin/providers/claude/pool/routing")}'
+        in apply_fn
+    )
+    assert "adopt:function(g){renderRoutingState(g.body)}" in apply_fn
 
 
 def test_dashboard_accounts_surface_routing_status(
