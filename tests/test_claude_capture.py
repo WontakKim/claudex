@@ -20,7 +20,7 @@ from typing import Any
 
 import pytest
 
-from claudex_gateway import claude_capture
+from claudex_gateway import claude_capture, claude_keychain
 from claudex_gateway.claude_capture import CaptureCancelled, CaptureError, CapturedAccount
 
 # ---------------------------------------------------------------------------
@@ -267,28 +267,28 @@ def test_selector_vector_nfc_and_nfd_korean_paths_hash_identically() -> None:
     nfc_path = unicodedata.normalize("NFC", "/tmp/한글-설정")
     nfd_path = unicodedata.normalize("NFD", "/tmp/한글-설정")
     assert nfc_path != nfd_path  # sanity: genuinely distinct byte sequences
-    assert claude_capture._scoped_keychain_service(
+    assert claude_keychain.scoped_keychain_service(
         nfc_path
-    ) == claude_capture._scoped_keychain_service(nfd_path)
+    ) == claude_keychain.scoped_keychain_service(nfd_path)
 
 
 def test_selector_vector_trailing_slash_hashes_differently() -> None:
     base = "/tmp/claude-config"
-    assert claude_capture._scoped_keychain_service(
+    assert claude_keychain.scoped_keychain_service(
         base
-    ) != claude_capture._scoped_keychain_service(base + "/")
+    ) != claude_keychain.scoped_keychain_service(base + "/")
 
 
 def test_selector_vector_repeated_slash_hashes_differently() -> None:
-    assert claude_capture._scoped_keychain_service(
+    assert claude_keychain.scoped_keychain_service(
         "/tmp/claude-config"
-    ) != claude_capture._scoped_keychain_service("/tmp//claude-config")
+    ) != claude_keychain.scoped_keychain_service("/tmp//claude-config")
 
 
 def test_selector_vector_dot_component_hashes_differently() -> None:
-    assert claude_capture._scoped_keychain_service(
+    assert claude_keychain.scoped_keychain_service(
         "/tmp/claude-config"
-    ) != claude_capture._scoped_keychain_service("/tmp/./claude-config")
+    ) != claude_keychain.scoped_keychain_service("/tmp/./claude-config")
 
 
 def test_selector_vector_matches_the_documented_sha256_nfc_derivation() -> None:
@@ -297,7 +297,7 @@ def test_selector_vector_matches_the_documented_sha256_nfc_derivation() -> None:
         unicodedata.normalize("NFC", raw).encode("utf-8")
     ).hexdigest()[:8]
     assert (
-        claude_capture._scoped_keychain_service(raw)
+        claude_keychain.scoped_keychain_service(raw)
         == f"Claude Code-credentials-{expected_suffix}"
     )
 
@@ -307,7 +307,7 @@ def test_selector_vector_account_prefers_user_over_username(
 ) -> None:
     monkeypatch.setenv("USER", "alice")
     monkeypatch.setenv("USERNAME", "bob")
-    assert claude_capture._keychain_account() == "alice"
+    assert claude_keychain.keychain_account() == "alice"
 
 
 def test_selector_vector_account_falls_back_to_username(
@@ -315,7 +315,7 @@ def test_selector_vector_account_falls_back_to_username(
 ) -> None:
     monkeypatch.delenv("USER", raising=False)
     monkeypatch.setenv("USERNAME", "bob")
-    assert claude_capture._keychain_account() == "bob"
+    assert claude_keychain.keychain_account() == "bob"
 
 
 def test_fail_closed_when_user_and_username_are_both_absent(
@@ -324,7 +324,7 @@ def test_fail_closed_when_user_and_username_are_both_absent(
     monkeypatch.delenv("USER", raising=False)
     monkeypatch.delenv("USERNAME", raising=False)
     with pytest.raises(CaptureError):
-        claude_capture._keychain_account()
+        claude_keychain.keychain_account()
 
 
 # ---------------------------------------------------------------------------
@@ -342,13 +342,15 @@ def test_production_backend_classifies_security_exit_codes(
             args, state["returncode"], stdout=state["stdout"], stderr=""
         )
 
-    monkeypatch.setattr(claude_capture, "_run_security", _fake_run_security)
-    backend = claude_capture._SecurityKeychainBackend()
+    monkeypatch.setattr(
+        claude_keychain, claude_keychain._run_security.__name__, _fake_run_security
+    )
+    backend = claude_keychain.SecurityKeychainBackend()
 
     state["returncode"], state["stdout"] = 0, "the-password\n"
     assert backend.read("svc", "acct") == "the-password"
 
-    state["returncode"] = claude_capture._KEYCHAIN_ITEM_NOT_FOUND_STATUS
+    state["returncode"] = claude_keychain._KEYCHAIN_ITEM_NOT_FOUND_STATUS
     assert backend.read("svc", "acct") is None
 
     state["returncode"] = 1
@@ -358,7 +360,7 @@ def test_production_backend_classifies_security_exit_codes(
     state["returncode"] = 0
     backend.delete("svc", "acct")  # must not raise
 
-    state["returncode"] = claude_capture._KEYCHAIN_ITEM_NOT_FOUND_STATUS
+    state["returncode"] = claude_keychain._KEYCHAIN_ITEM_NOT_FOUND_STATUS
     backend.delete("svc", "acct")  # conclusively-missing counts as success
 
     state["returncode"] = 1
@@ -396,17 +398,17 @@ def test_headless_read_only_reads_via_scoped_keychain_on_darwin(
     before_mtime_ns = claude_json_path.stat().st_mtime_ns
 
     backend = _FakeKeychainBackend()
-    service = claude_capture._scoped_keychain_service(config_dir)
+    service = claude_keychain.scoped_keychain_service(config_dir)
     backend.store[(service, "tester")] = json.dumps(
         {"claudeAiOauth": {"accessToken": "tok", "email": "user@example.com"}}
     )
-    monkeypatch.setattr(claude_capture, "_default_keychain_backend", lambda: backend)
+    monkeypatch.setattr(claude_capture, "default_keychain_backend", lambda: backend)
 
     def _forbid_spawn(*_args: object, **_kwargs: object) -> None:
         raise AssertionError("capture_from_config_dir must never spawn a process")
 
     monkeypatch.setattr(claude_capture.subprocess, "Popen", _forbid_spawn)
-    monkeypatch.setattr(claude_capture.subprocess, "run", _forbid_spawn)
+    monkeypatch.setattr(claude_keychain.subprocess, "run", _forbid_spawn)
 
     account = claude_capture.capture_from_config_dir(config_dir)
 
@@ -435,7 +437,7 @@ def test_headless_read_only_reads_credentials_json_file_on_non_darwin(
         raise AssertionError("capture_from_config_dir must never spawn a process")
 
     monkeypatch.setattr(claude_capture.subprocess, "Popen", _forbid_spawn)
-    monkeypatch.setattr(claude_capture.subprocess, "run", _forbid_spawn)
+    monkeypatch.setattr(claude_keychain.subprocess, "run", _forbid_spawn)
 
     account = claude_capture.capture_from_config_dir(str(config_dir))
 
@@ -465,7 +467,7 @@ def test_fail_closed_when_scoped_keychain_item_is_absent(
     monkeypatch.setattr(claude_capture.sys, "platform", "darwin")
     monkeypatch.setenv("USER", "tester")
     backend = _FakeKeychainBackend()
-    monkeypatch.setattr(claude_capture, "_default_keychain_backend", lambda: backend)
+    monkeypatch.setattr(claude_capture, "default_keychain_backend", lambda: backend)
     config_dir = str(tmp_path / "claude-config")
     Path(config_dir).mkdir()
 
@@ -479,7 +481,7 @@ def test_fail_closed_when_keychain_read_operationally_fails(
     monkeypatch.setenv("USER", "tester")
     backend = _FakeKeychainBackend()
     backend.read_failure = CaptureError("Keychain unavailable")
-    monkeypatch.setattr(claude_capture, "_default_keychain_backend", lambda: backend)
+    monkeypatch.setattr(claude_capture, "default_keychain_backend", lambda: backend)
     config_dir = str(tmp_path / "claude-config")
     Path(config_dir).mkdir()
 
@@ -717,10 +719,10 @@ def test_token_sentinels_absent_from_malformed_credentials_error(
     backend = _FakeKeychainBackend()
     config_dir = str(tmp_path / "claude-config")
     Path(config_dir).mkdir()
-    service = claude_capture._scoped_keychain_service(config_dir)
+    service = claude_keychain.scoped_keychain_service(config_dir)
     secret_sentinel = "sk-ant-oat-super-secret-token-value"
     backend.store[(service, "tester")] = f"not valid json but contains {secret_sentinel}"
-    monkeypatch.setattr(claude_capture, "_default_keychain_backend", lambda: backend)
+    monkeypatch.setattr(claude_capture, "default_keychain_backend", lambda: backend)
 
     with pytest.raises(CaptureError) as exc_info:
         claude_capture.capture_from_config_dir(config_dir)
@@ -869,7 +871,7 @@ def test_sighup_during_login_wait_translates_to_capture_cancelled(
 # ---------------------------------------------------------------------------
 
 
-def test_mint_temp_config_dir_retries_on_keychain_collision(
+def testmint_temp_config_dir_retries_on_keychain_collision(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(claude_capture.sys, "platform", "darwin")
@@ -880,10 +882,10 @@ def test_mint_temp_config_dir_retries_on_keychain_collision(
     monkeypatch.setattr(claude_capture.tempfile, "mkdtemp", _sequential_mkdtemp(mkdtemp_root))
 
     first_dir = str(mkdtemp_root / f"{claude_capture._TEMP_DIR_PREFIX}1")
-    colliding_service = claude_capture._scoped_keychain_service(first_dir)
+    colliding_service = claude_keychain.scoped_keychain_service(first_dir)
     backend.store[(colliding_service, "tester")] = "occupied by another login"
 
-    result = claude_capture._mint_temp_config_dir(backend)
+    result = claude_capture.mint_temp_config_dir(backend)
 
     assert result != first_dir
     assert not Path(first_dir).exists()  # discarded, never touched via delete
@@ -891,7 +893,7 @@ def test_mint_temp_config_dir_retries_on_keychain_collision(
     assert all(call.op == "read" for call in backend.calls)  # never deletes a collision
 
 
-def test_mint_temp_config_dir_gives_up_after_max_attempts(
+def testmint_temp_config_dir_gives_up_after_max_attempts(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(claude_capture.sys, "platform", "darwin")
@@ -905,19 +907,19 @@ def test_mint_temp_config_dir_gives_up_after_max_attempts(
         counter["n"] += 1
         candidate = mkdtemp_root / f"{prefix}{counter['n']}"
         candidate.mkdir()
-        service = claude_capture._scoped_keychain_service(str(candidate))
+        service = claude_keychain.scoped_keychain_service(str(candidate))
         backend.store[(service, "tester")] = "occupied"
         return str(candidate)
 
     monkeypatch.setattr(claude_capture.tempfile, "mkdtemp", _always_colliding_mkdtemp)
 
     with pytest.raises(CaptureError):
-        claude_capture._mint_temp_config_dir(backend)
+        claude_capture.mint_temp_config_dir(backend)
 
     assert counter["n"] == claude_capture._MAX_TEMP_DIR_ATTEMPTS
 
 
-def test_mint_temp_config_dir_skips_keychain_check_on_non_darwin(
+def testmint_temp_config_dir_skips_keychain_check_on_non_darwin(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(claude_capture.sys, "platform", "linux")
@@ -926,7 +928,7 @@ def test_mint_temp_config_dir_skips_keychain_check_on_non_darwin(
     mkdtemp_root.mkdir()
     monkeypatch.setattr(claude_capture.tempfile, "mkdtemp", _sequential_mkdtemp(mkdtemp_root))
 
-    result = claude_capture._mint_temp_config_dir(backend)
+    result = claude_capture.mint_temp_config_dir(backend)
 
     assert Path(result).exists()
     assert backend.calls == []
@@ -945,10 +947,10 @@ def test_cleanup_deletes_scoped_item_and_removes_temp_dir(
     backend = _FakeKeychainBackend()
     config_dir = tmp_path / "config"
     config_dir.mkdir()
-    service = claude_capture._scoped_keychain_service(str(config_dir))
+    service = claude_keychain.scoped_keychain_service(str(config_dir))
     backend.store[(service, "tester")] = "payload"
 
-    claude_capture._cleanup_temp_config_dir(str(config_dir), backend)
+    claude_capture.cleanup_temp_config_dir(str(config_dir), backend)
 
     assert backend.store == {}
     assert not config_dir.exists()
@@ -965,7 +967,7 @@ def test_cleanup_attempts_both_actions_and_raises_when_either_fails(
     config_dir.mkdir()
 
     with pytest.raises(CaptureError):
-        claude_capture._cleanup_temp_config_dir(str(config_dir), backend)
+        claude_capture.cleanup_temp_config_dir(str(config_dir), backend)
 
     # The directory removal was still attempted despite the Keychain failure.
     assert not config_dir.exists()
@@ -993,10 +995,10 @@ def test_capture_interactive_succeeds_end_to_end_with_fake_keychain(
     mkdtemp_root.mkdir()
     monkeypatch.setattr(claude_capture.tempfile, "mkdtemp", _sequential_mkdtemp(mkdtemp_root))
     predicted_config_dir = str(mkdtemp_root / f"{claude_capture._TEMP_DIR_PREFIX}1")
-    service = claude_capture._scoped_keychain_service(predicted_config_dir)
+    service = claude_keychain.scoped_keychain_service(predicted_config_dir)
 
     backend = _FakeKeychainBackend()
-    monkeypatch.setattr(claude_capture, "_default_keychain_backend", lambda: backend)
+    monkeypatch.setattr(claude_capture, "default_keychain_backend", lambda: backend)
 
     def _fake_run_login(
         claude_path: str, config_dir: str, timeout_secs: int, scope: Any = None
@@ -1021,7 +1023,7 @@ def test_capture_interactive_succeeds_end_to_end_with_fake_keychain(
     # Legacy-baseline fingerprint read, mint collision precheck read, capture
     # read, cleanup delete — and no failure-path legacy recheck on success.
     assert [call.op for call in backend.calls] == ["read", "read", "read", "delete"]
-    assert backend.calls[0].service == claude_capture._LEGACY_KEYCHAIN_SERVICE
+    assert backend.calls[0].service == claude_keychain.LEGACY_KEYCHAIN_SERVICE
 
 
 # ---------------------------------------------------------------------------
@@ -1049,11 +1051,11 @@ def _legacy_detection_fixture(
     monkeypatch.setattr(claude_capture.tempfile, "mkdtemp", _sequential_mkdtemp(mkdtemp_root))
 
     backend = _FakeKeychainBackend()
-    monkeypatch.setattr(claude_capture, "_default_keychain_backend", lambda: backend)
+    monkeypatch.setattr(claude_capture, "default_keychain_backend", lambda: backend)
     return backend
 
 
-_LEGACY_KEY = (claude_capture._LEGACY_KEYCHAIN_SERVICE, "tester")
+_LEGACY_KEY = (claude_keychain.LEGACY_KEYCHAIN_SERVICE, "tester")
 
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="legacy Keychain detection is macOS-only")
@@ -1074,12 +1076,12 @@ def test_failed_capture_warns_when_login_wrote_the_legacy_item(
 
     err = capsys.readouterr().err
     assert "WARNING" in err
-    assert claude_capture._LEGACY_KEYCHAIN_SERVICE in err
+    assert claude_keychain.LEGACY_KEYCHAIN_SERVICE in err
     # Detection is strictly read-only: the mis-scoped legacy write is
     # reported, never deleted or overwritten.
     assert backend.store == {_LEGACY_KEY: "credentials-in-the-wrong-place"}
     assert not any(
-        call.op == "delete" and call.service == claude_capture._LEGACY_KEYCHAIN_SERVICE
+        call.op == "delete" and call.service == claude_keychain.LEGACY_KEYCHAIN_SERVICE
         for call in backend.calls
     )
 
@@ -1130,14 +1132,14 @@ def test_unreadable_legacy_item_disables_detection_without_blocking_capture(
 ) -> None:
     class _LegacyFailingBackend(_FakeKeychainBackend):
         def read(self, service: str, account: str) -> str | None:
-            if service == claude_capture._LEGACY_KEYCHAIN_SERVICE:
+            if service == claude_keychain.LEGACY_KEYCHAIN_SERVICE:
                 self.calls.append(_KeychainCall("read", service, account))
                 raise CaptureError("keychain unavailable")
             return super().read(service, account)
 
     _legacy_detection_fixture(tmp_path, monkeypatch)
     failing_backend = _LegacyFailingBackend()
-    monkeypatch.setattr(claude_capture, "_default_keychain_backend", lambda: failing_backend)
+    monkeypatch.setattr(claude_capture, "default_keychain_backend", lambda: failing_backend)
 
     def _login_writes_legacy_item(
         claude_path: str, config_dir: str, timeout_secs: int, scope: Any = None
@@ -1182,10 +1184,10 @@ def _interactive_fixture(
     mkdtemp_root.mkdir()
     monkeypatch.setattr(claude_capture.tempfile, "mkdtemp", _sequential_mkdtemp(mkdtemp_root))
     predicted_config_dir = str(mkdtemp_root / f"{claude_capture._TEMP_DIR_PREFIX}1")
-    service = claude_capture._scoped_keychain_service(predicted_config_dir)
+    service = claude_keychain.scoped_keychain_service(predicted_config_dir)
 
     backend = _FakeKeychainBackend()
-    monkeypatch.setattr(claude_capture, "_default_keychain_backend", lambda: backend)
+    monkeypatch.setattr(claude_capture, "default_keychain_backend", lambda: backend)
 
     def _fake_run_login(
         claude_path: str, config_dir: str, timeout_secs: int, scope: Any = None
@@ -1206,7 +1208,7 @@ def test_sigterm_during_credential_capture_cancels_after_full_cleanup(
 ) -> None:
     backend, predicted_config_dir, _service = _interactive_fixture(tmp_path, monkeypatch)
 
-    real_capture_impl = claude_capture._capture_from_config_dir_impl
+    real_capture_impl = claude_capture.capture_from_config_dir
 
     def _signalled_capture_impl(config_dir: str, keychain: Any) -> CapturedAccount:
         # The login child has already exited; the cancel lands while the
@@ -1214,7 +1216,7 @@ def test_sigterm_during_credential_capture_cancels_after_full_cleanup(
         os.kill(os.getpid(), signal.SIGTERM)
         return real_capture_impl(config_dir, keychain)
 
-    monkeypatch.setattr(claude_capture, "_capture_from_config_dir_impl", _signalled_capture_impl)
+    monkeypatch.setattr(claude_capture, "capture_from_config_dir", _signalled_capture_impl)
 
     with pytest.raises(CaptureCancelled):
         claude_capture.capture_interactive(timeout_secs=10)
@@ -1272,7 +1274,7 @@ def test_second_signal_during_process_group_grace_is_deferred(
     predicted_config_dir = Path(mkdtemp_root / f"{claude_capture._TEMP_DIR_PREFIX}1")
 
     backend = _FakeKeychainBackend()
-    monkeypatch.setattr(claude_capture, "_default_keychain_backend", lambda: backend)
+    monkeypatch.setattr(claude_capture, "default_keychain_backend", lambda: backend)
 
     pids: dict[str, int] = {}
 
@@ -1355,7 +1357,7 @@ def test_second_sigint_during_cleanup_is_deferred_and_both_actions_complete(
     def _interrupted_capture_impl(config_dir: str, keychain: Any) -> CapturedAccount:
         raise KeyboardInterrupt
 
-    monkeypatch.setattr(claude_capture, "_capture_from_config_dir_impl", _interrupted_capture_impl)
+    monkeypatch.setattr(claude_capture, "capture_from_config_dir", _interrupted_capture_impl)
 
     real_delete = _FakeKeychainBackend.delete
 
@@ -1379,7 +1381,7 @@ def test_second_sigint_during_cleanup_is_deferred_and_both_actions_complete(
 # ---------------------------------------------------------------------------
 
 
-def test_resolve_claude_executable_absolutizes_a_relative_path_entry(
+def testresolve_claude_executable_absolutizes_a_relative_path_entry(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     bin_dir = tmp_path / "bin"
@@ -1388,7 +1390,7 @@ def test_resolve_claude_executable_absolutizes_a_relative_path_entry(
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("PATH", "bin")  # relative PATH entry
 
-    resolved = claude_capture._resolve_claude_executable()
+    resolved = claude_capture.resolve_claude_executable()
 
     assert os.path.isabs(resolved)
     assert Path(resolved) == bin_dir / "claude"
@@ -1434,7 +1436,7 @@ def test_keychain_credentials_blob_over_byte_cap_is_rejected(
     monkeypatch.setenv("USER", "tester")
     config_dir = str(tmp_path / "config")
     Path(config_dir).mkdir()
-    service = claude_capture._scoped_keychain_service(config_dir)
+    service = claude_keychain.scoped_keychain_service(config_dir)
 
     backend = _FakeKeychainBackend()
     oversized = '{"pad": "' + "x" * (claude_capture._SOURCE_FILE_BYTE_CAP + 1) + '"}'
@@ -1499,12 +1501,12 @@ def test_real_keychain_integration_found_missing_and_legacy_item_untouched(
     import pwd
 
     monkeypatch.setenv("HOME", pwd.getpwuid(os.getuid()).pw_dir)
-    backend = claude_capture._SecurityKeychainBackend()
+    backend = claude_keychain.SecurityKeychainBackend()
     account = os.environ.get("USER") or os.environ.get("USERNAME")
     assert account, "USER/USERNAME must be set to run the real-Keychain integration test"
 
     config_dir = str(tmp_path / f"claudex-test-real-keychain-{uuid.uuid4().hex[:8]}")
-    service = claude_capture._scoped_keychain_service(config_dir)
+    service = claude_keychain.scoped_keychain_service(config_dir)
 
     legacy_service = "Claude Code-credentials"
     # Metadata only: never read the real legacy item's secret (see helper).

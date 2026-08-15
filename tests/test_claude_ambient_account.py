@@ -19,7 +19,7 @@ from claudex_gateway.claude_ambient_account import (
     is_duplicate_identity,
 )
 from claudex_gateway.claude_auth import ClaudeAccountAuthError
-from claudex_gateway.claude_capture import KeychainBackend
+from claudex_gateway.claude_capture_model import KeychainBackend
 
 _ACCOUNT_UUID = "226432ad-b115-4a79-a152-8420aacbd4b2"
 _ORGANIZATION_UUID = "8ccaa9d3-2bb1-4447-a09b-b35467e47a9e"

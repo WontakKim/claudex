@@ -13,7 +13,7 @@ Neither entry point writes the account registry; both return a
 `CapturedAccount` for the caller to persist.
 
 Only Claude Code builds that store credentials in a *scoped* macOS Keychain
-item (`Claude Code-credentials-<hex[:8]>`, see `_scoped_keychain_service`)
+item (`Claude Code-credentials-<hex[:8]>`, see `scoped_keychain_service`)
 are supported. The legacy unscoped Keychain item is never a credential
 source, never written, and never deleted: when the expected scoped item is
 absent, capture fails closed with a `CaptureError` naming the expected
@@ -35,73 +35,28 @@ import sys
 import tempfile
 import time
 import unicodedata
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any
 
 from claudex_gateway import locking, paths
-
-# ---------------------------------------------------------------------------
-# Public data types
-# ---------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class CapturedAccount:
-    credentials_json: dict[str, Any]
-    oauth_account_json: dict[str, Any] | None
-    email: str
-    organization_uuid: str | None
-    organization_name: str | None
-
-
-class CaptureError(Exception):
-    """Raised when Claude credential capture fails."""
-
-
-class CaptureCancelled(CaptureError):
-    """Raised when the user cancels an interactive login (SIGINT/SIGTERM/SIGHUP).
-
-    Distinct from a plain `CaptureError` so a caller (the CLI) can map
-    cancellation to exit 130 instead of a generic failure exit code.
-    """
-
-
-class KeychainBackend(Protocol):
-    """Reads and deletes macOS Keychain generic-password items.
-
-    `read` is tri-state: a string password means the item was found; `None`
-    means the Keychain conclusively reported that no such item exists (the
-    documented item-not-found exit); any other outcome is an operational
-    failure and must raise `CaptureError`. `delete` treats
-    conclusively-missing as success and raises `CaptureError` for every
-    other failure. Both operations must apply a bounded timeout and always
-    reap the subprocess they spawn.
-    """
-
-    def read(self, service: str, account: str) -> str | None: ...
-
-    def delete(self, service: str, account: str) -> None: ...
-
+from claudex_gateway.claude_capture_model import (
+    CapturedAccount,
+    CaptureCancelled,
+    CaptureError,
+    KeychainBackend,
+)
+from claudex_gateway.claude_keychain import (
+    LEGACY_KEYCHAIN_SERVICE,
+    default_keychain_backend,
+    keychain_account,
+    scoped_keychain_service,
+)
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
-_SECURITY_BIN = "/usr/bin/security"
-# `security`'s documented exit status for "the specified item could not be
-# found in the keychain" (SecKeychainSearchCopyNext errSecItemNotFound).
-_KEYCHAIN_ITEM_NOT_FOUND_STATUS = 44
-_KEYCHAIN_TIMEOUT_SECONDS = 5.0
-
-# Capture only ever addresses the scoped service form below as a credential
-# source. The legacy unscoped service name exists solely for read-only change
-# detection (`_read_legacy_login_fingerprint`): it is never captured from,
-# never written, and never deleted.
-_KEYCHAIN_SERVICE_FORMAT = "Claude Code-credentials-{suffix}"
-_LEGACY_KEYCHAIN_SERVICE = "Claude Code-credentials"
-
-_LOGIN_LOCK_FILENAME = "claude-capture.lock"
+LOGIN_LOCK_FILENAME = "claude-capture.lock"
 _TEMP_DIR_PREFIX = "claudex-claude-login-"
 _MAX_TEMP_DIR_ATTEMPTS = 3
 _PROCESS_GROUP_GRACE_SECONDS = 5.0
@@ -128,91 +83,6 @@ _ENV_VARS_TO_REMOVE = (
     "CLAUDE_CODE_USE_MANTLE",
     "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST",
 )
-
-
-# ---------------------------------------------------------------------------
-# Production Keychain backend
-# ---------------------------------------------------------------------------
-
-
-def _run_security(args: list[str]) -> subprocess.CompletedProcess[str]:
-    """Run `/usr/bin/security` with a bounded timeout, always reaping it."""
-    try:
-        return subprocess.run(
-            [_SECURITY_BIN, *args],
-            capture_output=True,
-            text=True,
-            timeout=_KEYCHAIN_TIMEOUT_SECONDS,
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise CaptureError(
-            f"`{_SECURITY_BIN} {args[0]}` timed out after {_KEYCHAIN_TIMEOUT_SECONDS}s"
-        ) from exc
-    except OSError as exc:
-        raise CaptureError(f"failed to invoke {_SECURITY_BIN}: {exc}") from exc
-
-
-class _SecurityKeychainBackend:
-    """Production `KeychainBackend`, always invoking `/usr/bin/security` by
-    absolute path rather than resolving `security` through PATH."""
-
-    def read(self, service: str, account: str) -> str | None:
-        result = _run_security(["find-generic-password", "-s", service, "-a", account, "-w"])
-        if result.returncode == 0:
-            return result.stdout.strip()
-        if result.returncode == _KEYCHAIN_ITEM_NOT_FOUND_STATUS:
-            return None
-        raise CaptureError(
-            f"Keychain read for service {service!r} failed (security exited "
-            f"{result.returncode})"
-        )
-
-    def delete(self, service: str, account: str) -> None:
-        result = _run_security(["delete-generic-password", "-s", service, "-a", account])
-        if result.returncode in (0, _KEYCHAIN_ITEM_NOT_FOUND_STATUS):
-            return
-        raise CaptureError(
-            f"Keychain delete for service {service!r} failed (security exited "
-            f"{result.returncode})"
-        )
-
-
-def _default_keychain_backend() -> KeychainBackend:
-    return _SecurityKeychainBackend()
-
-
-# ---------------------------------------------------------------------------
-# Scoped selector algorithm
-# ---------------------------------------------------------------------------
-
-
-def _scoped_keychain_service(raw_config_dir: str) -> str:
-    """Derive the scoped Keychain service name for `raw_config_dir`.
-
-    Hashes the RAW caller-supplied string: no `~` expansion, absolutizing,
-    separator cleanup, or `Path` conversion happens before hashing, so a
-    trailing slash or `.` component changes the result on purpose. Unicode
-    variants of the same path (NFC vs NFD) must hash identically, so the
-    string is NFC-normalized before hashing.
-    """
-    normalized = unicodedata.normalize("NFC", raw_config_dir)
-    digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
-    return _KEYCHAIN_SERVICE_FORMAT.format(suffix=digest[:8])
-
-
-def _keychain_account() -> str:
-    """The Keychain account attribute: USER, else USERNAME, else fail closed.
-
-    Never falls back to a guessed literal — a wrong account would silently
-    miss Claude's item and could strand the temp credential.
-    """
-    account = os.environ.get("USER") or os.environ.get("USERNAME")
-    if not account:
-        raise CaptureError(
-            "cannot determine the Keychain account attribute: neither USER nor "
-            "USERNAME is set in the environment"
-        )
-    return account
 
 
 # ---------------------------------------------------------------------------
@@ -255,8 +125,8 @@ def _read_credentials_blob(config_dir: str, keychain: KeychainBackend) -> dict[s
     """Read the credentials blob for `config_dir`: scoped Keychain item on
     macOS, `<config_dir>/.credentials.json` everywhere else."""
     if sys.platform == "darwin":
-        service = _scoped_keychain_service(config_dir)
-        account = _keychain_account()
+        service = scoped_keychain_service(config_dir)
+        account = keychain_account()
         password = keychain.read(service, account)
         if password is None:
             raise CaptureError(
@@ -384,7 +254,18 @@ def _resolve_identity(
     return email, organization_uuid, organization_name
 
 
-def _capture_from_config_dir_impl(config_dir: str, keychain: KeychainBackend) -> CapturedAccount:
+def capture_from_config_dir(
+    config_dir: str, keychain: KeychainBackend | None = None
+) -> CapturedAccount:
+    """Capture a previously-completed Claude Code login from `config_dir`.
+
+    Strictly read-only: never spawns `claude`, never writes or deletes
+    anything. On macOS this reads only the scoped Keychain item for the
+    exact `config_dir` string given (see `scoped_keychain_service`); on
+    every other platform it reads `<config_dir>/.credentials.json`.
+    """
+    if keychain is None:
+        keychain = default_keychain_backend()
     credentials_json = _read_credentials_blob(config_dir, keychain)
     oauth_account_json = _read_oauth_account_block(config_dir)
     email, organization_uuid, organization_name = _resolve_identity(
@@ -399,23 +280,12 @@ def _capture_from_config_dir_impl(config_dir: str, keychain: KeychainBackend) ->
     )
 
 
-def capture_from_config_dir(config_dir: str) -> CapturedAccount:
-    """Capture a previously-completed Claude Code login from `config_dir`.
-
-    Strictly read-only: never spawns `claude`, never writes or deletes
-    anything. On macOS this reads only the scoped Keychain item for the
-    exact `config_dir` string given (see `_scoped_keychain_service`); on
-    every other platform it reads `<config_dir>/.credentials.json`.
-    """
-    return _capture_from_config_dir_impl(config_dir, _default_keychain_backend())
-
-
 # ---------------------------------------------------------------------------
 # Claude executable resolution & legacy sign-in change detection
 # ---------------------------------------------------------------------------
 
 
-def _resolve_claude_executable() -> str:
+def resolve_claude_executable() -> str:
     resolved = shutil.which("claude")
     if resolved is None:
         raise CaptureError("the `claude` CLI was not found on PATH; install Claude Code first")
@@ -427,24 +297,24 @@ def _resolve_claude_executable() -> str:
 # Distinguishes "the legacy item conclusively does not exist" (None) from "the
 # legacy item could not be read at all" — comparing the latter against a later
 # read would fabricate a change warning.
-_LEGACY_STATE_UNAVAILABLE = object()
+LEGACY_STATE_UNAVAILABLE = object()
 
 
-def _read_legacy_login_fingerprint(keychain: KeychainBackend) -> object:
+def read_legacy_login_fingerprint(keychain: KeychainBackend) -> object:
     """Fingerprint the machine-level legacy Keychain sign-in, read-only.
 
     Returns the sha256 hex digest of the legacy item's value, `None` when the
-    item conclusively does not exist, or `_LEGACY_STATE_UNAVAILABLE` when the
+    item conclusively does not exist, or `LEGACY_STATE_UNAVAILABLE` when the
     read failed or the platform has no Keychain. Never raises and never keeps
     the raw value: detection is best-effort and must not block or outlive a
     capture.
     """
     if sys.platform != "darwin":
-        return _LEGACY_STATE_UNAVAILABLE
+        return LEGACY_STATE_UNAVAILABLE
     try:
-        value = keychain.read(_LEGACY_KEYCHAIN_SERVICE, _keychain_account())
+        value = keychain.read(LEGACY_KEYCHAIN_SERVICE, keychain_account())
     except CaptureError:
-        return _LEGACY_STATE_UNAVAILABLE
+        return LEGACY_STATE_UNAVAILABLE
     if value is None:
         return None
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
@@ -461,14 +331,14 @@ def _warn_if_legacy_login_changed(keychain: KeychainBackend, baseline: object) -
     (unavailable baseline or recheck) skips the warning rather than raising
     over the original capture error.
     """
-    if baseline is _LEGACY_STATE_UNAVAILABLE:
+    if baseline is LEGACY_STATE_UNAVAILABLE:
         return
-    current = _read_legacy_login_fingerprint(keychain)
-    if current is _LEGACY_STATE_UNAVAILABLE or current == baseline:
+    current = read_legacy_login_fingerprint(keychain)
+    if current is LEGACY_STATE_UNAVAILABLE or current == baseline:
         return
     print(
         "WARNING: this machine's Claude Code sign-in (Keychain item "
-        f"{_LEGACY_KEYCHAIN_SERVICE!r}) changed during the Claude login "
+        f"{LEGACY_KEYCHAIN_SERVICE!r}) changed during the Claude login "
         "capture. The login that just failed to capture may have replaced "
         "your existing `claude` CLI sign-in; run `claude` in a terminal and "
         "sign in again if so.",
@@ -534,7 +404,7 @@ class _CancellationScope:
         self._previous.clear()
 
 
-def _child_process_env(config_dir: str) -> dict[str, str]:
+def child_process_env(config_dir: str) -> dict[str, str]:
     """Build the login child's environment: copy, point at the temp config
     dir, disable auto-update, and remove every auth-selector variable that
     could steer `claude auth login` away from a fresh interactive login."""
@@ -546,7 +416,7 @@ def _child_process_env(config_dir: str) -> dict[str, str]:
     return env
 
 
-def _process_group_alive(pgid: int) -> bool:
+def process_group_alive(pgid: int) -> bool:
     try:
         os.killpg(pgid, 0)
     except ProcessLookupError:
@@ -583,7 +453,7 @@ def _terminate_process_group(pgid: int, process: subprocess.Popen[Any]) -> None:
         # Reap the leader as soon as it exits: an unreaped zombie keeps the
         # process group alive and would otherwise pin the grace loop.
         process.poll()
-        if not _process_group_alive(pgid):
+        if not process_group_alive(pgid):
             process.wait()
             return
         time.sleep(0.05)
@@ -619,7 +489,7 @@ def _run_login(
     try:
         process = subprocess.Popen(
             [claude_path, "auth", "login", "--claudeai"],
-            env=_child_process_env(config_dir),
+            env=child_process_env(config_dir),
             start_new_session=True,
         )
         # start_new_session makes the child the leader of a fresh group
@@ -654,7 +524,7 @@ def _run_login(
         raise CaptureError(f"`claude auth login --claudeai` exited with status {returncode}")
 
 
-def _mint_temp_config_dir(keychain: KeychainBackend) -> str:
+def mint_temp_config_dir(keychain: KeychainBackend) -> str:
     """Create a fresh temp Claude config dir, retrying on macOS if a scoped
     Keychain item already exists for that exact path.
 
@@ -667,8 +537,8 @@ def _mint_temp_config_dir(keychain: KeychainBackend) -> str:
         if sys.platform != "darwin":
             return candidate
         try:
-            service = _scoped_keychain_service(candidate)
-            existing = keychain.read(service, _keychain_account())
+            service = scoped_keychain_service(candidate)
+            existing = keychain.read(service, keychain_account())
         except BaseException:
             # The collision precheck failed: do not leak the freshly minted
             # empty directory alongside the propagating error.
@@ -683,7 +553,7 @@ def _mint_temp_config_dir(keychain: KeychainBackend) -> str:
     )
 
 
-def _cleanup_temp_config_dir(config_dir: str, keychain: KeychainBackend) -> None:
+def cleanup_temp_config_dir(config_dir: str, keychain: KeychainBackend) -> None:
     """Delete the scoped Keychain item and remove the temp dir.
 
     Both actions are attempted even when one fails; any failure raises a
@@ -692,7 +562,7 @@ def _cleanup_temp_config_dir(config_dir: str, keychain: KeychainBackend) -> None
     errors: list[str] = []
     if sys.platform == "darwin":
         try:
-            keychain.delete(_scoped_keychain_service(config_dir), _keychain_account())
+            keychain.delete(scoped_keychain_service(config_dir), keychain_account())
         except CaptureError as exc:
             errors.append(f"failed to delete the scoped Keychain item: {exc}")
     try:
@@ -725,10 +595,10 @@ def capture_interactive(timeout_secs: int = 180) -> CapturedAccount:
             "from an existing login with `--from <dir>` instead"
         )
 
-    with locking.file_lock(paths.runtime_dir() / _LOGIN_LOCK_FILENAME):
-        claude_path = _resolve_claude_executable()
-        keychain = _default_keychain_backend()
-        legacy_baseline = _read_legacy_login_fingerprint(keychain)
+    with locking.file_lock(paths.runtime_dir() / LOGIN_LOCK_FILENAME):
+        claude_path = resolve_claude_executable()
+        keychain = default_keychain_backend()
+        legacy_baseline = read_legacy_login_fingerprint(keychain)
 
         # Cancellation scope: SIGINT/SIGTERM/SIGHUP are owned by RECORD-ONLY
         # handlers from BEFORE the temp config dir is minted until credential
@@ -745,13 +615,13 @@ def capture_interactive(timeout_secs: int = 180) -> CapturedAccount:
             with _CancellationScope() as scope:
                 try:
                     try:
-                        config_dir = _mint_temp_config_dir(keychain)
+                        config_dir = mint_temp_config_dir(keychain)
                         if scope.deferred:
                             # Cancelled during minting: skip the interactive
                             # login entirely; the finally still cleans up.
                             raise CaptureCancelled("Claude login was cancelled")
                         _run_login(claude_path, config_dir, timeout_secs, scope)
-                        captured = _capture_from_config_dir_impl(config_dir, keychain)
+                        captured = capture_from_config_dir(config_dir, keychain)
                     except (_LoginSignalReceived, KeyboardInterrupt) as exc:
                         # Programmatic interrupts (and raising handlers from
                         # scope-less callers) still clean up fully — via the
@@ -759,7 +629,7 @@ def capture_interactive(timeout_secs: int = 180) -> CapturedAccount:
                         raise CaptureCancelled("Claude login was cancelled") from exc
                 finally:
                     if config_dir is not None:
-                        _cleanup_temp_config_dir(config_dir, keychain)
+                        cleanup_temp_config_dir(config_dir, keychain)
             if scope.deferred:
                 raise CaptureCancelled("Claude login was cancelled")
         except CaptureError:

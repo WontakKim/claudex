@@ -25,12 +25,8 @@ from typing import Any
 from .claude_account_profile import compute_account_profile_fingerprint
 from .claude_accounts import AccountRecord
 from .claude_auth import ClaudeAccountAuthError, ClaudeAccountCredentials
-from .claude_capture import (
-    CaptureError,
-    KeychainBackend,
-    _LEGACY_KEYCHAIN_SERVICE,
-    _SecurityKeychainBackend,
-)
+from .claude_capture_model import CaptureError, KeychainBackend
+from .claude_keychain import LEGACY_KEYCHAIN_SERVICE, SecurityKeychainBackend
 
 AMBIENT_ID_NAMESPACE = uuid.UUID("49d01c38-08d0-4df4-a742-13aa3c192f3e")
 
@@ -86,7 +82,7 @@ class AmbientAccountProvider:
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._keychain = (
-            _SecurityKeychainBackend()
+            SecurityKeychainBackend()
             if keychain is None and sys.platform == "darwin"
             else keychain
         )
@@ -167,7 +163,7 @@ class AmbientAccountProvider:
             if self._keychain is None:
                 return None
             try:
-                raw = self._keychain.read(_LEGACY_KEYCHAIN_SERVICE, getpass.getuser())
+                raw = self._keychain.read(LEGACY_KEYCHAIN_SERVICE, getpass.getuser())
             except (CaptureError, OSError):
                 return None
             if raw is None:

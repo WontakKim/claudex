@@ -6,7 +6,7 @@ instead, driven by HTTP-shaped commands (status poll, code paste, replace
 confirmation, cancel). This module owns that state machine; the temp-dir
 mint/cleanup, scoped-Keychain capture, identity resolution, and process-group
 teardown semantics are claude_capture's, imported directly so the two flows
-can never drift (same-package private reuse, mirrored by the test suite).
+can never drift (same-package reuse, mirrored by the test suite).
 
 Verified against claude 2.1.224 with piped stdio
 (.docs/research/claude-login-piped-stdio.md): the authorize URL is printed to
@@ -47,24 +47,24 @@ from pathlib import Path
 
 from claudex_gateway import claude_accounts, paths
 from claudex_gateway.claude_capture import (
-    CaptureError,
-    _capture_from_config_dir_impl,
-    _child_process_env,
-    _cleanup_temp_config_dir,
-    _default_keychain_backend,
-    _LEGACY_STATE_UNAVAILABLE,
-    _LOGIN_LOCK_FILENAME,
-    _mint_temp_config_dir,
-    _process_group_alive,
-    _read_legacy_login_fingerprint,
-    _resolve_claude_executable,
+    LEGACY_STATE_UNAVAILABLE,
+    LOGIN_LOCK_FILENAME,
+    capture_from_config_dir,
+    child_process_env,
+    cleanup_temp_config_dir,
+    mint_temp_config_dir,
+    process_group_alive,
+    read_legacy_login_fingerprint,
+    resolve_claude_executable,
 )
+from claudex_gateway.claude_capture_model import CaptureError
+from claudex_gateway.claude_keychain import default_keychain_backend
 from claudex_gateway.locking import FileLockHandle
 
 
 def capture_lock_path() -> Path:
     """The cross-process login lock shared with the CLI's capture_interactive."""
-    return paths.runtime_dir() / _LOGIN_LOCK_FILENAME
+    return paths.runtime_dir() / LOGIN_LOCK_FILENAME
 
 logger = logging.getLogger(__name__)
 
@@ -198,21 +198,21 @@ class ClaudeLoginSession:
     # -- driver ------------------------------------------------------------
 
     async def _run(self) -> None:
-        keychain = _default_keychain_backend()
+        keychain = default_keychain_backend()
         config_dir: str | None = None
         cleaned = False
-        legacy_baseline: object = _LEGACY_STATE_UNAVAILABLE
+        legacy_baseline: object = LEGACY_STATE_UNAVAILABLE
         try:
-            claude_path = _resolve_claude_executable()
-            legacy_baseline = await asyncio.to_thread(_read_legacy_login_fingerprint, keychain)
-            config_dir = await asyncio.to_thread(_mint_temp_config_dir, keychain)
+            claude_path = resolve_claude_executable()
+            legacy_baseline = await asyncio.to_thread(read_legacy_login_fingerprint, keychain)
+            config_dir = await asyncio.to_thread(mint_temp_config_dir, keychain)
 
             process = await asyncio.create_subprocess_exec(
                 claude_path,
                 "auth",
                 "login",
                 "--claudeai",
-                env=_child_process_env(config_dir),
+                env=child_process_env(config_dir),
                 stdin=asyncio.subprocess.PIPE,
                 # stdin stays open for the child's lifetime: the browser
                 # callback server's lifetime is bound to it, and the pasted
@@ -257,11 +257,11 @@ class ClaudeLoginSession:
             self._expires_at = None
 
             captured = await asyncio.to_thread(
-                _capture_from_config_dir_impl, config_dir, keychain
+                capture_from_config_dir, config_dir, keychain
             )
             # Early cleanup shrinks the window in which a daemon crash leaks
             # the temp dir and its scoped Keychain item.
-            await asyncio.to_thread(_cleanup_temp_config_dir, config_dir, keychain)
+            await asyncio.to_thread(cleanup_temp_config_dir, config_dir, keychain)
             cleaned = True
             try:
                 try:
@@ -304,7 +304,7 @@ class ClaudeLoginSession:
                     await _terminate_process_group_async(process.pid, process)
                 if config_dir is not None and not cleaned:
                     try:
-                        await asyncio.to_thread(_cleanup_temp_config_dir, config_dir, keychain)
+                        await asyncio.to_thread(cleanup_temp_config_dir, config_dir, keychain)
                     except CaptureError as exc:
                         logger.warning("login temp-dir cleanup failed: %s", exc)
                 if self._status == "failed":
@@ -425,10 +425,10 @@ class ClaudeLoginSession:
     def _warn_if_legacy_login_changed(self, keychain: Any, baseline: object) -> None:
         """Daemon analog of claude_capture's stderr warning: log it instead,
         so it lands in the dashboard's Logs tab. Read-only and best-effort."""
-        if baseline is _LEGACY_STATE_UNAVAILABLE:
+        if baseline is LEGACY_STATE_UNAVAILABLE:
             return
-        current = _read_legacy_login_fingerprint(keychain)
-        if current is _LEGACY_STATE_UNAVAILABLE or current == baseline:
+        current = read_legacy_login_fingerprint(keychain)
+        if current is LEGACY_STATE_UNAVAILABLE or current == baseline:
             return
         logger.warning(
             "this machine's Claude Code sign-in changed during the dashboard "
@@ -468,9 +468,9 @@ async def _terminate_process_group_async(
     except ProcessLookupError:
         pass
     deadline = time.monotonic() + _PROCESS_GROUP_GRACE_SECONDS
-    while time.monotonic() < deadline and _process_group_alive(pgid):
+    while time.monotonic() < deadline and process_group_alive(pgid):
         await asyncio.sleep(0.1)
-    if _process_group_alive(pgid):
+    if process_group_alive(pgid):
         try:
             os.killpg(pgid, signal.SIGKILL)
         except ProcessLookupError:
