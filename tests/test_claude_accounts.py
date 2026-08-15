@@ -16,6 +16,8 @@ from typing import Any, Callable
 
 import pytest
 
+import claudex_gateway.claude_account_model as claude_account_model
+import claudex_gateway.claude_account_store as claude_account_store
 from claudex_gateway import claude_accounts, paths
 
 
@@ -78,7 +80,7 @@ def _base_row(**overrides: Any) -> dict[str, Any]:
     return row
 
 
-def _add(email: str = "user@example.com", **kwargs: Any) -> claude_accounts.AccountRecord:
+def _add(email: str = "user@example.com", **kwargs: Any) -> claude_account_model.AccountRecord:
     kwargs.setdefault("organization_uuid", None)
     kwargs.setdefault("organization_name", None)
     kwargs.setdefault("credentials_json", _credentials_payload())
@@ -134,7 +136,7 @@ def _fsync_directory_failing_on_nth_root_call(
     `exception_factory` lets a test inject a non-`OSError` interruption
     (e.g. `KeyboardInterrupt`) at the same boundaries.
     """
-    real = claude_accounts._fsync_directory
+    real = claude_account_store._fsync_directory
     accounts_root = _accounts_root()
     call_count = {"n": 0}
 
@@ -147,6 +149,55 @@ def _fsync_directory_failing_on_nth_root_call(
         real(directory)
 
     return _wrapped, call_count
+
+
+# --------------------------------------------------------------------------
+# Canonical model ownership and validation
+# --------------------------------------------------------------------------
+
+
+def test_facade_reexports_canonical_model_symbols() -> None:
+    assert claude_accounts.AccountRecord is claude_account_model.AccountRecord
+    assert claude_accounts.AccountRegistryError is claude_account_model.AccountRegistryError
+    assert claude_accounts.DuplicateAccountError is claude_account_model.DuplicateAccountError
+    assert claude_accounts.AccountNotFoundError is claude_account_model.AccountNotFoundError
+
+
+def test_model_strict_row_parser_owns_the_exact_persisted_schema() -> None:
+    row = _base_row()
+    [record] = claude_account_model._parse_current_rows(
+        [row], path=Path("registry.json")
+    )
+
+    assert type(record) is claude_account_model.AccountRecord
+    assert record.to_row() == row
+
+    with pytest.raises(claude_account_model.AccountRegistryError, match="unknown keys"):
+        claude_account_model._parse_current_rows(
+            [{**row, "unexpected": True}], path=Path("registry.json")
+        )
+
+
+def test_model_uuid_validation_requires_canonical_text() -> None:
+    canonical_uuid = "123e4567-e89b-12d3-a456-426614174000"
+    assert claude_account_model._canonical_uuid_or_none(canonical_uuid) == canonical_uuid
+    assert (
+        claude_account_model._validate_canonical_uuid_field(canonical_uuid, field="id")
+        == canonical_uuid
+    )
+
+    for noncanonical_uuid in (
+        canonical_uuid.upper(),
+        canonical_uuid.replace("-", ""),
+        f"{{{canonical_uuid}}}",
+    ):
+        assert claude_account_model._canonical_uuid_or_none(noncanonical_uuid) is None
+        with pytest.raises(ValueError, match="canonical UUID"):
+            claude_account_model._validate_canonical_uuid_field(
+                noncanonical_uuid, field="id"
+            )
+        with pytest.raises(claude_account_model.AccountNotFoundError):
+            claude_account_model._canonicalize_account_id(noncanonical_uuid)
 
 
 # --------------------------------------------------------------------------
@@ -283,7 +334,7 @@ def test_update_account_credentials_normalizes_email_for_the_identity_lookup() -
 
 def test_update_account_credentials_unknown_identity_raises_without_writes() -> None:
     original = _add(organization_uuid="org-1")
-    with pytest.raises(claude_accounts.AccountNotFoundError):
+    with pytest.raises(claude_account_model.AccountNotFoundError):
         claude_accounts.update_account_credentials(
             # Same email, different organization: the identity key is the
             # (email, organizationUuid) pair, not the email alone.
@@ -300,7 +351,7 @@ def test_update_account_credentials_unknown_identity_raises_without_writes() -> 
 
 
 def test_update_account_credentials_validates_inputs_before_any_write() -> None:
-    with pytest.raises(claude_accounts.AccountRegistryError):
+    with pytest.raises(claude_account_model.AccountRegistryError):
         claude_accounts.update_account_credentials(
             "user@example.com",
             None,
@@ -342,12 +393,12 @@ def test_mark_needs_reauth_is_idempotent_without_a_registry_write() -> None:
 
 def test_mark_needs_reauth_unknown_id_raises_not_found() -> None:
     _add()
-    with pytest.raises(claude_accounts.AccountNotFoundError):
+    with pytest.raises(claude_account_model.AccountNotFoundError):
         claude_accounts.mark_account_needs_reauth(str(uuid.uuid4()))
 
 
 def test_mark_needs_reauth_rejects_non_canonical_id() -> None:
-    with pytest.raises(claude_accounts.AccountNotFoundError):
+    with pytest.raises(claude_account_model.AccountNotFoundError):
         claude_accounts.mark_account_needs_reauth("../../etc/passwd")
 
 
@@ -375,19 +426,19 @@ def test_update_account_credentials_resets_needs_reauth_to_ready() -> None:
 
 
 def test_add_account_rejects_missing_email_before_any_write() -> None:
-    with pytest.raises(claude_accounts.AccountRegistryError):
+    with pytest.raises(claude_account_model.AccountRegistryError):
         _add("   ")
     assert not paths.runtime_dir().exists()
 
 
 def test_add_account_rejects_non_dict_credentials_before_any_write() -> None:
-    with pytest.raises(claude_accounts.AccountRegistryError):
+    with pytest.raises(claude_account_model.AccountRegistryError):
         _add(credentials_json="not-a-dict")  # type: ignore[arg-type]
     assert not paths.runtime_dir().exists()
 
 
 def test_add_account_rejects_non_dict_oauth_account_before_any_write() -> None:
-    with pytest.raises(claude_accounts.AccountRegistryError):
+    with pytest.raises(claude_account_model.AccountRegistryError):
         _add(oauth_account_json="not-a-dict")  # type: ignore[arg-type]
     assert not paths.runtime_dir().exists()
 
@@ -396,14 +447,14 @@ def test_add_account_rejects_non_dict_oauth_account_before_any_write() -> None:
     "bad_email", ["foo\tbar@example.com", "foo\nbar@example.com", "foo\x00bar@example.com"]
 )
 def test_add_account_rejects_control_characters_in_email(bad_email: str) -> None:
-    with pytest.raises(claude_accounts.AccountRegistryError):
+    with pytest.raises(claude_account_model.AccountRegistryError):
         _add(bad_email)
     assert not paths.runtime_dir().exists()
 
 
 @pytest.mark.parametrize("field", ["organization_uuid", "organization_name"])
 def test_add_account_rejects_control_characters_in_organization_fields(field: str) -> None:
-    with pytest.raises(claude_accounts.AccountRegistryError):
+    with pytest.raises(claude_account_model.AccountRegistryError):
         _add(**{field: "org\twith-control"})
     assert not paths.runtime_dir().exists()
 
@@ -421,7 +472,7 @@ def test_load_registry_rejects_malformed_json_file_level_error() -> None:
     root = _accounts_root()
     root.mkdir(parents=True)
     (root / "registry.json").write_text("{not json", encoding="utf-8")
-    with pytest.raises(claude_accounts.AccountRegistryError, match="not valid JSON"):
+    with pytest.raises(claude_account_model.AccountRegistryError, match="not valid JSON"):
         claude_accounts.load_registry()
 
 
@@ -429,13 +480,13 @@ def test_load_registry_rejects_non_array_root_malformed_file_level_error() -> No
     root = _accounts_root()
     root.mkdir(parents=True)
     (root / "registry.json").write_text(json.dumps({"not": "an array"}), encoding="utf-8")
-    with pytest.raises(claude_accounts.AccountRegistryError, match="JSON array"):
+    with pytest.raises(claude_account_model.AccountRegistryError, match="JSON array"):
         claude_accounts.load_registry()
 
 
 def test_load_registry_rejects_malformed_row_that_is_not_an_object() -> None:
     _write_raw_registry(["not-an-object"])
-    with pytest.raises(claude_accounts.AccountRegistryError, match="row 0"):
+    with pytest.raises(claude_account_model.AccountRegistryError, match="row 0"):
         claude_accounts.load_registry()
 
 
@@ -462,7 +513,7 @@ def test_load_registry_rejects_malformed_row_that_is_not_an_object() -> None:
 )
 def test_load_registry_strict_rejects_invalid_rows(overrides: dict[str, Any]) -> None:
     _write_raw_registry([_base_row(**overrides)])
-    with pytest.raises(claude_accounts.AccountRegistryError):
+    with pytest.raises(claude_account_model.AccountRegistryError):
         claude_accounts.load_registry()
 
 
@@ -470,7 +521,7 @@ def test_load_registry_strict_rejects_missing_key() -> None:
     row = _base_row()
     del row["state"]
     _write_raw_registry([row])
-    with pytest.raises(claude_accounts.AccountRegistryError, match="missing keys"):
+    with pytest.raises(claude_account_model.AccountRegistryError, match="missing keys"):
         claude_accounts.load_registry()
 
 
@@ -481,7 +532,7 @@ def test_load_registry_strict_rejects_duplicate_ids() -> None:
         _base_row(id=shared_id, email="b@example.com"),
     ]
     _write_raw_registry(rows)
-    with pytest.raises(claude_accounts.AccountRegistryError, match="duplicate id"):
+    with pytest.raises(claude_account_model.AccountRegistryError, match="duplicate id"):
         claude_accounts.load_registry()
 
 
@@ -491,13 +542,13 @@ def test_load_registry_strict_rejects_duplicate_identity_keys() -> None:
         _base_row(email="same@example.com", organizationUuid=None),
     ]
     _write_raw_registry(rows)
-    with pytest.raises(claude_accounts.AccountRegistryError, match="duplicate account identity"):
+    with pytest.raises(claude_account_model.AccountRegistryError, match="duplicate account identity"):
         claude_accounts.load_registry()
 
 
 def test_load_registry_strict_rejects_non_canonical_id() -> None:
     _write_raw_registry([_base_row(id="../../etc/passwd")])
-    with pytest.raises(claude_accounts.AccountRegistryError, match="row 0"):
+    with pytest.raises(claude_account_model.AccountRegistryError, match="row 0"):
         claude_accounts.load_registry()
 
 
@@ -527,7 +578,7 @@ def test_load_registry_rejects_exact_eight_key_row_without_mutating_file() -> No
     bytes_before = registry_path.read_bytes()
     mtime_before = registry_path.stat().st_mtime_ns
 
-    with pytest.raises(claude_accounts.AccountRegistryError) as exc_info:
+    with pytest.raises(claude_account_model.AccountRegistryError) as exc_info:
         claude_accounts.load_registry()
 
     detail = str(exc_info.value)
@@ -629,13 +680,13 @@ def test_reauth_valid_uuid_change_rotates_incarnation() -> None:
 
 
 def test_remove_unknown_id_raises_not_found() -> None:
-    with pytest.raises(claude_accounts.AccountNotFoundError):
+    with pytest.raises(claude_account_model.AccountNotFoundError):
         claude_accounts.remove_account(str(uuid.uuid4()))
 
 
 def test_remove_account_rejects_non_canonical_id_path_traversal() -> None:
     record = _add()
-    with pytest.raises(claude_accounts.AccountNotFoundError):
+    with pytest.raises(claude_account_model.AccountNotFoundError):
         claude_accounts.remove_account(f"../{record.id}")
     # Zero state change: the legitimate account is still fully present.
     assert (_accounts_root() / record.id).is_dir()
@@ -688,11 +739,11 @@ def test_file_and_directory_modes_are_owner_only_on_posix() -> None:
 def test_rollback_on_credentials_write_failure_leaves_no_partial_account(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    real_write = claude_accounts._write_json_atomic
+    real_write = claude_account_store._write_json_atomic
     failer = _FailOnceOnMatch(real_write, lambda path, data: path.name == "credentials.json")
-    monkeypatch.setattr(claude_accounts, "_write_json_atomic", failer)
+    monkeypatch.setattr(claude_account_store, "_write_json_atomic", failer)
 
-    with pytest.raises(claude_accounts.AccountRegistryError):
+    with pytest.raises(claude_account_model.AccountRegistryError):
         _add()
     _assert_pristine()
 
@@ -700,10 +751,13 @@ def test_rollback_on_credentials_write_failure_leaves_no_partial_account(
 def test_rollback_on_staging_rename_failure_leaves_no_partial_account(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    failer = _FailOnceOnMatch(os.rename, lambda src, dst: Path(src).name.startswith(".staging-"))
-    monkeypatch.setattr(os, "rename", failer)
+    failer = _FailOnceOnMatch(
+        claude_account_store._rename_directory,
+        lambda src, dst: Path(src).name.startswith(".staging-"),
+    )
+    monkeypatch.setattr(claude_account_store, "_rename_directory", failer)
 
-    with pytest.raises(claude_accounts.AccountRegistryError):
+    with pytest.raises(claude_account_model.AccountRegistryError):
         _add()
     _assert_pristine()
 
@@ -711,11 +765,11 @@ def test_rollback_on_staging_rename_failure_leaves_no_partial_account(
 def test_rollback_on_registry_write_failure_leaves_no_partial_account(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    real_write = claude_accounts._write_json_atomic
+    real_write = claude_account_store._write_json_atomic
     failer = _FailOnceOnMatch(real_write, lambda path, data: path.name == "registry.json")
-    monkeypatch.setattr(claude_accounts, "_write_json_atomic", failer)
+    monkeypatch.setattr(claude_account_store, "_write_json_atomic", failer)
 
-    with pytest.raises(claude_accounts.AccountRegistryError):
+    with pytest.raises(claude_account_model.AccountRegistryError):
         _add()
     _assert_pristine()
 
@@ -726,9 +780,9 @@ def test_rollback_on_precommit_fsync_barrier_failure_removes_the_directory(
     # The 1st `accounts/claude/` fsync is the pre-commit durability barrier,
     # strictly before the registry commit point.
     wrapped, call_count = _fsync_directory_failing_on_nth_root_call(fail_on_call=1)
-    monkeypatch.setattr(claude_accounts, "_fsync_directory", wrapped)
+    monkeypatch.setattr(claude_account_store, "_fsync_directory", wrapped)
 
-    with pytest.raises(claude_accounts.AccountRegistryError, match="failed to add the account"):
+    with pytest.raises(claude_account_model.AccountRegistryError, match="failed to add the account"):
         _add()
 
     # The rollback itself used the (now working) real fsync, so it must have
@@ -748,9 +802,9 @@ def test_add_post_commit_fsync_failure_reports_uncertain_but_keeps_the_account(
     # The 2nd `accounts/claude/` fsync is the registry writer's own
     # post-`os.replace` fsync — strictly after the registry commit point.
     wrapped, _call_count = _fsync_directory_failing_on_nth_root_call(fail_on_call=2)
-    monkeypatch.setattr(claude_accounts, "_fsync_directory", wrapped)
+    monkeypatch.setattr(claude_account_store, "_fsync_directory", wrapped)
 
-    with pytest.raises(claude_accounts.AccountRegistryError, match="durability"):
+    with pytest.raises(claude_account_model.AccountRegistryError, match="durability"):
         _add()
 
     # The registry os.replace() already succeeded: the account is committed
@@ -763,14 +817,14 @@ def test_remove_post_commit_fsync_failure_leaves_the_tombstone_in_place(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     record = _add()
-    real_fsync_directory = claude_accounts._fsync_directory
+    real_fsync_directory = claude_account_store._fsync_directory
     # Call order for remove: 1st `accounts/claude/` fsync is the
     # tombstone-rename fsync; the 2nd is the registry writer's own
     # post-`os.replace` fsync — the boundary this test targets.
     wrapped, _call_count = _fsync_directory_failing_on_nth_root_call(fail_on_call=2)
-    monkeypatch.setattr(claude_accounts, "_fsync_directory", wrapped)
+    monkeypatch.setattr(claude_account_store, "_fsync_directory", wrapped)
 
-    with pytest.raises(claude_accounts.AccountRegistryError, match="durability"):
+    with pytest.raises(claude_account_model.AccountRegistryError, match="durability"):
         claude_accounts.remove_account(record.id)
 
     tombstone = _accounts_root() / f"{record.id}.tombstone"
@@ -782,7 +836,7 @@ def test_remove_post_commit_fsync_failure_leaves_the_tombstone_in_place(
     # `monkeypatch` fixture also holds) before letting the next mutation's
     # crash recovery resolve the leftover tombstone: the registry already
     # lacks the row, so it must be purged, not restored.
-    monkeypatch.setattr(claude_accounts, "_fsync_directory", real_fsync_directory)
+    monkeypatch.setattr(claude_account_store, "_fsync_directory", real_fsync_directory)
     other = _add("other@example.com")
     assert not tombstone.exists()
     assert {r.id for r in claude_accounts.list_accounts()} == {other.id}
@@ -797,9 +851,9 @@ def test_add_interrupt_after_registry_replace_never_rolls_back(
     wrapped, _call_count = _fsync_directory_failing_on_nth_root_call(
         fail_on_call=2, exception_factory=KeyboardInterrupt
     )
-    monkeypatch.setattr(claude_accounts, "_fsync_directory", wrapped)
+    monkeypatch.setattr(claude_account_store, "_fsync_directory", wrapped)
 
-    with pytest.raises(claude_accounts.AccountRegistryError, match="durability"):
+    with pytest.raises(claude_account_model.AccountRegistryError, match="durability"):
         _add()
 
     [listed] = claude_accounts.list_accounts()
@@ -814,9 +868,9 @@ def test_remove_interrupt_after_registry_replace_keeps_the_tombstone(
     wrapped, _call_count = _fsync_directory_failing_on_nth_root_call(
         fail_on_call=2, exception_factory=KeyboardInterrupt
     )
-    monkeypatch.setattr(claude_accounts, "_fsync_directory", wrapped)
+    monkeypatch.setattr(claude_account_store, "_fsync_directory", wrapped)
 
-    with pytest.raises(claude_accounts.AccountRegistryError, match="durability"):
+    with pytest.raises(claude_account_model.AccountRegistryError, match="durability"):
         claude_accounts.remove_account(record.id)
 
     # Post-commit: the tombstone is neither restored nor purged, and the
@@ -834,9 +888,9 @@ def test_remove_precommit_tombstone_fsync_failure_restores_the_directory(
     # tombstone durability barrier: the registry still references the
     # account, so a failure here must rename the tombstone back.
     wrapped, _call_count = _fsync_directory_failing_on_nth_root_call(fail_on_call=1)
-    monkeypatch.setattr(claude_accounts, "_fsync_directory", wrapped)
+    monkeypatch.setattr(claude_account_store, "_fsync_directory", wrapped)
 
-    with pytest.raises(claude_accounts.AccountRegistryError, match="failed to tombstone"):
+    with pytest.raises(claude_account_model.AccountRegistryError, match="failed to tombstone"):
         claude_accounts.remove_account(record.id)
 
     assert (_accounts_root() / record.id).is_dir()
@@ -851,14 +905,14 @@ def _interrupt_registry_replace_after_success(
     """Patch os.replace so the REGISTRY replacement really happens and then
     raises KeyboardInterrupt — modeling an async interrupt landing at the
     replacement boundary where the commit outcome is unknowable."""
-    real_replace = os.replace
+    real_replace = claude_account_store.os.replace
 
     def _replace_then_interrupt(src: object, dst: object, **kwargs: object) -> None:
         real_replace(src, dst, **kwargs)  # type: ignore[arg-type]
         if Path(str(dst)).name == "registry.json":
             raise KeyboardInterrupt
 
-    monkeypatch.setattr(os, "replace", _replace_then_interrupt)
+    monkeypatch.setattr(claude_account_store.os, "replace", _replace_then_interrupt)
 
 
 def test_add_interrupt_at_the_replace_boundary_never_rolls_back(
@@ -866,7 +920,7 @@ def test_add_interrupt_at_the_replace_boundary_never_rolls_back(
 ) -> None:
     _interrupt_registry_replace_after_success(monkeypatch)
 
-    with pytest.raises(claude_accounts.AccountRegistryError, match="uncertain|unknown"):
+    with pytest.raises(claude_account_model.AccountRegistryError, match="uncertain|unknown"):
         _add()
 
     # The replace completed before the interrupt: the account directory and
@@ -882,7 +936,7 @@ def test_remove_interrupt_at_the_replace_boundary_keeps_the_tombstone(
     record = _add()
     _interrupt_registry_replace_after_success(monkeypatch)
 
-    with pytest.raises(claude_accounts.AccountRegistryError, match="uncertain|unknown"):
+    with pytest.raises(claude_account_model.AccountRegistryError, match="uncertain|unknown"):
         claude_accounts.remove_account(record.id)
 
     # Outcome-unknown at the boundary: the tombstone is neither restored nor
@@ -896,11 +950,11 @@ def test_tombstone_purge_failure_surfaces_an_error_while_the_row_stays_removed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     record = _add()
-    real_remove_tree = claude_accounts._remove_directory_tree
+    real_remove_tree = claude_account_store._remove_directory_tree
     failer = _FailOnceOnMatch(real_remove_tree, lambda path: path.name.endswith(".tombstone"))
-    monkeypatch.setattr(claude_accounts, "_remove_directory_tree", failer)
+    monkeypatch.setattr(claude_account_store, "_remove_directory_tree", failer)
 
-    with pytest.raises(claude_accounts.AccountRegistryError, match="tombstone"):
+    with pytest.raises(claude_account_model.AccountRegistryError, match="tombstone"):
         claude_accounts.remove_account(record.id)
 
     assert claude_accounts.load_registry() == []
@@ -931,7 +985,7 @@ def test_crash_recovery_purges_tombstone_when_registry_lacks_the_row() -> None:
     tombstone = _accounts_root() / f"{record.id}.tombstone"
     final_dir.rename(tombstone)
     # Simulate the registry having already been committed without the row.
-    claude_accounts._write_json_atomic(_registry_path(), [])
+    claude_account_store._write_json_atomic(_registry_path(), [])
 
     other = _add("other@example.com")
 
@@ -945,7 +999,7 @@ def test_crash_recovery_both_final_dir_and_tombstone_present_is_inconsistency_er
     tombstone = _accounts_root() / f"{record.id}.tombstone"
     shutil.copytree(final_dir, tombstone)
 
-    with pytest.raises(claude_accounts.AccountRegistryError):
+    with pytest.raises(claude_account_model.AccountRegistryError):
         _add("other@example.com")
 
 
@@ -960,7 +1014,7 @@ def test_missing_registry_with_tombstone_only_raises_and_deletes_nothing() -> No
     tombstone = root / f"{uuid.uuid4()}.tombstone"
     tombstone.mkdir(mode=0o700)
 
-    with pytest.raises(claude_accounts.AccountRegistryError):
+    with pytest.raises(claude_account_model.AccountRegistryError):
         _add()
     assert tombstone.exists()
 
@@ -971,7 +1025,7 @@ def test_missing_registry_with_orphan_only_raises_and_deletes_nothing() -> None:
     orphan = root / f".orphan-{uuid.uuid4()}"
     orphan.mkdir(mode=0o700)
 
-    with pytest.raises(claude_accounts.AccountRegistryError):
+    with pytest.raises(claude_account_model.AccountRegistryError):
         _add()
     assert orphan.exists()
 
@@ -982,7 +1036,7 @@ def test_missing_registry_with_final_uuid_dir_only_raises_and_deletes_nothing() 
     leftover = root / str(uuid.uuid4())
     leftover.mkdir(mode=0o700)
 
-    with pytest.raises(claude_accounts.AccountRegistryError):
+    with pytest.raises(claude_account_model.AccountRegistryError):
         _add()
     assert leftover.exists()
 
@@ -1027,7 +1081,7 @@ def test_orphaned_uuid_directory_is_preserved_and_reported(
     orphan_dir.mkdir(mode=0o700)
     (orphan_dir / "credentials.json").write_text("{}", encoding="utf-8")
 
-    with caplog.at_level(logging.WARNING, logger="claudex_gateway.claude_accounts"):
+    with caplog.at_level(logging.WARNING, logger="claudex_gateway.claude_account_store"):
         other = _add("other@example.com")
 
     assert orphan_dir.is_dir()  # never auto-deleted
@@ -1263,7 +1317,7 @@ def test_sigkill_after_staging_rename_in_add_leaves_a_reported_orphan(
     assert len(leftover_dirs) == 1  # the orphaned canonical-UUID directory
     orphan_id = leftover_dirs[0].name
 
-    with caplog.at_level(logging.WARNING, logger="claudex_gateway.claude_accounts"):
+    with caplog.at_level(logging.WARNING, logger="claudex_gateway.claude_account_store"):
         record = _add("third@example.com")
 
     assert leftover_dirs[0].exists()  # never auto-deleted
