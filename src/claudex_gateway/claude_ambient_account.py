@@ -25,8 +25,8 @@ from typing import Any
 from .claude_account_profile import compute_account_profile_fingerprint
 from .claude_accounts import AccountRecord
 from .claude_auth import ClaudeAccountAuthError, ClaudeAccountCredentials
-from .claude_capture_model import CaptureError, KeychainBackend
-from .claude_keychain import LEGACY_KEYCHAIN_SERVICE, SecurityKeychainBackend
+from .claude.capture_model import CaptureError, KeychainBackend
+from .claude.keychain import LEGACY_KEYCHAIN_SERVICE, SecurityKeychainBackend
 
 AMBIENT_ID_NAMESPACE = uuid.UUID("49d01c38-08d0-4df4-a742-13aa3c192f3e")
 
