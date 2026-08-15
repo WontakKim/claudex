@@ -871,7 +871,7 @@ def test_sighup_during_login_wait_translates_to_capture_cancelled(
 # ---------------------------------------------------------------------------
 
 
-def testmint_temp_config_dir_retries_on_keychain_collision(
+def test_mint_temp_config_dir_retries_on_keychain_collision(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(claude_capture.sys, "platform", "darwin")
@@ -893,7 +893,7 @@ def testmint_temp_config_dir_retries_on_keychain_collision(
     assert all(call.op == "read" for call in backend.calls)  # never deletes a collision
 
 
-def testmint_temp_config_dir_gives_up_after_max_attempts(
+def test_mint_temp_config_dir_gives_up_after_max_attempts(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(claude_capture.sys, "platform", "darwin")
@@ -919,7 +919,7 @@ def testmint_temp_config_dir_gives_up_after_max_attempts(
     assert counter["n"] == claude_capture._MAX_TEMP_DIR_ATTEMPTS
 
 
-def testmint_temp_config_dir_skips_keychain_check_on_non_darwin(
+def test_mint_temp_config_dir_skips_keychain_check_on_non_darwin(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(claude_capture.sys, "platform", "linux")
@@ -1381,7 +1381,7 @@ def test_second_sigint_during_cleanup_is_deferred_and_both_actions_complete(
 # ---------------------------------------------------------------------------
 
 
-def testresolve_claude_executable_absolutizes_a_relative_path_entry(
+def test_resolve_claude_executable_absolutizes_a_relative_path_entry(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     bin_dir = tmp_path / "bin"
