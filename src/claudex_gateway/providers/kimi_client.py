@@ -23,8 +23,7 @@ KIMI_MODELS_URL = "https://api.kimi.com/coding/v1/models"
 class KimiUpstreamError(UpstreamError):
     """Raised when the Kimi backend returns a non-success HTTP response."""
 
-    def __init__(self, status_code: int, body: str) -> None:
-        super().__init__(status_code, body, "kimi")
+    provider_label = "kimi"
 
 
 class KimiClient:
