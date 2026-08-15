@@ -95,7 +95,21 @@ def test_imports_only_stdlib() -> None:
             assert node.module in allowed_modules
 
 
-@pytest.mark.parametrize("module_name", ["__main__.py", "config.py"])
+@pytest.mark.parametrize(
+    "module_name",
+    [
+        "cli/daemon.py",
+        "cli/admin_client.py",
+        "cli/accounts.py",
+        "cli/compact.py",
+        "config.py",
+    ],
+)
 def test_consumers_use_shared_paths_module(module_name: str) -> None:
     source = (_PACKAGE_DIR / module_name).read_text(encoding="utf-8")
     assert 'Path.home() / ".claudex"' not in source
+
+
+def test_cli_daemon_imports_shared_paths_module() -> None:
+    source = (_PACKAGE_DIR / "cli" / "daemon.py").read_text(encoding="utf-8")
+    assert "from claudex_gateway import paths" in source

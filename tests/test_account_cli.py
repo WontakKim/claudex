@@ -9,7 +9,7 @@ established by `test_claude_capture.py` and `test_main.py`:
   `tmp_path` and every `CLAUDEX_*`/`CLAUDE_CONFIG_DIR` variable scrubbed from
   the child's environment.
 - Scenarios that need a successful Claude credential capture call
-  `claudex_gateway.__main__._account_main(...)` in-process, so a real macOS
+  `claudex_gateway.cli.accounts._account_main(...)` in-process, so a real macOS
   Keychain is never touched: either `sys.platform` is forced to `"linux"`
   (capture then reads plain `.credentials.json`/`.claude.json` files, exactly
   as `test_claude_capture.py`'s own version-gate tests do), or the login
@@ -36,8 +36,8 @@ from pathlib import Path
 
 import pytest
 
-from claudex_gateway import __main__ as gateway_main
 from claudex_gateway import claude_accounts, claude_capture, paths
+from claudex_gateway.cli import accounts, admin_client, daemon
 
 # ---------------------------------------------------------------------------
 # Shared fixtures
@@ -333,7 +333,7 @@ def test_interrupt_sigint_during_interactive_login_exit_code_130_no_account_regi
     signaler = threading.Thread(target=_deliver_sigint, daemon=True)
     signaler.start()
     try:
-        exit_code = gateway_main._account_main(["add"])
+        exit_code = accounts._account_main(["add"])
     finally:
         signaler.join(timeout=5)
 
@@ -360,20 +360,20 @@ def test_interactive_add_list_remove_round_trip(
     _prepend_fake_claude(monkeypatch, tmp_path)
     monkeypatch.setenv("CLAUDEX_FAKE_CLAUDE_MODE", "success")
 
-    add_exit_code = gateway_main._account_main(["add"])
+    add_exit_code = accounts._account_main(["add"])
     added_out = capsys.readouterr().out
     assert add_exit_code == 0
     assert re.fullmatch(
         r"added account fixture@example\.com \([0-9a-f-]{36}\)\n", added_out
     )
 
-    list_exit_code = gateway_main._account_main(["list"])
+    list_exit_code = accounts._account_main(["list"])
     list_out = capsys.readouterr().out
     assert list_exit_code == 0
     assert "fixture@example.com" in list_out
 
     [record] = claude_accounts.list_accounts()
-    remove_exit_code = gateway_main._account_main(["remove", record.id, "--yes"])
+    remove_exit_code = accounts._account_main(["remove", record.id, "--yes"])
     removed_out = capsys.readouterr().out
     assert remove_exit_code == 0
     assert removed_out.strip() == f"removed account {record.email} ({record.id})"
@@ -409,7 +409,7 @@ def test_from_import_uses_fixture_config_dir(
     config_dir = tmp_path / "fixture-config"
     _write_fixture_config_dir(config_dir)
 
-    exit_code = gateway_main._account_main(["add", "--from", str(config_dir)])
+    exit_code = accounts._account_main(["add", "--from", str(config_dir)])
     out = capsys.readouterr().out
     assert exit_code == 0
 
@@ -431,10 +431,10 @@ def test_duplicate_add_non_tty_without_yes_exit_code_2_keeps_stored_credentials(
     config_dir = tmp_path / "fixture-config"
     _write_fixture_config_dir(config_dir)
 
-    first_exit_code = gateway_main._account_main(["add", "--from", str(config_dir)])
+    first_exit_code = accounts._account_main(["add", "--from", str(config_dir)])
     capsys.readouterr()
     _write_fixture_config_dir(config_dir, access_token="at-import-2")
-    second_exit_code = gateway_main._account_main(["add", "--from", str(config_dir)])
+    second_exit_code = accounts._account_main(["add", "--from", str(config_dir)])
     err = capsys.readouterr().err
 
     assert first_exit_code == 0
@@ -453,12 +453,12 @@ def test_duplicate_add_with_yes_replaces_credentials_in_place(
     config_dir = tmp_path / "fixture-config"
     _write_fixture_config_dir(config_dir)
 
-    assert gateway_main._account_main(["add", "--from", str(config_dir)]) == 0
+    assert accounts._account_main(["add", "--from", str(config_dir)]) == 0
     capsys.readouterr()
     [original] = claude_accounts.list_accounts()
 
     _write_fixture_config_dir(config_dir, access_token="at-import-2")
-    exit_code = gateway_main._account_main(["add", "--from", str(config_dir), "--yes"])
+    exit_code = accounts._account_main(["add", "--from", str(config_dir), "--yes"])
     out = capsys.readouterr().out
 
     assert exit_code == 0
@@ -485,7 +485,7 @@ def test_duplicate_add_tty_prompt_response(
     config_dir = tmp_path / "fixture-config"
     _write_fixture_config_dir(config_dir)
 
-    assert gateway_main._account_main(["add", "--from", str(config_dir)]) == 0
+    assert accounts._account_main(["add", "--from", str(config_dir)]) == 0
     capsys.readouterr()
 
     _make_stdin_a_tty(monkeypatch)
@@ -497,7 +497,7 @@ def test_duplicate_add_tty_prompt_response(
 
     monkeypatch.setattr("builtins.input", _fake_input)
     _write_fixture_config_dir(config_dir, access_token="at-import-2")
-    exit_code = gateway_main._account_main(["add", "--from", str(config_dir)])
+    exit_code = accounts._account_main(["add", "--from", str(config_dir)])
 
     assert exit_code == 0
     assert len(prompts) == 1
@@ -515,7 +515,7 @@ def test_duplicate_add_tty_prompt_response(
 def test_unknown_remove_id_exit_code_1(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    exit_code = gateway_main._account_main(["remove", str(uuid.uuid4()), "--yes"])
+    exit_code = accounts._account_main(["remove", str(uuid.uuid4()), "--yes"])
     err = capsys.readouterr().err
     assert exit_code == 1
     assert "account remove failed" in err
@@ -529,7 +529,7 @@ def test_malformed_registry_exit_code_1_no_traceback(
     accounts_root.mkdir(parents=True)
     (accounts_root / "registry.json").write_text("{not valid json", encoding="utf-8")
 
-    exit_code = gateway_main._account_main(["list"])
+    exit_code = accounts._account_main(["list"])
     err = capsys.readouterr().err
     assert exit_code == 1
     assert "account list failed" in err
@@ -545,7 +545,7 @@ def test_malformed_registry_exit_code_1_no_traceback(
 def test_empty_list_output_exit_code_0(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    exit_code = gateway_main._account_main(["list"])
+    exit_code = accounts._account_main(["list"])
     out = capsys.readouterr().out
     assert exit_code == 0
     assert out.strip() == "no accounts registered"
@@ -555,7 +555,7 @@ def test_list_table_headers_and_date_format(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     record = _add_record("user@example.com", organization_name="Acme")
-    exit_code = gateway_main._account_main(["list"])
+    exit_code = accounts._account_main(["list"])
     out = capsys.readouterr().out
     lines = out.splitlines()
 
@@ -577,7 +577,7 @@ def test_list_does_not_read_credentials_files_even_when_corrupt(
     (account_dir / "credentials.json").write_text("{not valid json at all", encoding="utf-8")
     (account_dir / "oauth-account.json").unlink()
 
-    exit_code = gateway_main._account_main(["list"])
+    exit_code = accounts._account_main(["list"])
     out = capsys.readouterr().out
     assert exit_code == 0
     assert record.email in out
@@ -601,18 +601,18 @@ def test_no_secret_output_sentinel_absent_on_success_and_failure(
         encoding="utf-8",
     )
 
-    add_exit_code = gateway_main._account_main(["add", "--from", str(config_dir)])
+    add_exit_code = accounts._account_main(["add", "--from", str(config_dir)])
     added = capsys.readouterr()
     assert add_exit_code == 0
     assert sentinel not in added.out
     assert sentinel not in added.err
 
-    gateway_main._account_main(["list"])
+    accounts._account_main(["list"])
     listed = capsys.readouterr()
     assert sentinel not in listed.out
     assert sentinel not in listed.err
 
-    failure_exit_code = gateway_main._account_main(["remove", str(uuid.uuid4()), "--yes"])
+    failure_exit_code = accounts._account_main(["remove", str(uuid.uuid4()), "--yes"])
     failed = capsys.readouterr()
     assert failure_exit_code == 1
     assert sentinel not in failed.out
@@ -632,10 +632,21 @@ def _unlocked_account_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def _stub_probe(
-    monkeypatch: pytest.MonkeyPatch, outcome: "gateway_main.ProbeOutcome"
-) -> None:
-    monkeypatch.setattr(gateway_main, "_read_daemon_record", lambda: (None, "not running"))
-    monkeypatch.setattr(gateway_main, "_classify_daemon", lambda host, port: outcome)
+    monkeypatch: pytest.MonkeyPatch, outcome: "admin_client.ProbeOutcome"
+) -> dict[str, int]:
+    calls = {"record": 0, "classify": 0}
+
+    def read_daemon_record() -> tuple[None, str]:
+        calls["record"] += 1
+        return None, "not running"
+
+    def classify_daemon(host: str, port: int) -> admin_client.ProbeOutcome:
+        calls["classify"] += 1
+        return outcome
+
+    monkeypatch.setattr(daemon, "_read_daemon_record", read_daemon_record)
+    monkeypatch.setattr(admin_client, "_classify_daemon", classify_daemon)
+    return calls
 
 
 def _settings_path() -> Path:
@@ -645,11 +656,12 @@ def _settings_path() -> Path:
 def test_account_use_show_prints_off_by_default(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    _stub_probe(monkeypatch, gateway_main.ProbeOutcome.NO_LISTENER)
+    calls = _stub_probe(monkeypatch, admin_client.ProbeOutcome.NO_LISTENER)
 
-    exit_code = gateway_main._account_main(["use"])
+    exit_code = accounts._account_main(["use"])
 
     assert exit_code == 0
+    assert calls == {"record": 1, "classify": 1}
     assert "account use: off" in capsys.readouterr().out
 
 
@@ -657,9 +669,9 @@ def test_account_use_writes_settings_when_no_daemon(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     record = _add_record()
-    _stub_probe(monkeypatch, gateway_main.ProbeOutcome.NO_LISTENER)
+    _stub_probe(monkeypatch, admin_client.ProbeOutcome.NO_LISTENER)
 
-    exit_code = gateway_main._account_main(["use", record.id])
+    exit_code = accounts._account_main(["use", record.id])
 
     assert exit_code == 0
     output = capsys.readouterr().out
@@ -672,9 +684,9 @@ def test_account_use_resolves_email_to_id(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     record = _add_record(email="pool@example.com")
-    _stub_probe(monkeypatch, gateway_main.ProbeOutcome.NO_LISTENER)
+    _stub_probe(monkeypatch, admin_client.ProbeOutcome.NO_LISTENER)
 
-    exit_code = gateway_main._account_main(["use", "Pool@Example.com"])
+    exit_code = accounts._account_main(["use", "Pool@Example.com"])
 
     assert exit_code == 0
     saved = json.loads(_settings_path().read_text(encoding="utf-8"))
@@ -685,10 +697,10 @@ def test_account_use_off_removes_the_settings_key(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     record = _add_record()
-    _stub_probe(monkeypatch, gateway_main.ProbeOutcome.NO_LISTENER)
-    assert gateway_main._account_main(["use", record.id]) == 0
+    _stub_probe(monkeypatch, admin_client.ProbeOutcome.NO_LISTENER)
+    assert accounts._account_main(["use", record.id]) == 0
 
-    exit_code = gateway_main._account_main(["use", "off"])
+    exit_code = accounts._account_main(["use", "off"])
 
     assert exit_code == 0
     assert "account use: off" in capsys.readouterr().out
@@ -699,9 +711,9 @@ def test_account_use_off_removes_the_settings_key(
 def test_account_use_unknown_target_fails_without_touching_settings(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    _stub_probe(monkeypatch, gateway_main.ProbeOutcome.NO_LISTENER)
+    _stub_probe(monkeypatch, admin_client.ProbeOutcome.NO_LISTENER)
 
-    exit_code = gateway_main._account_main(["use", "nobody@example.com"])
+    exit_code = accounts._account_main(["use", "nobody@example.com"])
 
     assert exit_code == 1
     assert "no account registered" in capsys.readouterr().err
@@ -713,9 +725,9 @@ def test_account_use_ambiguous_email_requires_an_id(
 ) -> None:
     first = _add_record(email="shared@example.com", organization_uuid="org-1")
     second = _add_record(email="shared@example.com", organization_uuid="org-2")
-    _stub_probe(monkeypatch, gateway_main.ProbeOutcome.NO_LISTENER)
+    _stub_probe(monkeypatch, admin_client.ProbeOutcome.NO_LISTENER)
 
-    exit_code = gateway_main._account_main(["use", "shared@example.com"])
+    exit_code = accounts._account_main(["use", "shared@example.com"])
 
     assert exit_code == 1
     error = capsys.readouterr().err
@@ -728,7 +740,7 @@ def test_account_use_identified_daemon_puts_through_admin_api(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     record = _add_record()
-    _stub_probe(monkeypatch, gateway_main.ProbeOutcome.IDENTIFIED)
+    _stub_probe(monkeypatch, admin_client.ProbeOutcome.IDENTIFIED)
     calls: list[dict[str, object]] = []
 
     def fake_admin_request(
@@ -739,17 +751,17 @@ def test_account_use_identified_daemon_puts_through_admin_api(
         *,
         local_token: str | None,
         json_body: dict[str, object] | None = None,
-    ) -> "gateway_main._AdminHttpResponse":
+    ) -> "admin_client._AdminHttpResponse":
         calls.append({"method": method, "path": path, "json_body": json_body})
-        return gateway_main._AdminHttpResponse(
+        return admin_client._AdminHttpResponse(
             status=200,
             body={"account_id": record.id, "env_locked": False},
             detail="",
         )
 
-    monkeypatch.setattr(gateway_main, "_admin_request", fake_admin_request)
+    monkeypatch.setattr(admin_client, "_admin_request", fake_admin_request)
 
-    exit_code = gateway_main._account_main(["use", record.id])
+    exit_code = accounts._account_main(["use", record.id])
 
     assert exit_code == 0
     assert calls == [
@@ -768,7 +780,7 @@ def test_account_use_identified_daemon_puts_through_admin_api(
 def test_account_use_off_identified_daemon_deletes_through_admin_api(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    _stub_probe(monkeypatch, gateway_main.ProbeOutcome.IDENTIFIED)
+    _stub_probe(monkeypatch, admin_client.ProbeOutcome.IDENTIFIED)
     calls: list[dict[str, object]] = []
 
     def fake_admin_request(
@@ -779,17 +791,17 @@ def test_account_use_off_identified_daemon_deletes_through_admin_api(
         *,
         local_token: str | None,
         json_body: dict[str, object] | None = None,
-    ) -> "gateway_main._AdminHttpResponse":
+    ) -> "admin_client._AdminHttpResponse":
         calls.append({"method": method, "path": path, "json_body": json_body})
-        return gateway_main._AdminHttpResponse(
+        return admin_client._AdminHttpResponse(
             status=200,
             body={"account_id": None, "env_locked": False},
             detail="",
         )
 
-    monkeypatch.setattr(gateway_main, "_admin_request", fake_admin_request)
+    monkeypatch.setattr(admin_client, "_admin_request", fake_admin_request)
 
-    exit_code = gateway_main._account_main(["use", "off"])
+    exit_code = accounts._account_main(["use", "off"])
 
     assert exit_code == 0
     assert calls == [
@@ -807,18 +819,18 @@ def test_account_use_show_identified_reads_admin_api(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     record = _add_record()
-    _stub_probe(monkeypatch, gateway_main.ProbeOutcome.IDENTIFIED)
+    _stub_probe(monkeypatch, admin_client.ProbeOutcome.IDENTIFIED)
 
-    def fake_admin_request(*args: object, **kwargs: object) -> "gateway_main._AdminHttpResponse":
-        return gateway_main._AdminHttpResponse(
+    def fake_admin_request(*args: object, **kwargs: object) -> "admin_client._AdminHttpResponse":
+        return admin_client._AdminHttpResponse(
             status=200,
             body={"account_id": record.id, "env_locked": False},
             detail="",
         )
 
-    monkeypatch.setattr(gateway_main, "_admin_request", fake_admin_request)
+    monkeypatch.setattr(admin_client, "_admin_request", fake_admin_request)
 
-    exit_code = gateway_main._account_main(["use"])
+    exit_code = accounts._account_main(["use"])
 
     assert exit_code == 0
     assert f"user@example.com ({record.id})" in capsys.readouterr().out
@@ -828,9 +840,9 @@ def test_account_use_ambiguous_probe_refuses_to_write(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     record = _add_record()
-    _stub_probe(monkeypatch, gateway_main.ProbeOutcome.AMBIGUOUS)
+    _stub_probe(monkeypatch, admin_client.ProbeOutcome.AMBIGUOUS)
 
-    exit_code = gateway_main._account_main(["use", record.id])
+    exit_code = accounts._account_main(["use", record.id])
 
     assert exit_code == 1
     assert "refusing to modify settings" in capsys.readouterr().err
@@ -841,12 +853,12 @@ def test_account_use_show_warns_about_an_unregistered_configured_account(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     orphan_id = str(uuid.uuid4())
-    gateway_main.update_settings_file(
+    accounts.update_settings_file(
         _settings_path(), {"claude_account.id": orphan_id}
     )
-    _stub_probe(monkeypatch, gateway_main.ProbeOutcome.NO_LISTENER)
+    _stub_probe(monkeypatch, admin_client.ProbeOutcome.NO_LISTENER)
 
-    exit_code = gateway_main._account_main(["use"])
+    exit_code = accounts._account_main(["use"])
 
     assert exit_code == 0
     captured = capsys.readouterr()

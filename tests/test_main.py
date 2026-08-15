@@ -22,6 +22,7 @@ import pytest
 
 from claudex_gateway import __main__ as gateway_main
 from claudex_gateway import paths
+from claudex_gateway.cli import accounts, admin_client, compact, daemon
 from claudex_gateway.config import GatewayConfig
 from claudex_gateway.locking import try_file_lock
 
@@ -75,6 +76,35 @@ def _run_cli(env: dict[str, str], *arguments: str) -> subprocess.CompletedProces
         text=True,
         timeout=30,
     )
+
+
+@pytest.mark.parametrize(
+    ("arguments", "owner", "symbol", "expected_arguments"),
+    [
+        (["stop"], daemon, "_stop_background", ()),
+        (["account", "list"], accounts, "_account_main", (["list"],)),
+        (["compact"], compact, "_compact_main", ([],)),
+    ],
+)
+def test_main_dispatches_to_cli_module_binding(
+    monkeypatch: pytest.MonkeyPatch,
+    arguments: list[str],
+    owner: object,
+    symbol: str,
+    expected_arguments: tuple[object, ...],
+) -> None:
+    calls: list[tuple[object, ...]] = []
+
+    def replacement(*invoked_arguments: object) -> int:
+        calls.append(invoked_arguments)
+        return 0
+
+    monkeypatch.setattr(sys, "argv", ["claudex-gateway", *arguments])
+    monkeypatch.setattr(owner, symbol, replacement)
+
+    gateway_main.main()
+
+    assert calls == [expected_arguments]
 
 
 def _record_file(tmp_path: Path) -> Path:
@@ -387,7 +417,7 @@ def _stub_urlopen(
             raise exception
         return response
 
-    monkeypatch.setattr(gateway_main, "_urlopen_no_redirect", _fake)
+    monkeypatch.setattr(admin_client, "_urlopen_no_redirect", _fake)
 
 
 class _RecordingOpener:
@@ -419,28 +449,28 @@ def _stub_full_stack_urlopen(
             return _FakeResponse(200, _HELLO_BODY)
         raise urllib.error.HTTPError(url, admin_status, "error", None, io.BytesIO(admin_body))
 
-    monkeypatch.setattr(gateway_main, "_urlopen_no_redirect", _fake)
+    monkeypatch.setattr(admin_client, "_urlopen_no_redirect", _fake)
 
 
 # --- URL bracketing (IPv6-safe URL construction) ---------------------------
 
 
 def test_bracket_host_leaves_ipv4_and_hostnames_unbracketed() -> None:
-    assert gateway_main._bracket_host("127.0.0.1") == "127.0.0.1"
-    assert gateway_main._bracket_host("example.com") == "example.com"
+    assert admin_client._bracket_host("127.0.0.1") == "127.0.0.1"
+    assert admin_client._bracket_host("example.com") == "example.com"
 
 
 def test_bracket_host_brackets_ipv6_literals() -> None:
-    assert gateway_main._bracket_host("::1") == "[::1]"
+    assert admin_client._bracket_host("::1") == "[::1]"
 
 
 def test_http_url_formats_ipv6_endpoint_with_brackets() -> None:
-    assert gateway_main._http_url("::1", 8787, "/api/hello") == "http://[::1]:8787/api/hello"
+    assert admin_client._http_url("::1", 8787, "/api/hello") == "http://[::1]:8787/api/hello"
 
 
 def test_http_url_formats_ipv4_endpoint_without_brackets() -> None:
     assert (
-        gateway_main._http_url("127.0.0.1", 8787, "/api/hello")
+        admin_client._http_url("127.0.0.1", 8787, "/api/hello")
         == "http://127.0.0.1:8787/api/hello"
     )
 
@@ -461,7 +491,7 @@ def test_probe_endpoint_uses_the_daemon_record_when_valid(
     _write_record(record_file, pid=123, host="10.0.0.5", port=9999, nonce="abc")
     config = GatewayConfig(host="127.0.0.1", port=8787, settings_file=tmp_path / "settings.json")
 
-    assert gateway_main._probe_endpoint(config) == ("10.0.0.5", 9999)
+    assert admin_client._probe_endpoint(config) == ("10.0.0.5", 9999)
 
 
 def test_probe_endpoint_falls_back_to_config_when_no_record(
@@ -472,7 +502,7 @@ def test_probe_endpoint_falls_back_to_config_when_no_record(
     monkeypatch.setattr(paths, "daemon_record_file", lambda: tmp_path / "gateway.pid")
     config = GatewayConfig(host="192.168.1.5", port=9001, settings_file=tmp_path / "settings.json")
 
-    assert gateway_main._probe_endpoint(config) == ("192.168.1.5", 9001)
+    assert admin_client._probe_endpoint(config) == ("192.168.1.5", 9001)
 
 
 def test_probe_endpoint_treats_a_corrupt_record_as_absent(
@@ -484,7 +514,7 @@ def test_probe_endpoint_treats_a_corrupt_record_as_absent(
     record_file.write_text("42\n", encoding="utf-8")  # legacy bare-pid record
     config = GatewayConfig(host="127.0.0.1", port=8787, settings_file=tmp_path / "settings.json")
 
-    assert gateway_main._probe_endpoint(config) == ("127.0.0.1", 8787)
+    assert admin_client._probe_endpoint(config) == ("127.0.0.1", 8787)
 
 
 def test_probe_endpoint_converts_wildcard_record_host_via_connect_host(
@@ -495,7 +525,7 @@ def test_probe_endpoint_converts_wildcard_record_host_via_connect_host(
     _write_record(record_file, pid=123, host="0.0.0.0", port=9999, nonce="abc")
     config = GatewayConfig(settings_file=tmp_path / "settings.json")
 
-    assert gateway_main._probe_endpoint(config) == ("127.0.0.1", 9999)
+    assert admin_client._probe_endpoint(config) == ("127.0.0.1", 9999)
 
 
 def test_probe_endpoint_converts_wildcard_config_host_when_no_record(
@@ -504,7 +534,7 @@ def test_probe_endpoint_converts_wildcard_config_host_when_no_record(
     monkeypatch.setattr(paths, "daemon_record_file", lambda: tmp_path / "gateway.pid")
     config = GatewayConfig(host="::", port=8787, settings_file=tmp_path / "settings.json")
 
-    assert gateway_main._probe_endpoint(config) == ("127.0.0.1", 8787)
+    assert admin_client._probe_endpoint(config) == ("127.0.0.1", 8787)
 
 
 # --- Probe classification: the four-way outcome grammar ---------------------
@@ -512,7 +542,7 @@ def test_probe_endpoint_converts_wildcard_config_host_when_no_record(
 
 def test_classify_daemon_identified_on_valid_hello(monkeypatch: pytest.MonkeyPatch) -> None:
     _stub_urlopen(monkeypatch, response=_FakeResponse(200, _HELLO_BODY))
-    assert gateway_main._classify_daemon("127.0.0.1", 8787) is gateway_main.ProbeOutcome.IDENTIFIED
+    assert admin_client._classify_daemon("127.0.0.1", 8787) is admin_client.ProbeOutcome.IDENTIFIED
 
 
 def test_classify_daemon_no_listener_on_connection_refused(
@@ -521,7 +551,7 @@ def test_classify_daemon_no_listener_on_connection_refused(
     _stub_urlopen(
         monkeypatch, exception=urllib.error.URLError(ConnectionRefusedError())
     )
-    assert gateway_main._classify_daemon("127.0.0.1", 8787) is gateway_main.ProbeOutcome.NO_LISTENER
+    assert admin_client._classify_daemon("127.0.0.1", 8787) is admin_client.ProbeOutcome.NO_LISTENER
 
 
 def test_classify_daemon_foreign_on_http_error_status(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -529,30 +559,30 @@ def test_classify_daemon_foreign_on_http_error_status(monkeypatch: pytest.Monkey
         "http://127.0.0.1:8787/api/hello", 500, "boom", None, io.BytesIO(b"oops")
     )
     _stub_urlopen(monkeypatch, exception=exc)
-    assert gateway_main._classify_daemon("127.0.0.1", 8787) is gateway_main.ProbeOutcome.FOREIGN
+    assert admin_client._classify_daemon("127.0.0.1", 8787) is admin_client.ProbeOutcome.FOREIGN
 
 
 def test_classify_daemon_foreign_on_non_hello_json_body(monkeypatch: pytest.MonkeyPatch) -> None:
     body = json.dumps({"service": "something-else"}).encode()
     _stub_urlopen(monkeypatch, response=_FakeResponse(200, body))
-    assert gateway_main._classify_daemon("127.0.0.1", 8787) is gateway_main.ProbeOutcome.FOREIGN
+    assert admin_client._classify_daemon("127.0.0.1", 8787) is admin_client.ProbeOutcome.FOREIGN
 
 
 def test_classify_daemon_foreign_on_invalid_json_body(monkeypatch: pytest.MonkeyPatch) -> None:
     _stub_urlopen(monkeypatch, response=_FakeResponse(200, b"not json"))
-    assert gateway_main._classify_daemon("127.0.0.1", 8787) is gateway_main.ProbeOutcome.FOREIGN
+    assert admin_client._classify_daemon("127.0.0.1", 8787) is admin_client.ProbeOutcome.FOREIGN
 
 
 def test_classify_daemon_ambiguous_on_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
     _stub_urlopen(monkeypatch, exception=urllib.error.URLError(TimeoutError("timed out")))
-    assert gateway_main._classify_daemon("127.0.0.1", 8787) is gateway_main.ProbeOutcome.AMBIGUOUS
+    assert admin_client._classify_daemon("127.0.0.1", 8787) is admin_client.ProbeOutcome.AMBIGUOUS
 
 
 def test_classify_daemon_ambiguous_on_dns_failure(monkeypatch: pytest.MonkeyPatch) -> None:
     _stub_urlopen(
         monkeypatch, exception=urllib.error.URLError(socket.gaierror("name not known"))
     )
-    assert gateway_main._classify_daemon("127.0.0.1", 8787) is gateway_main.ProbeOutcome.AMBIGUOUS
+    assert admin_client._classify_daemon("127.0.0.1", 8787) is admin_client.ProbeOutcome.AMBIGUOUS
 
 
 def test_classify_daemon_ambiguous_on_connection_reset_before_response(
@@ -569,7 +599,7 @@ def test_classify_daemon_ambiguous_on_connection_reset_before_response(
             raise ConnectionResetError("reset")
 
     _stub_urlopen(monkeypatch, response=_ResetResponse())
-    assert gateway_main._classify_daemon("127.0.0.1", 8787) is gateway_main.ProbeOutcome.AMBIGUOUS
+    assert admin_client._classify_daemon("127.0.0.1", 8787) is admin_client.ProbeOutcome.AMBIGUOUS
 
 
 # --- The /admin/settings/compaction HTTP helper: auth, content type, error handling -
@@ -581,7 +611,7 @@ def test_admin_request_success_returns_status_body_and_detail(
     body = json.dumps({"model": None, "env_locked": False, "last_reroute": None}).encode()
     _stub_urlopen(monkeypatch, response=_FakeResponse(200, body))
 
-    response = gateway_main._admin_request(
+    response = admin_client._admin_request(
         "127.0.0.1", 8787, "GET", "/admin/settings/compaction", local_token=None
     )
 
@@ -593,9 +623,9 @@ def test_admin_request_attaches_bearer_header_when_local_token_configured(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     opener = _RecordingOpener(_FakeResponse(200, b"{}"))
-    monkeypatch.setattr(gateway_main, "_urlopen_no_redirect", opener)
+    monkeypatch.setattr(admin_client, "_urlopen_no_redirect", opener)
 
-    gateway_main._admin_request(
+    admin_client._admin_request(
         "127.0.0.1", 8787, "GET", "/admin/settings/compaction", local_token="local_token-value"
     )
 
@@ -607,9 +637,9 @@ def test_admin_request_omits_bearer_header_when_no_local_token_configured(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     opener = _RecordingOpener(_FakeResponse(200, b"{}"))
-    monkeypatch.setattr(gateway_main, "_urlopen_no_redirect", opener)
+    monkeypatch.setattr(admin_client, "_urlopen_no_redirect", opener)
 
-    gateway_main._admin_request(
+    admin_client._admin_request(
         "127.0.0.1", 8787, "GET", "/admin/settings/compaction", local_token=None
     )
 
@@ -621,9 +651,9 @@ def test_admin_request_sets_json_content_type_on_put_but_not_get(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     opener = _RecordingOpener(_FakeResponse(200, b"{}"))
-    monkeypatch.setattr(gateway_main, "_urlopen_no_redirect", opener)
+    monkeypatch.setattr(admin_client, "_urlopen_no_redirect", opener)
 
-    gateway_main._admin_request(
+    admin_client._admin_request(
         "127.0.0.1",
         8787,
         "PUT",
@@ -635,7 +665,7 @@ def test_admin_request_sets_json_content_type_on_put_but_not_get(
     assert opener.last_request.get_header("Content-type") == "application/json"
     assert opener.last_request.get_method() == "PUT"
 
-    gateway_main._admin_request(
+    admin_client._admin_request(
         "127.0.0.1", 8787, "GET", "/admin/settings/compaction", local_token=None
     )
     assert opener.last_request is not None
@@ -652,7 +682,7 @@ def test_admin_request_http_error_with_json_body(monkeypatch: pytest.MonkeyPatch
     )
     _stub_urlopen(monkeypatch, exception=exc)
 
-    response = gateway_main._admin_request(
+    response = admin_client._admin_request(
         "127.0.0.1", 8787, "GET", "/admin/settings/compaction", local_token=None
     )
 
@@ -671,7 +701,7 @@ def test_admin_request_http_error_with_non_json_body(monkeypatch: pytest.MonkeyP
     )
     _stub_urlopen(monkeypatch, exception=exc)
 
-    response = gateway_main._admin_request(
+    response = admin_client._admin_request(
         "127.0.0.1", 8787, "GET", "/admin/settings/compaction", local_token=None
     )
 
@@ -683,8 +713,8 @@ def test_admin_request_http_error_with_non_json_body(monkeypatch: pytest.MonkeyP
 def test_admin_request_transport_failure_raises(monkeypatch: pytest.MonkeyPatch) -> None:
     _stub_urlopen(monkeypatch, exception=urllib.error.URLError(TimeoutError("timed out")))
 
-    with pytest.raises(gateway_main._AdminTransportError):
-        gateway_main._admin_request(
+    with pytest.raises(admin_client._AdminTransportError):
+        admin_client._admin_request(
             "127.0.0.1", 8787, "GET", "/admin/settings/compaction", local_token=None
         )
 
@@ -694,30 +724,30 @@ def test_admin_request_transport_failure_raises(monkeypatch: pytest.MonkeyPatch)
 
 def test_parse_compaction_envelope_accepts_a_well_formed_body() -> None:
     envelope = {"model": "claude:claude-opus-5", "env_locked": False, "last_reroute": None}
-    assert gateway_main._parse_compaction_envelope(envelope) == envelope
+    assert compact._parse_compaction_envelope(envelope) == envelope
 
 
 def test_parse_compaction_envelope_rejects_a_non_dict_body() -> None:
-    assert gateway_main._parse_compaction_envelope(["not", "a", "dict"]) is None
+    assert compact._parse_compaction_envelope(["not", "a", "dict"]) is None
 
 
 def test_parse_compaction_envelope_rejects_a_missing_field() -> None:
-    assert gateway_main._parse_compaction_envelope({"model": None, "env_locked": False}) is None
+    assert compact._parse_compaction_envelope({"model": None, "env_locked": False}) is None
 
 
 def test_parse_compaction_envelope_rejects_a_wrongly_typed_model() -> None:
     body = {"model": 123, "env_locked": False, "last_reroute": None}
-    assert gateway_main._parse_compaction_envelope(body) is None
+    assert compact._parse_compaction_envelope(body) is None
 
 
 def test_parse_compaction_envelope_rejects_a_wrongly_typed_env_locked() -> None:
     body = {"model": None, "env_locked": "yes", "last_reroute": None}
-    assert gateway_main._parse_compaction_envelope(body) is None
+    assert compact._parse_compaction_envelope(body) is None
 
 
 def test_parse_compaction_envelope_rejects_a_wrongly_typed_last_reroute() -> None:
     body = {"model": None, "env_locked": False, "last_reroute": "nope"}
-    assert gateway_main._parse_compaction_envelope(body) is None
+    assert compact._parse_compaction_envelope(body) is None
 
 
 # --- `compact` command dispatch: unsupported forms and validation ordering -
@@ -727,7 +757,7 @@ def test_compact_test_is_an_unsupported_form(capsys: pytest.CaptureFixture[str])
     # "compact test" (unlike `compact`/`compact set`/`compact off`) was
     # deliberately never implemented; every unsupported argument form,
     # including this one, exits 2 with a usage message.
-    exit_code = gateway_main._compact_main(["test"])
+    exit_code = compact._compact_main(["test"])
     err = capsys.readouterr().err
     assert exit_code == 2
     assert "usage: claudex-gateway compact" in err
@@ -741,14 +771,14 @@ def test_compact_test_is_an_unsupported_form(capsys: pytest.CaptureFixture[str])
 def test_compact_unsupported_argument_shapes_exit_2(
     capsys: pytest.CaptureFixture[str], argv: list[str]
 ) -> None:
-    exit_code = gateway_main._compact_main(argv)
+    exit_code = compact._compact_main(argv)
     err = capsys.readouterr().err
     assert exit_code == 2
     assert "usage: claudex-gateway compact" in err
 
 
 def test_compact_set_invalid_model_syntax_exits_2(capsys: pytest.CaptureFixture[str]) -> None:
-    exit_code = gateway_main._compact_main(["set", "gpt-5"])
+    exit_code = compact._compact_main(["set", "gpt-5"])
     err = capsys.readouterr().err
     assert exit_code == 2
     assert "claude:" in err
@@ -761,11 +791,11 @@ def test_compact_set_validates_before_any_config_daemon_network_or_file_access(
         raise AssertionError("must not be called for an invalid compact set argument")
 
     monkeypatch.setattr(GatewayConfig, "load", staticmethod(_fail))
-    monkeypatch.setattr(gateway_main, "_read_daemon_record", _fail)
-    monkeypatch.setattr(gateway_main, "_classify_daemon", _fail)
-    monkeypatch.setattr(gateway_main, "update_settings_file", _fail)
+    monkeypatch.setattr(daemon, "_read_daemon_record", _fail)
+    monkeypatch.setattr(admin_client, "_classify_daemon", _fail)
+    monkeypatch.setattr(compact, "update_settings_file", _fail)
 
-    exit_code = gateway_main._compact_main(["set", "not-a-claude-model"])
+    exit_code = compact._compact_main(["set", "not-a-claude-model"])
 
     assert exit_code == 2
 
@@ -776,22 +806,22 @@ def test_compact_set_validates_before_any_config_daemon_network_or_file_access(
 def _compact_env(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
-    outcome: "gateway_main.ProbeOutcome",
+    outcome: "admin_client.ProbeOutcome",
     **config_overrides: object,
 ) -> GatewayConfig:
     """Wire a compact command up to a fixed probe outcome and config, with no
     real daemon record, network call, or config-file read involved."""
     config = GatewayConfig(settings_file=tmp_path / "settings.json", **config_overrides)
     monkeypatch.setattr(GatewayConfig, "load", staticmethod(lambda *a, **k: config))
-    monkeypatch.setattr(gateway_main, "_read_daemon_record", lambda: (None, "not running"))
-    monkeypatch.setattr(gateway_main, "_classify_daemon", lambda host, port: outcome)
+    monkeypatch.setattr(daemon, "_read_daemon_record", lambda: (None, "not running"))
+    monkeypatch.setattr(admin_client, "_classify_daemon", lambda host, port: outcome)
     return config
 
 
 def _stub_admin_request(
     monkeypatch: pytest.MonkeyPatch,
     *,
-    response: "gateway_main._AdminHttpResponse | None" = None,
+    response: "admin_client._AdminHttpResponse | None" = None,
     exception: Exception | None = None,
     calls: list[dict[str, object]] | None = None,
 ) -> None:
@@ -803,7 +833,7 @@ def _stub_admin_request(
         *,
         local_token: str | None,
         json_body: dict[str, object] | None = None,
-    ) -> "gateway_main._AdminHttpResponse":
+    ) -> "admin_client._AdminHttpResponse":
         if calls is not None:
             calls.append(
                 {
@@ -820,7 +850,7 @@ def _stub_admin_request(
         assert response is not None
         return response
 
-    monkeypatch.setattr(gateway_main, "_admin_request", _fake)
+    monkeypatch.setattr(admin_client, "_admin_request", _fake)
 
 
 def test_compact_show_no_listener_reads_settings_file_state(
@@ -829,10 +859,10 @@ def test_compact_show_no_listener_reads_settings_file_state(
     _compact_env(
         monkeypatch,
         tmp_path,
-        gateway_main.ProbeOutcome.NO_LISTENER,
+        admin_client.ProbeOutcome.NO_LISTENER,
         compaction_model="claude:claude-opus-5",
     )
-    exit_code = gateway_main._compact_main([])
+    exit_code = compact._compact_main([])
     out = capsys.readouterr().out
     assert exit_code == 0
     assert "compaction: enabled (target claude:claude-opus-5)" in out
@@ -841,8 +871,8 @@ def test_compact_show_no_listener_reads_settings_file_state(
 def test_compact_show_foreign_reads_settings_file_state(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    _compact_env(monkeypatch, tmp_path, gateway_main.ProbeOutcome.FOREIGN)
-    exit_code = gateway_main._compact_main([])
+    _compact_env(monkeypatch, tmp_path, admin_client.ProbeOutcome.FOREIGN)
+    exit_code = compact._compact_main([])
     out = capsys.readouterr().out
     assert exit_code == 0
     assert "compaction: disabled" in out
@@ -851,8 +881,8 @@ def test_compact_show_foreign_reads_settings_file_state(
 def test_compact_set_no_listener_writes_settings_file_directly(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    config = _compact_env(monkeypatch, tmp_path, gateway_main.ProbeOutcome.NO_LISTENER)
-    exit_code = gateway_main._compact_main(["set", "claude:claude-opus-5"])
+    config = _compact_env(monkeypatch, tmp_path, admin_client.ProbeOutcome.NO_LISTENER)
+    exit_code = compact._compact_main(["set", "claude:claude-opus-5"])
     assert exit_code == 0
     saved = json.loads(config.settings_file.read_text(encoding="utf-8"))
     assert saved == {"compaction": {"model": "claude:claude-opus-5"}}
@@ -861,8 +891,8 @@ def test_compact_set_no_listener_writes_settings_file_directly(
 def test_compact_set_foreign_writes_settings_file_directly(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    config = _compact_env(monkeypatch, tmp_path, gateway_main.ProbeOutcome.FOREIGN)
-    exit_code = gateway_main._compact_main(["set", "claude:claude-sonnet-5"])
+    config = _compact_env(monkeypatch, tmp_path, admin_client.ProbeOutcome.FOREIGN)
+    exit_code = compact._compact_main(["set", "claude:claude-sonnet-5"])
     assert exit_code == 0
     saved = json.loads(config.settings_file.read_text(encoding="utf-8"))
     assert saved == {"compaction": {"model": "claude:claude-sonnet-5"}}
@@ -875,8 +905,8 @@ def test_compact_off_no_listener_writes_settings_file_directly_via_deletion(
     settings_file.write_text(
         json.dumps({"compaction.model": "claude:claude-old-5", "port": 9000}), encoding="utf-8"
     )
-    config = _compact_env(monkeypatch, tmp_path, gateway_main.ProbeOutcome.NO_LISTENER)
-    exit_code = gateway_main._compact_main(["off"])
+    config = _compact_env(monkeypatch, tmp_path, admin_client.ProbeOutcome.NO_LISTENER)
+    exit_code = compact._compact_main(["off"])
     assert exit_code == 0
     saved = json.loads(config.settings_file.read_text(encoding="utf-8"))
     assert saved == {"port": 9000}
@@ -890,8 +920,8 @@ def test_compact_off_foreign_writes_settings_file_directly_via_deletion(
     settings_file.write_text(
         json.dumps({"compaction.model": "claude:claude-old-5"}), encoding="utf-8"
     )
-    config = _compact_env(monkeypatch, tmp_path, gateway_main.ProbeOutcome.FOREIGN)
-    exit_code = gateway_main._compact_main(["off"])
+    config = _compact_env(monkeypatch, tmp_path, admin_client.ProbeOutcome.FOREIGN)
+    exit_code = compact._compact_main(["off"])
     assert exit_code == 0
     saved = json.loads(config.settings_file.read_text(encoding="utf-8"))
     assert "compaction" not in saved
@@ -905,10 +935,10 @@ def test_compact_show_ambiguous_reads_file_with_unreachable_note(
     _compact_env(
         monkeypatch,
         tmp_path,
-        gateway_main.ProbeOutcome.AMBIGUOUS,
+        admin_client.ProbeOutcome.AMBIGUOUS,
         compaction_model="claude:claude-opus-5",
     )
-    exit_code = gateway_main._compact_main([])
+    exit_code = compact._compact_main([])
     captured = capsys.readouterr()
     assert exit_code == 0
     assert "unreachable" in captured.err
@@ -918,8 +948,8 @@ def test_compact_show_ambiguous_reads_file_with_unreachable_note(
 def test_compact_set_ambiguous_refuses_to_write(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    config = _compact_env(monkeypatch, tmp_path, gateway_main.ProbeOutcome.AMBIGUOUS)
-    exit_code = gateway_main._compact_main(["set", "claude:claude-opus-5"])
+    config = _compact_env(monkeypatch, tmp_path, admin_client.ProbeOutcome.AMBIGUOUS)
+    exit_code = compact._compact_main(["set", "claude:claude-opus-5"])
     assert exit_code != 0
     assert not config.settings_file.exists()
 
@@ -927,8 +957,8 @@ def test_compact_set_ambiguous_refuses_to_write(
 def test_compact_off_ambiguous_refuses_to_write(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    config = _compact_env(monkeypatch, tmp_path, gateway_main.ProbeOutcome.AMBIGUOUS)
-    exit_code = gateway_main._compact_main(["off"])
+    config = _compact_env(monkeypatch, tmp_path, admin_client.ProbeOutcome.AMBIGUOUS)
+    exit_code = compact._compact_main(["off"])
     assert exit_code != 0
     assert not config.settings_file.exists()
 
@@ -936,7 +966,7 @@ def test_compact_off_ambiguous_refuses_to_write(
 def test_compact_show_identified_success_prints_diagnostics(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    _compact_env(monkeypatch, tmp_path, gateway_main.ProbeOutcome.IDENTIFIED)
+    _compact_env(monkeypatch, tmp_path, admin_client.ProbeOutcome.IDENTIFIED)
     envelope = {
         "model": "claude:claude-opus-5",
         "env_locked": False,
@@ -951,10 +981,10 @@ def test_compact_show_identified_success_prints_diagnostics(
         },
     }
     _stub_admin_request(
-        monkeypatch, response=gateway_main._AdminHttpResponse(status=200, body=envelope, detail="")
+        monkeypatch, response=admin_client._AdminHttpResponse(status=200, body=envelope, detail="")
     )
 
-    exit_code = gateway_main._compact_main([])
+    exit_code = compact._compact_main([])
     out = capsys.readouterr().out
 
     assert exit_code == 0
@@ -968,13 +998,13 @@ def test_compact_show_identified_success_prints_diagnostics(
 def test_compact_show_identified_disabled_prints_no_reroute(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    _compact_env(monkeypatch, tmp_path, gateway_main.ProbeOutcome.IDENTIFIED)
+    _compact_env(monkeypatch, tmp_path, admin_client.ProbeOutcome.IDENTIFIED)
     envelope = {"model": None, "env_locked": False, "last_reroute": None}
     _stub_admin_request(
-        monkeypatch, response=gateway_main._AdminHttpResponse(status=200, body=envelope, detail="")
+        monkeypatch, response=admin_client._AdminHttpResponse(status=200, body=envelope, detail="")
     )
 
-    exit_code = gateway_main._compact_main([])
+    exit_code = compact._compact_main([])
     out = capsys.readouterr().out
 
     assert exit_code == 0
@@ -988,18 +1018,18 @@ def test_compact_set_identified_success_calls_put_with_the_local_bearer_token(
     config = _compact_env(
         monkeypatch,
         tmp_path,
-        gateway_main.ProbeOutcome.IDENTIFIED,
+        admin_client.ProbeOutcome.IDENTIFIED,
         local_token="local_token-abc",
     )
     envelope = {"model": "claude:claude-opus-5", "env_locked": False, "last_reroute": None}
     calls: list[dict[str, object]] = []
     _stub_admin_request(
         monkeypatch,
-        response=gateway_main._AdminHttpResponse(status=200, body=envelope, detail=""),
+        response=admin_client._AdminHttpResponse(status=200, body=envelope, detail=""),
         calls=calls,
     )
 
-    exit_code = gateway_main._compact_main(["set", "claude:claude-opus-5"])
+    exit_code = compact._compact_main(["set", "claude:claude-opus-5"])
 
     assert exit_code == 0
     assert not config.settings_file.exists()  # the admin call succeeded; no direct write
@@ -1014,13 +1044,13 @@ def test_compact_set_identified_success_calls_put_with_the_local_bearer_token(
 def test_compact_set_identified_admin_http_error_exits_nonzero_without_file_write(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, status: int
 ) -> None:
-    config = _compact_env(monkeypatch, tmp_path, gateway_main.ProbeOutcome.IDENTIFIED)
+    config = _compact_env(monkeypatch, tmp_path, admin_client.ProbeOutcome.IDENTIFIED)
     _stub_admin_request(
         monkeypatch,
-        response=gateway_main._AdminHttpResponse(status=status, body=None, detail="boom"),
+        response=admin_client._AdminHttpResponse(status=status, body=None, detail="boom"),
     )
 
-    exit_code = gateway_main._compact_main(["set", "claude:claude-opus-5"])
+    exit_code = compact._compact_main(["set", "claude:claude-opus-5"])
 
     assert exit_code != 0
     assert not config.settings_file.exists()
@@ -1036,15 +1066,15 @@ def test_compact_off_identified_admin_http_error_exits_nonzero_without_file_writ
     config = _compact_env(
         monkeypatch,
         tmp_path,
-        gateway_main.ProbeOutcome.IDENTIFIED,
+        admin_client.ProbeOutcome.IDENTIFIED,
         compaction_model="claude:claude-old-5",
     )
     _stub_admin_request(
         monkeypatch,
-        response=gateway_main._AdminHttpResponse(status=409, body=None, detail="env locked"),
+        response=admin_client._AdminHttpResponse(status=409, body=None, detail="env locked"),
     )
 
-    exit_code = gateway_main._compact_main(["off"])
+    exit_code = compact._compact_main(["off"])
 
     assert exit_code != 0
     saved = json.loads(settings_file.read_text(encoding="utf-8"))
@@ -1056,10 +1086,10 @@ def test_compact_set_identified_404_non_json_falls_back_with_restart_warning(
 ) -> None:
     config = GatewayConfig(settings_file=tmp_path / "settings.json")
     monkeypatch.setattr(GatewayConfig, "load", staticmethod(lambda *a, **k: config))
-    monkeypatch.setattr(gateway_main, "_read_daemon_record", lambda: (None, "not running"))
+    monkeypatch.setattr(daemon, "_read_daemon_record", lambda: (None, "not running"))
     _stub_full_stack_urlopen(monkeypatch, 404, b"<html>not found</html>")
 
-    exit_code = gateway_main._compact_main(["set", "claude:claude-opus-5"])
+    exit_code = compact._compact_main(["set", "claude:claude-opus-5"])
     err = capsys.readouterr().err
 
     assert exit_code == 0
@@ -1077,10 +1107,10 @@ def test_compact_off_identified_405_non_json_falls_back_with_restart_warning(
     )
     config = GatewayConfig(settings_file=settings_file, compaction_model="claude:claude-old-5")
     monkeypatch.setattr(GatewayConfig, "load", staticmethod(lambda *a, **k: config))
-    monkeypatch.setattr(gateway_main, "_read_daemon_record", lambda: (None, "not running"))
+    monkeypatch.setattr(daemon, "_read_daemon_record", lambda: (None, "not running"))
     _stub_full_stack_urlopen(monkeypatch, 405, b"method not allowed")
 
-    exit_code = gateway_main._compact_main(["off"])
+    exit_code = compact._compact_main(["off"])
     err = capsys.readouterr().err
 
     assert exit_code == 0
@@ -1096,10 +1126,10 @@ def test_compact_show_identified_405_falls_back_with_may_differ_note(
         settings_file=tmp_path / "settings.json", compaction_model="claude:claude-opus-5"
     )
     monkeypatch.setattr(GatewayConfig, "load", staticmethod(lambda *a, **k: config))
-    monkeypatch.setattr(gateway_main, "_read_daemon_record", lambda: (None, "not running"))
+    monkeypatch.setattr(daemon, "_read_daemon_record", lambda: (None, "not running"))
     _stub_full_stack_urlopen(monkeypatch, 405, b"method not allowed")
 
-    exit_code = gateway_main._compact_main([])
+    exit_code = compact._compact_main([])
     captured = capsys.readouterr()
 
     assert exit_code == 0
@@ -1112,10 +1142,10 @@ def test_compact_set_identified_non_json_500_fails_closed(
 ) -> None:
     config = GatewayConfig(settings_file=tmp_path / "settings.json")
     monkeypatch.setattr(GatewayConfig, "load", staticmethod(lambda *a, **k: config))
-    monkeypatch.setattr(gateway_main, "_read_daemon_record", lambda: (None, "not running"))
+    monkeypatch.setattr(daemon, "_read_daemon_record", lambda: (None, "not running"))
     _stub_full_stack_urlopen(monkeypatch, 500, b"internal server error, not json")
 
-    exit_code = gateway_main._compact_main(["set", "claude:claude-opus-5"])
+    exit_code = compact._compact_main(["set", "claude:claude-opus-5"])
 
     assert exit_code != 0
     assert not config.settings_file.exists()
@@ -1124,17 +1154,17 @@ def test_compact_set_identified_non_json_500_fails_closed(
 def test_compact_show_identified_malformed_get_envelope_exits_nonzero(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    _compact_env(monkeypatch, tmp_path, gateway_main.ProbeOutcome.IDENTIFIED)
+    _compact_env(monkeypatch, tmp_path, admin_client.ProbeOutcome.IDENTIFIED)
     _stub_admin_request(
         monkeypatch,
-        response=gateway_main._AdminHttpResponse(
+        response=admin_client._AdminHttpResponse(
             status=200,
             body={"model": None, "env_locked": "not-a-bool", "last_reroute": None},
             detail="",
         ),
     )
 
-    exit_code = gateway_main._compact_main([])
+    exit_code = compact._compact_main([])
 
     assert exit_code != 0
 
@@ -1142,15 +1172,15 @@ def test_compact_show_identified_malformed_get_envelope_exits_nonzero(
 def test_compact_set_identified_malformed_put_envelope_exits_nonzero_without_write(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    config = _compact_env(monkeypatch, tmp_path, gateway_main.ProbeOutcome.IDENTIFIED)
+    config = _compact_env(monkeypatch, tmp_path, admin_client.ProbeOutcome.IDENTIFIED)
     _stub_admin_request(
         monkeypatch,
-        response=gateway_main._AdminHttpResponse(
+        response=admin_client._AdminHttpResponse(
             status=200, body={"model": 123, "env_locked": False, "last_reroute": None}, detail=""
         ),
     )
 
-    exit_code = gateway_main._compact_main(["set", "claude:claude-opus-5"])
+    exit_code = compact._compact_main(["set", "claude:claude-opus-5"])
 
     assert exit_code != 0
     assert not config.settings_file.exists()
@@ -1159,15 +1189,15 @@ def test_compact_set_identified_malformed_put_envelope_exits_nonzero_without_wri
 def test_compact_off_identified_missing_field_envelope_exits_nonzero_without_write(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    config = _compact_env(monkeypatch, tmp_path, gateway_main.ProbeOutcome.IDENTIFIED)
+    config = _compact_env(monkeypatch, tmp_path, admin_client.ProbeOutcome.IDENTIFIED)
     _stub_admin_request(
         monkeypatch,
-        response=gateway_main._AdminHttpResponse(
+        response=admin_client._AdminHttpResponse(
             status=200, body={"model": None, "env_locked": False}, detail=""
         ),
     )
 
-    exit_code = gateway_main._compact_main(["off"])
+    exit_code = compact._compact_main(["off"])
 
     assert exit_code != 0
     assert not config.settings_file.exists()
@@ -1176,10 +1206,10 @@ def test_compact_off_identified_missing_field_envelope_exits_nonzero_without_wri
 def test_compact_set_identified_transport_failure_after_probe_exits_nonzero_no_write(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    config = _compact_env(monkeypatch, tmp_path, gateway_main.ProbeOutcome.IDENTIFIED)
-    _stub_admin_request(monkeypatch, exception=gateway_main._AdminTransportError("timed out"))
+    config = _compact_env(monkeypatch, tmp_path, admin_client.ProbeOutcome.IDENTIFIED)
+    _stub_admin_request(monkeypatch, exception=admin_client._AdminTransportError("timed out"))
 
-    exit_code = gateway_main._compact_main(["set", "claude:claude-opus-5"])
+    exit_code = compact._compact_main(["set", "claude:claude-opus-5"])
 
     assert exit_code != 0
     assert not config.settings_file.exists()
@@ -1195,22 +1225,22 @@ def test_compact_off_identified_transport_failure_after_probe_leaves_settings_un
     _compact_env(
         monkeypatch,
         tmp_path,
-        gateway_main.ProbeOutcome.IDENTIFIED,
+        admin_client.ProbeOutcome.IDENTIFIED,
         compaction_model="claude:claude-old-5",
     )
-    _stub_admin_request(monkeypatch, exception=gateway_main._AdminTransportError("connection reset"))
+    _stub_admin_request(monkeypatch, exception=admin_client._AdminTransportError("connection reset"))
 
-    exit_code = gateway_main._compact_main(["off"])
+    exit_code = compact._compact_main(["off"])
 
     assert exit_code != 0
     saved = json.loads(settings_file.read_text(encoding="utf-8"))
     assert saved == {"compaction.model": "claude:claude-old-5"}
 
 
-def _malformed_reroute_envelope() -> "gateway_main._AdminHttpResponse":
+def _malformed_reroute_envelope() -> "admin_client._AdminHttpResponse":
     # Envelope-level fields are fine, but the nested last_reroute is not the
     # pinned seven-key record — this must be an admin failure, not success.
-    return gateway_main._AdminHttpResponse(
+    return admin_client._AdminHttpResponse(
         status=200,
         body={"model": None, "env_locked": False, "last_reroute": {}},
         detail="",
@@ -1219,7 +1249,7 @@ def _malformed_reroute_envelope() -> "gateway_main._AdminHttpResponse":
 
 def test_parse_compaction_envelope_rejects_malformed_nested_reroute_record() -> None:
     assert (
-        gateway_main._parse_compaction_envelope(
+        compact._parse_compaction_envelope(
             {"model": None, "env_locked": False, "last_reroute": {}}
         )
         is None
@@ -1254,7 +1284,7 @@ def test_parse_reroute_record_rejects_schema_violations(
         "detail": "http_401",
     }
     record.update(record_override)
-    assert gateway_main._parse_reroute_record(record) is None
+    assert compact._parse_reroute_record(record) is None
 
 
 def test_parse_reroute_record_accepts_each_valid_outcome_shape() -> None:
@@ -1273,7 +1303,7 @@ def test_parse_reroute_record_accepts_each_valid_outcome_shape() -> None:
         ("midstream_error", "read_error"),
     ]:
         record = dict(base, outcome=outcome, detail=detail)
-        assert gateway_main._parse_reroute_record(record) == record
+        assert compact._parse_reroute_record(record) == record
 
 
 def test_compact_show_malformed_nested_record_exits_nonzero(
@@ -1281,10 +1311,10 @@ def test_compact_show_malformed_nested_record_exits_nonzero(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    _compact_env(monkeypatch, tmp_path, gateway_main.ProbeOutcome.IDENTIFIED)
+    _compact_env(monkeypatch, tmp_path, admin_client.ProbeOutcome.IDENTIFIED)
     _stub_admin_request(monkeypatch, response=_malformed_reroute_envelope())
 
-    exit_code = gateway_main._compact_main([])
+    exit_code = compact._compact_main([])
 
     assert exit_code != 0
     assert "malformed" in capsys.readouterr().err
@@ -1293,10 +1323,10 @@ def test_compact_show_malformed_nested_record_exits_nonzero(
 def test_compact_set_malformed_nested_record_exits_nonzero_without_write(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    config = _compact_env(monkeypatch, tmp_path, gateway_main.ProbeOutcome.IDENTIFIED)
+    config = _compact_env(monkeypatch, tmp_path, admin_client.ProbeOutcome.IDENTIFIED)
     _stub_admin_request(monkeypatch, response=_malformed_reroute_envelope())
 
-    exit_code = gateway_main._compact_main(["set", "claude:claude-opus-5"])
+    exit_code = compact._compact_main(["set", "claude:claude-opus-5"])
 
     assert exit_code != 0
     assert not config.settings_file.exists()
@@ -1312,12 +1342,12 @@ def test_compact_off_malformed_nested_record_exits_nonzero_without_write(
     _compact_env(
         monkeypatch,
         tmp_path,
-        gateway_main.ProbeOutcome.IDENTIFIED,
+        admin_client.ProbeOutcome.IDENTIFIED,
         compaction_model="claude:claude-old-5",
     )
     _stub_admin_request(monkeypatch, response=_malformed_reroute_envelope())
 
-    exit_code = gateway_main._compact_main(["off"])
+    exit_code = compact._compact_main(["off"])
 
     assert exit_code != 0
     saved = json.loads(settings_file.read_text(encoding="utf-8"))
@@ -1385,19 +1415,19 @@ def test_probe_and_admin_never_follow_redirects_or_leak_the_bearer() -> None:
     try:
         # Probe: the 3xx is the final answer from the port occupant — FOREIGN,
         # never classified from the redirect target.
-        outcome = gateway_main._classify_daemon("127.0.0.1", redirect_port)
-        assert outcome is gateway_main.ProbeOutcome.FOREIGN
+        outcome = admin_client._classify_daemon("127.0.0.1", redirect_port)
+        assert outcome is admin_client.ProbeOutcome.FOREIGN
 
         # Admin: the 3xx is a completed non-2xx response — FAILURE, and the
         # bearer-carrying request must never reach the redirect target.
-        admin_outcome, envelope, detail = gateway_main._run_admin_compaction(
+        admin_outcome, envelope, detail = compact._run_admin_compaction(
             "127.0.0.1",
             redirect_port,
             "GET",
             "secret-local-token",
             None,
         )
-        assert admin_outcome is gateway_main._AdminCallOutcome.FAILURE
+        assert admin_outcome is admin_client._AdminCallOutcome.FAILURE
         assert envelope is None
         assert "302" in detail
 
