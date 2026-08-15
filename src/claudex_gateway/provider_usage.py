@@ -23,6 +23,7 @@ from claudex_gateway.usage_envelope import (
     SESSION_WINDOW_MINUTES,
     USAGE_TIMEOUT,
     WEEKLY_WINDOW_MINUTES,
+    fetch_usage_payload,
     provider_result,
     reset_epoch_seconds,
 )
@@ -119,29 +120,17 @@ async def fetch_codex_usage(
             error="API key billing has no plan usage windows",
         )
     headers = _codex_backend_headers(credentials)
-    try:
-        response = await http_client.get(_CODEX_USAGE_URL, headers=headers, timeout=USAGE_TIMEOUT)
-    except httpx.HTTPError as exc:
-        logger.warning("codex usage fetch failed: %s", exc)
-        return provider_result(
-            "codex", status="error", error=f"failed to reach the ChatGPT usage API: {exc}"
-        )
-    if response.status_code != 200:
-        return provider_result(
-            "codex",
-            status="error",
-            error=f"usage API returned {response.status_code}: {response.text[:200]}",
-        )
-    try:
-        data = response.json()
-    except json.JSONDecodeError:
-        return provider_result(
-            "codex", status="error", error="usage API returned a non-JSON body"
-        )
-    if not isinstance(data, dict):
-        return provider_result(
-            "codex", status="error", error="usage API returned an unexpected payload"
-        )
+    data, error_result, _response = await fetch_usage_payload(
+        http_client,
+        _CODEX_USAGE_URL,
+        headers,
+        provider="codex",
+        api_label="ChatGPT",
+        special_statuses={},
+        logger=logger,
+    )
+    if error_result is not None:
+        return error_result
     rate_limit = data.get("rate_limit")
     if not isinstance(rate_limit, dict):
         rate_limit = {}
@@ -321,43 +310,23 @@ async def fetch_kimi_usage(
         credentials = await auth_manager.get_credentials()
     except Exception as exc:  # KimiAuthError and anything the file layer raises
         return provider_result("kimi", status="unavailable", error=str(exc))
-    try:
-        # Bearer token + Accept only; the endpoint authenticates by token.
-        response = await http_client.get(
-            _KIMI_USAGE_URL,
-            headers={
-                "Authorization": f"Bearer {credentials.access_token}",
-                "Accept": "application/json",
-            },
-            timeout=USAGE_TIMEOUT,
-        )
-    except httpx.HTTPError as exc:
-        logger.warning("kimi usage fetch failed: %s", exc)
-        return provider_result(
-            "kimi", status="error", error=f"failed to reach the Kimi usage API: {exc}"
-        )
-    if response.status_code == 401:
-        return provider_result(
-            "kimi",
-            status="error",
-            error="Kimi access token rejected (401); run `kimi login` again",
-        )
-    if response.status_code != 200:
-        return provider_result(
-            "kimi",
-            status="error",
-            error=f"usage API returned {response.status_code}: {response.text[:200]}",
-        )
-    try:
-        data = response.json()
-    except json.JSONDecodeError:
-        return provider_result(
-            "kimi", status="error", error="usage API returned a non-JSON body"
-        )
-    if not isinstance(data, dict):
-        return provider_result(
-            "kimi", status="error", error="usage API returned an unexpected payload"
-        )
+    # Bearer token + Accept only; the endpoint authenticates by token.
+    data, error_result, _response = await fetch_usage_payload(
+        http_client,
+        _KIMI_USAGE_URL,
+        {
+            "Authorization": f"Bearer {credentials.access_token}",
+            "Accept": "application/json",
+        },
+        provider="kimi",
+        api_label="Kimi",
+        special_statuses={
+            401: "Kimi access token rejected (401); run `kimi login` again"
+        },
+        logger=logger,
+    )
+    if error_result is not None:
+        return error_result
     # The top-level usage block is the weekly quota; limits[] carries the
     # shorter rolling windows, of which the 5-hour one is the session view.
     session = _map_kimi_session_window(data.get("limits"))

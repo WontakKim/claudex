@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import logging
 import time
 from datetime import datetime
 from typing import Any
@@ -38,6 +40,65 @@ def provider_result(
         "monthly": monthly,
         "updated_at": time.time(),
     }
+
+
+async def fetch_usage_payload(
+    http_client: httpx.AsyncClient,
+    url: str,
+    headers: dict[str, str],
+    *,
+    provider: str,
+    api_label: str,
+    special_statuses: dict[int, str],
+    logger: logging.Logger,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None, httpx.Response | None]:
+    """Returns (data, error_result, response); exactly one of data/error_result
+    is non-None; response is None only when the request never reached the API."""
+    try:
+        response = await http_client.get(url, headers=headers, timeout=USAGE_TIMEOUT)
+    except httpx.HTTPError as exc:
+        logger.warning(f"{provider} usage fetch failed: %s", exc)
+        return (
+            None,
+            provider_result(
+                provider,
+                status="error",
+                error=f"failed to reach the {api_label} usage API: {exc}",
+            ),
+            None,
+        )
+    special = special_statuses.get(response.status_code)
+    if special is not None:
+        return None, provider_result(provider, status="error", error=special), response
+    if response.status_code != 200:
+        return (
+            None,
+            provider_result(
+                provider,
+                status="error",
+                error=f"usage API returned {response.status_code}: {response.text[:200]}",
+            ),
+            response,
+        )
+    try:
+        data = response.json()
+    except json.JSONDecodeError:
+        return (
+            None,
+            provider_result(
+                provider, status="error", error="usage API returned a non-JSON body"
+            ),
+            response,
+        )
+    if not isinstance(data, dict):
+        return (
+            None,
+            provider_result(
+                provider, status="error", error="usage API returned an unexpected payload"
+            ),
+            response,
+        )
+    return data, None, response
 
 
 def reset_epoch_seconds(value: Any) -> float | None:
