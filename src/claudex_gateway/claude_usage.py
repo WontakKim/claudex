@@ -30,8 +30,8 @@ from claudex_gateway.claude_auth import (
 )
 from claudex_gateway.usage_envelope import (
     SESSION_WINDOW_MINUTES,
-    USAGE_TIMEOUT,
     WEEKLY_WINDOW_MINUTES,
+    fetch_usage_payload,
     provider_result,
     reset_epoch_seconds,
 )
@@ -197,72 +197,26 @@ async def _fetch_claude_usage_with_token(
     the request never reached the API. Callers that don't care (the ambient
     probe) discard the extra elements.
     """
-    try:
-        response = await http_client.get(
-            _CLAUDE_USAGE_URL,
-            headers={
-                "Authorization": f"Bearer {token}",
-                "anthropic-beta": _CLAUDE_OAUTH_BETA,
-                "User-Agent": _CLAUDE_CODE_USER_AGENT,
-            },
-            timeout=USAGE_TIMEOUT,
-        )
-    except httpx.HTTPError as exc:
-        logger.warning("claude usage fetch failed: %s", exc)
-        return (
-            provider_result(
-                "claude", status="error", error=f"failed to reach the Anthropic usage API: {exc}"
-            ),
-            None,
-            None,
-        )
-    status_code = response.status_code
-    if status_code == 401:
-        return (
-            provider_result(
-                "claude",
-                status="error",
-                error="Claude OAuth token rejected (401); sign in again with `claude`",
-            ),
-            None,
-            status_code,
-        )
-    if status_code == 429:
-        return (
-            provider_result(
-                "claude",
-                status="error",
-                error="usage API rate-limited (429); try again shortly",
-            ),
-            _retry_after_seconds(response),
-            status_code,
-        )
-    if status_code != 200:
-        return (
-            provider_result(
-                "claude",
-                status="error",
-                error=f"usage API returned {status_code}: {response.text[:200]}",
-            ),
-            None,
-            status_code,
-        )
-    try:
-        data = response.json()
-    except json.JSONDecodeError:
-        return (
-            provider_result("claude", status="error", error="usage API returned a non-JSON body"),
-            None,
-            status_code,
-        )
-    if not isinstance(data, dict):
-        return (
-            provider_result(
-                "claude", status="error", error="usage API returned an unexpected payload"
-            ),
-            None,
-            status_code,
-        )
+    data, error_result, response = await fetch_usage_payload(
+        http_client,
+        _CLAUDE_USAGE_URL,
+        {
+            "Authorization": f"Bearer {token}",
+            "anthropic-beta": _CLAUDE_OAUTH_BETA,
+            "User-Agent": _CLAUDE_CODE_USER_AGENT,
+        },
+        provider="claude",
+        api_label="Anthropic",
+        special_statuses={
+            401: "Claude OAuth token rejected (401); sign in again with `claude`",
+            429: "usage API rate-limited (429); try again shortly",
+        },
+        logger=logger,
+    )
+    status_code = response.status_code if response is not None else None
+    retry_after = _retry_after_seconds(response) if status_code == 429 else None
+    if error_result is not None:
+        return error_result, retry_after, status_code
     return (
         provider_result(
             "claude",
