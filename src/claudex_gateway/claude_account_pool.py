@@ -25,7 +25,7 @@ from email.utils import parsedate_to_datetime
 from typing import Any
 
 from claudex_gateway.claude_accounts import AccountRecord
-from claudex_gateway.usage_envelope import reset_epoch_seconds
+from claudex_gateway.usage.envelope import reset_epoch_seconds
 
 logger = logging.getLogger(__name__)
 

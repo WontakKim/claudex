@@ -22,7 +22,7 @@ from claudex_gateway.claude_auth import (
 )
 from claudex_gateway.config import GatewayConfig
 from claudex_gateway.claude_usage import fetch_claude_account_usage
-from claudex_gateway.usage_envelope import provider_result
+from claudex_gateway.usage.envelope import provider_result
 
 logger = logging.getLogger("claudex_gateway.server")
 

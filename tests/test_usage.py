@@ -11,7 +11,9 @@ from typing import Any
 import httpx
 import pytest
 
-from claudex_gateway import claude_usage, provider_usage, usage_envelope
+from claudex_gateway import claude_usage
+from claudex_gateway.usage import envelope as usage_envelope
+from claudex_gateway.usage import providers as provider_usage
 from claudex_gateway.claude_auth import (
     ClaudeAccountAuthError,
     ClaudeAccountCredentials,

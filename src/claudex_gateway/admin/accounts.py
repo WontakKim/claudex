@@ -35,7 +35,7 @@ from claudex_gateway.claude_login_session import (
 )
 from claudex_gateway.config import GatewayConfig
 from claudex_gateway.locking import try_file_lock
-from claudex_gateway.usage_envelope import provider_result
+from claudex_gateway.usage.envelope import provider_result
 
 
 _USAGE_WINDOW_FRESH_MAX_AGE_SECONDS = 5 * 60

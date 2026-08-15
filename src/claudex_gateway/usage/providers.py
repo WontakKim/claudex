@@ -19,7 +19,7 @@ import httpx
 from claudex_gateway.providers.codex_auth import CodexAuthManager, CodexCredentials
 from claudex_gateway.providers.kimi_auth import KimiAuthManager
 from claudex_gateway.providers.grok_auth import GrokAuthManager, GrokCredentials
-from claudex_gateway.usage_envelope import (
+from claudex_gateway.usage.envelope import (
     SESSION_WINDOW_MINUTES,
     USAGE_TIMEOUT,
     WEEKLY_WINDOW_MINUTES,

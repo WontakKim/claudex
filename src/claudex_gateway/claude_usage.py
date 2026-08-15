@@ -28,7 +28,7 @@ from claudex_gateway.claude_auth import (
     ClaudeAccountAuthManager,
     ClaudeAccountReauthRequiredError,
 )
-from claudex_gateway.usage_envelope import (
+from claudex_gateway.usage.envelope import (
     SESSION_WINDOW_MINUTES,
     WEEKLY_WINDOW_MINUTES,
     fetch_usage_payload,
