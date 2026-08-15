@@ -19,7 +19,8 @@ from claudex_gateway.account_usage_cache import ClaudeAccountUsageCache
 from claudex_gateway.claude_account_pool import AccountCooldownTracker
 from claudex_gateway.claude_accounts import AccountRecord, list_accounts
 from claudex_gateway.claude_ambient_account import AmbientAccountProvider, is_duplicate_identity
-from claudex_gateway.claude_balanced_router import ClaudeBalancedRuntime, UsagePollAccount
+from claudex_gateway.balanced.polling import UsagePollAccount
+from claudex_gateway.balanced.runtime import ClaudeBalancedRuntime
 from claudex_gateway.codex_auth import CodexAuthError, CodexAuthManager
 from claudex_gateway.codex_client import CodexClient
 from claudex_gateway.config import GatewayConfig

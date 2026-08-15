@@ -22,13 +22,10 @@ import claudex_gateway.server as server
 import claudex_gateway.server_support as server_support
 from claudex_gateway import claude_accounts, compaction, paths
 from claudex_gateway.account_usage_cache import ClaudeAccountUsageCache
-from claudex_gateway.claude_balanced_router import (
-    ClaudeBalancedRouter,
-    ClaudeBalancedRuntime,
-    ClaudeUsagePollCoordinator,
-    UsagePollAccount,
-    derive_session_key,
-)
+from claudex_gateway.balanced.polling import ClaudeUsagePollCoordinator, UsagePollAccount
+from claudex_gateway.balanced.router import ClaudeBalancedRouter
+from claudex_gateway.balanced.runtime import ClaudeBalancedRuntime
+from claudex_gateway.balanced.selection import derive_session_key
 from claudex_gateway.balanced.state_model import RestoreValidationContext
 from claudex_gateway.balanced.state_store import ClaudePoolRuntimeStateStore
 from claudex_gateway.codex_client import CodexUpstreamError
@@ -1171,7 +1168,7 @@ class TestBalancedRoutingExit:
 
         settings_file = tmp_path / "settings.json"
         config = GatewayConfig(settings_file=settings_file, claude_account_id=account_id)
-        caplog.set_level(logging.WARNING, logger="claudex_gateway.claude_balanced_router")
+        caplog.set_level(logging.WARNING, logger="claudex_gateway.balanced.runtime")
         with _create_test_client(
             monkeypatch, tmp_path, config=config, base_url="http://127.0.0.1:8787"
         ) as client:
@@ -1289,7 +1286,7 @@ def test_balanced_request_during_controlled_exit_awaits_and_serves_under_target_
     controlled transition was in flight.
     """
     from claudex_gateway.claude_accounts import AccountRecord
-    from claudex_gateway.claude_balanced_router import ClaudeBalancedRuntime
+    from claudex_gateway.balanced.runtime import ClaudeBalancedRuntime
 
     account_id = "22222222-3333-4444-5555-666666666666"
     accounts_root = tmp_path / "accounts"

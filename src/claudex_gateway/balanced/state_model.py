@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from typing import Any
 
 # Covers the pin-key ABI as well as the table shapes: pins are keyed by a
-# quota-family-salted digest (`claude_balanced_router._PIN_KEY_DOMAIN`), so
+# quota-family-salted digest (`balanced.selection._PIN_KEY_DOMAIN`), so
 # any change to that derivation must bump this version — `open_` then
 # quarantines the older database wholesale instead of restoring rows keyed
 # under a different ABI into the live pin map and cold-start counts.

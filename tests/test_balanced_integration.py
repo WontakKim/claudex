@@ -2,7 +2,7 @@
 corruption gates (T-17): real temporary `ClaudePoolRuntimeStateStore` SQLite
 files throughout, `TestClient` for the scenarios that need the full HTTP
 dispatch stack, and a deterministic fake clock (`_FakeClock`, mirroring
-`test_claude_balanced_router.py`'s own helper) wherever precise
+`test_balanced_router.py`'s own helper) wherever precise
 freshness/TTL timing matters.
 
 Every scenario here is locally reproducible with exactly ONE registered
@@ -13,7 +13,7 @@ failover.
 Reservation-aware LRU eviction and restored-cooldown no-repeat-burst
 behavior are intentionally NOT duplicated in this file: both are already
 exercised end-to-end by earlier task tests --
-`test_claude_balanced_router.py::test_migration_reserved_pin_survives_eviction_pressure_and_becomes_evictable_once_resolved`
+`test_balanced_router.py::test_migration_reserved_pin_survives_eviction_pressure_and_becomes_evictable_once_resolved`
 (plus its sibling `test_lru_eviction_*` tests) for reservation-aware LRU,
 and
 `test_server.py::test_balanced_restart_restores_the_family_cooldown_without_a_repeat_429_burst`
@@ -38,14 +38,9 @@ from starlette.testclient import TestClient
 
 from claudex_gateway import claude_accounts, paths
 from claudex_gateway.claude_ambient_account import AmbientClaudeAuthManager
-from claudex_gateway.claude_balanced_router import (
-    CAPABILITY_CLASSIFIER_VERSION,
-    AccountCandidate,
-    ClaudeBalancedRouter,
-    ClaudeBalancedRuntime,
-    SessionKey,
-    derive_session_key,
-)
+from claudex_gateway.balanced.router import CAPABILITY_CLASSIFIER_VERSION, ClaudeBalancedRouter
+from claudex_gateway.balanced.runtime import ClaudeBalancedRuntime
+from claudex_gateway.balanced.selection import AccountCandidate, SessionKey, derive_session_key
 from claudex_gateway.balanced.state_model import SCHEMA_VERSION, RestoreValidationContext
 from claudex_gateway.balanced.state_store import ClaudePoolRuntimeStateStore
 from claudex_gateway.config import GatewayConfig
@@ -248,7 +243,7 @@ def _enable_balanced(client: TestClient, handler: Any) -> ClaudeBalancedRuntime:
 
 class _FakeClock:
     """A manually advanced monotonic-like clock for deterministic freshness/TTL
-    assertions -- mirrors `test_claude_balanced_router.py`'s own helper."""
+    assertions -- mirrors `test_balanced_router.py`'s own helper."""
 
     def __init__(self, start: float = 1_000_000.0) -> None:
         self.value = start

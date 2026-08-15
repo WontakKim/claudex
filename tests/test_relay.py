@@ -28,11 +28,9 @@ from claudex_gateway import claude_accounts, compaction, paths
 from claudex_gateway.account_usage_cache import ClaudeAccountUsageCache
 from claudex_gateway.claude_account_pool import AccountCooldownTracker
 from claudex_gateway.claude_auth import CLAUDE_TOKEN_URL
-from claudex_gateway.claude_balanced_router import (
-    ClaudeBalancedRouter,
-    ClaudeBalancedRuntime,
-    derive_session_key,
-)
+from claudex_gateway.balanced.router import ClaudeBalancedRouter
+from claudex_gateway.balanced.runtime import ClaudeBalancedRuntime
+from claudex_gateway.balanced.selection import derive_session_key
 from claudex_gateway.codex_client import (
     CODEX_MODELS_URL,
     CODEX_RESPONSES_URL,
@@ -3705,7 +3703,7 @@ def test_balanced_repeat_request_reuses_the_existing_pin_without_a_new_placement
         created_flags.append(result.created)
         return result
 
-    monkeypatch.setattr(ClaudeBalancedRouter, "place_session", spy_place_session)
+    monkeypatch.setattr(relay.ClaudeBalancedRouter, "place_session", spy_place_session)
 
     def handler(request: httpx.Request) -> httpx.Response:
         calls.append(request)
@@ -3975,7 +3973,7 @@ def test_balanced_non_streaming_request_commits_at_headers_before_body_relay(
         order.append(f"commit:{result[0]}")
         return result
 
-    monkeypatch.setattr(ClaudeBalancedRouter, "commit_at_headers", spy_commit_at_headers)
+    monkeypatch.setattr(relay.ClaudeBalancedRouter, "commit_at_headers", spy_commit_at_headers)
 
     class _LoggingByteStream(httpx.AsyncByteStream):
         def __init__(self, body: bytes) -> None:

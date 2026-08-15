@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import hashlib
 import hmac
@@ -12,19 +13,21 @@ from typing import Any
 import pytest
 
 from claudex_gateway.account_usage_cache import ClaudeAccountUsageCache
-from claudex_gateway.claude_balanced_router import (
+from claudex_gateway.balanced.polling import ClaudeUsagePollCoordinator
+from claudex_gateway.balanced.router import (
     CAPABILITY_CLASSIFIER_VERSION,
     CAPABILITY_EVIDENCE_TTL_SECONDS,
-    AccountCandidate,
     ClaudeBalancedRouter,
-    ClaudeBalancedRuntime,
-    ClaudeUsagePollCoordinator,
-    FamilyGateOutcome,
     MigrationReservation,
-    NoEligibleAccountError,
-    ObservationView,
     PendingDurabilityBarrier,
     PlacementResult,
+)
+from claudex_gateway.balanced.runtime import ClaudeBalancedRuntime
+from claudex_gateway.balanced.selection import (
+    AccountCandidate,
+    FamilyGateOutcome,
+    NoEligibleAccountError,
+    ObservationView,
     SessionKey,
     account_headroom,
     binding_windows,
@@ -45,6 +48,247 @@ from claudex_gateway.claude_balanced_router import (
 )
 from claudex_gateway.balanced.state_model import PinRow, RestoreResult, RestoreValidationContext
 from claudex_gateway.balanced.state_store import ClaudePoolRuntimeStateStore
+
+
+_BALANCED_SOURCE_ROOT = Path(__file__).resolve().parents[1] / "src" / "claudex_gateway" / "balanced"
+_BALANCED_MODULE_NAMES = (
+    "selection",
+    "router",
+    "polling",
+    "runtime",
+    "state_model",
+    "state_store",
+)
+_ROUTING_RANK = {"selection": 0, "router": 1, "polling": 2, "runtime": 3}
+_PERSISTENCE_MODULES = {"state_model", "state_store"}
+_MANIFEST_SYMBOLS = {
+    "selection": {
+        "_SESSION_KEY_DOMAIN",
+        "_PIN_KEY_DOMAIN",
+        "_HRW_DOMAIN",
+        "_STATELESS_REQUEST_DOMAIN",
+        "_QUOTA_FAMILIES",
+        "SessionKey",
+        "_hmac_sha256",
+        "_length_prefixed",
+        "_uuid_session_key",
+        "_first_user_message",
+        "_content_hash_session_key",
+        "derive_session_key",
+        "hrw_unit_interval",
+        "derive_stateless_routing_digest",
+        "_FRESH_EXACT_SECONDS",
+        "_FRESH_PLUS5_SECONDS",
+        "_FRESH_PLUS10_SECONDS",
+        "_FRESH_PLUS5_PP",
+        "_FRESH_PLUS10_PP",
+        "_UNKNOWN_FLOOR_MARGIN",
+        "_UNKNOWN_FLOOR_CAP",
+        "_WARNING_FRESH_SECONDS",
+        "_WARNING_HAIRCUT_FACTOR",
+        "_IN_FLIGHT_PRESSURE_WEIGHT",
+        "_NON_FABLE_WINDOWS",
+        "_FABLE_WINDOWS",
+        "_PEEK_WINDOW_TO_BINDING",
+        "DEFAULT_PIN_TTL_UUID_SECONDS",
+        "DEFAULT_PIN_TTL_CONTENT_HASH_SECONDS",
+        "DEFAULT_PIN_MAP_MAX_ENTRIES",
+        "_is_ascii_alnum",
+        "_bounded_token_present",
+        "quota_family",
+        "_CAPABILITY_KEY_TOKENS",
+        "capability_key",
+        "binding_windows",
+        "freshness_adjusted_pressure",
+        "unknown_floor",
+        "_wall_to_monotonic",
+        "_WindowObservation",
+        "_WarningSignal",
+        "RealWindowReading",
+        "ObservationView",
+        "warning_factor",
+        "account_headroom",
+        "emergency_capacity",
+        "emergency_weight",
+        "select_weights",
+        "resolve_tie_break",
+        "pick_weighted_hrw",
+        "NoEligibleAccountError",
+        "AccountCandidate",
+        "is_eligible_candidate",
+        "_FAMILY_GATE_MAX_OBSERVATION_AGE_SECONDS",
+        "_FAMILY_GATE_FABLE_WEEKLY_MIN_PERCENT",
+        "_FAMILY_GATE_FIVE_HOUR_MAX_PERCENT",
+        "_FAMILY_GATE_SEVEN_DAY_MAX_PERCENT",
+        "FamilyGateOutcome",
+        "classify_balanced_cooldown_scope",
+    },
+    "router": {
+        "_COOLDOWN_RESTORE_MIN_SECONDS",
+        "_COOLDOWN_RESTORE_MAX_SECONDS",
+        "CAPABILITY_CLASSIFIER_VERSION",
+        "CAPABILITY_EVIDENCE_TTL_SECONDS",
+        "_CooldownEntry",
+        "_entry_cooldown_deadline",
+        "_CapabilityEvidenceEntry",
+        "PendingDurabilityBarrier",
+        "PinEntry",
+        "PlacementResult",
+        "MigrationOutcome",
+        "CommitOutcome",
+        "MigrationReservation",
+        "ClaudeBalancedRouter",
+    },
+    "polling": {
+        "_USAGE_POLL_INTERVAL_SECONDS",
+        "_MANUAL_REFRESH_RATE_LIMIT_SECONDS",
+        "PollTickOutcome",
+        "PollTickResult",
+        "UsagePollAccount",
+        "_AccountPollDiagnostics",
+        "UsagePollDiagnostics",
+        "ClaudeUsagePollCoordinator",
+    },
+    "runtime": {
+        "BalancedRuntimeStatus",
+        "BalancedPrepareError",
+        "ClaudeBalancedRuntime",
+    },
+}
+
+
+def _top_level_definitions(tree: ast.Module) -> set[str]:
+    definitions: set[str] = set()
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            definitions.add(node.name)
+        elif isinstance(node, ast.Assign):
+            definitions.update(
+                target.id for target in node.targets if isinstance(target, ast.Name)
+            )
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            definitions.add(node.target.id)
+    return definitions
+
+
+def _balanced_module_trees() -> dict[str, ast.Module]:
+    return {
+        name: ast.parse(
+            (_BALANCED_SOURCE_ROOT / f"{name}.py").read_text(encoding="utf-8")
+        )
+        for name in _BALANCED_MODULE_NAMES
+    }
+
+
+def _assert_no_unused_imports(module_name: str, tree: ast.Module) -> None:
+    loaded_names = {
+        node.id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)
+    }
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            aliases = [
+                (alias.asname or alias.name.split(".")[0], alias.name)
+                for alias in node.names
+            ]
+        elif isinstance(node, ast.ImportFrom):
+            if node.module == "__future__":
+                continue
+            aliases = [(alias.asname or alias.name, alias.name) for alias in node.names]
+        else:
+            continue
+        for local_name, imported_name in aliases:
+            assert imported_name != "*", f"{module_name}: star import is not an inventory"
+            assert local_name in loaded_names, f"{module_name}: unused import {imported_name}"
+
+
+def _balanced_sibling_edges(tree: ast.Module) -> set[str]:
+    package_name = "claudex_gateway.balanced"
+    edges: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported_modules = [alias.name for alias in node.names]
+        elif isinstance(node, ast.ImportFrom):
+            imported_base = node.module or ""
+            if imported_base == package_name:
+                edges.update(
+                    alias.name for alias in node.names if alias.name in _BALANCED_MODULE_NAMES
+                )
+            imported_modules = [imported_base]
+        else:
+            continue
+        for imported_module in imported_modules:
+            prefix = f"{package_name}."
+            if not imported_module.startswith(prefix):
+                continue
+            sibling_name = imported_module.removeprefix(prefix).partition(".")[0]
+            if sibling_name in _BALANCED_MODULE_NAMES:
+                edges.add(sibling_name)
+    return edges
+
+
+def _imported_module_names(tree: ast.Module) -> set[str]:
+    imported_modules: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported_modules.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            imported_modules.add(node.module)
+    return imported_modules
+
+
+def test_balanced_manifest_symbols_have_one_canonical_owner() -> None:
+    definitions = {
+        module_name: _top_level_definitions(tree)
+        for module_name, tree in _balanced_module_trees().items()
+    }
+
+    for expected_owner, symbols in _MANIFEST_SYMBOLS.items():
+        for symbol in symbols:
+            actual_owners = [
+                module_name
+                for module_name, module_definitions in definitions.items()
+                if symbol in module_definitions
+            ]
+            assert actual_owners == [expected_owner], (
+                symbol,
+                expected_owner,
+                actual_owners,
+            )
+
+
+def test_balanced_import_inventory_and_dependency_directions() -> None:
+    trees = _balanced_module_trees()
+    edges: dict[str, set[str]] = {}
+    forbidden_consumers = {
+        "claudex_gateway.relay",
+        "claudex_gateway.admin_api",
+        "claudex_gateway.server",
+    }
+
+    for module_name, tree in trees.items():
+        _assert_no_unused_imports(module_name, tree)
+        edges[module_name] = _balanced_sibling_edges(tree)
+        assert not (_imported_module_names(tree) & forbidden_consumers)
+
+    for source, source_rank in _ROUTING_RANK.items():
+        allowed_dependencies = {
+            dependency
+            for dependency, dependency_rank in _ROUTING_RANK.items()
+            if dependency_rank < source_rank
+        }
+        if source != "selection":
+            allowed_dependencies |= _PERSISTENCE_MODULES
+        assert edges[source] <= allowed_dependencies, (
+            source,
+            edges[source],
+            allowed_dependencies,
+        )
+
+    assert edges["state_model"] == set()
+    assert edges["state_store"] == {"state_model"}
+    assert not (edges["state_model"] | edges["state_store"]) & set(_ROUTING_RANK)
 
 
 def _claude_code_user_id(session_id: str, account_uuid: str = "client-account-uuid") -> str:
@@ -518,9 +762,16 @@ def test_resolve_tie_break_falls_back_to_lexical_order_without_a_tied_serving_pi
 
 
 def test_pick_weighted_hrw_tie_break_is_deterministic(monkeypatch: pytest.MonkeyPatch) -> None:
-    import claudex_gateway.claude_balanced_router as router_module
+    import claudex_gateway.balanced.selection as selection_module
 
-    monkeypatch.setattr(router_module, "hrw_unit_interval", lambda seed, digest, account_id: 0.5)
+    call_count = 0
+
+    def fixed_hrw_unit_interval(_seed: bytes, _digest: bytes, _account_id: str) -> float:
+        nonlocal call_count
+        call_count += 1
+        return 0.5
+
+    monkeypatch.setattr(selection_module, "hrw_unit_interval", fixed_hrw_unit_interval)
     weights = {"b": 10.0, "a": 10.0, "c": 10.0}
 
     winner = pick_weighted_hrw(weights=weights, seed=b"seed", session_key_digest=b"digest", serving_account_id="c")
@@ -532,6 +783,7 @@ def test_pick_weighted_hrw_tie_break_is_deterministic(monkeypatch: pytest.Monkey
         weights=weights, seed=b"seed", session_key_digest=b"digest", serving_account_id="not-in-pool"
     )
     assert without_serving_tie == "a"
+    assert call_count == 9
 
 
 # -- N=1 pool trivially converges ----------------------------------------------

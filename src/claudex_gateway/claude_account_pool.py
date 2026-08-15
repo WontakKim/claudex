@@ -4,8 +4,7 @@ In fallback mode, every request first uses the admin-selected serving
 account. When that account is rate-limited, the gateway cools it down in
 memory and tries the next ready account in registration order, failing back
 automatically once the cooldown expires. Balanced session-affinity routing
-is owned by ``claude_balanced_router`` and does not use this tracker for
-eligibility.
+is owned by ``balanced.router`` and does not use this tracker for eligibility.
 
 Cooldowns in this module are process-local; the registry stores durable facts
 only. A cooldown deadline is derived from the best signal a 429 provides.

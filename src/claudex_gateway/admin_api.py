@@ -29,7 +29,7 @@ from claudex_gateway.claude_accounts import (
     load_registry,
     remove_account,
 )
-from claudex_gateway.claude_balanced_router import BalancedPrepareError, ClaudeBalancedRuntime
+from claudex_gateway.balanced.runtime import BalancedPrepareError, ClaudeBalancedRuntime
 from claudex_gateway.claude_login_session import (
     ClaudeLoginSession,
     LoginSessionStateError,

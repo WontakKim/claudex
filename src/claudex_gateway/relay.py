@@ -37,10 +37,10 @@ from claudex_gateway.claude_auth import (
     ClaudeAccountAuthError,
     ClaudeAccountReauthRequiredError,
 )
-from claudex_gateway.claude_balanced_router import (
+from claudex_gateway.balanced.router import ClaudeBalancedRouter
+from claudex_gateway.balanced.runtime import ClaudeBalancedRuntime
+from claudex_gateway.balanced.selection import (
     AccountCandidate,
-    ClaudeBalancedRouter,
-    ClaudeBalancedRuntime,
     NoEligibleAccountError,
     SessionKey,
     binding_windows,
