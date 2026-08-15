@@ -29,10 +29,8 @@ from claudex_gateway.claude_balanced_router import (
     UsagePollAccount,
     derive_session_key,
 )
-from claudex_gateway.claude_pool_runtime_state import (
-    ClaudePoolRuntimeStateStore,
-    RestoreValidationContext,
-)
+from claudex_gateway.balanced.state_model import RestoreValidationContext
+from claudex_gateway.balanced.state_store import ClaudePoolRuntimeStateStore
 from claudex_gateway.codex_client import CodexUpstreamError
 from claudex_gateway.config import GatewayConfig, OpenAICompatibleProvider
 from claudex_gateway.kimi_auth import KimiCredentials

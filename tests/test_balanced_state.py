@@ -13,12 +13,15 @@ from typing import Any
 
 import pytest
 
-from claudex_gateway.claude_pool_runtime_state import (
+import claudex_gateway.balanced.state_model as state_model
+import claudex_gateway.balanced.state_store as state_store
+from claudex_gateway.balanced.state_model import (
     SCHEMA_VERSION,
-    ClaudePoolRuntimeStateStore,
     RestoreValidationContext,
     UnsupportedSchemaVersionError,
+    _SCHEMA_SQL,
 )
+from claudex_gateway.balanced.state_store import ClaudePoolRuntimeStateStore
 
 # --------------------------------------------------------------------------
 # Fixtures and small row-builder helpers
@@ -117,6 +120,16 @@ def _pin_kwargs(**overrides: Any) -> dict[str, Any]:
 # --------------------------------------------------------------------------
 
 
+def test_persistence_symbols_have_canonical_owners() -> None:
+    assert SCHEMA_VERSION is state_model.SCHEMA_VERSION
+    assert RestoreValidationContext is state_model.RestoreValidationContext
+    assert UnsupportedSchemaVersionError is state_model.UnsupportedSchemaVersionError
+    assert ClaudePoolRuntimeStateStore is state_store.ClaudePoolRuntimeStateStore
+    assert RestoreValidationContext.__module__ == "claudex_gateway.balanced.state_model"
+    assert UnsupportedSchemaVersionError.__module__ == "claudex_gateway.balanced.state_model"
+    assert ClaudePoolRuntimeStateStore.__module__ == "claudex_gateway.balanced.state_store"
+
+
 def test_schema_contains_only_the_five_declared_tables(tmp_path: Path) -> None:
     path = tmp_path / "runtime.sqlite3"
     store = ClaudePoolRuntimeStateStore.open_(path)
@@ -183,6 +196,84 @@ def test_reopen_reuses_existing_schema_and_epoch(tmp_path: Path) -> None:
         assert store2.get_cooldown("acct-1", "account", "") is not None
     finally:
         store2.close()
+
+
+def test_restore_reads_database_written_in_pre_split_format(tmp_path: Path) -> None:
+    path = tmp_path / "pre-split-runtime.sqlite3"
+    now = time.time()
+    epoch_id = "pre-split-epoch"
+    conn = sqlite3.connect(str(path))
+    try:
+        conn.executescript(_SCHEMA_SQL)
+        conn.executemany(
+            "INSERT INTO meta (key, value) VALUES (?, ?)",
+            [
+                ("schema_version", str(SCHEMA_VERSION)),
+                ("balanced_epoch_id", epoch_id),
+                ("epoch_seed_hex", "01" * 32),
+                ("epoch_active", "0"),
+            ],
+        )
+        conn.execute(
+            """
+            INSERT INTO pins (session_key_digest, key_kind, account_id, account_incarnation_id,
+                              last_seen_utc, expires_at_utc, generation, balanced_epoch_id, model_family)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (b"pre-split-pin", "uuid", "acct-1", "inc-1", now, now + 3600, 3, epoch_id, "fable"),
+        )
+        conn.execute(
+            """
+            INSERT INTO cooldowns (account_id, scope, model_family, account_incarnation_id,
+                                   account_profile_fingerprint, deadline_utc, reason, evidence, updated_at_utc)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            ("acct-1", "family", "fable", "inc-1", "fp-1", now + 3600, "rate_limited", "{}", now),
+        )
+        conn.execute(
+            """
+            INSERT INTO usage_observations (account_id, window, account_incarnation_id,
+                                            account_profile_fingerprint, used_percent, reset_identity,
+                                            reset_at_utc, observed_at_utc, source, unified_status, unified_claim)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "acct-1",
+                "fable_weekly",
+                "inc-1",
+                "fp-1",
+                42.5,
+                "reset-1",
+                now + 3600,
+                now,
+                "usage_api",
+                "ok",
+                "claim-1",
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO capability_evidence (account_id, capability_key, account_incarnation_id,
+                                             account_profile_fingerprint, state, evidence_source,
+                                             classifier_version, observed_at_utc, expires_at_utc)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            ("acct-1", "opus_4_5", "inc-1", "fp-1", "eligible", "probe", "v1", now, now + 3600),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    store = ClaudePoolRuntimeStateStore.open_(path, debounce_seconds=0.0)
+    try:
+        restored = store.restore(RestoreValidationContext(now_utc=now))
+        assert restored.pins[b"pre-split-pin"].generation == 3
+        assert restored.pins[b"pre-split-pin"].model_family == "fable"
+        assert restored.cooldowns[("acct-1", "family", "fable")].reason == "rate_limited"
+        assert restored.usage_observations[("acct-1", "fable_weekly")].unified_claim == "claim-1"
+        assert restored.capability_evidence[("acct-1", "opus_4_5")].state == "eligible"
+    finally:
+        store.close()
 
 
 # --------------------------------------------------------------------------

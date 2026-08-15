@@ -54,11 +54,8 @@ from typing import Any, Literal
 from claudex_gateway.account_usage_cache import ClaudeAccountUsageCache
 from claudex_gateway.claude_account_profile import load_account_profile_fingerprint
 from claudex_gateway.claude_accounts import AccountRecord, list_accounts
-from claudex_gateway.claude_pool_runtime_state import (
-    ClaudePoolRuntimeStateStore,
-    RestoreResult,
-    RestoreValidationContext,
-)
+from claudex_gateway.balanced.state_model import RestoreResult, RestoreValidationContext
+from claudex_gateway.balanced.state_store import ClaudePoolRuntimeStateStore
 
 logger = logging.getLogger(__name__)
 
@@ -66,7 +63,7 @@ _SESSION_KEY_DOMAIN = b"claudex-session-key-v1"
 # The pin identity is the LOGICAL session digest salted with the request's
 # quota family, so one Claude Code session carries one independent pin per
 # family (correlated-HRW design). The domain version is part of the pin-key
-# ABI: bumping it requires bumping `claude_pool_runtime_state.SCHEMA_VERSION`
+# ABI: bumping it requires bumping `balanced.state_model.SCHEMA_VERSION`
 # so pre-existing rows are quarantined rather than left as unreachable
 # entries that would distort the LRU and cold-start counts.
 _PIN_KEY_DOMAIN = b"claudex-pin-key-v2"

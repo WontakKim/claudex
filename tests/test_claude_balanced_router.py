@@ -43,12 +43,8 @@ from claudex_gateway.claude_balanced_router import (
     unknown_floor,
     warning_factor,
 )
-from claudex_gateway.claude_pool_runtime_state import (
-    ClaudePoolRuntimeStateStore,
-    PinRow,
-    RestoreResult,
-    RestoreValidationContext,
-)
+from claudex_gateway.balanced.state_model import PinRow, RestoreResult, RestoreValidationContext
+from claudex_gateway.balanced.state_store import ClaudePoolRuntimeStateStore
 
 
 def _claude_code_user_id(session_id: str, account_uuid: str = "client-account-uuid") -> str:

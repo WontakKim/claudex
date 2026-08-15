@@ -46,11 +46,8 @@ from claudex_gateway.claude_balanced_router import (
     SessionKey,
     derive_session_key,
 )
-from claudex_gateway.claude_pool_runtime_state import (
-    SCHEMA_VERSION,
-    ClaudePoolRuntimeStateStore,
-    RestoreValidationContext,
-)
+from claudex_gateway.balanced.state_model import SCHEMA_VERSION, RestoreValidationContext
+from claudex_gateway.balanced.state_store import ClaudePoolRuntimeStateStore
 from claudex_gateway.config import GatewayConfig
 from claudex_gateway.grok_auth import GrokCredentials
 from claudex_gateway.kimi_auth import KimiCredentials
