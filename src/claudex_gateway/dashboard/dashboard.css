@@ -1,3 +1,4 @@
+/* Theme variables */
 :root{
   --canvas:#f2f4f5; --panel:#ffffff; --inset:#e9edf0; --text:#172026; --muted:#56616a; --line:#7a858d;
   --accent:#1d5fbf; --accent-soft:#e3edfa; --ok:#1a7f4b; --ok-soft:#e2f2e9; --warn:#8a5d00; --warn-soft:#f7ecd4; --err:#a03427; --err-soft:#f7e3e0;
@@ -12,6 +13,7 @@
          --accent:#5da2e8; --accent-soft:#173044; --ok:#5cbd8a; --ok-soft:#15301f; --warn:#cfa24d; --warn-soft:#37301c; --err:#d8746a; --err-soft:#3a1f1b;
          --wire:#5a666f; }
 }
+/* Base layout */
 *{box-sizing:border-box} body{margin:0;background:var(--canvas);color:var(--text);font:15.5px/1.45 var(--sans);padding-bottom:90px}
 .doc{max-width:1120px;margin:0 auto;padding:0 24px}
 header{height:60px;display:flex;align-items:baseline;gap:14px;padding-top:14px}
@@ -28,6 +30,7 @@ nav.tabs .cnt{font:600 12px var(--mono);color:var(--accent);margin-left:6px}
 nav.tabs a.on .cnt{color:var(--canvas)}
 main>section{display:none;padding-top:20px}
 body[data-tab="settings"] #tab-settings,body[data-tab="status"] #tab-status,body[data-tab="map"] #tab-map,body[data-tab="log"] #tab-log{display:block}
+/* Cards */
 .card{background:var(--panel);border-radius:8px;padding:18px;box-shadow:0 1px 3px rgba(0,0,0,.07);margin-bottom:16px}
 .card h2{font-size:20px;font-weight:650;margin:0 0 4px}
 .card .sub{font-size:14px;color:var(--muted);margin-bottom:14px}
@@ -134,6 +137,7 @@ body[data-tab="settings"] #tab-settings,body[data-tab="status"] #tab-status,body
 .nicon{display:inline-flex;vertical-align:middle;margin-right:7px}
 .nicon svg{display:block}
 .node .name{vertical-align:middle}
+/* Router board */
 .board{position:relative;background:var(--panel);border-radius:10px;box-shadow:0 1px 3px rgba(0,0,0,.07);height:460px;overflow:hidden;cursor:grab}
 .board.panning{cursor:grabbing}
 #layer{position:absolute;inset:0;will-change:transform;pointer-events:none;transform-origin:0 0;z-index:1}
@@ -238,6 +242,7 @@ body.wiring .node .x{pointer-events:none}
 .toast .chip-err{background:color-mix(in srgb,var(--err) 12%,transparent);color:var(--err)}
 .toast .lat{color:var(--muted);margin-left:6px}
 .toast .dim{color:var(--muted)}
+/* Apply bar */
 .applybar{position:fixed;left:0;right:0;bottom:0;background:var(--panel);border-top:2px solid var(--line);padding:12px 0;display:none}
 body[data-tab="map"] .applybar.dirty{display:block}
 .applybar .in{max-width:1120px;margin:0 auto;padding:0 24px;display:flex;align-items:center;gap:18px;font-size:14.5px}

@@ -1,6 +1,7 @@
 <!doctype html>
 <!-- Runtime dashboard for routing Claude Code models across multiple providers. -->
 <html lang="ko">
+<!-- Head -->
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -14,6 +15,7 @@
     <div class="health" id="health"></div>
   </header>
 
+  <!-- Tab navigation -->
   <nav class="tabs">
     <a href="#settings" data-t="settings">Settings</a>
     <a href="#status" data-t="status">Status</a>
@@ -22,6 +24,7 @@
   </nav>
 
   <main>
+    <!-- Settings tab -->
     <section id="tab-settings" data-cat="general">
       <div class="layout">
         <nav class="rail" aria-label="설정 종류">
@@ -116,6 +119,7 @@
       </div>
     </section>
 
+    <!-- Router tab -->
     <section id="tab-map">
       <div class="lockband"><b>LOCKED</b> — <code id="lock-env"></code> 환경변수가 우선합니다. 보드는 열람 전용입니다.</div>
       <div class="board" id="board">
@@ -152,6 +156,7 @@
       </div>
     </section>
 
+    <!-- Status tab -->
     <section id="tab-status">
       <div class="card">
         <div class="ucard-h">
@@ -212,6 +217,7 @@
       </div>
     </section>
 
+    <!-- Log tab -->
     <section id="tab-log">
       <div class="card">
         <h2>Log Level</h2>
