@@ -270,7 +270,12 @@ def test_balanced_import_inventory_and_dependency_directions() -> None:
     for module_name, tree in trees.items():
         _assert_no_unused_imports(module_name, tree)
         edges[module_name] = _balanced_sibling_edges(tree)
-        assert not (_imported_module_names(tree) & forbidden_consumers)
+        for imported_module in _imported_module_names(tree):
+            assert not any(
+                imported_module == forbidden
+                or imported_module.startswith(f"{forbidden}.")
+                for forbidden in forbidden_consumers
+            ), f"{module_name} imports forbidden consumer module {imported_module}"
 
     for source, source_rank in _ROUTING_RANK.items():
         allowed_dependencies = {
