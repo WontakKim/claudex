@@ -11,7 +11,7 @@ from typing import Any
 import httpx
 import pytest
 
-from claudex_gateway import usage
+from claudex_gateway import usage, usage_envelope
 from claudex_gateway.claude_auth import (
     ClaudeAccountAuthError,
     ClaudeAccountCredentials,
@@ -659,16 +659,16 @@ def test_fetch_kimi_usage_without_windows_is_error() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_reset_epoch_seconds_normalizes_units() -> None:
-    assert usage._reset_epoch_seconds(1754000000) == 1754000000.0
-    assert usage._reset_epoch_seconds(1754000000000) == 1754000000.0
-    assert usage._reset_epoch_seconds("1754000000") == 1754000000.0
+def test_usage_envelope_reset_time_normalizes_units() -> None:
+    assert usage_envelope.reset_epoch_seconds(1754000000) == 1754000000.0
+    assert usage_envelope.reset_epoch_seconds(1754000000000) == 1754000000.0
+    assert usage_envelope.reset_epoch_seconds("1754000000") == 1754000000.0
     expected = datetime.fromisoformat("2026-07-31T15:00:00+00:00").timestamp()
-    assert usage._reset_epoch_seconds("2026-07-31T15:00:00+00:00") == expected
-    assert usage._reset_epoch_seconds("2026-07-31T15:00:00Z") == expected
-    assert usage._reset_epoch_seconds("not a date") is None
-    assert usage._reset_epoch_seconds(None) is None
-    assert usage._reset_epoch_seconds(True) is None
+    assert usage_envelope.reset_epoch_seconds("2026-07-31T15:00:00+00:00") == expected
+    assert usage_envelope.reset_epoch_seconds("2026-07-31T15:00:00Z") == expected
+    assert usage_envelope.reset_epoch_seconds("not a date") is None
+    assert usage_envelope.reset_epoch_seconds(None) is None
+    assert usage_envelope.reset_epoch_seconds(True) is None
 
 
 # ---------------------------------------------------------------------------

@@ -25,7 +25,7 @@ from email.utils import parsedate_to_datetime
 from typing import Any
 
 from claudex_gateway.claude_accounts import AccountRecord
-from claudex_gateway.usage import _reset_epoch_seconds
+from claudex_gateway.usage_envelope import reset_epoch_seconds
 
 logger = logging.getLogger(__name__)
 
@@ -170,7 +170,7 @@ def rate_limit_cooldown_seconds(
 
     seconds = _parse_retry_after(lowered.get("retry-after"), now)
     if seconds is None:
-        seconds = _epoch_delta(_reset_epoch_seconds(lowered.get(_RESET_HEADER)), now)
+        seconds = _epoch_delta(reset_epoch_seconds(lowered.get(_RESET_HEADER)), now)
     if seconds is None:
         seconds = _epoch_delta(_body_reset_epoch(body), now)
     if seconds is None:
@@ -216,7 +216,7 @@ def _walk_for_reset(node: Any, depth: int) -> float | None:
         return None
     if isinstance(node, dict):
         for key in _BODY_RESET_KEYS:
-            epoch = _reset_epoch_seconds(node.get(key))
+            epoch = reset_epoch_seconds(node.get(key))
             if epoch is not None:
                 return epoch
         for value in node.values():
@@ -249,7 +249,7 @@ def _usage_reset_delta(usage_envelope: dict[str, Any] | None, now: float) -> flo
             continue
         if used_percent < _USAGE_EXHAUSTED_PERCENT:
             continue
-        delta = _epoch_delta(_reset_epoch_seconds(window.get("resets_at")), now)
+        delta = _epoch_delta(reset_epoch_seconds(window.get("resets_at")), now)
         if delta is not None:
             deltas.append(delta)
     return min(deltas) if deltas else None

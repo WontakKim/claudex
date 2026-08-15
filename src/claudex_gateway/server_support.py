@@ -21,7 +21,8 @@ from claudex_gateway.claude_auth import (
     ClaudeAccountReauthRequiredError,
 )
 from claudex_gateway.config import GatewayConfig
-from claudex_gateway.usage import _provider_result, fetch_claude_account_usage
+from claudex_gateway.usage import fetch_claude_account_usage
+from claudex_gateway.usage_envelope import provider_result
 
 logger = logging.getLogger("claudex_gateway.server")
 
@@ -149,7 +150,7 @@ def _account_usage_fetch(app_state: Any) -> Any:
         except ClaudeAccountReauthRequiredError:
             await _mark_account_needs_reauth_best_effort(app_state, account_id)
             return (
-                _provider_result(
+                provider_result(
                     "claude",
                     status="unavailable",
                     error="account needs re-authentication; log in again from the dashboard",

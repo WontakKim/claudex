@@ -19,7 +19,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
-from claudex_gateway.usage import _provider_result
+from claudex_gateway.usage_envelope import provider_result
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +31,7 @@ _RETRY_AFTER_MAX_SECONDS = 3600.0
 # The only per-window source this cache ever observes: a live usage-API fetch.
 _SOURCE_USAGE_API = "usage_api"
 
-# Envelope keys (see usage._provider_result / _map_claude_window) that carry
+# Envelope keys (see usage_envelope.provider_result / _map_claude_window) that carry
 # a per-window quota reading and are eligible for observation metadata.
 _WINDOW_NAMES = ("session", "weekly", "fable_weekly")
 
@@ -190,7 +190,7 @@ class ClaudeAccountUsageCache:
                 result = (
                     entry.result
                     if entry is not None
-                    else _provider_result(
+                    else provider_result(
                         "claude",
                         status="error",
                         error="usage API rate-limited; retrying after the cooldown",
@@ -212,7 +212,7 @@ class ClaudeAccountUsageCache:
         if now < self._not_before:
             if entry is not None:
                 return entry.result
-            return _provider_result(
+            return provider_result(
                 "claude",
                 status="error",
                 error="usage API rate-limited; retrying after the cooldown",
@@ -226,7 +226,7 @@ class ClaudeAccountUsageCache:
             logger.warning(
                 "per-account usage fetch failed unexpectedly for %s", account_id, exc_info=True
             )
-            result = _provider_result(
+            result = provider_result(
                 "claude", status="error", error="usage probe failed unexpectedly"
             )
             retry_after = None
