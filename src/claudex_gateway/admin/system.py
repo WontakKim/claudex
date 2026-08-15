@@ -134,7 +134,7 @@ async def _handle_dashboard(request: Request) -> Response:
     try:
         page = (
             importlib.resources.files("claudex_gateway")
-            .joinpath("dashboard.html")
+            .joinpath("dashboard", "dashboard.html")
             .read_text(encoding="utf-8")
         )
     except (FileNotFoundError, OSError) as exc:
@@ -151,7 +151,7 @@ async def _handle_dashboard_css(request: Request) -> Response:
     try:
         stylesheet = (
             importlib.resources.files("claudex_gateway")
-            .joinpath("dashboard.css")
+            .joinpath("dashboard", "dashboard.css")
             .read_text(encoding="utf-8")
         )
     except (FileNotFoundError, OSError) as exc:
@@ -170,7 +170,7 @@ async def _handle_dashboard_js(request: Request) -> Response:
     try:
         javascript = (
             importlib.resources.files("claudex_gateway")
-            .joinpath("dashboard.js")
+            .joinpath("dashboard", "dashboard.js")
             .read_text(encoding="utf-8")
         )
     except (FileNotFoundError, OSError) as exc:

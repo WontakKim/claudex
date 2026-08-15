@@ -2001,7 +2001,7 @@ def test_dashboard_assets_match_packaged_resources(
 ) -> None:
     expected = (
         importlib.resources.files("claudex_gateway")
-        .joinpath(asset_name)
+        .joinpath("dashboard", asset_name)
         .read_text(encoding="utf-8")
     )
     with _create_test_client(monkeypatch, tmp_path) as client:

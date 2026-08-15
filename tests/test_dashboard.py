@@ -5,9 +5,9 @@ from pathlib import Path
 
 
 PACKAGE_PATH = Path(__file__).parents[1] / "src" / "claudex_gateway"
-DASHBOARD_HTML = (PACKAGE_PATH / "dashboard.html").read_text(encoding="utf-8")
-DASHBOARD_CSS = (PACKAGE_PATH / "dashboard.css").read_text(encoding="utf-8")
-DASHBOARD_JAVASCRIPT = (PACKAGE_PATH / "dashboard.js").read_text(encoding="utf-8")
+DASHBOARD_HTML = (PACKAGE_PATH / "dashboard" / "dashboard.html").read_text(encoding="utf-8")
+DASHBOARD_CSS = (PACKAGE_PATH / "dashboard" / "dashboard.css").read_text(encoding="utf-8")
+DASHBOARD_JAVASCRIPT = (PACKAGE_PATH / "dashboard" / "dashboard.js").read_text(encoding="utf-8")
 DEVELOPER_COMMENT_PATTERN = re.compile(
     r"<!--.*?-->|/\*.*?\*/|//[^\n]*",
     re.DOTALL,
