@@ -23,6 +23,7 @@ from starlette.testclient import TestClient
 
 import claudex_gateway.relay as relay
 import claudex_gateway.server as server
+import claudex_gateway.translate.context_overflow as context_overflow
 from claudex_gateway import claude_accounts, compaction, paths
 from claudex_gateway.account_usage_cache import ClaudeAccountUsageCache
 from claudex_gateway.claude_account_pool import AccountCooldownTracker
@@ -53,7 +54,6 @@ from claudex_gateway.relay import (
     _upstream_error_to_claude,
 )
 from claudex_gateway.translate import translate_claude_request_to_codex
-from claudex_gateway.translate.codex_to_claude import estimate_overflow_prompt_tokens
 
 
 class AvailableCodexAuthManager:
@@ -218,7 +218,18 @@ def _overflow_error_body(message: str) -> str:
     return json.dumps({"error": {"code": "context_length_exceeded", "message": message}})
 
 
-def test_context_overflow_http_error_is_rewritten_for_claude_compaction() -> None:
+def test_context_overflow_http_error_is_rewritten_for_claude_compaction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rewrite_calls: list[int] = []
+    real_rewrite = context_overflow.rewrite_context_overflow_message
+
+    def counting_rewrite(*args: Any, **kwargs: Any) -> str | None:
+        rewrite_calls.append(1)
+        return real_rewrite(*args, **kwargs)
+
+    monkeypatch.setattr(context_overflow, "rewrite_context_overflow_message", counting_rewrite)
+
     status_code, body = _upstream_error_to_claude(
         _upstream_error(
             400,
@@ -234,6 +245,7 @@ def test_context_overflow_http_error_is_rewritten_for_claude_compaction() -> Non
     assert body["error"]["message"] == (
         "prompt is too long: Your input exceeds the context window of this model."
     )
+    assert rewrite_calls == [1]
 
 
 def test_context_overflow_forces_400_regardless_of_upstream_status() -> None:
@@ -1488,7 +1500,7 @@ def _parse_sse_error(raw: bytes) -> dict[str, Any]:
 
 def test_compaction_reroute_success_returns_anthropic_response_and_records_diagnostics() -> None:
     body = _compaction_body("claude-opus-4-6")
-    expected_estimate = estimate_overflow_prompt_tokens(body)
+    expected_estimate = context_overflow.estimate_overflow_prompt_tokens(body)
     window = expected_estimate - 1
     captured: list[httpx.Request] = []
     stream = _TrackedByteStream(
@@ -1534,7 +1546,7 @@ def test_compaction_reroute_success_returns_anthropic_response_and_records_diagn
 
 def test_compaction_reroute_skipped_without_credentials_falls_back_to_mapped_path() -> None:
     body = _compaction_body("claude-opus-4-6")
-    window = estimate_overflow_prompt_tokens(body) - 1
+    window = context_overflow.estimate_overflow_prompt_tokens(body) - 1
     captured: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -1566,7 +1578,7 @@ def test_compaction_reroute_skipped_without_credentials_falls_back_to_mapped_pat
 
 def test_compaction_reroute_falls_back_on_non_2xx_status() -> None:
     body = _compaction_body("claude-opus-4-6")
-    window = estimate_overflow_prompt_tokens(body) - 1
+    window = context_overflow.estimate_overflow_prompt_tokens(body) - 1
     captured: list[httpx.Request] = []
     stream = _TrackedByteStream([b'{"error": {"message": "invalid x-api-key"}}'])
 
@@ -1591,7 +1603,7 @@ def test_compaction_reroute_falls_back_on_non_2xx_status() -> None:
 
 def test_compaction_reroute_falls_back_on_3xx_without_following_redirect() -> None:
     body = _compaction_body("claude-opus-4-6")
-    window = estimate_overflow_prompt_tokens(body) - 1
+    window = context_overflow.estimate_overflow_prompt_tokens(body) - 1
     captured: list[httpx.Request] = []
     stream = _TrackedByteStream([b""])
 
@@ -1617,7 +1629,7 @@ def test_compaction_reroute_falls_back_on_3xx_without_following_redirect() -> No
 
 def test_compaction_reroute_falls_back_on_connect_error() -> None:
     body = _compaction_body("claude-opus-4-6")
-    window = estimate_overflow_prompt_tokens(body) - 1
+    window = context_overflow.estimate_overflow_prompt_tokens(body) - 1
 
     def handler(request: httpx.Request) -> httpx.Response:
         raise httpx.ConnectError("connection refused")
@@ -1637,7 +1649,7 @@ def test_compaction_reroute_falls_back_on_non_connect_transport_error() -> None:
     # httpx.HTTPError is not narrowed to ConnectError: any pre-response
     # transport failure must fall back the same way.
     body = _compaction_body("claude-opus-4-6")
-    window = estimate_overflow_prompt_tokens(body) - 1
+    window = context_overflow.estimate_overflow_prompt_tokens(body) - 1
 
     def handler(request: httpx.Request) -> httpx.Response:
         raise httpx.WriteError("connection reset while writing the request")
@@ -1655,7 +1667,7 @@ def test_compaction_reroute_falls_back_on_non_connect_transport_error() -> None:
 
 def test_compaction_reroute_falls_back_on_read_error() -> None:
     body = _compaction_body("claude-opus-4-6")
-    window = estimate_overflow_prompt_tokens(body) - 1
+    window = context_overflow.estimate_overflow_prompt_tokens(body) - 1
     stream = _TrackedByteStream([b'{"partial": '], httpx.ReadError("connection reset"))
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -1675,7 +1687,7 @@ def test_compaction_reroute_falls_back_on_read_error() -> None:
 
 def test_compaction_reroute_falls_back_on_invalid_json() -> None:
     body = _compaction_body("claude-opus-4-6")
-    window = estimate_overflow_prompt_tokens(body) - 1
+    window = context_overflow.estimate_overflow_prompt_tokens(body) - 1
     stream = _TrackedByteStream([b"not valid json"])
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -1699,7 +1711,7 @@ def test_compaction_reroute_falls_back_on_nonfinite_json_constants() -> None:
     # body as invalid_json and fall back rather than record "rerouted" and
     # then fail the request.
     body = _compaction_body("claude-opus-4-6")
-    window = estimate_overflow_prompt_tokens(body) - 1
+    window = context_overflow.estimate_overflow_prompt_tokens(body) - 1
     stream = _TrackedByteStream([b'{"value": NaN}'])
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -1719,7 +1731,7 @@ def test_compaction_reroute_falls_back_on_nonfinite_json_constants() -> None:
 
 def test_compaction_reroute_falls_back_on_json_scalar_body() -> None:
     body = _compaction_body("claude-opus-4-6")
-    window = estimate_overflow_prompt_tokens(body) - 1
+    window = context_overflow.estimate_overflow_prompt_tokens(body) - 1
     stream = _TrackedByteStream([b"42"])
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -1747,7 +1759,7 @@ def test_compaction_reroute_success_never_calls_translation(
     assert relay.translate_claude_request_to_codex is _boom
 
     body = _compaction_body("claude-opus-4-6")
-    window = estimate_overflow_prompt_tokens(body) - 1
+    window = context_overflow.estimate_overflow_prompt_tokens(body) - 1
     captured: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -1791,7 +1803,7 @@ def test_compaction_reroute_fallback_translates_untouched_original_body_once(
     monkeypatch.setattr(relay, "translate_claude_request_to_codex", recording_translate)
 
     body = _compaction_body("claude-opus-4-6", thinking_block=True)
-    window = estimate_overflow_prompt_tokens(body) - 1
+    window = context_overflow.estimate_overflow_prompt_tokens(body) - 1
 
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(401, json={"error": {"message": "bad key"}})
@@ -1817,7 +1829,7 @@ def test_compaction_reroute_fallback_translates_untouched_original_body_once(
 
 def test_compaction_trigger_reroutes_grok_mapped_request() -> None:
     body = _compaction_body("claude-opus-4-6")
-    window = estimate_overflow_prompt_tokens(body) - 1
+    window = context_overflow.estimate_overflow_prompt_tokens(body) - 1
     captured: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -1894,7 +1906,7 @@ def test_compaction_trigger_absent_setting_never_runs_signal_a_or_estimator(
     signal_calls = {"count": 0}
     estimate_calls = {"count": 0}
     real_is_compaction_request = relay.is_compaction_request
-    real_estimate = relay.estimate_overflow_prompt_tokens
+    real_estimate = context_overflow.estimate_overflow_prompt_tokens
 
     def counting_is_compaction_request(*args: Any, **kwargs: Any) -> bool:
         signal_calls["count"] += 1
@@ -1905,9 +1917,9 @@ def test_compaction_trigger_absent_setting_never_runs_signal_a_or_estimator(
         return real_estimate(*args, **kwargs)
 
     monkeypatch.setattr(relay, "is_compaction_request", counting_is_compaction_request)
-    monkeypatch.setattr(relay, "estimate_overflow_prompt_tokens", counting_estimate)
+    monkeypatch.setattr(context_overflow, "estimate_overflow_prompt_tokens", counting_estimate)
     assert relay.is_compaction_request is counting_is_compaction_request
-    assert relay.estimate_overflow_prompt_tokens is counting_estimate
+    assert context_overflow.estimate_overflow_prompt_tokens is counting_estimate
 
     body = _compaction_body("claude-opus-4-6")
     config = GatewayConfig(model_map={"opus": "codex:gpt-5.1-codex-max"})  # compaction_model unset
@@ -1925,14 +1937,14 @@ def test_compaction_trigger_non_signal_body_never_runs_estimator(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     estimate_calls = {"count": 0}
-    real_estimate = relay.estimate_overflow_prompt_tokens
+    real_estimate = context_overflow.estimate_overflow_prompt_tokens
 
     def counting_estimate(*args: Any, **kwargs: Any) -> int:
         estimate_calls["count"] += 1
         return real_estimate(*args, **kwargs)
 
-    monkeypatch.setattr(relay, "estimate_overflow_prompt_tokens", counting_estimate)
-    assert relay.estimate_overflow_prompt_tokens is counting_estimate
+    monkeypatch.setattr(context_overflow, "estimate_overflow_prompt_tokens", counting_estimate)
+    assert context_overflow.estimate_overflow_prompt_tokens is counting_estimate
 
     config = _compaction_config({"opus": "codex:gpt-5.1-codex-max"})
     client, stub = _gateway(config, _failing_anthropic_handler, codex_context_window=10)
@@ -1950,7 +1962,7 @@ def test_compaction_trigger_non_signal_body_never_runs_estimator(
 
 def test_compaction_trigger_under_window_does_not_reroute() -> None:
     body = _compaction_body("claude-opus-4-6")
-    window = estimate_overflow_prompt_tokens(body) + 1
+    window = context_overflow.estimate_overflow_prompt_tokens(body) + 1
     captured: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -1970,7 +1982,7 @@ def test_compaction_trigger_under_window_does_not_reroute() -> None:
 
 def test_compaction_trigger_equal_window_does_not_reroute() -> None:
     body = _compaction_body("claude-opus-4-6")
-    window = estimate_overflow_prompt_tokens(body)
+    window = context_overflow.estimate_overflow_prompt_tokens(body)
     captured: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -2012,14 +2024,14 @@ def test_compaction_trigger_rejects_boolean_catalog_window(
     # bool is an int subclass; the trigger's window check must exclude it
     # explicitly rather than trusting a bare isinstance(x, int).
     estimate_calls = {"count": 0}
-    real_estimate = relay.estimate_overflow_prompt_tokens
+    real_estimate = context_overflow.estimate_overflow_prompt_tokens
 
     def counting_estimate(*args: Any, **kwargs: Any) -> int:
         estimate_calls["count"] += 1
         return real_estimate(*args, **kwargs)
 
-    monkeypatch.setattr(relay, "estimate_overflow_prompt_tokens", counting_estimate)
-    assert relay.estimate_overflow_prompt_tokens is counting_estimate
+    monkeypatch.setattr(context_overflow, "estimate_overflow_prompt_tokens", counting_estimate)
+    assert context_overflow.estimate_overflow_prompt_tokens is counting_estimate
 
     body = _compaction_body("claude-opus-4-6")
     captured: list[httpx.Request] = []
@@ -2044,7 +2056,7 @@ def test_compaction_reroute_never_reenters_the_model_map_via_the_canonical_targe
     # very map key; the reroute must never re-enter model_map resolution and
     # loop back into the mapped Codex path for its own output.
     body = _compaction_body("claude-sonnet-4-6")
-    window = estimate_overflow_prompt_tokens(body) - 1
+    window = context_overflow.estimate_overflow_prompt_tokens(body) - 1
     captured: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -2077,7 +2089,7 @@ def test_compaction_reroute_never_reenters_the_model_map_via_the_canonical_targe
 def test_compaction_stream_reroute_success_relays_sse_bytes_and_headers() -> None:
     body = _compaction_body("claude-opus-4-6")
     body["stream"] = True
-    expected_estimate = estimate_overflow_prompt_tokens(body)
+    expected_estimate = context_overflow.estimate_overflow_prompt_tokens(body)
     window = expected_estimate - 1
     captured: list[httpx.Request] = []
     chunks = [
@@ -2139,7 +2151,7 @@ def test_compaction_stream_reroute_success_relays_sse_bytes_and_headers() -> Non
 def test_compaction_stream_reroute_falls_back_on_non_2xx_status_and_closes_response() -> None:
     body = _compaction_body("claude-opus-4-6")
     body["stream"] = True
-    window = estimate_overflow_prompt_tokens(body) - 1
+    window = context_overflow.estimate_overflow_prompt_tokens(body) - 1
     captured: list[httpx.Request] = []
     stream = _TrackedByteStream([b'{"error": {"message": "invalid x-api-key"}}'])
 
@@ -2165,7 +2177,7 @@ def test_compaction_stream_reroute_falls_back_on_non_2xx_status_and_closes_respo
 def test_compaction_stream_reroute_falls_back_on_3xx_without_following_redirect() -> None:
     body = _compaction_body("claude-opus-4-6")
     body["stream"] = True
-    window = estimate_overflow_prompt_tokens(body) - 1
+    window = context_overflow.estimate_overflow_prompt_tokens(body) - 1
     captured: list[httpx.Request] = []
     stream = _TrackedByteStream([b""])
 
@@ -2192,7 +2204,7 @@ def test_compaction_stream_reroute_falls_back_on_3xx_without_following_redirect(
 def test_compaction_stream_reroute_falls_back_on_connect_error() -> None:
     body = _compaction_body("claude-opus-4-6")
     body["stream"] = True
-    window = estimate_overflow_prompt_tokens(body) - 1
+    window = context_overflow.estimate_overflow_prompt_tokens(body) - 1
 
     def handler(request: httpx.Request) -> httpx.Response:
         raise httpx.ConnectError("connection refused")
@@ -2234,7 +2246,7 @@ def test_compaction_stream_reroute_fallback_translates_untouched_original_body_w
 
     body = _compaction_body("claude-opus-4-6", thinking_block=True)
     body["stream"] = True
-    window = estimate_overflow_prompt_tokens(body) - 1
+    window = context_overflow.estimate_overflow_prompt_tokens(body) - 1
 
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(401, json={"error": {"message": "bad key"}})
@@ -2261,7 +2273,7 @@ def test_compaction_stream_reroute_fallback_translates_untouched_original_body_w
 def test_compaction_stream_reroute_read_failure_after_first_byte_emits_error_event_and_records_midstream_error() -> None:
     body = _compaction_body("claude-opus-4-6")
     body["stream"] = True
-    window = estimate_overflow_prompt_tokens(body) - 1
+    window = context_overflow.estimate_overflow_prompt_tokens(body) - 1
     first_chunk = b'event: message_start\ndata: {"type": "message_start"}\n\n'
     stream = _TrackedByteStream([first_chunk], httpx.ReadError("connection reset"))
 
@@ -2299,7 +2311,7 @@ def test_compaction_stream_reroute_read_failure_after_first_byte_emits_error_eve
 def test_compaction_stream_reroute_read_failure_before_first_byte_never_invokes_mapped_backend() -> None:
     body = _compaction_body("claude-opus-4-6")
     body["stream"] = True
-    window = estimate_overflow_prompt_tokens(body) - 1
+    window = context_overflow.estimate_overflow_prompt_tokens(body) - 1
     stream = _TrackedByteStream([], httpx.ReadError("connection reset before any byte"))
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -2328,7 +2340,7 @@ def test_compaction_stream_reroute_read_failure_before_first_byte_never_invokes_
 def test_compaction_stream_reroute_first_sse_event_is_error_relayed_unchanged_without_fallback() -> None:
     body = _compaction_body("claude-opus-4-6")
     body["stream"] = True
-    window = estimate_overflow_prompt_tokens(body) - 1
+    window = context_overflow.estimate_overflow_prompt_tokens(body) - 1
     error_chunk = (
         b"event: error\n"
         b'data: {"type": "error", "error": {"type": "overloaded_error", "message": "busy"}}\n\n'

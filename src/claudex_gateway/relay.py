@@ -19,6 +19,7 @@ import httpx
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response, StreamingResponse
 
+import claudex_gateway.translate.context_overflow as context_overflow
 from claudex_gateway import server_support
 from claudex_gateway.claude_account_pool import (
     _DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS,
@@ -68,11 +69,6 @@ from claudex_gateway.translate import (
     TranslationError,
     assemble_claude_message,
     translate_claude_request_to_codex,
-)
-from claudex_gateway.translate.codex_to_claude import (
-    estimate_overflow_prompt_tokens,
-    is_context_overflow_error,
-    rewrite_context_overflow_message,
 )
 from claudex_gateway.upstream_errors import UpstreamAuthError, UpstreamError
 
@@ -137,7 +133,7 @@ def _upstream_error_to_claude(
     message = server_support._upstream_error_message(exc.body)
     code = _upstream_error_code(exc.body)
     # Overflow classification is provider-neutral (shared error-code and
-    # phrase matching in translate.codex_to_claude), so it applies to both
+    # phrase matching in translate.context_overflow), so it applies to both
     # Codex and Grok errors alike; when the caller supplies both the request
     # and a catalog-resolved context window, the rewrite is enriched with the
     # `<actual> tokens > <limit>` pair Claude Code's client needs to compact.
@@ -145,10 +141,10 @@ def _upstream_error_to_claude(
     if (
         claude_request is not None
         and context_window is not None
-        and is_context_overflow_error(code, message)
+        and context_overflow.is_context_overflow_error(code, message)
     ):
-        estimated_tokens = estimate_overflow_prompt_tokens(claude_request)
-    rewritten = rewrite_context_overflow_message(
+        estimated_tokens = context_overflow.estimate_overflow_prompt_tokens(claude_request)
+    rewritten = context_overflow.rewrite_context_overflow_message(
         code, message, estimated_tokens=estimated_tokens, context_window=context_window
     )
     if rewritten is not None:
@@ -1436,7 +1432,7 @@ async def _relay_via_responses_backend(
         # never be treated as a real window, so the bool case is excluded
         # explicitly rather than trusting `isinstance(x, int)` alone.
         if isinstance(context_window, int) and not isinstance(context_window, bool):
-            estimated_prompt_tokens = estimate_overflow_prompt_tokens(claude_request)
+            estimated_prompt_tokens = context_overflow.estimate_overflow_prompt_tokens(claude_request)
             if estimated_prompt_tokens > context_window:
                 target_model = parse_compaction_model(config.compaction_model)
                 reroute_response = await _reroute_compaction(

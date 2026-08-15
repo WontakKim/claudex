@@ -5,12 +5,10 @@ import re
 
 import pytest
 
-import claudex_gateway.translate.codex_to_claude as codex_to_claude
+import claudex_gateway.translate.context_overflow as context_overflow
 from claudex_gateway.translate.codex_to_claude import (
     CodexToClaudeStreamTranslator,
     assemble_claude_message,
-    estimate_overflow_prompt_tokens,
-    rewrite_context_overflow_message,
 )
 
 # Mirrors the Claude Code client's contract regex: without a match it falls
@@ -38,13 +36,13 @@ def _count_estimate_calls(monkeypatch: pytest.MonkeyPatch) -> list[int]:
     implementation that always estimates; only a call count can.
     """
     calls: list[int] = []
-    original = codex_to_claude.estimate_overflow_prompt_tokens
+    original = context_overflow.estimate_overflow_prompt_tokens
 
     def counting_wrapper(claude_request: dict) -> int:
         calls.append(1)
         return original(claude_request)
 
-    monkeypatch.setattr(codex_to_claude, "estimate_overflow_prompt_tokens", counting_wrapper)
+    monkeypatch.setattr(context_overflow, "estimate_overflow_prompt_tokens", counting_wrapper)
     return calls
 
 
@@ -464,7 +462,7 @@ def test_context_overflow_clamp_applies_floor_for_small_request() -> None:
 def test_context_overflow_reports_char_based_estimate_above_floor() -> None:
     claude_request = {"model": "m", "messages": [{"role": "user", "content": "x" * 2_000_000}]}
     floor = (272000 * 110 + 99) // 100
-    expected = estimate_overflow_prompt_tokens(claude_request)
+    expected = context_overflow.estimate_overflow_prompt_tokens(claude_request)
     assert expected > floor  # sanity check that this fixture exercises the char-based branch
 
     events = _run_stream(
@@ -484,7 +482,7 @@ def test_context_overflow_reports_char_based_estimate_above_floor() -> None:
 
 
 def test_context_overflow_without_context_window_matches_legacy_behavior() -> None:
-    message = rewrite_context_overflow_message(
+    message = context_overflow.rewrite_context_overflow_message(
         "context_length_exceeded", "Your input exceeds the context window of this model."
     )
     assert message == "prompt is too long: Your input exceeds the context window of this model."
@@ -503,14 +501,14 @@ def test_non_overflow_error_with_context_window_is_unaffected() -> None:
 
 def test_rewrite_context_overflow_message_is_idempotent_with_enrichment() -> None:
     claude_request = {"model": "m"}
-    estimated_tokens = estimate_overflow_prompt_tokens(claude_request)
-    first = rewrite_context_overflow_message(
+    estimated_tokens = context_overflow.estimate_overflow_prompt_tokens(claude_request)
+    first = context_overflow.rewrite_context_overflow_message(
         "context_length_exceeded",
         "too many tokens",
         estimated_tokens=estimated_tokens,
         context_window=272000,
     )
-    second = rewrite_context_overflow_message(
+    second = context_overflow.rewrite_context_overflow_message(
         "context_length_exceeded",
         first,
         estimated_tokens=estimated_tokens,
@@ -520,16 +518,16 @@ def test_rewrite_context_overflow_message_is_idempotent_with_enrichment() -> Non
 
 
 def test_rewrite_context_overflow_message_is_idempotent_after_neutralization() -> None:
-    first = rewrite_context_overflow_message("context_length_exceeded", "100 tokens > 200")
-    second = rewrite_context_overflow_message("context_length_exceeded", first)
+    first = context_overflow.rewrite_context_overflow_message("context_length_exceeded", "100 tokens > 200")
+    second = context_overflow.rewrite_context_overflow_message("context_length_exceeded", first)
     assert second == first
     assert _CLIENT_OVERFLOW_RE.search(first) is None
 
 
 def test_invalid_numeric_pair_with_enrichment_synthesizes_valid_pair() -> None:
     claude_request = {"model": "m"}
-    estimated_tokens = estimate_overflow_prompt_tokens(claude_request)
-    message = rewrite_context_overflow_message(
+    estimated_tokens = context_overflow.estimate_overflow_prompt_tokens(claude_request)
+    message = context_overflow.rewrite_context_overflow_message(
         "context_length_exceeded",
         "prompt is too long: 100 tokens > 200",
         estimated_tokens=estimated_tokens,
@@ -544,10 +542,10 @@ def test_enriched_message_contains_exactly_one_parseable_pair() -> None:
     # The appended original text is neutralized, so the synthesized pair is
     # the only one any regex-match strategy (first, last, all) can extract.
     claude_request = {"model": "m"}
-    message = rewrite_context_overflow_message(
+    message = context_overflow.rewrite_context_overflow_message(
         "context_length_exceeded",
         "prompt is too long: 100 tokens > 200",
-        estimated_tokens=estimate_overflow_prompt_tokens(claude_request),
+        estimated_tokens=context_overflow.estimate_overflow_prompt_tokens(claude_request),
         context_window=272000,
     )
     matches = list(_CLIENT_OVERFLOW_RE.finditer(message))
@@ -558,7 +556,7 @@ def test_enriched_message_contains_exactly_one_parseable_pair() -> None:
 
 
 def test_invalid_numeric_pair_without_enrichment_is_neutralized() -> None:
-    message = rewrite_context_overflow_message(
+    message = context_overflow.rewrite_context_overflow_message(
         "context_length_exceeded", "prompt is too long: 100 tokens > 200"
     )
     assert _CLIENT_OVERFLOW_RE.search(message) is None
@@ -566,20 +564,20 @@ def test_invalid_numeric_pair_without_enrichment_is_neutralized() -> None:
 
 
 def test_phraseless_invalid_pair_does_not_mint_a_poison_pair() -> None:
-    message = rewrite_context_overflow_message("context_length_exceeded", "100 tokens > 200")
+    message = context_overflow.rewrite_context_overflow_message("context_length_exceeded", "100 tokens > 200")
     assert "prompt is too long" in message.lower()
     assert _CLIENT_OVERFLOW_RE.search(message) is None
 
 
 def test_phraseless_valid_pair_is_preserved_after_legacy_prefix() -> None:
-    message = rewrite_context_overflow_message("context_length_exceeded", "300 tokens > 200")
+    message = context_overflow.rewrite_context_overflow_message("context_length_exceeded", "300 tokens > 200")
     match = _CLIENT_OVERFLOW_RE.search(message)
     assert match is not None
     assert int(match.group(1)) > int(match.group(2))
 
 
 def test_invalid_pair_followed_by_second_numeric_phrase_has_no_match() -> None:
-    message = rewrite_context_overflow_message(
+    message = context_overflow.rewrite_context_overflow_message(
         "context_length_exceeded", "100 tokens > 200 then retried with 300 tokens > 400"
     )
     assert _CLIENT_OVERFLOW_RE.search(message) is None
@@ -588,14 +586,14 @@ def test_invalid_pair_followed_by_second_numeric_phrase_has_no_match() -> None:
 def test_estimate_overflow_prompt_tokens_matches_ceil_chars_over_3_2() -> None:
     claude_request = {"model": "m", "messages": [{"role": "user", "content": "x" * 100}]}
     chars = len(json.dumps(claude_request, ensure_ascii=False))
-    assert estimate_overflow_prompt_tokens(claude_request) == (chars * 5 + 15) // 16
+    assert context_overflow.estimate_overflow_prompt_tokens(claude_request) == (chars * 5 + 15) // 16
 
 
 def test_overlong_numeric_capture_with_enrichment_synthesizes_valid_pair() -> None:
     # A capture beyond sys.get_int_max_str_digits() must not raise; the pair
     # is treated as invalid and the authoritative numbers are synthesized.
     huge = "9" * 5000
-    message = rewrite_context_overflow_message(
+    message = context_overflow.rewrite_context_overflow_message(
         "context_length_exceeded",
         f"prompt is too long: {huge} tokens > 200",
         estimated_tokens=10,
@@ -608,7 +606,7 @@ def test_overlong_numeric_capture_with_enrichment_synthesizes_valid_pair() -> No
 
 def test_overlong_numeric_capture_without_enrichment_is_neutralized() -> None:
     huge = "9" * 5000
-    message = rewrite_context_overflow_message(
+    message = context_overflow.rewrite_context_overflow_message(
         "context_length_exceeded", f"prompt is too long: {huge} tokens > 200"
     )
     assert _CLIENT_OVERFLOW_RE.search(message) is None
@@ -618,7 +616,7 @@ def test_overlong_numeric_capture_without_enrichment_is_neutralized() -> None:
 def test_unicode_numerals_are_not_treated_as_client_parseable() -> None:
     # JavaScript's \d matches ASCII digits only; a pair written with Unicode
     # decimal digits must not be preserved as if the client could parse it.
-    message = rewrite_context_overflow_message(
+    message = context_overflow.rewrite_context_overflow_message(
         "context_length_exceeded",
         "prompt is too long: ٩٩٩ tokens > ١٠",
         estimated_tokens=10,
