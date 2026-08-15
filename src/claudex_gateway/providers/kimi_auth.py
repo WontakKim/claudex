@@ -57,7 +57,7 @@ def _account_from_token(access_token: str) -> str | None:
     return account if isinstance(account, str) and account else None
 
 
-def identity_headers(device_id: str | None) -> dict[str, str]:
+def _identity_headers(device_id: str | None) -> dict[str, str]:
     """Device identity headers the Kimi OAuth endpoints expect."""
     headers = {
         "X-Msh-Platform": "claudex-gateway",
@@ -148,7 +148,7 @@ class KimiAuthManager:
                 },
                 headers={
                     "Accept": "application/json",
-                    **identity_headers(self._load_device_id()),
+                    **_identity_headers(self._load_device_id()),
                 },
             )
         except httpx.HTTPError as exc:

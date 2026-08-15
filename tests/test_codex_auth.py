@@ -12,7 +12,7 @@ from typing import Any
 import httpx
 import pytest
 
-from claudex_gateway.providers.codex_auth import OAUTH_TOKEN_URL, CodexAuthError, CodexAuthManager
+from claudex_gateway.providers.codex_auth import CODEX_TOKEN_URL, CodexAuthError, CodexAuthManager
 
 
 def _fake_jwt(exp: float) -> str:
@@ -42,7 +42,7 @@ def _write_auth_file(path: Path, access_token: str) -> None:
 
 def _refresh_transport(counter: dict[str, int], new_access_token: str) -> httpx.MockTransport:
     async def handler(request: httpx.Request) -> httpx.Response:
-        assert str(request.url) == OAUTH_TOKEN_URL
+        assert str(request.url) == CODEX_TOKEN_URL
         counter["posts"] += 1
         # Suspend while holding the refresh lock so a concurrent caller
         # genuinely waits on it instead of racing past.

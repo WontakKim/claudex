@@ -23,8 +23,8 @@ import httpx
 
 from claudex_gateway.upstream_errors import UpstreamAuthError
 
-OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token"
-OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
+CODEX_TOKEN_URL = "https://auth.openai.com/oauth/token"
+CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 
 # Refresh the access token this many seconds before its JWT exp claim.
 _EXPIRY_SKEW_SECONDS = 300
@@ -161,9 +161,9 @@ class CodexAuthManager:
 
         try:
             response = await self._http_client.post(
-                OAUTH_TOKEN_URL,
+                CODEX_TOKEN_URL,
                 data={
-                    "client_id": OAUTH_CLIENT_ID,
+                    "client_id": CODEX_CLIENT_ID,
                     "grant_type": "refresh_token",
                     "refresh_token": refresh_token,
                     "scope": "openid profile email",
