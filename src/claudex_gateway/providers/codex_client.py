@@ -2,13 +2,19 @@
 
 from __future__ import annotations
 
-import json
 from collections.abc import AsyncIterator
+from contextlib import aclosing
 from dataclasses import dataclass
 from typing import Any
 
 import httpx
 
+from claudex_gateway.providers.client_support import (
+    coerce_context_window,
+    fetch_models_list,
+    stream_sse_events,
+    stream_with_one_retry,
+)
 from claudex_gateway.providers.codex_auth import CodexAuthError, CodexAuthManager, CodexCredentials
 from claudex_gateway.providers.model_catalog_cache import ModelCatalogCache
 from claudex_gateway.upstream_errors import UpstreamError
@@ -29,8 +35,7 @@ _CODEX_CLIENT_VERSION = "0.146.0"
 class CodexUpstreamError(UpstreamError):
     """Raised when the Codex backend returns a non-success HTTP response."""
 
-    def __init__(self, status_code: int, body: str) -> None:
-        super().__init__(status_code, body, "codex")
+    provider_label = "codex"
 
 
 @dataclass(frozen=True)
@@ -55,17 +60,14 @@ class CodexClient:
 
         Retries exactly once with force-refreshed credentials on HTTP 401.
         """
-        credentials = await self._auth_manager.get_credentials()
-        try:
-            async for event in self._stream_once(payload, session_id, credentials):
-                yield event
-            return
-        except CodexUpstreamError as exc:
-            if exc.status_code != 401 or credentials.is_api_key:
-                raise
-
-        credentials = await self._auth_manager.get_credentials(force_refresh=True)
-        async for event in self._stream_once(payload, session_id, credentials):
+        async for event in stream_with_one_retry(
+            self._auth_manager.get_credentials,
+            lambda credentials: self._stream_once(payload, session_id, credentials),
+            upstream_error=CodexUpstreamError,
+            should_retry=lambda exc, credentials: (
+                exc.status_code == 401 and not credentials.is_api_key
+            ),
+        ):
             yield event
 
     async def list_models(self) -> list[str]:
@@ -106,7 +108,7 @@ class CodexClient:
                 for tier in service_tiers
             )
             entries[slug] = CodexModelEntry(
-                context_window=self._coerce_context_window(model.get("context_window")),
+                context_window=coerce_context_window(model.get("context_window")),
                 supports_fast_tier=supports_fast_tier,
             )
         return entries
@@ -121,38 +123,16 @@ class CodexClient:
         credentials = await self._auth_manager.get_credentials()
         headers = self._base_headers(credentials)
         headers["Accept"] = "application/json"
-        response = await self._http_client.get(
+        return await fetch_models_list(
+            self._http_client,
             CODEX_MODELS_URL,
+            headers,
+            label="codex",
+            make_error=CodexUpstreamError,
             params={"client_version": _CODEX_CLIENT_VERSION},
-            headers=headers,
+            items_key="models",
+            require_object_root=True,
         )
-        if response.status_code != 200:
-            raise CodexUpstreamError(response.status_code, response.text)
-        try:
-            parsed = response.json()
-        except ValueError as exc:
-            # ValueError covers JSONDecodeError, UnicodeDecodeError, and the
-            # int-conversion digit limit — every decode failure must surface
-            # as a structural catalog failure the model-catalog cache can
-            # treat as a failed refresh.
-            raise CodexUpstreamError(502, "codex models response is not valid JSON") from exc
-        if not isinstance(parsed, dict):
-            raise CodexUpstreamError(502, "codex models response is not a JSON object")
-        models = parsed.get("models")
-        if not isinstance(models, list):
-            raise CodexUpstreamError(502, "codex models response has no models list")
-        return models
-
-    @staticmethod
-    def _coerce_context_window(value: Any) -> int | None:
-        """Apply the accepted-type policy for a raw ``context_window`` value."""
-        if isinstance(value, bool):
-            return None
-        if isinstance(value, int):
-            return value if value > 0 else None
-        if isinstance(value, float) and value.is_integer():
-            return int(value) if value > 0 else None
-        return None
 
     @staticmethod
     def _base_headers(credentials: CodexCredentials) -> dict[str, str]:
@@ -181,20 +161,14 @@ class CodexClient:
         if service_tier:
             headers["x-codex-routing-hint"] = f"model={payload['model']};tier={service_tier}"
 
-        async with self._http_client.stream(
-            "POST", CODEX_RESPONSES_URL, json=payload, headers=headers
-        ) as response:
-            if response.status_code != 200:
-                body = (await response.aread()).decode("utf-8", errors="replace")
-                raise CodexUpstreamError(response.status_code, body)
-
-            async for line in response.aiter_lines():
-                if not line.startswith("data:"):
-                    continue
-                data = line[5:].strip()
-                if not data or data == "[DONE]":
-                    continue
-                try:
-                    yield json.loads(data)
-                except json.JSONDecodeError:
-                    continue
+        async with aclosing(
+            stream_sse_events(
+                self._http_client,
+                CODEX_RESPONSES_URL,
+                payload,
+                headers,
+                make_error=CodexUpstreamError,
+            )
+        ) as events:
+            async for event in events:
+                yield event
