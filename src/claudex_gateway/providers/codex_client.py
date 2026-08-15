@@ -9,8 +9,8 @@ from typing import Any
 
 import httpx
 
-from claudex_gateway.codex_auth import CodexAuthError, CodexAuthManager, CodexCredentials
-from claudex_gateway.model_catalog_cache import ModelCatalogCache
+from claudex_gateway.providers.codex_auth import CodexAuthError, CodexAuthManager, CodexCredentials
+from claudex_gateway.providers.model_catalog_cache import ModelCatalogCache
 from claudex_gateway.upstream_errors import UpstreamError
 
 CODEX_RESPONSES_URL = "https://chatgpt.com/backend-api/codex/responses"

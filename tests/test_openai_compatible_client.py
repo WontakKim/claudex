@@ -10,7 +10,7 @@ import httpx
 import pytest
 
 from claudex_gateway.config import OpenAICompatibleProvider
-from claudex_gateway.openai_compatible_client import (
+from claudex_gateway.providers.openai_compatible_client import (
     OpenAICompatibleClient,
     OpenAICompatibleUpstreamError,
 )

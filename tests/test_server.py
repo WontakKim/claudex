@@ -29,13 +29,13 @@ from claudex_gateway.balanced.runtime import ClaudeBalancedRuntime
 from claudex_gateway.balanced.selection import derive_session_key
 from claudex_gateway.balanced.state_model import RestoreValidationContext
 from claudex_gateway.balanced.state_store import ClaudePoolRuntimeStateStore
-from claudex_gateway.codex_client import CodexUpstreamError
+from claudex_gateway.providers.codex_client import CodexUpstreamError
 from claudex_gateway.config import ConfigError, GatewayConfig, OpenAICompatibleProvider
-from claudex_gateway.kimi_auth import KimiCredentials
-from claudex_gateway.kimi_client import KimiClient, KimiUpstreamError
-from claudex_gateway.openai_compatible_client import OpenAICompatibleUpstreamError
-from claudex_gateway.grok_auth import GrokCredentials
-from claudex_gateway.grok_client import GrokUpstreamError
+from claudex_gateway.providers.kimi_auth import KimiCredentials
+from claudex_gateway.providers.kimi_client import KimiClient, KimiUpstreamError
+from claudex_gateway.providers.openai_compatible_client import OpenAICompatibleUpstreamError
+from claudex_gateway.providers.grok_auth import GrokCredentials
+from claudex_gateway.providers.grok_client import GrokUpstreamError
 from claudex_gateway.translate.codex_to_claude import estimate_overflow_prompt_tokens
 
 

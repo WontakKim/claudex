@@ -24,18 +24,18 @@ import claudex_gateway.admin.system as admin_system
 import claudex_gateway.server as server
 import claudex_gateway.server_support as server_support
 from claudex_gateway import claude_accounts, compaction, paths
-from claudex_gateway.codex_client import (
+from claudex_gateway.providers.codex_client import (
     CODEX_MODELS_URL,
     CODEX_RESPONSES_URL,
     CodexClient,
     CodexUpstreamError,
 )
 from claudex_gateway.config import ConfigError, GatewayConfig, OpenAICompatibleProvider
-from claudex_gateway.grok_auth import GrokCredentials
-from claudex_gateway.grok_client import GrokClient, GrokUpstreamError
-from claudex_gateway.kimi_auth import KimiCredentials
-from claudex_gateway.kimi_client import KimiClient, KimiUpstreamError
-from claudex_gateway.openai_compatible_client import OpenAICompatibleUpstreamError
+from claudex_gateway.providers.grok_auth import GrokCredentials
+from claudex_gateway.providers.grok_client import GrokClient, GrokUpstreamError
+from claudex_gateway.providers.kimi_auth import KimiCredentials
+from claudex_gateway.providers.kimi_client import KimiClient, KimiUpstreamError
+from claudex_gateway.providers.openai_compatible_client import OpenAICompatibleUpstreamError
 
 
 _ADMIN_SOURCE_ROOT = Path(__file__).resolve().parents[1] / "src" / "claudex_gateway" / "admin"

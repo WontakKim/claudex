@@ -14,8 +14,8 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response, StreamingResponse
 
 from claudex_gateway import server_support
-from claudex_gateway.kimi_auth import KimiAuthError
-from claudex_gateway.kimi_client import KimiClient, KimiUpstreamError
+from claudex_gateway.providers.kimi_auth import KimiAuthError
+from claudex_gateway.providers.kimi_client import KimiClient, KimiUpstreamError
 from claudex_gateway.relay.common import (
     _MANAGED_RELAY_SKIP_REQUEST_HEADERS,
     _OAUTH_BETA,

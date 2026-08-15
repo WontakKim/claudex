@@ -9,14 +9,14 @@ from typing import Any
 import httpx
 import pytest
 
-from claudex_gateway.codex_auth import CodexAuthError, CodexCredentials
-from claudex_gateway.codex_client import (
+from claudex_gateway.providers.codex_auth import CodexAuthError, CodexCredentials
+from claudex_gateway.providers.codex_client import (
     CODEX_MODELS_URL,
     CODEX_RESPONSES_URL,
     CodexClient,
     CodexUpstreamError,
 )
-from claudex_gateway.model_catalog_cache import ModelCatalogCache
+from claudex_gateway.providers.model_catalog_cache import ModelCatalogCache
 
 
 class _FakeAuthManager:

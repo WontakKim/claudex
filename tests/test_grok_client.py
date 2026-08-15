@@ -9,9 +9,9 @@ from typing import Any
 import httpx
 import pytest
 
-from claudex_gateway.model_catalog_cache import ModelCatalogCache
-from claudex_gateway.grok_auth import GrokAuthError, GrokCredentials
-from claudex_gateway.grok_client import (
+from claudex_gateway.providers.model_catalog_cache import ModelCatalogCache
+from claudex_gateway.providers.grok_auth import GrokAuthError, GrokCredentials
+from claudex_gateway.providers.grok_client import (
     GROK_MODELS_URL,
     GROK_RESPONSES_URL,
     GrokClient,

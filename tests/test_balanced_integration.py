@@ -44,8 +44,8 @@ from claudex_gateway.balanced.selection import AccountCandidate, SessionKey, der
 from claudex_gateway.balanced.state_model import SCHEMA_VERSION, RestoreValidationContext
 from claudex_gateway.balanced.state_store import ClaudePoolRuntimeStateStore
 from claudex_gateway.config import GatewayConfig
-from claudex_gateway.grok_auth import GrokCredentials
-from claudex_gateway.kimi_auth import KimiCredentials
+from claudex_gateway.providers.grok_auth import GrokCredentials
+from claudex_gateway.providers.kimi_auth import KimiCredentials
 
 import claudex_gateway.admin.settings as admin_settings
 import claudex_gateway.relay.balanced as relay_balanced

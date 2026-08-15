@@ -20,14 +20,14 @@ from claudex_gateway.admin.common import (
     _read_json_object,
     _require_json_content_type,
 )
-from claudex_gateway.codex_auth import CodexAuthError
-from claudex_gateway.codex_client import CodexClient, CodexUpstreamError
+from claudex_gateway.providers.codex_auth import CodexAuthError
+from claudex_gateway.providers.codex_client import CodexClient, CodexUpstreamError
 from claudex_gateway.config import ConfigError, GatewayConfig, parse_route_target
-from claudex_gateway.grok_auth import GrokAuthError
-from claudex_gateway.grok_client import GrokClient, GrokUpstreamError, sanitize_grok_payload
-from claudex_gateway.kimi_auth import KimiAuthError
-from claudex_gateway.kimi_client import KimiClient, KimiUpstreamError
-from claudex_gateway.openai_compatible_client import (
+from claudex_gateway.providers.grok_auth import GrokAuthError
+from claudex_gateway.providers.grok_client import GrokClient, GrokUpstreamError, sanitize_grok_payload
+from claudex_gateway.providers.kimi_auth import KimiAuthError
+from claudex_gateway.providers.kimi_client import KimiClient, KimiUpstreamError
+from claudex_gateway.providers.openai_compatible_client import (
     OpenAICompatibleClient,
     OpenAICompatibleUpstreamError,
 )

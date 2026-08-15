@@ -35,9 +35,9 @@ from claudex_gateway.claude_auth import (
     ClaudeAccountAuthManager,
     ClaudeAccountReauthRequiredError,
 )
-from claudex_gateway.codex_auth import CodexAuthManager, CodexCredentials
-from claudex_gateway.kimi_auth import KimiAuthManager
-from claudex_gateway.grok_auth import GrokAuthManager, GrokCredentials
+from claudex_gateway.providers.codex_auth import CodexAuthManager, CodexCredentials
+from claudex_gateway.providers.kimi_auth import KimiAuthManager
+from claudex_gateway.providers.grok_auth import GrokAuthManager, GrokCredentials
 
 logger = logging.getLogger(__name__)
 

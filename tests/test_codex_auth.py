@@ -12,7 +12,7 @@ from typing import Any
 import httpx
 import pytest
 
-from claudex_gateway.codex_auth import OAUTH_TOKEN_URL, CodexAuthError, CodexAuthManager
+from claudex_gateway.providers.codex_auth import OAUTH_TOKEN_URL, CodexAuthError, CodexAuthManager
 
 
 def _fake_jwt(exp: float) -> str:

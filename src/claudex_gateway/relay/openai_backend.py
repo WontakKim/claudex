@@ -15,15 +15,15 @@ from starlette.responses import JSONResponse, StreamingResponse
 
 import claudex_gateway.translate.context_overflow as context_overflow
 from claudex_gateway import server_support
-from claudex_gateway.codex_client import CODEX_FAST_TIER_WIRE_VALUE, CodexClient
+from claudex_gateway.providers.codex_client import CODEX_FAST_TIER_WIRE_VALUE, CodexClient
 from claudex_gateway.compaction import (
     build_reroute_headers,
     build_reroute_payload,
     is_compaction_request,
 )
 from claudex_gateway.config import GatewayConfig, RouteTarget, parse_compaction_model
-from claudex_gateway.grok_client import GrokClient, sanitize_grok_payload
-from claudex_gateway.openai_compatible_client import OpenAICompatibleClient
+from claudex_gateway.providers.grok_client import GrokClient, sanitize_grok_payload
+from claudex_gateway.providers.openai_compatible_client import OpenAICompatibleClient
 from claudex_gateway.relay.common import (
     _ANTHROPIC_API_BASE,
     _format_sse,

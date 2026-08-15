@@ -64,15 +64,15 @@ from claudex_gateway.claude_accounts import AccountRecord, list_accounts
 from claudex_gateway.claude_ambient_account import AmbientAccountProvider, is_duplicate_identity
 from claudex_gateway.balanced.polling import UsagePollAccount
 from claudex_gateway.balanced.runtime import ClaudeBalancedRuntime
-from claudex_gateway.codex_auth import CodexAuthError, CodexAuthManager
-from claudex_gateway.codex_client import CodexClient
+from claudex_gateway.providers.codex_auth import CodexAuthError, CodexAuthManager
+from claudex_gateway.providers.codex_client import CodexClient
 from claudex_gateway.config import GatewayConfig
-from claudex_gateway.grok_auth import GrokAuthError, GrokAuthManager
-from claudex_gateway.grok_client import GrokClient
-from claudex_gateway.kimi_auth import KimiAuthError, KimiAuthManager
-from claudex_gateway.kimi_client import KimiClient
+from claudex_gateway.providers.grok_auth import GrokAuthError, GrokAuthManager
+from claudex_gateway.providers.grok_client import GrokClient
+from claudex_gateway.providers.kimi_auth import KimiAuthError, KimiAuthManager
+from claudex_gateway.providers.kimi_client import KimiClient
 from claudex_gateway.locking import try_file_lock
-from claudex_gateway.openai_compatible_client import OpenAICompatibleClient
+from claudex_gateway.providers.openai_compatible_client import OpenAICompatibleClient
 
 logger = logging.getLogger(__name__)
 

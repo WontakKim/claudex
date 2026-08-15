@@ -12,10 +12,10 @@ from starlette.responses import JSONResponse
 
 import claudex_gateway
 from claudex_gateway import server_support
-from claudex_gateway.codex_auth import CodexAuthError, CodexAuthManager
+from claudex_gateway.providers.codex_auth import CodexAuthError, CodexAuthManager
 from claudex_gateway.config import GatewayConfig
-from claudex_gateway.grok_auth import GrokAuthError, GrokAuthManager
-from claudex_gateway.kimi_auth import KimiAuthError, KimiAuthManager
+from claudex_gateway.providers.grok_auth import GrokAuthError, GrokAuthManager
+from claudex_gateway.providers.kimi_auth import KimiAuthError, KimiAuthManager
 from claudex_gateway.upstream_errors import UpstreamError
 
 

@@ -14,8 +14,8 @@ from typing import Any
 
 import httpx
 
-from claudex_gateway.model_catalog_cache import ModelCatalogCache
-from claudex_gateway.grok_auth import GrokAuthError, GrokAuthManager, GrokCredentials
+from claudex_gateway.providers.model_catalog_cache import ModelCatalogCache
+from claudex_gateway.providers.grok_auth import GrokAuthError, GrokAuthManager, GrokCredentials
 from claudex_gateway.upstream_errors import UpstreamError
 
 GROK_RESPONSES_URL = "https://cli-chat-proxy.grok.com/v1/responses"

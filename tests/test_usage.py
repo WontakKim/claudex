@@ -17,9 +17,9 @@ from claudex_gateway.claude_auth import (
     ClaudeAccountCredentials,
     ClaudeAccountReauthRequiredError,
 )
-from claudex_gateway.codex_auth import CodexAuthError, CodexCredentials
-from claudex_gateway.kimi_auth import KimiAuthError, KimiCredentials
-from claudex_gateway.grok_auth import GrokAuthError, GrokCredentials
+from claudex_gateway.providers.codex_auth import CodexAuthError, CodexCredentials
+from claudex_gateway.providers.kimi_auth import KimiAuthError, KimiCredentials
+from claudex_gateway.providers.grok_auth import GrokAuthError, GrokCredentials
 
 
 def _run(coroutine: Coroutine[Any, Any, Any]) -> Any:

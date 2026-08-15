@@ -12,7 +12,7 @@ from typing import Any
 
 import httpx
 
-from claudex_gateway.kimi_auth import KimiAuthManager, KimiCredentials
+from claudex_gateway.providers.kimi_auth import KimiAuthManager, KimiCredentials
 from claudex_gateway.upstream_errors import UpstreamError
 
 KIMI_MESSAGES_URL = "https://api.kimi.com/coding/v1/messages"
