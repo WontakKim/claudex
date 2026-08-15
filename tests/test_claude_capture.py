@@ -20,9 +20,9 @@ from typing import Any
 
 import pytest
 
-from claudex_gateway.claude import capture as claude_capture
-from claudex_gateway.claude import keychain as claude_keychain
-from claudex_gateway.claude.capture import CaptureCancelled, CaptureError, CapturedAccount
+from claudex.claude import capture as claude_capture
+from claudex.claude import keychain as claude_keychain
+from claudex.claude.capture import CaptureCancelled, CaptureError, CapturedAccount
 
 # ---------------------------------------------------------------------------
 # Fixtures and shared test doubles

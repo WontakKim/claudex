@@ -12,9 +12,9 @@ from typing import Any
 
 import pytest
 
-from claudex_gateway.claude.account_usage_cache import ClaudeAccountUsageCache
-from claudex_gateway.balanced.polling import ClaudeUsagePollCoordinator
-from claudex_gateway.balanced.router import (
+from claudex.claude.account_usage_cache import ClaudeAccountUsageCache
+from claudex.balanced.polling import ClaudeUsagePollCoordinator
+from claudex.balanced.router import (
     CAPABILITY_CLASSIFIER_VERSION,
     CAPABILITY_EVIDENCE_TTL_SECONDS,
     ClaudeBalancedRouter,
@@ -22,8 +22,8 @@ from claudex_gateway.balanced.router import (
     PendingDurabilityBarrier,
     PlacementResult,
 )
-from claudex_gateway.balanced.runtime import ClaudeBalancedRuntime
-from claudex_gateway.balanced.selection import (
+from claudex.balanced.runtime import ClaudeBalancedRuntime
+from claudex.balanced.selection import (
     AccountCandidate,
     FamilyGateOutcome,
     NoEligibleAccountError,
@@ -46,11 +46,11 @@ from claudex_gateway.balanced.selection import (
     unknown_floor,
     warning_factor,
 )
-from claudex_gateway.balanced.state_model import PinRow, RestoreResult, RestoreValidationContext
-from claudex_gateway.balanced.state_store import ClaudePoolRuntimeStateStore
+from claudex.balanced.state_model import PinRow, RestoreResult, RestoreValidationContext
+from claudex.balanced.state_store import ClaudePoolRuntimeStateStore
 
 
-_BALANCED_SOURCE_ROOT = Path(__file__).resolve().parents[1] / "src" / "claudex_gateway" / "balanced"
+_BALANCED_SOURCE_ROOT = Path(__file__).resolve().parents[1] / "src" / "claudex" / "balanced"
 _BALANCED_MODULE_NAMES = (
     "selection",
     "router",
@@ -204,7 +204,7 @@ def _assert_no_unused_imports(module_name: str, tree: ast.Module) -> None:
 
 
 def _balanced_sibling_edges(tree: ast.Module) -> set[str]:
-    package_name = "claudex_gateway.balanced"
+    package_name = "claudex.balanced"
     edges: set[str] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
@@ -262,9 +262,9 @@ def test_balanced_import_inventory_and_dependency_directions() -> None:
     trees = _balanced_module_trees()
     edges: dict[str, set[str]] = {}
     forbidden_consumers = {
-        "claudex_gateway.relay",
-        "claudex_gateway.admin",
-        "claudex_gateway.server",
+        "claudex.relay",
+        "claudex.admin",
+        "claudex.server",
     }
 
     for module_name, tree in trees.items():
@@ -767,7 +767,7 @@ def test_resolve_tie_break_falls_back_to_lexical_order_without_a_tied_serving_pi
 
 
 def test_pick_weighted_hrw_tie_break_is_deterministic(monkeypatch: pytest.MonkeyPatch) -> None:
-    import claudex_gateway.balanced.selection as selection_module
+    import claudex.balanced.selection as selection_module
 
     call_count = 0
 

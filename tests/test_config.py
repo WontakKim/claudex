@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from claudex_gateway.config import (
+from claudex.config import (
     BUILTIN_ROUTE_PROVIDERS,
     ConfigError,
     GatewayConfig,

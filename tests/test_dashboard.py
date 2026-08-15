@@ -4,7 +4,7 @@ import re
 from pathlib import Path
 
 
-PACKAGE_PATH = Path(__file__).parents[1] / "src" / "claudex_gateway"
+PACKAGE_PATH = Path(__file__).parents[1] / "src" / "claudex"
 DASHBOARD_HTML = (PACKAGE_PATH / "dashboard" / "dashboard.html").read_text(encoding="utf-8")
 DASHBOARD_CSS = (PACKAGE_PATH / "dashboard" / "dashboard.css").read_text(encoding="utf-8")
 DASHBOARD_JAVASCRIPT = (PACKAGE_PATH / "dashboard" / "dashboard.js").read_text(encoding="utf-8")

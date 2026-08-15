@@ -16,28 +16,28 @@ import httpx
 import pytest
 from starlette.testclient import TestClient
 
-import claudex_gateway.admin.settings as admin_settings
-import claudex_gateway.admin.system as admin_system
-import claudex_gateway.relay.openai_backend as relay_openai_backend
-import claudex_gateway.server as server
-import claudex_gateway.server_support as server_support
-from claudex_gateway import compaction, paths
-from claudex_gateway.claude import accounts as claude_accounts
-from claudex_gateway.claude.account_usage_cache import ClaudeAccountUsageCache
-from claudex_gateway.balanced.polling import ClaudeUsagePollCoordinator, UsagePollAccount
-from claudex_gateway.balanced.router import ClaudeBalancedRouter
-from claudex_gateway.balanced.runtime import ClaudeBalancedRuntime
-from claudex_gateway.balanced.selection import derive_session_key
-from claudex_gateway.balanced.state_model import RestoreValidationContext
-from claudex_gateway.balanced.state_store import ClaudePoolRuntimeStateStore
-from claudex_gateway.providers.codex_client import CodexUpstreamError
-from claudex_gateway.config import ConfigError, GatewayConfig, OpenAICompatibleProvider
-from claudex_gateway.providers.kimi_auth import KimiCredentials
-from claudex_gateway.providers.kimi_client import KimiClient, KimiUpstreamError
-from claudex_gateway.providers.openai_compatible_client import OpenAICompatibleUpstreamError
-from claudex_gateway.providers.grok_auth import GrokCredentials
-from claudex_gateway.providers.grok_client import GrokUpstreamError
-from claudex_gateway.translate.codex_to_claude import estimate_overflow_prompt_tokens
+import claudex.admin.settings as admin_settings
+import claudex.admin.system as admin_system
+import claudex.relay.openai_backend as relay_openai_backend
+import claudex.server as server
+import claudex.server_support as server_support
+from claudex import compaction, paths
+from claudex.claude import accounts as claude_accounts
+from claudex.claude.account_usage_cache import ClaudeAccountUsageCache
+from claudex.balanced.polling import ClaudeUsagePollCoordinator, UsagePollAccount
+from claudex.balanced.router import ClaudeBalancedRouter
+from claudex.balanced.runtime import ClaudeBalancedRuntime
+from claudex.balanced.selection import derive_session_key
+from claudex.balanced.state_model import RestoreValidationContext
+from claudex.balanced.state_store import ClaudePoolRuntimeStateStore
+from claudex.providers.codex_client import CodexUpstreamError
+from claudex.config import ConfigError, GatewayConfig, OpenAICompatibleProvider
+from claudex.providers.kimi_auth import KimiCredentials
+from claudex.providers.kimi_client import KimiClient, KimiUpstreamError
+from claudex.providers.openai_compatible_client import OpenAICompatibleUpstreamError
+from claudex.providers.grok_auth import GrokCredentials
+from claudex.providers.grok_client import GrokUpstreamError
+from claudex.translate.codex_to_claude import estimate_overflow_prompt_tokens
 
 
 class AvailableCodexAuthManager:
@@ -196,151 +196,151 @@ def test_route_ownership_matches_surface_modules() -> None:
 
     expected_admin_routes = {
         ("/", route_methods("GET")): (
-            "claudex_gateway.admin.system",
+            "claudex.admin.system",
             "_handle_dashboard",
         ),
         ("/dashboard.css", route_methods("GET")): (
-            "claudex_gateway.admin.system",
+            "claudex.admin.system",
             "_handle_dashboard_css",
         ),
         ("/dashboard.js", route_methods("GET")): (
-            "claudex_gateway.admin.system",
+            "claudex.admin.system",
             "_handle_dashboard_js",
         ),
         ("/favicon.ico", route_methods("GET")): (
-            "claudex_gateway.admin.system",
+            "claudex.admin.system",
             "_handle_favicon",
         ),
         ("/api/hello", route_methods("GET")): (
-            "claudex_gateway.admin.common",
+            "claudex.admin.common",
             "_handle_hello",
         ),
         ("/health", route_methods("GET")): (
-            "claudex_gateway.admin.common",
+            "claudex.admin.common",
             "_handle_health",
         ),
         ("/admin/settings/mapping", route_methods("GET")): (
-            "claudex_gateway.admin.settings",
+            "claudex.admin.settings",
             "_handle_admin_mapping_get",
         ),
         ("/admin/settings/mapping", route_methods("PUT")): (
-            "claudex_gateway.admin.settings",
+            "claudex.admin.settings",
             "_handle_admin_mapping_put",
         ),
         ("/admin/settings/log-level", route_methods("GET")): (
-            "claudex_gateway.admin.settings",
+            "claudex.admin.settings",
             "_handle_admin_log_level_get",
         ),
         ("/admin/settings/log-level", route_methods("PUT")): (
-            "claudex_gateway.admin.settings",
+            "claudex.admin.settings",
             "_handle_admin_log_level_put",
         ),
         ("/admin/settings/compaction", route_methods("GET")): (
-            "claudex_gateway.admin.settings",
+            "claudex.admin.settings",
             "_handle_admin_compaction_get",
         ),
         ("/admin/settings/compaction", route_methods("PUT")): (
-            "claudex_gateway.admin.settings",
+            "claudex.admin.settings",
             "_handle_admin_compaction_put",
         ),
         ("/admin/settings/codex", route_methods("GET")): (
-            "claudex_gateway.admin.settings",
+            "claudex.admin.settings",
             "_handle_admin_codex_get",
         ),
         ("/admin/settings/codex", route_methods("PUT")): (
-            "claudex_gateway.admin.settings",
+            "claudex.admin.settings",
             "_handle_admin_codex_put",
         ),
         ("/admin/providers/codex/models", route_methods("GET")): (
-            "claudex_gateway.admin.system",
+            "claudex.admin.system",
             "_handle_admin_codex_models",
         ),
         ("/admin/providers/codex/reset-credit", route_methods("POST")): (
-            "claudex_gateway.admin.system",
+            "claudex.admin.system",
             "_handle_admin_codex_reset_credit",
         ),
         ("/admin/providers/kimi/models", route_methods("GET")): (
-            "claudex_gateway.admin.system",
+            "claudex.admin.system",
             "_handle_admin_kimi_models",
         ),
         ("/admin/providers/grok/models", route_methods("GET")): (
-            "claudex_gateway.admin.system",
+            "claudex.admin.system",
             "_handle_admin_grok_models",
         ),
         ("/admin/providers/custom/{name}/models", route_methods("GET")): (
-            "claudex_gateway.admin.system",
+            "claudex.admin.system",
             "_handle_admin_custom_models",
         ),
         ("/admin/providers/claude/local", route_methods("GET")): (
-            "claudex_gateway.admin.accounts",
+            "claudex.admin.accounts",
             "_handle_admin_claude_local_get",
         ),
         ("/admin/providers/claude/accounts", route_methods("GET")): (
-            "claudex_gateway.admin.accounts",
+            "claudex.admin.accounts",
             "_handle_admin_claude_accounts_get",
         ),
         ("/admin/providers/claude/accounts/{account_id}", route_methods("DELETE")): (
-            "claudex_gateway.admin.accounts",
+            "claudex.admin.accounts",
             "_handle_admin_claude_account_delete",
         ),
         ("/admin/providers/claude/login", route_methods("GET")): (
-            "claudex_gateway.admin.accounts",
+            "claudex.admin.accounts",
             "_handle_admin_claude_login_get",
         ),
         ("/admin/providers/claude/login", route_methods("POST")): (
-            "claudex_gateway.admin.accounts",
+            "claudex.admin.accounts",
             "_handle_admin_claude_login_post",
         ),
         ("/admin/providers/claude/login", route_methods("DELETE")): (
-            "claudex_gateway.admin.accounts",
+            "claudex.admin.accounts",
             "_handle_admin_claude_login_delete",
         ),
         ("/admin/providers/claude/login/code", route_methods("POST")): (
-            "claudex_gateway.admin.accounts",
+            "claudex.admin.accounts",
             "_handle_admin_claude_login_code_post",
         ),
         ("/admin/providers/claude/login/replace", route_methods("POST")): (
-            "claudex_gateway.admin.accounts",
+            "claudex.admin.accounts",
             "_handle_admin_claude_login_replace_post",
         ),
         ("/admin/providers/claude/pool/serving", route_methods("GET")): (
-            "claudex_gateway.admin.settings",
+            "claudex.admin.settings",
             "_handle_admin_claude_serving_get",
         ),
         ("/admin/providers/claude/pool/serving", route_methods("PUT")): (
-            "claudex_gateway.admin.settings",
+            "claudex.admin.settings",
             "_handle_admin_claude_serving_put",
         ),
         ("/admin/providers/claude/pool/serving", route_methods("DELETE")): (
-            "claudex_gateway.admin.settings",
+            "claudex.admin.settings",
             "_handle_admin_claude_serving_delete",
         ),
         ("/admin/providers/claude/pool/routing", route_methods("GET")): (
-            "claudex_gateway.admin.settings",
+            "claudex.admin.settings",
             "_handle_admin_claude_routing_get",
         ),
         ("/admin/providers/claude/pool/routing", route_methods("PUT")): (
-            "claudex_gateway.admin.settings",
+            "claudex.admin.settings",
             "_handle_admin_claude_routing_put",
         ),
         ("/admin/providers/claude/pool/status", route_methods("GET")): (
-            "claudex_gateway.admin.accounts",
+            "claudex.admin.accounts",
             "_handle_admin_claude_pool_status",
         ),
         ("/admin/providers/claude/pool/usage", route_methods("GET")): (
-            "claudex_gateway.admin.accounts",
+            "claudex.admin.accounts",
             "_handle_admin_claude_accounts_usage",
         ),
         ("/admin/logs", route_methods("GET")): (
-            "claudex_gateway.admin.system",
+            "claudex.admin.system",
             "_handle_admin_logs",
         ),
         ("/admin/usage", route_methods("GET")): (
-            "claudex_gateway.admin.system",
+            "claudex.admin.system",
             "_handle_admin_usage",
         ),
         ("/admin/test", route_methods("POST")): (
-            "claudex_gateway.admin.system",
+            "claudex.admin.system",
             "_handle_admin_connection_test",
         ),
     }
@@ -368,8 +368,8 @@ def test_route_ownership_matches_surface_modules() -> None:
         and route.path in {"/v1/messages", "/v1/messages/count_tokens"}
     }
     assert relay_routes == {
-        "/v1/messages": "claudex_gateway.relay.endpoints",
-        "/v1/messages/count_tokens": "claudex_gateway.relay.endpoints",
+        "/v1/messages": "claudex.relay.endpoints",
+        "/v1/messages/count_tokens": "claudex.relay.endpoints",
     }
 
 
@@ -1342,7 +1342,7 @@ class TestBalancedRoutingExit:
 
         settings_file = tmp_path / "settings.json"
         config = GatewayConfig(settings_file=settings_file, claude_account_id=account_id)
-        caplog.set_level(logging.WARNING, logger="claudex_gateway.balanced.runtime")
+        caplog.set_level(logging.WARNING, logger="claudex.balanced.runtime")
         with _create_test_client(
             monkeypatch, tmp_path, config=config, base_url="http://127.0.0.1:8787"
         ) as client:
@@ -1459,8 +1459,8 @@ def test_balanced_request_during_controlled_exit_awaits_and_serves_under_target_
     the ALREADY-published target mode -- never a 503 merely because the
     controlled transition was in flight.
     """
-    from claudex_gateway.claude.accounts import AccountRecord
-    from claudex_gateway.balanced.runtime import ClaudeBalancedRuntime
+    from claudex.claude.accounts import AccountRecord
+    from claudex.balanced.runtime import ClaudeBalancedRuntime
 
     account_id = "22222222-3333-4444-5555-666666666666"
     accounts_root = tmp_path / "accounts"

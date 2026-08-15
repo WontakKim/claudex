@@ -7,7 +7,7 @@ from typing import Any
 
 import pytest
 
-from claudex_gateway.providers.model_catalog_cache import ModelCatalogCache
+from claudex.providers.model_catalog_cache import ModelCatalogCache
 
 
 class FetchError(Exception):

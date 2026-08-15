@@ -8,8 +8,8 @@ from typing import Any
 import httpx
 import pytest
 
-from claudex_gateway.providers.kimi_auth import KimiCredentials
-from claudex_gateway.providers.kimi_client import (
+from claudex.providers.kimi_auth import KimiCredentials
+from claudex.providers.kimi_client import (
     KIMI_COUNT_TOKENS_URL,
     KIMI_MESSAGES_URL,
     KIMI_MODELS_URL,

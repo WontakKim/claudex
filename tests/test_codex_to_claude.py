@@ -5,8 +5,8 @@ import re
 
 import pytest
 
-import claudex_gateway.translate.context_overflow as context_overflow
-from claudex_gateway.translate.codex_to_claude import (
+import claudex.translate.context_overflow as context_overflow
+from claudex.translate.codex_to_claude import (
     CodexToClaudeStreamTranslator,
     assemble_claude_message,
 )
@@ -631,7 +631,7 @@ def test_tool_names_are_restored_from_shortened_form() -> None:
     long_name = "mcp__really-long-server-name-that-goes-on-forever__" + "t" * 40
     claude_request = {"tools": [{"name": long_name}]}
 
-    from claudex_gateway.translate.claude_to_codex import build_tool_name_shortening_map
+    from claudex.translate.claude_to_codex import build_tool_name_shortening_map
 
     short_name = build_tool_name_shortening_map(claude_request)[long_name]
     assert short_name != long_name

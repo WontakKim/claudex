@@ -17,35 +17,35 @@ import httpx
 import pytest
 from starlette.testclient import TestClient
 
-import claudex_gateway.admin.accounts as admin_accounts
-import claudex_gateway.admin.common as admin_common
-import claudex_gateway.admin.settings as admin_settings
-import claudex_gateway.admin.system as admin_system
-import claudex_gateway.server as server
-import claudex_gateway.server_support as server_support
-from claudex_gateway import compaction, paths
-from claudex_gateway.claude import accounts as claude_accounts
-from claudex_gateway.providers.codex_client import (
+import claudex.admin.accounts as admin_accounts
+import claudex.admin.common as admin_common
+import claudex.admin.settings as admin_settings
+import claudex.admin.system as admin_system
+import claudex.server as server
+import claudex.server_support as server_support
+from claudex import compaction, paths
+from claudex.claude import accounts as claude_accounts
+from claudex.providers.codex_client import (
     CODEX_MODELS_URL,
     CODEX_RESPONSES_URL,
     CodexClient,
     CodexUpstreamError,
 )
-from claudex_gateway.config import ConfigError, GatewayConfig, OpenAICompatibleProvider
-from claudex_gateway.providers.grok_auth import GrokCredentials
-from claudex_gateway.providers.grok_client import GrokClient, GrokUpstreamError
-from claudex_gateway.providers.kimi_auth import KimiCredentials
-from claudex_gateway.providers.kimi_client import KimiClient, KimiUpstreamError
-from claudex_gateway.providers.openai_compatible_client import OpenAICompatibleUpstreamError
+from claudex.config import ConfigError, GatewayConfig, OpenAICompatibleProvider
+from claudex.providers.grok_auth import GrokCredentials
+from claudex.providers.grok_client import GrokClient, GrokUpstreamError
+from claudex.providers.kimi_auth import KimiCredentials
+from claudex.providers.kimi_client import KimiClient, KimiUpstreamError
+from claudex.providers.openai_compatible_client import OpenAICompatibleUpstreamError
 
 
-_ADMIN_SOURCE_ROOT = Path(__file__).resolve().parents[1] / "src" / "claudex_gateway" / "admin"
+_ADMIN_SOURCE_ROOT = Path(__file__).resolve().parents[1] / "src" / "claudex" / "admin"
 _ADMIN_MODULE_NAMES = ("common", "settings", "accounts", "system")
 _ADMIN_MODULE_PATHS = {
-    "common": "claudex_gateway.admin.common",
-    "settings": "claudex_gateway.admin.settings",
-    "accounts": "claudex_gateway.admin.accounts",
-    "system": "claudex_gateway.admin.system",
+    "common": "claudex.admin.common",
+    "settings": "claudex.admin.settings",
+    "accounts": "claudex.admin.accounts",
+    "system": "claudex.admin.system",
 }
 _ADMIN_IMPORTED_MODULES = {
     "common": admin_common,
@@ -180,7 +180,7 @@ def _admin_top_level_assignments(tree: ast.Module) -> set[str]:
 
 
 def _admin_sibling_dependencies(tree: ast.Module) -> set[str]:
-    package_name = "claudex_gateway.admin"
+    package_name = "claudex.admin"
     dependencies: set[str] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
@@ -284,7 +284,7 @@ def test_admin_import_inventory_and_dependency_directions() -> None:
     for module_name, tree in trees.items():
         _assert_admin_imports_are_used(module_name, tree)
         edges[module_name] = _admin_sibling_dependencies(tree)
-        assert "claudex_gateway.server" not in _admin_imported_modules(tree)
+        assert "claudex.server" not in _admin_imported_modules(tree)
 
     assert edges == {
         "common": set(),
@@ -1638,13 +1638,13 @@ class TestAdminClaudeRoutingApi:
 
 def test_admin_logs_returns_recent_records(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     with _create_test_client(monkeypatch, tmp_path, base_url="http://127.0.0.1:8787") as client:
-        logging.getLogger("claudex_gateway.test").warning("hello %s", "world")
+        logging.getLogger("claudex.test").warning("hello %s", "world")
         response = client.get("/admin/logs")
 
     assert response.status_code == 200
     entries = [e for e in response.json()["logs"] if e["message"] == "hello world"]
     assert entries and entries[0]["level"] == "WARNING"
-    assert entries[0]["logger"] == "claudex_gateway.test"
+    assert entries[0]["logger"] == "claudex.test"
 
 
 def test_admin_logs_refuses_foreign_host(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -2001,7 +2001,7 @@ def test_dashboard_assets_match_packaged_resources(
     content_type: str,
 ) -> None:
     expected = (
-        importlib.resources.files("claudex_gateway")
+        importlib.resources.files("claudex")
         .joinpath("dashboard", asset_name)
         .read_text(encoding="utf-8")
     )
@@ -3428,8 +3428,8 @@ class TestAdminClaudeAccountsApi:
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         client = self._client(monkeypatch, tmp_path)
-        from claudex_gateway.claude.login_session import capture_lock_path
-        from claudex_gateway.locking import try_file_lock as _try_lock
+        from claudex.claude.login_session import capture_lock_path
+        from claudex.locking import try_file_lock as _try_lock
 
         handle = _try_lock(capture_lock_path())
         assert handle is not None

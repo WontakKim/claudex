@@ -20,11 +20,11 @@ from pathlib import Path
 
 import pytest
 
-from claudex_gateway import __main__ as gateway_main
-from claudex_gateway import paths
-from claudex_gateway.cli import accounts, admin_client, compact, daemon
-from claudex_gateway.config import GatewayConfig
-from claudex_gateway.locking import try_file_lock
+from claudex import __main__ as gateway_main
+from claudex import paths
+from claudex.cli import accounts, admin_client, compact, daemon
+from claudex.config import GatewayConfig
+from claudex.locking import try_file_lock
 
 # Serves the given JSON payload on every GET; "__SELF_PID__": true is
 # replaced with the fake server's own pid so identity checks can match.
@@ -70,7 +70,7 @@ def _gateway_env(tmp_path: Path, port: int) -> dict[str, str]:
 
 def _run_cli(env: dict[str, str], *arguments: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        [sys.executable, "-m", "claudex_gateway", *arguments],
+        [sys.executable, "-m", "claudex", *arguments],
         env=env,
         capture_output=True,
         text=True,
@@ -363,7 +363,7 @@ def test_foreground_start_fails_with_the_pinned_message_when_pool_lock_is_held(
     assert holder is not None
     try:
         result = subprocess.run(
-            [sys.executable, "-m", "claudex_gateway", "--foreground"],
+            [sys.executable, "-m", "claudex", "--foreground"],
             env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,

@@ -2,7 +2,7 @@
 
 import pytest
 
-from claudex_gateway.translate.claude_to_codex import (
+from claudex.translate.claude_to_codex import (
     TranslationError,
     build_tool_name_shortening_map,
     shorten_call_id,

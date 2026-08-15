@@ -16,10 +16,10 @@ from typing import Any, Callable
 
 import pytest
 
-import claudex_gateway.claude.account_model as claude_account_model
-import claudex_gateway.claude.account_store as claude_account_store
-from claudex_gateway import paths
-from claudex_gateway.claude import accounts as claude_accounts
+import claudex.claude.account_model as claude_account_model
+import claudex.claude.account_store as claude_account_store
+from claudex import paths
+from claudex.claude import accounts as claude_accounts
 
 
 @pytest.fixture(autouse=True)
@@ -1082,7 +1082,7 @@ def test_orphaned_uuid_directory_is_preserved_and_reported(
     orphan_dir.mkdir(mode=0o700)
     (orphan_dir / "credentials.json").write_text("{}", encoding="utf-8")
 
-    with caplog.at_level(logging.WARNING, logger="claudex_gateway.claude.account_store"):
+    with caplog.at_level(logging.WARNING, logger="claudex.claude.account_store"):
         other = _add("other@example.com")
 
     assert orphan_dir.is_dir()  # never auto-deleted
@@ -1096,7 +1096,7 @@ def test_orphaned_uuid_directory_is_preserved_and_reported(
 
 _ADD_SCRIPT = """
 import sys
-from claudex_gateway.claude import accounts as ca
+from claudex.claude import accounts as ca
 
 try:
     record = ca.add_account(sys.argv[1], None, None, {"accessToken": "at"}, None)
@@ -1176,7 +1176,7 @@ def crashing_rename(src, dst):
 
 os.rename = crashing_rename
 
-from claudex_gateway.claude import accounts as ca
+from claudex.claude import accounts as ca
 ca.remove_account(sys.argv[1])
 print("should not reach here")
 """
@@ -1195,7 +1195,7 @@ def crashing_replace(src, dst):
 
 os.replace = crashing_replace
 
-from claudex_gateway.claude import accounts as ca
+from claudex.claude import accounts as ca
 
 if sys.argv[1] == "add":
     ca.add_account(sys.argv[2], None, None, {"accessToken": "at"}, None)
@@ -1218,7 +1218,7 @@ def crashing_rename(src, dst):
 
 os.rename = crashing_rename
 
-from claudex_gateway.claude import accounts as ca
+from claudex.claude import accounts as ca
 ca.add_account(sys.argv[1], None, None, {"accessToken": "at"}, None)
 print("should not reach here")
 """
@@ -1318,7 +1318,7 @@ def test_sigkill_after_staging_rename_in_add_leaves_a_reported_orphan(
     assert len(leftover_dirs) == 1  # the orphaned canonical-UUID directory
     orphan_id = leftover_dirs[0].name
 
-    with caplog.at_level(logging.WARNING, logger="claudex_gateway.claude.account_store"):
+    with caplog.at_level(logging.WARNING, logger="claudex.claude.account_store"):
         record = _add("third@example.com")
 
     assert leftover_dirs[0].exists()  # never auto-deleted

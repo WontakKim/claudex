@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
-from claudex_gateway.claude.account_usage_cache import ClaudeAccountUsageCache
+from claudex.claude.account_usage_cache import ClaudeAccountUsageCache
 
 
 class FakeClock:

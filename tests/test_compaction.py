@@ -13,7 +13,7 @@ literal text here means a drift in either file breaks the tests.
 
 import copy
 
-from claudex_gateway import compaction
+from claudex import compaction
 
 FULL_COMPACT_PROMPT = (
     "CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.\n"

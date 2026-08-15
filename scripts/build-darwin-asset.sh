@@ -79,7 +79,7 @@ uv pip install \
   --only-binary :all: \
   -r build/requirements.txt \
   "dist/claudex_gateway-${VERSION}-py3-none-any.whl"
-# Console scripts are unused — the shim runs `python -m claudex_gateway`.
+# Console scripts are unused — the shim runs `python -m claudex`.
 rm -rf "${SITE_PACKAGES}/bin"
 
 echo "==> Enforcing the pure-Python gate"
@@ -92,7 +92,7 @@ mkdir -p "${STAGE}/bin"
 cat > "${STAGE}/bin/${TOOL}" <<'EOF'
 #!/bin/sh
 DIR="$(cd "$(dirname "$0")/.." && pwd)"
-exec "$DIR/python/bin/python3" -m claudex_gateway "$@"
+exec "$DIR/python/bin/python3" -m claudex "$@"
 EOF
 chmod +x "${STAGE}/bin/${TOOL}"
 # The tarball also ships a ready-made `claudex` command that starts the
@@ -119,7 +119,7 @@ chmod +x "${STAGE}/bin/claudex"
 echo "==> Verifying assembled layout"
 [ -x "${STAGE}/bin/${TOOL}" ] || fail "${STAGE}/bin/${TOOL} is missing or not executable"
 [ -x "${STAGE}/bin/claudex" ] || fail "${STAGE}/bin/claudex is missing or not executable"
-[ -f "${SITE_PACKAGES}/claudex_gateway/__main__.py" ] || fail "claudex_gateway package missing from site-packages"
+[ -f "${SITE_PACKAGES}/claudex/__main__.py" ] || fail "claudex package missing from site-packages"
 # The python binary must be Mach-O arm64. `file` may be absent on the CI
 # container — check the Mach-O 64-bit magic (cf fa ed fe) and arm64 cputype
 # (0c 00 00 01) directly.
@@ -137,7 +137,7 @@ if [ "$(uname -s)" = "Darwin" ] && [ "$(uname -m)" = "arm64" ]; then
   SMOKE_OUT="$("${STAGE}/bin/${TOOL}" definitely-not-a-subcommand 2>&1)" || SMOKE_RC=$?
 else
   SMOKE_OUT="$(PYTHONPATH="${SITE_PACKAGES}" uv run --no-project --python "${PBS_SERIES}" \
-    python -m claudex_gateway definitely-not-a-subcommand 2>&1)" || SMOKE_RC=$?
+    python -m claudex definitely-not-a-subcommand 2>&1)" || SMOKE_RC=$?
 fi
 [ "${SMOKE_RC}" = "2" ] || fail "smoke test exited with ${SMOKE_RC}, expected usage error 2: ${SMOKE_OUT}"
 case "${SMOKE_OUT}" in
@@ -153,7 +153,7 @@ echo "==> Packing ${ASSET}"
 # grep exits on an early match, misreporting present entries as missing.
 LISTING_FILE="build/asset-listing.txt"
 tar -tzf "build/${ASSET}" > "${LISTING_FILE}"
-for entry in "./bin/${TOOL}" "./bin/claudex" "./python/bin/python3" "./python/lib/python${PBS_SERIES}/site-packages/claudex_gateway/__main__.py"; do
+for entry in "./bin/${TOOL}" "./bin/claudex" "./python/bin/python3" "./python/lib/python${PBS_SERIES}/site-packages/claudex/__main__.py"; do
   grep -qx "${entry}" "${LISTING_FILE}" || fail "build/${ASSET} is missing ${entry}"
 done
 rm -f "${LISTING_FILE}"

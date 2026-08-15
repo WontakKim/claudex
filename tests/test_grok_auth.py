@@ -13,7 +13,7 @@ from typing import Any
 import httpx
 import pytest
 
-from claudex_gateway.providers.grok_auth import XAI_ISSUER, GrokAuthError, GrokAuthManager
+from claudex.providers.grok_auth import XAI_ISSUER, GrokAuthError, GrokAuthManager
 
 _SCOPE = f"{XAI_ISSUER}::client-1"
 _TOKEN_ENDPOINT = "https://auth.x.ai/oauth/token"

@@ -24,39 +24,39 @@ import pytest
 import uvicorn
 from starlette.testclient import TestClient
 
-import claudex_gateway.relay.balanced as relay_balanced
-import claudex_gateway.relay.openai_backend as relay_openai_backend
-import claudex_gateway.server as server
-import claudex_gateway.translate.context_overflow as context_overflow
-from claudex_gateway import compaction, paths
-from claudex_gateway.claude import accounts as claude_accounts
-from claudex_gateway.claude.account_usage_cache import ClaudeAccountUsageCache
-from claudex_gateway.claude.account_pool import AccountCooldownTracker
-from claudex_gateway.claude.auth import CLAUDE_TOKEN_URL
-from claudex_gateway.balanced.router import ClaudeBalancedRouter
-from claudex_gateway.balanced.runtime import ClaudeBalancedRuntime
-from claudex_gateway.balanced.selection import derive_session_key
-from claudex_gateway.providers.codex_client import (
+import claudex.relay.balanced as relay_balanced
+import claudex.relay.openai_backend as relay_openai_backend
+import claudex.server as server
+import claudex.translate.context_overflow as context_overflow
+from claudex import compaction, paths
+from claudex.claude import accounts as claude_accounts
+from claudex.claude.account_usage_cache import ClaudeAccountUsageCache
+from claudex.claude.account_pool import AccountCooldownTracker
+from claudex.claude.auth import CLAUDE_TOKEN_URL
+from claudex.balanced.router import ClaudeBalancedRouter
+from claudex.balanced.runtime import ClaudeBalancedRuntime
+from claudex.balanced.selection import derive_session_key
+from claudex.providers.codex_client import (
     CODEX_MODELS_URL,
     CODEX_RESPONSES_URL,
     CodexClient,
     CodexUpstreamError,
 )
-from claudex_gateway.config import GatewayConfig, OpenAICompatibleProvider
-from claudex_gateway.providers.kimi_auth import KimiCredentials
-from claudex_gateway.providers.kimi_client import KimiClient
-from claudex_gateway.providers.openai_compatible_client import OpenAICompatibleUpstreamError
-from claudex_gateway.providers.grok_auth import GrokCredentials
-from claudex_gateway.providers.grok_client import GrokUpstreamError
-from claudex_gateway.relay.common import _upstream_error_to_claude
-from claudex_gateway.relay.kimi import _rewrite_kimi_sse
-from claudex_gateway.relay.openai_backend import (
+from claudex.config import GatewayConfig, OpenAICompatibleProvider
+from claudex.providers.kimi_auth import KimiCredentials
+from claudex.providers.kimi_client import KimiClient
+from claudex.providers.openai_compatible_client import OpenAICompatibleUpstreamError
+from claudex.providers.grok_auth import GrokCredentials
+from claudex.providers.grok_client import GrokUpstreamError
+from claudex.relay.common import _upstream_error_to_claude
+from claudex.relay.kimi import _rewrite_kimi_sse
+from claudex.relay.openai_backend import (
     _CompactionStreamRelay,
     _OwnedStreamingResponse,
     _aggregate_claude_response,
     _translate_claude_sse,
 )
-from claudex_gateway.translate import translate_claude_request_to_codex
+from claudex.translate import translate_claude_request_to_codex
 
 
 _RELAY_SYMBOL_MANIFEST = {
@@ -123,7 +123,7 @@ _RELAY_MANIFEST_SYMBOLS = set().union(*_RELAY_SYMBOL_MANIFEST.values())
 
 
 def test_relay_symbol_manifest_has_one_canonical_owner() -> None:
-    package_root = Path(__file__).resolve().parents[1] / "src/claudex_gateway/relay"
+    package_root = Path(__file__).resolve().parents[1] / "src/claudex/relay"
     node_types = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
     definitions_by_module = {
         module_name: {
@@ -159,10 +159,10 @@ def test_relay_imports_as_private_package_in_clean_subprocess() -> None:
 import importlib.util
 from pathlib import Path
 
-import claudex_gateway.relay as relay
-import claudex_gateway.relay.endpoints
+import claudex.relay as relay
+import claudex.relay.endpoints
 
-spec = importlib.util.find_spec("claudex_gateway.relay")
+spec = importlib.util.find_spec("claudex.relay")
 assert spec is not None and spec.submodule_search_locations is not None
 assert Path(relay.__file__).as_posix().endswith("relay/__init__.py")
 assert not [symbol for symbol in {moved_symbols!r} if hasattr(relay, symbol)]
@@ -606,14 +606,14 @@ def test_codex_fast_tier_is_sent_for_supported_model(
         _failing_anthropic_handler,
         codex_supports_fast_tier=True,
     )
-    caplog.set_level(logging.INFO, logger="claudex_gateway.server")
+    caplog.set_level(logging.INFO, logger="claudex.server")
 
     response = client.post("/v1/messages", json=_message_body("claude-opus-4-6"))
 
     assert response.status_code == 503
     assert stub.payloads[0]["service_tier"] == "priority"
     assert any(
-        record.name == "claudex_gateway.server"
+        record.name == "claudex.server"
         and record.levelno == logging.INFO
         and "tier=priority" in record.getMessage()
         for record in caplog.records
@@ -627,21 +627,21 @@ def test_codex_fast_tier_is_omitted_for_unsupported_model(
         model_map={"opus": "codex:gpt-5.6-sol"}, codex_service_tier="fast"
     )
     client, stub = _gateway(config, _failing_anthropic_handler)
-    caplog.set_level(logging.DEBUG, logger="claudex_gateway.server")
+    caplog.set_level(logging.DEBUG, logger="claudex.server")
 
     response = client.post("/v1/messages", json=_message_body("claude-opus-4-6"))
 
     assert response.status_code == 503
     assert "service_tier" not in stub.payloads[0]
     assert any(
-        record.name == "claudex_gateway.server"
+        record.name == "claudex.server"
         and record.levelno == logging.DEBUG
         and record.getMessage()
         == "fast tier requested but the codex catalog does not advertise it for gpt-5.6-sol"
         for record in caplog.records
     )
     assert any(
-        record.name == "claudex_gateway.server"
+        record.name == "claudex.server"
         and record.levelno == logging.INFO
         and "tier=standard" in record.getMessage()
         for record in caplog.records
@@ -657,14 +657,14 @@ def test_codex_fast_tier_is_omitted_when_disabled(
         _failing_anthropic_handler,
         codex_supports_fast_tier=True,
     )
-    caplog.set_level(logging.INFO, logger="claudex_gateway.server")
+    caplog.set_level(logging.INFO, logger="claudex.server")
 
     response = client.post("/v1/messages", json=_message_body("claude-opus-4-6"))
 
     assert response.status_code == 503
     assert "service_tier" not in stub.payloads[0]
     assert any(
-        record.name == "claudex_gateway.server"
+        record.name == "claudex.server"
         and record.levelno == logging.INFO
         and "tier=standard" in record.getMessage()
         for record in caplog.records
@@ -4533,7 +4533,7 @@ def test_balanced_successful_2xx_records_eligible_capability_evidence_for_the_re
         router = runtime.router
         assert router is not None
         record = next(r for r in claude_accounts.list_accounts() if r.id == account_id)
-        from claudex_gateway.claude.account_profile import load_account_profile_fingerprint
+        from claudex.claude.account_profile import load_account_profile_fingerprint
 
         fingerprint = load_account_profile_fingerprint(paths.accounts_dir("claude") / account_id)
         assert fingerprint is not None

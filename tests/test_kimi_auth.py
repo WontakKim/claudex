@@ -13,7 +13,7 @@ from typing import Any
 import httpx
 import pytest
 
-from claudex_gateway.providers.kimi_auth import (
+from claudex.providers.kimi_auth import (
     KIMI_CLIENT_ID,
     KIMI_TOKEN_URL,
     KimiAuthError,

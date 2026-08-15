@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from claudex_gateway import paths
+from claudex import paths
 
 _PACKAGE_DIR = Path(paths.__file__).parent
 
@@ -115,4 +115,4 @@ def test_consumers_use_shared_paths_module(module_name: str) -> None:
 
 def test_cli_daemon_imports_shared_paths_module() -> None:
     source = (_PACKAGE_DIR / "cli" / "daemon.py").read_text(encoding="utf-8")
-    assert "from claudex_gateway import paths" in source
+    assert "from claudex import paths" in source

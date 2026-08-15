@@ -10,8 +10,8 @@ from typing import Any
 import httpx
 import pytest
 
-from claudex_gateway.config import OpenAICompatibleProvider
-from claudex_gateway.providers.openai_compatible_client import (
+from claudex.config import OpenAICompatibleProvider
+from claudex.providers.openai_compatible_client import (
     OpenAICompatibleClient,
     OpenAICompatibleUpstreamError,
 )

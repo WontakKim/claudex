@@ -36,22 +36,22 @@ import pytest
 from starlette.responses import JSONResponse
 from starlette.testclient import TestClient
 
-from claudex_gateway import paths
-from claudex_gateway.claude import accounts as claude_accounts
-from claudex_gateway.claude.ambient_account import AmbientClaudeAuthManager
-from claudex_gateway.balanced.router import CAPABILITY_CLASSIFIER_VERSION, ClaudeBalancedRouter
-from claudex_gateway.balanced.runtime import ClaudeBalancedRuntime
-from claudex_gateway.balanced.selection import AccountCandidate, SessionKey, derive_session_key
-from claudex_gateway.balanced.state_model import SCHEMA_VERSION, RestoreValidationContext
-from claudex_gateway.balanced.state_store import ClaudePoolRuntimeStateStore
-from claudex_gateway.config import GatewayConfig
-from claudex_gateway.providers.grok_auth import GrokCredentials
-from claudex_gateway.providers.kimi_auth import KimiCredentials
+from claudex import paths
+from claudex.claude import accounts as claude_accounts
+from claudex.claude.ambient_account import AmbientClaudeAuthManager
+from claudex.balanced.router import CAPABILITY_CLASSIFIER_VERSION, ClaudeBalancedRouter
+from claudex.balanced.runtime import ClaudeBalancedRuntime
+from claudex.balanced.selection import AccountCandidate, SessionKey, derive_session_key
+from claudex.balanced.state_model import SCHEMA_VERSION, RestoreValidationContext
+from claudex.balanced.state_store import ClaudePoolRuntimeStateStore
+from claudex.config import GatewayConfig
+from claudex.providers.grok_auth import GrokCredentials
+from claudex.providers.kimi_auth import KimiCredentials
 
-import claudex_gateway.admin.settings as admin_settings
-import claudex_gateway.relay.balanced as relay_balanced
-import claudex_gateway.server as server
-import claudex_gateway.server_support as server_support
+import claudex.admin.settings as admin_settings
+import claudex.relay.balanced as relay_balanced
+import claudex.server as server
+import claudex.server_support as server_support
 
 # ---------------------------------------------------------------------------
 # Fakes/fixtures mirroring test_server.py's `_create_test_client` exactly --
@@ -919,7 +919,7 @@ def test_disable_while_streaming_drains_the_in_flight_stream_before_epoch_rotati
     not invalidate that stream's pin or rotate the epoch until the stream
     finishes.
     """
-    from claudex_gateway.claude.accounts import AccountRecord
+    from claudex.claude.accounts import AccountRecord
 
     account_id = "22222222-3333-4444-5555-666666666666"
     accounts_root = tmp_path / "accounts"

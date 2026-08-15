@@ -21,13 +21,13 @@ from pathlib import Path
 
 import pytest
 
-from claudex_gateway import paths
-from claudex_gateway.claude import accounts as claude_accounts
-from claudex_gateway.claude.login_session import (
+from claudex import paths
+from claudex.claude import accounts as claude_accounts
+from claudex.claude.login_session import (
     ClaudeLoginSession,
     LoginSessionStateError,
 )
-from claudex_gateway.locking import FileLockHandle, try_file_lock
+from claudex.locking import FileLockHandle, try_file_lock
 from fake_claude import prepend_fake_claude
 
 

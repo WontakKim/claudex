@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-_PACKAGE_NAME = "claudex_gateway"
+_PACKAGE_NAME = "claudex"
 _PACKAGE_ROOT = Path(__file__).resolve().parents[1] / "src" / _PACKAGE_NAME
 
 ImportGraph = dict[str, set[str]]
@@ -236,16 +236,16 @@ _SOURCE_MODULES = set(_SOURCE_MODULE_PATHS)
 
 
 def test_resolves_absolute_package_member_import() -> None:
-    source = "from claudex_gateway import paths"
+    source = "from claudex import paths"
 
     dependencies = _extract_internal_imports(
         source,
-        "claudex_gateway.config",
+        "claudex.config",
         _SOURCE_MODULES,
         _PACKAGE_MODULES,
     )
 
-    assert "claudex_gateway.paths" in dependencies
+    assert "claudex.paths" in dependencies
 
 
 def test_resolves_relative_package_member_import() -> None:
@@ -253,12 +253,12 @@ def test_resolves_relative_package_member_import() -> None:
 
     dependencies = _extract_internal_imports(
         source,
-        "claudex_gateway.server_support",
+        "claudex.server_support",
         _SOURCE_MODULES,
         _PACKAGE_MODULES,
     )
 
-    assert "claudex_gateway.paths" in dependencies
+    assert "claudex.paths" in dependencies
 
 
 def test_package_initializer_member_import_adds_no_self_edge() -> None:
@@ -266,35 +266,35 @@ def test_package_initializer_member_import_adds_no_self_edge() -> None:
 
     dependencies = _extract_internal_imports(
         source,
-        "claudex_gateway.translate",
+        "claudex.translate",
         _SOURCE_MODULES,
         _PACKAGE_MODULES,
     )
 
-    assert "claudex_gateway.translate.claude_to_codex" in dependencies
-    assert "claudex_gateway.translate" not in dependencies
+    assert "claudex.translate.claude_to_codex" in dependencies
+    assert "claudex.translate" not in dependencies
 
 
 def test_module_explicit_self_import_keeps_self_edge() -> None:
-    source = "import claudex_gateway.config"
+    source = "import claudex.config"
 
     dependencies = _extract_internal_imports(
         source,
-        "claudex_gateway.config",
+        "claudex.config",
         _SOURCE_MODULES,
         _PACKAGE_MODULES,
     )
 
-    assert "claudex_gateway.config" in dependencies
+    assert "claudex.config" in dependencies
 
 
 @pytest.mark.parametrize(
     ("source", "expected_dependency"),
     [
-        ("import claudex_gateway.paths", "claudex_gateway.paths"),
+        ("import claudex.paths", "claudex.paths"),
         (
-            "from claudex_gateway.paths import runtime_dir",
-            "claudex_gateway.paths",
+            "from claudex.paths import runtime_dir",
+            "claudex.paths",
         ),
     ],
 )
@@ -303,7 +303,7 @@ def test_resolves_direct_internal_imports(
 ) -> None:
     dependencies = _extract_internal_imports(
         source,
-        "claudex_gateway.config",
+        "claudex.config",
         _SOURCE_MODULES,
         _PACKAGE_MODULES,
     )
@@ -314,31 +314,31 @@ def test_resolves_direct_internal_imports(
 @pytest.fixture
 def multi_module_cycle_graph() -> ImportGraph:
     return {
-        "claudex_gateway.alpha": {"claudex_gateway.bravo"},
-        "claudex_gateway.bravo": {"claudex_gateway.charlie"},
-        "claudex_gateway.charlie": {"claudex_gateway.alpha"},
-        "claudex_gateway.independent": set(),
+        "claudex.alpha": {"claudex.bravo"},
+        "claudex.bravo": {"claudex.charlie"},
+        "claudex.charlie": {"claudex.alpha"},
+        "claudex.independent": set(),
     }
 
 
 @pytest.fixture
 def self_cycle_graph() -> ImportGraph:
-    return {"claudex_gateway.self_reference": {"claudex_gateway.self_reference"}}
+    return {"claudex.self_reference": {"claudex.self_reference"}}
 
 
 def test_detects_multi_module_cycle(multi_module_cycle_graph: ImportGraph) -> None:
     assert _find_cyclic_components(multi_module_cycle_graph) == [
         (
-            "claudex_gateway.alpha",
-            "claudex_gateway.bravo",
-            "claudex_gateway.charlie",
+            "claudex.alpha",
+            "claudex.bravo",
+            "claudex.charlie",
         )
     ]
 
 
 def test_detects_self_cycle(self_cycle_graph: ImportGraph) -> None:
     assert _find_cyclic_components(self_cycle_graph) == [
-        ("claudex_gateway.self_reference",)
+        ("claudex.self_reference",)
     ]
 
 
@@ -350,12 +350,12 @@ def test_cycle_failure_lists_complete_component_and_path(
     failure = _format_cycle_failure(multi_module_cycle_graph, cyclic_components)
 
     assert (
-        "component: claudex_gateway.alpha, claudex_gateway.bravo, "
-        "claudex_gateway.charlie"
+        "component: claudex.alpha, claudex.bravo, "
+        "claudex.charlie"
     ) in failure
     assert (
-        "cycle: claudex_gateway.alpha -> claudex_gateway.bravo -> "
-        "claudex_gateway.charlie -> claudex_gateway.alpha"
+        "cycle: claudex.alpha -> claudex.bravo -> "
+        "claudex.charlie -> claudex.alpha"
     ) in failure
 
 

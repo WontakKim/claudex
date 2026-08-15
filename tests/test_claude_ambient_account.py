@@ -11,15 +11,15 @@ from typing import Any
 
 import pytest
 
-from claudex_gateway.claude import ambient_account as ambient_module
-from claudex_gateway.claude.accounts import AccountRecord
-from claudex_gateway.claude.ambient_account import (
+from claudex.claude import ambient_account as ambient_module
+from claudex.claude.accounts import AccountRecord
+from claudex.claude.ambient_account import (
     AmbientAccountProvider,
     AmbientPoolMember,
     is_duplicate_identity,
 )
-from claudex_gateway.claude.auth import ClaudeAccountAuthError
-from claudex_gateway.claude.capture_model import KeychainBackend
+from claudex.claude.auth import ClaudeAccountAuthError
+from claudex.claude.capture_model import KeychainBackend
 
 _ACCOUNT_UUID = "226432ad-b115-4a79-a152-8420aacbd4b2"
 _ORGANIZATION_UUID = "8ccaa9d3-2bb1-4447-a09b-b35467e47a9e"

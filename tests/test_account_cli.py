@@ -5,11 +5,11 @@ established by `test_claude_capture.py` and `test_main.py`:
 
 - Scenarios that need a real process boundary (signal delivery, a `pty` for
   an interactive prompt, top-level argv routing) spawn
-  `python -m claudex_gateway ...` via `subprocess`, with `HOME` isolated to
+  `python -m claudex ...` via `subprocess`, with `HOME` isolated to
   `tmp_path` and every `CLAUDEX_*`/`CLAUDE_CONFIG_DIR` variable scrubbed from
   the child's environment.
 - Scenarios that need a successful Claude credential capture call
-  `claudex_gateway.cli.accounts._account_main(...)` in-process, so a real macOS
+  `claudex.cli.accounts._account_main(...)` in-process, so a real macOS
   Keychain is never touched: either `sys.platform` is forced to `"linux"`
   (capture then reads plain `.credentials.json`/`.claude.json` files, exactly
   as `test_claude_capture.py`'s own version-gate tests do), or the login
@@ -36,10 +36,10 @@ from pathlib import Path
 
 import pytest
 
-from claudex_gateway import paths
-from claudex_gateway.claude import accounts as claude_accounts
-from claudex_gateway.claude import capture as claude_capture
-from claudex_gateway.cli import accounts, admin_client, daemon
+from claudex import paths
+from claudex.claude import accounts as claude_accounts
+from claudex.claude import capture as claude_capture
+from claudex.cli import accounts, admin_client, daemon
 
 # ---------------------------------------------------------------------------
 # Shared fixtures
@@ -103,7 +103,7 @@ def _run_cli(
     else:
         kwargs["stdin"] = stdin
     return subprocess.run(
-        [sys.executable, "-m", "claudex_gateway", *args],
+        [sys.executable, "-m", "claudex", *args],
         env=env,
         capture_output=True,
         text=True,
@@ -158,7 +158,7 @@ def _assert_process_gone(pid: int, timeout: float = 5.0) -> None:
 
 
 def _spawn_pty_cli(env: dict[str, str], *args: str) -> tuple[int, int]:
-    """Fork a `python -m claudex_gateway <args>` child on a fresh pty.
+    """Fork a `python -m claudex <args>` child on a fresh pty.
 
     Uses `os.forkpty()` rather than `subprocess.Popen` dup'ing an
     already-open fd: only a real `open()` of the pty slave -- which
@@ -169,7 +169,7 @@ def _spawn_pty_cli(env: dict[str, str], *args: str) -> tuple[int, int]:
     pid, controller_fd = os.forkpty()
     if pid == 0:
         try:
-            os.execvpe(sys.executable, [sys.executable, "-m", "claudex_gateway", *args], env)
+            os.execvpe(sys.executable, [sys.executable, "-m", "claudex", *args], env)
         except OSError:
             pass
         os._exit(127)

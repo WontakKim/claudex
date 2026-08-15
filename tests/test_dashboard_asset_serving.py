@@ -10,8 +10,8 @@ from collections.abc import Awaitable, Callable
 import pytest
 from starlette.responses import Response
 
-import claudex_gateway.admin.system as admin_system
-import claudex_gateway.server_support as server_support
+import claudex.admin.system as admin_system
+import claudex.server_support as server_support
 
 
 _DashboardHandler = Callable[..., Awaitable[Response]]
@@ -55,7 +55,7 @@ def test_dashboard_wrappers_load_expected_utf8_assets(
 
     response = asyncio.run(handler(None))
 
-    assert anchors == ["claudex_gateway"]
+    assert anchors == ["claudex"]
     assert joined_paths == [("dashboard", basename)]
     assert response.status_code == 200
     assert response.body.decode("utf-8") == sentinel_body

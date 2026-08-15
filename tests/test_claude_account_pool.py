@@ -7,12 +7,12 @@ import uuid
 from datetime import datetime, timezone
 from email.utils import format_datetime
 
-from claudex_gateway.claude.account_pool import (
+from claudex.claude.account_pool import (
     AccountCooldownTracker,
     build_serving_chain,
     rate_limit_cooldown_seconds,
 )
-from claudex_gateway.claude.accounts import AccountRecord
+from claudex.claude.accounts import AccountRecord
 
 
 class FakeClock:

@@ -13,15 +13,15 @@ from typing import Any
 
 import pytest
 
-import claudex_gateway.balanced.state_model as state_model
-import claudex_gateway.balanced.state_store as state_store
-from claudex_gateway.balanced.state_model import (
+import claudex.balanced.state_model as state_model
+import claudex.balanced.state_store as state_store
+from claudex.balanced.state_model import (
     SCHEMA_VERSION,
     RestoreValidationContext,
     UnsupportedSchemaVersionError,
     _SCHEMA_SQL,
 )
-from claudex_gateway.balanced.state_store import ClaudePoolRuntimeStateStore
+from claudex.balanced.state_store import ClaudePoolRuntimeStateStore
 
 # --------------------------------------------------------------------------
 # Fixtures and small row-builder helpers
@@ -125,9 +125,9 @@ def test_persistence_symbols_have_canonical_owners() -> None:
     assert RestoreValidationContext is state_model.RestoreValidationContext
     assert UnsupportedSchemaVersionError is state_model.UnsupportedSchemaVersionError
     assert ClaudePoolRuntimeStateStore is state_store.ClaudePoolRuntimeStateStore
-    assert RestoreValidationContext.__module__ == "claudex_gateway.balanced.state_model"
-    assert UnsupportedSchemaVersionError.__module__ == "claudex_gateway.balanced.state_model"
-    assert ClaudePoolRuntimeStateStore.__module__ == "claudex_gateway.balanced.state_store"
+    assert RestoreValidationContext.__module__ == "claudex.balanced.state_model"
+    assert UnsupportedSchemaVersionError.__module__ == "claudex.balanced.state_model"
+    assert ClaudePoolRuntimeStateStore.__module__ == "claudex.balanced.state_store"
 
 
 def test_schema_contains_only_the_five_declared_tables(tmp_path: Path) -> None:

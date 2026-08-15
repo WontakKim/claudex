@@ -7,7 +7,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from claudex_gateway.claude.account_profile import (
+from claudex.claude.account_profile import (
     compute_account_profile_fingerprint,
     load_account_profile_fingerprint,
 )

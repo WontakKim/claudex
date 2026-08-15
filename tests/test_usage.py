@@ -11,17 +11,17 @@ from typing import Any
 import httpx
 import pytest
 
-from claudex_gateway.claude import usage as claude_usage
-from claudex_gateway.usage import envelope as usage_envelope
-from claudex_gateway.usage import providers as provider_usage
-from claudex_gateway.claude.auth import (
+from claudex.claude import usage as claude_usage
+from claudex.usage import envelope as usage_envelope
+from claudex.usage import providers as provider_usage
+from claudex.claude.auth import (
     ClaudeAccountAuthError,
     ClaudeAccountCredentials,
     ClaudeAccountReauthRequiredError,
 )
-from claudex_gateway.providers.codex_auth import CodexAuthError, CodexCredentials
-from claudex_gateway.providers.kimi_auth import KimiAuthError, KimiCredentials
-from claudex_gateway.providers.grok_auth import GrokAuthError, GrokCredentials
+from claudex.providers.codex_auth import CodexAuthError, CodexCredentials
+from claudex.providers.kimi_auth import KimiAuthError, KimiCredentials
+from claudex.providers.grok_auth import GrokAuthError, GrokCredentials
 
 
 def _run(coroutine: Coroutine[Any, Any, Any]) -> Any:

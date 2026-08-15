@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from claudex_gateway.locking import file_lock, try_file_lock
+from claudex.locking import file_lock, try_file_lock
 
 if sys.platform == "win32":
     import msvcrt
@@ -26,7 +26,7 @@ import sys
 import time
 from pathlib import Path
 
-from claudex_gateway.locking import file_lock
+from claudex.locking import file_lock
 
 path = Path(sys.argv[1])
 hold_seconds = float(sys.argv[2])
