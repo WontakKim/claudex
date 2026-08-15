@@ -129,59 +129,39 @@ async def _handle_admin_codex_reset_credit(request: Request) -> JSONResponse:
     return JSONResponse(result)
 
 
+if True:
+
+    def _serve_dashboard_asset(basename: str, media_type: str) -> Response:
+        try:
+            text = (
+                importlib.resources.files("claudex_gateway")
+                .joinpath("dashboard", basename)
+                .read_text(encoding="utf-8")
+            )
+        except (FileNotFoundError, OSError) as exc:
+            logger.warning("dashboard asset unavailable: %s", exc)
+            return JSONResponse(
+                server_support._openai_error_body(
+                    "server_error", f"{basename} is missing from the package"
+                ),
+                status_code=500,
+            )
+        return Response(text, media_type=media_type)
+
+
 async def _handle_dashboard(request: Request) -> Response:
-    """Serve the runtime dashboard, embedded in the package as dashboard.html."""
-    try:
-        page = (
-            importlib.resources.files("claudex_gateway")
-            .joinpath("dashboard", "dashboard.html")
-            .read_text(encoding="utf-8")
-        )
-    except (FileNotFoundError, OSError) as exc:
-        logger.warning("dashboard asset unavailable: %s", exc)
-        return JSONResponse(
-            server_support._openai_error_body("server_error", "dashboard.html is missing from the package"),
-            status_code=500,
-        )
-    return Response(page, media_type="text/html; charset=utf-8")
+    """Serve the runtime dashboard embedded in the package."""
+    return _serve_dashboard_asset("dashboard.html", "text/html; charset=utf-8")
 
 
 async def _handle_dashboard_css(request: Request) -> Response:
     """Serve the dashboard stylesheet embedded in the package."""
-    try:
-        stylesheet = (
-            importlib.resources.files("claudex_gateway")
-            .joinpath("dashboard", "dashboard.css")
-            .read_text(encoding="utf-8")
-        )
-    except (FileNotFoundError, OSError) as exc:
-        logger.warning("dashboard asset unavailable: %s", exc)
-        return JSONResponse(
-            server_support._openai_error_body(
-                "server_error", "dashboard.css is missing from the package"
-            ),
-            status_code=500,
-        )
-    return Response(stylesheet, media_type="text/css")
+    return _serve_dashboard_asset("dashboard.css", "text/css")
 
 
 async def _handle_dashboard_js(request: Request) -> Response:
     """Serve the dashboard JavaScript embedded in the package."""
-    try:
-        javascript = (
-            importlib.resources.files("claudex_gateway")
-            .joinpath("dashboard", "dashboard.js")
-            .read_text(encoding="utf-8")
-        )
-    except (FileNotFoundError, OSError) as exc:
-        logger.warning("dashboard asset unavailable: %s", exc)
-        return JSONResponse(
-            server_support._openai_error_body(
-                "server_error", "dashboard.js is missing from the package"
-            ),
-            status_code=500,
-        )
-    return Response(javascript, media_type="application/javascript")
+    return _serve_dashboard_asset("dashboard.js", "application/javascript")
 
 
 _FAVICON_SVG = (
