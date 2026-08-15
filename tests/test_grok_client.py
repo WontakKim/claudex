@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import AsyncIterator
 from typing import Any
 
 import httpx
@@ -127,6 +128,22 @@ def _sse(events: list[dict[str, Any]]) -> bytes:
     return chunks + b"data: [DONE]\n\n"
 
 
+class _HangingSSEByteStream(httpx.AsyncByteStream):
+    """Yield one SSE chunk, then wait until the consumer is cancelled."""
+
+    def __init__(self, chunk: bytes) -> None:
+        self._chunk = chunk
+        self.wait_started = asyncio.Event()
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        yield self._chunk
+        self.wait_started.set()
+        await asyncio.Event().wait()
+
+    async def aclose(self) -> None:
+        pass
+
+
 async def _collect(client: GrokClient, payload: dict[str, Any]) -> list[dict[str, Any]]:
     return [event async for event in client.stream_responses(payload, "session-1")]
 
@@ -158,6 +175,36 @@ def test_stream_responses_sends_grok_headers_and_parses_events() -> None:
     assert request.headers["user-agent"].startswith("xai-grok-workspace/")
     assert request.headers["x-grok-conv-id"] == "session-1"
     assert request.headers["accept"] == "text/event-stream"
+
+
+def test_stream_responses_propagates_cancellation_after_first_event() -> None:
+    upstream_event = {"type": "response.output_text.delta", "delta": "hello"}
+
+    async def scenario() -> None:
+        stream = _HangingSSEByteStream(_sse([upstream_event]))
+        first_event_seen = asyncio.Event()
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                stream=stream,
+                headers={"content-type": "text/event-stream"},
+            )
+
+        async def consume(client: GrokClient) -> None:
+            async for event in client.stream_responses({"stream": True}, "session-1"):
+                assert event == upstream_event
+                first_event_seen.set()
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+            task = asyncio.create_task(consume(GrokClient(_FakeAuthManager(), http_client)))
+            await asyncio.wait_for(first_event_seen.wait(), timeout=1)
+            await asyncio.wait_for(stream.wait_started.wait(), timeout=1)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+    asyncio.run(scenario())
 
 
 def test_stream_responses_retries_once_with_fresh_credentials_on_401() -> None:

@@ -8,14 +8,20 @@ fields Grok rejects. Ported from router-for-me/CLIProxyAPI's Grok executor.
 
 from __future__ import annotations
 
-import json
 from collections.abc import AsyncIterator
+from contextlib import aclosing
 from typing import Any
 
 import httpx
 
-from claudex_gateway.providers.model_catalog_cache import ModelCatalogCache
+from claudex_gateway.providers.client_support import (
+    coerce_context_window,
+    fetch_models_list,
+    stream_sse_events,
+    stream_with_one_retry,
+)
 from claudex_gateway.providers.grok_auth import GrokAuthError, GrokAuthManager, GrokCredentials
+from claudex_gateway.providers.model_catalog_cache import ModelCatalogCache
 from claudex_gateway.upstream_errors import UpstreamError
 
 GROK_RESPONSES_URL = "https://cli-chat-proxy.grok.com/v1/responses"
@@ -66,25 +72,7 @@ _GROK_EFFORT_MAP = {
 class GrokUpstreamError(UpstreamError):
     """Raised when the Grok backend returns a non-success HTTP response."""
 
-    def __init__(self, status_code: int, body: str) -> None:
-        super().__init__(status_code, body, "grok")
-
-
-def _coerce_context_window(value: Any) -> int | None:
-    """Apply the catalog's context-window type policy.
-
-    Accepts a positive `int` (excluding `bool`, which is technically an
-    `int` subclass) or a positive, integral `float` coerced to `int`.
-    Everything else — missing, non-numeric, zero, negative, or fractional —
-    yields `None`.
-    """
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, int):
-        return value if value > 0 else None
-    if isinstance(value, float) and value.is_integer():
-        return int(value) if value > 0 else None
-    return None
+    provider_label = "grok"
 
 
 def sanitize_grok_payload(payload: dict[str, Any], model: str) -> dict[str, Any]:
@@ -117,17 +105,12 @@ class GrokClient:
 
         Retries exactly once with force-refreshed credentials on HTTP 401.
         """
-        credentials = await self._auth_manager.get_credentials()
-        try:
-            async for event in self._stream_once(payload, session_id, credentials):
-                yield event
-            return
-        except GrokUpstreamError as exc:
-            if exc.status_code != 401:
-                raise
-
-        credentials = await self._auth_manager.get_credentials(force_refresh=True)
-        async for event in self._stream_once(payload, session_id, credentials):
+        async for event in stream_with_one_retry(
+            self._auth_manager.get_credentials,
+            lambda credentials: self._stream_once(payload, session_id, credentials),
+            upstream_error=GrokUpstreamError,
+            should_retry=lambda exc, credentials: exc.status_code == 401,
+        ):
             yield event
 
     async def list_models(self) -> list[str]:
@@ -153,7 +136,7 @@ class GrokClient:
             model_id = entry.get("id")
             if not isinstance(model_id, str) or not model_id:
                 continue
-            window = _coerce_context_window(entry.get("context_window"))
+            window = coerce_context_window(entry.get("context_window"))
             if window is not None:
                 windows[model_id] = window
         return windows
@@ -168,21 +151,13 @@ class GrokClient:
         credentials = await self._auth_manager.get_credentials()
         headers = self._base_headers(credentials)
         headers["Accept"] = "application/json"
-        response = await self._http_client.get(GROK_MODELS_URL, headers=headers)
-        if response.status_code != 200:
-            raise GrokUpstreamError(response.status_code, response.text)
-        try:
-            parsed = response.json()
-        except ValueError as exc:
-            # ValueError covers JSONDecodeError, UnicodeDecodeError, and the
-            # int-conversion digit limit — every decode failure must surface
-            # as a structural catalog failure the context-window cache can
-            # treat as a failed refresh.
-            raise GrokUpstreamError(502, "grok models response is not valid JSON") from exc
-        data = parsed.get("data") if isinstance(parsed, dict) else None
-        if not isinstance(data, list):
-            raise GrokUpstreamError(502, "grok models response has no data list")
-        return data
+        return await fetch_models_list(
+            self._http_client,
+            GROK_MODELS_URL,
+            headers,
+            label="grok",
+            make_error=GrokUpstreamError,
+        )
 
     @staticmethod
     def _base_headers(credentials: GrokCredentials) -> dict[str, str]:
@@ -202,20 +177,14 @@ class GrokClient:
         headers = self._base_headers(credentials)
         headers["x-grok-conv-id"] = session_id
 
-        async with self._http_client.stream(
-            "POST", GROK_RESPONSES_URL, json=payload, headers=headers
-        ) as response:
-            if response.status_code != 200:
-                body = (await response.aread()).decode("utf-8", errors="replace")
-                raise GrokUpstreamError(response.status_code, body)
-
-            async for line in response.aiter_lines():
-                if not line.startswith("data:"):
-                    continue
-                data = line[5:].strip()
-                if not data or data == "[DONE]":
-                    continue
-                try:
-                    yield json.loads(data)
-                except json.JSONDecodeError:
-                    continue
+        async with aclosing(
+            stream_sse_events(
+                self._http_client,
+                GROK_RESPONSES_URL,
+                payload,
+                headers,
+                make_error=GrokUpstreamError,
+            )
+        ) as events:
+            async for event in events:
+                yield event
