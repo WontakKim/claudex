@@ -146,6 +146,44 @@ async def _handle_dashboard(request: Request) -> Response:
     return Response(page, media_type="text/html; charset=utf-8")
 
 
+async def _handle_dashboard_css(request: Request) -> Response:
+    """Serve the dashboard stylesheet embedded in the package."""
+    try:
+        stylesheet = (
+            importlib.resources.files("claudex_gateway")
+            .joinpath("dashboard.css")
+            .read_text(encoding="utf-8")
+        )
+    except (FileNotFoundError, OSError) as exc:
+        logger.warning("dashboard asset unavailable: %s", exc)
+        return JSONResponse(
+            server_support._openai_error_body(
+                "server_error", "dashboard.css is missing from the package"
+            ),
+            status_code=500,
+        )
+    return Response(stylesheet, media_type="text/css")
+
+
+async def _handle_dashboard_js(request: Request) -> Response:
+    """Serve the dashboard JavaScript embedded in the package."""
+    try:
+        javascript = (
+            importlib.resources.files("claudex_gateway")
+            .joinpath("dashboard.js")
+            .read_text(encoding="utf-8")
+        )
+    except (FileNotFoundError, OSError) as exc:
+        logger.warning("dashboard asset unavailable: %s", exc)
+        return JSONResponse(
+            server_support._openai_error_body(
+                "server_error", "dashboard.js is missing from the package"
+            ),
+            status_code=500,
+        )
+    return Response(javascript, media_type="application/javascript")
+
+
 _FAVICON_SVG = (
     '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16">'
     '<rect width="16" height="16" rx="3" fill="#1d5fbf"/>'

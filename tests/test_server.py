@@ -198,6 +198,14 @@ def test_route_ownership_matches_surface_modules() -> None:
             "claudex_gateway.admin.system",
             "_handle_dashboard",
         ),
+        ("/dashboard.css", route_methods("GET")): (
+            "claudex_gateway.admin.system",
+            "_handle_dashboard_css",
+        ),
+        ("/dashboard.js", route_methods("GET")): (
+            "claudex_gateway.admin.system",
+            "_handle_dashboard_js",
+        ),
         ("/favicon.ico", route_methods("GET")): (
             "claudex_gateway.admin.system",
             "_handle_favicon",

@@ -54,6 +54,8 @@ from claudex_gateway.admin.system import (
     _handle_admin_logs,
     _handle_admin_usage,
     _handle_dashboard,
+    _handle_dashboard_css,
+    _handle_dashboard_js,
     _handle_favicon,
 )
 from claudex_gateway.relay import endpoints as relay_endpoints
@@ -231,6 +233,8 @@ def create_app(config: GatewayConfig, daemon_nonce: str | None = None) -> Starle
     app = Starlette(
         routes=[
             Route("/", _handle_dashboard, methods=["GET"]),
+            Route("/dashboard.css", _handle_dashboard_css, methods=["GET"]),
+            Route("/dashboard.js", _handle_dashboard_js, methods=["GET"]),
             Route("/favicon.ico", _handle_favicon, methods=["GET"]),
             Route("/v1/messages", relay_endpoints._handle_messages, methods=["POST"]),
             Route(

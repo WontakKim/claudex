@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import importlib.resources
 import json
 import logging
 import time
@@ -107,6 +108,8 @@ _ADMIN_FUNCTION_MANIFEST = {
         "_handle_admin_usage",
         "_handle_admin_codex_reset_credit",
         "_handle_dashboard",
+        "_handle_dashboard_css",
+        "_handle_dashboard_js",
         "_handle_favicon",
         "_handle_admin_codex_models",
         "_handle_admin_grok_models",
@@ -1813,18 +1816,31 @@ def test_admin_reset_credit_is_never_reachable_by_GET(
         assert client.get("/admin/providers/codex/reset-credit").status_code == 405
 
 
+def _dashboard_sources(client: TestClient) -> dict[str, str]:
+    routes = {
+        "html": "/",
+        "css": "/dashboard.css",
+        "javascript": "/dashboard.js",
+    }
+    responses = {name: client.get(route) for name, route in routes.items()}
+    assert all(response.status_code == 200 for response in responses.values())
+    return {name: response.text for name, response in responses.items()}
+
+
 def test_dashboard_usage_merged_into_status_cards(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     # Usage renders inside the Status tab's provider cards: a per-provider
     # body hook, the fetch on entering Status, and no separate tab.
     with _create_test_client(monkeypatch, tmp_path) as client:
-        page = client.get("/").text
+        sources = _dashboard_sources(client)
+        page = sources["html"]
+        javascript = sources["javascript"]
 
     assert 'data-t="usage"' not in page
     assert 'id="tab-usage"' not in page
     assert 'id="usage-body-claude"' in page
     assert 'id="usage-body-codex"' in page
     assert 'id="usage-body-kimi"' in page
-    assert "/admin/usage" in page
+    assert "/admin/usage" in javascript
     # The usage hooks sit inside the Status section, not a sibling tab.
     assert page.index('id="tab-status"') < page.index('id="usage-body-codex"')
     assert page.index('id="usage-body-claude"') < page.index('id="tab-log"')
@@ -1841,7 +1857,9 @@ def test_dashboard_settings_tab_leads_and_holds_compaction(
     # default, and holds the Compact Reroute row behind the category rail;
     # the provider status cards live in the Status tab.
     with _create_test_client(monkeypatch, tmp_path) as client:
-        page = client.get("/").text
+        sources = _dashboard_sources(client)
+        page = sources["html"]
+        javascript = sources["javascript"]
 
     assert (
         page.index('data-t="settings"')
@@ -1850,7 +1868,7 @@ def test_dashboard_settings_tab_leads_and_holds_compaction(
         < page.index('data-t="log"')
     )
     assert '<body data-tab="settings">' in page
-    assert 'var TAB_NAMES=["settings","status","map","log"]' in page
+    assert 'var TAB_NAMES=["settings","status","map","log"]' in javascript
     # The category rail leads the pane and deep-links its single category.
     assert 'href="#settings/general"' in page
     assert (
@@ -1876,30 +1894,34 @@ def test_dashboard_optional_providers_hidden_until_detected(
     # is cosmetic only; routing, settings.json, and the admin API are
     # untouched.
     with _create_test_client(monkeypatch, tmp_path) as client:
-        page = client.get("/").text
+        sources = _dashboard_sources(client)
+        page = sources["html"]
+        javascript = sources["javascript"]
 
     assert '<div class="card provider-hidden" id="card-kimi">' in page
     assert '<div class="card provider-hidden" id="card-grok">' in page
     # Codex is built in and never hides.
     assert 'id="card-codex"' not in page
-    assert "function setProviderVisibility(" in page
-    assert 'info.status==="ok"||info.required===true' in page
+    assert "function setProviderVisibility(" in javascript
+    assert 'info.status==="ok"||info.required===true' in javascript
     # The Router provider picker builds optional providers hidden too.
-    assert '''(p==="codex"?"":' class="provider-hidden"')''' in page
+    assert '''(p==="codex"?"":' class="provider-hidden"')''' in javascript
     # Bulk usage refresh only probes visible cards.
-    assert "PROVIDER_VISIBLE[p]!==false" in page
+    assert "PROVIDER_VISIBLE[p]!==false" in javascript
 
 
 def test_dashboard_plan_and_credits_read_inside_the_card(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
-        page = client.get("/").text
+        sources = _dashboard_sources(client)
+        page = sources["html"]
+        javascript = sources["javascript"]
 
     # Plan and credit chips used to crowd the card headings; both now read as
     # part of the card they qualify, so the hooks and the chip style are gone.
-    assert "usage-chips" not in page
-    assert "uplan" not in page
+    assert all("usage-chips" not in source for source in sources.values())
+    assert all("uplan" not in source for source in sources.values())
     for provider in ("Claude", "Codex", "Kimi"):
         assert f"<h2>{provider} Status</h2>" in page
 
@@ -1923,29 +1945,32 @@ def test_dashboard_plan_and_credits_read_inside_the_card(
 
     # The credit count is stated by the reset line, which owns the spend
     # button too, so there is one place credits are reported.
-    assert 'class="uact"' in page
-    assert "리셋 크레딧" in page
+    assert 'class="uact"' in javascript
+    assert "리셋 크레딧" in javascript
 
 
 def test_dashboard_status_cards_load_as_skeletons(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
-        page = client.get("/").text
+        sources = _dashboard_sources(client)
+        page = sources["html"]
+        stylesheet = sources["css"]
+        javascript = sources["javascript"]
 
     # The cards used to render a one-line "Checking…" status that loaded content
     # then pushed apart. They now ship a skeleton of the same shape instead,
     # so nothing moves when the probes answer.
-    assert "확인 중" not in page
+    assert all("확인 중" not in source for source in sources.values())
     assert 'class="sk"' in page
     # A skeleton carries the text it stands in for, painted transparent, so
     # its line box matches the line that replaces it.
-    assert ".sk{" in page and "color:transparent" in page
+    assert ".sk{" in stylesheet and "color:transparent" in stylesheet
     # Both status boxes seed one before any request goes out, and the usage
     # bodies are filled synchronously at boot rather than starting empty.
     for provider in ("codex", "kimi"):
         assert f'id="{provider}-statline"><span class="sk">' in page
-    assert 'renderUsageProvider(p,null)' in page
+    assert 'renderUsageProvider(p,null)' in javascript
 
 
 def test_dashboard_served_at_root(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -1955,7 +1980,61 @@ def test_dashboard_served_at_root(monkeypatch: pytest.MonkeyPatch, tmp_path: Pat
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("text/html")
     assert "Claudex Gateway" in response.text
-    assert "/admin/settings/mapping" in response.text
+    assert 'rel="stylesheet" href="/dashboard.css"' in response.text
+    assert 'src="/dashboard.js"' in response.text
+
+
+@pytest.mark.parametrize(
+    ("route", "asset_name", "content_type"),
+    [
+        ("/dashboard.css", "dashboard.css", "text/css"),
+        ("/dashboard.js", "dashboard.js", "application/javascript"),
+    ],
+)
+def test_dashboard_assets_match_packaged_resources(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    route: str,
+    asset_name: str,
+    content_type: str,
+) -> None:
+    expected = (
+        importlib.resources.files("claudex_gateway")
+        .joinpath(asset_name)
+        .read_text(encoding="utf-8")
+    )
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        response = client.get(route)
+
+    assert response.status_code == 200
+    assert response.text == expected
+    assert response.headers["content-type"].startswith(content_type)
+
+
+@pytest.mark.parametrize(
+    ("route", "asset_name"),
+    [
+        ("/dashboard.css", "dashboard.css"),
+        ("/dashboard.js", "dashboard.js"),
+    ],
+)
+def test_dashboard_asset_missing_returns_named_error_envelope(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    route: str,
+    asset_name: str,
+) -> None:
+    def missing_package_files(_package: str) -> Any:
+        raise FileNotFoundError(asset_name)
+
+    monkeypatch.setattr(importlib.resources, "files", missing_package_files)
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        response = client.get(route)
+
+    assert response.status_code == 500
+    assert response.json() == server_support._openai_error_body(
+        "server_error", f"{asset_name} is missing from the package"
+    )
 
 
 def test_favicon_served_for_browser_probe(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -1975,7 +2054,8 @@ def test_dashboard_port_has_an_enlarged_invisible_hit_zone(
     # the grab area to the node's full height plus margins without changing
     # the visual. These markers are the whole mechanism, so pin them.
     with _create_test_client(monkeypatch, tmp_path) as client:
-        page = client.get("/").text
+        sources = _dashboard_sources(client)
+        page = sources["css"]
 
     assert ".node.src .port::after" in page
     assert "pointer-events:auto" in page
@@ -2005,7 +2085,8 @@ def test_dashboard_keeps_the_local_token_in_memory_only(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
-        page = client.get("/").text
+        sources = _dashboard_sources(client)
+        page = sources["javascript"]
 
     # The dashboard bootstraps from the safe hello flag and attaches the
     # bearer token to admin calls from a closure variable only.
@@ -2021,7 +2102,8 @@ def test_dashboard_has_no_hardcoded_codex_model_snapshot(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
-        page = client.get("/").text
+        sources = _dashboard_sources(client)
+        page = sources["javascript"]
 
     # Catalogs are fetched live; a baked-in model list goes stale and misleads
     # when the catalog request fails. Nodes already in the mapping still render
@@ -2035,13 +2117,15 @@ def test_dashboard_board_shows_only_referenced_targets(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
-        page = client.get("/").text
+        sources = _dashboard_sources(client)
+        page = sources["javascript"]
+        html = sources["html"]
 
     # With several providers a catalog dump is unusable as a board, so target
     # nodes are only what the map references plus what the add-node box
     # stages; the catalogs survive purely as autocomplete for that box.
     assert "concat(Object.values(DIR.mapping),addedTargets)" in page
-    assert 'list="add-catalog"' in page
+    assert 'list="add-catalog"' in html
     # All provider catalogs feed it, so the dashboard depends on the Kimi
     # and Grok endpoints too — not just the Codex one.
     assert '"/admin/providers/kimi/models"' in page
@@ -2082,20 +2166,24 @@ def test_dashboard_compaction_section_marker_and_endpoint_present(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
-        page = client.get("/").text
+        sources = _dashboard_sources(client)
+        page = sources["html"]
+        javascript = sources["javascript"]
 
     assert "<!-- compaction-section:start -->" in page
     assert "<!-- compaction-section:end -->" in page
     section = _compaction_section(page)
     assert 'id="compaction-card"' in section
-    assert "/admin/settings/compaction" in page
+    assert "/admin/settings/compaction" in javascript
 
 
 def test_dashboard_compaction_options_in_pinned_order_without_haiku(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
-        page = client.get("/").text
+        sources = _dashboard_sources(client)
+        page = sources["html"]
+        javascript = sources["javascript"]
 
     section = _compaction_section(page)
     assert (
@@ -2106,17 +2194,18 @@ def test_dashboard_compaction_options_in_pinned_order_without_haiku(
         < section.index(">Custom<")
     )
     assert "claude-haiku" not in section
-    # The literal string still exists elsewhere in the document (see
+    # The literal string still exists in the JavaScript asset (see
     # compactionDraftFromModel's own comment), proving this is a scoped
-    # assertion and not a whole-page absence check.
-    assert "claude-haiku" in page
+    # assertion and not a whole-dashboard absence check.
+    assert "claude-haiku" in javascript
 
 
 def test_dashboard_compaction_custom_input_labeled_unverified(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
-        page = client.get("/").text
+        sources = _dashboard_sources(client)
+        page = sources["html"]
 
     section = _compaction_section(page)
     assert "unverified until first use" in section
@@ -2129,7 +2218,8 @@ def test_dashboard_compaction_credentials_disclosure_present(
     # The card must state which credentials rerouted requests run on, so the
     # user knows their own Claude account is being used.
     with _create_test_client(monkeypatch, tmp_path) as client:
-        page = client.get("/").text
+        sources = _dashboard_sources(client)
+        page = sources["html"]
 
     section = _compaction_section(page)
     assert "장치에 저장된 Claude 기본 자격증명" in section
@@ -2139,7 +2229,8 @@ def test_dashboard_compaction_fetched_in_parallel_boot_sequence(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
-        page = client.get("/").text
+        sources = _dashboard_sources(client)
+        page = sources["javascript"]
 
     boot_start = page.index("function boot(){")
     promise_all = page.index("Promise.all([", boot_start)
@@ -2152,7 +2243,8 @@ def test_dashboard_compaction_keeps_configured_custom_model(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
-        page = client.get("/").text
+        sources = _dashboard_sources(client)
+        page = sources["javascript"]
 
     # A configured model that is not one of the three curated ids renders as
     # Custom with its raw id filled in, instead of being dropped.
@@ -2167,18 +2259,21 @@ def test_dashboard_compaction_diagnostics_ui_removed_by_design(
     # diagnostics stay reachable through GET /admin/settings/compaction only. Guard
     # against the UI quietly returning.
     with _create_test_client(monkeypatch, tmp_path) as client:
-        page = client.get("/").text
+        sources = _dashboard_sources(client)
+        page = sources["html"]
+        javascript = sources["javascript"]
 
     assert 'id="comp-diagnostics"' not in page
-    assert "renderCompactionDiagnostics" not in page
-    assert "아직 재라우팅이 시도되지 않았습니다" not in page
+    assert "renderCompactionDiagnostics" not in javascript
+    assert "아직 재라우팅이 시도되지 않았습니다" not in javascript
 
 
 def test_dashboard_compaction_apply_body_matches_pinned_shape(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
-        page = client.get("/").text
+        sources = _dashboard_sources(client)
+        page = sources["javascript"]
 
     assert "JSON.stringify({model:model})" in page
     apply_fn = _compaction_apply_fn(page)
@@ -2193,7 +2288,8 @@ def test_dashboard_compaction_custom_submission_is_trimmed_and_guarded(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
-        page = client.get("/").text
+        sources = _dashboard_sources(client)
+        page = sources["javascript"]
 
     apply_fn = _compaction_apply_fn(page)
     assert "input.value.trim()" in apply_fn
@@ -2204,7 +2300,8 @@ def test_dashboard_compaction_409_branch_refreshes_via_get_not_error_body(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
-        page = client.get("/").text
+        sources = _dashboard_sources(client)
+        page = sources["javascript"]
 
     apply_fn = _compaction_apply_fn(page)
     branch_start = apply_fn.index("r.status===409")
@@ -2226,7 +2323,8 @@ def test_dashboard_compaction_409_refresh_failure_stays_locked(
     # envelope, its body must not be rendered as state and the card must
     # remain locked.
     with _create_test_client(monkeypatch, tmp_path) as client:
-        page = client.get("/").text
+        sources = _dashboard_sources(client)
+        page = sources["javascript"]
 
     apply_fn = _compaction_apply_fn(page)
     branch_start = apply_fn.index("r.status===409")
@@ -2259,7 +2357,9 @@ def test_dashboard_codex_fast_card_wires_apply_flow_and_env_lock(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
-        page = client.get("/").text
+        sources = _dashboard_sources(client)
+        page = sources["html"]
+        javascript = sources["javascript"]
 
     section = _codex_section(page)
     assert page.index('id="compaction-card"') < page.index('id="codex-card"')
@@ -2268,19 +2368,23 @@ def test_dashboard_codex_fast_card_wires_apply_flow_and_env_lock(
     assert "~1.5x speed" in section
     assert "~2–2.5x usage burn" in section
     assert "silently stay standard" in section
-    assert "CLAUDEX_CODEX_SERVICE_TIER" in page
-    assert 'jfetch("/admin/settings/codex")' in page
-    assert 'jfetch("/admin/settings/codex",{' in page
-    assert 'JSON.stringify({service_tier:CODEX.draft?"fast":null})' in page
-    assert "checkbox.disabled=CODEX.locked" in page
-    assert "btn.disabled=CODEX.locked||CODEX.draft===(CODEX.serviceTier===\"fast\")" in page
+    assert "CLAUDEX_CODEX_SERVICE_TIER" in javascript
+    assert 'jfetch("/admin/settings/codex")' in javascript
+    assert 'jfetch("/admin/settings/codex",{' in javascript
+    assert 'JSON.stringify({service_tier:CODEX.draft?"fast":null})' in javascript
+    assert "checkbox.disabled=CODEX.locked" in javascript
+    assert (
+        "btn.disabled=CODEX.locked||CODEX.draft===(CODEX.serviceTier===\"fast\")"
+        in javascript
+    )
 
 
 def test_dashboard_codex_fast_fetched_in_parallel_boot_sequence(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
-        page = client.get("/").text
+        sources = _dashboard_sources(client)
+        page = sources["javascript"]
 
     boot_start = page.index("function boot(){")
     promise_all = page.index("Promise.all([", boot_start)
@@ -2295,15 +2399,18 @@ def test_dashboard_settings_rail_switches_categories(
     # The Settings rail is real category switching now: one .scard visible at
     # a time, gated by data-cat on the section, deep-linkable per category.
     with _create_test_client(monkeypatch, tmp_path) as client:
-        page = client.get("/").text
+        sources = _dashboard_sources(client)
+        page = sources["html"]
+        stylesheet = sources["css"]
+        javascript = sources["javascript"]
 
     assert '<section id="tab-settings" data-cat="general">' in page
     assert 'href="#settings/general"' in page
     assert 'href="#settings/accounts"' in page
-    assert ".scard{display:none}" in page
+    assert ".scard{display:none}" in stylesheet
     assert 'id="scard-general"' in page
     assert 'id="scard-accounts"' in page
-    assert "function setSettingsCat(" in page
+    assert "function setSettingsCat(" in javascript
     # General leads the rail and the card order; the accounts card follows.
     assert page.index('href="#settings/general"') < page.index(
         'href="#settings/accounts"'
@@ -2311,8 +2418,14 @@ def test_dashboard_settings_rail_switches_categories(
     assert page.index('id="scard-general"') < page.index('id="scard-accounts"')
     # A #settings/accounts deep link lands on the category at boot and on
     # hash changes.
-    assert 'if(bootTab==="settings"&&bootParts[1])setSettingsCat(bootParts[1])' in page
-    assert 'if(parts[0]==="settings")setSettingsCat(parts[1]||"general")' in page
+    assert (
+        'if(bootTab==="settings"&&bootParts[1])setSettingsCat(bootParts[1])'
+        in javascript
+    )
+    assert (
+        'if(parts[0]==="settings")setSettingsCat(parts[1]||"general")'
+        in javascript
+    )
 
 
 def test_dashboard_accounts_card_mirrors_the_final_probe(
@@ -2322,11 +2435,13 @@ def test_dashboard_accounts_card_mirrors_the_final_probe(
     # caption with the add
     # button, then dense flat rows that expand independently.
     with _create_test_client(monkeypatch, tmp_path) as client:
-        page = client.get("/").text
+        sources = _dashboard_sources(client)
+        page = sources["html"]
+        javascript = sources["javascript"]
 
     assert 'class="lhero"' in page
     assert "로컬 CLI 로그인" in page
-    assert "게이트웨이 서빙과 무관" in page
+    assert "게이트웨이 서빙과 무관" in javascript
     assert 'id="btn-local-refresh"' in page
     assert 'id="btn-add-account"' in page
     assert (
@@ -2336,14 +2451,14 @@ def test_dashboard_accounts_card_mirrors_the_final_probe(
     )
     # Collapsed rows carry status text only (no chips, no mini bars); the
     # right edge is the plan text.
-    assert "서빙 중" in page
-    assert "재로그인 필요" in page
-    assert 'class="plan-txt"' in page
+    assert "서빙 중" in javascript
+    assert "재로그인 필요" in javascript
+    assert 'class="plan-txt"' in javascript
     # Expansion is independent per-row state, never an accordion.
-    assert "ACCT.open[id]=!ACCT.open[id]" in page
+    assert "ACCT.open[id]=!ACCT.open[id]" in javascript
     # Plan pill mapping: claude_max -> MAX, claude_pro -> PRO, null -> dash.
-    assert "function planLabel(" in page
-    assert 'replace(/^claude_/,"").toUpperCase()' in page
+    assert "function planLabel(" in javascript
+    assert 'replace(/^claude_/,"").toUpperCase()' in javascript
 
 
 def test_dashboard_accounts_fetch_paints_registry_before_usage(
@@ -2353,7 +2468,8 @@ def test_dashboard_accounts_fetch_paints_registry_before_usage(
     # and the local hero's ambient usage fill in async afterwards. No force
     # parameter exists — the UI shows data age instead.
     with _create_test_client(monkeypatch, tmp_path) as client:
-        page = client.get("/").text
+        sources = _dashboard_sources(client)
+        page = sources["javascript"]
 
     assert 'jfetch("/admin/providers/claude/accounts")' in page
     assert 'jfetch("/admin/providers/claude/pool/usage")' in page
@@ -2372,13 +2488,16 @@ def test_dashboard_serving_selection_reuses_the_singular_admin_endpoint(
     # Serving and unserving go through the existing PUT /admin/providers/claude/pool/serving; a 409
     # env-lock renders the lockband and disables the buttons.
     with _create_test_client(monkeypatch, tmp_path) as client:
-        page = client.get("/").text
+        sources = _dashboard_sources(client)
+        page = sources["javascript"]
+        html = sources["html"]
+        stylesheet = sources["css"]
 
     assert 'jfetch("/admin/providers/claude/pool/serving",{' in page
     assert "JSON.stringify({account_id:accountId})" in page
     assert "CLAUDEX_CLAUDE_ACCOUNT_ID" in page
-    assert 'id="acct-lockband"' in page
-    assert "#scard-accounts.locked .acctlock{display:block}" in page
+    assert 'id="acct-lockband"' in html
+    assert "#scard-accounts.locked .acctlock{display:block}" in stylesheet
     assert "이 계정으로 서빙" in page
     assert "서빙 해제" in page
     # Removal uses the account endpoint; the serving pin guard stays visible in the UI.
@@ -2389,7 +2508,9 @@ def test_dashboard_routing_section_wires_endpoint(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
-        page = client.get("/").text
+        sources = _dashboard_sources(client)
+        page = sources["html"]
+        javascript = sources["javascript"]
 
     assert "<!-- routing-section:start -->" in page
     assert "<!-- routing-section:end -->" in page
@@ -2397,9 +2518,9 @@ def test_dashboard_routing_section_wires_endpoint(
     assert page.index('id="compaction-card"') < page.index('id="routing-card"')
     # Boot GET and the apply PUT both target the pool/routing endpoint, and
     # the PUT body is pinned to exactly {"mode": ...}.
-    assert 'jfetch("/admin/providers/claude/pool/routing")' in page
-    assert 'jfetch("/admin/providers/claude/pool/routing",{' in page
-    assert "JSON.stringify({mode:ROUTING.draft})" in page
+    assert 'jfetch("/admin/providers/claude/pool/routing")' in javascript
+    assert 'jfetch("/admin/providers/claude/pool/routing",{' in javascript
+    assert "JSON.stringify({mode:ROUTING.draft})" in javascript
     section = _routing_section(page)
     assert ">Disabled<" in section
     assert ">Fallback<" in section
@@ -2410,7 +2531,7 @@ def test_dashboard_routing_section_wires_endpoint(
     assert "계정별 라우팅 상태 보기" in section
     # The mode-envelope validator adopts a balanced boot GET/apply response
     # instead of rejecting it as malformed.
-    assert 'body.mode==="balanced"' in page
+    assert 'body.mode==="balanced"' in javascript
 
 
 def test_dashboard_accounts_surface_pool_usage_freshness(
@@ -2421,11 +2542,13 @@ def test_dashboard_accounts_surface_pool_usage_freshness(
     # pool/usage observation age/source, and a queued manual refresh renders
     # its own indication instead of claiming a completed refresh.
     with _create_test_client(monkeypatch, tmp_path) as client:
-        page = client.get("/").text
+        sources = _dashboard_sources(client)
+        page = sources["javascript"]
+        html = sources["html"]
 
     assert "ACCT.usageFreshness" in page
     assert "statusResp.body.usage_freshness" in page
-    assert 'id="pool-fresh-pill"' in page
+    assert 'id="pool-fresh-pill"' in html
     assert "function renderPoolFreshness(" in page
     assert "meta.age_seconds" in page
     assert "meta.source" in page
@@ -2439,13 +2562,16 @@ def test_dashboard_routing_locked_renders_readonly(
     # A 409 flips the local lock; the lockband names the env var and the
     # control disables — same discipline as the compaction card.
     with _create_test_client(monkeypatch, tmp_path) as client:
-        page = client.get("/").text
+        sources = _dashboard_sources(client)
+        page = sources["javascript"]
+        html = sources["html"]
+        stylesheet = sources["css"]
 
     assert "CLAUDEX_CLAUDE_ACCOUNT_ROUTING" in page
-    assert 'id="routing-lock-env"' in page
+    assert 'id="routing-lock-env"' in html
     assert (
         "#compaction-card.locked .complock,#codex-card.locked .complock,"
-        "#routing-card.locked .complock{display:block}" in page
+        "#routing-card.locked .complock{display:block}" in stylesheet
     )
     apply_fn = page[
         page.index("function applyRouting(){") : page.index(
@@ -2462,7 +2588,9 @@ def test_dashboard_accounts_surface_routing_status(
     # Row badges come from pool/status; a failed status GET renders no badges
     # (never stale), and the cooldown row explains itself in the detail pane.
     with _create_test_client(monkeypatch, tmp_path) as client:
-        page = client.get("/").text
+        sources = _dashboard_sources(client)
+        page = sources["javascript"]
+        html = sources["html"]
 
     assert 'jfetch("/admin/providers/claude/pool/status")' in page
     assert "라우팅 준비" in page
@@ -2473,7 +2601,7 @@ def test_dashboard_accounts_surface_routing_status(
     # The accounts card links back to the policy row in General.
     assert (
         '라우팅 정책은 <a class="route-link" href="#settings/general">General</a>에서 설정합니다.'
-        in page
+        in html
     )
 
 
@@ -2481,7 +2609,8 @@ def test_dashboard_login_modal_drives_the_login_endpoints(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
-        page = client.get("/").text
+        sources = _dashboard_sources(client)
+        page = sources["javascript"]
 
     # All five login endpoints are wired: start, poll, code, confirm, cancel.
     assert 'jfetch("/admin/providers/claude/login",{\n    method:"POST"' in page.replace(
