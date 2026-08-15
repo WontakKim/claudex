@@ -8,7 +8,7 @@ from typing import Any
 
 import httpx
 
-from claudex_gateway.config import OpenAICompatibleProvider
+from claudex_gateway.config.schema import OpenAICompatibleProvider
 from claudex_gateway.providers.model_catalog_cache import ModelCatalogCache
 from claudex_gateway.upstream_errors import UpstreamError
 

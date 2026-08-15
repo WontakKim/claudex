@@ -102,7 +102,10 @@ def test_imports_only_stdlib() -> None:
         "cli/admin_client.py",
         "cli/accounts.py",
         "cli/compact.py",
-        "config.py",
+        "config/__init__.py",
+        "config/schema.py",
+        "config/settings_io.py",
+        "config/gateway.py",
     ],
 )
 def test_consumers_use_shared_paths_module(module_name: str) -> None:
