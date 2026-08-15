@@ -12,7 +12,6 @@ import asyncio
 import base64
 import binascii
 import json
-import os
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -21,6 +20,11 @@ from typing import Any
 
 import httpx
 
+from claudex_gateway.providers.auth_support import (
+    load_json_credentials,
+    refresh_when_still_stale,
+    replace_credentials_file,
+)
 from claudex_gateway.upstream_errors import UpstreamAuthError
 
 CODEX_TOKEN_URL = "https://auth.openai.com/oauth/token"
@@ -54,6 +58,15 @@ def _decode_jwt_claims(token: str) -> dict[str, Any]:
 def _jwt_expiry(token: str) -> float | None:
     exp = _decode_jwt_claims(token).get("exp")
     return float(exp) if isinstance(exp, (int, float)) else None
+
+
+def _tokens_stale(auth_data: dict[str, Any]) -> bool:
+    tokens = auth_data.get("tokens") or {}
+    access_token = tokens.get("access_token", "")
+    expiry = _jwt_expiry(access_token)
+    return not access_token or (
+        expiry is not None and expiry - time.time() < _EXPIRY_SKEW_SECONDS
+    )
 
 
 def _account_id_from_token(token: str) -> str | None:
@@ -98,35 +111,26 @@ class CodexAuthManager:
             )
 
         access_token = tokens.get("access_token", "")
-        expiry = _jwt_expiry(access_token)
-        needs_refresh = (
-            force_refresh
-            or not access_token
-            or (expiry is not None and expiry - time.time() < _EXPIRY_SKEW_SECONDS)
-        )
+        needs_refresh = force_refresh or _tokens_stale(auth_data)
         if needs_refresh:
-            # Remember which token looked stale: concurrent 401 retries all
-            # force-refresh, and only the first one holding the lock should
-            # actually rotate — with rotating refresh tokens a second POST
-            # for the same generation can invalidate the fresh credentials.
             stale_access_token = access_token
-            async with self._refresh_lock:
-                # Another request may have refreshed while we waited for the lock.
-                auth_data = self._load_auth_file()
-                tokens = auth_data.get("tokens")
-                if not isinstance(tokens, dict):
-                    raise CodexAuthError(
-                        f"no ChatGPT tokens in {self._auth_file}; run `codex login` first"
-                    )
-                access_token = tokens.get("access_token", "")
-                expiry = _jwt_expiry(access_token)
-                if (
-                    (force_refresh and access_token == stale_access_token)
-                    or not access_token
-                    or (expiry is not None and expiry - time.time() < _EXPIRY_SKEW_SECONDS)
-                ):
-                    tokens = await self._refresh_tokens(auth_data)
-                    access_token = tokens.get("access_token", "")
+
+            async def refresh(state: dict[str, Any]) -> dict[str, Any]:
+                return {**state, "tokens": await self._refresh_tokens(state)}
+
+            auth_data = await refresh_when_still_stale(
+                self._refresh_lock,
+                force_refresh=force_refresh,
+                stale_token=stale_access_token,
+                reload=self._reload_validated,
+                token_of=lambda state: (state.get("tokens") or {}).get(
+                    "access_token", ""
+                ),
+                is_stale=_tokens_stale,
+                refresh=refresh,
+            )
+            tokens = auth_data["tokens"]
+            access_token = tokens.get("access_token", "")
 
         account_id = tokens.get("account_id") or _account_id_from_token(access_token)
         return CodexCredentials(
@@ -136,18 +140,21 @@ class CodexAuthManager:
         )
 
     def _load_auth_file(self) -> dict[str, Any]:
-        try:
-            raw = self._auth_file.read_text()
-        except FileNotFoundError as exc:
-            raise CodexAuthError(
+        return load_json_credentials(
+            self._auth_file,
+            error_cls=CodexAuthError,
+            missing_message=(
                 f"{self._auth_file} not found; install the Codex CLI and run `codex login`"
-            ) from exc
-        try:
-            auth_data = json.loads(raw)
-        except json.JSONDecodeError as exc:
-            raise CodexAuthError(f"{self._auth_file} is not valid JSON: {exc}") from exc
-        if not isinstance(auth_data, dict):
-            raise CodexAuthError(f"{self._auth_file} has an unexpected format")
+            ),
+            encoding=None,
+        )
+
+    def _reload_validated(self) -> dict[str, Any]:
+        auth_data = self._load_auth_file()
+        if not isinstance(auth_data.get("tokens"), dict):
+            raise CodexAuthError(
+                f"no ChatGPT tokens in {self._auth_file}; run `codex login` first"
+            )
         return auth_data
 
     async def _refresh_tokens(self, auth_data: dict[str, Any]) -> dict[str, Any]:
@@ -196,10 +203,10 @@ class CodexAuthManager:
         auth_data["last_refresh"] = (
             datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
         )
-        self._persist_auth_file(auth_data)
+        replace_credentials_file(
+            self._auth_file,
+            temp_file=self._auth_file.with_suffix(".json.tmp"),
+            text=json.dumps(auth_data, indent=2),
+            encoding=None,
+        )
         return new_tokens
-
-    def _persist_auth_file(self, auth_data: dict[str, Any]) -> None:
-        temp_file = self._auth_file.with_suffix(".json.tmp")
-        temp_file.write_text(json.dumps(auth_data, indent=2))
-        os.replace(temp_file, self._auth_file)

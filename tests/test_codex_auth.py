@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import stat
 import time
 from pathlib import Path
 from typing import Any
@@ -85,6 +86,35 @@ def test_concurrent_forced_refreshes_rotate_only_once(tmp_path: Path) -> None:
     persisted = json.loads(auth_file.read_text(encoding="utf-8"))
     assert persisted["tokens"]["access_token"] == "rotated-token"
     assert persisted["tokens"]["refresh_token"] == "refresh-2"
+
+
+def test_refresh_persists_private_mode_and_exact_serialization(tmp_path: Path) -> None:
+    auth_file = tmp_path / "auth.json"
+    _write_auth_file(auth_file, "stale-token")
+    counter = {"posts": 0}
+
+    async def scenario() -> None:
+        async with httpx.AsyncClient(
+            transport=_refresh_transport(counter, "rotated-token")
+        ) as http_client:
+            await CodexAuthManager(auth_file, http_client).get_credentials(
+                force_refresh=True
+            )
+
+    _run(scenario())
+
+    persisted_text = auth_file.read_text()
+    persisted_auth_data = json.loads(persisted_text)
+    expected_auth_data = {
+        "tokens": {
+            "access_token": "rotated-token",
+            "refresh_token": "refresh-2",
+            "account_id": "acct-1",
+        },
+        "last_refresh": persisted_auth_data["last_refresh"],
+    }
+    assert stat.S_IMODE(auth_file.stat().st_mode) == 0o600
+    assert persisted_text == json.dumps(expected_auth_data, indent=2)
 
 
 def test_sequential_forced_refreshes_each_rotate(tmp_path: Path) -> None:
