@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import AsyncIterator
 from typing import Any
 
 import httpx
@@ -31,6 +32,26 @@ def _provider() -> OpenAICompatibleProvider:
 def _sse(events: list[dict[str, Any]]) -> bytes:
     chunks = b"".join(f"data: {json.dumps(event)}\n\n".encode() for event in events)
     return b": keep-alive\n\n" + chunks + b"data: [DONE]\n\n"
+
+
+class _TrackedSSEByteStream(httpx.AsyncByteStream):
+    """Yield SSE chunks, optionally block afterward, and record closure."""
+
+    def __init__(self, chunks: list[bytes], *, should_hang: bool = False) -> None:
+        self._chunks = chunks
+        self._should_hang = should_hang
+        self.wait_started = asyncio.Event()
+        self.is_closed = False
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        for chunk in self._chunks:
+            yield chunk
+        if self._should_hang:
+            self.wait_started.set()
+            await asyncio.Event().wait()
+
+    async def aclose(self) -> None:
+        self.is_closed = True
 
 
 async def _collect(
@@ -87,6 +108,57 @@ def test_stream_responses_posts_to_prefixed_url_and_parses_function_call_events(
     assert request.headers["content-type"] == "application/json"
     assert request.headers["accept"] == "text/event-stream"
     assert "x-grok-conv-id" not in request.headers
+
+
+def test_stream_responses_explicit_close_closes_upstream_response_synchronously() -> None:
+    upstream_event = {"type": "response.output_text.delta", "delta": "hello"}
+    stream = _TrackedSSEByteStream([_sse([upstream_event])])
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            stream=stream,
+            headers={"content-type": "text/event-stream"},
+        )
+
+    async def scenario() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+            client = OpenAICompatibleClient(_PROVIDER_NAME, _provider(), http_client)
+            events = client.stream_responses({"stream": True}, "session-1")
+            assert await anext(events) == upstream_event
+            assert stream.is_closed is False
+            await events.aclose()
+            assert stream.is_closed is True
+
+    asyncio.run(scenario())
+
+
+def test_stream_responses_cancellation_closes_upstream_response() -> None:
+    upstream_event = {"type": "response.output_text.delta", "delta": "hello"}
+    stream = _TrackedSSEByteStream([_sse([upstream_event])], should_hang=True)
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            stream=stream,
+            headers={"content-type": "text/event-stream"},
+        )
+
+    async def consume(client: OpenAICompatibleClient) -> None:
+        async for event in client.stream_responses({"stream": True}, "session-1"):
+            assert event == upstream_event
+
+    async def scenario() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+            client = OpenAICompatibleClient(_PROVIDER_NAME, _provider(), http_client)
+            task = asyncio.create_task(consume(client))
+            await asyncio.wait_for(stream.wait_started.wait(), timeout=1)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert stream.is_closed is True
+
+    asyncio.run(scenario())
 
 
 def test_stream_responses_raises_upstream_error_without_retry() -> None:
@@ -190,6 +262,8 @@ def test_list_models_raises_on_structural_catalog_failure(kind: str) -> None:
     expected_status = 503 if kind == "non_200" else 502
     assert exc_info.value.status_code == expected_status
     assert _API_KEY not in str(exc_info.value)
+    if kind == "invalid_json":
+        assert isinstance(exc_info.value.__cause__, ValueError)
 
 
 class TestContextWindow:
