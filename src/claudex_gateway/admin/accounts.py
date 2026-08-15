@@ -35,7 +35,7 @@ from claudex_gateway.claude_login_session import (
 )
 from claudex_gateway.config import GatewayConfig
 from claudex_gateway.locking import try_file_lock
-from claudex_gateway.usage import _provider_result
+from claudex_gateway.usage_envelope import provider_result
 
 
 _USAGE_WINDOW_FRESH_MAX_AGE_SECONDS = 5 * 60
@@ -453,7 +453,7 @@ async def _handle_admin_claude_accounts_usage(request: Request) -> JSONResponse:
                 coordinator.request_manual_refresh(account_id)
             peeked = cache.peek_with_metadata(account_id)
             if peeked is None:
-                envelope = _provider_result(
+                envelope = provider_result(
                     "claude",
                     status="unavailable",
                     error="no usage observation yet; the balanced poll coordinator "
@@ -479,7 +479,7 @@ async def _handle_admin_claude_accounts_usage(request: Request) -> JSONResponse:
         for record in records:
             if record.state != "ready":
                 results[record.id] = {
-                    **_provider_result(
+                    **provider_result(
                         "claude",
                         status="unavailable",
                         error="account needs re-authentication; log in again from the dashboard",
@@ -498,7 +498,7 @@ async def _handle_admin_claude_accounts_usage(request: Request) -> JSONResponse:
     results = await cache.get(ready_ids)
     for record in records:
         if record.state != "ready":
-            results[record.id] = _provider_result(
+            results[record.id] = provider_result(
                 "claude",
                 status="unavailable",
                 error="account needs re-authentication; log in again from the dashboard",

@@ -23,7 +23,6 @@ import math
 import os
 import sys
 import time
-from datetime import datetime
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any
@@ -38,6 +37,13 @@ from claudex_gateway.claude_auth import (
 from claudex_gateway.providers.codex_auth import CodexAuthManager, CodexCredentials
 from claudex_gateway.providers.kimi_auth import KimiAuthManager
 from claudex_gateway.providers.grok_auth import GrokAuthManager, GrokCredentials
+from claudex_gateway.usage_envelope import (
+    SESSION_WINDOW_MINUTES,
+    USAGE_TIMEOUT,
+    WEEKLY_WINDOW_MINUTES,
+    provider_result,
+    reset_epoch_seconds,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -59,59 +65,8 @@ _CODEX_RESET_OUTCOMES = ("reset", "nothing_to_reset", "no_credit", "already_rede
 
 _KIMI_USAGE_URL = "https://api.kimi.com/coding/v1/usages"
 
-_USAGE_TIMEOUT = httpx.Timeout(10.0)
-
-_SESSION_WINDOW_MINUTES = 300
-_WEEKLY_WINDOW_MINUTES = 10080
 # Tolerate the one-minute drift seen in older Codex bucket lengths.
 _WINDOW_TOLERANCE_MINUTES = 1
-
-
-def _provider_result(
-    provider: str,
-    *,
-    status: str,
-    error: str | None,
-    session: dict[str, Any] | None = None,
-    weekly: dict[str, Any] | None = None,
-    plan_type: str | None = None,
-    reset_credits_available: int | None = None,
-    fable_weekly: dict[str, Any] | None = None,
-    monthly: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    return {
-        "provider": provider,
-        "status": status,
-        "error": error,
-        "session": session,
-        "weekly": weekly,
-        "plan_type": plan_type,
-        "reset_credits_available": reset_credits_available,
-        "fable_weekly": fable_weekly,
-        "monthly": monthly,
-        "updated_at": time.time(),
-    }
-
-
-def _reset_epoch_seconds(value: Any) -> float | None:
-    """Normalize a resets_at value (ISO 8601 string or epoch s/ms) to seconds."""
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, (int, float)):
-        # 1e10 sits between any plausible seconds epoch (<2286) and any
-        # milliseconds epoch (>2001), distinguishing the two units.
-        return float(value) / 1000 if value > 10_000_000_000 else float(value)
-    if isinstance(value, str) and value.strip():
-        text = value.strip()
-        try:
-            return _reset_epoch_seconds(float(text))
-        except ValueError:
-            pass
-        try:
-            return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
-        except ValueError:
-            return None
-    return None
 
 
 def _map_claude_window(raw: Any, window_minutes: int) -> dict[str, Any] | None:
@@ -125,7 +80,7 @@ def _map_claude_window(raw: Any, window_minutes: int) -> dict[str, Any] | None:
     return {
         "used_percent": min(100.0, max(0.0, float(used))),
         "window_minutes": window_minutes,
-        "resets_at": _reset_epoch_seconds(raw.get("resets_at")),
+        "resets_at": reset_epoch_seconds(raw.get("resets_at")),
     }
 
 
@@ -147,7 +102,7 @@ def _map_fable_weekly_window(data: dict[str, Any]) -> dict[str, Any] | None:
     if scoped is not None:
         mapped = _map_claude_window(
             {"used_percentage": scoped.get("percent"), "resets_at": scoped.get("resets_at")},
-            _WEEKLY_WINDOW_MINUTES,
+            WEEKLY_WINDOW_MINUTES,
         )
         if mapped is not None:
             return mapped
@@ -231,7 +186,7 @@ async def fetch_claude_usage(http_client: httpx.AsyncClient) -> dict[str, Any]:
     """Fetch Claude subscription windows via the Anthropic OAuth usage API."""
     token = await _resolve_claude_oauth_token()
     if token is None:
-        return _provider_result(
+        return provider_result(
             "claude",
             status="unavailable",
             error="no Claude Code OAuth credentials found; sign in with `claude` first",
@@ -273,12 +228,12 @@ async def _fetch_claude_usage_with_token(
                 "anthropic-beta": _CLAUDE_OAUTH_BETA,
                 "User-Agent": _CLAUDE_CODE_USER_AGENT,
             },
-            timeout=_USAGE_TIMEOUT,
+            timeout=USAGE_TIMEOUT,
         )
     except httpx.HTTPError as exc:
         logger.warning("claude usage fetch failed: %s", exc)
         return (
-            _provider_result(
+            provider_result(
                 "claude", status="error", error=f"failed to reach the Anthropic usage API: {exc}"
             ),
             None,
@@ -287,7 +242,7 @@ async def _fetch_claude_usage_with_token(
     status_code = response.status_code
     if status_code == 401:
         return (
-            _provider_result(
+            provider_result(
                 "claude",
                 status="error",
                 error="Claude OAuth token rejected (401); sign in again with `claude`",
@@ -297,7 +252,7 @@ async def _fetch_claude_usage_with_token(
         )
     if status_code == 429:
         return (
-            _provider_result(
+            provider_result(
                 "claude",
                 status="error",
                 error="usage API rate-limited (429); try again shortly",
@@ -307,7 +262,7 @@ async def _fetch_claude_usage_with_token(
         )
     if status_code != 200:
         return (
-            _provider_result(
+            provider_result(
                 "claude",
                 status="error",
                 error=f"usage API returned {status_code}: {response.text[:200]}",
@@ -319,25 +274,25 @@ async def _fetch_claude_usage_with_token(
         data = response.json()
     except json.JSONDecodeError:
         return (
-            _provider_result("claude", status="error", error="usage API returned a non-JSON body"),
+            provider_result("claude", status="error", error="usage API returned a non-JSON body"),
             None,
             status_code,
         )
     if not isinstance(data, dict):
         return (
-            _provider_result(
+            provider_result(
                 "claude", status="error", error="usage API returned an unexpected payload"
             ),
             None,
             status_code,
         )
     return (
-        _provider_result(
+        provider_result(
             "claude",
             status="ok",
             error=None,
-            session=_map_claude_window(data.get("five_hour"), _SESSION_WINDOW_MINUTES),
-            weekly=_map_claude_window(data.get("seven_day"), _WEEKLY_WINDOW_MINUTES),
+            session=_map_claude_window(data.get("five_hour"), SESSION_WINDOW_MINUTES),
+            weekly=_map_claude_window(data.get("seven_day"), WEEKLY_WINDOW_MINUTES),
             fable_weekly=_map_fable_weekly_window(data),
         ),
         None,
@@ -353,7 +308,7 @@ async def fetch_claude_account_usage(
     Documented deviation from this module's never-raise contract:
     `ClaudeAccountReauthRequiredError` propagates so the caller can mark the
     registry row needs-reauth. Every other failure returns a normal
-    `_provider_result` envelope. A 401 result gets one force-refresh retry,
+    `provider_result` envelope. A 401 result gets one force-refresh retry,
     mirroring the serving path.
     """
     try:
@@ -361,7 +316,7 @@ async def fetch_claude_account_usage(
     except ClaudeAccountReauthRequiredError:
         raise
     except ClaudeAccountAuthError as exc:
-        return (_provider_result("claude", status="unavailable", error=str(exc)), None)
+        return (provider_result("claude", status="unavailable", error=str(exc)), None)
 
     result, retry_after, status_code = await _fetch_claude_usage_with_token(
         http_client, credentials.access_token
@@ -372,12 +327,12 @@ async def fetch_claude_account_usage(
         except ClaudeAccountReauthRequiredError:
             raise
         except ClaudeAccountAuthError as exc:
-            return (_provider_result("claude", status="unavailable", error=str(exc)), None)
+            return (provider_result("claude", status="unavailable", error=str(exc)), None)
         result, retry_after, status_code = await _fetch_claude_usage_with_token(
             http_client, credentials.access_token
         )
         if status_code == 401:
-            result = _provider_result(
+            result = provider_result(
                 "claude",
                 status="error",
                 error="account token rejected (401) even after refresh",
@@ -402,16 +357,16 @@ def _map_codex_window(raw: Any) -> dict[str, Any] | None:
     return {
         "used_percent": min(100.0, max(0.0, float(used))),
         "window_minutes": window_minutes,
-        "resets_at": _reset_epoch_seconds(raw.get("reset_at")),
+        "resets_at": reset_epoch_seconds(raw.get("reset_at")),
     }
 
 
 def _codex_window_kind(window_minutes: Any) -> str | None:
     if not isinstance(window_minutes, (int, float)) or isinstance(window_minutes, bool):
         return None
-    if abs(window_minutes - _SESSION_WINDOW_MINUTES) <= _WINDOW_TOLERANCE_MINUTES:
+    if abs(window_minutes - SESSION_WINDOW_MINUTES) <= _WINDOW_TOLERANCE_MINUTES:
         return "session"
-    if abs(window_minutes - _WEEKLY_WINDOW_MINUTES) <= _WINDOW_TOLERANCE_MINUTES:
+    if abs(window_minutes - WEEKLY_WINDOW_MINUTES) <= _WINDOW_TOLERANCE_MINUTES:
         return "weekly"
     return None
 
@@ -454,23 +409,23 @@ async def fetch_codex_usage(
     try:
         credentials = await auth_manager.get_credentials()
     except Exception as exc:  # CodexAuthError and anything the file layer raises
-        return _provider_result("codex", status="unavailable", error=str(exc))
+        return provider_result("codex", status="unavailable", error=str(exc))
     if credentials.is_api_key:
-        return _provider_result(
+        return provider_result(
             "codex",
             status="unavailable",
             error="API key billing has no plan usage windows",
         )
     headers = _codex_backend_headers(credentials)
     try:
-        response = await http_client.get(_CODEX_USAGE_URL, headers=headers, timeout=_USAGE_TIMEOUT)
+        response = await http_client.get(_CODEX_USAGE_URL, headers=headers, timeout=USAGE_TIMEOUT)
     except httpx.HTTPError as exc:
         logger.warning("codex usage fetch failed: %s", exc)
-        return _provider_result(
+        return provider_result(
             "codex", status="error", error=f"failed to reach the ChatGPT usage API: {exc}"
         )
     if response.status_code != 200:
-        return _provider_result(
+        return provider_result(
             "codex",
             status="error",
             error=f"usage API returned {response.status_code}: {response.text[:200]}",
@@ -478,11 +433,11 @@ async def fetch_codex_usage(
     try:
         data = response.json()
     except json.JSONDecodeError:
-        return _provider_result(
+        return provider_result(
             "codex", status="error", error="usage API returned a non-JSON body"
         )
     if not isinstance(data, dict):
-        return _provider_result(
+        return provider_result(
             "codex", status="error", error="usage API returned an unexpected payload"
         )
     rate_limit = data.get("rate_limit")
@@ -495,7 +450,7 @@ async def fetch_codex_usage(
     plan_type = data.get("plan_type")
     reset_credits = data.get("rate_limit_reset_credits")
     available = reset_credits.get("available_count") if isinstance(reset_credits, dict) else None
-    return _provider_result(
+    return provider_result(
         "codex",
         status="ok",
         error=None,
@@ -539,7 +494,7 @@ async def consume_codex_reset_credit(
             _CODEX_RESET_CONSUME_URL,
             headers={**_codex_backend_headers(credentials), "Content-Type": "application/json"},
             json={"redeem_request_id": redeem_request_id},
-            timeout=_USAGE_TIMEOUT,
+            timeout=USAGE_TIMEOUT,
         )
     except httpx.HTTPError as exc:
         logger.warning("codex reset credit request failed: %s", exc)
@@ -625,7 +580,7 @@ def _map_kimi_quota(raw: Any, window_minutes: float | None) -> dict[str, Any] | 
     if limit is None or limit <= 0 or used is None:
         return None
     # The CLI has shipped both resetTime and resetAt spellings.
-    resets_at = _reset_epoch_seconds(raw.get("resetTime") or raw.get("resetAt"))
+    resets_at = reset_epoch_seconds(raw.get("resetTime") or raw.get("resetAt"))
     return {
         "used_percent": min(100.0, max(0.0, used / limit * 100)),
         "window_minutes": window_minutes,
@@ -642,11 +597,11 @@ def _map_kimi_session_window(limits: Any) -> dict[str, Any] | None:
     for entry in limits:
         if not isinstance(entry, dict):
             continue
-        minutes = _kimi_window_minutes(entry.get("window")) or _SESSION_WINDOW_MINUTES
+        minutes = _kimi_window_minutes(entry.get("window")) or SESSION_WINDOW_MINUTES
         mapped = _map_kimi_quota(entry.get("detail"), minutes)
         if mapped is None:
             continue
-        distance = abs(minutes - _SESSION_WINDOW_MINUTES)
+        distance = abs(minutes - SESSION_WINDOW_MINUTES)
         if best is None or distance < best_distance:
             best, best_distance = mapped, distance
     return best
@@ -663,7 +618,7 @@ async def fetch_kimi_usage(
     try:
         credentials = await auth_manager.get_credentials()
     except Exception as exc:  # KimiAuthError and anything the file layer raises
-        return _provider_result("kimi", status="unavailable", error=str(exc))
+        return provider_result("kimi", status="unavailable", error=str(exc))
     try:
         # Bearer token + Accept only; the endpoint authenticates by token.
         response = await http_client.get(
@@ -672,21 +627,21 @@ async def fetch_kimi_usage(
                 "Authorization": f"Bearer {credentials.access_token}",
                 "Accept": "application/json",
             },
-            timeout=_USAGE_TIMEOUT,
+            timeout=USAGE_TIMEOUT,
         )
     except httpx.HTTPError as exc:
         logger.warning("kimi usage fetch failed: %s", exc)
-        return _provider_result(
+        return provider_result(
             "kimi", status="error", error=f"failed to reach the Kimi usage API: {exc}"
         )
     if response.status_code == 401:
-        return _provider_result(
+        return provider_result(
             "kimi",
             status="error",
             error="Kimi access token rejected (401); run `kimi login` again",
         )
     if response.status_code != 200:
-        return _provider_result(
+        return provider_result(
             "kimi",
             status="error",
             error=f"usage API returned {response.status_code}: {response.text[:200]}",
@@ -694,19 +649,19 @@ async def fetch_kimi_usage(
     try:
         data = response.json()
     except json.JSONDecodeError:
-        return _provider_result(
+        return provider_result(
             "kimi", status="error", error="usage API returned a non-JSON body"
         )
     if not isinstance(data, dict):
-        return _provider_result(
+        return provider_result(
             "kimi", status="error", error="usage API returned an unexpected payload"
         )
     # The top-level usage block is the weekly quota; limits[] carries the
     # shorter rolling windows, of which the 5-hour one is the session view.
     session = _map_kimi_session_window(data.get("limits"))
-    weekly = _map_kimi_quota(data.get("usage"), _WEEKLY_WINDOW_MINUTES)
+    weekly = _map_kimi_quota(data.get("usage"), WEEKLY_WINDOW_MINUTES)
     if session is None and weekly is None:
-        return _provider_result(
+        return provider_result(
             "kimi", status="error", error="usage response did not include quota windows"
         )
     user = data.get("user")
@@ -717,7 +672,7 @@ async def fetch_kimi_usage(
         if isinstance(level, str) and level.startswith("LEVEL_")
         else None
     )
-    return _provider_result(
+    return provider_result(
         "kimi",
         status="ok",
         error=None,
@@ -789,8 +744,8 @@ def _map_grok_weekly_credits(config: dict[str, Any]) -> dict[str, Any] | None:
         return None
     return {
         "used_percent": min(100.0, max(0.0, used_percent)),
-        "window_minutes": _WEEKLY_WINDOW_MINUTES,
-        "resets_at": _reset_epoch_seconds(_grok_period_end(config)),
+        "window_minutes": WEEKLY_WINDOW_MINUTES,
+        "resets_at": reset_epoch_seconds(_grok_period_end(config)),
     }
 
 
@@ -808,7 +763,7 @@ def _map_grok_monthly(config: dict[str, Any]) -> dict[str, Any] | None:
     return {
         "used_percent": min(100.0, max(0.0, used / limit * 100)),
         "window_minutes": _MONTHLY_WINDOW_MINUTES,
-        "resets_at": _reset_epoch_seconds(_grok_period_end(config)),
+        "resets_at": reset_epoch_seconds(_grok_period_end(config)),
     }
 
 
@@ -818,7 +773,7 @@ async def _fetch_grok_billing(
     """GET a billing view; the result dict is a config payload or an error marker."""
     try:
         response = await http_client.get(
-            url, headers=_grok_billing_headers(credentials), timeout=_USAGE_TIMEOUT
+            url, headers=_grok_billing_headers(credentials), timeout=USAGE_TIMEOUT
         )
     except httpx.HTTPError as exc:
         return {"_error": f"failed to reach the Grok billing API: {exc}"}
@@ -846,16 +801,16 @@ async def fetch_grok_usage(
     try:
         credentials = await auth_manager.get_credentials()
     except Exception as exc:  # GrokAuthError and anything the file layer raises
-        return _provider_result("grok", status="unavailable", error=str(exc))
+        return provider_result("grok", status="unavailable", error=str(exc))
 
     data = await _fetch_grok_billing(http_client, credentials, _GROK_BILLING_CREDITS_URL)
     error = data.pop("_error", None)
     if error is not None:
-        return _provider_result("grok", status="error", error=error)
+        return provider_result("grok", status="error", error=error)
     config = data.get("config") if isinstance(data.get("config"), dict) else data
     weekly = _map_grok_weekly_credits(config)
     if weekly is not None:
-        return _provider_result(
+        return provider_result(
             "grok",
             status="ok",
             error=None,
@@ -866,11 +821,11 @@ async def fetch_grok_usage(
     fallback = await _fetch_grok_billing(http_client, credentials, _GROK_BILLING_URL)
     error = fallback.pop("_error", None)
     if error is not None:
-        return _provider_result("grok", status="error", error=error)
+        return provider_result("grok", status="error", error=error)
     fallback_config = fallback.get("config") if isinstance(fallback.get("config"), dict) else fallback
     monthly = _map_grok_monthly(fallback_config)
     if monthly is not None:
-        return _provider_result(
+        return provider_result(
             "grok",
             status="ok",
             error=None,
@@ -880,6 +835,6 @@ async def fetch_grok_usage(
         )
     # A signed-in account whose billing views expose no quota has no bar to
     # show — 'unavailable' hides the card body instead of painting an alert.
-    return _provider_result(
+    return provider_result(
         "grok", status="unavailable", error="billing response did not include credit usage"
     )
