@@ -37,7 +37,7 @@ from claudex_gateway.claude.accounts import (
     AccountRegistryError,
     load_registry,
 )
-from claudex_gateway.claude_ambient_account import AmbientAccountProvider, is_duplicate_identity
+from claudex_gateway.claude.ambient_account import AmbientAccountProvider, is_duplicate_identity
 from claudex_gateway.config import GatewayConfig
 from claudex_gateway.relay.registered import (
     _FailedAttempt,

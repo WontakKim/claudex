@@ -9,7 +9,7 @@ from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Literal
 
-from claudex_gateway.account_usage_cache import ClaudeAccountUsageCache
+from claudex_gateway.claude.account_usage_cache import ClaudeAccountUsageCache
 from claudex_gateway.balanced.polling import ClaudeUsagePollCoordinator, UsagePollAccount
 from claudex_gateway.balanced.router import ClaudeBalancedRouter
 from claudex_gateway.balanced.state_model import RestoreValidationContext

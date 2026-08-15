@@ -30,8 +30,8 @@ import claudex_gateway.server as server
 import claudex_gateway.translate.context_overflow as context_overflow
 from claudex_gateway import compaction, paths
 from claudex_gateway.claude import accounts as claude_accounts
-from claudex_gateway.account_usage_cache import ClaudeAccountUsageCache
-from claudex_gateway.claude_account_pool import AccountCooldownTracker
+from claudex_gateway.claude.account_usage_cache import ClaudeAccountUsageCache
+from claudex_gateway.claude.account_pool import AccountCooldownTracker
 from claudex_gateway.claude.auth import CLAUDE_TOKEN_URL
 from claudex_gateway.balanced.router import ClaudeBalancedRouter
 from claudex_gateway.balanced.runtime import ClaudeBalancedRuntime

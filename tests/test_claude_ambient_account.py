@@ -11,9 +11,9 @@ from typing import Any
 
 import pytest
 
-import claudex_gateway.claude_ambient_account as ambient_module
+from claudex_gateway.claude import ambient_account as ambient_module
 from claudex_gateway.claude.accounts import AccountRecord
-from claudex_gateway.claude_ambient_account import (
+from claudex_gateway.claude.ambient_account import (
     AmbientAccountProvider,
     AmbientPoolMember,
     is_duplicate_identity,

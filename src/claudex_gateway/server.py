@@ -15,7 +15,7 @@ from starlette.applications import Starlette
 from starlette.routing import Route
 
 from claudex_gateway import paths, server_support
-from claudex_gateway.account_usage_cache import ClaudeAccountUsageCache
+from claudex_gateway.claude.account_usage_cache import ClaudeAccountUsageCache
 from claudex_gateway.admin.accounts import (
     _handle_admin_claude_account_delete,
     _handle_admin_claude_accounts_get,
@@ -59,9 +59,9 @@ from claudex_gateway.admin.system import (
     _handle_favicon,
 )
 from claudex_gateway.relay import endpoints as relay_endpoints
-from claudex_gateway.claude_account_pool import AccountCooldownTracker
+from claudex_gateway.claude.account_pool import AccountCooldownTracker
 from claudex_gateway.claude.accounts import AccountRecord, list_accounts
-from claudex_gateway.claude_ambient_account import AmbientAccountProvider, is_duplicate_identity
+from claudex_gateway.claude.ambient_account import AmbientAccountProvider, is_duplicate_identity
 from claudex_gateway.balanced.polling import UsagePollAccount
 from claudex_gateway.balanced.runtime import ClaudeBalancedRuntime
 from claudex_gateway.providers.codex_auth import CodexAuthError, CodexAuthManager

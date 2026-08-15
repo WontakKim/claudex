@@ -14,7 +14,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
 from claudex_gateway import server_support
-from claudex_gateway.claude_account_pool import (
+from claudex_gateway.claude.account_pool import (
     _DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS,
     AccountCooldownTracker,
     build_serving_chain,

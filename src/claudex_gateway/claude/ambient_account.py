@@ -22,11 +22,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .claude.account_profile import compute_account_profile_fingerprint
-from .claude.accounts import AccountRecord
-from .claude.auth import ClaudeAccountAuthError, ClaudeAccountCredentials
-from .claude.capture_model import CaptureError, KeychainBackend
-from .claude.keychain import LEGACY_KEYCHAIN_SERVICE, SecurityKeychainBackend
+from .account_profile import compute_account_profile_fingerprint
+from .accounts import AccountRecord
+from .auth import ClaudeAccountAuthError, ClaudeAccountCredentials
+from .capture_model import CaptureError, KeychainBackend
+from .keychain import LEGACY_KEYCHAIN_SERVICE, SecurityKeychainBackend
 
 AMBIENT_ID_NAMESPACE = uuid.UUID("49d01c38-08d0-4df4-a742-13aa3c192f3e")
 

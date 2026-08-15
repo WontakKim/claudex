@@ -23,7 +23,7 @@ import claudex_gateway.server as server
 import claudex_gateway.server_support as server_support
 from claudex_gateway import compaction, paths
 from claudex_gateway.claude import accounts as claude_accounts
-from claudex_gateway.account_usage_cache import ClaudeAccountUsageCache
+from claudex_gateway.claude.account_usage_cache import ClaudeAccountUsageCache
 from claudex_gateway.balanced.polling import ClaudeUsagePollCoordinator, UsagePollAccount
 from claudex_gateway.balanced.router import ClaudeBalancedRouter
 from claudex_gateway.balanced.runtime import ClaudeBalancedRuntime

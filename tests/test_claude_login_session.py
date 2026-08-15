@@ -23,7 +23,7 @@ import pytest
 
 from claudex_gateway import paths
 from claudex_gateway.claude import accounts as claude_accounts
-from claudex_gateway.claude_login_session import (
+from claudex_gateway.claude.login_session import (
     ClaudeLoginSession,
     LoginSessionStateError,
 )

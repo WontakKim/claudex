@@ -33,7 +33,7 @@ from claudex_gateway.providers.openai_compatible_client import (
 )
 from claudex_gateway.translate import translate_claude_request_to_codex
 from claudex_gateway.upstream_errors import UpstreamAuthError, UpstreamError
-from claudex_gateway.claude_usage import fetch_claude_usage
+from claudex_gateway.claude.usage import fetch_claude_usage
 from claudex_gateway.usage.providers import (
     consume_codex_reset_credit,
     fetch_codex_usage,

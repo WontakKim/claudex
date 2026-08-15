@@ -3362,7 +3362,7 @@ class TestAdminClaudeAccountsApi:
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         client = self._client(monkeypatch, tmp_path)
-        from claudex_gateway.claude_login_session import capture_lock_path
+        from claudex_gateway.claude.login_session import capture_lock_path
         from claudex_gateway.locking import try_file_lock as _try_lock
 
         handle = _try_lock(capture_lock_path())

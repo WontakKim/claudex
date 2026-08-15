@@ -7,7 +7,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal
 
-from claudex_gateway.account_usage_cache import ClaudeAccountUsageCache
+from claudex_gateway.claude.account_usage_cache import ClaudeAccountUsageCache
 from claudex_gateway.balanced.router import ClaudeBalancedRouter
 from claudex_gateway.balanced.selection import _PEEK_WINDOW_TO_BINDING
 from claudex_gateway.balanced.state_store import ClaudePoolRuntimeStateStore

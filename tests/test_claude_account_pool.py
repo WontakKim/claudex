@@ -7,7 +7,7 @@ import uuid
 from datetime import datetime, timezone
 from email.utils import format_datetime
 
-from claudex_gateway.claude_account_pool import (
+from claudex_gateway.claude.account_pool import (
     AccountCooldownTracker,
     build_serving_chain,
     rate_limit_cooldown_seconds,

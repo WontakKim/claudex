@@ -12,7 +12,7 @@ from typing import Any
 
 import pytest
 
-from claudex_gateway.account_usage_cache import ClaudeAccountUsageCache
+from claudex_gateway.claude.account_usage_cache import ClaudeAccountUsageCache
 from claudex_gateway.balanced.polling import ClaudeUsagePollCoordinator
 from claudex_gateway.balanced.router import (
     CAPABILITY_CLASSIFIER_VERSION,

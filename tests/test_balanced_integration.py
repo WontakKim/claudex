@@ -38,7 +38,7 @@ from starlette.testclient import TestClient
 
 from claudex_gateway import paths
 from claudex_gateway.claude import accounts as claude_accounts
-from claudex_gateway.claude_ambient_account import AmbientClaudeAuthManager
+from claudex_gateway.claude.ambient_account import AmbientClaudeAuthManager
 from claudex_gateway.balanced.router import CAPABILITY_CLASSIFIER_VERSION, ClaudeBalancedRouter
 from claudex_gateway.balanced.runtime import ClaudeBalancedRuntime
 from claudex_gateway.balanced.selection import AccountCandidate, SessionKey, derive_session_key
