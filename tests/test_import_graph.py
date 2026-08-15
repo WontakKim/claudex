@@ -253,7 +253,7 @@ def test_resolves_relative_package_member_import() -> None:
 
     dependencies = _extract_internal_imports(
         source,
-        "claudex_gateway.config",
+        "claudex_gateway.server_support",
         _SOURCE_MODULES,
         _PACKAGE_MODULES,
     )
