@@ -1604,7 +1604,7 @@ def _register_balanced_accounts(count: int) -> list[tuple[str, str]]:
     return accounts
 
 
-_USAGE_PROBE_PATH = "/api/oauth/usage"  # usage._CLAUDE_USAGE_URL's path component
+_USAGE_PROBE_PATH = "/api/oauth/usage"  # claude_usage._CLAUDE_USAGE_URL's path component
 
 
 def _usage_probe_intercepting_handler(anthropic_handler: Any) -> Any:

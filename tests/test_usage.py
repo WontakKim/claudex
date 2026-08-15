@@ -11,7 +11,7 @@ from typing import Any
 import httpx
 import pytest
 
-from claudex_gateway import usage, usage_envelope
+from claudex_gateway import claude_usage, provider_usage, usage_envelope
 from claudex_gateway.claude_auth import (
     ClaudeAccountAuthError,
     ClaudeAccountCredentials,
@@ -59,26 +59,26 @@ class MissingCredentials:
 
 def test_parse_claude_credentials_extracts_access_token() -> None:
     raw = json.dumps({"claudeAiOauth": {"accessToken": "sk-ant-oat-1", "refreshToken": "r"}})
-    assert usage._parse_claude_credentials(raw) == "sk-ant-oat-1"
+    assert claude_usage._parse_claude_credentials(raw) == "sk-ant-oat-1"
 
 
 def test_parse_claude_credentials_rejects_garbage() -> None:
-    assert usage._parse_claude_credentials("not json") is None
-    assert usage._parse_claude_credentials(json.dumps({"claudeAiOauth": {}})) is None
-    assert usage._parse_claude_credentials(json.dumps({"other": 1})) is None
+    assert claude_usage._parse_claude_credentials("not json") is None
+    assert claude_usage._parse_claude_credentials(json.dumps({"claudeAiOauth": {}})) is None
+    assert claude_usage._parse_claude_credentials(json.dumps({"other": 1})) is None
 
 
 def test_claude_keychain_services_scoped_when_config_dir_set(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", "/tmp/custom-claude")
-    services = usage._claude_keychain_services()
+    services = claude_usage._claude_keychain_services()
     assert len(services) == 2
     assert services[0].startswith("Claude Code-credentials-")
     assert services[1] == "Claude Code-credentials"
 
     monkeypatch.delenv("CLAUDE_CONFIG_DIR")
-    assert usage._claude_keychain_services() == ["Claude Code-credentials"]
+    assert claude_usage._claude_keychain_services() == ["Claude Code-credentials"]
 
 
 def test_resolve_claude_token_reads_credentials_file(
@@ -87,12 +87,12 @@ def test_resolve_claude_token_reads_credentials_file(
     async def no_keychain(service: str, account: str) -> None:
         return None
 
-    monkeypatch.setattr(usage, "_keychain_password", no_keychain)
+    monkeypatch.setattr(claude_usage, "_keychain_password", no_keychain)
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
     (tmp_path / ".credentials.json").write_text(
         json.dumps({"claudeAiOauth": {"accessToken": "file-token"}})
     )
-    assert _run(usage._resolve_claude_oauth_token()) == "file-token"
+    assert _run(claude_usage._resolve_claude_oauth_token()) == "file-token"
 
 
 def test_resolve_claude_token_prefers_keychain(
@@ -101,12 +101,12 @@ def test_resolve_claude_token_prefers_keychain(
     async def keychain(service: str, account: str) -> str:
         return json.dumps({"claudeAiOauth": {"accessToken": "keychain-token"}})
 
-    monkeypatch.setattr(usage, "_keychain_password", keychain)
+    monkeypatch.setattr(claude_usage, "_keychain_password", keychain)
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
     (tmp_path / ".credentials.json").write_text(
         json.dumps({"claudeAiOauth": {"accessToken": "file-token"}})
     )
-    assert _run(usage._resolve_claude_oauth_token()) == "keychain-token"
+    assert _run(claude_usage._resolve_claude_oauth_token()) == "keychain-token"
 
 
 # ---------------------------------------------------------------------------
@@ -118,7 +118,7 @@ def test_fetch_claude_usage_maps_windows(monkeypatch: pytest.MonkeyPatch) -> Non
     async def stub_token() -> str:
         return "tok"
 
-    monkeypatch.setattr(usage, "_resolve_claude_oauth_token", stub_token)
+    monkeypatch.setattr(claude_usage, "_resolve_claude_oauth_token", stub_token)
     seen: dict[str, Any] = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -132,7 +132,7 @@ def test_fetch_claude_usage_maps_windows(monkeypatch: pytest.MonkeyPatch) -> Non
             },
         )
 
-    result = _run(usage.fetch_claude_usage(_mock_client(handler)))
+    result = _run(claude_usage.fetch_claude_usage(_mock_client(handler)))
 
     assert seen["authorization"] == "Bearer tok"
     assert seen["beta"] == "oauth-2025-04-20"
@@ -151,12 +151,12 @@ def test_fetch_claude_usage_401_is_an_error(monkeypatch: pytest.MonkeyPatch) -> 
     async def stub_token() -> str:
         return "tok"
 
-    monkeypatch.setattr(usage, "_resolve_claude_oauth_token", stub_token)
+    monkeypatch.setattr(claude_usage, "_resolve_claude_oauth_token", stub_token)
 
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(401, json={"error": {"message": "invalid token"}})
 
-    result = _run(usage.fetch_claude_usage(_mock_client(handler)))
+    result = _run(claude_usage.fetch_claude_usage(_mock_client(handler)))
     assert result["status"] == "error"
     assert "401" in result["error"]
 
@@ -167,7 +167,7 @@ def test_fetch_claude_usage_maps_fable_weekly_from_scoped_limits(
     async def stub_token() -> str:
         return "tok"
 
-    monkeypatch.setattr(usage, "_resolve_claude_oauth_token", stub_token)
+    monkeypatch.setattr(claude_usage, "_resolve_claude_oauth_token", stub_token)
 
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
@@ -189,7 +189,7 @@ def test_fetch_claude_usage_maps_fable_weekly_from_scoped_limits(
             },
         )
 
-    result = _run(usage.fetch_claude_usage(_mock_client(handler)))
+    result = _run(claude_usage.fetch_claude_usage(_mock_client(handler)))
 
     assert result["status"] == "ok"
     assert result["fable_weekly"]["used_percent"] == 99.0
@@ -204,11 +204,11 @@ def test_fetch_claude_usage_maps_fable_weekly_from_scoped_limits(
 def test_flat_fable_quota_fields_are_ignored(field_name: str) -> None:
     data = {field_name: {"utilization": 55, "resets_at": 1754600000}}
 
-    assert usage._map_fable_weekly_window(data) is None
+    assert claude_usage._map_fable_weekly_window(data) is None
 
 
 def test_map_fable_weekly_window_ignores_malformed_or_nonmatching_limits() -> None:
-    assert usage._map_fable_weekly_window({"limits": "malformed"}) is None
+    assert claude_usage._map_fable_weekly_window({"limits": "malformed"}) is None
     data = {
         "limits": [
             None,
@@ -221,7 +221,7 @@ def test_map_fable_weekly_window_ignores_malformed_or_nonmatching_limits() -> No
         ]
     }
 
-    assert usage._map_fable_weekly_window(data) is None
+    assert claude_usage._map_fable_weekly_window(data) is None
 
 
 def test_fetch_claude_usage_without_credentials_is_unavailable(
@@ -230,8 +230,8 @@ def test_fetch_claude_usage_without_credentials_is_unavailable(
     async def no_token() -> None:
         return None
 
-    monkeypatch.setattr(usage, "_resolve_claude_oauth_token", no_token)
-    result = _run(usage.fetch_claude_usage(_unused_client()))
+    monkeypatch.setattr(claude_usage, "_resolve_claude_oauth_token", no_token)
+    result = _run(claude_usage.fetch_claude_usage(_unused_client()))
     assert result["status"] == "unavailable"
     assert result["session"] is None
 
@@ -274,7 +274,7 @@ def test_fetch_claude_account_usage_sends_the_account_bearer() -> None:
             200, json={"five_hour": {"utilization": 10, "resets_at": 1754500000}}
         )
 
-    result, retry_after = _run(usage.fetch_claude_account_usage(_mock_client(handler), manager))
+    result, retry_after = _run(claude_usage.fetch_claude_account_usage(_mock_client(handler), manager))
 
     assert seen["authorization"] == "Bearer acct-tok"
     assert seen["beta"] == "oauth-2025-04-20"
@@ -290,7 +290,7 @@ def test_fetch_claude_account_usage_429_returns_retry_after_seconds() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(429, headers={"Retry-After": "30"})
 
-    result, retry_after = _run(usage.fetch_claude_account_usage(_mock_client(handler), manager))
+    result, retry_after = _run(claude_usage.fetch_claude_account_usage(_mock_client(handler), manager))
     assert result["status"] == "error"
     assert "429" in result["error"]
     assert retry_after == 30.0
@@ -306,7 +306,7 @@ def test_fetch_claude_account_usage_429_parses_http_date_retry_after() -> None:
         )
         return httpx.Response(429, headers={"Retry-After": http_date})
 
-    _result, retry_after = _run(usage.fetch_claude_account_usage(_mock_client(handler), manager))
+    _result, retry_after = _run(claude_usage.fetch_claude_account_usage(_mock_client(handler), manager))
     assert retry_after is not None
     assert 0 < retry_after <= 121
 
@@ -323,7 +323,7 @@ def test_fetch_claude_account_usage_retries_once_with_a_forced_refresh() -> None
             200, json={"five_hour": {"utilization": 5, "resets_at": 1754500000}}
         )
 
-    result, _retry_after = _run(usage.fetch_claude_account_usage(_mock_client(handler), manager))
+    result, _retry_after = _run(claude_usage.fetch_claude_account_usage(_mock_client(handler), manager))
 
     assert tokens_seen == ["Bearer stale-tok", "Bearer fresh-tok"]
     assert manager.calls == [False, True]
@@ -336,14 +336,14 @@ def test_fetch_claude_account_usage_persistent_401_is_an_error() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(401)
 
-    result, _retry_after = _run(usage.fetch_claude_account_usage(_mock_client(handler), manager))
+    result, _retry_after = _run(claude_usage.fetch_claude_account_usage(_mock_client(handler), manager))
     assert result["status"] == "error"
     assert "after refresh" in result["error"]
 
 
 def test_fetch_claude_account_usage_auth_error_is_unavailable() -> None:
     manager = _FailingAccountCredentials(ClaudeAccountAuthError("no credentials file"))
-    result, retry_after = _run(usage.fetch_claude_account_usage(_unused_client(), manager))
+    result, retry_after = _run(claude_usage.fetch_claude_account_usage(_unused_client(), manager))
     assert result["status"] == "unavailable"
     assert "no credentials file" in result["error"]
     assert retry_after is None
@@ -352,7 +352,7 @@ def test_fetch_claude_account_usage_auth_error_is_unavailable() -> None:
 def test_fetch_claude_account_usage_reauth_required_propagates() -> None:
     manager = _FailingAccountCredentials(ClaudeAccountReauthRequiredError("invalid_grant"))
     with pytest.raises(ClaudeAccountReauthRequiredError):
-        _run(usage.fetch_claude_account_usage(_unused_client(), manager))
+        _run(claude_usage.fetch_claude_account_usage(_unused_client(), manager))
 
 
 # ---------------------------------------------------------------------------
@@ -387,7 +387,7 @@ def test_fetch_codex_usage_maps_windows_and_plan() -> None:
         )
 
     auth = ChatGPTCredentials(CodexCredentials(access_token="tok", account_id="acc-1"))
-    result = _run(usage.fetch_codex_usage(_mock_client(handler), auth))
+    result = _run(provider_usage.fetch_codex_usage(_mock_client(handler), auth))
 
     assert seen["account"] == "acc-1"
     assert seen["originator"] == "Codex Desktop"
@@ -415,7 +415,7 @@ def test_fetch_codex_usage_classifies_unknown_durations_legacy_way() -> None:
         )
 
     auth = ChatGPTCredentials(CodexCredentials(access_token="tok", account_id=None))
-    result = _run(usage.fetch_codex_usage(_mock_client(handler), auth))
+    result = _run(provider_usage.fetch_codex_usage(_mock_client(handler), auth))
 
     assert result["session"]["used_percent"] == 5
     assert result["weekly"]["used_percent"] == 7
@@ -425,13 +425,13 @@ def test_fetch_codex_usage_api_key_mode_is_unavailable() -> None:
     auth = ChatGPTCredentials(
         CodexCredentials(access_token="sk-key", account_id=None, is_api_key=True)
     )
-    result = _run(usage.fetch_codex_usage(_unused_client(), auth))
+    result = _run(provider_usage.fetch_codex_usage(_unused_client(), auth))
     assert result["status"] == "unavailable"
     assert "API key" in result["error"]
 
 
 def test_fetch_codex_usage_missing_credentials_is_unavailable() -> None:
-    result = _run(usage.fetch_codex_usage(_unused_client(), MissingCredentials()))
+    result = _run(provider_usage.fetch_codex_usage(_unused_client(), MissingCredentials()))
     assert result["status"] == "unavailable"
     assert "missing Codex credentials" in result["error"]
 
@@ -441,7 +441,7 @@ def test_fetch_codex_usage_upstream_error() -> None:
         return httpx.Response(500, text="boom")
 
     auth = ChatGPTCredentials(CodexCredentials(access_token="tok", account_id=None))
-    result = _run(usage.fetch_codex_usage(_mock_client(handler), auth))
+    result = _run(provider_usage.fetch_codex_usage(_mock_client(handler), auth))
     assert result["status"] == "error"
     assert "500" in result["error"]
 
@@ -465,7 +465,7 @@ def test_consume_codex_reset_credit_reports_every_backend_outcome(code: str) -> 
         return httpx.Response(200, json={"code": code})
 
     auth = ChatGPTCredentials(CodexCredentials(access_token="tok", account_id="acc-1"))
-    result = _run(usage.consume_codex_reset_credit(_mock_client(handler), auth, "key-1"))
+    result = _run(provider_usage.consume_codex_reset_credit(_mock_client(handler), auth, "key-1"))
 
     assert seen["method"] == "POST"
     assert seen["url"].endswith("/wham/rate-limit-reset-credits/consume")
@@ -480,7 +480,7 @@ def test_consume_codex_reset_credit_treats_unknown_outcome_as_unsettled() -> Non
         return httpx.Response(200, json={"code": "teleported"})
 
     auth = ChatGPTCredentials(CodexCredentials(access_token="tok", account_id=None))
-    result = _run(usage.consume_codex_reset_credit(_mock_client(handler), auth, "key-1"))
+    result = _run(provider_usage.consume_codex_reset_credit(_mock_client(handler), auth, "key-1"))
 
     # The credit may have been spent, so this must not settle the attempt.
     assert result["status"] == "error"
@@ -493,7 +493,7 @@ def test_consume_codex_reset_credit_upstream_error_is_unsettled() -> None:
         return httpx.Response(503, text="nope")
 
     auth = ChatGPTCredentials(CodexCredentials(access_token="tok", account_id=None))
-    result = _run(usage.consume_codex_reset_credit(_mock_client(handler), auth, "key-1"))
+    result = _run(provider_usage.consume_codex_reset_credit(_mock_client(handler), auth, "key-1"))
     assert result["status"] == "error"
     assert "503" in result["error"]
 
@@ -503,7 +503,7 @@ def test_consume_codex_reset_credit_transport_error_is_unsettled() -> None:
         raise httpx.ConnectError("no route")
 
     auth = ChatGPTCredentials(CodexCredentials(access_token="tok", account_id=None))
-    result = _run(usage.consume_codex_reset_credit(_mock_client(handler), auth, "key-1"))
+    result = _run(provider_usage.consume_codex_reset_credit(_mock_client(handler), auth, "key-1"))
     assert result["status"] == "error"
     assert result["outcome"] is None
 
@@ -513,10 +513,10 @@ def test_consume_codex_reset_credit_never_calls_out_without_usable_credentials()
         CodexCredentials(access_token="sk-key", account_id=None, is_api_key=True)
     )
     assert _run(
-        usage.consume_codex_reset_credit(_unused_client(), api_key, "key-1")
+        provider_usage.consume_codex_reset_credit(_unused_client(), api_key, "key-1")
     )["status"] == "unavailable"
     assert _run(
-        usage.consume_codex_reset_credit(_unused_client(), MissingCredentials(), "key-1")
+        provider_usage.consume_codex_reset_credit(_unused_client(), MissingCredentials(), "key-1")
     )["status"] == "unavailable"
 
 
@@ -568,7 +568,7 @@ def test_fetch_kimi_usage_maps_windows_and_plan() -> None:
             },
         )
 
-    result = _run(usage.fetch_kimi_usage(_mock_client(handler), KimiCredentialsStore()))
+    result = _run(provider_usage.fetch_kimi_usage(_mock_client(handler), KimiCredentialsStore()))
 
     assert seen["authorization"] == "Bearer kimi-tok"
     assert result["status"] == "ok"
@@ -590,7 +590,7 @@ def test_fetch_kimi_usage_derives_used_from_remaining() -> None:
             json={"usage": {"limit": "100", "remaining": "90", "resetAt": 1754600000}},
         )
 
-    result = _run(usage.fetch_kimi_usage(_mock_client(handler), KimiCredentialsStore()))
+    result = _run(provider_usage.fetch_kimi_usage(_mock_client(handler), KimiCredentialsStore()))
 
     assert result["status"] == "ok"
     assert result["weekly"]["used_percent"] == 10.0
@@ -615,14 +615,14 @@ def test_fetch_kimi_usage_picks_window_closest_to_five_hours() -> None:
             },
         )
 
-    result = _run(usage.fetch_kimi_usage(_mock_client(handler), KimiCredentialsStore()))
+    result = _run(provider_usage.fetch_kimi_usage(_mock_client(handler), KimiCredentialsStore()))
 
     assert result["session"]["used_percent"] == 4.0
     assert result["session"]["window_minutes"] == 300
 
 
 def test_fetch_kimi_usage_missing_credentials_is_unavailable() -> None:
-    result = _run(usage.fetch_kimi_usage(_unused_client(), MissingKimiCredentials()))
+    result = _run(provider_usage.fetch_kimi_usage(_unused_client(), MissingKimiCredentials()))
     assert result["status"] == "unavailable"
     assert "missing Kimi credentials" in result["error"]
 
@@ -631,7 +631,7 @@ def test_fetch_kimi_usage_401_is_an_error() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(401, json={"error": {"message": "invalid token"}})
 
-    result = _run(usage.fetch_kimi_usage(_mock_client(handler), KimiCredentialsStore()))
+    result = _run(provider_usage.fetch_kimi_usage(_mock_client(handler), KimiCredentialsStore()))
     assert result["status"] == "error"
     assert "401" in result["error"]
 
@@ -640,7 +640,7 @@ def test_fetch_kimi_usage_upstream_error() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(500, text="boom")
 
-    result = _run(usage.fetch_kimi_usage(_mock_client(handler), KimiCredentialsStore()))
+    result = _run(provider_usage.fetch_kimi_usage(_mock_client(handler), KimiCredentialsStore()))
     assert result["status"] == "error"
     assert "500" in result["error"]
 
@@ -649,7 +649,7 @@ def test_fetch_kimi_usage_without_windows_is_error() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"user": {}})
 
-    result = _run(usage.fetch_kimi_usage(_mock_client(handler), KimiCredentialsStore()))
+    result = _run(provider_usage.fetch_kimi_usage(_mock_client(handler), KimiCredentialsStore()))
     assert result["status"] == "error"
     assert "quota windows" in result["error"]
 
@@ -714,7 +714,7 @@ def test_fetch_grok_usage_maps_weekly_credits_and_tier() -> None:
             },
         )
 
-    result = _run(usage.fetch_grok_usage(_mock_client(handler), GrokCredentialsStore()))
+    result = _run(provider_usage.fetch_grok_usage(_mock_client(handler), GrokCredentialsStore()))
 
     assert seen["url"].endswith("/v1/billing?format=credits")
     assert seen["authorization"] == "Bearer grok-tok"
@@ -733,7 +733,7 @@ def test_fetch_grok_usage_accepts_top_level_config() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"creditUsagePercent": 10})
 
-    result = _run(usage.fetch_grok_usage(_mock_client(handler), GrokCredentialsStore()))
+    result = _run(provider_usage.fetch_grok_usage(_mock_client(handler), GrokCredentialsStore()))
 
     assert result["status"] == "ok"
     assert result["weekly"]["used_percent"] == 10.0
@@ -758,7 +758,7 @@ def test_fetch_grok_usage_confirmed_weekly_period_means_zero_used() -> None:
             },
         )
 
-    result = _run(usage.fetch_grok_usage(_mock_client(handler), GrokCredentialsStore()))
+    result = _run(provider_usage.fetch_grok_usage(_mock_client(handler), GrokCredentialsStore()))
 
     assert result["status"] == "ok"
     assert result["weekly"]["used_percent"] == 0.0
@@ -783,7 +783,7 @@ def test_fetch_grok_usage_falls_back_to_monthly_budget() -> None:
             },
         )
 
-    result = _run(usage.fetch_grok_usage(_mock_client(handler), GrokCredentialsStore()))
+    result = _run(provider_usage.fetch_grok_usage(_mock_client(handler), GrokCredentialsStore()))
 
     assert len(urls) == 2
     assert result["status"] == "ok"
@@ -797,13 +797,13 @@ def test_fetch_grok_usage_without_credit_usage_is_unavailable() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"config": {}})
 
-    result = _run(usage.fetch_grok_usage(_mock_client(handler), GrokCredentialsStore()))
+    result = _run(provider_usage.fetch_grok_usage(_mock_client(handler), GrokCredentialsStore()))
 
     assert result["status"] == "unavailable"
 
 
 def test_fetch_grok_usage_missing_credentials_is_unavailable() -> None:
-    result = _run(usage.fetch_grok_usage(_unused_client(), MissingGrokCredentials()))
+    result = _run(provider_usage.fetch_grok_usage(_unused_client(), MissingGrokCredentials()))
     assert result["status"] == "unavailable"
     assert "missing Grok credentials" in result["error"]
 
@@ -812,6 +812,6 @@ def test_fetch_grok_usage_401_is_an_error() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(401, json={"error": "invalid token"})
 
-    result = _run(usage.fetch_grok_usage(_mock_client(handler), GrokCredentialsStore()))
+    result = _run(provider_usage.fetch_grok_usage(_mock_client(handler), GrokCredentialsStore()))
     assert result["status"] == "error"
     assert "401" in result["error"]

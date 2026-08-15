@@ -33,9 +33,9 @@ from claudex_gateway.providers.openai_compatible_client import (
 )
 from claudex_gateway.translate import translate_claude_request_to_codex
 from claudex_gateway.upstream_errors import UpstreamAuthError, UpstreamError
-from claudex_gateway.usage import (
+from claudex_gateway.claude_usage import fetch_claude_usage
+from claudex_gateway.provider_usage import (
     consume_codex_reset_credit,
-    fetch_claude_usage,
     fetch_codex_usage,
     fetch_grok_usage,
     fetch_kimi_usage,
