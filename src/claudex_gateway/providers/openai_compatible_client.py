@@ -2,33 +2,24 @@
 
 from __future__ import annotations
 
-import json
 from collections.abc import AsyncIterator
+from contextlib import aclosing
 from typing import Any
 
 import httpx
 
 from claudex_gateway.config.schema import OpenAICompatibleProvider
+from claudex_gateway.providers.client_support import (
+    coerce_context_window,
+    fetch_models_list,
+    stream_sse_events,
+)
 from claudex_gateway.providers.model_catalog_cache import ModelCatalogCache
 from claudex_gateway.upstream_errors import UpstreamError
 
 
 class OpenAICompatibleUpstreamError(UpstreamError):
     """Raised when a custom provider returns a non-success HTTP response."""
-
-    def __init__(self, status_code: int, body: str, provider_name: str) -> None:
-        super().__init__(status_code, body, provider_name)
-
-
-def _coerce_context_window(value: Any) -> int | None:
-    """Apply the catalog's context-window type policy."""
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, int):
-        return value if value > 0 else None
-    if isinstance(value, float) and value.is_integer():
-        return int(value) if value > 0 else None
-    return None
 
 
 class OpenAICompatibleClient:
@@ -52,27 +43,19 @@ class OpenAICompatibleClient:
     ) -> AsyncIterator[dict[str, Any]]:
         """POST a Responses payload and yield each SSE data event as a dict."""
         headers = self._base_headers()
-        async with self._http_client.stream(
-            "POST", f"{self._base_url}/responses", json=payload, headers=headers
-        ) as response:
-            if response.status_code != 200:
-                body = (await response.aread()).decode("utf-8", errors="replace")
-                raise OpenAICompatibleUpstreamError(
-                    response.status_code,
-                    self._redact_api_key(body),
-                    self._name,
-                )
-
-            async for line in response.aiter_lines():
-                if not line.startswith("data:"):
-                    continue
-                data = line[5:].strip()
-                if not data or data == "[DONE]":
-                    continue
-                try:
-                    yield json.loads(data)
-                except json.JSONDecodeError:
-                    continue
+        async with aclosing(
+            stream_sse_events(
+                self._http_client,
+                f"{self._base_url}/responses",
+                payload,
+                headers,
+                make_error=lambda code, body: OpenAICompatibleUpstreamError(
+                    code, self._redact_api_key(body), self._name
+                ),
+            )
+        ) as events:
+            async for event in events:
+                yield event
 
     async def list_models(self) -> list[str]:
         """Return the model IDs from the live OpenAI-shaped catalog."""
@@ -103,7 +86,7 @@ class OpenAICompatibleClient:
             else:
                 limits = entry.get("limits")
                 raw_window = limits.get("contextWindow") if isinstance(limits, dict) else None
-            window = _coerce_context_window(raw_window)
+            window = coerce_context_window(raw_window)
             if window is not None:
                 windows[model_id] = window
         return windows
@@ -112,31 +95,16 @@ class OpenAICompatibleClient:
         """GET the live model catalog and return its `data` list."""
         headers = self._base_headers()
         headers["Accept"] = "application/json"
-        response = await self._http_client.get(
-            f"{self._base_url}/models", headers=headers
+        return await fetch_models_list(
+            self._http_client,
+            f"{self._base_url}/models",
+            headers,
+            label=self._name,
+            make_error=lambda code, body: OpenAICompatibleUpstreamError(
+                code, body, self._name
+            ),
+            redact=self._redact_api_key,
         )
-        if response.status_code != 200:
-            raise OpenAICompatibleUpstreamError(
-                response.status_code,
-                self._redact_api_key(response.text),
-                self._name,
-            )
-        try:
-            parsed = response.json()
-        except ValueError as exc:
-            raise OpenAICompatibleUpstreamError(
-                502,
-                f"{self._name} models response is not valid JSON",
-                self._name,
-            ) from exc
-        data = parsed.get("data") if isinstance(parsed, dict) else None
-        if not isinstance(data, list):
-            raise OpenAICompatibleUpstreamError(
-                502,
-                f"{self._name} models response has no data list",
-                self._name,
-            )
-        return data
 
     def _base_headers(self) -> dict[str, str]:
         return {
