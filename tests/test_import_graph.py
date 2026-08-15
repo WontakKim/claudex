@@ -90,7 +90,10 @@ def _extract_internal_imports(
         if imported_base is None or not _is_internal_module(imported_base):
             continue
 
-        if imported_base in source_modules:
+        if imported_base in source_modules and not (
+            importing_module in package_modules
+            and imported_base == importing_module
+        ):
             dependencies.add(imported_base)
 
         for imported_name in node.names:
@@ -256,6 +259,33 @@ def test_resolves_relative_package_member_import() -> None:
     )
 
     assert "claudex_gateway.paths" in dependencies
+
+
+def test_package_initializer_member_import_adds_no_self_edge() -> None:
+    source = "from . import claude_to_codex"
+
+    dependencies = _extract_internal_imports(
+        source,
+        "claudex_gateway.translate",
+        _SOURCE_MODULES,
+        _PACKAGE_MODULES,
+    )
+
+    assert "claudex_gateway.translate.claude_to_codex" in dependencies
+    assert "claudex_gateway.translate" not in dependencies
+
+
+def test_module_explicit_self_import_keeps_self_edge() -> None:
+    source = "import claudex_gateway.config"
+
+    dependencies = _extract_internal_imports(
+        source,
+        "claudex_gateway.config",
+        _SOURCE_MODULES,
+        _PACKAGE_MODULES,
+    )
+
+    assert "claudex_gateway.config" in dependencies
 
 
 @pytest.mark.parametrize(
