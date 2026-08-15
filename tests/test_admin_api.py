@@ -1869,7 +1869,7 @@ def test_dashboard_settings_tab_leads_and_holds_compaction(
         < page.index('data-t="log"')
     )
     assert '<body data-tab="settings">' in page
-    assert 'var TAB_NAMES=["settings","status","map","log"]' in javascript
+    assert 'const TAB_NAMES=["settings","status","map","log"]' in javascript
     # The category rail leads the pane and deep-links its single category.
     assert 'href="#settings/general"' in page
     assert (
@@ -2154,12 +2154,34 @@ def _compaction_apply_fn(page: str) -> str:
     return page[start:end]
 
 
+def _lockable_apply_fn(page: str) -> str:
+    start = page.index("function applyLockableSetting(config){")
+    end = page.index("/* --- Compaction reroute", start)
+    return page[start:end]
+
+
+def _codex_apply_fn(page: str) -> str:
+    start = page.index("function applyCodex(){")
+    end = page.index(
+        'document.getElementById("codex-fast").addEventListener("change"', start
+    )
+    return page[start:end]
+
+
 def _routing_section(page: str) -> str:
     """Slice the routing card's own markup — "balanced" legitimately appears
     elsewhere in the document (API test prose never, but future copy might),
     so absence is asserted against this scoped slice."""
     start = page.index("<!-- routing-section:start -->")
     end = page.index("<!-- routing-section:end -->")
+    return page[start:end]
+
+
+def _routing_apply_fn(page: str) -> str:
+    start = page.index("function applyRouting(){")
+    end = page.index(
+        'document.getElementById("routing-select").addEventListener("change"', start
+    )
     return page[start:end]
 
 
@@ -2276,8 +2298,11 @@ def test_dashboard_compaction_apply_body_matches_pinned_shape(
         sources = _dashboard_sources(client)
         page = sources["javascript"]
 
-    assert "JSON.stringify({model:model})" in page
     apply_fn = _compaction_apply_fn(page)
+    assert 'jfetch("/admin/settings/compaction",{' in apply_fn
+    assert 'method:"PUT"' in apply_fn
+    assert "headers:JSON_HEADERS" in apply_fn
+    assert "JSON.stringify({model:model})" in apply_fn
     # Disabled sends exactly {"model": null}; curated/custom selections carry
     # the "claude:" prefix parse_compaction_model expects.
     assert "model=null" in apply_fn
@@ -2304,17 +2329,22 @@ def test_dashboard_compaction_409_branch_refreshes_via_get_not_error_body(
         sources = _dashboard_sources(client)
         page = sources["javascript"]
 
+    shared_apply = _lockable_apply_fn(page)
+    branch_start = shared_apply.index("r.status===409")
+    branch_end = shared_apply.index("if(!r.ok){", branch_start)
+    locked_branch = shared_apply[branch_start:branch_end]
     apply_fn = _compaction_apply_fn(page)
-    branch_start = apply_fn.index("r.status===409")
-    branch_end = apply_fn.index("if(!r.ok){", branch_start)
-    locked_branch = apply_fn[branch_start:branch_end]
 
-    # Controls lock and the admin error renders before any GET is issued.
-    assert "COMP.locked=true" in locked_branch
-    assert "errDetail(r.body)" in locked_branch
-    # Current state is only ever adopted from a fresh, authenticated GET —
-    # never from the 409 response body itself.
-    assert 'jfetch("/admin/settings/compaction")' in locked_branch
+    # The shared flow locks and renders the admin error before refreshing.
+    lock_at = locked_branch.index("config.lock()")
+    error_at = locked_branch.index("errDetail(r.body)")
+    refresh_at = locked_branch.index("config.refresh()")
+    assert lock_at < error_at < refresh_at
+    # The compaction wrapper provides the lock mutation and authenticated GET;
+    # the 409 response body itself is never passed to the state renderer.
+    assert "COMP.locked=true" in apply_fn
+    assert 'refresh:function(){return jfetch("/admin/settings/compaction")}' in apply_fn
+    assert "renderCompactionState(g.body)" in apply_fn
 
 
 def test_dashboard_compaction_409_refresh_failure_stays_locked(
@@ -2327,25 +2357,28 @@ def test_dashboard_compaction_409_refresh_failure_stays_locked(
         sources = _dashboard_sources(client)
         page = sources["javascript"]
 
+    shared_apply = _lockable_apply_fn(page)
     apply_fn = _compaction_apply_fn(page)
-    branch_start = apply_fn.index("r.status===409")
-    branch_end = apply_fn.index("if(!r.ok){", branch_start)
-    locked_branch = apply_fn[branch_start:branch_end]
 
-    refresh_start = locked_branch.index('jfetch("/admin/settings/compaction")')
-    refresh_branch = locked_branch[refresh_start:]
-    # renderCompactionState is guarded on a successful, well-formed envelope.
-    guard_at = refresh_branch.index('typeof g.body.env_locked==="boolean"')
-    render_at = refresh_branch.index("renderCompactionState(g.body)")
+    # The wrapper validates a successful, well-formed refresh envelope before
+    # handing it to renderCompactionState.
+    guard_at = apply_fn.index('typeof g.body.env_locked==="boolean"')
+    render_at = apply_fn.index("renderCompactionState(g.body)")
     assert guard_at < render_at
-    assert "g.ok" in refresh_branch[:render_at]
-    # The failure arm keeps the card locked instead of adopting the body.
-    else_arm = refresh_branch[render_at:]
-    assert "COMP.locked=true" in else_arm
-    assert "renderCompactionState(g.body)" in locked_branch
-    assert "r.body.model" not in locked_branch
-    assert "r.body.env_locked" not in locked_branch
-    assert "r.body.last_reroute" not in locked_branch
+    assert "g.ok" in apply_fn[:render_at]
+    # The shared failure arm re-locks and re-renders instead of adopting the
+    # malformed body.
+    fresh_guard = shared_apply.index("if(config.isFresh(g)){")
+    adopt_at = shared_apply.index("config.adopt(g)", fresh_guard)
+    failure_arm = shared_apply[adopt_at:]
+    assert "config.lock()" in failure_arm
+    assert "config.render()" in failure_arm
+    assert "COMP.locked=true" in apply_fn
+    assert "renderCompactionState(g.body)" in apply_fn
+    locked_sources = shared_apply + apply_fn
+    assert "r.body.model" not in locked_sources
+    assert "r.body.env_locked" not in locked_sources
+    assert "r.body.last_reroute" not in locked_sources
 
 
 def _codex_section(page: str) -> str:
@@ -2371,8 +2404,11 @@ def test_dashboard_codex_fast_card_wires_apply_flow_and_env_lock(
     assert "silently stay standard" in section
     assert "CLAUDEX_CODEX_SERVICE_TIER" in javascript
     assert 'jfetch("/admin/settings/codex")' in javascript
-    assert 'jfetch("/admin/settings/codex",{' in javascript
-    assert 'JSON.stringify({service_tier:CODEX.draft?"fast":null})' in javascript
+    apply_fn = _codex_apply_fn(javascript)
+    assert 'jfetch("/admin/settings/codex",{' in apply_fn
+    assert 'method:"PUT"' in apply_fn
+    assert "headers:JSON_HEADERS" in apply_fn
+    assert 'JSON.stringify({service_tier:CODEX.draft?"fast":null})' in apply_fn
     assert "checkbox.disabled=CODEX.locked" in javascript
     assert (
         "btn.disabled=CODEX.locked||CODEX.draft===(CODEX.serviceTier===\"fast\")"
@@ -2520,8 +2556,11 @@ def test_dashboard_routing_section_wires_endpoint(
     # Boot GET and the apply PUT both target the pool/routing endpoint, and
     # the PUT body is pinned to exactly {"mode": ...}.
     assert 'jfetch("/admin/providers/claude/pool/routing")' in javascript
-    assert 'jfetch("/admin/providers/claude/pool/routing",{' in javascript
-    assert "JSON.stringify({mode:ROUTING.draft})" in javascript
+    apply_fn = _routing_apply_fn(javascript)
+    assert 'jfetch("/admin/providers/claude/pool/routing",{' in apply_fn
+    assert 'method:"PUT"' in apply_fn
+    assert "headers:JSON_HEADERS" in apply_fn
+    assert "JSON.stringify({mode:ROUTING.draft})" in apply_fn
     section = _routing_section(page)
     assert ">Disabled<" in section
     assert ">Fallback<" in section
@@ -2574,12 +2613,10 @@ def test_dashboard_routing_locked_renders_readonly(
         "#compaction-card.locked .complock,#codex-card.locked .complock,"
         "#routing-card.locked .complock{display:block}" in stylesheet
     )
-    apply_fn = page[
-        page.index("function applyRouting(){") : page.index(
-            'document.getElementById("routing-select").addEventListener("change"'
-        )
-    ]
-    assert "r.status===409" in apply_fn
+    shared_apply = _lockable_apply_fn(page)
+    apply_fn = _routing_apply_fn(page)
+    assert "r.status===409" in shared_apply
+    assert "config.lock()" in shared_apply
     assert "ROUTING.locked=true" in apply_fn
 
 
@@ -2614,9 +2651,13 @@ def test_dashboard_login_modal_drives_the_login_endpoints(
         page = sources["javascript"]
 
     # All five login endpoints are wired: start, poll, code, confirm, cancel.
-    assert 'jfetch("/admin/providers/claude/login",{\n    method:"POST"' in page.replace(
-        "\r\n", "\n"
-    ) or 'method:"POST",headers:{"Content-Type":"application/json"},body:"{}"' in page
+    assert 'const JSON_HEADERS={"Content-Type":"application/json"}' in page
+    login_start = page.index("function openLoginModal(){")
+    login_end = page.index("function pollLogin(){", login_start)
+    login_start_flow = page[login_start:login_end]
+    assert 'jfetch("/admin/providers/claude/login",{' in login_start_flow
+    assert 'method:"POST",headers:JSON_HEADERS,body:"{}"' in login_start_flow
+    assert page.count("attemptHeaders(attempt,JSON_HEADERS)") == 2
     assert 'jfetch("/admin/providers/claude/login")' in page
     assert "/admin/providers/claude/login/code" in page
     assert "/admin/providers/claude/login/replace" in page

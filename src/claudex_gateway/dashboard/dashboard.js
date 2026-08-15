@@ -1,3 +1,12 @@
+/* === Shared constants and helpers ======================================== */
+const JSON_HEADERS={"Content-Type":"application/json"};
+function pad(n){return(n<10?"0":"")+n}
+function setButtonBusy(button){
+  button.disabled=true;
+  button.textContent="…";
+}
+
+/* === Routing map and board =============================================== */
 var CLAUDE_KEYS=["fable","opus","sonnet","haiku"];
 /* Every target value names its provider with a prefix. Custom provider names
    join the built-ins once the mapping payload arrives. */
@@ -372,7 +381,7 @@ board.addEventListener("wheel",function(ev){
   zoom=next;
   applyView();drawWires();
 },{passive:false});
-/* --- staging a target node ------------------------------------------------ */
+/* === Target node staging ================================================= */
 var addProvider="codex";
 document.getElementById("add-prov").innerHTML=ROUTE_PROVIDERS.map(function(p){
   // Optional providers start hidden; setProviderVisibility reveals them
@@ -438,7 +447,7 @@ function showToast(html,isErr){
   clearTimeout(toastTimer);
   toastTimer=setTimeout(function(){t.remove()},4500);
 }
-/* --- live data plumbing ------------------------------------------------- */
+/* === Data access and provider status ===================================== */
 /* CLAUDEX_LOCAL_TOKEN lives only in these closure variables for the page's
    lifetime: never in HTML, URLs, storage, or logs. */
 var authRequired=false,localToken=null;
@@ -547,58 +556,36 @@ function setProviderVisibility(h){
     if(btn)btn.classList.toggle("provider-hidden",!visible);
   });
 }
+function renderProviderHealth(provider,info,successDetail,account,unusedDetail,errorDetail,command){
+  if(info.status==="ok"){
+    renderStatLine(provider,"okv",null,'● OK <span class="detail">'+successDetail+"</span>"+
+      (account?'<div class="codeblock">'+esc(String(account))+"</div>":""));
+    return;
+  }
+  var isUnused=info.required===false&&unusedDetail;
+  var copyId=provider+"-login-copy";
+  renderStatLine(provider,isUnused?"":"err",info.detail||"",
+    '● '+(isUnused?"미사용":"ERROR")+' <span class="detail">'+(isUnused?unusedDetail:errorDetail)+"</span>"+
+    '<div class="codeblock"><span class="tx">$ '+command+'</span>'+
+    '<button class="cp" id="'+copyId+'" title="복사"></button></div>');
+  wireCopy(document.getElementById(copyId),command);
+}
 function renderProviderCards(h){
   var codex=(h.providers||{}).codex||{};
-  if(codex.status==="ok"){
-    renderStatLine("codex","okv",null,'● OK <span class="detail">'+
-      (codex.auth_mode==="api_key"?"API 키로 인증됨":"ChatGPT 계정으로 로그인됨")+"</span>"+
-      (codex.auth_mode!=="api_key"&&(codex.email||codex.account)
-        ?'<div class="codeblock">'+esc(String(codex.email||codex.account))+"</div>":""));
-  }else{
-    renderStatLine("codex","err",codex.detail||"",
-      '● ERROR <span class="detail">Codex 로그인이 필요합니다</span>'+
-      '<div class="codeblock"><span class="tx">$ codex login</span>'+
-      '<button class="cp" id="codex-login-copy" title="복사"></button></div>');
-    wireCopy(document.getElementById("codex-login-copy"),"codex login");
-  }
+  renderProviderHealth("codex",codex,
+    codex.auth_mode==="api_key"?"API 키로 인증됨":"ChatGPT 계정으로 로그인됨",
+    codex.auth_mode!=="api_key"?(codex.email||codex.account):null,
+    null,"Codex 로그인이 필요합니다","codex login");
   var kimi=(h.providers||{}).kimi||{};
-  if(kimi.status==="ok"){
-    renderStatLine("kimi","okv",null,'● OK <span class="detail">Kimi 계정으로 로그인됨</span>'+
-      (kimi.account?'<div class="codeblock">'+esc(String(kimi.account))+"</div>":""));
-  }else if(kimi.required===false){
-    // Kimi login does not affect readiness without a route, so use a neutral state.
-    renderStatLine("kimi","",kimi.detail||"",
-      '● 미사용 <span class="detail">모델 맵에 kimi: 타겟이 없어 로그인하지 않아도 됩니다</span>'+
-      '<div class="codeblock"><span class="tx">$ kimi login</span>'+
-      '<button class="cp" id="kimi-login-copy" title="복사"></button></div>');
-    wireCopy(document.getElementById("kimi-login-copy"),"kimi login");
-  }else{
-    renderStatLine("kimi","err",kimi.detail||"",
-      '● ERROR <span class="detail">Kimi 로그인이 필요합니다</span>'+
-      '<div class="codeblock"><span class="tx">$ kimi login</span>'+
-      '<button class="cp" id="kimi-login-copy" title="복사"></button></div>');
-    wireCopy(document.getElementById("kimi-login-copy"),"kimi login");
-  }
+  renderProviderHealth("kimi",kimi,"Kimi 계정으로 로그인됨",kimi.account,
+    "모델 맵에 kimi: 타겟이 없어 로그인하지 않아도 됩니다",
+    "Kimi 로그인이 필요합니다","kimi login");
   var grok=(h.providers||{}).grok||{};
-  if(grok.status==="ok"){
-    renderStatLine("grok","okv",null,'● OK <span class="detail">'+
-      (grok.auth_mode==="api_key"?"API 키로 인증됨":"Grok 계정으로 로그인됨")+"</span>"+
-      (grok.auth_mode!=="api_key"&&grok.account
-        ?'<div class="codeblock">'+esc(String(grok.account))+"</div>":""));
-  }else if(grok.required===false){
-    // Grok login does not affect readiness without a route, so use a neutral state.
-    renderStatLine("grok","",grok.detail||"",
-      '● 미사용 <span class="detail">모델 맵에 grok: 타겟이 없어 로그인하지 않아도 됩니다</span>'+
-      '<div class="codeblock"><span class="tx">$ grok login</span>'+
-      '<button class="cp" id="grok-login-copy" title="복사"></button></div>');
-    wireCopy(document.getElementById("grok-login-copy"),"grok login");
-  }else{
-    renderStatLine("grok","err",grok.detail||"",
-      '● ERROR <span class="detail">Grok 로그인이 필요합니다</span>'+
-      '<div class="codeblock"><span class="tx">$ grok login</span>'+
-      '<button class="cp" id="grok-login-copy" title="복사"></button></div>');
-    wireCopy(document.getElementById("grok-login-copy"),"grok login");
-  }
+  renderProviderHealth("grok",grok,
+    grok.auth_mode==="api_key"?"API 키로 인증됨":"Grok 계정으로 로그인됨",
+    grok.auth_mode!=="api_key"?grok.account:null,
+    "모델 맵에 grok: 타겟이 없어 로그인하지 않아도 됩니다",
+    "Grok 로그인이 필요합니다","grok login");
   CUSTOM_PROVIDERS.forEach(function(provider){
     var name=provider.name,info=(h.providers||{})[name]||{};
     if(info.status==="ok"){
@@ -636,7 +623,6 @@ function syncLogTimer(){
 }
 function fmtLogTs(ts){
   var d=new Date(ts*1000);
-  function pad(n){return(n<10?"0":"")+n}
   return pad(d.getHours())+":"+pad(d.getMinutes())+":"+pad(d.getSeconds());
 }
 function renderLogs(entries){
@@ -657,7 +643,7 @@ function fetchLogs(){
 function setLogLevel(level){
   jfetch("/admin/settings/log-level",{
     method:"PUT",
-    headers:{"Content-Type":"application/json"},
+    headers:JSON_HEADERS,
     body:JSON.stringify({log_level:level})
   }).then(function(r){
     if(!r.ok){
@@ -672,8 +658,46 @@ function setLogLevel(level){
     showToast('<span class="chip chip-err">ERROR</span><br>log level<br><span class="dim">gateway unreachable</span>',true);
   });
 }
-/* --- compaction reroute (Claude Code's own compaction requests, sent
-   directly to Anthropic instead of the mapped provider) ------------------ */
+/* === Lockable settings =================================================== */
+/* A 409 error body is never a settings envelope. Lock immediately, report
+   its error detail, and adopt state only from the authenticated refresh GET. */
+function applyLockableSetting(config){
+  setButtonBusy(config.button);
+  config.request().then(function(r){
+    if(r.status===409){
+      config.lock();
+      config.render();
+      showToast('<span class="chip chip-err">LOCKED</span><span class="lat">409</span><br>'+esc(config.envName)+
+        '<br><span class="dim">'+esc(errDetail(r.body))+"</span>",true);
+      config.refresh().then(function(g){
+        if(config.isFresh(g)){
+          config.adopt(g);
+        }else{
+          config.lock();
+          config.render();
+          showToast('<span class="chip chip-err">ERROR</span><br>'+config.refreshName+
+            '<br><span class="dim">could not load current state</span>',true);
+        }
+      });
+      return;
+    }
+    if(!r.ok){
+      config.render();
+      showToast('<span class="chip chip-err">ERROR</span><span class="lat">'+r.status+"</span><br>"+config.name+
+        '<br><span class="dim">'+esc(errDetail(r.body))+"</span>",true);
+      return;
+    }
+    config.adopt(r);
+    showToast('<span class="chip chip-ok">APPLIED</span><br>'+config.successText(r.body),false);
+  }).catch(function(){
+    config.render();
+    showToast('<span class="chip chip-err">ERROR</span><br>'+config.name+
+      '<br><span class="dim">gateway unreachable</span>',true);
+  });
+}
+
+/* --- Compaction reroute: Claude Code's own compaction requests go directly
+   to Anthropic instead of the mapped provider. ---------------------------- */
 var COMP={
   envName:"CLAUDEX_COMPACTION_MODEL",
   locked:false,
@@ -736,44 +760,23 @@ function applyCompaction(){
   }else{
     model="claude:"+COMP.draftKind;
   }
-  btn.disabled=true;btn.textContent="…";
-  jfetch("/admin/settings/compaction",{
-    method:"PUT",
-    headers:{"Content-Type":"application/json"},
-    body:JSON.stringify({model:model})
-  }).then(function(r){
-    if(r.status===409){
-      COMP.locked=true;
-      renderCompaction();
-      showToast('<span class="chip chip-err">LOCKED</span><span class="lat">409</span><br>'+esc(COMP.envName)+
-        '<br><span class="dim">'+esc(errDetail(r.body))+"</span>",true);
-      // The 409 body is only the admin error envelope, never state: model,
-      // env_locked and last_reroute are only ever read from this fresh GET,
-      // never from r.body above. And if that refresh GET itself fails or
-      // returns a malformed envelope, its body must not be rendered as
-      // state either — the card stays locked with its previous live state.
-      jfetch("/admin/settings/compaction").then(function(g){
-        if(g.ok&&g.body&&typeof g.body.env_locked==="boolean"&&"model" in g.body&&"last_reroute" in g.body){
-          renderCompactionState(g.body);
-        }else{
-          COMP.locked=true;
-          renderCompaction();
-          showToast('<span class="chip chip-err">ERROR</span><br>Compaction refresh<br><span class="dim">could not load current state</span>',true);
-        }
-      });
-      return;
-    }
-    if(!r.ok){
-      renderCompaction();
-      showToast('<span class="chip chip-err">ERROR</span><span class="lat">'+r.status+"</span><br>Compaction"+
-        '<br><span class="dim">'+esc(errDetail(r.body))+"</span>",true);
-      return;
-    }
-    renderCompactionState(r.body);
-    showToast('<span class="chip chip-ok">APPLIED</span><br>Compaction → '+esc(r.body.model||"Disabled"),false);
-  }).catch(function(){
-    renderCompaction();
-    showToast('<span class="chip chip-err">ERROR</span><br>Compaction<br><span class="dim">gateway unreachable</span>',true);
+  applyLockableSetting({
+    button:btn,
+    request:function(){return jfetch("/admin/settings/compaction",{
+      method:"PUT",
+      headers:JSON_HEADERS,
+      body:JSON.stringify({model:model})
+    })},
+    refresh:function(){return jfetch("/admin/settings/compaction")},
+    lock:function(){COMP.locked=true},
+    render:renderCompaction,
+    isFresh:function(g){return g.ok&&g.body&&typeof g.body.env_locked==="boolean"&&
+      "model" in g.body&&"last_reroute" in g.body},
+    adopt:function(g){renderCompactionState(g.body)},
+    envName:COMP.envName,
+    name:"Compaction",
+    refreshName:"Compaction refresh",
+    successText:function(body){return "Compaction → "+esc(body.model||"Disabled")}
   });
 }
 document.getElementById("comp-select").addEventListener("change",function(){
@@ -810,39 +813,22 @@ function renderCodexState(body){
 function applyCodex(){
   var btn=document.getElementById("codex-apply");
   if(CODEX.locked||btn.disabled)return;
-  btn.disabled=true;btn.textContent="…";
-  jfetch("/admin/settings/codex",{
-    method:"PUT",
-    headers:{"Content-Type":"application/json"},
-    body:JSON.stringify({service_tier:CODEX.draft?"fast":null})
-  }).then(function(r){
-    if(r.status===409){
-      CODEX.locked=true;
-      renderCodex();
-      showToast('<span class="chip chip-err">LOCKED</span><span class="lat">409</span><br>'+esc(CODEX.envName)+
-        '<br><span class="dim">'+esc(errDetail(r.body))+"</span>",true);
-      jfetch("/admin/settings/codex").then(function(g){
-        if(g.ok&&isCodexEnvelope(g.body)){
-          renderCodexState(g.body);
-        }else{
-          CODEX.locked=true;
-          renderCodex();
-          showToast('<span class="chip chip-err">ERROR</span><br>Codex Fast refresh<br><span class="dim">could not load current state</span>',true);
-        }
-      });
-      return;
-    }
-    if(!r.ok){
-      renderCodex();
-      showToast('<span class="chip chip-err">ERROR</span><span class="lat">'+r.status+"</span><br>Codex Fast"+
-        '<br><span class="dim">'+esc(errDetail(r.body))+"</span>",true);
-      return;
-    }
-    renderCodexState(r.body);
-    showToast('<span class="chip chip-ok">APPLIED</span><br>Codex Fast → '+(r.body.service_tier==="fast"?"Enabled":"Disabled"),false);
-  }).catch(function(){
-    renderCodex();
-    showToast('<span class="chip chip-err">ERROR</span><br>Codex Fast<br><span class="dim">gateway unreachable</span>',true);
+  applyLockableSetting({
+    button:btn,
+    request:function(){return jfetch("/admin/settings/codex",{
+      method:"PUT",
+      headers:JSON_HEADERS,
+      body:JSON.stringify({service_tier:CODEX.draft?"fast":null})
+    })},
+    refresh:function(){return jfetch("/admin/settings/codex")},
+    lock:function(){CODEX.locked=true},
+    render:renderCodex,
+    isFresh:function(g){return g.ok&&isCodexEnvelope(g.body)},
+    adopt:function(g){renderCodexState(g.body)},
+    envName:CODEX.envName,
+    name:"Codex Fast",
+    refreshName:"Codex Fast refresh",
+    successText:function(body){return "Codex Fast → "+(body.service_tier==="fast"?"Enabled":"Disabled")}
   });
 }
 document.getElementById("codex-fast").addEventListener("change",function(){
@@ -885,39 +871,22 @@ function renderRoutingState(body){
 function applyRouting(){
   var btn=document.getElementById("routing-apply");
   if(ROUTING.locked||btn.disabled)return;
-  btn.disabled=true;btn.textContent="…";
-  jfetch("/admin/providers/claude/pool/routing",{
-    method:"PUT",
-    headers:{"Content-Type":"application/json"},
-    body:JSON.stringify({mode:ROUTING.draft})
-  }).then(function(r){
-    if(r.status===409){
-      ROUTING.locked=true;
-      renderRouting();
-      showToast('<span class="chip chip-err">LOCKED</span><span class="lat">409</span><br>'+esc(ROUTING.envName)+
-        '<br><span class="dim">'+esc(errDetail(r.body))+"</span>",true);
-      jfetch("/admin/providers/claude/pool/routing").then(function(g){
-        if(g.ok&&isRoutingEnvelope(g.body)){
-          renderRoutingState(g.body);
-        }else{
-          ROUTING.locked=true;
-          renderRouting();
-          showToast('<span class="chip chip-err">ERROR</span><br>라우팅 새로고침<br><span class="dim">could not load current state</span>',true);
-        }
-      });
-      return;
-    }
-    if(!r.ok){
-      renderRouting();
-      showToast('<span class="chip chip-err">ERROR</span><span class="lat">'+r.status+"</span><br>계정 라우팅"+
-        '<br><span class="dim">'+esc(errDetail(r.body))+"</span>",true);
-      return;
-    }
-    renderRoutingState(r.body);
-    showToast('<span class="chip chip-ok">APPLIED</span><br>라우팅 → '+(ROUTING_LABELS[r.body.mode]||"Disabled"),false);
-  }).catch(function(){
-    renderRouting();
-    showToast('<span class="chip chip-err">ERROR</span><br>계정 라우팅<br><span class="dim">gateway unreachable</span>',true);
+  applyLockableSetting({
+    button:btn,
+    request:function(){return jfetch("/admin/providers/claude/pool/routing",{
+      method:"PUT",
+      headers:JSON_HEADERS,
+      body:JSON.stringify({mode:ROUTING.draft})
+    })},
+    refresh:function(){return jfetch("/admin/providers/claude/pool/routing")},
+    lock:function(){ROUTING.locked=true},
+    render:renderRouting,
+    isFresh:function(g){return g.ok&&isRoutingEnvelope(g.body)},
+    adopt:function(g){renderRoutingState(g.body)},
+    envName:ROUTING.envName,
+    name:"계정 라우팅",
+    refreshName:"라우팅 새로고침",
+    successText:function(body){return "라우팅 → "+(ROUTING_LABELS[body.mode]||"Disabled")}
   });
 }
 document.getElementById("routing-select").addEventListener("change",function(){
@@ -925,6 +894,7 @@ document.getElementById("routing-select").addEventListener("change",function(){
   renderRouting();
 });
 document.getElementById("routing-apply").addEventListener("click",applyRouting);
+/* === Settings navigation and Claude accounts ============================= */
 /* The Settings rail switches the visible category card (.scard) and pins a
    deep-linkable #settings/<cat> hash; entering the accounts category fetches
    its data. */
@@ -963,7 +933,6 @@ function planLabel(planType){
 function fmtAcctDate(epochMs){
   if(typeof epochMs!=="number")return"—";
   var d=new Date(epochMs);
-  function pad(n){return(n<10?"0":"")+n}
   return d.getFullYear()+"-"+pad(d.getMonth()+1)+"-"+pad(d.getDate());
 }
 function fmtAgo(epochSec){
@@ -982,7 +951,6 @@ function fmtAge(ageSeconds){
 function fmtCooldownUntil(epochMs){
   if(typeof epochMs!=="number")return"—";
   var d=new Date(epochMs);
-  function pad(n){return(n<10?"0":"")+n}
   return d.getFullYear()+"-"+pad(d.getMonth()+1)+"-"+pad(d.getDate())+" "+pad(d.getHours())+":"+pad(d.getMinutes());
 }
 function routingBadgeHtml(accountId){
@@ -1210,7 +1178,7 @@ function setServingAccount(accountId){
   (accountId
     ?jfetch("/admin/providers/claude/pool/serving",{
       method:"PUT",
-      headers:{"Content-Type":"application/json"},
+      headers:JSON_HEADERS,
       body:JSON.stringify({account_id:accountId})
     })
     :jfetch("/admin/providers/claude/pool/serving",{method:"DELETE"})
@@ -1268,7 +1236,7 @@ document.getElementById("acct-list").addEventListener("click",function(e){
         btn.classList.add("armed");btn.textContent="정말 제거";
       }else{
         delete ACCT.removeArmed[id];
-        btn.disabled=true;btn.textContent="…";
+        setButtonBusy(btn);
         removeAccount(id);
       }
     }
@@ -1294,17 +1262,17 @@ document.getElementById("btn-add-account").addEventListener("click",function(){o
 document.getElementById("btn-local-refresh").addEventListener("click",function(){
   var btn=this;
   if(btn.disabled)return;
-  btn.disabled=true;btn.textContent="…";
+  setButtonBusy(btn);
   ACCT.localUsage=null;renderLocalHero();
   fetchLocalHeroUsage().finally(function(){btn.disabled=false;btn.textContent="갱신"});
 });
 document.getElementById("btn-usage-refresh").addEventListener("click",function(){
   var btn=this;
   if(btn.disabled)return;
-  btn.disabled=true;btn.textContent="…";
+  setButtonBusy(btn);
   refreshAccountUsage().finally(function(){btn.disabled=false;btn.textContent="사용량 새로고침"});
 });
-/* --- dashboard login (browser OAuth through the gateway's claude CLI) -----
+/* === Dashboard login (browser OAuth through the gateway's Claude CLI) =====
    POST starts the session (or attaches to a running one on 409 login-active);
    a 1s poll drives the modal. The body re-renders only when the session
    status materially changes — an unconditional re-render would wipe the code
@@ -1362,7 +1330,7 @@ function openLoginModal(){
   // its attempt over the one the latest open established.
   var generation=++LOGIN.openGeneration;
   jfetch("/admin/providers/claude/login",{
-    method:"POST",headers:{"Content-Type":"application/json"},body:"{}"
+    method:"POST",headers:JSON_HEADERS,body:"{}"
   }).then(function(r){
     if(generation!==LOGIN.openGeneration)return;
     var code=r.body&&r.body.error&&r.body.error.code;
@@ -1487,7 +1455,7 @@ function submitLoginCode(){
   var attempt=LOGIN.attemptId;
   if(!attempt)return;
   jfetch("/admin/providers/claude/login/code",{
-    method:"POST",headers:attemptHeaders(attempt,{"Content-Type":"application/json"}),
+    method:"POST",headers:attemptHeaders(attempt,JSON_HEADERS),
     body:JSON.stringify({code:code})
   }).then(function(r){
     if(!isCurrentAttempt(attempt))return;
@@ -1527,7 +1495,7 @@ document.getElementById("login-modal").addEventListener("click",function(e){
     var attempt=LOGIN.attemptId;
     if(!attempt)return;
     jfetch("/admin/providers/claude/login/replace",{
-      method:"POST",headers:attemptHeaders(attempt,{"Content-Type":"application/json"}),
+      method:"POST",headers:attemptHeaders(attempt,JSON_HEADERS),
       body:JSON.stringify({existing_account_id:LOGIN.existingAccountId})
     }).then(function(r){
       if(!isCurrentAttempt(attempt))return;
@@ -1541,12 +1509,13 @@ document.getElementById("login-modal").addEventListener("click",function(e){
 document.getElementById("login-modal").addEventListener("keydown",function(e){
   if(e.key==="Enter"&&e.target.id==="login-code-input"){e.preventDefault();submitLoginCode()}
 });
+/* === Map apply and connection test ======================================= */
 function apply(){
   if(DIR.locked)return;
   var count=dirtyCount();
   jfetch("/admin/settings/mapping",{
     method:"PUT",
-    headers:{"Content-Type":"application/json"},
+    headers:JSON_HEADERS,
     body:JSON.stringify({model_map:DIR.mapping})
   }).then(function(r){
     if(r.status===409){
@@ -1583,11 +1552,11 @@ function runConnTest(){
   var n=document.getElementById("ct-in").value.trim();
   var btn=document.getElementById("ct-btn");
   if(!n||btn.disabled)return;
-  btn.disabled=true;btn.textContent="…";
+  setButtonBusy(btn);
   var label='"'+esc(n)+'"';
   jfetch("/admin/test",{
     method:"POST",
-    headers:{"Content-Type":"application/json"},
+    headers:JSON_HEADERS,
     body:JSON.stringify({target:n})
   }).then(function(r){
     btn.disabled=false;btn.textContent="Test";
@@ -1648,14 +1617,13 @@ function setTab(t){
   if(t==="log")fetchLogs();
   syncLogTimer();
 }
-var TAB_NAMES=["settings","status","map","log"];
-/* --- subscription usage (merged into the Status tab's provider cards) ----- */
+const TAB_NAMES=["settings","status","map","log"];
+/* === Subscription usage in Status provider cards ========================= */
 function fmtPct(v){return (Math.round(v*10)/10)+"%"}
 function fmtReset(epochSec){
   if(!epochSec)return"리셋 시각 정보 없음";
   var ms=epochSec*1000,diffMin=Math.max(0,Math.round((ms-Date.now())/60000));
   var d=new Date(ms);
-  function pad(n){return(n<10?"0":"")+n}
   var days=["일","월","화","수","목","금","토"];
   var abs=(d.toDateString()===new Date().toDateString())
     ?pad(d.getHours())+":"+pad(d.getMinutes())
@@ -1781,7 +1749,7 @@ function fetchUsage(provider){
 document.getElementById("tab-status").addEventListener("click",function(ev){
   var btn=ev.target.closest?ev.target.closest(".urefresh"):null;
   if(!btn||btn.disabled)return;
-  btn.disabled=true;btn.textContent="…";
+  setButtonBusy(btn);
   fetchUsage(btn.dataset.provider);
 });
 /* --- spending a Codex reset credit ---------------------------------------
@@ -1815,10 +1783,10 @@ document.getElementById("reset-modal").addEventListener("click",function(ev){
 document.addEventListener("keydown",function(ev){if(ev.key==="Escape")closeResetModal()});
 document.getElementById("reset-confirm").addEventListener("click",function(){
   if(this.disabled)return;
-  this.disabled=true;this.textContent="…";
+  setButtonBusy(this);
   jfetch("/admin/providers/codex/reset-credit",{
     method:"POST",
-    headers:{"Content-Type":"application/json"},
+    headers:JSON_HEADERS,
     body:"{}"
   }).then(function(r){
     closeResetModal();
@@ -1855,6 +1823,7 @@ window.addEventListener("hashchange",function(){
   if(TAB_NAMES.indexOf(parts[0])>=0)setTab(parts[0]);
   if(parts[0]==="settings")setSettingsCat(parts[1]||"general");
 });
+/* === Page startup ======================================================== */
 function boot(){
   document.getElementById("ep").textContent=location.host;
   // Fill the usage bodies before the first request goes out: an empty body
