@@ -13,7 +13,7 @@ this version — on Windows, always use `--from <dir>` instead.
 
 Adding an account whose `(email, organization)` identity is already
 registered replaces that account's stored credentials in place after a
-confirmation prompt — the account keeps its id, so a `account use`
+confirmation prompt — the account keeps its id, so an `account use`
 selection keeps working. This doubles as the re-auth flow for an account
 whose refresh token has gone stale. Non-interactive runs (piped stdin with
 `--from`) require `--yes` to confirm the replacement.

@@ -3,9 +3,9 @@
 ## Behavior
 
 - Serves `POST /v1/messages` in Anthropic Messages format: models with a
-  `CLAUDEX_MODEL_MAP` entry are translated to the Codex Responses backend,
-  everything else is forwarded byte-for-byte to the real Anthropic API with
-  the client's own credentials.
+  `CLAUDEX_MODEL_MAP` entry are routed to the provider-prefixed target
+  backend, while everything else is forwarded byte-for-byte to the real
+  Anthropic API with the client's own credentials.
 - Answers as the Claude model the client requested — the Codex, Kimi, or Grok
   target model never appears on the Anthropic wire, so Claude Code heuristics
   keyed on model names keep working.
