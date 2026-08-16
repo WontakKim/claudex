@@ -21,8 +21,9 @@ from claudex.balanced.state_store import ClaudePoolRuntimeStateStore
 
 # Budget: at most one actual upstream call per this many seconds, burst one
 # (no credit banking -- a call arriving before the interval elapses is
-# refused outright, not deferred or accumulated).
-_USAGE_POLL_INTERVAL_SECONDS = 30.0
+# refused outright, not deferred or accumulated). Kept coarse because the
+# Anthropic OAuth usage API rate-limits aggressively.
+_USAGE_POLL_INTERVAL_SECONDS = 5 * 60.0
 
 # Manual refresh: at most one NEW enqueue globally per this many seconds. A
 # repeat request for an ALREADY-pending account always coalesces (never
