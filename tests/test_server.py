@@ -1894,7 +1894,12 @@ def _make_usage_poll_coordinator(
     cache = ClaudeAccountUsageCache(fetch, clock=clock)
     router = ClaudeBalancedRouter(balanced_epoch_id="epoch-1", clock=clock, wall_clock=clock)
     coordinator = ClaudeUsagePollCoordinator(
-        cache=cache, router=router, store=store, clock=clock, wall_clock=clock
+        cache=cache,
+        router=router,
+        store=store,
+        clock=clock,
+        wall_clock=clock,
+        poll_interval_seconds=30.0,
     )
     return coordinator, cache, router
 
@@ -1907,7 +1912,7 @@ class TestUsagePollCoordinatorScheduling:
 
     def test_coordinator_enforces_the_actual_call_budget(self) -> None:
         # Two DIFFERENT accounts, both never observed -- this isolates the
-        # coordinator's own 30s call budget from the cache's own (120s,
+        # coordinator's test-pinned 30s call budget from the cache's own (120s,
         # unrelated) per-account TTL: "b" stays due the whole time, so its
         # own due-ness can never explain a budget_wait here.
         clock = _FakeMonotonicClock()
