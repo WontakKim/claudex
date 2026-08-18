@@ -92,6 +92,7 @@ _RELAY_SYMBOL_MANIFEST = {
         "_serve_balanced_count_tokens",
     },
     "openai_backend": {
+        "_resolve_context_window",
         "_validate_mapped_claude_request",
         "_relay_via_responses_backend",
         "_rfc3339_now",
@@ -136,7 +137,7 @@ def test_relay_symbol_manifest_has_one_canonical_owner() -> None:
         for module_name in _RELAY_SYMBOL_MANIFEST
     }
 
-    assert len(_RELAY_MANIFEST_SYMBOLS) == 46
+    assert len(_RELAY_MANIFEST_SYMBOLS) == 47
     assert definitions_by_module == _RELAY_SYMBOL_MANIFEST
     for symbol in _RELAY_MANIFEST_SYMBOLS:
         owners = [
@@ -693,6 +694,56 @@ def test_codex_pre_stream_overflow_uses_catalog_context_window() -> None:
     assert actual > limit
 
 
+def test_codex_pre_stream_overflow_uses_context_window_override() -> None:
+    config = GatewayConfig(
+        model_map={"opus": "codex:gpt-5.6-sol"},
+        context_window_map={"codex:gpt-5.6-sol": 872000},
+    )
+    client, stub = _gateway(
+        config,
+        _failing_anthropic_handler,
+        codex_context_window=272000,
+        codex_error=CodexUpstreamError(
+            400,
+            _overflow_error_body("Your input exceeds the context window of this model."),
+        ),
+    )
+
+    response = client.post("/v1/messages", json=_message_body("claude-opus-4-6"))
+
+    assert response.status_code == 400
+    match = _CLIENT_OVERFLOW_NUMBERS_RE.search(response.json()["error"]["message"])
+    assert match is not None
+    actual, limit = int(match.group(1)), int(match.group(2))
+    assert limit == 872000
+    assert actual > limit
+    assert stub.context_window_calls == []
+
+
+def test_context_window_override_requires_exact_upstream_slug() -> None:
+    config = GatewayConfig(
+        model_map={"opus": "codex:gpt-5.6-sol"},
+        context_window_map={"codex:gpt-5.6": 872000},
+    )
+    client, stub = _gateway(
+        config,
+        _failing_anthropic_handler,
+        codex_context_window=272000,
+        codex_error=CodexUpstreamError(
+            400,
+            _overflow_error_body("Your input exceeds the context window of this model."),
+        ),
+    )
+
+    response = client.post("/v1/messages", json=_message_body("claude-opus-4-6"))
+
+    assert response.status_code == 400
+    match = _CLIENT_OVERFLOW_NUMBERS_RE.search(response.json()["error"]["message"])
+    assert match is not None
+    assert int(match.group(2)) == 272000
+    assert stub.context_window_calls == ["gpt-5.6-sol"]
+
+
 def test_pre_stream_overflow_without_catalog_window_falls_back_to_legacy_message() -> None:
     config = GatewayConfig(model_map={"opus": "codex:gpt-5.6-sol"})
     client, _ = _gateway(
@@ -758,7 +809,7 @@ class RecordingMidStreamOverflowCodexClient(FakeCodexClient):
     prove it was resolved from the mapped `RouteTarget.model`.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *_args: Any, **_kwargs: Any) -> None:
         self.context_window_calls: list[str] = []
 
     async def context_window(self, model: str) -> int | None:
@@ -773,6 +824,35 @@ class RecordingMidStreamOverflowCodexClient(FakeCodexClient):
             400,
             _overflow_error_body("Your input exceeds the context window of this model."),
         )
+
+
+def test_streaming_mid_stream_overflow_uses_context_window_override(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config = GatewayConfig(
+        model_map={"opus": "codex:gpt-5.6-sol"},
+        context_window_map={"codex:gpt-5.6-sol": 872000},
+    )
+    body = _message_body("claude-opus-4-6")
+    body["stream"] = True
+
+    with _create_test_client(
+        monkeypatch,
+        tmp_path,
+        config=config,
+        codex_client=RecordingMidStreamOverflowCodexClient,
+    ) as client:
+        stub = client.app.state.codex_client
+        response = client.post("/v1/messages", json=body)
+
+    assert response.status_code == 200
+    events = [event for event in response.text.split("\n\n") if event]
+    error_event = next(event for event in events if event.startswith("event: error"))
+    payload = json.loads(error_event.split("data: ", 1)[1])
+    match = _CLIENT_OVERFLOW_NUMBERS_RE.search(payload["error"]["message"])
+    assert match is not None
+    assert int(match.group(2)) == 872000
+    assert stub.context_window_calls == []
 
 
 def test_non_streaming_mid_stream_overflow_reports_numbers() -> None:
@@ -1411,6 +1491,25 @@ def test_custom_provider_route_uses_custom_client_without_builtin_payload_mutati
     assert payload["reasoning"]["effort"] == "max"
     assert "service_tier" not in payload
     assert "max_output_tokens" not in payload
+
+
+def test_context_window_override_is_scoped_to_provider() -> None:
+    custom_stub = StubOpenAICompatibleClient()
+    config = GatewayConfig(
+        model_map={"opus": "wrtn:gpt-5.5"},
+        context_window_map={"codex:gpt-5.5": 872000},
+        custom_providers={"wrtn": _custom_provider()},
+    )
+    client, _ = _gateway(
+        config,
+        _failing_anthropic_handler,
+        custom_provider_clients={"wrtn": custom_stub},
+    )
+
+    response = client.post("/v1/messages", json=_message_body("claude-opus-4-6"))
+
+    assert response.status_code == 503
+    assert custom_stub.context_window_calls == ["gpt-5.5"]
 
 
 # --- /v1/messages routing: grok-mapped models go to the Grok Responses backend ---
@@ -2091,6 +2190,36 @@ def test_compaction_trigger_under_window_does_not_reroute() -> None:
     assert response.status_code == 503
     assert captured == []
     assert stub.payloads
+    assert client.app.state.compaction_last_reroute is None
+
+
+def test_compaction_trigger_uses_context_window_override() -> None:
+    body = _compaction_body("claude-opus-4-6")
+    estimated_prompt_tokens = context_overflow.estimate_overflow_prompt_tokens(body)
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(500, json={"error": "unexpected"})
+
+    config = _compaction_config(
+        {"opus": "codex:gpt-5.1-codex-max"},
+        context_window_map={"codex:gpt-5.1-codex-max": estimated_prompt_tokens + 1},
+    )
+    client, stub = _gateway(
+        config,
+        handler,
+        codex_context_window=estimated_prompt_tokens - 1,
+    )
+
+    response = client.post(
+        "/v1/messages", json=body, headers=_ANTHROPIC_CREDENTIAL_HEADERS
+    )
+
+    assert response.status_code == 503
+    assert captured == []
+    assert stub.payloads
+    assert stub.context_window_calls == []
     assert client.app.state.compaction_last_reroute is None
 
 

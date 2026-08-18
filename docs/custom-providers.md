@@ -47,8 +47,8 @@ Behavioral boundaries to know:
 - The translated payload is sent exactly as produced: there is no provider
   sanitizer, `max_output_tokens` injection, or reasoning-effort clamping.
 - Context-overflow phrase detection may not recognize a translated upstream's
-  wording. Compaction rerouting still works from the context window reported by
-  the provider's model catalog.
+  wording. Compaction rerouting still works from an exact provider-prefixed
+  context-window override or the window reported by the provider's model catalog.
 - An upstream `401` surfaces as an upstream error; there is no credential refresh
   or retry.
 - The dashboard has no usage or billing card for custom providers.

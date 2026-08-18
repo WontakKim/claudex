@@ -10,6 +10,7 @@ stays available for one-off overrides.
 | `CLAUDEX_HOST` | `127.0.0.1` | Bind address |
 | `CLAUDEX_PORT` | `8787` | Bind port |
 | `CLAUDEX_MODEL_MAP` | empty | JSON mapping of Claude names, exact or substring, to provider-prefixed target models — `codex:`-prefixed values run on Codex, `kimi:`-prefixed values on Kimi, `grok:`-prefixed values on Grok; unmapped models are relayed verbatim to Anthropic |
+| `CLAUDEX_CONTEXT_WINDOW_MAP` | empty | JSON mapping of exact provider-prefixed model targets to positive integer context-window overrides; an override takes precedence over that provider's catalog value, e.g. `{"codex:gpt-5.6-sol": 872000}` |
 | `CLAUDEX_CUSTOM_PROVIDERS` | empty | JSON-encoded custom-provider document; an empty string means no custom providers. See [Custom providers](custom-providers.md#custom-providers) |
 | `CLAUDEX_REASONING_EFFORT` | derived | Force `minimal`, `low`, `medium`, `high`, `xhigh`, or `max` on Codex requests |
 | `CODEX_HOME` | `~/.codex` | Directory containing Codex `auth.json` |
@@ -27,11 +28,12 @@ The settings key for each variable is its environment name minus the
 `CLAUDEX_` prefix, lowercased (the CLI-home variables — `CODEX_HOME`,
 `GROK_HOME`, `KIMI_CODE_HOME` — having no prefix, keep their full names as
 `codex_home` / `grok_home` / `kimi_code_home`). Values use native JSON types,
-so the model map is a plain object instead of JSON-in-a-string:
+so maps are plain objects instead of JSON-in-a-string:
 
 ```json
 {
-  "model_map": {"opus": "codex:gpt-5.6-sol", "haiku": "codex:gpt-5.6-luna"}
+  "model_map": {"opus": "codex:gpt-5.6-sol", "haiku": "codex:gpt-5.6-luna"},
+  "context_window_map": {"codex:gpt-5.6-sol": 872000}
 }
 ```
 

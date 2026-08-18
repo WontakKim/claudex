@@ -40,6 +40,18 @@ from claudex.upstream_errors import UpstreamAuthError, UpstreamError
 logger = logging.getLogger("claudex.server")
 
 
+async def _resolve_context_window(
+    config: GatewayConfig,
+    client: CodexClient | GrokClient | OpenAICompatibleClient,
+    provider: str,
+    upstream_model: str,
+) -> int | None:
+    override = config.context_window_map.get(f"{provider}:{upstream_model}")
+    if override is not None:
+        return override
+    return await client.context_window(upstream_model)
+
+
 def _validate_mapped_claude_request(claude_request: dict[str, Any]) -> str | None:
     """Check the required Messages fields the Codex translation consumes.
 
@@ -68,8 +80,8 @@ async def _relay_via_responses_backend(
     Before translation, a Responses-mapped request also carries the compaction
     reroute trigger: when `config.compaction_model` is set, the
     body is a detected Claude Code compaction request (Signal A), and the
-    mapped model's catalog context window is a real (non-bool) integer the
-    estimated prompt overflows, the request is diverted to
+    mapped model's configured or catalog context window is a real (non-bool)
+    integer the estimated prompt overflows, the request is diverted to
     `_reroute_compaction` before `translate_claude_request_to_codex` or
     `sanitize_grok_payload` ever run. A `None` return from that helper means
     "fall back": translation then runs against the untouched original body
@@ -98,7 +110,7 @@ async def _relay_via_responses_backend(
     context_window: int | None = None
     context_window_resolved = False
     if config.compaction_model is not None and is_compaction_request(claude_request):
-        context_window = await client.context_window(upstream_model)
+        context_window = await _resolve_context_window(config, client, provider, upstream_model)
         context_window_resolved = True
         # Booleans are `int` subclasses; a catalog entry that is literally
         # `True`/`False` (e.g. a stubbed or malformed provider response) must
@@ -156,14 +168,14 @@ async def _relay_via_responses_backend(
         len(payload.get("tools") or []),
     )
 
-    # Resolved once per request from the provider's own catalog cache (the
-    # client instance is long-lived on request.app.state). Fresh-cache
-    # lookups are memory-only; a cold or expired cache may synchronously
-    # refresh the catalog once before falling back to stale data or None.
-    # The compaction trigger above already resolved this for a detected
-    # compaction request, so that lookup is reused here instead of repeated.
+    # Resolved once per request from the exact-slug config override or the
+    # provider's own catalog cache (the client is long-lived on app state).
+    # Fresh-cache lookups are memory-only; a cold or expired cache may refresh
+    # once before falling back to stale data or None. The compaction trigger
+    # above already resolved this for a detected compaction request, so that
+    # result is reused here instead of looked up again.
     if not context_window_resolved:
-        context_window = await client.context_window(upstream_model)
+        context_window = await _resolve_context_window(config, client, provider, upstream_model)
 
     event_stream = client.stream_responses(payload, session_id)
     try:

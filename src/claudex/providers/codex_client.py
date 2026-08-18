@@ -107,8 +107,21 @@ class CodexClient:
                 and tier.get("id") == CODEX_FAST_TIER_WIRE_VALUE
                 for tier in service_tiers
             )
+            context_window = coerce_context_window(model.get("context_window"))
+            max_context_window = coerce_context_window(model.get("max_context_window"))
+            # The catalog's context_window is a conservative client default and
+            # max_context_window is the server's actual input ceiling, so the
+            # larger valid value is the enforceable window.
+            effective_context_window = max(
+                (
+                    window
+                    for window in (context_window, max_context_window)
+                    if window is not None
+                ),
+                default=None,
+            )
             entries[slug] = CodexModelEntry(
-                context_window=coerce_context_window(model.get("context_window")),
+                context_window=effective_context_window,
                 supports_fast_tier=supports_fast_tier,
             )
         return entries

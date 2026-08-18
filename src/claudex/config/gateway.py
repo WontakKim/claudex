@@ -27,6 +27,7 @@ from .schema import (
     parse_compaction_model,
     parse_custom_providers,
     parse_route_target,
+    validate_context_window_map,
     validate_model_map,
 )
 from .settings_io import read_settings_file
@@ -45,6 +46,8 @@ class GatewayConfig:
     # Unmapped models are relayed verbatim to Anthropic, so there is no
     # default target — the map alone decides what runs where.
     model_map: dict[str, str] = field(default_factory=dict)
+    # Exact provider-prefixed model targets mapped to context-window overrides.
+    context_window_map: dict[str, int] = field(default_factory=dict)
     custom_providers: dict[str, OpenAICompatibleProvider] = field(default_factory=dict)
     # When set, overrides the reasoning effort derived from the Claude request.
     reasoning_effort_override: str | None = None
@@ -130,6 +133,7 @@ class GatewayConfig:
             '{"haiku": "codex:gpt-5.6-luna"}',
             route_providers,
         )
+        context_window_map = _context_window_map_setting(settings, route_providers)
 
         value, label = _resolve("reasoning_effort", settings)
         if value is not None and not isinstance(value, str):
@@ -248,6 +252,7 @@ class GatewayConfig:
             host=host,
             port=port,
             model_map=model_map,
+            context_window_map=context_window_map,
             custom_providers=custom_providers,
             reasoning_effort_override=effort,
             codex_service_tier=codex_service_tier,
@@ -317,6 +322,28 @@ def _map_setting(
             f"{label} must be a JSON object mapping model names, e.g. {example}"
         )
     return validate_model_map(label, value, known_providers)
+
+
+def _context_window_map_setting(
+    settings: dict[str, object], known_providers: Sequence[str]
+) -> dict[str, int]:
+    value, label = _resolve("context_window_map", settings)
+    if value is None:
+        return {}
+    if isinstance(value, str):
+        if not value:
+            return {}
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise ConfigError(
+                f"{label} must be a JSON object mapping model targets to positive integers: {exc}"
+            ) from exc
+    if not isinstance(value, dict):
+        raise ConfigError(
+            f"{label} must be a JSON object mapping model targets to positive integers"
+        )
+    return validate_context_window_map(label, value, known_providers)
 
 
 def _path_setting(key: str, settings: dict[str, object], default: Path) -> Path:

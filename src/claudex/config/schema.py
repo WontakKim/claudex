@@ -33,6 +33,7 @@ SETTINGS_KEYS: dict[str, str] = {
     "host": "CLAUDEX_HOST",
     "port": "CLAUDEX_PORT",
     "model_map": "CLAUDEX_MODEL_MAP",
+    "context_window_map": "CLAUDEX_CONTEXT_WINDOW_MAP",
     "custom_providers": "CLAUDEX_CUSTOM_PROVIDERS",
     "reasoning_effort": "CLAUDEX_REASONING_EFFORT",
     # Opt-in: which Codex service tier mapped requests use. Absence of the key
@@ -378,6 +379,32 @@ def validate_model_map(
         except ConfigError as exc:
             raise ConfigError(f"{variable}: {exc}") from exc
     return model_map
+
+
+def validate_context_window_map(
+    variable: str,
+    parsed: dict[object, object],
+    known_providers: Sequence[str],
+) -> dict[str, int]:
+    if not all(
+        isinstance(key, str)
+        and bool(key.strip())
+        and isinstance(value, int)
+        and not isinstance(value, bool)
+        and value > 0
+        for key, value in parsed.items()
+    ):
+        raise ConfigError(
+            f"{variable} must be a JSON object mapping non-empty model targets "
+            "to positive integers"
+        )
+    context_window_map = {key.strip(): value for key, value in parsed.items()}
+    for key in context_window_map:
+        try:
+            parse_route_target(key, known_providers)
+        except ConfigError as exc:
+            raise ConfigError(f"{variable}: {exc}") from exc
+    return context_window_map
 
 
 def is_loopback_host(host: str) -> bool:

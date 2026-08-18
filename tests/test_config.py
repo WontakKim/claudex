@@ -81,6 +81,64 @@ def test_model_names_must_not_be_empty(monkeypatch: pytest.MonkeyPatch) -> None:
         GatewayConfig.from_env()
 
 
+def test_context_window_map_is_accepted_from_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CLAUDEX_CONTEXT_WINDOW_MAP", '{"codex:gpt-5.6-sol": 872000}')
+    assert GatewayConfig.from_env().context_window_map == {"codex:gpt-5.6-sol": 872000}
+
+
+def test_malformed_context_window_map_json_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CLAUDEX_CONTEXT_WINDOW_MAP", "{not json")
+    with pytest.raises(ConfigError, match="CLAUDEX_CONTEXT_WINDOW_MAP"):
+        GatewayConfig.from_env()
+
+
+@pytest.mark.parametrize("raw", ["[]", '"gpt-5.6-sol"', "872000", "null"])
+def test_non_object_context_window_map_fails(
+    monkeypatch: pytest.MonkeyPatch, raw: str
+) -> None:
+    monkeypatch.setenv("CLAUDEX_CONTEXT_WINDOW_MAP", raw)
+    with pytest.raises(ConfigError, match="CLAUDEX_CONTEXT_WINDOW_MAP"):
+        GatewayConfig.from_env()
+
+
+@pytest.mark.parametrize("value", [None, "872000", True, 0, -1, 872000.5])
+def test_context_window_map_values_must_be_positive_integers(
+    monkeypatch: pytest.MonkeyPatch, value: object
+) -> None:
+    monkeypatch.setenv(
+        "CLAUDEX_CONTEXT_WINDOW_MAP", json.dumps({"codex:gpt-5.6-sol": value})
+    )
+    with pytest.raises(ConfigError, match="CLAUDEX_CONTEXT_WINDOW_MAP"):
+        GatewayConfig.from_env()
+
+
+def test_context_window_map_keys_must_be_strings(tmp_path: Path) -> None:
+    with pytest.raises(ConfigError, match="context_window_map"):
+        GatewayConfig._from_sources(
+            {"context_window_map": {1: 872000}}, tmp_path / "settings.json"
+        )
+
+
+@pytest.mark.parametrize("target", ["code:gpt-5.6-sol", "gpt-5.6-sol"])
+def test_context_window_map_keys_require_known_provider_prefix(
+    monkeypatch: pytest.MonkeyPatch, target: str
+) -> None:
+    monkeypatch.setenv(
+        "CLAUDEX_CONTEXT_WINDOW_MAP", json.dumps({target: 872000})
+    )
+
+    with pytest.raises(ConfigError) as error:
+        GatewayConfig.from_env()
+
+    message = str(error.value)
+    assert f"model target {target!r}" in message
+    assert "known providers: codex, kimi, grok" in message
+
+
 class TestSettingsFile:
     @staticmethod
     def _write(tmp_path: Path, payload: object) -> Path:
@@ -101,6 +159,59 @@ class TestSettingsFile:
 
         assert config.port == 9090
         assert config.model_map == {"haiku": "codex:gpt-5.6-luna"}
+
+    def test_context_window_map_applies_with_native_values(
+        self, tmp_path: Path
+    ) -> None:
+        settings_file = self._write(
+            tmp_path, {"context_window_map": {"codex:gpt-5.6-sol": 872000}}
+        )
+
+        assert GatewayConfig.load(settings_file).context_window_map == {
+            "codex:gpt-5.6-sol": 872000
+        }
+
+    def test_context_window_map_env_overrides_settings_file(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        settings_file = self._write(
+            tmp_path, {"context_window_map": {"codex:gpt-5.6-sol": 272000}}
+        )
+        monkeypatch.setenv(
+            "CLAUDEX_CONTEXT_WINDOW_MAP", '{"codex:gpt-5.6-sol": 872000}'
+        )
+
+        assert GatewayConfig.load(settings_file).context_window_map == {
+            "codex:gpt-5.6-sol": 872000
+        }
+
+    def test_empty_context_window_map_env_overrides_settings_file(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        settings_file = self._write(
+            tmp_path, {"context_window_map": {"codex:gpt-5.6-sol": 872000}}
+        )
+        monkeypatch.setenv("CLAUDEX_CONTEXT_WINDOW_MAP", "")
+
+        assert GatewayConfig.load(settings_file).context_window_map == {}
+
+    @pytest.mark.parametrize(
+        "value", [["gpt-5.6-sol"], {"codex:gpt-5.6-sol": True}]
+    )
+    def test_invalid_context_window_map_setting_fails(
+        self, tmp_path: Path, value: object
+    ) -> None:
+        settings_file = self._write(tmp_path, {"context_window_map": value})
+
+        with pytest.raises(ConfigError, match='settings.json key "context_window_map"'):
+            GatewayConfig.load(settings_file)
+
+    def test_null_context_window_map_setting_means_no_overrides(
+        self, tmp_path: Path
+    ) -> None:
+        settings_file = self._write(tmp_path, {"context_window_map": None})
+
+        assert GatewayConfig.load(settings_file).context_window_map == {}
 
     def test_env_overrides_settings_file(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -311,6 +422,22 @@ class TestCustomProviders:
             )
         }
         assert config.route_providers == (*BUILTIN_ROUTE_PROVIDERS, "wrtn")
+
+    def test_context_window_map_accepts_builtin_and_custom_provider_prefixes(
+        self, tmp_path: Path
+    ) -> None:
+        payload = self._payload()
+        payload["context_window_map"] = {
+            "grok:shared-model": 500000,
+            "wrtn:shared-model": 600000,
+        }
+
+        config = GatewayConfig.load(self._write(tmp_path, payload))
+
+        assert config.context_window_map == {
+            "grok:shared-model": 500000,
+            "wrtn:shared-model": 600000,
+        }
 
     def test_env_json_string_form_is_parsed(
         self, monkeypatch: pytest.MonkeyPatch

@@ -39,6 +39,10 @@ _CATALOG_MODELS: list[dict[str, Any]] = [
     },
     {"slug": "gpt-5.3-codex-spark", "context_window": 128000, "service_tiers": []},
     {"slug": "gpt-5.4", "context_window": 272000, "max_context_window": 1000000},
+    {"slug": "max-only-window", "max_context_window": 872000},
+    {"slug": "context-larger-than-max", "context_window": 128000, "max_context_window": 64000},
+    {"slug": "valid-context-malformed-max", "context_window": 128000, "max_context_window": True},
+    {"slug": "valid-max-malformed-context", "context_window": "272000", "max_context_window": 872000},
     {"slug": "malformed-tier-list", "context_window": 64000, "service_tiers": [None, "priority"]},
     {"slug": "malformed-tiers", "context_window": 64000, "service_tiers": {"id": "priority"}},
     {"slug": "gpt-5.6-hidden", "context_window": 64000, "visibility": "hide"},
@@ -49,6 +53,8 @@ _CATALOG_MODELS: list[dict[str, Any]] = [
         "service_tiers": [{"id": "priority"}],
     },
     {"slug": "bool-window", "context_window": True},
+    {"slug": "bool-max-window", "max_context_window": True},
+    {"slug": "string-max-window", "max_context_window": "872000"},
     {"slug": "zero-window", "context_window": 0},
     {"slug": "negative-window", "context_window": -1},
     {"slug": "fractional-window", "context_window": 272000.5},
@@ -229,7 +235,7 @@ def test_hidden_model_excluded_from_list_but_resolvable_via_context_window() -> 
     assert window == 64000
 
 
-def test_max_context_window_sibling_field_is_ignored() -> None:
+def test_context_window_uses_larger_catalog_value() -> None:
     calls = {"n": 0}
 
     async def scenario() -> int | None:
@@ -237,12 +243,43 @@ def test_max_context_window_sibling_field_is_ignored() -> None:
             client = CodexClient(_FakeAuthManager(), http_client)
             return await client.context_window("gpt-5.4")
 
-    assert asyncio.run(scenario()) == 272000
+    assert asyncio.run(scenario()) == 1000000
+
+
+@pytest.mark.parametrize(
+    ("slug", "expected"),
+    [
+        ("max-only-window", 872000),
+        ("context-larger-than-max", 128000),
+        ("valid-context-malformed-max", 128000),
+        ("valid-max-malformed-context", 872000),
+    ],
+)
+def test_context_window_uses_each_valid_catalog_value(
+    slug: str, expected: int
+) -> None:
+    calls = {"n": 0}
+
+    async def scenario() -> int | None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(_catalog_handler(calls))) as http_client:
+            client = CodexClient(_FakeAuthManager(), http_client)
+            return await client.context_window(slug)
+
+    assert asyncio.run(scenario()) == expected
 
 
 @pytest.mark.parametrize(
     "slug",
-    ["no-window-field", "string-window", "bool-window", "zero-window", "negative-window", "fractional-window"],
+    [
+        "no-window-field",
+        "string-window",
+        "bool-window",
+        "bool-max-window",
+        "string-max-window",
+        "zero-window",
+        "negative-window",
+        "fractional-window",
+    ],
 )
 def test_invalid_context_window_values_resolve_to_none(slug: str) -> None:
     calls = {"n": 0}
