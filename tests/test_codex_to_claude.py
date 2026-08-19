@@ -849,6 +849,165 @@ def test_tool_use_timing_unchanged_with_custom_provider() -> None:
     ]
 
 
+def _generated_tool_id_counter_value(tool_id: str) -> int:
+    match = re.fullmatch(r"toolu_gateway_(\d+)", tool_id)
+    assert match is not None, tool_id
+    return int(match.group(1))
+
+
+def test_generated_tool_id_order_unchanged_with_parked_empty_call_id() -> None:
+    events = _run_stream(
+        {},
+        [
+            # Parked: nameless and without a call_id. Parking must not consume
+            # a generated fallback id.
+            {
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {"type": "function_call", "call_id": "", "name": ""},
+            },
+            # Starts immediately: the first generated fallback id goes here.
+            {
+                "type": "response.output_item.added",
+                "output_index": 1,
+                "item": {"type": "function_call", "call_id": "", "name": "tool_b"},
+            },
+            {
+                "type": "response.output_item.done",
+                "output_index": 1,
+                "item": {"type": "function_call", "call_id": "", "name": "tool_b"},
+            },
+            # The parked call completes afterwards and takes the next id.
+            {
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {"type": "function_call", "call_id": "", "name": "tool_a"},
+            },
+        ],
+    )
+
+    tool_use_ids = [
+        payload["content_block"]["id"]
+        for event_name, payload in events
+        if event_name == "content_block_start"
+        and payload["content_block"]["type"] == "tool_use"
+    ]
+    names = [
+        payload["content_block"]["name"]
+        for event_name, payload in events
+        if event_name == "content_block_start"
+        and payload["content_block"]["type"] == "tool_use"
+    ]
+    assert names == ["tool_b", "tool_a"]
+    first_started, parked = map(_generated_tool_id_counter_value, tool_use_ids)
+    assert first_started < parked
+
+
+def test_pending_call_real_call_id_from_done_defines_tool_and_carrier_id() -> None:
+    events = _run_stream(
+        {},
+        [
+            {
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {"type": "function_call", "call_id": "", "name": ""},
+            },
+            {
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {
+                    "type": "function_call",
+                    "call_id": "call_real",
+                    "name": "lookup",
+                    "extra_content": {"google": {"thought_signature": "sig-real"}},
+                },
+            },
+        ],
+        custom_provider="gemprov",
+    )
+
+    tool_use_ids = [
+        payload["content_block"]["id"]
+        for event_name, payload in events
+        if event_name == "content_block_start"
+        and payload["content_block"]["type"] == "tool_use"
+    ]
+    assert tool_use_ids == ["call_real"]
+    assert _decoded_call_signature_carriers(events) == [
+        CallSignatureCarrier(
+            provider="gemprov", call_id="call_real", signature="sig-real"
+        )
+    ]
+
+
+def test_unidentifiable_done_item_does_not_overwrite_signature() -> None:
+    events = _run_stream(
+        {},
+        [
+            {
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {
+                    "type": "function_call",
+                    "call_id": "call_open",
+                    "name": "lookup",
+                    "extra_content": {"google": {"thought_signature": "sig-added"}},
+                },
+            },
+            # No call_id, no item id, no output_index: closure may proceed but
+            # the signature must not be attributed to the open call.
+            {
+                "type": "response.output_item.done",
+                "item": {
+                    "type": "function_call",
+                    "extra_content": {"google": {"thought_signature": "sig-foreign"}},
+                },
+            },
+        ],
+        custom_provider="gemprov",
+    )
+
+    assert _decoded_call_signature_carriers(events) == [
+        CallSignatureCarrier(
+            provider="gemprov", call_id="call_open", signature="sig-added"
+        )
+    ]
+
+
+def test_closed_call_terminal_match_requires_positive_identity() -> None:
+    events = _run_stream(
+        {},
+        [
+            # No call_id, no item id, and no output_index anywhere: the closed
+            # call retains no usable identity for terminal attribution.
+            {
+                "type": "response.output_item.added",
+                "item": {"type": "function_call", "call_id": "", "name": "lookup"},
+            },
+            {
+                "type": "response.output_item.done",
+                "item": {"type": "function_call", "call_id": "", "name": "lookup"},
+            },
+            {
+                "type": "response.completed",
+                "response": {
+                    "output": [
+                        {
+                            "type": "function_call",
+                            "extra_content": {
+                                "google": {"thought_signature": "sig-terminal"}
+                            },
+                        }
+                    ]
+                },
+            },
+        ],
+        custom_provider="gemprov",
+    )
+
+    assert _decoded_call_signature_carriers(events) == []
+
+
 def test_message_item_fallback_when_no_text_deltas() -> None:
     events = _run_stream(
         {},

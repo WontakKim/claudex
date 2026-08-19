@@ -638,7 +638,9 @@ class CodexToClaudeStreamTranslator:
         item_id = self._function_call_item_id(event, item)
         if self._function_call_block_item_id and item_id:
             return self._function_call_block_item_id == item_id
-        return True
+        # Signature attribution is call-specific opaque state: without one
+        # positively matching identity the signature must not be adopted.
+        return False
 
     def _on_function_call_arguments_delta(self, event: dict[str, Any]) -> list[ClaudeEvent]:
         delta = event.get("delta", "")
@@ -740,7 +742,8 @@ class CodexToClaudeStreamTranslator:
         terminal_output_index = item.get("output_index", output_index)
         if self._function_call_block_output_index is not None:
             return self._function_call_block_output_index == terminal_output_index
-        return not self._function_call_block_call_id and not call_id
+        # Signature attribution requires a positive identity match.
+        return False
 
     def _hydrate_open_function_call_from_terminal(
         self, response_data: dict[str, Any]
@@ -751,11 +754,15 @@ class CodexToClaudeStreamTranslator:
         for output_index, item in enumerate(response_data.get("output") or []):
             if not isinstance(item, dict) or item.get("type") != "function_call":
                 continue
-            if not self._terminal_item_matches_open_function_call(output_index, item):
-                continue
             signature = self._function_call_thought_signature(item)
-            if signature is not None:
+            if signature is not None and self._terminal_item_matches_open_function_call(
+                output_index, item
+            ):
                 self._function_call_signature = signature
+            # Argument backfill keeps the original strict call_id equality so
+            # built-in routes see byte-identical behavior.
+            if item.get("call_id") != self._function_call_block_call_id:
+                continue
             if not self._has_received_arguments_delta and item.get("arguments"):
                 self._has_received_arguments_delta = True
                 return self._function_call_arguments_delta(
@@ -876,7 +883,8 @@ class CodexToClaudeStreamTranslator:
         terminal_output_index = item.get("output_index", output_index)
         if closed_call.output_index is not None:
             return closed_call.output_index == terminal_output_index
-        return not closed_call.call_id and not call_id
+        # Signature attribution requires a positive identity match.
+        return False
 
     def _emit_closed_call_carriers_from_terminal(
         self, response_data: dict[str, Any]
