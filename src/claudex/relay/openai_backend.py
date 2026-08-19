@@ -100,6 +100,7 @@ async def _relay_via_responses_backend(
         )
 
     custom_client = request.app.state.custom_provider_clients.get(provider)
+    custom_provider_name = provider if custom_client is not None else None
     if custom_client is not None:
         client: CodexClient | GrokClient | OpenAICompatibleClient = custom_client
     elif provider == "grok":
@@ -148,6 +149,7 @@ async def _relay_via_responses_backend(
             upstream_model,
             config.reasoning_effort_override,
             service_tier=service_tier,
+            custom_provider=custom_provider_name,
         )
     except TranslationError as exc:
         return JSONResponse(
@@ -216,11 +218,21 @@ async def _relay_via_responses_backend(
 
     if claude_request.get("stream"):
         return StreamingResponse(
-            _translate_claude_sse(claude_request, upstream_events(), context_window),
+            _translate_claude_sse(
+                claude_request,
+                upstream_events(),
+                context_window,
+                custom_provider=custom_provider_name,
+            ),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache"},
         )
-    return await _aggregate_claude_response(claude_request, upstream_events(), context_window)
+    return await _aggregate_claude_response(
+        claude_request,
+        upstream_events(),
+        context_window,
+        custom_provider=custom_provider_name,
+    )
 
 
 def _rfc3339_now() -> str:
@@ -504,8 +516,14 @@ async def _translate_claude_sse(
     claude_request: dict[str, Any],
     upstream_events: AsyncGenerator[dict[str, Any], None],
     context_window: int | None = None,
+    *,
+    custom_provider: str | None = None,
 ) -> AsyncIterator[str]:
-    translator = CodexToClaudeStreamTranslator(claude_request, context_window=context_window)
+    translator = CodexToClaudeStreamTranslator(
+        claude_request,
+        context_window=context_window,
+        custom_provider=custom_provider,
+    )
     try:
         async for event in upstream_events:
             for event_name, payload in translator.translate_event(event):
@@ -531,8 +549,14 @@ async def _aggregate_claude_response(
     claude_request: dict[str, Any],
     upstream_events: AsyncGenerator[dict[str, Any], None],
     context_window: int | None = None,
+    *,
+    custom_provider: str | None = None,
 ) -> JSONResponse:
-    translator = CodexToClaudeStreamTranslator(claude_request, context_window=context_window)
+    translator = CodexToClaudeStreamTranslator(
+        claude_request,
+        context_window=context_window,
+        custom_provider=custom_provider,
+    )
     claude_events: list[tuple[str, dict[str, Any]]] = []
     try:
         async for event in upstream_events:

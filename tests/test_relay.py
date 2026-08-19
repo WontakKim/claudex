@@ -57,6 +57,11 @@ from claudex.relay.openai_backend import (
     _translate_claude_sse,
 )
 from claudex.translate import translate_claude_request_to_codex
+from claudex.translate.thought_signature import (
+    CallSignatureCarrier,
+    decode_call_signature_carrier,
+    encode_call_signature_carrier,
+)
 
 
 _RELAY_SYMBOL_MANIFEST = {
@@ -1442,9 +1447,10 @@ def test_count_tokens_falls_back_to_estimate_when_kimi_fails() -> None:
 
 
 class StubOpenAICompatibleClient:
-    def __init__(self) -> None:
+    def __init__(self, events: list[dict[str, Any]] | None = None) -> None:
         self.payloads: list[dict[str, Any]] = []
         self.context_window_calls: list[str] = []
+        self.events = events
 
     async def context_window(self, model: str) -> int | None:
         self.context_window_calls.append(model)
@@ -1454,8 +1460,10 @@ class StubOpenAICompatibleClient:
         self, payload: dict[str, Any], session_id: str
     ) -> AsyncIterator[dict[str, Any]]:
         self.payloads.append(payload)
-        raise OpenAICompatibleUpstreamError(503, "stub custom upstream", "wrtn")
-        yield
+        if self.events is None:
+            raise OpenAICompatibleUpstreamError(503, "stub custom upstream", "wrtn")
+        for event in self.events:
+            yield event
 
 
 def test_custom_provider_route_uses_custom_client_without_builtin_payload_mutations(
@@ -1510,6 +1518,211 @@ def test_context_window_override_is_scoped_to_provider() -> None:
 
     assert response.status_code == 503
     assert custom_stub.context_window_calls == ["gpt-5.5"]
+
+
+def _custom_function_call_events(
+    call_id: str, thought_signature: str
+) -> list[dict[str, Any]]:
+    return [
+        {
+            "type": "response.created",
+            "response": {"id": "resp_custom", "model": "gpt-5.5"},
+        },
+        {
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {
+                "type": "function_call",
+                "call_id": call_id,
+                "name": "lookup",
+                "extra_content": {
+                    "google": {"thought_signature": thought_signature}
+                },
+            },
+        },
+        {
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": {
+                "type": "function_call",
+                "call_id": call_id,
+                "name": "lookup",
+                "arguments": "{}",
+                "extra_content": {
+                    "google": {"thought_signature": thought_signature}
+                },
+            },
+        },
+        {
+            "type": "response.completed",
+            "response": {
+                "id": "resp_custom",
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+                "output": [],
+            },
+        },
+    ]
+
+
+def _carrier_thinking_block(
+    provider: str, call_id: str, thought_signature: str
+) -> dict[str, Any]:
+    carrier = encode_call_signature_carrier(provider, call_id, thought_signature)
+    assert carrier is not None
+    return {"type": "thinking", "thinking": "", "signature": carrier}
+
+
+def _custom_provider_gateway(custom_stub: StubOpenAICompatibleClient) -> TestClient:
+    config = GatewayConfig(
+        model_map={"opus": "wrtn:gpt-5.5"},
+        custom_providers={"wrtn": _custom_provider()},
+    )
+    client, _ = _gateway(
+        config,
+        _failing_anthropic_handler,
+        custom_provider_clients={"wrtn": custom_stub},
+    )
+    return client
+
+
+def _message_with_carrier(
+    provider: str, call_id: str, thought_signature: str
+) -> dict[str, Any]:
+    body = _message_body("claude-opus-4-6")
+    body["messages"] = [
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "tool_use", "id": call_id, "name": "lookup", "input": {}},
+                _carrier_thinking_block(provider, call_id, thought_signature),
+            ],
+        }
+    ]
+    return body
+
+
+def test_custom_provider_stream_emits_carrier_thinking_block() -> None:
+    call_id = "call_stream"
+    thought_signature = "stream-signature+/=한글"
+    custom_stub = StubOpenAICompatibleClient(
+        _custom_function_call_events(call_id, thought_signature)
+    )
+    client = _custom_provider_gateway(custom_stub)
+    body = _message_body("claude-opus-4-6")
+    body["stream"] = True
+
+    response = client.post("/v1/messages", json=body)
+
+    assert response.status_code == 200
+    payloads = [
+        json.loads(frame.split("data: ", 1)[1])
+        for frame in response.text.split("\n\n")
+        if frame
+    ]
+    block_starts = [
+        payload
+        for payload in payloads
+        if payload.get("type") == "content_block_start"
+    ]
+    assert [payload["content_block"]["type"] for payload in block_starts] == [
+        "tool_use",
+        "thinking",
+    ]
+    tool_use_block = block_starts[0]["content_block"]
+    assert block_starts[1]["content_block"] == {
+        "type": "thinking",
+        "thinking": "",
+    }
+    signature_delta = next(
+        payload["delta"]
+        for payload in payloads
+        if payload.get("delta", {}).get("type") == "signature_delta"
+    )
+    assert decode_call_signature_carrier(signature_delta["signature"]) == (
+        CallSignatureCarrier(
+            provider="wrtn",
+            call_id=tool_use_block["id"],
+            signature=thought_signature,
+        )
+    )
+
+
+def test_custom_provider_nonstream_emits_carrier_thinking_block() -> None:
+    call_id = "call_nonstream"
+    thought_signature = "nonstream-signature+/=한글"
+    custom_stub = StubOpenAICompatibleClient(
+        _custom_function_call_events(call_id, thought_signature)
+    )
+    client = _custom_provider_gateway(custom_stub)
+    body = _message_body("claude-opus-4-6")
+    body["stream"] = False
+
+    response = client.post("/v1/messages", json=body)
+
+    assert response.status_code == 200
+    message = response.json()
+    assert [block["type"] for block in message["content"]] == [
+        "tool_use",
+        "thinking",
+    ]
+    tool_use_block, carrier_block = message["content"]
+    assert carrier_block["thinking"] == ""
+    assert decode_call_signature_carrier(carrier_block["signature"]) == (
+        CallSignatureCarrier(
+            provider="wrtn",
+            call_id=tool_use_block["id"],
+            signature=thought_signature,
+        )
+    )
+
+
+def test_custom_provider_replay_attaches_extra_content_upstream() -> None:
+    call_id = "call_replay"
+    thought_signature = "replayed-signature+/=한글"
+    custom_stub = StubOpenAICompatibleClient()
+    client = _custom_provider_gateway(custom_stub)
+    body = _message_with_carrier("wrtn", call_id, thought_signature)
+
+    response = client.post("/v1/messages", json=body)
+
+    assert response.status_code == 503
+    function_call = next(
+        item for item in custom_stub.payloads[0]["input"] if item["type"] == "function_call"
+    )
+    assert function_call["extra_content"] == {
+        "google": {"thought_signature": thought_signature}
+    }
+
+
+def test_builtin_route_payload_has_no_extra_content_even_with_forged_carrier() -> None:
+    call_id = "call_forged"
+    body = _message_with_carrier("wrtn", call_id, "forged-signature")
+    config = GatewayConfig(model_map={"opus": "codex:gpt-5.5"})
+    client, codex_stub = _gateway(config, _failing_anthropic_handler)
+
+    response = client.post("/v1/messages", json=body)
+
+    assert response.status_code == 503
+    (payload,) = codex_stub.payloads
+    assert all("extra_content" not in item for item in payload["input"])
+    assert all(item["type"] != "reasoning" for item in payload["input"])
+
+
+def test_custom_provider_cross_name_carrier_not_replayed() -> None:
+    call_id = "call_cross_name"
+    custom_stub = StubOpenAICompatibleClient()
+    client = _custom_provider_gateway(custom_stub)
+    body = _message_with_carrier(
+        "other-provider", call_id, "foreign-signature"
+    )
+
+    response = client.post("/v1/messages", json=body)
+
+    assert response.status_code == 503
+    function_call = next(
+        item for item in custom_stub.payloads[0]["input"] if item["type"] == "function_call"
+    )
+    assert "extra_content" not in function_call
 
 
 # --- /v1/messages routing: grok-mapped models go to the Grok Responses backend ---
@@ -2002,6 +2215,7 @@ def test_compaction_reroute_fallback_translates_untouched_original_body_once(
         reasoning_effort_override: str | None,
         *,
         service_tier: str | None = None,
+        custom_provider: str | None = None,
     ) -> dict[str, Any]:
         # A deep, JSON-round-tripped copy: proves equality without ever
         # aliasing the mutable dict the caller still holds.
@@ -2011,6 +2225,7 @@ def test_compaction_reroute_fallback_translates_untouched_original_body_once(
             upstream_model,
             reasoning_effort_override,
             service_tier=service_tier,
+            custom_provider=custom_provider,
         )
 
     monkeypatch.setattr(relay_openai_backend, "translate_claude_request_to_codex", recording_translate)
@@ -2474,6 +2689,7 @@ def test_compaction_stream_reroute_fallback_translates_untouched_original_body_w
         reasoning_effort_override: str | None,
         *,
         service_tier: str | None = None,
+        custom_provider: str | None = None,
     ) -> dict[str, Any]:
         # A deep, JSON-round-tripped copy: proves equality without ever
         # aliasing the mutable dict the caller still holds.
@@ -2483,6 +2699,7 @@ def test_compaction_stream_reroute_fallback_translates_untouched_original_body_w
             upstream_model,
             reasoning_effort_override,
             service_tier=service_tier,
+            custom_provider=custom_provider,
         )
 
     monkeypatch.setattr(relay_openai_backend, "translate_claude_request_to_codex", recording_translate)
