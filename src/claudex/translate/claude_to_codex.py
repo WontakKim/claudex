@@ -19,6 +19,11 @@ import re
 import uuid
 from typing import Any
 
+from .thought_signature import (
+    decode_call_signature_carrier,
+    is_call_signature_carrier,
+)
+
 # OpenAI Responses API limit for tool names and call ids.
 _NAME_LIMIT = 64
 
@@ -209,7 +214,10 @@ def _translate_document_block(block: dict[str, Any], role: str) -> dict[str, Any
 
 
 def _translate_messages(
-    claude_request: dict[str, Any], name_map: dict[str, str]
+    claude_request: dict[str, Any],
+    name_map: dict[str, str],
+    *,
+    custom_provider: str | None,
 ) -> list[dict[str, Any]]:
     input_items: list[dict[str, Any]] = []
 
@@ -255,6 +263,40 @@ def _translate_messages(
         if not isinstance(content, list):
             continue
 
+        call_signatures: dict[str, str] = {}
+        if role == "assistant" and custom_provider is not None:
+            carrier_counts: dict[str, int] = {}
+            tool_use_counts: dict[str, int] = {}
+            matching_signatures: dict[str, str] = {}
+
+            for candidate_block in content:
+                if not isinstance(candidate_block, dict):
+                    continue
+                candidate_type = candidate_block.get("type")
+                if candidate_type == "tool_use":
+                    tool_use_id = candidate_block.get("id")
+                    if isinstance(tool_use_id, str):
+                        tool_use_counts[tool_use_id] = tool_use_counts.get(tool_use_id, 0) + 1
+                    continue
+                if candidate_type != "thinking":
+                    continue
+
+                candidate_signature = candidate_block.get("signature")
+                if not is_call_signature_carrier(candidate_signature):
+                    continue
+                carrier = decode_call_signature_carrier(candidate_signature)
+                if carrier is None:
+                    continue
+                carrier_counts[carrier.call_id] = carrier_counts.get(carrier.call_id, 0) + 1
+                if carrier.provider == custom_provider:
+                    matching_signatures[carrier.call_id] = carrier.signature
+
+            call_signatures = {
+                call_id: signature
+                for call_id, signature in matching_signatures.items()
+                if carrier_counts[call_id] == 1 and tool_use_counts.get(call_id) == 1
+            }
+
         for block in content:
             if not isinstance(block, dict):
                 continue
@@ -272,6 +314,8 @@ def _translate_messages(
                 if role != "assistant":
                     continue
                 signature = block.get("signature") or ""
+                if is_call_signature_carrier(signature):
+                    continue
                 if not is_gpt_reasoning_signature(signature):
                     continue
                 flush()
@@ -286,14 +330,18 @@ def _translate_messages(
             elif block_type == "tool_use":
                 flush()
                 name = block.get("name", "")
-                input_items.append(
-                    {
-                        "type": "function_call",
-                        "call_id": shorten_call_id(block.get("id", "")),
-                        "name": name_map.get(name, shorten_tool_name(name)),
-                        "arguments": json.dumps(block.get("input") or {}, ensure_ascii=False),
+                tool_use_id = block.get("id", "")
+                function_call: dict[str, Any] = {
+                    "type": "function_call",
+                    "call_id": shorten_call_id(tool_use_id),
+                    "name": name_map.get(name, shorten_tool_name(name)),
+                    "arguments": json.dumps(block.get("input") or {}, ensure_ascii=False),
+                }
+                if isinstance(tool_use_id, str) and tool_use_id in call_signatures:
+                    function_call["extra_content"] = {
+                        "google": {"thought_signature": call_signatures[tool_use_id]}
                     }
-                )
+                input_items.append(function_call)
             elif block_type == "tool_result":
                 flush()
                 input_items.append(
@@ -428,6 +476,7 @@ def translate_claude_request_to_codex(
     reasoning_effort_override: str | None = None,
     *,
     service_tier: str | None = None,
+    custom_provider: str | None = None,
 ) -> dict[str, Any]:
     """Build a Codex Responses API payload, optionally with a service tier."""
     name_map = build_tool_name_shortening_map(claude_request)
@@ -435,7 +484,11 @@ def translate_claude_request_to_codex(
     payload: dict[str, Any] = {
         "model": codex_model,
         "instructions": "",
-        "input": _translate_messages(claude_request, name_map),
+        "input": _translate_messages(
+            claude_request,
+            name_map,
+            custom_provider=custom_provider,
+        ),
         "reasoning": {
             "effort": reasoning_effort_override or _derive_reasoning_effort(claude_request),
             "summary": "auto",

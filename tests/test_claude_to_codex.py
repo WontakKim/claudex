@@ -8,10 +8,34 @@ from claudex.translate.claude_to_codex import (
     shorten_call_id,
     translate_claude_request_to_codex,
 )
+from claudex.translate.thought_signature import (
+    CARRIER_PREFIX,
+    encode_call_signature_carrier,
+)
 
 
 def _find_items(payload: dict, item_type: str) -> list[dict]:
     return [item for item in payload["input"] if item["type"] == item_type]
+
+
+def _carrier_block(provider: str, call_id: str, signature: str) -> dict:
+    carrier = encode_call_signature_carrier(provider, call_id, signature)
+    assert carrier is not None
+    return {"type": "thinking", "thinking": "...", "signature": carrier}
+
+
+def _tool_use_block(call_id: str, name: str = "lookup") -> dict:
+    return {"type": "tool_use", "id": call_id, "name": name, "input": {}}
+
+
+def _translate_assistant_content(
+    content: list[dict], *, custom_provider: str | None
+) -> dict:
+    return translate_claude_request_to_codex(
+        {"messages": [{"role": "assistant", "content": content}]},
+        codex_model="gpt-5.5",
+        custom_provider=custom_provider,
+    )
 
 
 def test_basic_request_shape() -> None:
@@ -326,6 +350,216 @@ def test_thinking_block_with_foreign_signature_is_dropped() -> None:
         codex_model="gpt-5.5",
     )
     assert _find_items(payload, "reasoning") == []
+
+
+def test_carrier_signature_attaches_to_matching_function_call() -> None:
+    thought_signature = "opaque-signature+/=한글"
+    payload = _translate_assistant_content(
+        [
+            _carrier_block("gemini", "toolu_01", thought_signature),
+            _tool_use_block("toolu_01"),
+        ],
+        custom_provider="gemini",
+    )
+
+    assert _find_items(payload, "function_call") == [
+        {
+            "type": "function_call",
+            "call_id": "toolu_01",
+            "name": "lookup",
+            "arguments": "{}",
+            "extra_content": {
+                "google": {"thought_signature": thought_signature}
+            },
+        }
+    ]
+
+
+def test_carrier_attaches_when_carrier_block_follows_tool_use() -> None:
+    payload = _translate_assistant_content(
+        [
+            _tool_use_block("toolu_01"),
+            _carrier_block("gemini", "toolu_01", "signature-after-call"),
+        ],
+        custom_provider="gemini",
+    )
+
+    function_call = _find_items(payload, "function_call")[0]
+    assert function_call["extra_content"] == {
+        "google": {"thought_signature": "signature-after-call"}
+    }
+
+
+def test_no_extra_content_without_custom_provider() -> None:
+    payload = translate_claude_request_to_codex(
+        {
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [
+                        _carrier_block("gemini", "toolu_01", "signature"),
+                        _tool_use_block("toolu_01"),
+                    ],
+                }
+            ]
+        },
+        codex_model="gpt-5.5",
+    )
+
+    assert _find_items(payload, "function_call") == [
+        {
+            "type": "function_call",
+            "call_id": "toolu_01",
+            "name": "lookup",
+            "arguments": "{}",
+        }
+    ]
+
+
+def test_carrier_provider_mismatch_is_dropped() -> None:
+    payload = _translate_assistant_content(
+        [
+            _carrier_block("other-provider", "toolu_01", "signature"),
+            _tool_use_block("toolu_01"),
+        ],
+        custom_provider="gemini",
+    )
+
+    assert "extra_content" not in _find_items(payload, "function_call")[0]
+
+
+def test_duplicate_carriers_invalidate_call_even_when_identical() -> None:
+    carrier = _carrier_block("gemini", "toolu_01", "same-signature")
+    payload = _translate_assistant_content(
+        [carrier, carrier.copy(), _tool_use_block("toolu_01")],
+        custom_provider="gemini",
+    )
+
+    assert "extra_content" not in _find_items(payload, "function_call")[0]
+
+
+def test_conflicting_carriers_invalidate_call() -> None:
+    payload = _translate_assistant_content(
+        [
+            _carrier_block("gemini", "toolu_01", "first-signature"),
+            _carrier_block("gemini", "toolu_01", "second-signature"),
+            _tool_use_block("toolu_01"),
+        ],
+        custom_provider="gemini",
+    )
+
+    assert "extra_content" not in _find_items(payload, "function_call")[0]
+
+
+def test_carrier_in_other_message_does_not_attach() -> None:
+    payload = translate_claude_request_to_codex(
+        {
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [_carrier_block("gemini", "toolu_01", "signature")],
+                },
+                {
+                    "role": "assistant",
+                    "content": [_tool_use_block("toolu_01")],
+                },
+            ]
+        },
+        codex_model="gpt-5.5",
+        custom_provider="gemini",
+    )
+
+    assert "extra_content" not in _find_items(payload, "function_call")[0]
+
+
+def test_unmatched_and_ambiguous_tool_use_ids_drop_carrier() -> None:
+    unmatched_payload = _translate_assistant_content(
+        [
+            _carrier_block("gemini", "missing-call", "signature"),
+            _tool_use_block("other-call"),
+        ],
+        custom_provider="gemini",
+    )
+    ambiguous_payload = _translate_assistant_content(
+        [
+            _carrier_block("gemini", "duplicate-call", "signature"),
+            _tool_use_block("duplicate-call", "first_tool"),
+            _tool_use_block("duplicate-call", "second_tool"),
+        ],
+        custom_provider="gemini",
+    )
+
+    for payload in (unmatched_payload, ambiguous_payload):
+        assert all(
+            "extra_content" not in item
+            for item in _find_items(payload, "function_call")
+        )
+
+
+def test_parallel_calls_sibling_items_get_no_copy() -> None:
+    payload = _translate_assistant_content(
+        [
+            _carrier_block("gemini", "toolu_01", "first-signature"),
+            _tool_use_block("toolu_01", "first_tool"),
+            _tool_use_block("toolu_02", "second_tool"),
+        ],
+        custom_provider="gemini",
+    )
+
+    matching_call, sibling_call = _find_items(payload, "function_call")
+    assert matching_call["extra_content"] == {
+        "google": {"thought_signature": "first-signature"}
+    }
+    assert "extra_content" not in sibling_call
+
+
+@pytest.mark.parametrize("custom_provider", [None, "gemini"])
+def test_carrier_never_becomes_reasoning_item(custom_provider: str | None) -> None:
+    payload = _translate_assistant_content(
+        [_carrier_block("gemini", "toolu_01", "signature")],
+        custom_provider=custom_provider,
+    )
+
+    assert _find_items(payload, "reasoning") == []
+
+
+def test_fernet_reasoning_replay_unchanged_with_custom_provider() -> None:
+    payload = _translate_assistant_content(
+        [
+            {
+                "type": "thinking",
+                "thinking": "...",
+                "signature": "gAAAAABabc_123-=",
+            }
+        ],
+        custom_provider="gemini",
+    )
+
+    assert _find_items(payload, "reasoning") == [
+        {
+            "type": "reasoning",
+            "summary": [],
+            "content": None,
+            "encrypted_content": "gAAAAABabc_123-=",
+        }
+    ]
+
+
+def test_malformed_carrier_dropped_fail_closed() -> None:
+    payload = _translate_assistant_content(
+        [
+            {
+                "type": "thinking",
+                "thinking": "...",
+                "signature": CARRIER_PREFIX + "not*base64",
+            },
+            _tool_use_block("toolu_01"),
+        ],
+        custom_provider="gemini",
+    )
+
+    assert _find_items(payload, "reasoning") == []
+    assert "extra_content" not in _find_items(payload, "function_call")[0]
 
 
 def test_image_block_becomes_data_url() -> None:
