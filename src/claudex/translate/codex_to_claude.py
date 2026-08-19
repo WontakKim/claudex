@@ -23,6 +23,7 @@ from typing import Any
 
 import claudex.translate.context_overflow as context_overflow
 from claudex.translate.claude_to_codex import build_tool_name_shortening_map, shorten_call_id
+from claudex.translate.thought_signature import encode_call_signature_carrier
 
 # Claude tool_use ids only allow this alphabet.
 _TOOL_ID_SANITIZER = re.compile(r"[^a-zA-Z0-9_-]")
@@ -92,12 +93,38 @@ def _build_reverse_tool_name_map(claude_request: dict[str, Any]) -> dict[str, st
     return {short: original for original, short in build_tool_name_shortening_map(claude_request).items()}
 
 
+def extract_google_thought_signature(item: dict[str, Any]) -> str | None:
+    extra_content = item.get("extra_content")
+    if not isinstance(extra_content, dict):
+        return None
+    google = extra_content.get("google")
+    if not isinstance(google, dict):
+        return None
+    signature = google.get("thought_signature")
+    if not isinstance(signature, str) or not signature:
+        return None
+    return signature
+
+
 @dataclass
 class _PendingFunctionCall:
     call_id: str = ""
     arguments: str = ""
     has_received_arguments_delta: bool = False
     start_emitted: bool = False
+    signature: str = ""
+    claude_tool_id: str = ""
+    output_index: Any = None
+    item_id: str = ""
+
+
+@dataclass
+class _ClosedFunctionCall:
+    call_id: str = ""
+    claude_tool_id: str = ""
+    signature: str = ""
+    output_index: Any = None
+    item_id: str = ""
 
 
 @dataclass
@@ -106,6 +133,7 @@ class CodexToClaudeStreamTranslator:
 
     claude_request: dict[str, Any]
     context_window: int | None = None
+    custom_provider: str | None = None
 
     _short_to_original: dict[str, str] = field(init=False)
     _block_index: int = 0
@@ -115,12 +143,18 @@ class CodexToClaudeStreamTranslator:
     _thinking_summary_seen: bool = False
     _function_call_block_open: bool = False
     _function_call_block_call_id: str = ""
+    _function_call_block_claude_tool_id: str = ""
     _function_call_block_index: int = 0
+    _function_call_block_output_index: Any = None
+    _function_call_block_item_id: str = ""
+    _function_call_signature: str = ""
     _has_received_arguments_delta: bool = False
     _has_text_delta: bool = False
     _has_emitted_tool_use: bool = False
     _pending_calls: dict[str, _PendingFunctionCall] = field(default_factory=dict)
     _last_pending_key: str = ""
+    _closed_function_calls: list[_ClosedFunctionCall] = field(default_factory=list)
+    _emitted_carrier_tool_ids: set[str] = field(default_factory=set)
     _web_search_tool_use_ids: set[str] = field(default_factory=set)
     _web_search_tool_result_ids: set[str] = field(default_factory=set)
     _last_web_search_tool_use_id: str = ""
@@ -173,7 +207,9 @@ class CodexToClaudeStreamTranslator:
         if rewritten is not None:
             error_type = "invalid_request_error"
             message = rewritten
-        return [("error", {"type": "error", "error": {"type": error_type, "message": message}})]
+        events = [("error", {"type": "error", "error": {"type": error_type, "message": message}})]
+        self._release_call_signature_retention()
+        return events
 
     def _on_failed(self, event: dict[str, Any]) -> list[ClaudeEvent]:
         response = event.get("response") or {}
@@ -184,7 +220,9 @@ class CodexToClaudeStreamTranslator:
         if rewritten is not None:
             error_type = "invalid_request_error"
             message = rewritten
-        return [("error", {"type": "error", "error": {"type": error_type, "message": message}})]
+        events = [("error", {"type": "error", "error": {"type": error_type, "message": message}})]
+        self._release_call_signature_retention()
+        return events
 
     def _rewrite_overflow_message(self, code: Any, message: Any) -> str | None:
         """Rewrite an overflow error message, enriching it with a numeric pair.
@@ -209,6 +247,7 @@ class CodexToClaudeStreamTranslator:
         events.extend(self._hydrate_open_function_call_from_terminal(response))
         events.extend(self._finalize_open_blocks())
         events.extend(self._flush_pending_calls_from_terminal(response))
+        events.extend(self._emit_closed_call_carriers_from_terminal(response))
 
         input_tokens, output_tokens, cached_tokens = extract_responses_usage(response.get("usage"))
         usage: dict[str, Any] = {"input_tokens": input_tokens, "output_tokens": output_tokens}
@@ -224,6 +263,7 @@ class CodexToClaudeStreamTranslator:
 
         events.append(("message_delta", {"type": "message_delta", "delta": delta, "usage": usage}))
         events.append(("message_stop", {"type": "message_stop"}))
+        self._release_call_signature_retention()
         return events
 
     _on_incomplete = _on_completed
@@ -289,23 +329,34 @@ class CodexToClaudeStreamTranslator:
             events.extend(self._stop_text_block())
             self._has_received_arguments_delta = False
 
+            signature = self._function_call_thought_signature(item)
             call_id = item.get("call_id", "")
             name = item.get("name", "")
             if not name:
-                self._record_pending_call(event, item)
+                self._record_pending_call(event, item, signature)
                 return events
 
             pending, alias_keys = self._pending_call_for_done(event, item)
+            retained_signature = pending.signature if pending is not None else ""
+            if signature is not None:
+                retained_signature = signature
+            claude_tool_id = pending.claude_tool_id if pending is not None else ""
+            if not claude_tool_id:
+                claude_tool_id = sanitize_claude_tool_id(call_id)
             if pending is not None:
                 self._delete_pending_aliases(alias_keys)
 
             block_index = self._block_index
-            events.extend(self._function_call_start(call_id, name, block_index))
+            events.extend(self._function_call_start(claude_tool_id, name, block_index))
             self._has_emitted_tool_use = True
             events.extend(self._function_call_arguments_delta("", block_index))
             self._function_call_block_open = True
             self._function_call_block_call_id = call_id
+            self._function_call_block_claude_tool_id = claude_tool_id
             self._function_call_block_index = block_index
+            self._function_call_block_output_index = event.get("output_index")
+            self._function_call_block_item_id = self._function_call_item_id(event, item)
+            self._function_call_signature = retained_signature
             return events
 
         if item_type == "reasoning":
@@ -327,14 +378,19 @@ class CodexToClaudeStreamTranslator:
             return self._emit_message_item_fallback(item)
 
         if item_type == "function_call":
+            signature = self._function_call_thought_signature(item)
             pending, alias_keys = self._pending_call_for_done(event, item)
+            if pending is not None and signature is not None:
+                pending.signature = signature
             if pending is not None and not pending.start_emitted:
                 name = item.get("name", "")
                 if not name:
                     return []
                 call_id = pending.call_id or item.get("call_id", "")
+                if not pending.claude_tool_id:
+                    pending.claude_tool_id = sanitize_claude_tool_id(call_id)
                 block_index = self._block_index
-                events = self._function_call_start(call_id, name, block_index)
+                events = self._function_call_start(pending.claude_tool_id, name, block_index)
                 self._has_emitted_tool_use = True
                 pending.start_emitted = True
 
@@ -343,10 +399,24 @@ class CodexToClaudeStreamTranslator:
                     events.extend(self._function_call_arguments_delta(arguments, block_index))
                 events.extend(self._function_call_stop(block_index))
                 self._block_index += 1
+                events.extend(
+                    self._carrier_thinking_block_events(
+                        pending.claude_tool_id, pending.signature
+                    )
+                )
+                self._retain_closed_function_call(
+                    call_id=pending.call_id or item.get("call_id", ""),
+                    claude_tool_id=pending.claude_tool_id,
+                    signature=pending.signature,
+                    output_index=pending.output_index,
+                    item_id=pending.item_id,
+                )
                 self._delete_pending_aliases(alias_keys)
                 return events
 
             if self._function_call_block_open:
+                if signature is not None and self._event_matches_open_function_call(event, item):
+                    self._function_call_signature = signature
                 events: list[ClaudeEvent] = []
                 if not self._has_received_arguments_delta and item.get("arguments"):
                     events.extend(
@@ -542,6 +612,34 @@ class CodexToClaudeStreamTranslator:
 
     # --- function call argument events ---------------------------------------
 
+    def _function_call_thought_signature(self, item: dict[str, Any]) -> str | None:
+        if self.custom_provider is None:
+            return None
+        return extract_google_thought_signature(item)
+
+    @staticmethod
+    def _function_call_item_id(event: dict[str, Any], item: dict[str, Any]) -> str:
+        for value in (item.get("id"), event.get("item_id")):
+            if isinstance(value, str) and value:
+                return value
+        return ""
+
+    def _event_matches_open_function_call(
+        self, event: dict[str, Any], item: dict[str, Any]
+    ) -> bool:
+        call_id = item.get("call_id", "")
+        if self._function_call_block_call_id and call_id:
+            return self._function_call_block_call_id == call_id
+
+        output_index = event.get("output_index")
+        if self._function_call_block_output_index is not None and output_index is not None:
+            return self._function_call_block_output_index == output_index
+
+        item_id = self._function_call_item_id(event, item)
+        if self._function_call_block_item_id and item_id:
+            return self._function_call_block_item_id == item_id
+        return True
+
     def _on_function_call_arguments_delta(self, event: dict[str, Any]) -> list[ClaudeEvent]:
         delta = event.get("delta", "")
         pending = self._pending_call_for_arguments(event)
@@ -575,8 +673,18 @@ class CodexToClaudeStreamTranslator:
             return f"call:{item['call_id']}"
         return "last"
 
-    def _record_pending_call(self, event: dict[str, Any], item: dict[str, Any]) -> None:
-        pending = _PendingFunctionCall(call_id=item.get("call_id", ""))
+    def _record_pending_call(
+        self,
+        event: dict[str, Any],
+        item: dict[str, Any],
+        signature: str | None,
+    ) -> None:
+        pending = _PendingFunctionCall(
+            call_id=item.get("call_id", ""),
+            signature=signature or "",
+            output_index=event.get("output_index"),
+            item_id=self._function_call_item_id(event, item),
+        )
         key = self._pending_key(event, item)
         self._pending_calls[key] = pending
         if pending.call_id:
@@ -618,18 +726,37 @@ class CodexToClaudeStreamTranslator:
             if self._last_pending_key == key:
                 self._last_pending_key = ""
 
+    def _terminal_item_matches_open_function_call(
+        self, output_index: int, item: dict[str, Any]
+    ) -> bool:
+        call_id = item.get("call_id", "")
+        if self._function_call_block_call_id and call_id:
+            return self._function_call_block_call_id == call_id
+
+        item_id = self._function_call_item_id({}, item)
+        if self._function_call_block_item_id and item_id:
+            return self._function_call_block_item_id == item_id
+
+        terminal_output_index = item.get("output_index", output_index)
+        if self._function_call_block_output_index is not None:
+            return self._function_call_block_output_index == terminal_output_index
+        return not self._function_call_block_call_id and not call_id
+
     def _hydrate_open_function_call_from_terminal(
         self, response_data: dict[str, Any]
     ) -> list[ClaudeEvent]:
-        """Backfill arguments for an open tool_use block from the terminal response."""
-        if not self._function_call_block_open or self._has_received_arguments_delta:
+        """Backfill an open tool_use block from the terminal response."""
+        if not self._function_call_block_open:
             return []
-        for item in response_data.get("output") or []:
+        for output_index, item in enumerate(response_data.get("output") or []):
             if not isinstance(item, dict) or item.get("type") != "function_call":
                 continue
-            if item.get("call_id") != self._function_call_block_call_id:
+            if not self._terminal_item_matches_open_function_call(output_index, item):
                 continue
-            if item.get("arguments"):
+            signature = self._function_call_thought_signature(item)
+            if signature is not None:
+                self._function_call_signature = signature
+            if not self._has_received_arguments_delta and item.get("arguments"):
                 self._has_received_arguments_delta = True
                 return self._function_call_arguments_delta(
                     item["arguments"], self._function_call_block_index
@@ -650,6 +777,9 @@ class CodexToClaudeStreamTranslator:
             pending, alias_keys = self._pending_call_for_terminal_item(output_index, item)
             if pending is None:
                 continue
+            signature = self._function_call_thought_signature(item)
+            if signature is not None:
+                pending.signature = signature
             if pending.start_emitted:
                 self._delete_pending_aliases(alias_keys)
                 continue
@@ -659,9 +789,11 @@ class CodexToClaudeStreamTranslator:
                 self._delete_pending_aliases(alias_keys)
                 continue
             call_id = pending.call_id or item.get("call_id", "")
+            if not pending.claude_tool_id:
+                pending.claude_tool_id = sanitize_claude_tool_id(call_id)
 
             block_index = self._block_index
-            events.extend(self._function_call_start(call_id, name, block_index))
+            events.extend(self._function_call_start(pending.claude_tool_id, name, block_index))
             self._has_emitted_tool_use = True
             pending.start_emitted = True
 
@@ -670,6 +802,11 @@ class CodexToClaudeStreamTranslator:
                 events.extend(self._function_call_arguments_delta(arguments, block_index))
             events.extend(self._function_call_stop(block_index))
             self._block_index += 1
+            events.extend(
+                self._carrier_thinking_block_events(
+                    pending.claude_tool_id, pending.signature
+                )
+            )
             self._delete_pending_aliases(alias_keys)
 
         self._pending_calls.clear()
@@ -692,7 +829,141 @@ class CodexToClaudeStreamTranslator:
                 return pending, self._aliases_of(pending)
         return None, []
 
+    def _retain_closed_function_call(
+        self,
+        *,
+        call_id: str,
+        claude_tool_id: str,
+        signature: str,
+        output_index: Any,
+        item_id: str,
+    ) -> None:
+        if (
+            self.custom_provider is None
+            or not claude_tool_id
+            or claude_tool_id in self._emitted_carrier_tool_ids
+        ):
+            return
+        if any(
+            closed_call.claude_tool_id == claude_tool_id
+            for closed_call in self._closed_function_calls
+        ):
+            return
+        self._closed_function_calls.append(
+            _ClosedFunctionCall(
+                call_id=call_id,
+                claude_tool_id=claude_tool_id,
+                signature=signature,
+                output_index=output_index,
+                item_id=item_id,
+            )
+        )
+
+    @staticmethod
+    def _terminal_item_matches_closed_function_call(
+        closed_call: _ClosedFunctionCall,
+        output_index: int,
+        item: dict[str, Any],
+    ) -> bool:
+        call_id = item.get("call_id", "")
+        if closed_call.call_id and call_id:
+            return closed_call.call_id == call_id
+
+        item_id = item.get("id", "")
+        if closed_call.item_id and item_id:
+            return closed_call.item_id == item_id
+
+        terminal_output_index = item.get("output_index", output_index)
+        if closed_call.output_index is not None:
+            return closed_call.output_index == terminal_output_index
+        return not closed_call.call_id and not call_id
+
+    def _emit_closed_call_carriers_from_terminal(
+        self, response_data: dict[str, Any]
+    ) -> list[ClaudeEvent]:
+        if self.custom_provider is None or not self._closed_function_calls:
+            return []
+
+        events: list[ClaudeEvent] = []
+        for output_index, item in enumerate(response_data.get("output") or []):
+            if not isinstance(item, dict) or item.get("type") != "function_call":
+                continue
+            closed_call = next(
+                (
+                    candidate
+                    for candidate in self._closed_function_calls
+                    if self._terminal_item_matches_closed_function_call(
+                        candidate, output_index, item
+                    )
+                ),
+                None,
+            )
+            if closed_call is None:
+                continue
+            signature = self._function_call_thought_signature(item)
+            if signature is not None:
+                closed_call.signature = signature
+            events.extend(
+                self._carrier_thinking_block_events(
+                    closed_call.claude_tool_id, closed_call.signature
+                )
+            )
+            self._closed_function_calls.remove(closed_call)
+        return events
+
+    def _release_call_signature_retention(self) -> None:
+        self._function_call_block_claude_tool_id = ""
+        self._function_call_block_output_index = None
+        self._function_call_block_item_id = ""
+        self._function_call_signature = ""
+        self._closed_function_calls.clear()
+        self._emitted_carrier_tool_ids.clear()
+        for pending in self._pending_calls.values():
+            pending.signature = ""
+            pending.claude_tool_id = ""
+
     # --- block emit helpers ----------------------------------------------------
+
+    def _carrier_thinking_block_events(
+        self, claude_tool_id: str, signature: str
+    ) -> list[ClaudeEvent]:
+        if (
+            self.custom_provider is None
+            or claude_tool_id in self._emitted_carrier_tool_ids
+        ):
+            return []
+        carrier = encode_call_signature_carrier(
+            self.custom_provider, claude_tool_id, signature
+        )
+        if carrier is None:
+            return []
+
+        block_index = self._block_index
+        events: list[ClaudeEvent] = [
+            (
+                "content_block_start",
+                {
+                    "type": "content_block_start",
+                    "index": block_index,
+                    "content_block": {"type": "thinking", "thinking": ""},
+                },
+            ),
+            (
+                "content_block_delta",
+                {
+                    "type": "content_block_delta",
+                    "index": block_index,
+                    "delta": {"type": "signature_delta", "signature": carrier},
+                },
+            ),
+            (
+                "content_block_stop",
+                {"type": "content_block_stop", "index": block_index},
+            ),
+        ]
+        self._block_index += 1
+        self._emitted_carrier_tool_ids.add(claude_tool_id)
+        return events
 
     def _start_text_block(self) -> list[ClaudeEvent]:
         if self._text_block_open:
@@ -781,7 +1052,9 @@ class CodexToClaudeStreamTranslator:
         events.extend(self._finalize_thinking_block())
         return events
 
-    def _function_call_start(self, call_id: str, name: str, block_index: int) -> list[ClaudeEvent]:
+    def _function_call_start(
+        self, claude_tool_id: str, name: str, block_index: int
+    ) -> list[ClaudeEvent]:
         return [
             (
                 "content_block_start",
@@ -790,7 +1063,7 @@ class CodexToClaudeStreamTranslator:
                     "index": block_index,
                     "content_block": {
                         "type": "tool_use",
-                        "id": sanitize_claude_tool_id(call_id),
+                        "id": claude_tool_id,
                         "name": self._short_to_original.get(name, name),
                         "input": {},
                     },
@@ -816,13 +1089,32 @@ class CodexToClaudeStreamTranslator:
     def _stop_open_function_call_block(self) -> list[ClaudeEvent]:
         if not self._function_call_block_open:
             return []
+        call_id = self._function_call_block_call_id
+        claude_tool_id = self._function_call_block_claude_tool_id
         block_index = self._function_call_block_index
+        output_index = self._function_call_block_output_index
+        item_id = self._function_call_block_item_id
+        signature = self._function_call_signature
+
         events = self._function_call_stop(block_index)
         if self._block_index <= block_index:
             self._block_index = block_index + 1
+        events.extend(self._carrier_thinking_block_events(claude_tool_id, signature))
+        self._retain_closed_function_call(
+            call_id=call_id,
+            claude_tool_id=claude_tool_id,
+            signature=signature,
+            output_index=output_index,
+            item_id=item_id,
+        )
+
         self._function_call_block_open = False
         self._function_call_block_call_id = ""
+        self._function_call_block_claude_tool_id = ""
         self._function_call_block_index = 0
+        self._function_call_block_output_index = None
+        self._function_call_block_item_id = ""
+        self._function_call_signature = ""
         return events
 
     def _finalize_open_blocks(self) -> list[ClaudeEvent]:

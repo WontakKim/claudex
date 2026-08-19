@@ -10,6 +10,10 @@ from claudex.translate.codex_to_claude import (
     CodexToClaudeStreamTranslator,
     assemble_claude_message,
 )
+from claudex.translate.thought_signature import (
+    CallSignatureCarrier,
+    decode_call_signature_carrier,
+)
 
 # Mirrors the Claude Code client's contract regex: without a match it falls
 # back to trimming 20% per retry instead of the exact actual/limit overflow.
@@ -19,13 +23,37 @@ _CLIENT_OVERFLOW_RE = re.compile(
 
 
 def _run_stream(
-    claude_request: dict, codex_events: list[dict], *, context_window: int | None = None
+    claude_request: dict,
+    codex_events: list[dict],
+    *,
+    context_window: int | None = None,
+    custom_provider: str | None = None,
 ) -> list[tuple[str, dict]]:
-    translator = CodexToClaudeStreamTranslator(claude_request, context_window=context_window)
+    translator = CodexToClaudeStreamTranslator(
+        claude_request,
+        context_window=context_window,
+        custom_provider=custom_provider,
+    )
     events: list[tuple[str, dict]] = []
     for codex_event in codex_events:
         events.extend(translator.translate_event(codex_event))
     return events
+
+
+def _decoded_call_signature_carriers(
+    events: list[tuple[str, dict]],
+) -> list[CallSignatureCarrier]:
+    carriers: list[CallSignatureCarrier] = []
+    for event_name, payload in events:
+        if event_name != "content_block_delta":
+            continue
+        delta = payload.get("delta") or {}
+        if delta.get("type") != "signature_delta":
+            continue
+        carrier = decode_call_signature_carrier(delta.get("signature"))
+        if carrier is not None:
+            carriers.append(carrier)
+    return carriers
 
 
 def _count_estimate_calls(monkeypatch: pytest.MonkeyPatch) -> list[int]:
@@ -207,6 +235,618 @@ def test_nameless_function_call_is_hydrated_on_done() -> None:
     assert start_payload["content_block"]["name"] == "late_tool"
     assert events[2][1]["delta"]["partial_json"] == '{"a":1}'
     assert events[4][1]["delta"]["stop_reason"] == "tool_use"
+
+
+def test_carrier_emitted_for_signature_on_added() -> None:
+    events = _run_stream(
+        {},
+        [
+            {
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {
+                    "type": "function_call",
+                    "call_id": "call_added",
+                    "name": "lookup",
+                    "extra_content": {
+                        "google": {"thought_signature": "  signature+/=한글  "}
+                    },
+                },
+            },
+            {
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {
+                    "type": "function_call",
+                    "call_id": "call_added",
+                    "name": "lookup",
+                },
+            },
+        ],
+        custom_provider="gemprov",
+    )
+
+    assert _decoded_call_signature_carriers(events) == [
+        CallSignatureCarrier(
+            provider="gemprov",
+            call_id="call_added",
+            signature="  signature+/=한글  ",
+        )
+    ]
+    assert [
+        payload["content_block"]["type"]
+        for event_name, payload in events
+        if event_name == "content_block_start"
+    ] == ["tool_use", "thinking"]
+    carrier_start_index = next(
+        index
+        for index, (event_name, payload) in enumerate(events)
+        if event_name == "content_block_start"
+        and payload["content_block"]["type"] == "thinking"
+    )
+    assert [event_name for event_name, _ in events[carrier_start_index : carrier_start_index + 3]] == [
+        "content_block_start",
+        "content_block_delta",
+        "content_block_stop",
+    ]
+    assert events[carrier_start_index][1]["content_block"] == {
+        "type": "thinking",
+        "thinking": "",
+    }
+
+
+def test_carrier_emitted_for_signature_on_done_retains_latest() -> None:
+    events = _run_stream(
+        {},
+        [
+            {
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {
+                    "type": "function_call",
+                    "call_id": "call_latest",
+                    "extra_content": {"google": {"thought_signature": "first"}},
+                },
+            },
+            {
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {
+                    "type": "function_call",
+                    "call_id": "call_latest",
+                    "name": "lookup",
+                    "extra_content": {"google": {"thought_signature": "latest"}},
+                },
+            },
+        ],
+        custom_provider="gemprov",
+    )
+
+    assert _decoded_call_signature_carriers(events) == [
+        CallSignatureCarrier(provider="gemprov", call_id="call_latest", signature="latest")
+    ]
+
+
+def test_carrier_emitted_from_completed_fallback() -> None:
+    translator = CodexToClaudeStreamTranslator({}, custom_provider="gemprov")
+    added_events = translator.translate_event(
+        {
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {
+                "type": "function_call",
+                "call_id": "call_terminal",
+                "name": "lookup",
+            },
+        }
+    )
+    done_events = translator.translate_event(
+        {
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": {
+                "type": "function_call",
+                "call_id": "call_terminal",
+                "name": "lookup",
+            },
+        }
+    )
+    assert _decoded_call_signature_carriers(added_events + done_events) == []
+
+    completed_events = translator.translate_event(
+        {
+            "type": "response.completed",
+            "response": {
+                "usage": {},
+                "output": [
+                    {
+                        "type": "function_call",
+                        "call_id": "call_terminal",
+                        "name": "lookup",
+                        "extra_content": {
+                            "google": {"thought_signature": "terminal-signature"}
+                        },
+                    }
+                ],
+            },
+        }
+    )
+    assert _decoded_call_signature_carriers(completed_events) == [
+        CallSignatureCarrier(
+            provider="gemprov",
+            call_id="call_terminal",
+            signature="terminal-signature",
+        )
+    ]
+
+
+def test_carrier_emitted_once_per_call() -> None:
+    done_event = {
+        "type": "response.output_item.done",
+        "output_index": 0,
+        "item": {
+            "type": "function_call",
+            "call_id": "call_once",
+            "name": "lookup",
+            "extra_content": {"google": {"thought_signature": "signature"}},
+        },
+    }
+    events = _run_stream(
+        {},
+        [
+            {
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {
+                    "type": "function_call",
+                    "call_id": "call_once",
+                    "name": "lookup",
+                    "extra_content": {"google": {"thought_signature": "signature"}},
+                },
+            },
+            done_event,
+            done_event,
+            {
+                "type": "response.completed",
+                "response": {"usage": {}, "output": [done_event["item"]]},
+            },
+        ],
+        custom_provider="gemprov",
+    )
+
+    assert _decoded_call_signature_carriers(events) == [
+        CallSignatureCarrier(provider="gemprov", call_id="call_once", signature="signature")
+    ]
+
+
+def test_parallel_calls_only_matching_call_gets_carrier() -> None:
+    events = _run_stream(
+        {},
+        [
+            {
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {
+                    "type": "function_call",
+                    "call_id": "call_signed",
+                    "name": "first_tool",
+                    "extra_content": {"google": {"thought_signature": "first-signature"}},
+                },
+            },
+            {
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {
+                    "type": "function_call",
+                    "call_id": "call_signed",
+                    "name": "first_tool",
+                },
+            },
+            {
+                "type": "response.output_item.added",
+                "output_index": 1,
+                "item": {
+                    "type": "function_call",
+                    "call_id": "call_unsigned",
+                    "name": "second_tool",
+                },
+            },
+            {
+                "type": "response.output_item.done",
+                "output_index": 1,
+                "item": {
+                    "type": "function_call",
+                    "call_id": "call_unsigned",
+                    "name": "second_tool",
+                },
+            },
+            {
+                "type": "response.completed",
+                "response": {
+                    "usage": {},
+                    "output": [
+                        {
+                            "type": "function_call",
+                            "call_id": "call_signed",
+                            "name": "first_tool",
+                            "extra_content": {
+                                "google": {"thought_signature": "first-signature"}
+                            },
+                        },
+                        {
+                            "type": "function_call",
+                            "call_id": "call_unsigned",
+                            "name": "second_tool",
+                        },
+                    ],
+                },
+            },
+        ],
+        custom_provider="gemprov",
+    )
+
+    assert _decoded_call_signature_carriers(events) == [
+        CallSignatureCarrier(
+            provider="gemprov",
+            call_id="call_signed",
+            signature="first-signature",
+        )
+    ]
+
+
+def test_no_carrier_without_custom_provider() -> None:
+    events = _run_stream(
+        {},
+        [
+            {
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {
+                    "type": "function_call",
+                    "call_id": "call_default",
+                    "name": "lookup",
+                    "extra_content": {"google": {"thought_signature": "discarded"}},
+                },
+            },
+            {
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {
+                    "type": "function_call",
+                    "call_id": "call_default",
+                    "name": "lookup",
+                    "extra_content": {"google": {"thought_signature": "discarded"}},
+                },
+            },
+        ],
+    )
+
+    assert _decoded_call_signature_carriers(events) == []
+    assert [
+        payload["content_block"]["type"]
+        for event_name, payload in events
+        if event_name == "content_block_start"
+    ] == ["tool_use"]
+
+
+@pytest.mark.parametrize(
+    "extra_content",
+    [
+        {},
+        {"google": {}},
+        {"google": {"thought_signature": ""}},
+        {"google": {"thought_signature": 1}},
+        {"google": {"thought_signature": []}},
+        {"google": {"thought_signature": "x" * 16_385}},
+    ],
+)
+def test_no_carrier_when_signature_absent_or_invalid(extra_content: object) -> None:
+    events = _run_stream(
+        {},
+        [
+            {
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {
+                    "type": "function_call",
+                    "call_id": "call_invalid",
+                    "name": "lookup",
+                    "extra_content": extra_content,
+                },
+            },
+            {
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {
+                    "type": "function_call",
+                    "call_id": "call_invalid",
+                    "name": "lookup",
+                    "extra_content": extra_content,
+                },
+            },
+        ],
+        custom_provider="gemprov",
+    )
+
+    assert _decoded_call_signature_carriers(events) == []
+
+
+@pytest.mark.parametrize(
+    "extra_content",
+    [
+        None,
+        "not-a-dictionary",
+        [],
+        {"google": None},
+        {"google": "not-a-dictionary"},
+        {"google": []},
+    ],
+)
+def test_malformed_extra_content_shapes_do_not_raise_or_emit_carrier(
+    extra_content: object,
+) -> None:
+    events = _run_stream(
+        {},
+        [
+            {
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {
+                    "type": "function_call",
+                    "call_id": "call_malformed",
+                    "name": "lookup",
+                    "extra_content": extra_content,
+                },
+            },
+            {
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {
+                    "type": "function_call",
+                    "call_id": "call_malformed",
+                    "name": "lookup",
+                    "extra_content": extra_content,
+                },
+            },
+        ],
+        custom_provider="gemprov",
+    )
+
+    assert _decoded_call_signature_carriers(events) == []
+
+
+def test_carrier_uses_claude_surface_tool_id() -> None:
+    events = _run_stream(
+        {},
+        [
+            {
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {
+                    "type": "function_call",
+                    "call_id": "call.bad/id",
+                    "name": "lookup",
+                    "extra_content": {"google": {"thought_signature": "signature"}},
+                },
+            },
+            {
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {
+                    "type": "function_call",
+                    "call_id": "call.bad/id",
+                    "name": "lookup",
+                },
+            },
+        ],
+        custom_provider="gemprov",
+    )
+
+    tool_start = next(
+        payload
+        for event_name, payload in events
+        if event_name == "content_block_start"
+        and payload["content_block"]["type"] == "tool_use"
+    )
+    [carrier] = _decoded_call_signature_carriers(events)
+    assert tool_start["content_block"]["id"] == "call_bad_id"
+    assert carrier.call_id == tool_start["content_block"]["id"]
+
+
+def test_carrier_matches_generated_claude_surface_tool_id_for_empty_call_id() -> None:
+    events = _run_stream(
+        {},
+        [
+            {
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {
+                    "type": "function_call",
+                    "call_id": "",
+                    "name": "lookup",
+                },
+            },
+            {
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {"type": "function_call", "call_id": "", "name": "lookup"},
+            },
+            {
+                "type": "response.completed",
+                "response": {
+                    "usage": {},
+                    "output": [
+                        {
+                            "type": "function_call",
+                            "call_id": "",
+                            "name": "lookup",
+                            "extra_content": {
+                                "google": {"thought_signature": "signature"}
+                            },
+                        }
+                    ],
+                },
+            },
+        ],
+        custom_provider="gemprov",
+    )
+
+    tool_start = next(
+        payload
+        for event_name, payload in events
+        if event_name == "content_block_start"
+        and payload["content_block"]["type"] == "tool_use"
+    )
+    [carrier] = _decoded_call_signature_carriers(events)
+    claude_tool_id = tool_start["content_block"]["id"]
+    assert claude_tool_id.startswith("toolu_gateway_")
+    assert carrier.call_id == claude_tool_id
+
+
+def test_carrier_events_precede_message_stop() -> None:
+    events = _run_stream(
+        {},
+        [
+            {
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {
+                    "type": "function_call",
+                    "call_id": "call_order",
+                    "name": "lookup",
+                    "extra_content": {"google": {"thought_signature": "signature"}},
+                },
+            },
+            {
+                "type": "response.completed",
+                "response": {
+                    "usage": {},
+                    "output": [
+                        {
+                            "type": "function_call",
+                            "call_id": "call_order",
+                            "name": "lookup",
+                            "extra_content": {
+                                "google": {"thought_signature": "signature"}
+                            },
+                        }
+                    ],
+                },
+            },
+        ],
+        custom_provider="gemprov",
+    )
+
+    event_names = [event_name for event_name, _ in events]
+    thinking_start_index = next(
+        index
+        for index, (event_name, payload) in enumerate(events)
+        if event_name == "content_block_start"
+        and payload["content_block"]["type"] == "thinking"
+    )
+    tool_stop_index = next(
+        index
+        for index, (event_name, payload) in enumerate(events)
+        if event_name == "content_block_stop" and payload["index"] == 0
+    )
+    assert tool_stop_index < thinking_start_index
+    assert thinking_start_index < event_names.index("message_delta")
+    assert event_names.index("message_delta") < event_names.index("message_stop")
+
+
+def test_assembled_message_contains_carrier_thinking_block() -> None:
+    events = _run_stream(
+        {"model": "claude-sonnet-4-5"},
+        [
+            {
+                "type": "response.created",
+                "response": {"id": "response-carrier", "model": "upstream-model"},
+            },
+            {
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {
+                    "type": "function_call",
+                    "call_id": "call_assembled",
+                    "name": "lookup",
+                    "extra_content": {
+                        "google": {"thought_signature": "assembled-signature"}
+                    },
+                },
+            },
+            {
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {
+                    "type": "function_call",
+                    "call_id": "call_assembled",
+                    "name": "lookup",
+                },
+            },
+            {
+                "type": "response.completed",
+                "response": {"id": "response-carrier", "usage": {}, "output": []},
+            },
+        ],
+        custom_provider="gemprov",
+    )
+
+    message = assemble_claude_message(events)
+    assert message is not None
+    assert [block["type"] for block in message["content"]] == ["tool_use", "thinking"]
+    carrier_block = message["content"][1]
+    assert carrier_block["thinking"] == ""
+    assert decode_call_signature_carrier(carrier_block["signature"]) == CallSignatureCarrier(
+        provider="gemprov",
+        call_id="call_assembled",
+        signature="assembled-signature",
+    )
+
+
+def test_tool_use_timing_unchanged_with_custom_provider() -> None:
+    codex_events = [
+        {
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {
+                "type": "function_call",
+                "call_id": "call_timing",
+                "name": "lookup",
+                "extra_content": {"google": {"thought_signature": "signature"}},
+            },
+        },
+        {
+            "type": "response.function_call_arguments.delta",
+            "output_index": 0,
+            "delta": '{"city":"Seoul"}',
+        },
+        {
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": {
+                "type": "function_call",
+                "call_id": "call_timing",
+                "name": "lookup",
+            },
+        },
+    ]
+    legacy_events = _run_stream({}, codex_events)
+    custom_provider_events = _run_stream(
+        {}, codex_events, custom_provider="gemprov"
+    )
+
+    assert custom_provider_events[: len(legacy_events)] == legacy_events
+    assert [event_name for event_name, _ in legacy_events] == [
+        "content_block_start",
+        "content_block_delta",
+        "content_block_delta",
+        "content_block_stop",
+    ]
+    assert [event_name for event_name, _ in custom_provider_events[len(legacy_events) :]] == [
+        "content_block_start",
+        "content_block_delta",
+        "content_block_stop",
+    ]
 
 
 def test_message_item_fallback_when_no_text_deltas() -> None:
