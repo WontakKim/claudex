@@ -359,10 +359,22 @@ async def _attempt_with_account(
                             pass
 
                 refresh_coroutine = _refresh_usage_after_quota_429()
+                refresh_task: asyncio.Task[None] | None = None
+                refresh_tasks: set[asyncio.Task[None]] | None = None
                 try:
-                    asyncio.create_task(refresh_coroutine)
+                    refresh_tasks = (
+                        request.app.state.claude_usage_refresh_tasks
+                    )
+                    refresh_task = asyncio.create_task(refresh_coroutine)
+                    refresh_tasks.add(refresh_task)
+                    refresh_task.add_done_callback(refresh_tasks.discard)
                 except Exception:
-                    refresh_coroutine.close()
+                    if refresh_task is None:
+                        refresh_coroutine.close()
+                    else:
+                        refresh_task.cancel()
+                        if refresh_tasks is not None:
+                            refresh_tasks.discard(refresh_task)
 
             mode = (
                 "balanced"

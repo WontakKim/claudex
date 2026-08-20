@@ -3743,8 +3743,11 @@ def test_fallback_429_schedules_forced_usage_refresh_without_blocking(
                 await asyncio.wait_for(poll_started.wait(), timeout=1.0)
                 response = await asyncio.wait_for(response_task, timeout=1.0)
                 assert not poll_completed.is_set()
+                assert len(client.app.state.claude_usage_refresh_tasks) == 1
                 poll_release.set()
                 await asyncio.wait_for(poll_completed.wait(), timeout=1.0)
+                await asyncio.sleep(0)
+                assert client.app.state.claude_usage_refresh_tasks == set()
                 return response
 
         assert client.portal is not None
@@ -3785,6 +3788,7 @@ def test_fallback_refresh_scheduling_failure_preserves_429(
         )
 
         response = client.post("/v1/messages", json=_account_body())
+        assert client.app.state.claude_usage_refresh_tasks == set()
 
     assert response.status_code == 429
     assert response.json()["error"]["message"] == "scheduling-failure"
