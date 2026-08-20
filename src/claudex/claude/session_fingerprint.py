@@ -90,6 +90,14 @@ def _load_winning_seed(seed_path: Path) -> bytes | None:
         return None
 
 
+def _fsync_directory(directory: Path) -> None:
+    descriptor = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 def _create_fingerprint_seed(pool_dir: Path, seed_path: Path) -> bytes | None:
     try:
         pool_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -125,6 +133,16 @@ def _create_fingerprint_seed(pool_dir: Path, seed_path: Path) -> bytes | None:
         _discard_temporary_seed(temp_path)
         _warn_seed_unavailable(seed_path, "could not be published")
         return None
+
+    if not publication_lost:
+        # fsync the directory so the newly linked seed entry survives a crash;
+        # the temporary entry's durability does not matter.
+        try:
+            _fsync_directory(pool_dir)
+        except OSError:
+            _discard_temporary_seed(temp_path)
+            _warn_seed_unavailable(seed_path, "could not be made durable")
+            return None
 
     if not _discard_temporary_seed(temp_path):
         _warn_seed_unavailable(seed_path, "left an unreadable temporary file")

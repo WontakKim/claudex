@@ -207,6 +207,36 @@ def test_load_or_create_fingerprint_seed_corruption_returns_none_and_warns(
     assert all(corrupt_seed not in message for message in caplog.messages)
 
 
+def test_load_or_create_fingerprint_seed_directory_sync_failure_returns_none(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    pool_dir = tmp_path / "sync-failure"
+
+    def fail_directory_sync(_directory: Path) -> None:
+        raise OSError("simulated directory fsync failure")
+
+    monkeypatch.setattr(session_fingerprint, "_fsync_directory", fail_directory_sync)
+    with caplog.at_level(
+        logging.WARNING, logger="claudex.claude.session_fingerprint"
+    ):
+        seed = load_or_create_fingerprint_seed(pool_dir)
+
+    assert seed is None
+    assert any("could not be made durable" in message for message in caplog.messages)
+    seed_path = pool_dir / "session-fingerprint-seed"
+    persisted = seed_path.read_text(encoding="ascii")
+    assert len(persisted) == 64
+    assert all(character in "0123456789abcdef" for character in persisted)
+    assert list(pool_dir.glob(".session-fingerprint-seed.tmp-*")) == []
+
+    monkeypatch.undo()
+    recovered = load_or_create_fingerprint_seed(pool_dir)
+    assert recovered is not None
+    assert recovered.hex() == persisted
+
+
 def test_selection_uuid_session_key_digest_unchanged_after_refactor() -> None:
     seed = b"routing-digest-compatibility-seed"
     raw_spelling = _CANONICAL_UUID.upper()
