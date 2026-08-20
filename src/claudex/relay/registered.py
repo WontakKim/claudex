@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import math
@@ -340,6 +341,33 @@ async def _attempt_with_account(
                 account_id,
                 cooldown_decision.seconds,
             )
+
+            if on_quota_429 is None:
+                async def _refresh_usage_after_quota_429() -> None:
+                    await request.app.state.claude_account_usage_cache.poll(
+                        account_id, force=True
+                    )
+
+                def _consume_usage_refresh_exception(
+                    task: asyncio.Task[None],
+                ) -> None:
+                    if task.cancelled():
+                        return
+                    exception = task.exception()
+                    if exception is not None:
+                        logger.warning(
+                            "post-429 Claude usage refresh failed unexpectedly",
+                            exc_info=(
+                                type(exception),
+                                exception,
+                                exception.__traceback__,
+                            ),
+                        )
+
+                refresh_task = asyncio.create_task(
+                    _refresh_usage_after_quota_429()
+                )
+                refresh_task.add_done_callback(_consume_usage_refresh_exception)
 
             mode = (
                 "balanced"

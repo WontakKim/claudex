@@ -539,7 +539,7 @@ async def _serve_balanced_stateless_message(
             _account_id: str = record.id,
             _incarnation: str = record.account_incarnation_id,
         ) -> str:
-            return await _install_balanced_quota_cooldown(
+            canonical_record = await _install_balanced_quota_cooldown(
                 request.app.state,
                 router,
                 account_id=_account_id,
@@ -548,6 +548,9 @@ async def _serve_balanced_stateless_message(
                 epoch_seed=runtime.epoch_seed,
                 mark=mark,
             )
+            assert runtime.usage_poll_coordinator is not None
+            runtime.usage_poll_coordinator.request_manual_refresh(_account_id)
+            return canonical_record
 
         async def _on_response(
             upstream_response: httpx.Response,
@@ -731,7 +734,7 @@ async def _serve_balanced_pinned_message(
                 _account_id: str = target_record.id,
                 _incarnation: str = target_record.account_incarnation_id,
             ) -> str:
-                return await _install_balanced_quota_cooldown(
+                canonical_record = await _install_balanced_quota_cooldown(
                     request.app.state,
                     router,
                     account_id=_account_id,
@@ -740,6 +743,9 @@ async def _serve_balanced_pinned_message(
                     epoch_seed=runtime.epoch_seed,
                     mark=mark,
                 )
+                assert runtime.usage_poll_coordinator is not None
+                runtime.usage_poll_coordinator.request_manual_refresh(_account_id)
+                return canonical_record
 
             async def _on_response(
                 upstream_response: httpx.Response,

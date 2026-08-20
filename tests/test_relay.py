@@ -3700,6 +3700,187 @@ def _quota_429(marker: str = "Error") -> httpx.Response:
     )
 
 
+def test_fallback_429_schedules_forced_usage_refresh_without_blocking(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    account_id = _register_serving_account()
+    poll_started = asyncio.Event()
+    poll_release = asyncio.Event()
+    poll_completed = asyncio.Event()
+    poll_calls: list[tuple[str, bool]] = []
+
+    class BlockingUsageCache:
+        def peek(self, _account_id: str) -> None:
+            return None
+
+        async def poll(self, marked_account_id: str, *, force: bool = False) -> Any:
+            poll_calls.append((marked_account_id, force))
+            poll_started.set()
+            await poll_release.wait()
+            poll_completed.set()
+            return SimpleNamespace(source="fetched", result={"status": "ok"})
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return _quota_429("fallback-refresh")
+
+    with _create_test_client(
+        monkeypatch, tmp_path, config=_pool_config(account_id)
+    ) as client:
+        client.app.state.http_client = httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        )
+        client.app.state.claude_account_usage_cache = BlockingUsageCache()
+
+        async def exercise_request() -> httpx.Response:
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=client.app),
+                base_url="http://testserver",
+            ) as async_client:
+                response_task = asyncio.create_task(
+                    async_client.post("/v1/messages", json=_account_body())
+                )
+                await asyncio.wait_for(poll_started.wait(), timeout=1.0)
+                response = await asyncio.wait_for(response_task, timeout=1.0)
+                assert not poll_completed.is_set()
+                poll_release.set()
+                await asyncio.wait_for(poll_completed.wait(), timeout=1.0)
+                return response
+
+        assert client.portal is not None
+        response = client.portal.call(exercise_request)
+
+    assert response.status_code == 429
+    assert response.json()["error"]["message"] == "fallback-refresh"
+    assert poll_calls == [(account_id, True)]
+
+
+def test_fallback_refresh_unexpected_exception_warns_once(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    account_id = _register_serving_account()
+    poll_completed = asyncio.Event()
+    poll_calls: list[tuple[str, bool]] = []
+
+    class RaisingUsageCache:
+        def peek(self, _account_id: str) -> None:
+            return None
+
+        async def poll(self, marked_account_id: str, *, force: bool = False) -> None:
+            poll_calls.append((marked_account_id, force))
+            poll_completed.set()
+            raise RuntimeError("simulated refresh task failure")
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return _quota_429()
+
+    caplog.set_level(logging.WARNING)
+    with _create_test_client(
+        monkeypatch, tmp_path, config=_pool_config(account_id)
+    ) as client:
+        client.app.state.http_client = httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        )
+        client.app.state.claude_account_usage_cache = RaisingUsageCache()
+
+        async def exercise_request() -> httpx.Response:
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=client.app),
+                base_url="http://testserver",
+            ) as async_client:
+                response = await async_client.post(
+                    "/v1/messages", json=_account_body()
+                )
+                await asyncio.wait_for(poll_completed.wait(), timeout=1.0)
+                await asyncio.sleep(0)
+                return response
+
+        assert client.portal is not None
+        response = client.portal.call(exercise_request)
+
+    refresh_warnings = [
+        record
+        for record in caplog.records
+        if record.getMessage()
+        == "post-429 Claude usage refresh failed unexpectedly"
+    ]
+    assert response.status_code == 429
+    assert poll_calls == [(account_id, True)]
+    assert len(refresh_warnings) == 1
+    assert isinstance(refresh_warnings[0].exc_info[1], RuntimeError)
+
+
+def test_fallback_refresh_cache_error_result_not_double_warned(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    account_id = _register_serving_account()
+    poll_completed = asyncio.Event()
+    poll_calls: list[tuple[str, bool]] = []
+    cache_logger = logging.getLogger("claudex.claude.account_usage_cache")
+
+    class ErrorResultUsageCache:
+        def peek(self, _account_id: str) -> None:
+            return None
+
+        async def poll(self, marked_account_id: str, *, force: bool = False) -> Any:
+            poll_calls.append((marked_account_id, force))
+            cache_logger.warning("simulated cache-owned usage refresh failure")
+            poll_completed.set()
+            return SimpleNamespace(
+                source="fetched",
+                result={"status": "error", "error": "usage probe failed"},
+            )
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return _quota_429()
+
+    caplog.set_level(logging.WARNING)
+    with _create_test_client(
+        monkeypatch, tmp_path, config=_pool_config(account_id)
+    ) as client:
+        client.app.state.http_client = httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        )
+        client.app.state.claude_account_usage_cache = ErrorResultUsageCache()
+
+        async def exercise_request() -> httpx.Response:
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=client.app),
+                base_url="http://testserver",
+            ) as async_client:
+                response = await async_client.post(
+                    "/v1/messages", json=_account_body()
+                )
+                await asyncio.wait_for(poll_completed.wait(), timeout=1.0)
+                await asyncio.sleep(0)
+                return response
+
+        assert client.portal is not None
+        response = client.portal.call(exercise_request)
+
+    cache_warnings = [
+        record
+        for record in caplog.records
+        if record.getMessage() == "simulated cache-owned usage refresh failure"
+    ]
+    relay_warnings = [
+        record
+        for record in caplog.records
+        if record.getMessage()
+        == "post-429 Claude usage refresh failed unexpectedly"
+    ]
+    assert response.status_code == 429
+    assert poll_calls == [(account_id, True)]
+    assert len(cache_warnings) == 1
+    assert relay_warnings == []
+
+
 def test_routing_disabled_by_default_relays_429_without_touching_other_accounts(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -3744,7 +3925,9 @@ def test_pool_fails_over_to_second_account_on_429(
             return _quota_429()
         return httpx.Response(200, json={"id": "msg_1"})
 
-    client, _ = _gateway(_pool_config(first), handler)
+    client, _ = _gateway(
+        _pool_config(first), _usage_probe_intercepting_handler(handler)
+    )
 
     response = client.post("/v1/messages", json=_account_body())
 
@@ -3845,7 +4028,9 @@ def test_all_cooling_returns_429_with_retry_after_without_contacting_upstream(
         calls.append(request)
         return _quota_429()
 
-    client, _ = _gateway(_pool_config(first), handler)
+    client, _ = _gateway(
+        _pool_config(first), _usage_probe_intercepting_handler(handler)
+    )
 
     assert client.post("/v1/messages", json=_account_body()).status_code == 429
     upstream_probes = len(calls)
@@ -3988,7 +4173,9 @@ def test_pool_serves_count_tokens_failover(
             return _quota_429()
         return httpx.Response(200, json={"input_tokens": 42})
 
-    client, _ = _gateway(_pool_config(first), handler)
+    client, _ = _gateway(
+        _pool_config(first), _usage_probe_intercepting_handler(handler)
+    )
 
     response = client.post("/v1/messages/count_tokens", json=_account_body())
 
@@ -4011,7 +4198,9 @@ def test_pool_single_account_429_replays_upstream_body_and_cools_down(
         calls.append(request)
         return _quota_429("single")
 
-    client, _ = _gateway(_pool_config(account_id), handler)
+    client, _ = _gateway(
+        _pool_config(account_id), _usage_probe_intercepting_handler(handler)
+    )
 
     first_response = client.post("/v1/messages", json=_account_body())
     assert first_response.status_code == 429
@@ -4038,7 +4227,9 @@ def test_pool_forwards_non_claude_code_body_unchanged_on_failover(
             return _quota_429()
         return httpx.Response(200, json={"id": "msg_1"})
 
-    client, _ = _gateway(_pool_config(first), handler)
+    client, _ = _gateway(
+        _pool_config(first), _usage_probe_intercepting_handler(handler)
+    )
     body = _message_body("claude-fable-5")
     body["metadata"] = {"user_id": "not-a-json-string"}
     raw = json.dumps(body)
@@ -4205,6 +4396,87 @@ def _balanced_body(session_id: str, *, model: str = "claude-fable-5") -> dict[st
         )
     }
     return body
+
+
+def test_balanced_429_enqueues_manual_usage_refresh(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _balanced_env(monkeypatch, tmp_path)
+    account_id, _access_token = _register_balanced_accounts(1)[0]
+
+    class RecordingUsagePollCoordinator:
+        poll_interval_seconds = 300.0
+
+        def __init__(self, router: ClaudeBalancedRouter) -> None:
+            self.router = router
+            self.account_ids: list[str] = []
+            self.cooldown_installed: list[bool] = []
+
+        async def run_due_poll(self, *_args: Any, **_kwargs: Any) -> None:
+            return None
+
+        def request_manual_refresh(self, marked_account_id: str) -> bool:
+            self.account_ids.append(marked_account_id)
+            self.cooldown_installed.append(
+                self.router.account_cooldown_deadline(marked_account_id) is not None
+            )
+            return True
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return _quota_429()
+
+    with _create_test_client(
+        monkeypatch,
+        tmp_path,
+        config=GatewayConfig(),
+        base_url="http://127.0.0.1:8787",
+    ) as client:
+        runtime = _enable_balanced(client, handler)
+        assert runtime.router is not None
+        assert client.portal is not None
+        client.portal.call(runtime._stop_usage_poll_driver)
+        recording_coordinator = RecordingUsagePollCoordinator(runtime.router)
+        runtime.usage_poll_coordinator = recording_coordinator
+
+        response = client.post(
+            "/v1/messages", json=_balanced_body(_new_session_id())
+        )
+
+        assert response.status_code == 429
+        assert recording_coordinator.account_ids == [account_id]
+        assert recording_coordinator.cooldown_installed == [True]
+
+
+def test_balanced_429_refresh_enqueue_coalesces_per_account(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _balanced_env(monkeypatch, tmp_path)
+    account_id, _access_token = _register_balanced_accounts(1)[0]
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return _quota_429()
+
+    with _create_test_client(
+        monkeypatch,
+        tmp_path,
+        config=GatewayConfig(),
+        base_url="http://127.0.0.1:8787",
+    ) as client:
+        runtime = _enable_balanced(client, handler)
+        coordinator = runtime.usage_poll_coordinator
+        assert coordinator is not None
+        assert client.portal is not None
+        client.portal.call(runtime._stop_usage_poll_driver)
+        assert coordinator.request_manual_refresh(account_id) is True
+        assert coordinator.diagnostics().manual_enqueued_count == 1
+
+        response = client.post(
+            "/v1/messages", json=_balanced_body(_new_session_id())
+        )
+
+        assert response.status_code == 429
+        assert coordinator.is_manual_refresh_pending(account_id) is True
+        assert coordinator.diagnostics().manual_enqueued_count == 1
 
 
 def test_balanced_429_persists_evidence_json_with_required_keys(
