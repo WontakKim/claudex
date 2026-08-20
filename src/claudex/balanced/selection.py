@@ -5,11 +5,12 @@ from __future__ import annotations
 import hmac
 import json
 import math
-import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from hashlib import sha256
 from typing import Any, Literal
+
+from claudex.claude.session_fingerprint import extract_session_uuid
 
 _SESSION_KEY_DOMAIN = b"claudex-session-key-v1"
 # The pin identity is the LOGICAL session digest salted with the request's
@@ -71,28 +72,10 @@ def _length_prefixed(*fields: bytes) -> bytes:
 
 def _uuid_session_key(body: dict[str, Any], seed: bytes) -> SessionKey | None:
     """Try the uuid branch; None on anything that isn't a clean RFC 4122 session_id."""
-    metadata = body.get("metadata")
-    if not isinstance(metadata, dict):
+    extracted = extract_session_uuid(body)
+    if extracted is None:
         return None
-    user_id = metadata.get("user_id")
-    if not isinstance(user_id, str):
-        return None
-    try:
-        parsed_user_id = json.loads(user_id)
-    except json.JSONDecodeError:
-        return None
-    if not isinstance(parsed_user_id, dict):
-        return None
-    candidate = parsed_user_id.get("session_id")
-    if not isinstance(candidate, str) or candidate != candidate.strip():
-        return None
-    try:
-        parsed = uuid.UUID(candidate)
-    except ValueError:
-        return None
-    if parsed.variant != uuid.RFC_4122:
-        return None
-    canonical_utf8 = str(parsed).encode("utf-8")
+    canonical_utf8 = extracted[1].encode("utf-8")
     digest = _hmac_sha256(
         seed, _SESSION_KEY_DOMAIN + b"\x00uuid\x00" + _length_prefixed(canonical_utf8)
     )
