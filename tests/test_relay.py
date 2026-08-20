@@ -22,6 +22,7 @@ from typing import Any
 import httpx
 import pytest
 import uvicorn
+from starlette.responses import Response
 from starlette.testclient import TestClient
 
 import claudex.relay.balanced as relay_balanced
@@ -5292,7 +5293,7 @@ def test_balanced_post_2xx_midstream_failure_relays_sse_error_and_retains_the_co
         assert pin.generation == 1
 
 
-def test_balanced_all_cooling_chain_exhaustion_relays_the_upstream_429_verbatim(
+def test_chain_exhausted_real_429_without_retry_after_gets_local_retry_after(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     _balanced_env(monkeypatch, tmp_path)
@@ -5311,11 +5312,110 @@ def test_balanced_all_cooling_chain_exhaustion_relays_the_upstream_429_verbatim(
 
         assert response.status_code == 429
         assert response.json()["error"]["message"] == "balanced-exhausted"
+        assert int(response.headers["retry-after"]) >= 1
         assert response.headers["x-should-retry"] == "true"
         assert client.app.state.claude_account_cooldowns.is_cooling(account_id)
 
 
-def test_balanced_all_cooling_synthesizes_429_with_retry_after_clamped_over_candidate_set(
+def test_chain_exhausted_retry_after_matches_earliest_local_unblock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(relay_balanced.time, "monotonic", lambda: 1_000.0)
+    records = {
+        "account-a": SimpleNamespace(id="account-a", state="ready"),
+        "account-b": SimpleNamespace(id="account-b", state="ready"),
+    }
+    account_offsets = {"account-a": 9.25, "account-b": 1.0}
+    family_offsets = {"account-a": 2.0, "account-b": 5.25}
+    router = SimpleNamespace(
+        account_cooldown_deadline=lambda account_id, *, now: now
+        + account_offsets[account_id],
+        family_cooldown_deadline=lambda account_id, family, *, now: now
+        + family_offsets[account_id],
+    )
+    upstream = Response(content=b"upstream", status_code=429)
+
+    returned = relay_balanced._balanced_all_cooling_response(
+        records, router, family="fable", chain_exhausted_429=upstream
+    )
+
+    assert returned is upstream
+    assert returned.headers["retry-after"] == "6"
+
+
+@pytest.mark.parametrize("retry_after", ["", "not-a-delay"])
+def test_chain_exhausted_real_429_preserves_upstream_retry_after(
+    retry_after: str,
+) -> None:
+    records = {"account-a": SimpleNamespace(id="account-a", state="ready")}
+    router = SimpleNamespace(
+        account_cooldown_deadline=lambda account_id, *, now: now + 10.0,
+        family_cooldown_deadline=lambda account_id, family, *, now: now + 20.0,
+    )
+    upstream = Response(
+        content=b"upstream",
+        status_code=429,
+        headers={"ReTrY-AfTeR": retry_after, "request-id": "req_preserved"},
+    )
+    before_headers = list(upstream.raw_headers)
+
+    returned = relay_balanced._balanced_all_cooling_response(
+        records, router, family="fable", chain_exhausted_429=upstream
+    )
+
+    assert returned is upstream
+    assert returned.headers["retry-after"] == retry_after
+    assert list(returned.raw_headers) == before_headers
+
+
+def test_chain_exhausted_real_429_preserves_body_and_other_headers(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _balanced_env(monkeypatch, tmp_path)
+    _register_balanced_accounts(2)
+    api_calls: list[httpx.Request] = []
+    payload = b"\x00upstream-body\xff"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == CLAUDE_TOKEN_URL:
+            return httpx.Response(
+                200,
+                json={
+                    "access_token": "rotated-access",
+                    "refresh_token": "rotated-refresh",
+                    "expires_in": 900,
+                },
+            )
+        api_calls.append(request)
+        if len(api_calls) <= 2:
+            return httpx.Response(401, json={"type": "error"})
+        return httpx.Response(
+            429,
+            content=payload,
+            headers={
+                "content-type": "application/octet-stream",
+                "request-id": "req_terminal_429",
+                "x-should-retry": "true",
+            },
+        )
+
+    with _create_test_client(
+        monkeypatch, tmp_path, config=GatewayConfig(), base_url="http://127.0.0.1:8787"
+    ) as client:
+        _enable_balanced(client, handler)
+
+        response = client.post("/v1/messages", json=_balanced_body(_new_session_id()))
+
+        assert response.status_code == 429
+        assert response.content == payload
+        assert response.headers["retry-after"] == "1"
+        assert response.headers["content-type"] == "application/octet-stream"
+        assert response.headers["request-id"] == "req_terminal_429"
+        assert response.headers["x-should-retry"] == "true"
+        assert len(api_calls) == 3
+
+
+def test_synthetic_all_cooling_response_unchanged(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     _balanced_env(monkeypatch, tmp_path)
@@ -5345,6 +5445,14 @@ def test_balanced_all_cooling_synthesizes_429_with_retry_after_clamped_over_cand
         second = client.post("/v1/messages", json=_balanced_body(_new_session_id()))
 
         assert second.status_code == 429
+        assert second.json() == {
+            "type": "error",
+            "error": {
+                "type": "rate_limit_error",
+                "message": "every eligible claude account is rate-limited; "
+                "retry after the cooldown",
+            },
+        }
         retry_after = int(second.headers["retry-after"])
         # The ready account's own (freshly installed, ~60s default) cooldown drives
         # Retry-After; the excluded, not-ready account's much shorter 5s deadline

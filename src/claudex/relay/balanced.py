@@ -391,15 +391,21 @@ def _balanced_all_cooling_response(
 ) -> Response:
     """Respond after a retry chain or initial placement finds no eligible account.
 
-    A chain that exhausted on a real upstream 429 relays that response
-    verbatim. Otherwise this synthesizes an Anthropic-compatible 429 with
-    `Retry-After` based on the earliest unblock time among registered, ready,
-    capability-eligible accounts. A disabled or capability-denied account
-    cannot shorten that value. An empty candidate set returns 503.
+    A chain that exhausted on a real upstream 429 relays that response, adding
+    local `Retry-After` guidance only when the upstream omitted it. Otherwise
+    this synthesizes an Anthropic-compatible 429 with `Retry-After` based on the
+    earliest unblock time among registered, ready, capability-eligible
+    accounts. A disabled or capability-denied account cannot shorten that
+    value. An empty candidate set returns 503 only on the synthetic path.
     """
-    if chain_exhausted_429 is not None:
-        return chain_exhausted_429
     candidate_set = _balanced_eligible_candidate_set(records_by_id)
+    should_add_retry_after = (
+        chain_exhausted_429 is not None
+        and bool(candidate_set)
+        and "retry-after" not in chain_exhausted_429.headers
+    )
+    if chain_exhausted_429 is not None and not should_add_retry_after:
+        return chain_exhausted_429
     if not candidate_set:
         return JSONResponse(
             server_support._claude_error_body(
@@ -418,6 +424,9 @@ def _balanced_all_cooling_response(
 
     min_unblock_at = min(_unblock_at(record) for record in candidate_set)
     retry_after = max(1, math.ceil(min_unblock_at - now))
+    if chain_exhausted_429 is not None:
+        chain_exhausted_429.headers["retry-after"] = str(retry_after)
+        return chain_exhausted_429
     return JSONResponse(
         server_support._claude_error_body(
             "rate_limit_error",
