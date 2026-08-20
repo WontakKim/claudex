@@ -9,6 +9,7 @@ import secrets
 import time
 import uuid
 from collections.abc import Iterable, Mapping, Sequence
+from datetime import datetime, timezone
 from typing import Any
 
 import httpx
@@ -39,7 +40,16 @@ from claudex.claude.accounts import (
     load_registry,
 )
 from claudex.claude.ambient_account import AmbientAccountProvider, is_duplicate_identity
-from claudex.claude.session_fingerprint import extract_session_uuid
+from claudex.claude.quota_429 import (
+    Quota429Mark,
+    enrich_record_degraded,
+    enrich_record_with_family_gate,
+    finalize_quota_429_record,
+)
+from claudex.claude.session_fingerprint import (
+    extract_session_uuid,
+    observability_session_fingerprint,
+)
 from claudex.config import GatewayConfig
 from claudex.relay.registered import (
     _FailedAttempt,
@@ -61,46 +71,113 @@ async def _install_balanced_quota_cooldown(
     account_id: str,
     account_incarnation_id: str,
     model: str,
-    cooldown_seconds: float,
-) -> None:
-    """Install and persist a balanced-mode cooldown after an upstream 429.
+    epoch_seed: bytes,
+    mark: Quota429Mark,
+) -> str:
+    """Install one balanced cooldown and return its canonical incident record."""
+    monotonic_now = time.monotonic()
+    wall_now = time.time()
+    requested_family = quota_family(model)
+    gate = None
+    family_gate = None
+    try:
+        gate = router.classify_cooldown_scope(
+            account_id=account_id,
+            model=model,
+            upstream_status_code=429,
+            now=monotonic_now,
+        )
+        family_deadline_utc = (
+            None
+            if gate.family_deadline is None
+            else datetime.fromtimestamp(
+                wall_now + (gate.family_deadline - monotonic_now),
+                tz=timezone.utc,
+            )
+            .isoformat(timespec="milliseconds")
+            .replace("+00:00", "Z")
+        )
+        family_gate = {
+            "scope": gate.scope,
+            "reason": gate.reason,
+            "family_deadline_utc": family_deadline_utc,
+        }
+        session_fingerprint = (
+            observability_session_fingerprint(epoch_seed, mark.session_literals[1])
+            if mark.session_literals is not None
+            else None
+        )
+        enrich_record_with_family_gate(
+            mark.record,
+            scope=gate.scope,
+            reason=gate.reason,
+            family_deadline_utc=family_deadline_utc,
+            quota_family=requested_family,
+            session_fingerprint=session_fingerprint,
+        )
+        canonical_record = finalize_quota_429_record(mark.record)
+        evidence = canonical_record
+    except Exception:
+        logger.warning("failed to enrich Claude 429 cooldown evidence")
+        if gate is None:
+            installed_scope = "account"
+            family_gate = None
+        else:
+            installed_scope = gate.scope
+            if family_gate is None:
+                family_gate = {
+                    "scope": gate.scope,
+                    "reason": gate.reason,
+                    "family_deadline_utc": None,
+                }
+        enrich_record_degraded(
+            mark.record,
+            installed_scope=installed_scope,
+            quota_family=requested_family,
+            family_gate=family_gate,
+        )
+        canonical_record = finalize_quota_429_record(mark.record)
+        evidence = ""
 
-    The Fable family gate is evaluated before choosing scope. A family-scoped
-    cooldown uses the Fable reset as its deadline; otherwise the same
-    account-wide `cooldown_seconds` applied to the shared in-memory tracker
-    drives the deadline. The high-priority durable write is awaited so a
-    restart does not repeat a burst of 429s against a cooling account.
-    """
-    now = time.monotonic()
-    gate = router.classify_cooldown_scope(
-        account_id=account_id, model=model, upstream_status_code=429, now=now
-    )
-    fingerprint = server_support._account_profile_fingerprint(app_state, account_id)
-    if gate.scope == "family":
+    if gate is not None and gate.scope == "family":
         assert gate.family_deadline is not None
-        pending_write = router.install_cooldown(
-            account_id=account_id,
-            account_incarnation_id=account_incarnation_id,
-            account_profile_fingerprint=fingerprint,
-            scope="family",
-            model_family=quota_family(model),
-            deadline=gate.family_deadline,
-            reason=gate.reason,
-        )
+        installed_scope = "family"
+        deadline = gate.family_deadline
+        reason = gate.reason
+        model_family = requested_family
     else:
+        installed_scope = "account"
+        deadline = monotonic_now + mark.cooldown_seconds
+        reason = (
+            gate.reason if gate is not None else "evidence_classification_unavailable"
+        )
+        model_family = ""
+
+    try:
+        fingerprint = server_support._account_profile_fingerprint(
+            app_state, account_id
+        )
         pending_write = router.install_cooldown(
             account_id=account_id,
             account_incarnation_id=account_incarnation_id,
             account_profile_fingerprint=fingerprint,
-            scope="account",
-            deadline=now + cooldown_seconds,
-            reason=gate.reason,
+            scope=installed_scope,
+            model_family=model_family,
+            deadline=deadline,
+            reason=reason,
+            evidence=evidence,
+            now=monotonic_now,
+            wall_now=wall_now,
         )
+    except Exception:
+        router.persistence_degraded = True
+        return canonical_record
     if pending_write is not None:
         try:
             await pending_write.wait_async()
         except Exception:
             router.persistence_degraded = True
+    return canonical_record
 
 
 async def _record_balanced_capability_evidence(
@@ -404,15 +481,19 @@ async def _serve_balanced_stateless_message(
         record = records_by_id[account_id]
 
         async def _on_quota_429(
-            cooldown_seconds: float, *, _account_id: str = record.id, _incarnation: str = record.account_incarnation_id
-        ) -> None:
-            await _install_balanced_quota_cooldown(
+            mark: Quota429Mark,
+            *,
+            _account_id: str = record.id,
+            _incarnation: str = record.account_incarnation_id,
+        ) -> str:
+            return await _install_balanced_quota_cooldown(
                 request.app.state,
                 router,
                 account_id=_account_id,
                 account_incarnation_id=_incarnation,
                 model=model,
-                cooldown_seconds=cooldown_seconds,
+                epoch_seed=runtime.epoch_seed,
+                mark=mark,
             )
 
         async def _on_response(
@@ -588,18 +669,19 @@ async def _serve_balanced_pinned_message(
                     )
 
             async def _on_quota_429(
-                cooldown_seconds: float,
+                mark: Quota429Mark,
                 *,
                 _account_id: str = target_record.id,
                 _incarnation: str = target_record.account_incarnation_id,
-            ) -> None:
-                await _install_balanced_quota_cooldown(
+            ) -> str:
+                return await _install_balanced_quota_cooldown(
                     request.app.state,
                     router,
                     account_id=_account_id,
                     account_incarnation_id=_incarnation,
                     model=model,
-                    cooldown_seconds=cooldown_seconds,
+                    epoch_seed=runtime.epoch_seed,
+                    mark=mark,
                 )
 
             async def _on_response(

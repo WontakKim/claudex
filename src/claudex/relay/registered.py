@@ -14,7 +14,7 @@ import httpx
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
-from claudex import server_support
+from claudex import paths, server_support
 from claudex.claude.account_attempts import (
     AccountLegContext,
     AccountLegTracker,
@@ -25,7 +25,7 @@ from claudex.claude.account_pool import (
     _DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS,
     AccountCooldownTracker,
     build_serving_chain,
-    rate_limit_cooldown_seconds,
+    rate_limit_cooldown_decision,
 )
 from claudex.claude.accounts import (
     AccountRecord,
@@ -36,7 +36,17 @@ from claudex.claude.auth import (
     ClaudeAccountAuthError,
     ClaudeAccountReauthRequiredError,
 )
-from claudex.claude.session_fingerprint import extract_session_uuid
+from claudex.claude.quota_429 import (
+    Quota429Mark,
+    build_quota_429_record,
+    enrich_record_fallback,
+    finalize_quota_429_record,
+)
+from claudex.claude.session_fingerprint import (
+    extract_session_uuid,
+    load_or_create_fingerprint_seed,
+    observability_session_fingerprint,
+)
 from claudex.relay.common import (
     _MANAGED_RELAY_SKIP_REQUEST_HEADERS,
     _OAUTH_BETA,
@@ -155,7 +165,7 @@ async def _attempt_with_account(
     rate_limit_failover: bool,
     commit_hook: Callable[[httpx.Response], Awaitable[None]] | None = None,
     on_relay_complete: Callable[[], None] | None = None,
-    on_quota_429: Callable[[float], Awaitable[None]] | None = None,
+    on_quota_429: Callable[[Quota429Mark], Awaitable[str]] | None = None,
     on_response: Callable[[httpx.Response], Awaitable[None]] | None = None,
 ) -> Response | _FailedAttempt:
     """Serve an Anthropic passthrough request with one registered account's token.
@@ -182,9 +192,9 @@ async def _attempt_with_account(
     becomes the relay's `on_finished` hook. The 401 and 429 failover branches
     do not invoke either hook.
 
-    `on_quota_429`, when given, is awaited with the derived cooldown immediately
+    `on_quota_429`, when given, is awaited with the attributed mark immediately
     after an account-specific 429 marks the shared in-memory tracker. Balanced
-    routing uses it to select the cooldown scope and persist the result.
+    routing uses it to select the cooldown scope and persist canonical evidence.
     `on_response`, when given, is awaited with the open upstream response at
     the same point as `commit_hook`; balanced routing uses it to record eligible
     capability evidence from an explicit 2xx. All hooks default to `None`, so
@@ -307,30 +317,115 @@ async def _attempt_with_account(
                 )
             )
         if upstream_response.status_code == 429 and rate_limit_failover:
-            # Buffer the (small) error response and release the connection before
-            # any next attempt reuses the shared client. Quota 429s carry no
-            # machine-readable reset (.docs/research/claude-429-shape.md), so the
-            # deadline falls back to the cached usage envelope or a short default.
-            response_headers = dict(upstream_response.headers)
+            # Preserve the occurrence-aware collection for evidence capture. The
+            # replay path needs its own plain mapping after httpx has decoded the
+            # buffered response.
+            response_headers = upstream_response.headers
+            replay_headers = dict(response_headers)
             response_body = await upstream_response.aread()
             await upstream_response.aclose()
-            cooldown_seconds = rate_limit_cooldown_seconds(
+            cooldown_decision = rate_limit_cooldown_decision(
                 response_headers,
                 response_body,
                 request.app.state.claude_account_usage_cache.peek(account_id),
             )
             request.app.state.claude_account_cooldowns.mark(
-                account_id, cooldown_seconds
+                account_id, cooldown_decision.seconds
             )
             logger.warning(
                 "claude account %.8s rate-limited by Anthropic; cooling down for %.0fs",
                 account_id,
-                cooldown_seconds,
+                cooldown_decision.seconds,
+            )
+
+            session_literals = extract_session_uuid(
+                parsed_body if isinstance(parsed_body, dict) else {}
+            )
+            context = attempt_context
+            if context is None:
+                context_mode = (
+                    "balanced_stateless" if on_quota_429 is not None else "fallback"
+                )
+                context = AccountLegContext(
+                    mode=context_mode,
+                    ordinal=1,
+                    pin_created=None,
+                    first_started_monotonic=0.0,
+                    started_monotonic=0.0,
+                    previous_started_monotonic=None,
+                    session_literals=session_literals or (),
+                )
+            mode = {
+                "balanced_stateless": "balanced",
+                "balanced_pinned": "balanced",
+                "fallback": "fallback",
+            }.get(context.mode, "balanced" if on_quota_429 is not None else "fallback")
+            quota_record = build_quota_429_record(
+                occurred_at_utc=datetime.now(timezone.utc)
+                .isoformat(timespec="milliseconds")
+                .replace("+00:00", "Z"),
+                mode=mode,
+                account_id=account_id,
+                model=model,
+                cooldown_seconds=cooldown_decision.seconds,
+                cooldown_source=cooldown_decision.source,
+                context=context,
+                parsed_body=parsed_body,
+                raw_body=raw_body,
+                response_headers=response_headers,
+                response_body=response_body,
+                session_literals=session_literals or (),
+            )
+            mark = Quota429Mark(
+                cooldown_seconds=cooldown_decision.seconds,
+                cooldown_source=cooldown_decision.source,
+                record=quota_record,
+                session_literals=session_literals,
             )
             if on_quota_429 is not None:
-                await on_quota_429(cooldown_seconds)
+                canonical_record = await on_quota_429(mark)
+            else:
+                try:
+                    fingerprint_seed = load_or_create_fingerprint_seed(
+                        paths.claude_account_pool_dir()
+                    )
+                    session_fingerprint = (
+                        observability_session_fingerprint(
+                            fingerprint_seed, session_literals[1]
+                        )
+                        if fingerprint_seed is not None
+                        and session_literals is not None
+                        else None
+                    )
+                    enrich_record_fallback(
+                        quota_record, session_fingerprint=session_fingerprint
+                    )
+                    canonical_record = finalize_quota_429_record(quota_record)
+                except Exception:
+                    logger.warning("failed to enrich Claude 429 incident evidence")
+                    enrich_record_fallback(
+                        quota_record, session_fingerprint=None
+                    )
+                    quota_record["record_degraded"] = True
+                    quota_record["degradation_reason"] = (
+                        "evidence_enrichment_failed"
+                    )
+                    canonical_record = finalize_quota_429_record(quota_record)
+
+            incident_writer = getattr(
+                request.app.state, "claude_quota_429_incident_writer", None
+            )
+            if incident_writer is None:
+                logger.warning(
+                    "Claude 429 incident writer is unavailable; skipping incident persistence"
+                )
+            else:
+                try:
+                    await incident_writer.append_record(canonical_record)
+                except Exception:
+                    logger.warning("failed to append Claude 429 incident record")
             return _FailedAttempt(
-                _replay_buffered_response(429, response_headers, response_body),
+                _replay_buffered_response(429, replay_headers, response_body),
                 rate_limited=True,
             )
         if commit_hook is not None:

@@ -17,6 +17,8 @@ from claudex.claude.quota_429 import (
     Quota429IncidentWriter,
     build_quota_429_record,
     capture_upstream_headers,
+    enrich_record_degraded,
+    enrich_record_fallback,
     finalize_quota_429_record,
     parse_upstream_error_body,
 )
@@ -259,6 +261,48 @@ def test_observed_scope_unknown_for_family_gate_failure() -> None:
     assert persisted["observed_scope"] == "unknown"
     assert persisted["observed_scope"] != "account"
     assert persisted["scope_rationale"] == reason
+
+
+def test_enrich_record_fallback_sets_account_scope_and_unknown_observed() -> None:
+    record = _build_record()
+
+    enriched = enrich_record_fallback(
+        record, session_fingerprint="session-fingerprint"
+    )
+
+    assert enriched is record
+    assert record["installed_scope"] == "account"
+    assert record["quota_family"] is None
+    assert record["family_gate"] is None
+    assert record["observed_scope"] == "unknown"
+    assert record["scope_rationale"] == "fallback_no_family_gate"
+    assert record["session_fingerprint"] == "session-fingerprint"
+
+
+def test_enrich_record_degraded_preserves_scope_facts() -> None:
+    record = _build_record()
+    gate = {
+        "scope": "account",
+        "reason": "fable_weekly_not_saturated",
+        "family_deadline_utc": None,
+    }
+
+    enriched = enrich_record_degraded(
+        record,
+        installed_scope="account",
+        quota_family="fable",
+        family_gate=gate,
+    )
+
+    assert enriched is record
+    assert record["installed_scope"] == "account"
+    assert record["quota_family"] == "fable"
+    assert record["family_gate"] is gate
+    assert record["observed_scope"] == "unknown"
+    assert record["scope_rationale"] == "fable_weekly_not_saturated"
+    assert record["session_fingerprint"] is None
+    assert record["record_degraded"] is True
+    assert record["degradation_reason"] == "evidence_enrichment_failed"
 
 
 def test_incident_writer_appends_one_record_per_line(tmp_path: Path) -> None:

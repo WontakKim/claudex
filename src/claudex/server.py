@@ -16,6 +16,7 @@ from starlette.routing import Route
 
 from claudex import paths, server_support
 from claudex.claude.account_usage_cache import ClaudeAccountUsageCache
+from claudex.claude.quota_429 import Quota429IncidentWriter
 from claudex.admin.accounts import (
     _handle_admin_claude_account_delete,
     _handle_admin_claude_accounts_get,
@@ -119,6 +120,9 @@ def create_app(config: GatewayConfig, daemon_nonce: str | None = None) -> Starle
                 "claude account pool is already served by another process (balanced-router.lock held)"
             )
         app.state.claude_pool_lease = claude_pool_lease
+        app.state.claude_quota_429_incident_writer = Quota429IncidentWriter(
+            pool_dir / "claude-429-incidents.jsonl"
+        )
         try:
             log_buffer = _LogBufferHandler()
             logging.getLogger().addHandler(log_buffer)

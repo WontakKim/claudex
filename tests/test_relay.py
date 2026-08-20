@@ -4207,6 +4207,369 @@ def _balanced_body(session_id: str, *, model: str = "claude-fable-5") -> dict[st
     return body
 
 
+def test_balanced_429_persists_evidence_json_with_required_keys(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _balanced_env(monkeypatch, tmp_path)
+    account_id, _access_token = _register_balanced_accounts(1)[0]
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return _quota_429()
+
+    with _create_test_client(
+        monkeypatch,
+        tmp_path,
+        config=GatewayConfig(),
+        base_url="http://127.0.0.1:8787",
+    ) as client:
+        runtime = _enable_balanced(client, handler)
+
+        response = client.post(
+            "/v1/messages", json=_balanced_body(_new_session_id())
+        )
+
+        assert response.status_code == 429
+        row = runtime._store.get_cooldown(account_id, "account", "")
+        assert row is not None
+        evidence = json.loads(row.evidence)
+        assert set(evidence) == {
+            "v",
+            "event",
+            "occurred_at_utc",
+            "mode",
+            "account_id",
+            "model",
+            "cooldown_seconds",
+            "cooldown_source",
+            "installed_scope",
+            "quota_family",
+            "family_gate",
+            "observed_scope",
+            "scope_rationale",
+            "upstream",
+            "attempt",
+            "session_fingerprint",
+            "request_shape",
+        }
+        assert evidence["event"] == "claude_quota_429"
+        assert evidence["mode"] == "balanced"
+        assert evidence["account_id"] == account_id
+        assert evidence["installed_scope"] == "account"
+        assert evidence["quota_family"] == "fable"
+        assert evidence["observed_scope"] == "unknown"
+        assert evidence["scope_rationale"] == "fable_weekly_not_saturated"
+        assert evidence["session_fingerprint"]
+
+
+def test_balanced_429_evidence_and_incident_jsonl_carry_identical_bytes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _balanced_env(monkeypatch, tmp_path)
+    account_id, _access_token = _register_balanced_accounts(1)[0]
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return _quota_429()
+
+    with _create_test_client(
+        monkeypatch,
+        tmp_path,
+        config=GatewayConfig(),
+        base_url="http://127.0.0.1:8787",
+    ) as client:
+        runtime = _enable_balanced(client, handler)
+
+        response = client.post(
+            "/v1/messages", json=_balanced_body(_new_session_id())
+        )
+
+        assert response.status_code == 429
+        row = runtime._store.get_cooldown(account_id, "account", "")
+        assert row is not None
+        incident_path = (
+            paths.claude_account_pool_dir() / "claude-429-incidents.jsonl"
+        )
+        assert incident_path.read_bytes() == row.evidence.encode("utf-8") + b"\n"
+
+
+def test_fallback_429_writes_incident_record_without_durable_evidence(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    first, _second = _register_pool_accounts(monkeypatch)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.headers["authorization"] == "Bearer pool-access-1":
+            return _quota_429()
+        return httpx.Response(200, json={"id": "msg_1"})
+
+    with _create_test_client(
+        monkeypatch, tmp_path, config=_pool_config(first)
+    ) as client:
+        client.app.state.http_client = httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        )
+
+        response = client.post("/v1/messages", json=_account_body())
+
+        assert response.status_code == 200
+        incident_path = (
+            paths.claude_account_pool_dir() / "claude-429-incidents.jsonl"
+        )
+        records = [json.loads(line) for line in incident_path.read_text().splitlines()]
+        assert len(records) == 1
+        assert records[0]["mode"] == "fallback"
+        assert records[0]["installed_scope"] == "account"
+        assert records[0]["quota_family"] is None
+        assert records[0]["family_gate"] is None
+        assert records[0]["scope_rationale"] == "fallback_no_family_gate"
+        assert client.app.state.claude_balanced_runtime.router is None
+
+
+def test_429_evidence_captures_request_id_from_header_and_body(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _balanced_env(monkeypatch, tmp_path)
+    account_id, _access_token = _register_balanced_accounts(1)[0]
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            429,
+            json={
+                "type": "error",
+                "error": {"type": "rate_limit_error", "message": "slow down"},
+                "request_id": "request-from-body",
+            },
+            headers={"request-id": "request-from-header"},
+        )
+
+    with _create_test_client(
+        monkeypatch,
+        tmp_path,
+        config=GatewayConfig(),
+        base_url="http://127.0.0.1:8787",
+    ) as client:
+        runtime = _enable_balanced(client, handler)
+
+        response = client.post(
+            "/v1/messages", json=_balanced_body(_new_session_id())
+        )
+
+        assert response.status_code == 429
+        row = runtime._store.get_cooldown(account_id, "account", "")
+        assert row is not None
+        upstream = json.loads(row.evidence)["upstream"]
+        assert upstream["headers"]["request-id"] == "request-from-header"
+        assert upstream["request_id"] == "request-from-body"
+
+
+def test_429_evidence_preserves_first_duplicate_allowlisted_header(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _balanced_env(monkeypatch, tmp_path)
+    account_id, _access_token = _register_balanced_accounts(1)[0]
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            429,
+            json={"error": {"type": "rate_limit_error", "message": "slow down"}},
+            headers=[
+                ("request-id", "first-request-id"),
+                ("request-id", "second-request-id"),
+                ("x-should-retry", "true"),
+            ],
+        )
+
+    with _create_test_client(
+        monkeypatch,
+        tmp_path,
+        config=GatewayConfig(),
+        base_url="http://127.0.0.1:8787",
+    ) as client:
+        runtime = _enable_balanced(client, handler)
+
+        response = client.post(
+            "/v1/messages", json=_balanced_body(_new_session_id())
+        )
+
+        assert response.status_code == 429
+        row = runtime._store.get_cooldown(account_id, "account", "")
+        assert row is not None
+        headers = json.loads(row.evidence)["upstream"]["headers"]
+        assert headers == {"request-id": "first-request-id"}
+        assert "second-request-id" not in row.evidence
+
+
+def test_429_evidence_omits_secrets_and_raw_session_id(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    _balanced_env(monkeypatch, tmp_path)
+    account_id, _access_token = _register_balanced_accounts(1)[0]
+    credential = "Bearer secret-token-that-must-not-appear"
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            429,
+            json={
+                "error": {
+                    "type": "rate_limit_error",
+                    "message": f"{credential} {_LEG_RAW_SESSION_UUID}",
+                }
+            },
+            headers={
+                "authorization": credential,
+                "x-api-key": "forbidden-api-key",
+                "request-id": "safe-request-id",
+            },
+        )
+
+    caplog.set_level(logging.INFO, logger="claudex.server")
+    with _create_test_client(
+        monkeypatch,
+        tmp_path,
+        config=GatewayConfig(),
+        base_url="http://127.0.0.1:8787",
+    ) as client:
+        runtime = _enable_balanced(client, handler)
+        body = _account_leg_body()
+        body["model"] = "claude-fable-5"
+
+        response = client.post("/v1/messages", json=body)
+
+        assert response.status_code == 429
+        row = runtime._store.get_cooldown(account_id, "account", "")
+        assert row is not None
+        incident = (
+            paths.claude_account_pool_dir() / "claude-429-incidents.jsonl"
+        ).read_text()
+        combined = row.evidence + incident + caplog.text
+        for forbidden in (
+            _LEG_RAW_SESSION_UUID,
+            _LEG_CANONICAL_SESSION_UUID,
+            _LEG_PROMPT_CONTENT,
+            _LEG_TOOL_ARGUMENT,
+            credential,
+            "secret-token-that-must-not-appear",
+            "forbidden-api-key",
+        ):
+            assert forbidden not in combined
+
+
+def test_429_incident_records_cooldown_source_default_60(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    first, _second = _register_pool_accounts(monkeypatch)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.headers["authorization"] == "Bearer pool-access-1":
+            return _quota_429()
+        return httpx.Response(200, json={"id": "msg_1"})
+
+    with _create_test_client(
+        monkeypatch, tmp_path, config=_pool_config(first)
+    ) as client:
+        client.app.state.http_client = httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        )
+
+        response = client.post("/v1/messages", json=_account_body())
+
+        assert response.status_code == 200
+        [line] = (
+            paths.claude_account_pool_dir() / "claude-429-incidents.jsonl"
+        ).read_text().splitlines()
+        record = json.loads(line)
+        assert record["cooldown_seconds"] == 60.0
+        assert record["cooldown_source"] == "default_60"
+
+
+def test_429_evidence_failure_still_installs_cooldown_and_records_degraded_incident(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _balanced_env(monkeypatch, tmp_path)
+    account_id, _access_token = _register_balanced_accounts(1)[0]
+    install_evidence: list[str] = []
+    original_install = ClaudeBalancedRouter.install_cooldown
+
+    def fail_fingerprint(_seed: bytes, _session_id: str) -> str:
+        raise RuntimeError("simulated evidence failure")
+
+    def recording_install(
+        self: ClaudeBalancedRouter, **kwargs: Any
+    ) -> Any:
+        install_evidence.append(kwargs["evidence"])
+        return original_install(self, **kwargs)
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return _quota_429()
+
+    monkeypatch.setattr(
+        relay_balanced, "observability_session_fingerprint", fail_fingerprint
+    )
+    monkeypatch.setattr(
+        relay_balanced.ClaudeBalancedRouter, "install_cooldown", recording_install
+    )
+    with _create_test_client(
+        monkeypatch,
+        tmp_path,
+        config=GatewayConfig(),
+        base_url="http://127.0.0.1:8787",
+    ) as client:
+        runtime = _enable_balanced(client, handler)
+
+        response = client.post(
+            "/v1/messages", json=_balanced_body(_new_session_id())
+        )
+
+        assert response.status_code == 429
+        assert install_evidence == [""]
+        row = runtime._store.get_cooldown(account_id, "account", "")
+        assert row is not None
+        assert row.evidence == ""
+        [line] = (
+            paths.claude_account_pool_dir() / "claude-429-incidents.jsonl"
+        ).read_text().splitlines()
+        record = json.loads(line)
+        assert record["installed_scope"] == "account"
+        assert record["family_gate"]["reason"] == "fable_weekly_not_saturated"
+        assert record["scope_rationale"] == "fable_weekly_not_saturated"
+        assert record["record_degraded"] is True
+        assert record["degradation_reason"] == "evidence_enrichment_failed"
+        assert record["session_fingerprint"] is None
+
+
+def test_one_mark_one_incident_record(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _balanced_env(monkeypatch, tmp_path)
+    _register_balanced_accounts(1)
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return _quota_429()
+
+    with _create_test_client(
+        monkeypatch,
+        tmp_path,
+        config=GatewayConfig(),
+        base_url="http://127.0.0.1:8787",
+    ) as client:
+        _enable_balanced(client, handler)
+
+        response = client.post(
+            "/v1/messages", json=_balanced_body(_new_session_id())
+        )
+
+        assert response.status_code == 429
+        incident_path = (
+            paths.claude_account_pool_dir() / "claude-429-incidents.jsonl"
+        )
+        lines = incident_path.read_text().splitlines()
+        assert len(lines) == 1
+        assert json.loads(lines[0])["event"] == "claude_quota_429"
+
+
 _UNPINNABLE_BODY: dict[str, Any] = {
     "model": "claude-fable-5",
     "max_tokens": 16,

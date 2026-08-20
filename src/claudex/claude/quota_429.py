@@ -10,6 +10,7 @@ import os
 import sys
 import uuid
 from collections.abc import Iterable, Mapping
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +32,16 @@ _ERROR_TYPE_CAP = 64
 _MESSAGE_CAP = 256
 _READ_CHUNK_BYTES = 65536
 _INCIDENT_WRITE_LOCK = asyncio.Lock()
+
+
+@dataclass(frozen=True)
+class Quota429Mark:
+    """One marked quota response and its privacy-sensitive session literals."""
+
+    cooldown_seconds: float
+    cooldown_source: str
+    record: dict[str, Any]
+    session_literals: tuple[str, str] | None = field(repr=False)
 
 
 def _canonical_json(value: Any) -> str:
@@ -237,6 +248,68 @@ def build_quota_429_record(
             parsed_body, raw_body, context.pin_created
         ),
     }
+
+
+def enrich_record_with_family_gate(
+    record: dict[str, Any],
+    *,
+    scope: str,
+    reason: str,
+    family_deadline_utc: str | None,
+    quota_family: str,
+    session_fingerprint: str | None,
+) -> dict[str, Any]:
+    """Add a balanced family-gate outcome to a base incident record."""
+    record["installed_scope"] = scope
+    record["quota_family"] = quota_family
+    record["family_gate"] = {
+        "scope": scope,
+        "reason": reason,
+        "family_deadline_utc": family_deadline_utc,
+    }
+    record["observed_scope"] = "family" if scope == "family" else "unknown"
+    record["scope_rationale"] = reason
+    record["session_fingerprint"] = session_fingerprint
+    return record
+
+
+def enrich_record_fallback(
+    record: dict[str, Any], *, session_fingerprint: str | None
+) -> dict[str, Any]:
+    """Add fallback-mode account cooldown facts to a base incident record."""
+    record["installed_scope"] = "account"
+    record["quota_family"] = None
+    record["family_gate"] = None
+    record["observed_scope"] = "unknown"
+    record["scope_rationale"] = "fallback_no_family_gate"
+    record["session_fingerprint"] = session_fingerprint
+    return record
+
+
+def enrich_record_degraded(
+    record: dict[str, Any],
+    *,
+    installed_scope: str,
+    quota_family: str,
+    family_gate: dict[str, Any] | None,
+    degradation_reason: str = "evidence_enrichment_failed",
+) -> dict[str, Any]:
+    """Preserve known cooldown facts when balanced evidence enrichment fails."""
+    record["installed_scope"] = installed_scope
+    record["quota_family"] = quota_family
+    record["family_gate"] = family_gate
+    if family_gate is None:
+        record["observed_scope"] = "unknown"
+        record["scope_rationale"] = "evidence_classification_unavailable"
+    else:
+        record["observed_scope"] = (
+            "family" if family_gate.get("scope") == "family" else "unknown"
+        )
+        record["scope_rationale"] = family_gate.get("reason")
+    record["session_fingerprint"] = None
+    record["record_degraded"] = True
+    record["degradation_reason"] = degradation_reason
+    return record
 
 
 def finalize_quota_429_record(record: Mapping[str, Any]) -> str:
