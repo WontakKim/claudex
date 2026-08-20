@@ -1,6 +1,6 @@
 [project]
 name = "claudex-gateway"
-version = "0.11.0"
+version = "0.12.0"
 description = "Local multi-provider gateway that routes Claude Code requests to Anthropic, Codex, Kimi, Grok, and custom backends."
 readme = "README.md"
 requires-python = ">=3.11"
