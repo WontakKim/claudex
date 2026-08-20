@@ -150,13 +150,21 @@ def build_serving_chain(
     )
 
 
-def rate_limit_cooldown_seconds(
+@dataclass(frozen=True)
+class CooldownDecision:
+    """A 429 cooldown duration and the signal that selected it."""
+
+    seconds: float
+    source: str
+
+
+def rate_limit_cooldown_decision(
     headers: Mapping[str, str],
     body: bytes,
     usage_envelope: dict[str, Any] | None,
     *,
     wall_clock: Callable[[], float] = time.time,
-) -> float:
+) -> CooldownDecision:
     """Derive how long a 429'd account should sit out; never raises.
 
     First successfully parsed signal wins: ① Retry-After header → ② ratelimit
@@ -169,15 +177,34 @@ def rate_limit_cooldown_seconds(
     lowered = {key.lower(): value for key, value in headers.items()}
 
     seconds = _parse_retry_after(lowered.get("retry-after"), now)
+    source = "retry_after"
     if seconds is None:
         seconds = _epoch_delta(reset_epoch_seconds(lowered.get(_RESET_HEADER)), now)
+        source = "header_reset"
     if seconds is None:
         seconds = _epoch_delta(_body_reset_epoch(body), now)
+        source = "body_reset"
     if seconds is None:
         seconds = _usage_reset_delta(usage_envelope, now)
+        source = "usage_reset"
     if seconds is None:
         seconds = _DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS
-    return min(_COOLDOWN_MAX_SECONDS, max(_COOLDOWN_MIN_SECONDS, seconds))
+        source = "default_60"
+    clamped_seconds = min(_COOLDOWN_MAX_SECONDS, max(_COOLDOWN_MIN_SECONDS, seconds))
+    return CooldownDecision(seconds=clamped_seconds, source=source)
+
+
+def rate_limit_cooldown_seconds(
+    headers: Mapping[str, str],
+    body: bytes,
+    usage_envelope: dict[str, Any] | None,
+    *,
+    wall_clock: Callable[[], float] = time.time,
+) -> float:
+    """Return the cooldown duration from the attributed decision."""
+    return rate_limit_cooldown_decision(
+        headers, body, usage_envelope, wall_clock=wall_clock
+    ).seconds
 
 
 def _parse_retry_after(raw: str | None, now: float) -> float | None:

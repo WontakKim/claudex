@@ -10,6 +10,7 @@ from email.utils import format_datetime
 from claudex.claude.account_pool import (
     AccountCooldownTracker,
     build_serving_chain,
+    rate_limit_cooldown_decision,
     rate_limit_cooldown_seconds,
 )
 from claudex.claude.accounts import AccountRecord
@@ -305,3 +306,65 @@ def test_cooldown_defaults_and_clamps_to_bounds() -> None:
         rate_limit_cooldown_seconds({"retry-after": "999999999"}, b"", None, wall_clock=_wall_clock)
         == 7 * 24 * 3600.0
     )
+
+
+def test_rate_limit_cooldown_decision_reports_retry_after_source() -> None:
+    envelope = {"weekly": {"used_percent": 100.0, "resets_at": _NOW + 9_999.0}}
+
+    decision = rate_limit_cooldown_decision(
+        {"Retry-After": "42"}, b"{}", envelope, wall_clock=_wall_clock
+    )
+
+    assert decision.seconds == 42.0
+    assert decision.source == "retry_after"
+
+
+def test_rate_limit_cooldown_decision_reports_header_reset_source() -> None:
+    headers = {"anthropic-ratelimit-unified-reset": str(int(_NOW + 300.0))}
+    body = json.dumps({"error": {"resets_at": _NOW + 600.0}}).encode()
+    envelope = {"weekly": {"used_percent": 100.0, "resets_at": _NOW + 900.0}}
+
+    decision = rate_limit_cooldown_decision(headers, body, envelope, wall_clock=_wall_clock)
+
+    assert decision.seconds == 300.0
+    assert decision.source == "header_reset"
+
+
+def test_rate_limit_cooldown_decision_reports_body_reset_source() -> None:
+    reset_iso = datetime.fromtimestamp(_NOW + 600.0, tz=timezone.utc).isoformat()
+    body = json.dumps({"error": {"type": "rate_limit_error", "resets_at": reset_iso}}).encode()
+    envelope = {"weekly": {"used_percent": 100.0, "resets_at": _NOW + 900.0}}
+
+    decision = rate_limit_cooldown_decision({}, body, envelope, wall_clock=_wall_clock)
+
+    assert abs(decision.seconds - 600.0) < 1.0
+    assert decision.source == "body_reset"
+
+
+def test_rate_limit_cooldown_decision_reports_usage_reset_source() -> None:
+    envelope = {
+        "session": {"used_percent": 0.0, "resets_at": None},
+        "weekly": {"used_percent": 100.0, "resets_at": _NOW + 100.0},
+        "fable_weekly": {"used_percent": 100.0, "resets_at": _NOW + 7_200.0},
+    }
+
+    decision = rate_limit_cooldown_decision({}, b"not json", envelope, wall_clock=_wall_clock)
+
+    assert decision.seconds == 100.0
+    assert decision.source == "usage_reset"
+
+
+def test_rate_limit_cooldown_decision_reports_default_60_source() -> None:
+    decision = rate_limit_cooldown_decision({}, b"", None, wall_clock=_wall_clock)
+
+    assert decision.seconds == 60.0
+    assert decision.source == "default_60"
+
+
+def test_rate_limit_cooldown_seconds_wrapper_matches_decision_seconds() -> None:
+    headers = {"retry-after": "999999999"}
+
+    decision = rate_limit_cooldown_decision(headers, b"", None, wall_clock=_wall_clock)
+    seconds = rate_limit_cooldown_seconds(headers, b"", None, wall_clock=_wall_clock)
+
+    assert seconds == decision.seconds
