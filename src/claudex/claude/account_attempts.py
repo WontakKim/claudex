@@ -191,6 +191,18 @@ class AccountLegTracker:
         return context
 
 
+def try_begin_account_leg(
+    tracker: AccountLegTracker | None, pin_created: bool | None
+) -> AccountLegContext | None:
+    """Allocate optional observability context without affecting relay behavior."""
+    if tracker is None:
+        return None
+    try:
+        return tracker.begin_leg(pin_created)
+    except Exception:
+        return None
+
+
 def emit_account_leg_log(
     logger,
     context: AccountLegContext,

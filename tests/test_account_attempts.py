@@ -16,6 +16,7 @@ from claudex.claude.account_attempts import (
     emit_account_leg_log,
     request_shape_fields,
     sanitize_external_text,
+    try_begin_account_leg,
 )
 
 _RAW_SESSION = "550E8400-E29B-41D4-A716-446655440000"
@@ -315,6 +316,16 @@ def test_tracker_first_leg_has_null_gap_and_zero_elapsed() -> None:
     assert first.first_started_monotonic == first.started_monotonic == 42.0
     with pytest.raises(FrozenInstanceError):
         first.ordinal = 2
+
+
+def test_try_begin_account_leg_returns_none_when_clock_fails() -> None:
+    def failing_clock() -> float:
+        raise OSError("clock unavailable")
+
+    tracker = AccountLegTracker("fallback", monotonic=failing_clock)
+
+    assert try_begin_account_leg(tracker, None) is None
+    assert try_begin_account_leg(None, True) is None
 
 
 def test_account_leg_log_envelope_fields_and_canonical_payload() -> None:

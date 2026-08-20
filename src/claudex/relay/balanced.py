@@ -32,7 +32,7 @@ from claudex.balanced.selection import (
     select_weights,
     warning_factor,
 )
-from claudex.claude.account_attempts import AccountLegTracker
+from claudex.claude.account_attempts import AccountLegTracker, try_begin_account_leg
 from claudex.claude.accounts import (
     AccountRecord,
     AccountRegistryError,
@@ -370,12 +370,15 @@ async def _serve_balanced_stateless_message(
     The digest is reused for the request's complete retry chain, never
     persisted, and never inserted into the pin map.
     """
-    session_uuid = extract_session_uuid(
-        parsed_body if isinstance(parsed_body, dict) else {}
-    )
-    leg_tracker = AccountLegTracker(
-        "balanced_stateless", session_literals=session_uuid or ()
-    )
+    try:
+        session_uuid = extract_session_uuid(
+            parsed_body if isinstance(parsed_body, dict) else {}
+        )
+        leg_tracker: AccountLegTracker | None = AccountLegTracker(
+            "balanced_stateless", session_literals=session_uuid or ()
+        )
+    except Exception:
+        leg_tracker = None
     router = runtime.router
     assert router is not None
     family = quota_family(model)
@@ -429,7 +432,7 @@ async def _serve_balanced_stateless_message(
 
         router.begin_attempt(account_id)
         try:
-            attempt_context = leg_tracker.begin_leg(None)
+            attempt_context = try_begin_account_leg(leg_tracker,None)
             outcome = await _attempt_with_account(
                 request,
                 raw_body,
@@ -466,12 +469,15 @@ async def _serve_balanced_pinned_message(
     and await the durable pin write before any downstream byte is forwarded.
     Once a 2xx response is relayed, no cross-account retry occurs.
     """
-    session_uuid = extract_session_uuid(
-        parsed_body if isinstance(parsed_body, dict) else {}
-    )
-    leg_tracker = AccountLegTracker(
-        "balanced_pinned", session_literals=session_uuid or ()
-    )
+    try:
+        session_uuid = extract_session_uuid(
+            parsed_body if isinstance(parsed_body, dict) else {}
+        )
+        leg_tracker: AccountLegTracker | None = AccountLegTracker(
+            "balanced_pinned", session_literals=session_uuid or ()
+        )
+    except Exception:
+        leg_tracker = None
     router = runtime.router
     assert router is not None
     family = quota_family(model)
@@ -613,7 +619,7 @@ async def _serve_balanced_pinned_message(
 
             if owner_attempt_id is not None:
                 try:
-                    attempt_context = leg_tracker.begin_leg(False)
+                    attempt_context = try_begin_account_leg(leg_tracker,False)
                     outcome = await _attempt_with_account(
                         request,
                         raw_body,
@@ -637,7 +643,7 @@ async def _serve_balanced_pinned_message(
             else:
                 router.begin_attempt(current_target)
                 try:
-                    attempt_context = leg_tracker.begin_leg(normal_pin_created)
+                    attempt_context = try_begin_account_leg(leg_tracker,normal_pin_created)
                     outcome = await _attempt_with_account(
                         request,
                         raw_body,
@@ -705,12 +711,15 @@ async def _serve_balanced_count_tokens(
     cooldown, or capability evidence, and never retries across accounts
     (`rate_limit_failover=False`).
     """
-    session_uuid = extract_session_uuid(
-        parsed_body if isinstance(parsed_body, dict) else {}
-    )
-    leg_tracker = AccountLegTracker(
-        "balanced_count_tokens", session_literals=session_uuid or ()
-    )
+    try:
+        session_uuid = extract_session_uuid(
+            parsed_body if isinstance(parsed_body, dict) else {}
+        )
+        leg_tracker: AccountLegTracker | None = AccountLegTracker(
+            "balanced_count_tokens", session_literals=session_uuid or ()
+        )
+    except Exception:
+        leg_tracker = None
     router = runtime.router
     assert router is not None
     if session_key is not None:
@@ -720,7 +729,7 @@ async def _serve_balanced_count_tokens(
             if record is not None:
                 if pin.pending_durability is not None:
                     await router.await_pin_durability(session_key.digest)
-                attempt_context = leg_tracker.begin_leg(None)
+                attempt_context = try_begin_account_leg(leg_tracker,None)
                 outcome = await _attempt_with_account(
                     request,
                     raw_body,
@@ -749,7 +758,7 @@ async def _serve_balanced_count_tokens(
     except NoEligibleAccountError:
         return _balanced_all_cooling_response(records_by_id, router, family=family, chain_exhausted_429=None)
     record = records_by_id[account_id]
-    attempt_context = leg_tracker.begin_leg(None)
+    attempt_context = try_begin_account_leg(leg_tracker,None)
     outcome = await _attempt_with_account(
         request,
         raw_body,

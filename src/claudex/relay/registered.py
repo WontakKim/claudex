@@ -19,6 +19,7 @@ from claudex.claude.account_attempts import (
     AccountLegContext,
     AccountLegTracker,
     emit_account_leg_log,
+    try_begin_account_leg,
 )
 from claudex.claude.account_pool import (
     _DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS,
@@ -150,7 +151,7 @@ async def _attempt_with_account(
     parsed_body: Any,
     record: AccountRecord,
     *,
-    attempt_context: AccountLegContext,
+    attempt_context: AccountLegContext | None,
     rate_limit_failover: bool,
     commit_hook: Callable[[httpx.Response], Awaitable[None]] | None = None,
     on_relay_complete: Callable[[], None] | None = None,
@@ -350,22 +351,23 @@ async def _attempt_with_account(
         result = "exception"
         raise
     finally:
-        try:
-            emit_account_leg_log(
-                logger,
-                attempt_context,
-                account_id=account_id,
-                model=model,
-                result=result,
-                parsed_body=parsed_body,
-                raw_body=raw_body,
-                occurred_at_utc=datetime.now(timezone.utc)
-                .isoformat(timespec="milliseconds")
-                .replace("+00:00", "Z"),
-            )
-        except BaseException:
-            # Observability must never replace the account-leg outcome.
-            pass
+        if attempt_context is not None:
+            try:
+                emit_account_leg_log(
+                    logger,
+                    attempt_context,
+                    account_id=account_id,
+                    model=model,
+                    result=result,
+                    parsed_body=parsed_body,
+                    raw_body=raw_body,
+                    occurred_at_utc=datetime.now(timezone.utc)
+                    .isoformat(timespec="milliseconds")
+                    .replace("+00:00", "Z"),
+                )
+            except BaseException:
+                # Observability must never replace the account-leg outcome.
+                pass
 
 
 async def _passthrough_with_claude_account(
@@ -379,12 +381,15 @@ async def _passthrough_with_claude_account(
     (read-through, no cache) so CLI- and dashboard-side account changes take
     effect without a restart.
     """
-    session_uuid = extract_session_uuid(
-        parsed_body if isinstance(parsed_body, dict) else {}
-    )
-    leg_tracker = AccountLegTracker(
-        "disabled", session_literals=session_uuid or ()
-    )
+    try:
+        session_uuid = extract_session_uuid(
+            parsed_body if isinstance(parsed_body, dict) else {}
+        )
+        leg_tracker: AccountLegTracker | None = AccountLegTracker(
+            "disabled", session_literals=session_uuid or ()
+        )
+    except Exception:
+        leg_tracker = None
     try:
         records = load_registry()
     except AccountRegistryError as exc:
@@ -401,7 +406,7 @@ async def _passthrough_with_claude_account(
             f"configured claude account {serving_account_id} is in state "
             f"{record.state!r}, not ready"
         )
-    attempt_context = leg_tracker.begin_leg(None)
+    attempt_context = try_begin_account_leg(leg_tracker, None)
     outcome = await _attempt_with_account(
         request,
         raw_body,
@@ -430,12 +435,15 @@ async def _passthrough_with_claude_pool(
     only constructed for terminal outcomes, and every failover branch fully
     closed its upstream response first.
     """
-    session_uuid = extract_session_uuid(
-        parsed_body if isinstance(parsed_body, dict) else {}
-    )
-    leg_tracker = AccountLegTracker(
-        "fallback", session_literals=session_uuid or ()
-    )
+    try:
+        session_uuid = extract_session_uuid(
+            parsed_body if isinstance(parsed_body, dict) else {}
+        )
+        leg_tracker = AccountLegTracker(
+            "fallback", session_literals=session_uuid or ()
+        )
+    except Exception:
+        leg_tracker = None
     try:
         records = load_registry()
     except AccountRegistryError as exc:
@@ -471,7 +479,7 @@ async def _passthrough_with_claude_pool(
     first_failure: Response | None = None
     last_rate_limited: Response | None = None
     for position, record in enumerate(chain.attempts):
-        attempt_context = leg_tracker.begin_leg(None)
+        attempt_context = try_begin_account_leg(leg_tracker, None)
         outcome = await _attempt_with_account(
             request,
             raw_body,

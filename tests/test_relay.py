@@ -5047,6 +5047,75 @@ def test_fallback_attempts_emit_leg_logs_with_ordinals_and_gaps(
     )
 
 
+@pytest.mark.parametrize("fallback", [False, True])
+def test_observability_session_extraction_failure_does_not_block_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    fallback: bool,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    if fallback:
+        account_id, _second = _register_pool_accounts(monkeypatch)
+        config = _pool_config(account_id)
+    else:
+        account_id = _register_serving_account()
+        config = GatewayConfig(claude_account_id=account_id)
+    upstream_calls = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal upstream_calls
+        upstream_calls += 1
+        return httpx.Response(200, json={"id": "msg_1"})
+
+    def fail_session_extraction(_body):
+        raise ValueError("session observability unavailable")
+
+    monkeypatch.setattr(relay_registered, "extract_session_uuid", fail_session_extraction)
+    caplog.set_level(logging.INFO, logger="claudex.server")
+    client, _ = _gateway(config, handler)
+
+    response = client.post("/v1/messages", json=_account_leg_body())
+
+    assert response.status_code == 200
+    assert upstream_calls == 1
+    assert _account_leg_envelopes(caplog) == []
+
+
+def test_observability_clock_failure_preserves_upstream_exception(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    account_id = _register_serving_account()
+    upstream_calls = 0
+
+    class RelaySignal(BaseException):
+        pass
+
+    signal = RelaySignal("unexpected relay signal")
+
+    def fail_clock(_tracker, _pin_created):
+        raise OSError("clock unavailable")
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal upstream_calls
+        upstream_calls += 1
+        raise signal
+
+    monkeypatch.setattr(relay_registered.AccountLegTracker, "begin_leg", fail_clock)
+    caplog.set_level(logging.INFO, logger="claudex.server")
+    client, _ = _gateway(GatewayConfig(claude_account_id=account_id), handler)
+
+    with pytest.raises(RelaySignal) as raised:
+        client.post("/v1/messages", json=_account_leg_body())
+
+    assert raised.value is signal
+    assert upstream_calls == 1
+    assert _account_leg_envelopes(caplog) == []
+
+
 def test_401_refresh_resend_stays_single_leg(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
