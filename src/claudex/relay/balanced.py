@@ -659,25 +659,45 @@ async def _serve_balanced_pinned_message(
         account_still_registered=pin is not None and pin.account_id in records_by_id,
     )
     if pin_was_touched:
-        durable_refresh_plan = router.plan_pin_durable_last_seen(digest)
+        try:
+            durable_refresh_plan = router.plan_pin_durable_last_seen(digest)
+        except Exception:
+            durable_refresh_plan = None
         if durable_refresh_plan is not None:
             last_seen_utc, expires_at_utc = durable_refresh_plan
 
-            def _consume_durable_refresh_result(completed_task: asyncio.Task[None]) -> None:
-                if completed_task.cancelled():
-                    return
-                exception = completed_task.exception()
-                if exception is not None:
-                    logger.warning("balanced durable pin refresh failed unexpectedly: %r", exception)
+            async def _refresh_durable_pin() -> None:
+                try:
+                    await router.refresh_pin_durable_last_seen(
+                        digest,
+                        last_seen_utc=last_seen_utc,
+                        expires_at_utc=expires_at_utc,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    try:
+                        logger.warning(
+                            "balanced durable pin refresh failed unexpectedly"
+                        )
+                    except Exception:
+                        pass
 
-            durable_refresh_task = asyncio.create_task(
-                router.refresh_pin_durable_last_seen(
-                    digest,
-                    last_seen_utc=last_seen_utc,
-                    expires_at_utc=expires_at_utc,
-                )
-            )
-            durable_refresh_task.add_done_callback(_consume_durable_refresh_result)
+            refresh_coroutine = _refresh_durable_pin()
+            refresh_task: asyncio.Task[None] | None = None
+            refresh_tasks: set[asyncio.Task[None]] | None = None
+            try:
+                refresh_tasks = request.app.state.claude_pin_refresh_tasks
+                refresh_task = asyncio.create_task(refresh_coroutine)
+                refresh_tasks.add(refresh_task)
+                refresh_task.add_done_callback(refresh_tasks.discard)
+            except Exception:
+                if refresh_task is None:
+                    refresh_coroutine.close()
+                else:
+                    refresh_task.cancel()
+                    if refresh_tasks is not None:
+                        refresh_tasks.discard(refresh_task)
 
     attempted: set[str] = set()
     chain_429: Response | None = None

@@ -5167,6 +5167,125 @@ def test_pinned_touch_schedules_durable_refresh(
         assert scheduled_refreshes == [
             (session_key.digest, 1_000_000.0, 1_000_120.0)
         ]
+        assert client.app.state.claude_pin_refresh_tasks == set()
+
+
+def test_pinned_durable_refresh_planning_failure_preserves_request(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _balanced_env(monkeypatch, tmp_path)
+    _register_balanced_accounts(1)
+
+    def fail_plan(_router: ClaudeBalancedRouter, _digest: bytes):
+        raise OSError("simulated planning failure")
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"id": "msg_1"})
+
+    monkeypatch.setattr(
+        ClaudeBalancedRouter, "plan_pin_durable_last_seen", fail_plan
+    )
+    with _create_test_client(
+        monkeypatch,
+        tmp_path,
+        config=GatewayConfig(),
+        base_url="http://127.0.0.1:8787",
+    ) as client:
+        _enable_balanced(client, handler)
+
+        response = client.post(
+            "/v1/messages", json=_balanced_body(_new_session_id())
+        )
+
+        assert response.status_code == 200
+        assert response.json() == {"id": "msg_1"}
+        assert client.app.state.claude_pin_refresh_tasks == set()
+
+
+def test_pinned_durable_refresh_scheduling_failure_preserves_request(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _balanced_env(monkeypatch, tmp_path)
+    _register_balanced_accounts(1)
+    real_create_task = asyncio.create_task
+
+    def fail_refresh_task(coroutine, *args, **kwargs):
+        if coroutine.cr_code.co_name == "_refresh_durable_pin":
+            raise RuntimeError("simulated scheduling failure")
+        return real_create_task(coroutine, *args, **kwargs)
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"id": "msg_1"})
+
+    monkeypatch.setattr(relay_balanced.asyncio, "create_task", fail_refresh_task)
+    with _create_test_client(
+        monkeypatch,
+        tmp_path,
+        config=GatewayConfig(),
+        base_url="http://127.0.0.1:8787",
+    ) as client:
+        _enable_balanced(client, handler)
+
+        response = client.post(
+            "/v1/messages", json=_balanced_body(_new_session_id())
+        )
+
+        assert response.status_code == 200
+        assert response.json() == {"id": "msg_1"}
+        assert client.app.state.claude_pin_refresh_tasks == set()
+
+
+def test_pinned_durable_refresh_exception_warning_is_constant(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    _balanced_env(monkeypatch, tmp_path)
+    _register_balanced_accounts(1)
+
+    async def fail_refresh(
+        _router: ClaudeBalancedRouter,
+        _digest: bytes,
+        *,
+        last_seen_utc: float,
+        expires_at_utc: float,
+    ) -> None:
+        raise RuntimeError(
+            f"secret path /private/{last_seen_utc}/{expires_at_utc}"
+        )
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"id": "msg_1"})
+
+    monkeypatch.setattr(
+        ClaudeBalancedRouter, "refresh_pin_durable_last_seen", fail_refresh
+    )
+    caplog.set_level(logging.WARNING, logger="claudex.server")
+    with _create_test_client(
+        monkeypatch,
+        tmp_path,
+        config=GatewayConfig(),
+        base_url="http://127.0.0.1:8787",
+    ) as client:
+        _enable_balanced(client, handler)
+
+        response = client.post(
+            "/v1/messages", json=_balanced_body(_new_session_id())
+        )
+        assert client.portal is not None
+        client.portal.call(asyncio.sleep, 0)
+
+        assert response.status_code == 200
+        warnings = [
+            record
+            for record in caplog.records
+            if record.getMessage()
+            == "balanced durable pin refresh failed unexpectedly"
+        ]
+        assert len(warnings) == 1
+        assert warnings[0].exc_info is None
+        assert "secret path" not in caplog.text
+        assert client.app.state.claude_pin_refresh_tasks == set()
 
 
 def test_balanced_repeat_request_reuses_the_existing_pin_without_a_new_placement(

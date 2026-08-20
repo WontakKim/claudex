@@ -224,12 +224,15 @@ def create_app(config: GatewayConfig, daemon_nonce: str | None = None) -> Starle
                     try:
                         yield
                     finally:
-                        refresh_tasks = app.state.claude_usage_refresh_tasks
-                        for refresh_task in tuple(refresh_tasks):
+                        refresh_tasks = (
+                            *tuple(app.state.claude_usage_refresh_tasks),
+                            *tuple(app.state.claude_pin_refresh_tasks),
+                        )
+                        for refresh_task in refresh_tasks:
                             refresh_task.cancel()
                         if refresh_tasks:
                             await asyncio.gather(
-                                *tuple(refresh_tasks), return_exceptions=True
+                                *refresh_tasks, return_exceptions=True
                             )
             finally:
                 logging.getLogger().removeHandler(log_buffer)
@@ -397,8 +400,9 @@ def create_app(config: GatewayConfig, daemon_nonce: str | None = None) -> Starle
     app.state.claude_account_usage_cache = ClaudeAccountUsageCache(
         fetch=server_support._account_usage_fetch(app.state)
     )
-    # Strong references keep detached post-429 refreshes alive until completion.
+    # Strong references keep detached refreshes alive until completion.
     app.state.claude_usage_refresh_tasks = set()
+    app.state.claude_pin_refresh_tasks = set()
     # Rate-limit cooldowns are ephemeral runtime state and live only in this
     # process; the registry records durable facts only.
     app.state.claude_account_cooldowns = AccountCooldownTracker()
