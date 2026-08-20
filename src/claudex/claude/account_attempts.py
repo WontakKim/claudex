@@ -26,20 +26,13 @@ _OCCURRED_AT_UTC_PATTERN = re.compile(
     r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z"
 )
 _TOKEN_CHARACTERS = r"[A-Za-z0-9._~+/=-]"
-# A credential token run stops before any position where another credential
-# prefix starts with its boundary satisfied, so an embedded prefix is
-# redacted independently instead of being absorbed into this match — e.g.
-# "Bearer pre<X>Bearer secret" must redact "secret" too, not just the run
-# through the second "Bearer". All prefixes share one boundary rule (the
-# lookbehind), which differs from the previous \b only after "_".
-_TOKEN_RUN_STOP = (
-    r"(?<![A-Za-z0-9])(?:"
-    r"Bearer +"
-    r"|sk-"
-    r"|xox[baprs]-|gh[pousr]_|github_pat_|glpat-|npm_|pypi-|hf_|xai-|ya29\."
-    r"|(?-i:AIza|AKIA)"
-    r")"
-)
+# A credential token run stops only before a complete embedded Bearer start
+# (boundary + "Bearer " + at least one token character). Bearer is the one
+# prefix whose secret is separated by a non-token space, so absorbing its
+# prefix would expose the secret; inline prefixes (sk-, ghp_, AIza, AKIA, …)
+# are still redacted wholesale when absorbed into an enclosing run, and an
+# incomplete Bearer (no token argument) must not suppress the enclosing match.
+_TOKEN_RUN_STOP = rf"(?<![A-Za-z0-9])Bearer +(?={_TOKEN_CHARACTERS})"
 _CREDENTIAL_RUN = rf"(?:(?!{_TOKEN_RUN_STOP}){_TOKEN_CHARACTERS})+"
 _CREDENTIAL_PATTERNS = (
     re.compile(rf"(?<![A-Za-z0-9])Bearer +{_CREDENTIAL_RUN}", re.IGNORECASE),
@@ -54,17 +47,17 @@ _CREDENTIAL_PATTERNS = (
 )
 _OPAQUE_RUN_PATTERN = re.compile(rf"{_TOKEN_CHARACTERS}{{32,}}")
 
-# Session literals are masked with this token-compatible sentinel until the
-# credential and opaque-run passes have run. Replacing a literal directly with
-# "[redacted]" would insert brackets — not token characters — and split a
-# surrounding credential or opaque run, leaving its outer fragments
-# unredacted. The sentinel keeps such runs contiguous for those passes and is
-# converted to "[redacted]" before truncation; a collision with real text
-# only ever over-redacts. Length >= 32 so a standalone sentinel is also
-# opaque-redacted in the full profile. The trailing "-" is a token character
-# but not a word character, so a credential prefix immediately following a
-# literal keeps its \b / lookbehind start boundary.
-_SESSION_LITERAL_SENTINEL = "claudex0session0literal0sentinel0redacted-"
+# Session literals and credential matches are both masked with this
+# token-compatible sentinel until the opaque-run pass has run. Substituting
+# "[redacted]" directly would insert brackets — not token characters — and
+# split a surrounding credential or opaque run, leaving its outer fragments
+# unredacted. The sentinel keeps such runs contiguous for the intervening
+# passes and is converted to "[redacted]" before truncation; a collision with
+# real text only ever over-redacts. Length >= 32 so a standalone sentinel is
+# also opaque-redacted in the full profile. The trailing "-" is a token
+# character but not a word character, so a credential prefix immediately
+# following a sentinel keeps its lookbehind start boundary.
+_REDACTION_SENTINEL = "claudex0session0literal0sentinel0redacted-"
 
 
 def _normalize_text_prefix(text: str) -> str:
@@ -103,12 +96,12 @@ def sanitize_external_text(
         }
         for literal in sorted(normalized_literals, key=len, reverse=True):
             if literal:
-                sanitized = sanitized.replace(literal, _SESSION_LITERAL_SENTINEL)
+                sanitized = sanitized.replace(literal, _REDACTION_SENTINEL)
         for credential_pattern in _CREDENTIAL_PATTERNS:
-            sanitized = credential_pattern.sub(_REDACTION, sanitized)
+            sanitized = credential_pattern.sub(_REDACTION_SENTINEL, sanitized)
         if redact_opaque_runs:
             sanitized = _OPAQUE_RUN_PATTERN.sub(_REDACTION, sanitized)
-        return sanitized.replace(_SESSION_LITERAL_SENTINEL, _REDACTION)[:cap]
+        return sanitized.replace(_REDACTION_SENTINEL, _REDACTION)[:cap]
     except Exception:
         return ""
 

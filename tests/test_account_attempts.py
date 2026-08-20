@@ -221,6 +221,29 @@ def test_sanitize_external_text_credential_run_stops_before_embedded_prefix() ->
         assert _CANONICAL_SESSION not in sanitized
 
 
+def test_sanitize_external_text_run_stop_requires_complete_bearer() -> None:
+    for source in (
+        "Bearer AKIAshortsecret",
+        "Bearer AIzashort",
+        "Bearer sk-",
+        "sk-AKIAshortsecret",
+    ):
+        for redact_opaque_runs in (True, False):
+            sanitized = sanitize_external_text(
+                source, cap=256, redact_opaque_runs=redact_opaque_runs
+            )
+
+            assert sanitized == "[redacted]"
+
+
+def test_sanitize_external_text_credential_inside_opaque_run_redacts_whole_run() -> None:
+    source = f"{'a' * 20}-AKIA0123456789ABCDEF-{'b' * 20}"
+
+    sanitized = sanitize_external_text(source, cap=256, redact_opaque_runs=True)
+
+    assert sanitized == "[redacted]"
+
+
 def test_request_shape_fields_counts_client_bytes_and_list_lengths() -> None:
     raw_body = "client-é".encode()
 
