@@ -3755,6 +3755,44 @@ def test_fallback_429_schedules_forced_usage_refresh_without_blocking(
     assert poll_calls == [(account_id, True)]
 
 
+def test_fallback_refresh_scheduling_failure_preserves_429(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    account_id = _register_serving_account()
+
+    real_create_task = asyncio.create_task
+
+    def fail_task_creation(coroutine, *args, **kwargs):
+        if coroutine.cr_code.co_name == "_refresh_usage_after_quota_429":
+            raise RuntimeError("simulated scheduling failure")
+        return real_create_task(coroutine, *args, **kwargs)
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return _quota_429("scheduling-failure")
+
+    monkeypatch.setattr(
+        relay_registered.asyncio, "create_task", fail_task_creation
+    )
+    caplog.set_level(logging.INFO, logger="claudex.server")
+    with _create_test_client(
+        monkeypatch, tmp_path, config=_pool_config(account_id)
+    ) as client:
+        client.app.state.http_client = httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        )
+
+        response = client.post("/v1/messages", json=_account_body())
+
+    assert response.status_code == 429
+    assert response.json()["error"]["message"] == "scheduling-failure"
+    envelopes = _account_leg_envelopes(caplog)
+    assert len(envelopes) == 1
+    assert envelopes[0]["result"] == "rate_limited"
+
+
 def test_fallback_refresh_unexpected_exception_warns_once(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -3810,7 +3848,8 @@ def test_fallback_refresh_unexpected_exception_warns_once(
     assert response.status_code == 429
     assert poll_calls == [(account_id, True)]
     assert len(refresh_warnings) == 1
-    assert isinstance(refresh_warnings[0].exc_info[1], RuntimeError)
+    assert refresh_warnings[0].exc_info is None
+    assert "simulated refresh task failure" not in caplog.text
 
 
 def test_fallback_refresh_cache_error_result_not_double_warned(
@@ -4445,6 +4484,53 @@ def test_balanced_429_enqueues_manual_usage_refresh(
         assert response.status_code == 429
         assert recording_coordinator.account_ids == [account_id]
         assert recording_coordinator.cooldown_installed == [True]
+
+
+def test_balanced_refresh_enqueue_failure_preserves_evidence_identity(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    _balanced_env(monkeypatch, tmp_path)
+    account_id, _access_token = _register_balanced_accounts(1)[0]
+
+    class RaisingUsagePollCoordinator:
+        poll_interval_seconds = 300.0
+
+        async def run_due_poll(self, *_args: Any, **_kwargs: Any) -> None:
+            return None
+
+        def request_manual_refresh(self, _account_id: str) -> bool:
+            raise RuntimeError("simulated enqueue failure")
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return _quota_429()
+
+    caplog.set_level(logging.WARNING, logger="claudex.server")
+    with _create_test_client(
+        monkeypatch,
+        tmp_path,
+        config=GatewayConfig(),
+        base_url="http://127.0.0.1:8787",
+    ) as client:
+        runtime = _enable_balanced(client, handler)
+        assert client.portal is not None
+        client.portal.call(runtime._stop_usage_poll_driver)
+        runtime.usage_poll_coordinator = RaisingUsagePollCoordinator()
+
+        response = client.post(
+            "/v1/messages", json=_balanced_body(_new_session_id())
+        )
+
+        assert response.status_code == 429
+        row = runtime._store.get_cooldown(account_id, "account", "")
+        assert row is not None
+        incident_path = (
+            paths.claude_account_pool_dir() / "claude-429-incidents.jsonl"
+        )
+        assert incident_path.read_bytes() == row.evidence.encode() + b"\n"
+        assert "failed to enrich Claude 429 incident evidence" not in caplog.text
+        assert "simulated enqueue failure" not in caplog.text
 
 
 def test_balanced_429_refresh_enqueue_coalesces_per_account(

@@ -548,8 +548,12 @@ async def _serve_balanced_stateless_message(
                 epoch_seed=runtime.epoch_seed,
                 mark=mark,
             )
-            assert runtime.usage_poll_coordinator is not None
-            runtime.usage_poll_coordinator.request_manual_refresh(_account_id)
+            try:
+                coordinator = runtime.usage_poll_coordinator
+                if coordinator is not None:
+                    coordinator.request_manual_refresh(_account_id)
+            except Exception:
+                pass
             return canonical_record
 
         async def _on_response(
@@ -743,8 +747,12 @@ async def _serve_balanced_pinned_message(
                     epoch_seed=runtime.epoch_seed,
                     mark=mark,
                 )
-                assert runtime.usage_poll_coordinator is not None
-                runtime.usage_poll_coordinator.request_manual_refresh(_account_id)
+                try:
+                    coordinator = runtime.usage_poll_coordinator
+                    if coordinator is not None:
+                        coordinator.request_manual_refresh(_account_id)
+                except Exception:
+                    pass
                 return canonical_record
 
             async def _on_response(

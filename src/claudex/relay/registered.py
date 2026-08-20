@@ -344,30 +344,25 @@ async def _attempt_with_account(
 
             if on_quota_429 is None:
                 async def _refresh_usage_after_quota_429() -> None:
-                    await request.app.state.claude_account_usage_cache.poll(
-                        account_id, force=True
-                    )
-
-                def _consume_usage_refresh_exception(
-                    task: asyncio.Task[None],
-                ) -> None:
-                    if task.cancelled():
-                        return
-                    exception = task.exception()
-                    if exception is not None:
-                        logger.warning(
-                            "post-429 Claude usage refresh failed unexpectedly",
-                            exc_info=(
-                                type(exception),
-                                exception,
-                                exception.__traceback__,
-                            ),
+                    try:
+                        await request.app.state.claude_account_usage_cache.poll(
+                            account_id, force=True
                         )
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        try:
+                            logger.warning(
+                                "post-429 Claude usage refresh failed unexpectedly"
+                            )
+                        except Exception:
+                            pass
 
-                refresh_task = asyncio.create_task(
-                    _refresh_usage_after_quota_429()
-                )
-                refresh_task.add_done_callback(_consume_usage_refresh_exception)
+                refresh_coroutine = _refresh_usage_after_quota_429()
+                try:
+                    asyncio.create_task(refresh_coroutine)
+                except Exception:
+                    refresh_coroutine.close()
 
             mode = (
                 "balanced"
