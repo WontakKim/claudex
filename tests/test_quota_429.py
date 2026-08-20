@@ -157,6 +157,20 @@ def test_parse_upstream_error_body_handles_malformed_and_nonjson(body: bytes) ->
     }
 
 
+def test_parse_upstream_error_body_handles_deep_valid_json() -> None:
+    body = b"[" * 10000 + b"0" + b"]" * 10000
+
+    parsed = parse_upstream_error_body(body)
+
+    assert parsed == {
+        "body_bytes": len(body),
+        "body_sha256": hashlib.sha256(body).hexdigest(),
+        "error_type": None,
+        "message": None,
+        "request_id": None,
+    }
+
+
 def test_parse_upstream_error_body_hashes_empty_body() -> None:
     parsed = parse_upstream_error_body(b"")
 
@@ -259,6 +273,48 @@ def test_incident_writer_appends_one_record_per_line(tmp_path: Path) -> None:
     assert path.read_bytes() == f"{first}\n{second}\n".encode()
 
 
+def test_incident_writer_fsyncs_parent_after_normal_append(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "incidents.jsonl"
+    events: list[str] = []
+    real_append_line = quota_429._append_line
+    real_fsync_directory = quota_429._fsync_directory
+
+    def recording_append_line(target: Path, line: bytes) -> None:
+        real_append_line(target, line)
+        events.append("file")
+
+    def recording_fsync_directory(directory: Path) -> None:
+        events.append("directory")
+        real_fsync_directory(directory)
+
+    monkeypatch.setattr(quota_429, "_append_line", recording_append_line)
+    monkeypatch.setattr(quota_429, "_fsync_directory", recording_fsync_directory)
+
+    asyncio.run(Quota429IncidentWriter(path).append_record(_canonical({"id": 1})))
+
+    assert events == ["file", "directory"]
+
+
+def test_incident_writer_directory_sync_failure_warns_without_raising(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    path = tmp_path / "incidents.jsonl"
+
+    def fail_directory_sync(_directory: Path) -> None:
+        raise OSError("simulated directory fsync failure")
+
+    monkeypatch.setattr(quota_429, "_fsync_directory", fail_directory_sync)
+
+    asyncio.run(Quota429IncidentWriter(path).append_record(_canonical({"id": 1})))
+
+    assert path.is_file()
+    assert "failed to append Claude 429 incident record" in caplog.text
+
+
 def test_incident_writer_repairs_truncated_tail_before_append(tmp_path: Path) -> None:
     path = tmp_path / "incidents.jsonl"
     first = _canonical({"id": 1})
@@ -276,7 +332,7 @@ def test_incident_writer_compacts_to_cap_keeping_newest_and_new_record(
 ) -> None:
     path = tmp_path / "incidents.jsonl"
     records = [
-        _canonical({"id": identifier, "padding": "x" * 16})
+        _canonical({"id": identifier, "padding": "x" * 16400})
         for identifier in (1, 2, 3)
     ]
     line_size = len(records[0].encode()) + 1
@@ -333,7 +389,7 @@ def test_incident_writer_complete_write_under_short_writes(
 ) -> None:
     path = tmp_path / "incidents.jsonl"
     records = [
-        _canonical({"id": identifier, "padding": "x" * 16})
+        _canonical({"id": identifier, "padding": "x" * 16400})
         for identifier in (1, 2, 3)
     ]
     line_size = len(records[0].encode()) + 1
@@ -382,3 +438,10 @@ def test_incident_writer_uses_one_process_wide_lock(tmp_path: Path) -> None:
     second = Quota429IncidentWriter(tmp_path / "second.jsonl")
 
     assert first._lock is second._lock
+
+
+def test_incident_writer_rejects_retention_smaller_than_one_record(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(ValueError, match="max_bytes must be at least 32769"):
+        Quota429IncidentWriter(tmp_path / "incidents.jsonl", max_bytes=32768)

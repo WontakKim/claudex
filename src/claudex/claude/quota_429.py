@@ -150,7 +150,7 @@ def parse_upstream_error_body(
 
     try:
         parsed = json.loads(body)
-    except (json.JSONDecodeError, UnicodeDecodeError, TypeError, ValueError):
+    except Exception:
         return result
     if not isinstance(parsed, dict):
         return result
@@ -468,6 +468,10 @@ class Quota429IncidentWriter:
     def __init__(
         self, path: Path, *, max_bytes: int = _DEFAULT_RETENTION_BYTES
     ) -> None:
+        if not isinstance(max_bytes, int) or max_bytes < _RECORD_BYTES_CAP + 1:
+            raise ValueError(
+                f"max_bytes must be at least {_RECORD_BYTES_CAP + 1}"
+            )
         self._path = path
         self._max_bytes = max_bytes
         self._lock = _INCIDENT_WRITE_LOCK
@@ -484,6 +488,7 @@ class Quota429IncidentWriter:
                 current_size = _repair_incomplete_tail(self._path)
                 if current_size + len(line) <= self._max_bytes:
                     _append_line(self._path, line)
+                    _fsync_directory(self._path.parent)
                     return
 
                 complete_lines = _read_file(self._path).splitlines(keepends=True)
