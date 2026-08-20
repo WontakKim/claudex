@@ -59,6 +59,8 @@ from claudex.relay.common import (
 
 logger = logging.getLogger("claudex.server")
 
+_DEGRADED_INCIDENT_OCCURRED_AT_UTC = "1970-01-01T00:00:00.000Z"
+
 
 def _claude_account_unavailable(message: str) -> JSONResponse:
     # A misconfigured or broken serving account is the gateway's fault, never
@@ -387,11 +389,16 @@ async def _attempt_with_account(
                     "balanced_pinned": "balanced",
                     "fallback": "fallback",
                 }.get(attempt_context.mode, mode)
-            occurred_at_utc = (
-                datetime.now(timezone.utc)
-                .isoformat(timespec="milliseconds")
-                .replace("+00:00", "Z")
-            )
+            try:
+                occurred_at_utc = (
+                    datetime.now(timezone.utc)
+                    .isoformat(timespec="milliseconds")
+                    .replace("+00:00", "Z")
+                )
+                timestamp_degradation_reason = None
+            except Exception:
+                occurred_at_utc = _DEGRADED_INCIDENT_OCCURRED_AT_UTC
+                timestamp_degradation_reason = "timestamp_generation_failed"
 
             def _finalize_incident(record: dict[str, Any]) -> str:
                 try:
@@ -403,21 +410,34 @@ async def _attempt_with_account(
                     )
 
             try:
-                quota_record = build_quota_429_record(
-                    occurred_at_utc=occurred_at_utc,
-                    mode=mode,
-                    account_id=account_id,
-                    model=model,
-                    cooldown_seconds=cooldown_decision.seconds,
-                    cooldown_source=cooldown_decision.source,
-                    context=attempt_context,
-                    parsed_body=parsed_body,
-                    raw_body=raw_body,
-                    response_headers=response_headers,
-                    response_body=response_body,
-                    session_literals=session_literals,
-                    pin_created=pin_created,
-                )
+                if timestamp_degradation_reason is None:
+                    quota_record = build_quota_429_record(
+                        occurred_at_utc=occurred_at_utc,
+                        mode=mode,
+                        account_id=account_id,
+                        model=model,
+                        cooldown_seconds=cooldown_decision.seconds,
+                        cooldown_source=cooldown_decision.source,
+                        context=attempt_context,
+                        parsed_body=parsed_body,
+                        raw_body=raw_body,
+                        response_headers=response_headers,
+                        response_body=response_body,
+                        session_literals=session_literals,
+                        pin_created=pin_created,
+                    )
+                else:
+                    quota_record = build_degraded_quota_429_record(
+                        occurred_at_utc=occurred_at_utc,
+                        mode=mode,
+                        cooldown_seconds=cooldown_decision.seconds,
+                        cooldown_source=cooldown_decision.source,
+                        parsed_body=parsed_body,
+                        raw_body=raw_body,
+                        response_body=response_body,
+                        pin_created=pin_created,
+                        degradation_reason=timestamp_degradation_reason,
+                    )
             except Exception:
                 logger.warning("failed to build Claude 429 incident evidence")
                 try:

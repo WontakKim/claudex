@@ -4848,6 +4848,161 @@ def test_429_incident_records_cooldown_source_default_60(
         assert record["cooldown_source"] == "default_60"
 
 
+def test_429_timestamp_failure_replays_and_records_degraded_incident(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    _balanced_env(monkeypatch, tmp_path)
+    account_id, _access_token = _register_balanced_accounts(1)[0]
+    upstream_returned = False
+    response_body = b'{"error":{"type":"rate_limit_error","message":"quota reached"}}'
+    original_datetime = relay_registered.datetime
+    original_install_callback = relay_balanced._install_balanced_quota_cooldown
+    install_calls: list[dict[str, Any]] = []
+
+    class CountingCooldownTracker(AccountCooldownTracker):
+        def __init__(self) -> None:
+            super().__init__()
+            self.mark_calls: list[tuple[str, float]] = []
+
+        def mark(self, marked_account_id: str, seconds: float) -> None:
+            self.mark_calls.append((marked_account_id, seconds))
+            super().mark(marked_account_id, seconds)
+
+    class FailingIncidentDatetime:
+        call_count = 0
+
+        @classmethod
+        def now(cls, timezone_value: Any) -> Any:
+            assert upstream_returned
+            cls.call_count += 1
+            if cls.call_count == 1:
+                raise RuntimeError("simulated incident timestamp failure")
+            return original_datetime.now(timezone_value)
+
+    async def recording_install_callback(
+        *args: Any, **kwargs: Any
+    ) -> str:
+        install_calls.append(kwargs)
+        return await original_install_callback(*args, **kwargs)
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal upstream_returned
+        response = httpx.Response(
+            429,
+            content=response_body,
+            headers={
+                "request-id": "upstream-request-id",
+                "retry-after": "17",
+                "x-should-retry": "true",
+            },
+        )
+        upstream_returned = True
+        return response
+
+    caplog.set_level(logging.INFO, logger="claudex.server")
+    with _create_test_client(
+        monkeypatch,
+        tmp_path,
+        config=GatewayConfig(),
+        base_url="http://127.0.0.1:8787",
+    ) as client:
+        _enable_balanced(client, handler)
+        cooldown_tracker = CountingCooldownTracker()
+        client.app.state.claude_account_cooldowns = cooldown_tracker
+        appended_records: list[str] = []
+        incident_writer = client.app.state.claude_quota_429_incident_writer
+        original_append_record = incident_writer.append_record
+
+        async def recording_append_record(canonical_record: str) -> None:
+            appended_records.append(canonical_record)
+            await original_append_record(canonical_record)
+
+        monkeypatch.setattr(relay_registered, "datetime", FailingIncidentDatetime)
+        monkeypatch.setattr(
+            relay_balanced,
+            "_install_balanced_quota_cooldown",
+            recording_install_callback,
+        )
+        monkeypatch.setattr(
+            incident_writer, "append_record", recording_append_record
+        )
+
+        response = client.post(
+            "/v1/messages", json=_balanced_body(_new_session_id())
+        )
+
+        assert response.status_code == 429
+        assert response.content == response_body
+        assert response.headers["request-id"] == "upstream-request-id"
+        assert response.headers["retry-after"] == "17"
+        assert response.headers["x-should-retry"] == "true"
+        assert cooldown_tracker.mark_calls == [(account_id, 17.0)]
+        assert cooldown_tracker.is_cooling(account_id)
+        assert len(install_calls) == 1
+        assert install_calls[0]["account_id"] == account_id
+        assert len(appended_records) == 1
+        incident = json.loads(appended_records[0])
+        mandatory_fields = {
+            "v",
+            "event",
+            "occurred_at_utc",
+            "mode",
+            "account_id",
+            "model",
+            "cooldown_seconds",
+            "cooldown_source",
+            "installed_scope",
+            "quota_family",
+            "family_gate",
+            "observed_scope",
+            "scope_rationale",
+            "upstream",
+            "attempt",
+            "session_fingerprint",
+            "request_shape",
+            "record_degraded",
+            "degradation_reason",
+        }
+        assert mandatory_fields <= incident.keys()
+        assert incident["v"] == 1
+        assert incident["event"] == "claude_quota_429"
+        assert incident["mode"] == "balanced"
+        assert incident["cooldown_seconds"] == 17.0
+        assert incident["cooldown_source"] == "retry_after"
+        assert set(incident["upstream"]) == {
+            "body_bytes",
+            "body_sha256",
+            "error_type",
+            "message",
+            "request_id",
+            "headers",
+        }
+        assert set(incident["request_shape"]) == {
+            "body_bytes",
+            "message_count",
+            "tool_count",
+            "pin_created",
+        }
+        assert re.fullmatch(
+            r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z",
+            incident["occurred_at_utc"],
+        )
+        assert incident["record_degraded"] is True
+        assert isinstance(incident["degradation_reason"], str)
+        assert incident["degradation_reason"]
+        incident_path = (
+            paths.claude_account_pool_dir() / "claude-429-incidents.jsonl"
+        )
+        assert incident_path.read_text() == appended_records[0] + "\n"
+
+    assert FailingIncidentDatetime.call_count == 2
+    envelopes = _account_leg_envelopes(caplog)
+    assert len(envelopes) == 1
+    assert envelopes[0]["result"] == "rate_limited"
+
+
 def test_429_evidence_failure_still_installs_cooldown_and_records_degraded_incident(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
