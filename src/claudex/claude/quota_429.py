@@ -30,6 +30,7 @@ _HEADER_VALUE_CAP = 256
 _ERROR_TYPE_CAP = 64
 _MESSAGE_CAP = 256
 _READ_CHUNK_BYTES = 65536
+_INCIDENT_WRITE_LOCK = asyncio.Lock()
 
 
 def _canonical_json(value: Any) -> str:
@@ -469,7 +470,7 @@ class Quota429IncidentWriter:
     ) -> None:
         self._path = path
         self._max_bytes = max_bytes
-        self._lock = asyncio.Lock()
+        self._lock = _INCIDENT_WRITE_LOCK
 
     async def append_record(self, canonical_record: str) -> None:
         """Append one incident without allowing persistence failures to escape."""

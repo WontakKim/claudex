@@ -375,3 +375,10 @@ def test_incident_writer_sets_0600_permissions(tmp_path: Path) -> None:
     asyncio.run(writer.append_record(_canonical({"id": 1})))
 
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+def test_incident_writer_uses_one_process_wide_lock(tmp_path: Path) -> None:
+    first = Quota429IncidentWriter(tmp_path / "first.jsonl")
+    second = Quota429IncidentWriter(tmp_path / "second.jsonl")
+
+    assert first._lock is second._lock
