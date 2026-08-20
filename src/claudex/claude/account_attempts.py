@@ -26,13 +26,28 @@ _OCCURRED_AT_UTC_PATTERN = re.compile(
     r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z"
 )
 _TOKEN_CHARACTERS = r"[A-Za-z0-9._~+/=-]"
+# A credential token run stops before any position where another credential
+# prefix starts with its boundary satisfied, so an embedded prefix is
+# redacted independently instead of being absorbed into this match — e.g.
+# "Bearer pre<X>Bearer secret" must redact "secret" too, not just the run
+# through the second "Bearer". All prefixes share one boundary rule (the
+# lookbehind), which differs from the previous \b only after "_".
+_TOKEN_RUN_STOP = (
+    r"(?<![A-Za-z0-9])(?:"
+    r"Bearer +"
+    r"|sk-"
+    r"|xox[baprs]-|gh[pousr]_|github_pat_|glpat-|npm_|pypi-|hf_|xai-|ya29\."
+    r"|(?-i:AIza|AKIA)"
+    r")"
+)
+_CREDENTIAL_RUN = rf"(?:(?!{_TOKEN_RUN_STOP}){_TOKEN_CHARACTERS})+"
 _CREDENTIAL_PATTERNS = (
-    re.compile(rf"\bBearer +{_TOKEN_CHARACTERS}+", re.IGNORECASE),
-    re.compile(rf"(?<![A-Za-z0-9])sk-{_TOKEN_CHARACTERS}+", re.IGNORECASE),
+    re.compile(rf"(?<![A-Za-z0-9])Bearer +{_CREDENTIAL_RUN}", re.IGNORECASE),
+    re.compile(rf"(?<![A-Za-z0-9])sk-{_CREDENTIAL_RUN}", re.IGNORECASE),
     re.compile(
         rf"(?<![A-Za-z0-9])(?:"
         rf"xox[baprs]-|gh[pousr]_|github_pat_|glpat-|npm_|pypi-|hf_|xai-|ya29\."
-        rf"){_TOKEN_CHARACTERS}+",
+        rf"){_CREDENTIAL_RUN}",
         re.IGNORECASE,
     ),
     re.compile(r"(?<![A-Za-z0-9])(?:AIza[A-Za-z0-9_-]{16,}|AKIA[A-Z0-9]{16})"),

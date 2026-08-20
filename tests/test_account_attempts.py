@@ -206,6 +206,21 @@ def test_sanitize_external_text_literal_adjacent_to_credential_keeps_boundary() 
             assert _CANONICAL_SESSION not in sanitized
 
 
+def test_sanitize_external_text_credential_run_stops_before_embedded_prefix() -> None:
+    source = f"Bearer pre{_CANONICAL_SESSION}Bearer secret"
+
+    for redact_opaque_runs in (True, False):
+        sanitized = sanitize_external_text(
+            source,
+            cap=256,
+            session_literals=_SESSION_LITERALS,
+            redact_opaque_runs=redact_opaque_runs,
+        )
+
+        assert "secret" not in sanitized
+        assert _CANONICAL_SESSION not in sanitized
+
+
 def test_request_shape_fields_counts_client_bytes_and_list_lengths() -> None:
     raw_body = "client-é".encode()
 
