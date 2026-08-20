@@ -46,8 +46,10 @@ _OPAQUE_RUN_PATTERN = re.compile(rf"{_TOKEN_CHARACTERS}{{32,}}")
 # unredacted. The sentinel keeps such runs contiguous for those passes and is
 # converted to "[redacted]" before truncation; a collision with real text
 # only ever over-redacts. Length >= 32 so a standalone sentinel is also
-# opaque-redacted in the full profile.
-_SESSION_LITERAL_SENTINEL = "claudex0session0literal0sentinel0redacted0"
+# opaque-redacted in the full profile. The trailing "-" is a token character
+# but not a word character, so a credential prefix immediately following a
+# literal keeps its \b / lookbehind start boundary.
+_SESSION_LITERAL_SENTINEL = "claudex0session0literal0sentinel0redacted-"
 
 
 def _normalize_text_prefix(text: str) -> str:

@@ -186,6 +186,26 @@ def test_sanitize_external_text_literal_inside_opaque_run_redacts_whole_run() ->
     assert "y" not in sanitized
 
 
+def test_sanitize_external_text_literal_adjacent_to_credential_keeps_boundary() -> None:
+    cases = (
+        ("Bearer opaque-token", "opaque-token"),
+        ("sk-ant-value", "sk-ant-value"),
+        ("ghp_tokenvalue", "ghp_tokenvalue"),
+        ("AKIAIOSFODNN7EXAMPLE", "AKIAIOSFODNN7EXAMPLE"),
+    )
+    for credential, value_fragment in cases:
+        for redact_opaque_runs in (True, False):
+            sanitized = sanitize_external_text(
+                f"{_CANONICAL_SESSION}{credential}",
+                cap=256,
+                session_literals=_SESSION_LITERALS,
+                redact_opaque_runs=redact_opaque_runs,
+            )
+
+            assert value_fragment not in sanitized
+            assert _CANONICAL_SESSION not in sanitized
+
+
 def test_request_shape_fields_counts_client_bytes_and_list_lengths() -> None:
     raw_body = "client-é".encode()
 
