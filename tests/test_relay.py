@@ -26,6 +26,7 @@ from starlette.testclient import TestClient
 
 import claudex.relay.balanced as relay_balanced
 import claudex.relay.openai_backend as relay_openai_backend
+import claudex.relay.registered as relay_registered
 import claudex.server as server
 import claudex.translate.context_overflow as context_overflow
 from claudex import compaction, paths
@@ -3271,12 +3272,16 @@ def _register_serving_account(
     return record.id
 
 
-def _claude_code_user_id(account_uuid: str = "client-account-uuid") -> str:
+def _claude_code_user_id(
+    account_uuid: str = "client-account-uuid",
+    *,
+    session_id: str = "11111111-2222-4333-8444-555555555555",
+) -> str:
     return json.dumps(
         {
             "device_id": "d" * 64,
             "account_uuid": account_uuid,
-            "session_id": "11111111-2222-4333-8444-555555555555",
+            "session_id": session_id,
         },
         separators=(",", ":"),
     )
@@ -3286,6 +3291,102 @@ def _account_body(model: str = "claude-fable-5") -> dict[str, Any]:
     body = _message_body(model)
     body["metadata"] = {"user_id": _claude_code_user_id()}
     return body
+
+
+_LEG_RAW_SESSION_UUID = "550E8400-E29B-41D4-A716-446655440000"
+_LEG_CANONICAL_SESSION_UUID = "550e8400-e29b-41d4-a716-446655440000"
+_LEG_PROMPT_CONTENT = "PROMPT-CONTENT-MUST-NOT-APPEAR-IN-ACCOUNT-LEG-LOG"
+_LEG_TOOL_ARGUMENT = "TOOL-ARGUMENT-MUST-NOT-APPEAR-IN-ACCOUNT-LEG-LOG"
+
+
+def _account_leg_body(
+    session_id: str = _LEG_RAW_SESSION_UUID,
+) -> dict[str, Any]:
+    canonical_session_id = str(uuid.UUID(session_id))
+    body = _message_body(
+        f"claude-fable-5-{session_id}-{canonical_session_id}"
+    )
+    body["messages"] = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": _LEG_PROMPT_CONTENT},
+                {
+                    "type": "tool_use",
+                    "id": "toolu_fixture",
+                    "name": "fixture",
+                    "input": {"secret": _LEG_TOOL_ARGUMENT},
+                },
+            ],
+        }
+    ]
+    body["tools"] = [
+        {
+            "name": "fixture",
+            "description": _LEG_TOOL_ARGUMENT,
+            "input_schema": {"type": "object"},
+        }
+    ]
+    body["metadata"] = {"user_id": _claude_code_user_id(session_id=session_id)}
+    return body
+
+
+def _account_leg_envelopes(
+    caplog: pytest.LogCaptureFixture,
+    *,
+    extra_session_literals: tuple[str, ...] = (),
+) -> list[dict[str, Any]]:
+    envelopes = []
+    for record in caplog.records:
+        if record.name != "claudex.server":
+            continue
+        message = record.getMessage()
+        try:
+            envelope = json.loads(message)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(envelope, dict) or envelope.get("event") != "claude_account_leg":
+            continue
+        assert message == json.dumps(
+            envelope, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        )
+        assert set(envelope) == {
+            "v",
+            "event",
+            "occurred_at_utc",
+            "mode",
+            "account_id",
+            "model",
+            "result",
+            "attempt",
+            "request_shape",
+        }
+        assert set(envelope["request_shape"]) == {
+            "body_bytes",
+            "message_count",
+            "tool_count",
+            "pin_created",
+        }
+        for forbidden in (
+            _LEG_PROMPT_CONTENT,
+            _LEG_TOOL_ARGUMENT,
+            _LEG_RAW_SESSION_UUID,
+            _LEG_CANONICAL_SESSION_UUID,
+            *extra_session_literals,
+        ):
+            assert forbidden not in message
+        envelopes.append(envelope)
+    return envelopes
+
+
+class _RaisingLegLogger:
+    def info(self, message: Any, *args: Any, **_kwargs: Any) -> None:
+        if not args and isinstance(message, str) and '"event":"claude_account_leg"' in message:
+            raise RuntimeError("account-leg info logging failed")
+
+    def warning(self, message: Any, *_args: Any, **_kwargs: Any) -> None:
+        if message == "failed to emit Claude account-leg log":
+            raise RuntimeError("account-leg warning logging failed")
 
 
 def test_account_passthrough_swaps_credentials_and_rewrites_metadata(
@@ -4899,3 +5000,386 @@ def test_balanced_successful_2xx_records_eligible_capability_evidence_for_the_re
             account_incarnation_id=record.account_incarnation_id,
             account_profile_fingerprint=fingerprint,
         )
+
+
+def test_fallback_attempts_emit_leg_logs_with_ordinals_and_gaps(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    first, _second = _register_pool_accounts(monkeypatch)
+    calls = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return _quota_429()
+        return httpx.Response(200, json={"id": "msg_1"})
+
+    caplog.set_level(logging.INFO, logger="claudex.server")
+    client, _ = _gateway(_pool_config(first), handler)
+
+    response = client.post("/v1/messages", json=_account_leg_body())
+
+    assert response.status_code == 200
+    envelopes = _account_leg_envelopes(caplog)
+    assert [envelope["mode"] for envelope in envelopes] == ["fallback", "fallback"]
+    assert [envelope["result"] for envelope in envelopes] == [
+        "rate_limited",
+        "success",
+    ]
+    assert [envelope["attempt"]["ordinal"] for envelope in envelopes] == [1, 2]
+    assert envelopes[0]["attempt"] == {
+        "ordinal": 1,
+        "elapsed_ms_since_first": 0,
+        "gap_ms_since_previous": None,
+    }
+    assert envelopes[1]["attempt"]["gap_ms_since_previous"] >= 0
+    assert (
+        envelopes[1]["attempt"]["elapsed_ms_since_first"]
+        == envelopes[1]["attempt"]["gap_ms_since_previous"]
+    )
+    assert all(
+        envelope["request_shape"]["pin_created"] is None
+        for envelope in envelopes
+    )
+
+
+def test_401_refresh_resend_stays_single_leg(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    account_id = _register_serving_account()
+    api_calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal api_calls
+        if str(request.url) == CLAUDE_TOKEN_URL:
+            return httpx.Response(
+                200,
+                json={
+                    "access_token": "rotated-access",
+                    "refresh_token": "rotated-refresh",
+                    "expires_in": 900,
+                },
+            )
+        api_calls += 1
+        if api_calls == 1:
+            return httpx.Response(401, json={"type": "error"})
+        return httpx.Response(200, json={"id": "msg_1"})
+
+    caplog.set_level(logging.INFO, logger="claudex.server")
+    client, _ = _gateway(GatewayConfig(claude_account_id=account_id), handler)
+
+    response = client.post("/v1/messages", json=_account_leg_body())
+
+    assert response.status_code == 200
+    assert api_calls == 2
+    envelopes = _account_leg_envelopes(caplog)
+    assert len(envelopes) == 1
+    assert envelopes[0]["mode"] == "disabled"
+    assert envelopes[0]["result"] == "success"
+    assert envelopes[0]["attempt"]["ordinal"] == 1
+
+
+def test_credential_failure_before_send_still_emits_leg_log(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    account_id = _register_serving_account(expires_in_seconds=-60)
+    upstream_paths: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        upstream_paths.append(request.url.path)
+        assert str(request.url) == CLAUDE_TOKEN_URL
+        return httpx.Response(400, json={"error": "invalid_grant"})
+
+    caplog.set_level(logging.INFO, logger="claudex.server")
+    client, _ = _gateway(GatewayConfig(claude_account_id=account_id), handler)
+
+    response = client.post("/v1/messages", json=_account_leg_body())
+
+    assert response.status_code == 503
+    assert upstream_paths == ["/v1/oauth/token"]
+    envelopes = _account_leg_envelopes(caplog)
+    assert len(envelopes) == 1
+    assert envelopes[0]["mode"] == "disabled"
+    assert envelopes[0]["result"] == "failed"
+    assert envelopes[0]["attempt"]["ordinal"] == 1
+
+
+def test_count_token_attempts_emit_leg_logs_with_null_pin_created(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    _balanced_env(monkeypatch, tmp_path)
+    _register_balanced_accounts(1)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/count_tokens"):
+            return httpx.Response(200, json={"input_tokens": 7})
+        return httpx.Response(200, json={"id": "msg_1"})
+
+    caplog.set_level(logging.INFO, logger="claudex.server")
+    with _create_test_client(
+        monkeypatch,
+        tmp_path,
+        config=GatewayConfig(),
+        base_url="http://127.0.0.1:8787",
+    ) as client:
+        _enable_balanced(client, handler)
+        pinned_body = _account_leg_body()
+        assert client.post("/v1/messages", json=pinned_body).status_code == 200
+        caplog.clear()
+
+        pinned_count = client.post(
+            "/v1/messages/count_tokens", json=pinned_body
+        )
+        unpinned_session = _new_session_id()
+        unpinned_count = client.post(
+            "/v1/messages/count_tokens",
+            json=_account_leg_body(unpinned_session),
+        )
+
+    assert pinned_count.status_code == 200
+    assert unpinned_count.status_code == 200
+    envelopes = _account_leg_envelopes(
+        caplog, extra_session_literals=(unpinned_session,)
+    )
+    assert len(envelopes) == 2
+    assert all(
+        envelope["mode"] == "balanced_count_tokens" for envelope in envelopes
+    )
+    assert all(envelope["result"] == "success" for envelope in envelopes)
+    assert all(envelope["attempt"]["ordinal"] == 1 for envelope in envelopes)
+    assert all(
+        envelope["request_shape"]["pin_created"] is None
+        for envelope in envelopes
+    )
+
+
+def test_count_token_429_emits_rate_limited_result(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    _balanced_env(monkeypatch, tmp_path)
+    _register_balanced_accounts(1)
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return _quota_429("count-token-rate-limit")
+
+    caplog.set_level(logging.INFO, logger="claudex.server")
+    with _create_test_client(
+        monkeypatch,
+        tmp_path,
+        config=GatewayConfig(),
+        base_url="http://127.0.0.1:8787",
+    ) as client:
+        _enable_balanced(client, handler)
+        response = client.post(
+            "/v1/messages/count_tokens", json=_account_leg_body()
+        )
+
+    assert response.status_code == 429
+    envelopes = _account_leg_envelopes(caplog)
+    assert len(envelopes) == 1
+    assert envelopes[0]["mode"] == "balanced_count_tokens"
+    assert envelopes[0]["result"] == "rate_limited"
+    assert envelopes[0]["request_shape"]["pin_created"] is None
+
+
+def test_pinned_initial_leg_pin_created_true_migration_leg_false(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    _balanced_env(monkeypatch, tmp_path)
+    _register_balanced_accounts(2)
+    calls = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return _quota_429()
+        return httpx.Response(200, json={"id": "msg_1"})
+
+    caplog.set_level(logging.INFO, logger="claudex.server")
+    with _create_test_client(
+        monkeypatch,
+        tmp_path,
+        config=GatewayConfig(),
+        base_url="http://127.0.0.1:8787",
+    ) as client:
+        _enable_balanced(client, handler)
+        response = client.post("/v1/messages", json=_account_leg_body())
+
+    assert response.status_code == 200
+    envelopes = _account_leg_envelopes(caplog)
+    assert [envelope["mode"] for envelope in envelopes] == [
+        "balanced_pinned",
+        "balanced_pinned",
+    ]
+    assert [envelope["result"] for envelope in envelopes] == [
+        "rate_limited",
+        "success",
+    ]
+    assert [
+        envelope["request_shape"]["pin_created"] for envelope in envelopes
+    ] == [True, False]
+    assert [envelope["attempt"]["ordinal"] for envelope in envelopes] == [1, 2]
+
+
+def test_stateless_attempts_emit_leg_logs_with_null_pin_created(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    _balanced_env(monkeypatch, tmp_path)
+    _register_balanced_accounts(2)
+    calls = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return _quota_429()
+        return httpx.Response(200, json={"id": "msg_1"})
+
+    stateless_body = {
+        "model": "claude-fable-5",
+        "max_tokens": 16,
+        "messages": [
+            {"role": "assistant", "content": _LEG_PROMPT_CONTENT}
+        ],
+        "tools": [
+            {
+                "name": "fixture",
+                "description": _LEG_TOOL_ARGUMENT,
+                "input_schema": {"type": "object"},
+            }
+        ],
+    }
+    caplog.set_level(logging.INFO, logger="claudex.server")
+    with _create_test_client(
+        monkeypatch,
+        tmp_path,
+        config=GatewayConfig(),
+        base_url="http://127.0.0.1:8787",
+    ) as client:
+        _enable_balanced(client, handler)
+        response = client.post("/v1/messages", json=stateless_body)
+
+    assert response.status_code == 200
+    envelopes = _account_leg_envelopes(caplog)
+    assert len(envelopes) == 2
+    assert all(envelope["mode"] == "balanced_stateless" for envelope in envelopes)
+    assert [envelope["result"] for envelope in envelopes] == [
+        "rate_limited",
+        "success",
+    ]
+    assert all(
+        envelope["request_shape"]["pin_created"] is None
+        for envelope in envelopes
+    )
+
+
+def test_non_2xx_terminal_attempt_emits_failed_result(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    account_id = _register_serving_account()
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, json={"error": {"message": "upstream failed"}})
+
+    caplog.set_level(logging.INFO, logger="claudex.server")
+    client, _ = _gateway(GatewayConfig(claude_account_id=account_id), handler)
+
+    response = client.post("/v1/messages", json=_account_leg_body())
+
+    assert response.status_code == 500
+    envelopes = _account_leg_envelopes(caplog)
+    assert len(envelopes) == 1
+    assert envelopes[0]["mode"] == "disabled"
+    assert envelopes[0]["result"] == "failed"
+
+
+def test_unexpected_exception_emits_exception_result_once(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    account_id = _register_serving_account()
+
+    class RelaySignal(BaseException):
+        pass
+
+    signal = RelaySignal("unexpected relay signal")
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        raise signal
+
+    caplog.set_level(logging.INFO, logger="claudex.server")
+    client, _ = _gateway(GatewayConfig(claude_account_id=account_id), handler)
+
+    with pytest.raises(RelaySignal) as raised:
+        client.post("/v1/messages", json=_account_leg_body())
+
+    assert raised.value is signal
+    envelopes = _account_leg_envelopes(caplog)
+    assert len(envelopes) == 1
+    assert envelopes[0]["mode"] == "disabled"
+    assert envelopes[0]["result"] == "exception"
+
+
+def test_leg_log_emission_failure_preserves_response(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    account_id = _register_serving_account()
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"id": "msg_1"})
+
+    monkeypatch.setattr(relay_registered, "logger", _RaisingLegLogger())
+    client, _ = _gateway(GatewayConfig(claude_account_id=account_id), handler)
+
+    response = client.post("/v1/messages", json=_account_leg_body())
+
+    assert response.status_code == 200
+    assert response.json() == {"id": "msg_1"}
+
+
+def test_leg_log_emission_failure_preserves_escaping_exception(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    account_id = _register_serving_account()
+
+    class RelaySignal(BaseException):
+        pass
+
+    signal = RelaySignal("unexpected relay signal")
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        raise signal
+
+    monkeypatch.setattr(relay_registered, "logger", _RaisingLegLogger())
+    client, _ = _gateway(GatewayConfig(claude_account_id=account_id), handler)
+
+    with pytest.raises(RelaySignal) as raised:
+        client.post("/v1/messages", json=_account_leg_body())
+
+    assert raised.value is signal

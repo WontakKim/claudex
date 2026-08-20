@@ -7,6 +7,7 @@ import logging
 import math
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any
 
 import httpx
@@ -14,6 +15,11 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
 from claudex import server_support
+from claudex.claude.account_attempts import (
+    AccountLegContext,
+    AccountLegTracker,
+    emit_account_leg_log,
+)
 from claudex.claude.account_pool import (
     _DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS,
     AccountCooldownTracker,
@@ -29,6 +35,7 @@ from claudex.claude.auth import (
     ClaudeAccountAuthError,
     ClaudeAccountReauthRequiredError,
 )
+from claudex.claude.session_fingerprint import extract_session_uuid
 from claudex.relay.common import (
     _MANAGED_RELAY_SKIP_REQUEST_HEADERS,
     _OAUTH_BETA,
@@ -143,6 +150,7 @@ async def _attempt_with_account(
     parsed_body: Any,
     record: AccountRecord,
     *,
+    attempt_context: AccountLegContext,
     rate_limit_failover: bool,
     commit_hook: Callable[[httpx.Response], Awaitable[None]] | None = None,
     on_relay_complete: Callable[[], None] | None = None,
@@ -182,131 +190,182 @@ async def _attempt_with_account(
     non-balanced callers need no special handling.
     """
     account_id = record.id
-    manager = server_support._claude_account_auth_manager(request.app.state, account_id)
+    result = "failed"
+    model: str | None = None
     try:
-        credentials = await manager.get_credentials()
-    except ClaudeAccountReauthRequiredError as exc:
-        await server_support._mark_account_needs_reauth_best_effort(request.app.state, account_id)
-        return _FailedAttempt(
-            _claude_account_unavailable(
-                f"claude account {account_id} needs re-authentication: {exc}; "
-                "log in again from the dashboard or re-add it with "
-                "`claudex-gateway account add`"
+        candidate_model = parsed_body.get("model") if isinstance(parsed_body, dict) else None
+        model = candidate_model if isinstance(candidate_model, str) else None
+        manager = server_support._claude_account_auth_manager(request.app.state, account_id)
+        try:
+            credentials = await manager.get_credentials()
+        except ClaudeAccountReauthRequiredError as exc:
+            await server_support._mark_account_needs_reauth_best_effort(
+                request.app.state, account_id
             )
-        )
-    except ClaudeAccountAuthError as exc:
+            return _FailedAttempt(
+                _claude_account_unavailable(
+                    f"claude account {account_id} needs re-authentication: {exc}; "
+                    "log in again from the dashboard or re-add it with "
+                    "`claudex-gateway account add`"
+                )
+            )
+        except ClaudeAccountAuthError as exc:
+            logger.info(
+                "claude relay: account %.8s (%s) unusable, trying next: %s",
+                account_id,
+                record.email,
+                exc,
+            )
+            return _FailedAttempt(
+                _claude_account_unavailable(
+                    f"claude account {account_id} is unusable: {exc}"
+                )
+            )
+
         logger.info(
-            "claude relay: account %.8s (%s) unusable, trying next: %s",
+            "claude relay: attempting %s with account %.8s (%s)",
+            request.url.path,
             account_id,
             record.email,
-            exc,
         )
-        return _FailedAttempt(
-            _claude_account_unavailable(f"claude account {account_id} is unusable: {exc}")
+        content = _rewrite_metadata_account_uuid(
+            raw_body, parsed_body, credentials.account_uuid
         )
-
-    logger.info(
-        "claude relay: attempting %s with account %.8s (%s)",
-        request.url.path,
-        account_id,
-        record.email,
-    )
-    content = _rewrite_metadata_account_uuid(raw_body, parsed_body, credentials.account_uuid)
-    try:
-        upstream_response = await _send_to_anthropic(
-            request, _claude_account_request_headers(request, credentials.access_token), content
-        )
-        if upstream_response.status_code == 401:
-            await upstream_response.aclose()
-            try:
-                credentials = await manager.get_credentials(force_refresh=True)
-            except ClaudeAccountReauthRequiredError as exc:
-                await server_support._mark_account_needs_reauth_best_effort(request.app.state, account_id)
-                return _FailedAttempt(
-                    _claude_account_unavailable(
-                        f"claude account {account_id} needs re-authentication: {exc}; "
-                        "log in again from the dashboard or re-add it with "
-                        "`claudex-gateway account add`"
-                    )
-                )
-            except ClaudeAccountAuthError as exc:
-                logger.info(
-                    "claude relay: account %.8s (%s) unusable, trying next: %s",
-                    account_id,
-                    record.email,
-                    exc,
-                )
-                return _FailedAttempt(
-                    _claude_account_unavailable(
-                        f"claude account {account_id} was rejected and could not be "
-                        f"refreshed: {exc}"
-                    )
-                )
+        try:
             upstream_response = await _send_to_anthropic(
                 request,
                 _claude_account_request_headers(request, credentials.access_token),
                 content,
             )
-    except httpx.HTTPError as exc:
-        logger.warning("anthropic passthrough failed: %s", exc)
-        return JSONResponse(
-            server_support._claude_error_body("api_error", f"failed to reach the Anthropic API: {exc}"),
-            status_code=502,
-        )
-    if upstream_response.status_code == 401:
-        await upstream_response.aclose()
-        # A freshly refreshed token that Anthropic still rejects is durably
-        # dead — only a human re-login recovers it, which is what the
-        # needs-reauth state means.
-        await server_support._mark_account_needs_reauth_best_effort(request.app.state, account_id)
-        return _FailedAttempt(
-            JSONResponse(
+            if upstream_response.status_code == 401:
+                await upstream_response.aclose()
+                try:
+                    credentials = await manager.get_credentials(force_refresh=True)
+                except ClaudeAccountReauthRequiredError as exc:
+                    await server_support._mark_account_needs_reauth_best_effort(
+                        request.app.state, account_id
+                    )
+                    return _FailedAttempt(
+                        _claude_account_unavailable(
+                            f"claude account {account_id} needs re-authentication: {exc}; "
+                            "log in again from the dashboard or re-add it with "
+                            "`claudex-gateway account add`"
+                        )
+                    )
+                except ClaudeAccountAuthError as exc:
+                    logger.info(
+                        "claude relay: account %.8s (%s) unusable, trying next: %s",
+                        account_id,
+                        record.email,
+                        exc,
+                    )
+                    return _FailedAttempt(
+                        _claude_account_unavailable(
+                            f"claude account {account_id} was rejected and could not be "
+                            f"refreshed: {exc}"
+                        )
+                    )
+                upstream_response = await _send_to_anthropic(
+                    request,
+                    _claude_account_request_headers(
+                        request, credentials.access_token
+                    ),
+                    content,
+                )
+        except httpx.HTTPError as exc:
+            logger.warning("anthropic passthrough failed: %s", exc)
+            return JSONResponse(
                 server_support._claude_error_body(
-                    "authentication_error",
-                    f"Anthropic rejected the registered claude account {account_id} "
-                    "after a token refresh; log in again from the dashboard or "
-                    "re-add it with `claudex-gateway account add`",
+                    "api_error", f"failed to reach the Anthropic API: {exc}"
                 ),
-                status_code=401,
+                status_code=502,
             )
-        )
-    if upstream_response.status_code == 429 and rate_limit_failover:
-        # Buffer the (small) error response and release the connection before
-        # any next attempt reuses the shared client. Quota 429s carry no
-        # machine-readable reset (.docs/research/claude-429-shape.md), so the
-        # deadline falls back to the cached usage envelope or a short default.
-        response_headers = dict(upstream_response.headers)
-        response_body = await upstream_response.aread()
-        await upstream_response.aclose()
-        cooldown_seconds = rate_limit_cooldown_seconds(
-            response_headers,
-            response_body,
-            request.app.state.claude_account_usage_cache.peek(account_id),
-        )
-        request.app.state.claude_account_cooldowns.mark(account_id, cooldown_seconds)
-        logger.warning(
-            "claude account %.8s rate-limited by Anthropic; cooling down for %.0fs",
+
+        if upstream_response.status_code == 429:
+            result = "rate_limited"
+        elif 200 <= upstream_response.status_code < 300:
+            result = "success"
+
+        if upstream_response.status_code == 401:
+            await upstream_response.aclose()
+            # A freshly refreshed token that Anthropic still rejects is durably
+            # dead — only a human re-login recovers it, which is what the
+            # needs-reauth state means.
+            await server_support._mark_account_needs_reauth_best_effort(
+                request.app.state, account_id
+            )
+            return _FailedAttempt(
+                JSONResponse(
+                    server_support._claude_error_body(
+                        "authentication_error",
+                        f"Anthropic rejected the registered claude account {account_id} "
+                        "after a token refresh; log in again from the dashboard or "
+                        "re-add it with `claudex-gateway account add`",
+                    ),
+                    status_code=401,
+                )
+            )
+        if upstream_response.status_code == 429 and rate_limit_failover:
+            # Buffer the (small) error response and release the connection before
+            # any next attempt reuses the shared client. Quota 429s carry no
+            # machine-readable reset (.docs/research/claude-429-shape.md), so the
+            # deadline falls back to the cached usage envelope or a short default.
+            response_headers = dict(upstream_response.headers)
+            response_body = await upstream_response.aread()
+            await upstream_response.aclose()
+            cooldown_seconds = rate_limit_cooldown_seconds(
+                response_headers,
+                response_body,
+                request.app.state.claude_account_usage_cache.peek(account_id),
+            )
+            request.app.state.claude_account_cooldowns.mark(
+                account_id, cooldown_seconds
+            )
+            logger.warning(
+                "claude account %.8s rate-limited by Anthropic; cooling down for %.0fs",
+                account_id,
+                cooldown_seconds,
+            )
+            if on_quota_429 is not None:
+                await on_quota_429(cooldown_seconds)
+            return _FailedAttempt(
+                _replay_buffered_response(429, response_headers, response_body),
+                rate_limited=True,
+            )
+        if commit_hook is not None:
+            await commit_hook(upstream_response)
+        if on_response is not None:
+            await on_response(upstream_response)
+        logger.info(
+            "claude relay: account %.8s (%s) serving %s -> upstream %s",
             account_id,
-            cooldown_seconds,
+            record.email,
+            request.url.path,
+            upstream_response.status_code,
         )
-        if on_quota_429 is not None:
-            await on_quota_429(cooldown_seconds)
-        return _FailedAttempt(
-            _replay_buffered_response(429, response_headers, response_body),
-            rate_limited=True,
+        return _relay_anthropic_response(
+            upstream_response, on_finished=on_relay_complete
         )
-    if commit_hook is not None:
-        await commit_hook(upstream_response)
-    if on_response is not None:
-        await on_response(upstream_response)
-    logger.info(
-        "claude relay: account %.8s (%s) serving %s -> upstream %s",
-        account_id,
-        record.email,
-        request.url.path,
-        upstream_response.status_code,
-    )
-    return _relay_anthropic_response(upstream_response, on_finished=on_relay_complete)
+    except BaseException:
+        result = "exception"
+        raise
+    finally:
+        try:
+            emit_account_leg_log(
+                logger,
+                attempt_context,
+                account_id=account_id,
+                model=model,
+                result=result,
+                parsed_body=parsed_body,
+                raw_body=raw_body,
+                occurred_at_utc=datetime.now(timezone.utc)
+                .isoformat(timespec="milliseconds")
+                .replace("+00:00", "Z"),
+            )
+        except BaseException:
+            # Observability must never replace the account-leg outcome.
+            pass
 
 
 async def _passthrough_with_claude_account(
@@ -320,6 +379,12 @@ async def _passthrough_with_claude_account(
     (read-through, no cache) so CLI- and dashboard-side account changes take
     effect without a restart.
     """
+    session_uuid = extract_session_uuid(
+        parsed_body if isinstance(parsed_body, dict) else {}
+    )
+    leg_tracker = AccountLegTracker(
+        "disabled", session_literals=session_uuid or ()
+    )
     try:
         records = load_registry()
     except AccountRegistryError as exc:
@@ -336,8 +401,14 @@ async def _passthrough_with_claude_account(
             f"configured claude account {serving_account_id} is in state "
             f"{record.state!r}, not ready"
         )
+    attempt_context = leg_tracker.begin_leg(None)
     outcome = await _attempt_with_account(
-        request, raw_body, parsed_body, record, rate_limit_failover=False
+        request,
+        raw_body,
+        parsed_body,
+        record,
+        attempt_context=attempt_context,
+        rate_limit_failover=False,
     )
     if isinstance(outcome, _FailedAttempt):
         return outcome.response
@@ -359,6 +430,12 @@ async def _passthrough_with_claude_pool(
     only constructed for terminal outcomes, and every failover branch fully
     closed its upstream response first.
     """
+    session_uuid = extract_session_uuid(
+        parsed_body if isinstance(parsed_body, dict) else {}
+    )
+    leg_tracker = AccountLegTracker(
+        "fallback", session_literals=session_uuid or ()
+    )
     try:
         records = load_registry()
     except AccountRegistryError as exc:
@@ -394,8 +471,14 @@ async def _passthrough_with_claude_pool(
     first_failure: Response | None = None
     last_rate_limited: Response | None = None
     for position, record in enumerate(chain.attempts):
+        attempt_context = leg_tracker.begin_leg(None)
         outcome = await _attempt_with_account(
-            request, raw_body, parsed_body, record, rate_limit_failover=True
+            request,
+            raw_body,
+            parsed_body,
+            record,
+            attempt_context=attempt_context,
+            rate_limit_failover=True,
         )
         if not isinstance(outcome, _FailedAttempt):
             if position:

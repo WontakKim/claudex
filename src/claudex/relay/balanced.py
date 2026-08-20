@@ -32,12 +32,14 @@ from claudex.balanced.selection import (
     select_weights,
     warning_factor,
 )
+from claudex.claude.account_attempts import AccountLegTracker
 from claudex.claude.accounts import (
     AccountRecord,
     AccountRegistryError,
     load_registry,
 )
 from claudex.claude.ambient_account import AmbientAccountProvider, is_duplicate_identity
+from claudex.claude.session_fingerprint import extract_session_uuid
 from claudex.config import GatewayConfig
 from claudex.relay.registered import (
     _FailedAttempt,
@@ -368,6 +370,12 @@ async def _serve_balanced_stateless_message(
     The digest is reused for the request's complete retry chain, never
     persisted, and never inserted into the pin map.
     """
+    session_uuid = extract_session_uuid(
+        parsed_body if isinstance(parsed_body, dict) else {}
+    )
+    leg_tracker = AccountLegTracker(
+        "balanced_stateless", session_literals=session_uuid or ()
+    )
     router = runtime.router
     assert router is not None
     family = quota_family(model)
@@ -421,11 +429,13 @@ async def _serve_balanced_stateless_message(
 
         router.begin_attempt(account_id)
         try:
+            attempt_context = leg_tracker.begin_leg(None)
             outcome = await _attempt_with_account(
                 request,
                 raw_body,
                 parsed_body,
                 record,
+                attempt_context=attempt_context,
                 rate_limit_failover=True,
                 on_quota_429=_on_quota_429,
                 on_response=_on_response,
@@ -456,6 +466,12 @@ async def _serve_balanced_pinned_message(
     and await the durable pin write before any downstream byte is forwarded.
     Once a 2xx response is relayed, no cross-account retry occurs.
     """
+    session_uuid = extract_session_uuid(
+        parsed_body if isinstance(parsed_body, dict) else {}
+    )
+    leg_tracker = AccountLegTracker(
+        "balanced_pinned", session_literals=session_uuid or ()
+    )
     router = runtime.router
     assert router is not None
     family = quota_family(model)
@@ -470,6 +486,7 @@ async def _serve_balanced_pinned_message(
     except NoEligibleAccountError:
         return _balanced_all_cooling_response(records_by_id, router, family=family, chain_exhausted_429=None)
 
+    normal_pin_created = placement.created
     if placement.created and placement.durability_barrier is not None:
         asyncio.create_task(router.submit_new_pin_durability(digest))
     await router.await_pin_durability(digest)
@@ -504,6 +521,7 @@ async def _serve_balanced_pinned_message(
                 return _balanced_all_cooling_response(
                     records_by_id, router, family=family, chain_exhausted_429=chain_429
                 )
+            normal_pin_created = placement.created
             if placement.created and placement.durability_barrier is not None:
                 asyncio.create_task(router.submit_new_pin_durability(digest))
             await router.await_pin_durability(digest)
@@ -595,11 +613,13 @@ async def _serve_balanced_pinned_message(
 
             if owner_attempt_id is not None:
                 try:
+                    attempt_context = leg_tracker.begin_leg(False)
                     outcome = await _attempt_with_account(
                         request,
                         raw_body,
                         parsed_body,
                         target_record,
+                        attempt_context=attempt_context,
                         rate_limit_failover=True,
                         commit_hook=_commit_hook,
                         on_relay_complete=_on_relay_complete,
@@ -617,11 +637,13 @@ async def _serve_balanced_pinned_message(
             else:
                 router.begin_attempt(current_target)
                 try:
+                    attempt_context = leg_tracker.begin_leg(normal_pin_created)
                     outcome = await _attempt_with_account(
                         request,
                         raw_body,
                         parsed_body,
                         target_record,
+                        attempt_context=attempt_context,
                         rate_limit_failover=True,
                         on_quota_429=_on_quota_429,
                         on_response=_on_response,
@@ -683,6 +705,12 @@ async def _serve_balanced_count_tokens(
     cooldown, or capability evidence, and never retries across accounts
     (`rate_limit_failover=False`).
     """
+    session_uuid = extract_session_uuid(
+        parsed_body if isinstance(parsed_body, dict) else {}
+    )
+    leg_tracker = AccountLegTracker(
+        "balanced_count_tokens", session_literals=session_uuid or ()
+    )
     router = runtime.router
     assert router is not None
     if session_key is not None:
@@ -692,8 +720,14 @@ async def _serve_balanced_count_tokens(
             if record is not None:
                 if pin.pending_durability is not None:
                     await router.await_pin_durability(session_key.digest)
+                attempt_context = leg_tracker.begin_leg(None)
                 outcome = await _attempt_with_account(
-                    request, raw_body, parsed_body, record, rate_limit_failover=False
+                    request,
+                    raw_body,
+                    parsed_body,
+                    record,
+                    attempt_context=attempt_context,
+                    rate_limit_failover=False,
                 )
                 return outcome.response if isinstance(outcome, _FailedAttempt) else outcome
 
@@ -715,7 +749,13 @@ async def _serve_balanced_count_tokens(
     except NoEligibleAccountError:
         return _balanced_all_cooling_response(records_by_id, router, family=family, chain_exhausted_429=None)
     record = records_by_id[account_id]
+    attempt_context = leg_tracker.begin_leg(None)
     outcome = await _attempt_with_account(
-        request, raw_body, parsed_body, record, rate_limit_failover=False
+        request,
+        raw_body,
+        parsed_body,
+        record,
+        attempt_context=attempt_context,
+        rate_limit_failover=False,
     )
     return outcome.response if isinstance(outcome, _FailedAttempt) else outcome
