@@ -39,6 +39,16 @@ _CREDENTIAL_PATTERNS = (
 )
 _OPAQUE_RUN_PATTERN = re.compile(rf"{_TOKEN_CHARACTERS}{{32,}}")
 
+# Session literals are masked with this token-compatible sentinel until the
+# credential and opaque-run passes have run. Replacing a literal directly with
+# "[redacted]" would insert brackets — not token characters — and split a
+# surrounding credential or opaque run, leaving its outer fragments
+# unredacted. The sentinel keeps such runs contiguous for those passes and is
+# converted to "[redacted]" before truncation; a collision with real text
+# only ever over-redacts. Length >= 32 so a standalone sentinel is also
+# opaque-redacted in the full profile.
+_SESSION_LITERAL_SENTINEL = "claudex0session0literal0sentinel0redacted0"
+
 
 def _normalize_text_prefix(text: str) -> str:
     replaced = text.encode("utf-8", errors="replace").decode(
@@ -76,12 +86,12 @@ def sanitize_external_text(
         }
         for literal in sorted(normalized_literals, key=len, reverse=True):
             if literal:
-                sanitized = sanitized.replace(literal, _REDACTION)
+                sanitized = sanitized.replace(literal, _SESSION_LITERAL_SENTINEL)
         for credential_pattern in _CREDENTIAL_PATTERNS:
             sanitized = credential_pattern.sub(_REDACTION, sanitized)
         if redact_opaque_runs:
             sanitized = _OPAQUE_RUN_PATTERN.sub(_REDACTION, sanitized)
-        return sanitized[:cap]
+        return sanitized.replace(_SESSION_LITERAL_SENTINEL, _REDACTION)[:cap]
     except Exception:
         return ""
 

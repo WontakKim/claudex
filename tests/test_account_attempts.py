@@ -154,6 +154,38 @@ def test_sanitize_external_text_identifier_profile_still_redacts_credentials_and
     assert bearer_token not in sanitized
 
 
+def test_sanitize_external_text_literal_inside_credential_leaves_no_fragments() -> None:
+    for credential in (
+        f"Bearer pre{_CANONICAL_SESSION}post",
+        f"sk-pre{_RAW_SESSION}post",
+    ):
+        sanitized = sanitize_external_text(
+            credential,
+            cap=256,
+            session_literals=_SESSION_LITERALS,
+            redact_opaque_runs=False,
+        )
+
+        assert sanitized == "[redacted]"
+        assert "pre" not in sanitized
+        assert "post" not in sanitized
+
+
+def test_sanitize_external_text_literal_inside_opaque_run_redacts_whole_run() -> None:
+    source = f"{'x' * 20}{_CANONICAL_SESSION}{'y' * 20}"
+
+    sanitized = sanitize_external_text(
+        source,
+        cap=256,
+        session_literals=_SESSION_LITERALS,
+        redact_opaque_runs=True,
+    )
+
+    assert sanitized == "[redacted]"
+    assert "x" not in sanitized
+    assert "y" not in sanitized
+
+
 def test_request_shape_fields_counts_client_bytes_and_list_lengths() -> None:
     raw_body = "client-é".encode()
 
