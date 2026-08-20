@@ -41,7 +41,7 @@ class Quota429Mark:
     cooldown_seconds: float
     cooldown_source: str
     record: dict[str, Any]
-    session_literals: tuple[str, str] | None = field(repr=False)
+    session_literals: tuple[str, ...] | None = field(repr=False)
 
 
 def _canonical_json(value: Any) -> str:
@@ -49,12 +49,15 @@ def _canonical_json(value: Any) -> str:
 
 
 def _record_session_literals(
-    context: AccountLegContext, session_literals: tuple[str, ...]
+    context: AccountLegContext | None,
+    session_literals: tuple[str, ...] | None,
 ) -> tuple[str, ...]:
+    context_literals = () if context is None else context.session_literals
+    supplied_literals = () if session_literals is None else session_literals
     return tuple(
         dict.fromkeys(
             literal
-            for literal in (*context.session_literals, *session_literals)
+            for literal in (*context_literals, *supplied_literals)
             if isinstance(literal, str) and literal
         )
     )
@@ -197,23 +200,37 @@ def build_quota_429_record(
     model: str | None,
     cooldown_seconds: float,
     cooldown_source: str,
-    context: AccountLegContext,
+    context: AccountLegContext | None,
     parsed_body: Any,
     raw_body: bytes,
     response_headers,
     response_body: bytes | None,
-    session_literals: tuple[str, ...] = (),
+    session_literals: tuple[str, ...] | None = (),
+    pin_created: bool | None = None,
 ) -> dict[str, Any]:
     """Build the base v1 Claude quota incident record for later enrichment."""
     record_literals = _record_session_literals(context, session_literals)
     upstream = parse_upstream_error_body(
         response_body, session_literals=record_literals
     )
-    upstream["headers"] = capture_upstream_headers(
-        response_headers, session_literals=record_literals
-    )
+    if session_literals is None:
+        # Session extraction failed, so externally controlled identifiers cannot
+        # be proven free of the raw session spelling. Keep only body size/hash.
+        upstream.update(
+            error_type=None,
+            message=None,
+            request_id=None,
+            headers={},
+        )
+    else:
+        upstream["headers"] = capture_upstream_headers(
+            response_headers, session_literals=record_literals
+        )
 
-    return {
+    effective_pin_created = (
+        context.pin_created if context is not None else pin_created
+    )
+    record = {
         "v": 1,
         "event": "claude_quota_429",
         "occurred_at_utc": occurred_at_utc,
@@ -226,7 +243,7 @@ def build_quota_429_record(
         ),
         "model": (
             None
-            if model is None
+            if model is None or session_literals is None
             else sanitize_external_text(
                 model,
                 cap=_IDENTIFIER_CAP,
@@ -242,11 +259,67 @@ def build_quota_429_record(
         "observed_scope": None,
         "scope_rationale": None,
         "upstream": upstream,
-        "attempt": context.attempt_fields(),
+        "attempt": None if context is None else context.attempt_fields(),
         "session_fingerprint": None,
         "request_shape": request_shape_fields(
-            parsed_body, raw_body, context.pin_created
+            parsed_body, raw_body, effective_pin_created
         ),
+    }
+    unavailable = []
+    if context is None:
+        unavailable.append("attempt")
+    if session_literals is None:
+        unavailable.append("session")
+    if unavailable:
+        record["record_degraded"] = True
+        record["degradation_reason"] = (
+            "_and_".join(unavailable) + "_context_unavailable"
+        )
+    return record
+
+
+def build_degraded_quota_429_record(
+    *,
+    occurred_at_utc: str,
+    mode: str,
+    cooldown_seconds: float,
+    cooldown_source: str,
+    parsed_body: Any,
+    raw_body: bytes,
+    response_body: bytes | None,
+    pin_created: bool | None,
+    degradation_reason: str,
+) -> dict[str, Any]:
+    """Build a minimal record from content-free values when evidence setup fails."""
+    upstream = parse_upstream_error_body(response_body)
+    upstream.update(
+        error_type=None,
+        message=None,
+        request_id=None,
+        headers={},
+    )
+    return {
+        "v": 1,
+        "event": "claude_quota_429",
+        "occurred_at_utc": occurred_at_utc,
+        "mode": mode,
+        "account_id": None,
+        "model": None,
+        "cooldown_seconds": cooldown_seconds,
+        "cooldown_source": cooldown_source,
+        "installed_scope": None,
+        "quota_family": None,
+        "family_gate": None,
+        "observed_scope": None,
+        "scope_rationale": None,
+        "upstream": upstream,
+        "attempt": None,
+        "session_fingerprint": None,
+        "request_shape": request_shape_fields(
+            parsed_body, raw_body, pin_created
+        ),
+        "record_degraded": True,
+        "degradation_reason": degradation_reason,
     }
 
 

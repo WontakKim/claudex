@@ -4540,6 +4540,140 @@ def test_429_evidence_failure_still_installs_cooldown_and_records_degraded_incid
         assert record["session_fingerprint"] is None
 
 
+def test_429_incident_missing_context_records_null_attempt(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    first, _second = _register_pool_accounts(monkeypatch)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.headers["authorization"] == "Bearer pool-access-1":
+            return _quota_429()
+        return httpx.Response(200, json={"id": "msg_1"})
+
+    monkeypatch.setattr(
+        relay_registered, "try_begin_account_leg", lambda _tracker, _pin: None
+    )
+    with _create_test_client(
+        monkeypatch, tmp_path, config=_pool_config(first)
+    ) as client:
+        client.app.state.http_client = httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        )
+
+        response = client.post("/v1/messages", json=_account_leg_body())
+
+        assert response.status_code == 200
+        [line] = (
+            paths.claude_account_pool_dir() / "claude-429-incidents.jsonl"
+        ).read_text().splitlines()
+        record = json.loads(line)
+        assert record["attempt"] is None
+        assert record["request_shape"]["pin_created"] is None
+        assert record["record_degraded"] is True
+        assert record["degradation_reason"] == "attempt_context_unavailable"
+
+
+def test_429_incident_session_extraction_failure_uses_conservative_record(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    first, _second = _register_pool_accounts(monkeypatch)
+
+    def fail_session_extraction(_body):
+        raise ValueError("session extraction unavailable")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.headers["authorization"] == "Bearer pool-access-1":
+            return httpx.Response(
+                429,
+                json={
+                    "request_id": _LEG_RAW_SESSION_UUID,
+                    "error": {"message": _LEG_CANONICAL_SESSION_UUID},
+                },
+                headers={"request-id": _LEG_RAW_SESSION_UUID},
+            )
+        return httpx.Response(200, json={"id": "msg_1"})
+
+    monkeypatch.setattr(
+        relay_registered, "extract_session_uuid", fail_session_extraction
+    )
+    with _create_test_client(
+        monkeypatch, tmp_path, config=_pool_config(first)
+    ) as client:
+        client.app.state.http_client = httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        )
+
+        response = client.post("/v1/messages", json=_account_leg_body())
+
+        assert response.status_code == 200
+        [line] = (
+            paths.claude_account_pool_dir() / "claude-429-incidents.jsonl"
+        ).read_text().splitlines()
+        record = json.loads(line)
+        assert record["model"] is None
+        assert record["attempt"] is None
+        assert record["upstream"]["request_id"] is None
+        assert record["upstream"]["message"] is None
+        assert record["upstream"]["headers"] == {}
+        assert record["degradation_reason"] == (
+            "attempt_and_session_context_unavailable"
+        )
+        assert _LEG_RAW_SESSION_UUID not in line
+        assert _LEG_CANONICAL_SESSION_UUID not in line
+
+
+def test_balanced_429_callback_failure_replays_and_attempts_degraded_incident(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    _balanced_env(monkeypatch, tmp_path)
+    account_id, _access_token = _register_balanced_accounts(1)[0]
+
+    async def fail_callback(*_args, **_kwargs) -> str:
+        raise RuntimeError("simulated callback entry failure")
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            429,
+            content=b'{"error":{"type":"rate_limit_error"}}',
+            headers={"request-id": "upstream-request-id"},
+        )
+
+    monkeypatch.setattr(
+        relay_balanced, "_install_balanced_quota_cooldown", fail_callback
+    )
+    caplog.set_level(logging.INFO, logger="claudex.server")
+    with _create_test_client(
+        monkeypatch,
+        tmp_path,
+        config=GatewayConfig(),
+        base_url="http://127.0.0.1:8787",
+    ) as client:
+        runtime = _enable_balanced(client, handler)
+
+        response = client.post(
+            "/v1/messages", json=_balanced_body(_new_session_id())
+        )
+
+        assert response.status_code == 429
+        assert response.content == b'{"error":{"type":"rate_limit_error"}}'
+        assert response.headers["request-id"] == "upstream-request-id"
+        assert client.app.state.claude_account_cooldowns.is_cooling(account_id)
+        assert runtime._store.get_cooldown(account_id, "account", "") is None
+        [line] = (
+            paths.claude_account_pool_dir() / "claude-429-incidents.jsonl"
+        ).read_text().splitlines()
+        record = json.loads(line)
+        assert record["record_degraded"] is True
+        assert record["degradation_reason"] == "evidence_enrichment_failed"
+        envelopes = _account_leg_envelopes(caplog)
+        assert len(envelopes) == 1
+        assert envelopes[0]["result"] == "rate_limited"
+
+
 def test_one_mark_one_incident_record(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

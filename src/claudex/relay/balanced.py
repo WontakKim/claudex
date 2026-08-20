@@ -75,18 +75,33 @@ async def _install_balanced_quota_cooldown(
     mark: Quota429Mark,
 ) -> str:
     """Install one balanced cooldown and return its canonical incident record."""
-    monotonic_now = time.monotonic()
-    wall_now = time.time()
-    requested_family = quota_family(model)
     gate = None
     family_gate = None
+    requested_family = "default"
+    monotonic_now: float | None = None
+    wall_now: float | None = None
+    canonical_record = (
+        '{"degradation_reason":"evidence_enrichment_failed",'
+        '"record_degraded":true}'
+    )
     try:
+        canonical_record = finalize_quota_429_record(mark.record)
+    except Exception:
+        pass
+    evidence = ""
+
+    try:
+        monotonic_now = time.monotonic()
+        wall_now = time.time()
+        requested_family = quota_family(model)
         gate = router.classify_cooldown_scope(
             account_id=account_id,
             model=model,
             upstream_status_code=429,
             now=monotonic_now,
         )
+        if gate.scope == "family" and gate.family_deadline is None:
+            raise ValueError("family cooldown classification omitted its deadline")
         family_deadline_utc = (
             None
             if gate.family_deadline is None
@@ -103,8 +118,11 @@ async def _install_balanced_quota_cooldown(
             "family_deadline_utc": family_deadline_utc,
         }
         session_fingerprint = (
-            observability_session_fingerprint(epoch_seed, mark.session_literals[1])
+            observability_session_fingerprint(
+                epoch_seed, mark.session_literals[1]
+            )
             if mark.session_literals is not None
+            and len(mark.session_literals) == 2
             else None
         )
         enrich_record_with_family_gate(
@@ -119,28 +137,54 @@ async def _install_balanced_quota_cooldown(
         evidence = canonical_record
     except Exception:
         logger.warning("failed to enrich Claude 429 cooldown evidence")
-        if gate is None:
-            installed_scope = "account"
-            family_gate = None
-        else:
-            installed_scope = gate.scope
-            if family_gate is None:
-                family_gate = {
-                    "scope": gate.scope,
-                    "reason": gate.reason,
-                    "family_deadline_utc": None,
-                }
-        enrich_record_degraded(
-            mark.record,
-            installed_scope=installed_scope,
-            quota_family=requested_family,
-            family_gate=family_gate,
-        )
-        canonical_record = finalize_quota_429_record(mark.record)
+        try:
+            if gate is None:
+                installed_scope = "account"
+                family_gate = None
+            else:
+                installed_scope = (
+                    "family"
+                    if gate.scope == "family" and gate.family_deadline is not None
+                    else "account"
+                )
+                if family_gate is None:
+                    family_gate = {
+                        "scope": gate.scope,
+                        "reason": gate.reason,
+                        "family_deadline_utc": None,
+                    }
+            enrich_record_degraded(
+                mark.record,
+                installed_scope=installed_scope,
+                quota_family=requested_family,
+                family_gate=family_gate,
+            )
+            canonical_record = finalize_quota_429_record(mark.record)
+        except Exception:
+            canonical_record = (
+                '{"degradation_reason":"evidence_enrichment_failed",'
+                '"record_degraded":true}'
+            )
         evidence = ""
 
-    if gate is not None and gate.scope == "family":
-        assert gate.family_deadline is not None
+    if monotonic_now is None:
+        try:
+            monotonic_now = time.monotonic()
+        except Exception:
+            router.persistence_degraded = True
+            return canonical_record
+    if wall_now is None:
+        try:
+            wall_now = time.time()
+        except Exception:
+            router.persistence_degraded = True
+            return canonical_record
+
+    if (
+        gate is not None
+        and gate.scope == "family"
+        and gate.family_deadline is not None
+    ):
         installed_scope = "family"
         deadline = gate.family_deadline
         reason = gate.reason
@@ -149,7 +193,9 @@ async def _install_balanced_quota_cooldown(
         installed_scope = "account"
         deadline = monotonic_now + mark.cooldown_seconds
         reason = (
-            gate.reason if gate is not None else "evidence_classification_unavailable"
+            gate.reason
+            if gate is not None
+            else "evidence_classification_unavailable"
         )
         model_family = ""
 
@@ -157,6 +203,11 @@ async def _install_balanced_quota_cooldown(
         fingerprint = server_support._account_profile_fingerprint(
             app_state, account_id
         )
+    except Exception:
+        router.persistence_degraded = True
+        fingerprint = None
+
+    try:
         pending_write = router.install_cooldown(
             account_id=account_id,
             account_incarnation_id=account_incarnation_id,
@@ -448,13 +499,15 @@ async def _serve_balanced_stateless_message(
     persisted, and never inserted into the pin map.
     """
     try:
-        session_uuid = extract_session_uuid(
+        extracted_session = extract_session_uuid(
             parsed_body if isinstance(parsed_body, dict) else {}
         )
+        session_literals: tuple[str, ...] | None = extracted_session or ()
         leg_tracker: AccountLegTracker | None = AccountLegTracker(
-            "balanced_stateless", session_literals=session_uuid or ()
+            "balanced_stateless", session_literals=session_literals
         )
     except Exception:
+        session_literals = None
         leg_tracker = None
     router = runtime.router
     assert router is not None
@@ -521,6 +574,8 @@ async def _serve_balanced_stateless_message(
                 record,
                 attempt_context=attempt_context,
                 rate_limit_failover=True,
+                session_literals=session_literals,
+                pin_created=None,
                 on_quota_429=_on_quota_429,
                 on_response=_on_response,
             )
@@ -551,13 +606,15 @@ async def _serve_balanced_pinned_message(
     Once a 2xx response is relayed, no cross-account retry occurs.
     """
     try:
-        session_uuid = extract_session_uuid(
+        extracted_session = extract_session_uuid(
             parsed_body if isinstance(parsed_body, dict) else {}
         )
+        session_literals: tuple[str, ...] | None = extracted_session or ()
         leg_tracker: AccountLegTracker | None = AccountLegTracker(
-            "balanced_pinned", session_literals=session_uuid or ()
+            "balanced_pinned", session_literals=session_literals
         )
     except Exception:
+        session_literals = None
         leg_tracker = None
     router = runtime.router
     assert router is not None
@@ -709,6 +766,8 @@ async def _serve_balanced_pinned_message(
                         target_record,
                         attempt_context=attempt_context,
                         rate_limit_failover=True,
+                        session_literals=session_literals,
+                        pin_created=False,
                         commit_hook=_commit_hook,
                         on_relay_complete=_on_relay_complete,
                         on_quota_429=_on_quota_429,
@@ -733,6 +792,8 @@ async def _serve_balanced_pinned_message(
                         target_record,
                         attempt_context=attempt_context,
                         rate_limit_failover=True,
+                        session_literals=session_literals,
+                        pin_created=normal_pin_created,
                         on_quota_429=_on_quota_429,
                         on_response=_on_response,
                     )
@@ -794,13 +855,15 @@ async def _serve_balanced_count_tokens(
     (`rate_limit_failover=False`).
     """
     try:
-        session_uuid = extract_session_uuid(
+        extracted_session = extract_session_uuid(
             parsed_body if isinstance(parsed_body, dict) else {}
         )
+        session_literals: tuple[str, ...] | None = extracted_session or ()
         leg_tracker: AccountLegTracker | None = AccountLegTracker(
-            "balanced_count_tokens", session_literals=session_uuid or ()
+            "balanced_count_tokens", session_literals=session_literals
         )
     except Exception:
+        session_literals = None
         leg_tracker = None
     router = runtime.router
     assert router is not None
@@ -819,6 +882,8 @@ async def _serve_balanced_count_tokens(
                     record,
                     attempt_context=attempt_context,
                     rate_limit_failover=False,
+                    session_literals=session_literals,
+                    pin_created=None,
                 )
                 return outcome.response if isinstance(outcome, _FailedAttempt) else outcome
 
@@ -848,5 +913,7 @@ async def _serve_balanced_count_tokens(
         record,
         attempt_context=attempt_context,
         rate_limit_failover=False,
+        session_literals=session_literals,
+        pin_created=None,
     )
     return outcome.response if isinstance(outcome, _FailedAttempt) else outcome

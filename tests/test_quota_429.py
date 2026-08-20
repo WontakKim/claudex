@@ -235,6 +235,60 @@ def test_build_record_sanitizes_account_id_and_model() -> None:
         assert forbidden not in canonical
 
 
+def test_build_record_marks_missing_attempt_context_without_fabrication() -> None:
+    record = build_quota_429_record(
+        occurred_at_utc=_OCCURRED_AT_UTC,
+        mode="balanced",
+        account_id="account-1",
+        model="claude-fable-5",
+        cooldown_seconds=60.0,
+        cooldown_source="default_60",
+        context=None,
+        parsed_body={"messages": [{}], "tools": []},
+        raw_body=b"client-body",
+        response_headers={"request-id": "request-1"},
+        response_body=b'{"request_id":"request-2"}',
+        session_literals=_SESSION_LITERALS,
+        pin_created=True,
+    )
+
+    assert record["attempt"] is None
+    assert record["request_shape"]["pin_created"] is True
+    assert record["record_degraded"] is True
+    assert record["degradation_reason"] == "attempt_context_unavailable"
+
+
+def test_build_record_omits_external_text_when_session_context_failed() -> None:
+    record = build_quota_429_record(
+        occurred_at_utc=_OCCURRED_AT_UTC,
+        mode="fallback",
+        account_id="account-1",
+        model=f"claude-{_RAW_SESSION}",
+        cooldown_seconds=60.0,
+        cooldown_source="default_60",
+        context=None,
+        parsed_body={"messages": [{}], "tools": []},
+        raw_body=b"client-body",
+        response_headers={"request-id": _RAW_SESSION},
+        response_body=(
+            f'{{"request_id":"{_RAW_SESSION}","error":{{"message":"{_RAW_SESSION}"}}}}'
+        ).encode(),
+        session_literals=None,
+    )
+
+    assert record["model"] is None
+    assert record["attempt"] is None
+    assert record["upstream"]["request_id"] is None
+    assert record["upstream"]["message"] is None
+    assert record["upstream"]["headers"] == {}
+    assert record["upstream"]["body_bytes"] is not None
+    assert record["upstream"]["body_sha256"] is not None
+    assert record["degradation_reason"] == (
+        "attempt_and_session_context_unavailable"
+    )
+    assert _RAW_SESSION not in finalize_quota_429_record(record)
+
+
 def test_finalize_record_produces_canonical_stable_json() -> None:
     record = {"z": "é", "a": {"second": 2, "first": 1}}
 

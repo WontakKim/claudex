@@ -38,6 +38,7 @@ from claudex.claude.auth import (
 )
 from claudex.claude.quota_429 import (
     Quota429Mark,
+    build_degraded_quota_429_record,
     build_quota_429_record,
     enrich_record_fallback,
     finalize_quota_429_record,
@@ -163,6 +164,8 @@ async def _attempt_with_account(
     *,
     attempt_context: AccountLegContext | None,
     rate_limit_failover: bool,
+    session_literals: tuple[str, ...] | None = (),
+    pin_created: bool | None = None,
     commit_hook: Callable[[httpx.Response], Awaitable[None]] | None = None,
     on_relay_complete: Callable[[], None] | None = None,
     on_quota_429: Callable[[Quota429Mark], Awaitable[str]] | None = None,
@@ -338,54 +341,83 @@ async def _attempt_with_account(
                 cooldown_decision.seconds,
             )
 
-            session_literals = extract_session_uuid(
-                parsed_body if isinstance(parsed_body, dict) else {}
+            mode = (
+                "balanced"
+                if on_quota_429 is not None
+                else "fallback"
             )
-            context = attempt_context
-            if context is None:
-                context_mode = (
-                    "balanced_stateless" if on_quota_429 is not None else "fallback"
-                )
-                context = AccountLegContext(
-                    mode=context_mode,
-                    ordinal=1,
-                    pin_created=None,
-                    first_started_monotonic=0.0,
-                    started_monotonic=0.0,
-                    previous_started_monotonic=None,
-                    session_literals=session_literals or (),
-                )
-            mode = {
-                "balanced_stateless": "balanced",
-                "balanced_pinned": "balanced",
-                "fallback": "fallback",
-            }.get(context.mode, "balanced" if on_quota_429 is not None else "fallback")
-            quota_record = build_quota_429_record(
-                occurred_at_utc=datetime.now(timezone.utc)
+            if attempt_context is not None:
+                mode = {
+                    "balanced_stateless": "balanced",
+                    "balanced_pinned": "balanced",
+                    "fallback": "fallback",
+                }.get(attempt_context.mode, mode)
+            occurred_at_utc = (
+                datetime.now(timezone.utc)
                 .isoformat(timespec="milliseconds")
-                .replace("+00:00", "Z"),
-                mode=mode,
-                account_id=account_id,
-                model=model,
-                cooldown_seconds=cooldown_decision.seconds,
-                cooldown_source=cooldown_decision.source,
-                context=context,
-                parsed_body=parsed_body,
-                raw_body=raw_body,
-                response_headers=response_headers,
-                response_body=response_body,
-                session_literals=session_literals or (),
+                .replace("+00:00", "Z")
             )
+
+            def _finalize_incident(record: dict[str, Any]) -> str:
+                try:
+                    return finalize_quota_429_record(record)
+                except Exception:
+                    return (
+                        '{"degradation_reason":"record_serialization_failed",'
+                        '"record_degraded":true}'
+                    )
+
+            try:
+                quota_record = build_quota_429_record(
+                    occurred_at_utc=occurred_at_utc,
+                    mode=mode,
+                    account_id=account_id,
+                    model=model,
+                    cooldown_seconds=cooldown_decision.seconds,
+                    cooldown_source=cooldown_decision.source,
+                    context=attempt_context,
+                    parsed_body=parsed_body,
+                    raw_body=raw_body,
+                    response_headers=response_headers,
+                    response_body=response_body,
+                    session_literals=session_literals,
+                    pin_created=pin_created,
+                )
+            except Exception:
+                logger.warning("failed to build Claude 429 incident evidence")
+                try:
+                    quota_record = build_degraded_quota_429_record(
+                        occurred_at_utc=occurred_at_utc,
+                        mode=mode,
+                        cooldown_seconds=cooldown_decision.seconds,
+                        cooldown_source=cooldown_decision.source,
+                        parsed_body=parsed_body,
+                        raw_body=raw_body,
+                        response_body=response_body,
+                        pin_created=pin_created,
+                        degradation_reason="record_construction_failed",
+                    )
+                except Exception:
+                    quota_record = {
+                        "v": 1,
+                        "event": "claude_quota_429",
+                        "mode": mode,
+                        "cooldown_seconds": cooldown_decision.seconds,
+                        "cooldown_source": cooldown_decision.source,
+                        "record_degraded": True,
+                        "degradation_reason": "record_construction_failed",
+                    }
             mark = Quota429Mark(
                 cooldown_seconds=cooldown_decision.seconds,
                 cooldown_source=cooldown_decision.source,
                 record=quota_record,
                 session_literals=session_literals,
             )
-            if on_quota_429 is not None:
-                canonical_record = await on_quota_429(mark)
-            else:
-                try:
+            canonical_record = _finalize_incident(quota_record)
+            try:
+                if on_quota_429 is not None:
+                    canonical_record = await on_quota_429(mark)
+                else:
                     fingerprint_seed = load_or_create_fingerprint_seed(
                         paths.claude_account_pool_dir()
                     )
@@ -395,35 +427,63 @@ async def _attempt_with_account(
                         )
                         if fingerprint_seed is not None
                         and session_literals is not None
+                        and len(session_literals) == 2
                         else None
                     )
                     enrich_record_fallback(
                         quota_record, session_fingerprint=session_fingerprint
                     )
-                    canonical_record = finalize_quota_429_record(quota_record)
-                except Exception:
-                    logger.warning("failed to enrich Claude 429 incident evidence")
-                    enrich_record_fallback(
-                        quota_record, session_fingerprint=None
-                    )
+                    canonical_record = _finalize_incident(quota_record)
+            except Exception:
+                logger.warning("failed to enrich Claude 429 incident evidence")
+                try:
+                    if on_quota_429 is None:
+                        enrich_record_fallback(
+                            quota_record, session_fingerprint=None
+                        )
+                    quota_record["session_fingerprint"] = None
                     quota_record["record_degraded"] = True
                     quota_record["degradation_reason"] = (
                         "evidence_enrichment_failed"
                     )
-                    canonical_record = finalize_quota_429_record(quota_record)
-
-            incident_writer = getattr(
-                request.app.state, "claude_quota_429_incident_writer", None
-            )
-            if incident_writer is None:
-                logger.warning(
-                    "Claude 429 incident writer is unavailable; skipping incident persistence"
-                )
-            else:
-                try:
-                    await incident_writer.append_record(canonical_record)
+                    canonical_record = _finalize_incident(quota_record)
                 except Exception:
-                    logger.warning("failed to append Claude 429 incident record")
+                    try:
+                        degraded_record = build_degraded_quota_429_record(
+                            occurred_at_utc=occurred_at_utc,
+                            mode=mode,
+                            cooldown_seconds=cooldown_decision.seconds,
+                            cooldown_source=cooldown_decision.source,
+                            parsed_body=parsed_body,
+                            raw_body=raw_body,
+                            response_body=response_body,
+                            pin_created=pin_created,
+                            degradation_reason="evidence_enrichment_failed",
+                        )
+                    except Exception:
+                        degraded_record = {
+                            "v": 1,
+                            "event": "claude_quota_429",
+                            "mode": mode,
+                            "cooldown_seconds": cooldown_decision.seconds,
+                            "cooldown_source": cooldown_decision.source,
+                            "record_degraded": True,
+                            "degradation_reason": "evidence_enrichment_failed",
+                        }
+                    canonical_record = _finalize_incident(degraded_record)
+
+            try:
+                incident_writer = getattr(
+                    request.app.state, "claude_quota_429_incident_writer", None
+                )
+                if incident_writer is None:
+                    logger.warning(
+                        "Claude 429 incident writer is unavailable; skipping incident persistence"
+                    )
+                else:
+                    await incident_writer.append_record(canonical_record)
+            except Exception:
+                logger.warning("failed to append Claude 429 incident record")
             return _FailedAttempt(
                 _replay_buffered_response(429, replay_headers, response_body),
                 rate_limited=True,
@@ -477,13 +537,15 @@ async def _passthrough_with_claude_account(
     effect without a restart.
     """
     try:
-        session_uuid = extract_session_uuid(
+        extracted_session = extract_session_uuid(
             parsed_body if isinstance(parsed_body, dict) else {}
         )
+        session_literals: tuple[str, ...] | None = extracted_session or ()
         leg_tracker: AccountLegTracker | None = AccountLegTracker(
-            "disabled", session_literals=session_uuid or ()
+            "disabled", session_literals=session_literals
         )
     except Exception:
+        session_literals = None
         leg_tracker = None
     try:
         records = load_registry()
@@ -509,6 +571,8 @@ async def _passthrough_with_claude_account(
         record,
         attempt_context=attempt_context,
         rate_limit_failover=False,
+        session_literals=session_literals,
+        pin_created=None,
     )
     if isinstance(outcome, _FailedAttempt):
         return outcome.response
@@ -531,13 +595,15 @@ async def _passthrough_with_claude_pool(
     closed its upstream response first.
     """
     try:
-        session_uuid = extract_session_uuid(
+        extracted_session = extract_session_uuid(
             parsed_body if isinstance(parsed_body, dict) else {}
         )
+        session_literals = extracted_session or ()
         leg_tracker = AccountLegTracker(
-            "fallback", session_literals=session_uuid or ()
+            "fallback", session_literals=session_literals
         )
     except Exception:
+        session_literals = None
         leg_tracker = None
     try:
         records = load_registry()
@@ -582,6 +648,8 @@ async def _passthrough_with_claude_pool(
             record,
             attempt_context=attempt_context,
             rate_limit_failover=True,
+            session_literals=session_literals,
+            pin_created=None,
         )
         if not isinstance(outcome, _FailedAttempt):
             if position:
