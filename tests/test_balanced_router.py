@@ -559,6 +559,7 @@ class _FakeStore:
         self.cooldown_calls: list[dict[str, Any]] = []
         self.capability_calls: list[dict[str, Any]] = []
         self.usage_observation_calls: list[dict[str, Any]] = []
+        self.pin_touch_calls: list[tuple[bytes, float, float]] = []
         self.deleted_incarnations: list[str] = []
         self.pending_writes: list[_FakePendingWrite] = []
 
@@ -568,7 +569,12 @@ class _FakeStore:
         self.pending_writes.append(pending_write)
         return pending_write
 
-    def touch_pin_last_seen(self, session_key_digest: bytes, last_seen_utc: float) -> _FakePendingWrite:
+    def touch_pin_last_seen(
+        self, session_key_digest: bytes, last_seen_utc: float, expires_at_utc: float
+    ) -> _FakePendingWrite:
+        self.pin_touch_calls.append(
+            (session_key_digest, last_seen_utc, expires_at_utc)
+        )
         pending_write = _FakePendingWrite()
         self.pending_writes.append(pending_write)
         return pending_write
@@ -1308,23 +1314,55 @@ def test_a_cancelled_waiter_does_not_cancel_the_shielded_barrier() -> None:
     asyncio.run(scenario())
 
 
-def test_refresh_pin_durable_last_seen_delegates_to_the_store() -> None:
+def test_refresh_pin_durable_last_seen_passes_computed_expiry() -> None:
     async def scenario() -> None:
         store = _FakeStore()
-        router = _make_router(store=store)
+        wall_clock = _FakeClock(2_000_000.0)
+        router = _make_router(
+            store=store,
+            wall_clock=wall_clock,
+            pin_ttl_content_hash_seconds=90.0,
+        )
         candidates = [_candidate("acct-a")]
         session_key = SessionKey(digest=b"\x07" * 32, kind="content_hash")
-        router.place_session(session_key=session_key, model="claude-sonnet-5", candidates=candidates, seed=b"seed")
+        router.place_session(
+            session_key=session_key,
+            model="claude-sonnet-5",
+            candidates=candidates,
+            seed=b"seed",
+        )
 
-        refresh_task = asyncio.create_task(router.refresh_pin_durable_last_seen(session_key.digest))
+        plan = router.plan_pin_durable_last_seen(session_key.digest)
+        assert plan == (2_000_000.0, 2_000_090.0)
+        assert plan is not None
+        last_seen_utc, expires_at_utc = plan
+        refresh_task = asyncio.create_task(
+            router.refresh_pin_durable_last_seen(
+                session_key.digest,
+                last_seen_utc=last_seen_utc,
+                expires_at_utc=expires_at_utc,
+            )
+        )
         with pytest.raises(asyncio.TimeoutError):
             await asyncio.wait_for(asyncio.shield(refresh_task), timeout=0.05)
-        assert len(store.pending_writes) == 1
 
+        assert store.pin_touch_calls == [
+            (session_key.digest, 2_000_000.0, 2_000_090.0)
+        ]
+        assert len(store.pending_writes) == 1
         store.pending_writes[0].resolve()
         await asyncio.wait_for(refresh_task, timeout=1.0)
 
     asyncio.run(scenario())
+
+
+def test_plan_pin_durable_last_seen_none_when_pin_missing() -> None:
+    def unexpected_wall_clock_read() -> float:
+        raise AssertionError("missing pins must not read the wall clock")
+
+    router = _make_router(wall_clock=unexpected_wall_clock_read)
+
+    assert router.plan_pin_durable_last_seen(b"missing-pin") is None
 
 
 # ==========================================================================

@@ -652,12 +652,32 @@ async def _serve_balanced_pinned_message(
     await router.await_pin_durability(digest)
 
     pin = router.get_pin(digest)
-    router.touch_pin(
+    pin_was_touched = router.touch_pin(
         digest,
         is_message_request=True,
         key_is_live=pin is not None,
         account_still_registered=pin is not None and pin.account_id in records_by_id,
     )
+    if pin_was_touched:
+        durable_refresh_plan = router.plan_pin_durable_last_seen(digest)
+        if durable_refresh_plan is not None:
+            last_seen_utc, expires_at_utc = durable_refresh_plan
+
+            def _consume_durable_refresh_result(completed_task: asyncio.Task[None]) -> None:
+                if completed_task.cancelled():
+                    return
+                exception = completed_task.exception()
+                if exception is not None:
+                    logger.warning("balanced durable pin refresh failed unexpectedly: %r", exception)
+
+            durable_refresh_task = asyncio.create_task(
+                router.refresh_pin_durable_last_seen(
+                    digest,
+                    last_seen_utc=last_seen_utc,
+                    expires_at_utc=expires_at_utc,
+                )
+            )
+            durable_refresh_task.add_done_callback(_consume_durable_refresh_result)
 
     attempted: set[str] = set()
     chain_429: Response | None = None

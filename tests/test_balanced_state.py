@@ -705,13 +705,61 @@ def test_same_row_coalescing_preserves_the_earliest_queue_position(store_factory
     assert row is not None and row.reason == "second"
 
 
+def test_touch_pin_last_seen_updates_last_seen_and_expiry(store_factory) -> None:
+    store = store_factory()
+    digest = b"digest-touch-timestamps"
+    store.upsert_pin(
+        **_pin_kwargs(
+            session_key_digest=digest,
+            last_seen_utc=1_000_000.0,
+            expires_at_utc=1_000_060.0,
+            balanced_epoch_id=store.balanced_epoch_id,
+        )
+    ).wait(timeout=5)
+
+    touch = store.touch_pin_last_seen(digest, 1_000_030.0, 1_000_090.0)
+    assert touch is not None
+    touch.wait(timeout=5)
+
+    pin = store.get_pin(digest)
+    assert pin is not None
+    assert pin.last_seen_utc == 1_000_030.0
+    assert pin.expires_at_utc == 1_000_090.0
+
+
+def test_restore_keeps_pin_with_slid_expiry_after_original_expiry(store_factory) -> None:
+    store = store_factory()
+    digest = b"digest-slid-expiry"
+    original_expiry = 1_000_060.0
+    store.upsert_pin(
+        **_pin_kwargs(
+            session_key_digest=digest,
+            last_seen_utc=1_000_000.0,
+            expires_at_utc=original_expiry,
+            balanced_epoch_id=store.balanced_epoch_id,
+        )
+    ).wait(timeout=5)
+
+    touch = store.touch_pin_last_seen(digest, 1_000_050.0, 1_000_110.0)
+    assert touch is not None
+    touch.wait(timeout=5)
+    result = store.restore(RestoreValidationContext(now_utc=original_expiry + 10.0))
+
+    assert digest in result.pins
+    assert result.pins[digest].last_seen_utc == 1_000_050.0
+    assert result.pins[digest].expires_at_utc == 1_000_110.0
+    assert result.skip_counts.get("pins.expired", 0) == 0
+
+
 def test_pin_last_seen_touch_does_not_clobber_a_pending_full_upsert(store_factory) -> None:
     store = store_factory(debounce_seconds=0.2)
     digest = b"digest-touch-safety"
     pending_upsert = store.upsert_pin(
         **_pin_kwargs(session_key_digest=digest, account_id="acct-full", balanced_epoch_id=store.balanced_epoch_id)
     )
-    touch = store.touch_pin_last_seen(digest, time.time() + 1)
+    last_seen_utc = time.time() + 1
+    expires_at_utc = last_seen_utc + 3600
+    touch = store.touch_pin_last_seen(digest, last_seen_utc, expires_at_utc)
     assert touch is not None
     pending_upsert.wait(timeout=5)
     touch.wait(timeout=5)
@@ -719,6 +767,8 @@ def test_pin_last_seen_touch_does_not_clobber_a_pending_full_upsert(store_factor
     pin = store.get_pin(digest)
     assert pin is not None
     assert pin.account_id == "acct-full"  # the full upsert's other columns survived
+    assert pin.last_seen_utc == last_seen_utc
+    assert pin.expires_at_utc == expires_at_utc
 
 
 # --------------------------------------------------------------------------
@@ -738,34 +788,64 @@ def test_default_debounce_flushes_within_roughly_one_second(tmp_path: Path) -> N
         store.close()
 
 
-def test_pin_last_seen_writes_are_throttled_to_once_per_60_seconds(tmp_path: Path) -> None:
+def test_touch_pin_last_seen_throttled_per_pin_with_expiry(tmp_path: Path) -> None:
     fake_time = {"t": 1_000_000.0}
 
     def clock() -> float:
         return fake_time["t"]
 
-    store = ClaudePoolRuntimeStateStore.open_(tmp_path / "runtime.sqlite3", clock=clock, debounce_seconds=0.0)
+    store = ClaudePoolRuntimeStateStore.open_(
+        tmp_path / "runtime.sqlite3", clock=clock, debounce_seconds=0.0
+    )
     try:
-        digest = b"digest-throttle"
-        store.upsert_pin(**_pin_kwargs(session_key_digest=digest, last_seen_utc=fake_time["t"], balanced_epoch_id=store.balanced_epoch_id)).wait(
-            timeout=5
-        )
+        first_digest = b"digest-throttle-first"
+        second_digest = b"digest-throttle-second"
+        for digest in (first_digest, second_digest):
+            store.upsert_pin(
+                **_pin_kwargs(
+                    session_key_digest=digest,
+                    last_seen_utc=fake_time["t"],
+                    expires_at_utc=fake_time["t"] + 60.0,
+                    balanced_epoch_id=store.balanced_epoch_id,
+                )
+            ).wait(timeout=5)
 
-        first = store.touch_pin_last_seen(digest, fake_time["t"])
+        first_expiry = fake_time["t"] + 120.0
+        first = store.touch_pin_last_seen(first_digest, fake_time["t"], first_expiry)
         assert first is not None
         first.wait(timeout=5)
 
-        fake_time["t"] += 30.0  # inside the 60s window
-        assert store.touch_pin_last_seen(digest, fake_time["t"]) is None
+        fake_time["t"] += 30.0  # inside the first pin's 60s window
+        assert (
+            store.touch_pin_last_seen(
+                first_digest, fake_time["t"], fake_time["t"] + 120.0
+            )
+            is None
+        )
 
-        fake_time["t"] += 31.0  # now past 60s since the first accepted touch
-        second = store.touch_pin_last_seen(digest, fake_time["t"])
-        assert second is not None
-        second.wait(timeout=5)
+        second_expiry = fake_time["t"] + 120.0
+        second_pin_touch = store.touch_pin_last_seen(
+            second_digest, fake_time["t"], second_expiry
+        )
+        assert second_pin_touch is not None
+        second_pin_touch.wait(timeout=5)
 
-        pin = store.get_pin(digest)
-        assert pin is not None
-        assert pin.last_seen_utc == fake_time["t"]
+        fake_time["t"] += 31.0  # past 60s since the first pin's accepted touch
+        final_expiry = fake_time["t"] + 120.0
+        final_touch = store.touch_pin_last_seen(
+            first_digest, fake_time["t"], final_expiry
+        )
+        assert final_touch is not None
+        final_touch.wait(timeout=5)
+
+        first_pin = store.get_pin(first_digest)
+        second_pin = store.get_pin(second_digest)
+        assert first_pin is not None
+        assert second_pin is not None
+        assert first_pin.last_seen_utc == fake_time["t"]
+        assert first_pin.expires_at_utc == final_expiry
+        assert second_pin.last_seen_utc == 1_000_030.0
+        assert second_pin.expires_at_utc == second_expiry
     finally:
         store.close()
 

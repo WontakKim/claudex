@@ -376,8 +376,10 @@ class ClaudePoolRuntimeStateStore:
             fence=(("epoch",), ("incarnation", account_incarnation_id)),
         )
 
-    def touch_pin_last_seen(self, session_key_digest: bytes, last_seen_utc: float) -> PendingWrite | None:
-        """Refresh a pin's `last_seen_utc`, throttled to once per pin per interval.
+    def touch_pin_last_seen(
+        self, session_key_digest: bytes, last_seen_utc: float, expires_at_utc: float
+    ) -> PendingWrite | None:
+        """Refresh a pin's activity timestamps, throttled to once per pin per interval.
 
         Returns None (no submission at all) when called again for the same
         pin within `pin_last_seen_min_interval_seconds` of the last accepted
@@ -392,13 +394,13 @@ class ClaudePoolRuntimeStateStore:
 
         def apply(conn: sqlite3.Connection) -> None:
             conn.execute(
-                "UPDATE pins SET last_seen_utc = ? WHERE session_key_digest = ?",
-                (last_seen_utc, session_key_digest),
+                "UPDATE pins SET last_seen_utc = ?, expires_at_utc = ? WHERE session_key_digest = ?",
+                (last_seen_utc, expires_at_utc, session_key_digest),
             )
 
-        # A distinct scope from ("pins", digest): a full upsert's payload
-        # carries every column, so a coalesced touch must never overwrite it
-        # (or vice versa) with a partial row.
+        # A distinct scope from ("pins", digest): the partial row carries only
+        # last_seen_utc and expires_at_utc, so it must remain disjoint from the
+        # full upsert scope to prevent either payload from clobbering the other.
         return self._submit(
             scope_key=("pins_last_seen", session_key_digest),
             apply=apply,

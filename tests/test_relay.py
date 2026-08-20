@@ -5112,6 +5112,63 @@ def test_balanced_new_session_pins_and_serves_with_a_durable_pin(
         assert store_row.generation == 0
 
 
+def test_pinned_touch_schedules_durable_refresh(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _balanced_env(monkeypatch, tmp_path)
+    _register_balanced_accounts(1)
+    planned_digests: list[bytes] = []
+    scheduled_refreshes: list[tuple[bytes, float, float]] = []
+
+    def plan_pin_durable_last_seen(
+        _router: ClaudeBalancedRouter, digest: bytes
+    ) -> tuple[float, float]:
+        planned_digests.append(digest)
+        return 1_000_000.0, 1_000_120.0
+
+    async def refresh_pin_durable_last_seen(
+        _router: ClaudeBalancedRouter,
+        digest: bytes,
+        *,
+        last_seen_utc: float,
+        expires_at_utc: float,
+    ) -> None:
+        scheduled_refreshes.append((digest, last_seen_utc, expires_at_utc))
+
+    monkeypatch.setattr(
+        ClaudeBalancedRouter,
+        "plan_pin_durable_last_seen",
+        plan_pin_durable_last_seen,
+    )
+    monkeypatch.setattr(
+        ClaudeBalancedRouter,
+        "refresh_pin_durable_last_seen",
+        refresh_pin_durable_last_seen,
+    )
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"id": "msg_1"})
+
+    with _create_test_client(
+        monkeypatch,
+        tmp_path,
+        config=GatewayConfig(),
+        base_url="http://127.0.0.1:8787",
+    ) as client:
+        runtime = _enable_balanced(client, handler)
+        body = _balanced_body(_new_session_id())
+
+        response = client.post("/v1/messages", json=body)
+
+        session_key = derive_session_key(body, runtime.epoch_seed, "fable")
+        assert session_key is not None
+        assert response.status_code == 200
+        assert planned_digests == [session_key.digest]
+        assert scheduled_refreshes == [
+            (session_key.digest, 1_000_000.0, 1_000_120.0)
+        ]
+
+
 def test_balanced_repeat_request_reuses_the_existing_pin_without_a_new_placement(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
