@@ -237,6 +237,34 @@ def test_load_or_create_fingerprint_seed_directory_sync_failure_returns_none(
     assert recovered.hex() == persisted
 
 
+def test_load_or_create_fingerprint_seed_losing_publication_syncs_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    pool_dir = tmp_path / "race-sync"
+    pool_dir.mkdir()
+    winner = b"w" * 32
+
+    def publish_winner_and_lose(_source: Path, destination: Path) -> None:
+        destination.write_text(winner.hex(), encoding="ascii")
+        destination.chmod(0o600)
+        raise FileExistsError
+
+    def fail_directory_sync(_directory: Path) -> None:
+        raise OSError("simulated directory fsync failure")
+
+    monkeypatch.setattr(session_fingerprint.os, "link", publish_winner_and_lose)
+    monkeypatch.setattr(session_fingerprint, "_fsync_directory", fail_directory_sync)
+    with caplog.at_level(
+        logging.WARNING, logger="claudex.claude.session_fingerprint"
+    ):
+        seed = load_or_create_fingerprint_seed(pool_dir)
+
+    assert seed is None
+    assert any("could not be made durable" in message for message in caplog.messages)
+
+
 def test_selection_uuid_session_key_digest_unchanged_after_refactor() -> None:
     seed = b"routing-digest-compatibility-seed"
     raw_spelling = _CANONICAL_UUID.upper()
