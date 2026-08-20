@@ -604,6 +604,13 @@ class _FakeStore:
         return pending_write
 
 
+class _RaisingPinTouchStore:
+    def touch_pin_last_seen(
+        self, session_key_digest: bytes, last_seen_utc: float, expires_at_utc: float
+    ) -> None:
+        raise RuntimeError("synchronous durable pin touch submission failed")
+
+
 # -- freshness ladder (4/10/20/31 min) --------------------------------------
 
 
@@ -1352,6 +1359,21 @@ def test_refresh_pin_durable_last_seen_passes_computed_expiry() -> None:
         assert len(store.pending_writes) == 1
         store.pending_writes[0].resolve()
         await asyncio.wait_for(refresh_task, timeout=1.0)
+
+    asyncio.run(scenario())
+
+
+def test_refresh_pin_durable_last_seen_marks_degraded_when_submission_raises() -> None:
+    async def scenario() -> None:
+        router = _make_router(store=_RaisingPinTouchStore())
+
+        await router.refresh_pin_durable_last_seen(
+            b"session-digest",
+            last_seen_utc=2_000_000.0,
+            expires_at_utc=2_000_090.0,
+        )
+
+        assert router.persistence_degraded is True
 
     asyncio.run(scenario())
 
