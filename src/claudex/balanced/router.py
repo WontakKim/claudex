@@ -625,10 +625,12 @@ class ClaudeBalancedRouter:
         """Refresh durable pin activity, coalesced to at most once per minute per pin."""
         if self._store is None:
             return
-        pending_write = self._store.touch_pin_last_seen(digest, last_seen_utc, expires_at_utc)
-        if pending_write is None:
-            return
         try:
+            pending_write = self._store.touch_pin_last_seen(
+                digest, last_seen_utc, expires_at_utc
+            )
+            if pending_write is None:
+                return
             await pending_write.wait_async()
         except Exception:
             self.persistence_degraded = True
