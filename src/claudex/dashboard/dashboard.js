@@ -512,11 +512,32 @@ function renderStatLine(provider,state,title,html){
   if(title)box.title=title;else box.removeAttribute("title");
   document.getElementById(provider+"-statline").innerHTML=html;
 }
+var CUSTOM_PROVIDER_WIRE_LABELS={
+  responses:"Responses API",
+  anthropic_messages:"Anthropic Messages"
+};
+function customProviderWireLabel(provider){
+  return CUSTOM_PROVIDER_WIRE_LABELS[provider.wire_kind]||"Unsupported wire protocol";
+}
+function customProviderStatus(provider,info){
+  var wireLabel=customProviderWireLabel(provider);
+  if(info.status==="ok"){
+    if(provider.catalog_available===false){
+      return{state:"okv",label:"CONFIGURED",detail:wireLabel+" configured · remote connection not verified"};
+    }
+    return{state:"okv",label:"CONNECTED",detail:wireLabel+" remote catalog verified"};
+  }
+  if(info.required===false&&provider.catalog_available!==false){
+    return{state:"",label:"UNUSED",detail:"No "+provider.name+": target is mapped; catalog failure does not affect readiness"};
+  }
+  return{state:"err",label:"ERROR",detail:wireLabel+
+    (provider.catalog_available===false?" binding unavailable":" connection failed")};
+}
 function configureCustomProviders(providers){
   CUSTOM_PROVIDERS=Array.isArray(providers)?providers.filter(function(p){return p&&p.name}):[];
   ROUTE_PROVIDERS=BUILTIN_ROUTE_PROVIDERS.concat(CUSTOM_PROVIDERS.map(function(p){return p.name}));
   CUSTOM_PROVIDERS.forEach(function(provider){
-    var name=provider.name;
+    var name=provider.name,wireLabel=customProviderWireLabel(provider);
     CATALOG[name]=[];
     PROVIDER_VISIBLE[name]=true;
     if(!document.querySelector('#add-prov button[data-p="'+name+'"]')){
@@ -528,11 +549,12 @@ function configureCustomProviders(providers){
       card.className="card provider-hidden";
       card.id="card-"+name;
       card.innerHTML='<div class="ucard-h"><h2>'+esc(name)+' Status</h2></div>'+
-        '<div class="sub">설정된 OpenAI 호환 Responses API 프로바이더의 연결 상태입니다.</div>'+
+        '<div class="sub">Configured custom provider · '+esc(wireLabel)+"</div>"+
         '<div class="stat" id="'+name+'-stat"><div class="statline" id="'+name+'-statline">'+
-        '<span class="sk">OK · Responses API 연결됨</span></div></div>';
+        '<span class="sk">CONFIGURED · '+esc(wireLabel)+"</span></div></div>";
       document.getElementById("tab-status").appendChild(card);
     }
+    if(provider.catalog_available===false)return;
     jfetch("/admin/providers/custom/"+encodeURIComponent(name)+"/models").then(function(r){
       if(r.ok)CATALOG[name]=catalogIds(r.body);
       if(addProvider===name&&document.getElementById("add-form").classList.contains("open"))renderAddForm();
@@ -588,14 +610,9 @@ function renderProviderCards(h){
     "Grok 로그인이 필요합니다","grok login");
   CUSTOM_PROVIDERS.forEach(function(provider){
     var name=provider.name,info=(h.providers||{})[name]||{};
-    if(info.status==="ok"){
-      renderStatLine(name,"okv",null,'● OK <span class="detail">Responses API 연결됨</span>');
-    }else if(info.required===false){
-      renderStatLine(name,"",info.detail||"",'● 미사용 <span class="detail">모델 맵에 '+esc(name)+
-        ': 타겟이 없어 연결 실패가 준비 상태와 무관합니다</span>');
-    }else{
-      renderStatLine(name,"err",info.detail||"",'● ERROR <span class="detail">Responses API 연결 실패</span>');
-    }
+    var status=customProviderStatus(provider,info);
+    renderStatLine(name,status.state,info.detail||"",'● '+status.label+
+      ' <span class="detail">'+esc(status.detail)+"</span>");
   });
 }
 function renderFacts(p){

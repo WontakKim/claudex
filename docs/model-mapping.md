@@ -6,9 +6,10 @@
   `CLAUDEX_MODEL_MAP` entry are routed to the provider-prefixed target
   backend, while everything else is forwarded byte-for-byte to the real
   Anthropic API with the client's own credentials.
-- Answers as the Claude model the client requested — the Codex, Kimi, or Grok
-  target model never appears on the Anthropic wire, so Claude Code heuristics
-  keyed on model names keep working.
+- Answers as the Claude model the client requested. The mapped upstream model
+  is restored in Responses-family output and in both streaming and non-streaming
+  native Messages output, so Claude Code heuristics keyed on model names keep
+  working for built-in and custom routes.
 
 ## Runtime mapping API
 
@@ -31,7 +32,8 @@ itself, so foreign web pages cannot drive it from a browser.
 
 ## Model mapping examples
 
-Route Claude Code model names to Codex, Kimi, and Grok models:
+Route Claude Code model names to Codex, Kimi, Grok, or a configured custom
+provider. This environment-only example uses built-ins:
 
 ```sh
 CLAUDEX_MODEL_MAP='{"fable":"grok:grok-4.5","opus":"kimi:k3","sonnet":"codex:gpt-5.6-terra","haiku":"codex:gpt-5.6-luna"}' \
@@ -45,10 +47,26 @@ empty model after the prefix) are rejected at startup and by the mapping API,
 so a typo like `"kim:k2.5"` fails loudly instead of surfacing as a baffling
 upstream error.
 
-`GET /health` returns `200` with `status: "ok"` when the Codex credential is
-usable and — only if the map routes to Kimi — the Kimi credential too;
-otherwise it returns `503` with `status: "error"`. Each provider's state is
-always listed under `providers`.
+`GET /health` returns `200` with `status: "ok"` when required provider
+readiness checks pass; otherwise it returns `503` with `status: "error"`.
+Catalog-capable custom providers use their remote catalog for that readiness
+check. Catalog-less Anthropic-compatible providers perform no remote health I/O:
+an `ok` state confirms configuration and binding only, not remote entitlement or
+Messages compatibility. Use `POST /admin/test` with a complete mapped target for
+explicit remote verification.
+
+## Custom provider targets
+
+Custom provider names become model-map prefixes. The configured family, not the
+name, selects the wire behavior. For example, a provider named
+`openai-by-name` can still use `anthropic_compatible` and the Anthropic Messages
+wire when configured in that family.
+
+OpenAI-compatible entries retain the required `wire_api: "responses"` schema and
+live catalog behavior. Anthropic-compatible entries have only `base_url` and
+`api_key`; their versioned prefix receives exactly `/messages`, they require
+manual model IDs, and token counting uses the local approximate characters/4
+fallback. See [Custom providers](custom-providers.md#custom-providers).
 
 ## Mixing Claude and Codex models
 

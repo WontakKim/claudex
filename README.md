@@ -1,20 +1,25 @@
 # claudex-gateway
 
-A lightweight local gateway that runs mapped Claude Code models on the OpenAI
-Codex, Kimi, or Grok backend and relays everything else to Anthropic untouched.
+A lightweight local gateway that runs mapped Claude Code models on Codex,
+Kimi, Grok, or configured custom Responses/Messages backends and relays
+everything else to Anthropic untouched.
 
 ```text
 Claude Code ── "codex:" mapped ───▶ claudex-gateway ── Codex Responses API ─▶ Codex
 Claude Code ── "kimi:" mapped ────▶ claudex-gateway ── near-verbatim relay ─▶ Kimi coding API
 Claude Code ── "grok:" mapped ────▶ claudex-gateway ── Grok Responses API ──▶ Grok
+Claude Code ── custom mapped ──────▶ claudex-gateway ── Responses or Messages ▶ configured upstream
 Claude Code ── unmapped model ────▶ claudex-gateway ── verbatim relay ──────▶ Anthropic API
 ```
 
-- Mapped models run on Codex, Kimi, or Grok, while everything else is relayed to Anthropic untouched.
-- The gateway reuses each provider's CLI login and can serve traffic through registered Claude accounts with fallback routing.
+- Mapped models run on Codex, Kimi, Grok, or a named custom provider, while everything else is relayed to Anthropic untouched.
+- Custom providers support the OpenAI Responses and Anthropic Messages wire families; static Messages providers require manual model IDs and explicit remote verification.
+- The gateway reuses each built-in provider's CLI login and can serve traffic through registered Claude accounts with fallback routing.
 - Configuration, model mapping, compaction, the dashboard, and detailed behavior are documented in docs/.
 
-Provider prerequisites and logins are covered in [Providers](docs/providers.md).
+Built-in provider prerequisites and logins are covered in
+[Providers](docs/providers.md). Static custom-provider schemas and capability
+boundaries are covered in [Custom providers](docs/custom-providers.md).
 
 ## Quickstart
 

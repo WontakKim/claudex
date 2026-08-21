@@ -1,9 +1,11 @@
 # Providers
 
-claudex-gateway reuses each provider's CLI login — no gateway-side auth: the
-Codex CLI's `~/.codex/auth.json`, the Kimi Code CLI's `~/.kimi-code` credential
-store, and the Grok CLI's `~/.grok/auth.json`, each refreshed in place like the
-CLI itself does.
+The built-in Codex, Kimi, and Grok providers reuse their CLI authentication:
+the Codex CLI's `~/.codex/auth.json`, the Kimi Code CLI's `~/.kimi-code`
+credential store, and the Grok CLI's `~/.grok/auth.json`, each refreshed in
+place like the CLI itself does. Custom providers are different: they use static
+credentials from gateway configuration and do not participate in CLI login,
+OAuth, or refresh flows.
 
 ## Codex
 
@@ -65,9 +67,9 @@ With the CLI logged in (`kimi login`, tokens at
 }
 ```
 
-Every value names its provider (`codex:`, `kimi:`, or `grok:`); a bare model
-name is rejected at boot and on `PUT`, so an entry always says which backend
-serves it. Kimi's coding endpoint speaks the
+Every value names its provider (`codex:`, `kimi:`, `grok:`, or a configured
+custom prefix); a bare model name is rejected at boot and on `PUT`, so an entry
+always says which backend serves it. Kimi's coding endpoint speaks the
 Anthropic Messages API natively, so requests and responses — streaming and
 non-streaming, thinking, tool use — are relayed as-is; only the model name
 and credentials are swapped.
@@ -87,6 +89,14 @@ The endpoint requires a logged-in Kimi Code CLI and honors the same
 is Kimi's catalog verbatim, unshaped by the gateway. Copy the `id` exactly —
 the catalog mixes naming styles (e.g. `kimi-for-coding` next to `k3`), which
 is precisely why the gateway refuses to normalize them.
+
+Kimi and static Anthropic-compatible custom providers share the generic native
+Messages relay, including streaming and non-streaming response ownership and
+requested-model restoration. Their transport policies remain separate. Kimi
+keeps its existing CLI-derived authentication, live model catalog, and native
+token counter. A static custom provider strips caller credentials, applies one
+configured Bearer credential, has no catalog or remote token counter, and does
+not refresh or retry authentication. See [Custom providers](custom-providers.md#anthropic-compatible-schema).
 
 ## Grok
 
@@ -115,6 +125,20 @@ drops the fields Grok rejects (`previous_response_id`, `stream_options`,
 reasoning config — sending one to a non-thinking model fails upstream.
 A newly released thinking model simply runs at its default effort until the
 gateway's list catches up.
+
+## Custom providers
+
+Named custom routes can use either the OpenAI Responses wire family or the
+Anthropic Messages wire family. Provider names do not select behavior; the
+configured family and its `wire_kind` do. Static Messages providers support
+only the configured versioned prefix plus `/messages`, require manually entered
+model IDs, and use local approximate token counting. Health confirms their
+configuration and route binding without contacting the remote service;
+`POST /admin/test` performs the explicit remote Messages verification.
+
+The complete schemas, authentication boundaries, dashboard semantics, and
+validation scope are in [Custom providers](custom-providers.md#custom-providers).
+No custom provider is added to built-in usage or billing views.
 
 ## Limitations
 
