@@ -41,8 +41,9 @@ from claudex.claude.quota_429 import (
     Quota429Mark,
     build_degraded_quota_429_record,
     build_quota_429_record,
+    enrich_record_degraded,
     enrich_record_fallback,
-    finalize_quota_429_record,
+    finalize_quota_429_record_strict,
 )
 from claudex.claude.session_fingerprint import (
     extract_session_uuid,
@@ -402,7 +403,7 @@ async def _attempt_with_account(
 
             def _finalize_incident(record: dict[str, Any]) -> str:
                 try:
-                    return finalize_quota_429_record(record)
+                    return finalize_quota_429_record_strict(record)
                 except Exception:
                     return (
                         '{"degradation_reason":"record_serialization_failed",'
@@ -496,11 +497,33 @@ async def _attempt_with_account(
                         enrich_record_fallback(
                             quota_record, session_fingerprint=None
                         )
+                        quota_record["record_degraded"] = True
+                        quota_record["degradation_reason"] = (
+                            "evidence_enrichment_failed"
+                        )
+                    else:
+                        installed_scope = quota_record.get("installed_scope")
+                        quota_family = quota_record.get("quota_family")
+                        family_gate = quota_record.get("family_gate")
+                        enrich_record_degraded(
+                            quota_record,
+                            installed_scope=(
+                                installed_scope
+                                if isinstance(installed_scope, str)
+                                else None
+                            ),
+                            quota_family=(
+                                quota_family
+                                if isinstance(quota_family, str)
+                                else None
+                            ),
+                            family_gate=(
+                                family_gate
+                                if isinstance(family_gate, dict)
+                                else None
+                            ),
+                        )
                     quota_record["session_fingerprint"] = None
-                    quota_record["record_degraded"] = True
-                    quota_record["degradation_reason"] = (
-                        "evidence_enrichment_failed"
-                    )
                     canonical_record = _finalize_incident(quota_record)
                 except Exception:
                     try:

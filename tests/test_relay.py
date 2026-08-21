@@ -5058,6 +5058,112 @@ def test_429_evidence_failure_still_installs_cooldown_and_records_degraded_incid
         assert record["session_fingerprint"] is None
 
 
+def test_balanced_429_finalization_failure_installs_empty_evidence_and_replays(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _balanced_env(monkeypatch, tmp_path)
+    account_id, _access_token = _register_balanced_accounts(1)[0]
+    response_body = b'{"error":{"type":"rate_limit_error","message":"quota reached"}}'
+    install_calls: list[dict[str, Any]] = []
+    original_install_callback = relay_balanced._install_balanced_quota_cooldown
+    original_install = ClaudeBalancedRouter.install_cooldown
+
+    async def inject_finalization_failure(*args: Any, **kwargs: Any) -> str:
+        kwargs["mark"].record["unknown_nonserializable_extra"] = object()
+        return await original_install_callback(*args, **kwargs)
+
+    def recording_install(
+        self: ClaudeBalancedRouter, **kwargs: Any
+    ) -> Any:
+        install_calls.append(dict(kwargs))
+        return original_install(self, **kwargs)
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            429,
+            content=response_body,
+            headers={
+                "request-id": "upstream-request-id",
+                "retry-after": "17",
+                "x-should-retry": "true",
+            },
+        )
+
+    monkeypatch.setattr(
+        relay_balanced,
+        "_install_balanced_quota_cooldown",
+        inject_finalization_failure,
+    )
+    monkeypatch.setattr(
+        ClaudeBalancedRouter, "install_cooldown", recording_install
+    )
+    with _create_test_client(
+        monkeypatch,
+        tmp_path,
+        config=GatewayConfig(),
+        base_url="http://127.0.0.1:8787",
+    ) as client:
+        runtime = _enable_balanced(client, handler)
+
+        response = client.post(
+            "/v1/messages", json=_balanced_body(_new_session_id())
+        )
+
+        assert response.status_code == 429
+        assert response.content == response_body
+        assert response.headers["request-id"] == "upstream-request-id"
+        assert response.headers["retry-after"] == "17"
+        assert response.headers["x-should-retry"] == "true"
+        assert len(install_calls) == 1
+        assert install_calls[0]["evidence"] == ""
+        row = runtime._store.get_cooldown(account_id, "account", "")
+        assert row is not None
+        assert row.evidence == ""
+        [canonical] = (
+            paths.claude_account_pool_dir() / "claude-429-incidents.jsonl"
+        ).read_text().splitlines()
+        incident = json.loads(canonical)
+        assert {
+            "v",
+            "event",
+            "occurred_at_utc",
+            "mode",
+            "account_id",
+            "model",
+            "cooldown_seconds",
+            "cooldown_source",
+            "installed_scope",
+            "quota_family",
+            "family_gate",
+            "observed_scope",
+            "scope_rationale",
+            "upstream",
+            "attempt",
+            "session_fingerprint",
+            "request_shape",
+            "record_degraded",
+            "degradation_reason",
+        } <= incident.keys()
+        assert incident["installed_scope"] == "account"
+        assert incident["quota_family"] == "fable"
+        assert incident["family_gate"]["reason"] == (
+            "fable_weekly_not_saturated"
+        )
+        assert incident["observed_scope"] == "unknown"
+        assert incident["scope_rationale"] == "fable_weekly_not_saturated"
+        assert incident["session_fingerprint"] is None
+        assert incident["record_degraded"] is True
+        assert incident["degradation_reason"] == "evidence_enrichment_failed"
+        assert "unknown_nonserializable_extra" not in incident
+        assert set(incident) != {"record_degraded", "degradation_reason"}
+        assert canonical == json.dumps(
+            incident,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        )
+
+
 def test_429_incident_missing_context_records_null_attempt(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

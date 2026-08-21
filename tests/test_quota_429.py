@@ -20,6 +20,7 @@ from claudex.claude.quota_429 import (
     enrich_record_degraded,
     enrich_record_fallback,
     finalize_quota_429_record,
+    finalize_quota_429_record_strict,
     parse_upstream_error_body,
 )
 
@@ -297,6 +298,59 @@ def test_finalize_record_produces_canonical_stable_json() -> None:
     assert finalized == '{"a":{"first":1,"second":2},"z":"é"}'
     assert finalized == finalize_quota_429_record(record)
     assert json.loads(finalize_quota_429_record({"unexpected": object()}))
+
+
+def test_finalization_failure_rebuilds_schema_valid_degraded_record() -> None:
+    record = _build_record()
+    record["unknown_nonserializable_extra"] = object()
+    gate = {
+        "scope": "account",
+        "reason": "fable_weekly_not_saturated",
+        "family_deadline_utc": None,
+    }
+
+    with pytest.raises(TypeError):
+        finalize_quota_429_record_strict(record)
+
+    enrich_record_degraded(
+        record,
+        installed_scope="account",
+        quota_family="fable",
+        family_gate=gate,
+    )
+    canonical = finalize_quota_429_record_strict(record)
+    incident = json.loads(canonical)
+
+    assert "unknown_nonserializable_extra" not in incident
+    assert {
+        "v",
+        "event",
+        "occurred_at_utc",
+        "mode",
+        "account_id",
+        "model",
+        "cooldown_seconds",
+        "cooldown_source",
+        "installed_scope",
+        "quota_family",
+        "family_gate",
+        "observed_scope",
+        "scope_rationale",
+        "upstream",
+        "attempt",
+        "session_fingerprint",
+        "request_shape",
+        "record_degraded",
+        "degradation_reason",
+    } <= incident.keys()
+    assert incident["installed_scope"] == "account"
+    assert incident["quota_family"] == "fable"
+    assert incident["family_gate"]["reason"] == "fable_weekly_not_saturated"
+    assert incident["scope_rationale"] == "fable_weekly_not_saturated"
+    assert incident["session_fingerprint"] is None
+    assert incident["record_degraded"] is True
+    assert incident["degradation_reason"] == "evidence_enrichment_failed"
+    assert canonical == _canonical(incident)
 
 
 def test_observed_scope_unknown_for_family_gate_failure() -> None:

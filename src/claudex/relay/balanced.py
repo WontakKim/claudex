@@ -44,7 +44,7 @@ from claudex.claude.quota_429 import (
     Quota429Mark,
     enrich_record_degraded,
     enrich_record_with_family_gate,
-    finalize_quota_429_record,
+    finalize_quota_429_record_strict,
 )
 from claudex.claude.session_fingerprint import (
     extract_session_uuid,
@@ -85,7 +85,7 @@ async def _install_balanced_quota_cooldown(
         '"record_degraded":true}'
     )
     try:
-        canonical_record = finalize_quota_429_record(mark.record)
+        canonical_record = finalize_quota_429_record_strict(mark.record)
     except Exception:
         pass
     evidence = ""
@@ -133,7 +133,7 @@ async def _install_balanced_quota_cooldown(
             quota_family=requested_family,
             session_fingerprint=session_fingerprint,
         )
-        canonical_record = finalize_quota_429_record(mark.record)
+        canonical_record = finalize_quota_429_record_strict(mark.record)
         evidence = canonical_record
     except Exception:
         logger.warning("failed to enrich Claude 429 cooldown evidence")
@@ -159,7 +159,7 @@ async def _install_balanced_quota_cooldown(
                 quota_family=requested_family,
                 family_gate=family_gate,
             )
-            canonical_record = finalize_quota_429_record(mark.record)
+            canonical_record = finalize_quota_429_record_strict(mark.record)
         except Exception:
             canonical_record = (
                 '{"degradation_reason":"evidence_enrichment_failed",'

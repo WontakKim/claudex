@@ -359,36 +359,112 @@ def enrich_record_fallback(
     return record
 
 
+def _serialization_safe(value: Any, default: Any) -> Any:
+    try:
+        _canonical_json(value)
+    except Exception:
+        return default
+    return value
+
+
+def _degraded_record_fields(record: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "v": _serialization_safe(record.get("v"), 1),
+        "event": _serialization_safe(
+            record.get("event"), "claude_quota_429"
+        ),
+        "occurred_at_utc": _serialization_safe(
+            record.get("occurred_at_utc"), "1970-01-01T00:00:00.000Z"
+        ),
+        "mode": _serialization_safe(record.get("mode"), "balanced"),
+        "account_id": _serialization_safe(record.get("account_id"), None),
+        "model": _serialization_safe(record.get("model"), None),
+        "cooldown_seconds": _serialization_safe(
+            record.get("cooldown_seconds"), 60.0
+        ),
+        "cooldown_source": _serialization_safe(
+            record.get("cooldown_source"), "default_60"
+        ),
+        "upstream": _serialization_safe(
+            record.get("upstream"),
+            {
+                "body_bytes": None,
+                "body_sha256": None,
+                "error_type": None,
+                "message": None,
+                "request_id": None,
+                "headers": {},
+            },
+        ),
+        "attempt": _serialization_safe(record.get("attempt"), None),
+        "request_shape": _serialization_safe(
+            record.get("request_shape"),
+            {
+                "body_bytes": None,
+                "message_count": None,
+                "tool_count": None,
+                "pin_created": None,
+            },
+        ),
+    }
+
+
 def enrich_record_degraded(
     record: dict[str, Any],
     *,
-    installed_scope: str,
-    quota_family: str,
+    installed_scope: str | None,
+    quota_family: str | None,
     family_gate: dict[str, Any] | None,
     degradation_reason: str = "evidence_enrichment_failed",
 ) -> dict[str, Any]:
     """Preserve known cooldown facts when balanced evidence enrichment fails."""
+    degraded_fields = _degraded_record_fields(record)
+    record.clear()
+    record.update(degraded_fields)
     record["installed_scope"] = installed_scope
     record["quota_family"] = quota_family
-    record["family_gate"] = family_gate
     if family_gate is None:
+        record["family_gate"] = None
         record["observed_scope"] = "unknown"
         record["scope_rationale"] = "evidence_classification_unavailable"
     else:
+        gate_scope = family_gate.get("scope")
+        gate_reason = family_gate.get("reason")
+        if _serialization_safe(family_gate, None) is family_gate:
+            record["family_gate"] = family_gate
+        else:
+            record["family_gate"] = {
+                "scope": (
+                    gate_scope if isinstance(gate_scope, str) else installed_scope
+                ),
+                "reason": (
+                    gate_reason
+                    if isinstance(gate_reason, str)
+                    else "evidence_classification_unavailable"
+                ),
+                "family_deadline_utc": _serialization_safe(
+                    family_gate.get("family_deadline_utc"), None
+                ),
+            }
         record["observed_scope"] = (
-            "family" if family_gate.get("scope") == "family" else "unknown"
+            "family" if gate_scope == "family" else "unknown"
         )
-        record["scope_rationale"] = family_gate.get("reason")
+        record["scope_rationale"] = record["family_gate"]["reason"]
     record["session_fingerprint"] = None
     record["record_degraded"] = True
     record["degradation_reason"] = degradation_reason
     return record
 
 
+def finalize_quota_429_record_strict(record: Mapping[str, Any]) -> str:
+    """Return canonical JSON while preserving serialization failures."""
+    return _canonical_json(dict(record))
+
+
 def finalize_quota_429_record(record: Mapping[str, Any]) -> str:
     """Return canonical JSON, degrading safely for unexpected values."""
     try:
-        return _canonical_json(dict(record))
+        return finalize_quota_429_record_strict(record)
     except Exception:
         return (
             '{"degradation_reason":"record_serialization_failed",'
