@@ -60,6 +60,10 @@ from claudex.admin.system import (
     _handle_favicon,
 )
 from claudex.relay import endpoints as relay_endpoints
+from claudex.relay.anthropic_compatible import (
+    _anthropic_compatible_error_to_claude,
+    _anthropic_compatible_request_headers,
+)
 from claudex.relay.kimi import _kimi_error_to_claude, _kimi_request_headers
 from claudex.claude.account_pool import AccountCooldownTracker
 from claudex.claude.accounts import AccountRecord, list_accounts
@@ -67,12 +71,17 @@ from claudex.claude.ambient_account import AmbientAccountProvider, is_duplicate_
 from claudex.balanced.polling import UsagePollAccount
 from claudex.balanced.runtime import ClaudeBalancedRuntime
 from claudex.providers.codex_auth import CodexAuthError, CodexAuthManager
+from claudex.providers.anthropic_compatible_client import AnthropicCompatibleClient
 from claudex.providers.backends import AnthropicBackend, ResponsesBackend, RouteBackend
 from claudex.providers.codex_client import (
     CODEX_FAST_TIER_WIRE_VALUE,
     CodexClient,
 )
-from claudex.config import GatewayConfig
+from claudex.config import (
+    AnthropicCompatibleProvider,
+    GatewayConfig,
+    OpenAICompatibleProvider,
+)
 from claudex.providers.grok_auth import GrokAuthError, GrokAuthManager
 from claudex.providers.grok_client import GrokClient, sanitize_grok_payload
 from claudex.providers.kimi_auth import KimiAuthError, KimiAuthManager
@@ -109,7 +118,9 @@ def _assemble_route_backends(
     codex_client: CodexClient,
     kimi_client: KimiClient,
     grok_client: GrokClient,
-    custom_provider_clients: dict[str, OpenAICompatibleClient],
+    custom_provider_clients: dict[
+        str, OpenAICompatibleClient | AnthropicCompatibleClient
+    ],
 ) -> dict[str, RouteBackend]:
     async def adapt_codex_payload(
         payload: dict[str, Any], model: str
@@ -147,24 +158,39 @@ def _assemble_route_backends(
             signature_namespace=None,
         ),
     }
-    route_backends.update(
-        {
-            name: ResponsesBackend(
+    custom_route_backends: dict[str, RouteBackend] = {}
+    for name, provider in config.custom_providers.items():
+        client = custom_provider_clients.get(name)
+        if client is None:
+            continue
+        if isinstance(provider, OpenAICompatibleProvider):
+            custom_route_backends[name] = ResponsesBackend(
                 transport=client,
                 adapt_payload=_adapt_identity_payload,
                 adapt_probe_payload=_adapt_identity_probe_payload,
                 signature_namespace=name,
             )
-            for name, client in custom_provider_clients.items()
-        }
-    )
+        elif isinstance(provider, AnthropicCompatibleProvider):
+            custom_route_backends[name] = AnthropicBackend(
+                transport=client,
+                header_policy=_anthropic_compatible_request_headers,
+                error_policy=_anthropic_compatible_error_to_claude,
+                token_counter=None,
+                catalog_loader=None,
+            )
 
-    configured_provider_names = set(config.route_providers)
-    client_provider_names = {"codex", "kimi", "grok", *custom_provider_clients}
-    backend_provider_names = set(route_backends)
+    configured_provider_names = config.route_providers
+    client_provider_names = ("codex", "kimi", "grok", *custom_provider_clients)
+    backend_provider_names = ("codex", "kimi", "grok", *custom_route_backends)
+    configured_provider_set = set(configured_provider_names)
+    client_provider_set = set(client_provider_names)
+    backend_provider_set = set(backend_provider_names)
     if (
-        client_provider_names != configured_provider_names
-        or backend_provider_names != configured_provider_names
+        len(configured_provider_names) != len(configured_provider_set)
+        or len(client_provider_names) != len(client_provider_set)
+        or len(backend_provider_names) != len(backend_provider_set)
+        or client_provider_set != configured_provider_set
+        or backend_provider_set != configured_provider_set
     ):
         raise RuntimeError(
             "route backend registry mismatch: "
@@ -172,6 +198,8 @@ def _assemble_route_backends(
             f"clients={sorted(client_provider_names)!r}; "
             f"backends={sorted(backend_provider_names)!r}"
         )
+
+    route_backends.update(custom_route_backends)
     return route_backends
 
 
@@ -243,11 +271,22 @@ def create_app(config: GatewayConfig, daemon_nonce: str | None = None) -> Starle
                     app.state.kimi_client = KimiClient(kimi_auth_manager, http_client)
                     app.state.grok_auth_manager = grok_auth_manager
                     app.state.grok_client = GrokClient(grok_auth_manager, http_client)
-                    custom_provider_clients: dict[str, OpenAICompatibleClient] = {}
+                    custom_provider_clients: dict[
+                        str, OpenAICompatibleClient | AnthropicCompatibleClient
+                    ] = {}
                     for name, provider in config.custom_providers.items():
-                        custom_provider_clients[name] = OpenAICompatibleClient(
-                            name, provider, http_client
-                        )
+                        if isinstance(provider, OpenAICompatibleProvider):
+                            custom_provider_clients[name] = OpenAICompatibleClient(
+                                name, provider, http_client
+                            )
+                        elif isinstance(provider, AnthropicCompatibleProvider):
+                            custom_provider_clients[name] = AnthropicCompatibleClient(
+                                name, provider, http_client
+                            )
+                        else:
+                            raise RuntimeError(
+                                f"custom provider {name!r} has an unsupported family"
+                            )
                     app.state.custom_provider_clients = custom_provider_clients
                     app.state.route_backends = _assemble_route_backends(
                         app,
@@ -313,11 +352,19 @@ def create_app(config: GatewayConfig, daemon_nonce: str | None = None) -> Starle
                         except GrokAuthError as exc:
                             logger.warning("grok direction unavailable: %s", exc)
 
-                    for name, custom_client in custom_provider_clients.items():
+                    for name in custom_provider_clients:
                         if not config.maps_to_provider(name):
                             continue
+                        backend = app.state.route_backends[name]
+                        catalog_loader = (
+                            backend.transport.list_models
+                            if isinstance(backend, ResponsesBackend)
+                            else backend.catalog_loader
+                        )
+                        if catalog_loader is None:
+                            continue
                         try:
-                            models = await custom_client.list_models()
+                            models = await catalog_loader()
                             logger.info(
                                 "custom provider '%s' ready (%d models)", name, len(models)
                             )

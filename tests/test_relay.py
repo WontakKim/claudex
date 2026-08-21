@@ -105,6 +105,13 @@ _RELAY_SYMBOL_MANIFEST = {
         "_serve_balanced_pinned_message",
         "_serve_balanced_count_tokens",
     },
+    "anthropic_compatible": {
+        "_anthropic_compatible_request_headers",
+        "_safe_anthropic_error",
+        "_safe_upstream_message",
+        "_configured_credential_error",
+        "_anthropic_compatible_error_to_claude",
+    },
     "anthropic_backend": {
         "_rewrite_message_start_data",
         "_rewrite_anthropic_sse",
@@ -156,7 +163,7 @@ def test_relay_symbol_manifest_has_one_canonical_owner() -> None:
         for module_name in _RELAY_SYMBOL_MANIFEST
     }
 
-    assert len(_RELAY_MANIFEST_SYMBOLS) == 50
+    assert len(_RELAY_MANIFEST_SYMBOLS) == 55
     assert definitions_by_module == _RELAY_SYMBOL_MANIFEST
     for symbol in _RELAY_MANIFEST_SYMBOLS:
         owners = [
