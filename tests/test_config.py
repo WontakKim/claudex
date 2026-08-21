@@ -649,6 +649,78 @@ class TestCustomProviders:
 
         assert "sensitive-api-key" not in str(error.value)
 
+    @pytest.mark.parametrize(
+        ("base_url", "found"),
+        [
+            (
+                "https://messages.example/api/v1?tenant=sensitive-query",
+                "query",
+            ),
+            (
+                "https://messages.example/api/v1#sensitive-fragment",
+                "fragment",
+            ),
+            (
+                "https://messages.example/api/v1?tenant=one#deployment",
+                "query, fragment",
+            ),
+        ],
+    )
+    def test_anthropic_compatible_rejects_base_url_suffix_semantics(
+        self, tmp_path: Path, base_url: str, found: str
+    ) -> None:
+        settings_file = self._write(
+            tmp_path,
+            self._anthropic_payload(
+                entry=self._anthropic_entry(base_url=base_url)
+            ),
+        )
+
+        with pytest.raises(
+            ConfigError,
+            match=(
+                "anthropic_compatible base_url must be a versioned API prefix "
+                "without a query or fragment"
+            ),
+        ) as error:
+            GatewayConfig.load(settings_file)
+
+        message = str(error.value)
+        assert f"found {found}" in message
+        assert "sensitive-query" not in message
+        assert "sensitive-fragment" not in message
+
+    def test_anthropic_compatible_trailing_slashes_are_stripped(
+        self, tmp_path: Path
+    ) -> None:
+        settings_file = self._write(
+            tmp_path,
+            self._anthropic_payload(
+                entry=self._anthropic_entry(
+                    base_url="https://messages.example/api/v1///"
+                )
+            ),
+        )
+
+        provider = GatewayConfig.load(settings_file).custom_providers[
+            "messages-api"
+        ]
+
+        assert provider.base_url == "https://messages.example/api/v1"
+
+    def test_openai_compatible_base_url_suffix_behavior_is_unchanged(
+        self, tmp_path: Path
+    ) -> None:
+        base_url = "https://model.example/api/v1?tenant=one#deployment"
+        settings_file = self._write(
+            tmp_path,
+            self._payload(entry=self._entry(base_url=base_url)),
+        )
+
+        provider = GatewayConfig.load(settings_file).custom_providers["wrtn"]
+
+        assert provider.base_url == base_url
+
     def test_unknown_entry_key_fails_at_boot(self, tmp_path: Path) -> None:
         settings_file = self._write(
             tmp_path,

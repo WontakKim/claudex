@@ -252,6 +252,20 @@ def parse_custom_providers(value: object) -> dict[str, _CustomProvider]:
                     f"custom provider {name!r} base_url is not a valid absolute URL; "
                     "valid URLs use https, e.g. 'https://model.example/api/v1'"
                 )
+            if family == "anthropic_compatible" and (
+                "?" in base_url or "#" in base_url
+            ):
+                suffixes = [
+                    suffix
+                    for suffix, delimiter in (("query", "?"), ("fragment", "#"))
+                    if delimiter in base_url
+                ]
+                raise ConfigError(
+                    f"custom provider {name!r} anthropic_compatible base_url must "
+                    "be a versioned API prefix without a query or fragment; found "
+                    f"{', '.join(suffixes)}"
+                )
+
             is_secure = parsed_url.scheme == "https"
             is_loopback_http = parsed_url.scheme == "http" and is_loopback_host(
                 base_url_host
