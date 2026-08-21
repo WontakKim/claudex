@@ -13,8 +13,10 @@ from starlette.responses import JSONResponse
 from claudex import paths, server_support
 from claudex.admin.common import (
     _admin_guard,
+    _get_custom_provider_binding,
     _read_json_object,
     _require_json_content_type,
+    _safe_route_target_error_detail,
 )
 from claudex.balanced.runtime import BalancedPrepareError, ClaudeBalancedRuntime
 from claudex.claude.accounts import AccountRegistryError, list_accounts, load_registry
@@ -23,13 +25,16 @@ from claudex.config import (
     VALID_CLAUDE_ACCOUNT_ROUTING_MODES,
     VALID_CODEX_SERVICE_TIERS,
     VALID_LOG_LEVELS,
+    AnthropicCompatibleProvider,
     ConfigError,
     GatewayConfig,
+    OpenAICompatibleProvider,
     parse_claude_account_id,
     parse_compaction_model,
     update_settings_file,
     validate_model_map,
 )
+from claudex.providers.backends import RouteBackend
 
 logger = logging.getLogger("claudex.server")
 
@@ -37,7 +42,9 @@ logger = logging.getLogger("claudex.server")
 _ADMIN_MAP_KEYS = ("model_map",)
 
 
-def _mapping_payload(config: GatewayConfig) -> dict[str, Any]:
+def _mapping_payload(
+    config: GatewayConfig, route_backends: dict[str, RouteBackend]
+) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "model_map": config.model_map,
         # The dashboard renders the board view-only while the corresponding
@@ -51,14 +58,29 @@ def _mapping_payload(config: GatewayConfig) -> dict[str, Any]:
         "kimi_code_home": str(config.kimi_code_home),
     }
     if config.custom_providers:
-        payload["custom_providers"] = [
-            {
-                "name": name,
-                "wire_api": provider.wire_api,
-                "base_url": provider.base_url,
-            }
-            for name, provider in config.custom_providers.items()
-        ]
+        custom_provider_metadata: list[dict[str, Any]] = []
+        for name, _configured_provider in sorted(config.custom_providers.items()):
+            provider, backend = _get_custom_provider_binding(
+                config, route_backends, name
+            )
+            if isinstance(provider, OpenAICompatibleProvider):
+                family = "openai_compatible"
+            elif isinstance(provider, AnthropicCompatibleProvider):
+                family = "anthropic_compatible"
+            else:
+                raise RuntimeError(
+                    f"custom provider {name!r} has an unsupported family"
+                )
+            custom_provider_metadata.append(
+                {
+                    "name": name,
+                    "family": family,
+                    "wire_kind": backend.wire_kind.value,
+                    "base_url": provider.base_url,
+                    "catalog_available": backend.catalog_loader is not None,
+                }
+            )
+        payload["custom_providers"] = custom_provider_metadata
     return payload
 
 
@@ -66,13 +88,36 @@ async def _handle_admin_mapping_get(request: Request) -> JSONResponse:
     denied = _admin_guard(request)
     if denied is not None:
         return denied
-    return JSONResponse(_mapping_payload(request.app.state.config))
+    try:
+        payload = _mapping_payload(
+            request.app.state.config, request.app.state.route_backends
+        )
+    except RuntimeError:
+        return JSONResponse(
+            server_support._openai_error_body(
+                "server_error", "custom provider metadata is unavailable"
+            ),
+            status_code=500,
+        )
+    return JSONResponse(payload)
 
 
 async def _handle_admin_mapping_put(request: Request) -> JSONResponse:
     denied = _admin_guard(request) or _require_json_content_type(request)
     if denied is not None:
         return denied
+
+    try:
+        _mapping_payload(
+            request.app.state.config, request.app.state.route_backends
+        )
+    except RuntimeError:
+        return JSONResponse(
+            server_support._openai_error_body(
+                "server_error", "custom provider metadata is unavailable"
+            ),
+            status_code=500,
+        )
 
     body, error = await _read_json_object(request, server_support._openai_error_body)
     if error is not None:
@@ -116,8 +161,11 @@ async def _handle_admin_mapping_put(request: Request) -> JSONResponse:
                 known_providers=request.app.state.config.route_providers,
             )
         except ConfigError as exc:
+            detail = _safe_route_target_error_detail(
+                exc, request.app.state.config
+            )
             return JSONResponse(
-                server_support._openai_error_body("invalid_request_error", str(exc)),
+                server_support._openai_error_body("invalid_request_error", detail),
                 status_code=400,
             )
         # An environment variable outranks settings.json at every boot, so a
@@ -148,7 +196,9 @@ async def _handle_admin_mapping_put(request: Request) -> JSONResponse:
         # runtime-safe fields; in-flight requests keep their config snapshot.
         new_config = replace(config, **updates)
         request.app.state.config = new_config
-    return JSONResponse(_mapping_payload(new_config))
+    return JSONResponse(
+        _mapping_payload(new_config, request.app.state.route_backends)
+    )
 
 
 _LOG_LEVEL_LOGGER_NAMES = ("", "uvicorn", "uvicorn.access", "uvicorn.error")

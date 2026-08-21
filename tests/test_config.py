@@ -649,6 +649,145 @@ class TestCustomProviders:
 
         assert "sensitive-api-key" not in str(error.value)
 
+    @pytest.mark.parametrize("overlap_field", ["name", "base_url"])
+    def test_anthropic_compatible_rejects_credential_in_public_field(
+        self, tmp_path: Path, overlap_field: str
+    ) -> None:
+        api_key = "sensitive-overlap-key"
+        name = "messages-api"
+        base_url = "https://messages.example/api/v1"
+        if overlap_field == "name":
+            name = f"messages-{api_key}"
+        else:
+            base_url = f"https://messages.example/{api_key}/v1"
+        payload = self._anthropic_payload(
+            name=name,
+            entry=self._anthropic_entry(base_url=base_url, api_key=api_key),
+        )
+
+        with pytest.raises(ConfigError) as error:
+            GatewayConfig.load(self._write(tmp_path, payload))
+
+        message = str(error.value)
+        if api_key in message:
+            pytest.fail("an Anthropic-compatible credential was exposed")
+        assert message.endswith(
+            "anthropic_compatible custom provider credential overlaps a public field"
+        )
+
+    @pytest.mark.parametrize(
+        "base_url",
+        [
+            pytest.param(
+                "https://messages.example/v1?credential=sensitive-overlap-key-unsafe-query",
+                id="query",
+            ),
+            pytest.param(
+                "https://messages.example/v1#sensitive-overlap-key-unsafe-fragment",
+                id="fragment",
+            ),
+            pytest.param(
+                "https://[sensitive-overlap-key-unsafe-malformed",
+                id="malformed-url",
+            ),
+            pytest.param(
+                "http://sensitive-overlap-key.unsafe-insecure.example/v1",
+                id="insecure-host",
+            ),
+        ],
+    )
+    def test_anthropic_overlap_precedes_unsafe_url_diagnostics(
+        self, tmp_path: Path, base_url: str
+    ) -> None:
+        api_key = "sensitive-overlap-key"
+        payload = self._anthropic_payload(
+            entry=self._anthropic_entry(base_url=base_url, api_key=api_key)
+        )
+
+        with pytest.raises(ConfigError) as error:
+            GatewayConfig.load(self._write(tmp_path, payload))
+
+        message = str(error.value)
+        if api_key in message or "unsafe-" in message:
+            pytest.fail("unsafe Anthropic provider details were exposed")
+        assert message.endswith(
+            "anthropic_compatible custom provider credential overlaps a public field"
+        )
+
+    @pytest.mark.parametrize(
+        "anthropic_credential_owns_overlap", [True, False]
+    )
+    def test_mixed_family_rejects_cross_provider_credential_overlap(
+        self,
+        tmp_path: Path,
+        anthropic_credential_owns_overlap: bool,
+    ) -> None:
+        overlapping_key = "cross-family-sensitive-key"
+        anthropic_key = (
+            overlapping_key
+            if anthropic_credential_owns_overlap
+            else "anthropic-non-overlapping-key"
+        )
+        openai_key = (
+            "openai-non-overlapping-key"
+            if anthropic_credential_owns_overlap
+            else overlapping_key
+        )
+        anthropic_base_url = "https://messages.example/v1"
+        openai_base_url = "https://responses.example/v1"
+        if anthropic_credential_owns_overlap:
+            openai_base_url = (
+                f"http://{overlapping_key}.unsafe-cross.example/v1"
+            )
+        else:
+            anthropic_base_url = (
+                f"https://messages.example/v1?credential={overlapping_key}-unsafe-cross"
+            )
+        payload = {
+            "custom_providers": {
+                "openai_compatible": {
+                    "responses-api": self._entry(
+                        base_url=openai_base_url, api_key=openai_key
+                    )
+                },
+                "anthropic_compatible": {
+                    "messages-api": self._anthropic_entry(
+                        base_url=anthropic_base_url, api_key=anthropic_key
+                    )
+                },
+            }
+        }
+
+        with pytest.raises(ConfigError) as error:
+            GatewayConfig.load(self._write(tmp_path, payload))
+
+        message = str(error.value)
+        if overlapping_key in message or "unsafe-cross" in message:
+            pytest.fail("cross-family provider details were exposed")
+        assert message.endswith(
+            "anthropic_compatible custom provider credential overlaps a public field"
+        )
+
+    @pytest.mark.parametrize("overlap_field", ["name", "base_url"])
+    def test_openai_compatible_public_field_overlap_parsing_is_unchanged(
+        self, tmp_path: Path, overlap_field: str
+    ) -> None:
+        api_key = "legacy-overlap-key"
+        name = "responses-api"
+        base_url = "https://responses.example/api/v1"
+        if overlap_field == "name":
+            name = f"responses-{api_key}"
+        else:
+            base_url = f"https://responses.example/{api_key}/v1"
+        payload = self._payload(
+            name=name, entry=self._entry(base_url=base_url, api_key=api_key)
+        )
+
+        config = GatewayConfig.load(self._write(tmp_path, payload))
+
+        if name not in config.custom_providers:
+            pytest.fail("legacy OpenAI-compatible configuration was rejected")
+
     @pytest.mark.parametrize(
         ("base_url", "found"),
         [

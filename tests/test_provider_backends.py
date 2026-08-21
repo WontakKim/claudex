@@ -14,13 +14,13 @@ from starlette.requests import Request
 
 from claudex.providers.backends import (
     AnthropicBackend,
-    AnthropicCatalogLoader,
     AnthropicErrorPolicy,
     AnthropicHeaderPolicy,
     AnthropicMessagesTransport,
     AnthropicRelayError,
     AnthropicStreamReadFailure,
     AnthropicTokenCounter,
+    CatalogLoader,
     ResponsesBackend,
     ResponsesPayloadAdapter,
     ResponsesProbePayloadAdapter,
@@ -142,6 +142,7 @@ def test_backend_type_determines_wire_kind_without_redundant_instance_field() ->
         "adapt_payload",
         "adapt_probe_payload",
         "signature_namespace",
+        "catalog_loader",
     ]
     assert [field.name for field in fields(AnthropicBackend)] == [
         "transport",
@@ -163,11 +164,12 @@ def test_backend_fields_retain_the_declared_callable_contracts() -> None:
     assert responses_hints["adapt_payload"] == ResponsesPayloadAdapter
     assert responses_hints["adapt_probe_payload"] == ResponsesProbePayloadAdapter
     assert responses_hints["signature_namespace"] == str | None
+    assert responses_hints["catalog_loader"] == CatalogLoader | None
     assert anthropic_hints["transport"] is AnthropicMessagesTransport
     assert anthropic_hints["header_policy"] == AnthropicHeaderPolicy
     assert anthropic_hints["error_policy"] == AnthropicErrorPolicy
     assert anthropic_hints["token_counter"] == AnthropicTokenCounter | None
-    assert anthropic_hints["catalog_loader"] == AnthropicCatalogLoader | None
+    assert anthropic_hints["catalog_loader"] == CatalogLoader | None
 
 
 def test_binding_callables_follow_the_existing_relay_call_shapes() -> None:
@@ -310,7 +312,7 @@ def test_kimi_binding_candidates_match_declared_policy_contracts() -> None:
         "return": httpx.Response,
     }
 
-    catalog_parameters, catalog_return = _callable_contract(AnthropicCatalogLoader)
+    catalog_parameters, catalog_return = _callable_contract(CatalogLoader)
     assert catalog_parameters == ()
     assert get_origin(catalog_return) is Awaitable
     assert get_args(catalog_return) == (Any,)

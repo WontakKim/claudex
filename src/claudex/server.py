@@ -29,7 +29,12 @@ from claudex.admin.accounts import (
     _handle_admin_claude_login_replace_post,
     _handle_admin_claude_pool_status,
 )
-from claudex.admin.common import _handle_health, _handle_hello
+from claudex.admin.common import (
+    _get_custom_provider_binding,
+    _handle_health,
+    _handle_hello,
+    _safe_custom_provider_exception_detail,
+)
 from claudex.admin.settings import (
     _handle_admin_claude_routing_get,
     _handle_admin_claude_routing_put,
@@ -169,6 +174,7 @@ def _assemble_route_backends(
                 adapt_payload=_adapt_identity_payload,
                 adapt_probe_payload=_adapt_identity_probe_payload,
                 signature_namespace=name,
+                catalog_loader=client.list_models,
             )
         elif isinstance(provider, AnthropicCompatibleProvider):
             custom_route_backends[name] = AnthropicBackend(
@@ -355,21 +361,24 @@ def create_app(config: GatewayConfig, daemon_nonce: str | None = None) -> Starle
                     for name in custom_provider_clients:
                         if not config.maps_to_provider(name):
                             continue
-                        backend = app.state.route_backends[name]
-                        catalog_loader = (
-                            backend.transport.list_models
-                            if isinstance(backend, ResponsesBackend)
-                            else backend.catalog_loader
-                        )
-                        if catalog_loader is None:
-                            continue
+                        configured_provider = config.custom_providers[name]
                         try:
+                            _, backend = _get_custom_provider_binding(
+                                config, app.state.route_backends, name
+                            )
+                            catalog_loader = backend.catalog_loader
+                            if catalog_loader is None:
+                                continue
                             models = await catalog_loader()
+                        except Exception as exc:
+                            detail = _safe_custom_provider_exception_detail(
+                                exc, configured_provider.api_key
+                            )
+                            logger.warning("custom provider unavailable: %s", detail)
+                        else:
                             logger.info(
                                 "custom provider '%s' ready (%d models)", name, len(models)
                             )
-                        except Exception as exc:
-                            logger.warning("custom provider '%s' unavailable: %s", name, exc)
 
                     try:
                         yield

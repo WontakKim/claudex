@@ -1796,6 +1796,9 @@ class StubOpenAICompatibleClient:
         self.context_window_calls.append(model)
         return None
 
+    async def list_models(self) -> list[str]:
+        return []
+
     async def stream_responses(
         self, payload: dict[str, Any], session_id: str
     ) -> AsyncIterator[dict[str, Any]]:

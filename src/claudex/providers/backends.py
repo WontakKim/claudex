@@ -76,7 +76,7 @@ AnthropicErrorPolicy: TypeAlias = Callable[
 AnthropicTokenCounter: TypeAlias = Callable[
     [bytes, dict[str, str]], Awaitable[httpx.Response]
 ]
-AnthropicCatalogLoader: TypeAlias = Callable[[], Awaitable[Any]]
+CatalogLoader: TypeAlias = Callable[[], Awaitable[Any]]
 
 
 @dataclass(frozen=True)
@@ -89,6 +89,7 @@ class ResponsesBackend:
     adapt_payload: ResponsesPayloadAdapter
     adapt_probe_payload: ResponsesProbePayloadAdapter
     signature_namespace: str | None
+    catalog_loader: CatalogLoader | None = None
 
 
 @dataclass(frozen=True)
@@ -101,7 +102,7 @@ class AnthropicBackend:
     header_policy: AnthropicHeaderPolicy
     error_policy: AnthropicErrorPolicy
     token_counter: AnthropicTokenCounter | None = None
-    catalog_loader: AnthropicCatalogLoader | None = None
+    catalog_loader: CatalogLoader | None = None
 
 
 RouteBackend: TypeAlias = ResponsesBackend | AnthropicBackend

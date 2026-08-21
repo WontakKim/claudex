@@ -7,7 +7,7 @@ import json
 import re
 import uuid
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TypeAlias
 from urllib.parse import urlsplit
 
@@ -76,21 +76,39 @@ class RouteTarget:
     model: str
 
 
-@dataclass(frozen=True)
+def _redact_provider_credential(value: str, credential: str) -> str:
+    marker = "[REDACTED]"
+    if credential in marker:
+        marker = "*" if credential != "*" else "?"
+    return value.replace(credential, marker) if credential else value
+
+
+@dataclass(frozen=True, repr=False)
 class OpenAICompatibleProvider:
     """A static OpenAI Responses-compatible upstream configuration."""
 
     wire_api: str
     base_url: str
-    api_key: str
+    api_key: str = field(repr=False)
+
+    def __repr__(self) -> str:
+        base_url = _redact_provider_credential(self.base_url, self.api_key)
+        return (
+            f"OpenAICompatibleProvider(wire_api={self.wire_api!r}, "
+            f"base_url={base_url!r})"
+        )
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, repr=False)
 class AnthropicCompatibleProvider:
     """A static Anthropic Messages-compatible upstream configuration."""
 
     base_url: str
-    api_key: str
+    api_key: str = field(repr=False)
+
+    def __repr__(self) -> str:
+        base_url = _redact_provider_credential(self.base_url, self.api_key)
+        return f"AnthropicCompatibleProvider(base_url={base_url!r})"
 
 
 _CustomProvider: TypeAlias = OpenAICompatibleProvider | AnthropicCompatibleProvider
@@ -161,6 +179,36 @@ def parse_custom_providers(value: object) -> dict[str, _CustomProvider]:
             f"custom providers has unknown families: {', '.join(unknown_families)}; "
             f"valid families: {', '.join(valid_families)}; example: {example}"
         )
+
+    public_fields: list[tuple[str, object, object]] = []
+    credentials: list[tuple[str, str]] = []
+    for family in family_fields:
+        entries = value.get(family, {})
+        if not isinstance(entries, dict):
+            continue
+        for name, entry in entries.items():
+            base_url: object = None
+            if isinstance(entry, dict):
+                base_url = entry.get("base_url")
+                api_key = entry.get("api_key")
+                if isinstance(api_key, str) and api_key.strip():
+                    credentials.append((family, api_key))
+            public_fields.append((family, name, base_url))
+
+    for public_family, name, base_url in public_fields:
+        for credential_family, api_key in credentials:
+            involves_anthropic_provider = (
+                public_family == "anthropic_compatible"
+                or credential_family == "anthropic_compatible"
+            )
+            has_overlap = (isinstance(name, str) and api_key in name) or (
+                isinstance(base_url, str) and api_key in base_url
+            )
+            if involves_anthropic_provider and has_overlap:
+                raise ConfigError(
+                    "anthropic_compatible custom provider credential overlaps "
+                    "a public field"
+                )
 
     providers: dict[str, _CustomProvider] = {}
     provider_families: dict[str, str] = {}
@@ -302,6 +350,7 @@ def parse_custom_providers(value: object) -> dict[str, _CustomProvider]:
                     api_key=api_key,
                 )
             provider_families[name] = family
+
     return providers
 
 

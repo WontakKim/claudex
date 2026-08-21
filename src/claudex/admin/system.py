@@ -17,12 +17,15 @@ from starlette.responses import JSONResponse, Response
 from claudex import server_support
 from claudex.admin.common import (
     _admin_guard,
+    _get_custom_provider_binding,
     _read_json_object,
     _require_json_content_type,
+    _safe_custom_provider_exception_detail,
+    _safe_custom_provider_upstream_detail,
+    _safe_route_target_error_detail,
 )
 from claudex.providers.backends import (
     AnthropicBackend,
-    AnthropicMessagesTransport,
     ResponsesBackend,
     RouteBackend,
 )
@@ -33,7 +36,6 @@ from claudex.providers.grok_auth import GrokAuthError
 from claudex.providers.grok_client import GrokUpstreamError
 from claudex.providers.kimi_auth import KimiAuthError
 from claudex.providers.kimi_client import KimiUpstreamError
-from claudex.providers.openai_compatible_client import OpenAICompatibleUpstreamError
 from claudex.translate import translate_claude_request_to_codex
 from claudex.upstream_errors import UpstreamAuthError, UpstreamError
 from claudex.claude.usage import fetch_claude_usage
@@ -273,25 +275,43 @@ async def _handle_admin_custom_models(request: Request) -> JSONResponse:
     if name not in config.custom_providers:
         return JSONResponse(
             server_support._openai_error_body(
-                "not_found_error", f"custom provider {name!r} is not configured"
+                "not_found_error", "custom provider is not configured"
             ),
             status_code=404,
         )
-    backend = _get_route_backend(request, name)
-    if not isinstance(backend, ResponsesBackend):
-        raise RuntimeError(f"custom provider {name!r} route backend must use the Responses wire")
     try:
-        models = await backend.transport.list_models()
-    except OpenAICompatibleUpstreamError as exc:
-        error_type = _STATUS_TO_OPENAI_ERROR_TYPE.get(exc.status_code, "server_error")
+        provider, backend = _get_custom_provider_binding(
+            config, request.app.state.route_backends, name
+        )
+    except RuntimeError:
         return JSONResponse(
-            server_support._openai_error_body(error_type, server_support._upstream_error_message(exc.body)),
+            server_support._openai_error_body(
+                "server_error", "custom provider binding is unavailable"
+            ),
+            status_code=500,
+        )
+    if backend.catalog_loader is None:
+        return JSONResponse(
+            server_support._openai_error_body(
+                "not_found_error",
+                f"custom provider {name!r} does not provide a model catalog",
+            ),
+            status_code=404,
+        )
+    try:
+        models = await backend.catalog_loader()
+    except UpstreamError as exc:
+        error_type = _STATUS_TO_OPENAI_ERROR_TYPE.get(exc.status_code, "server_error")
+        detail = _safe_custom_provider_upstream_detail(exc.body, provider.api_key)
+        return JSONResponse(
+            server_support._openai_error_body(error_type, detail),
             status_code=exc.status_code,
         )
     except httpx.HTTPError as exc:
+        detail = _safe_custom_provider_exception_detail(exc, provider.api_key)
         return JSONResponse(
             server_support._openai_error_body(
-                "server_error", f"failed to reach custom provider {name!r}: {exc}"
+                "server_error", f"failed to reach custom provider: {detail}"
             ),
             status_code=502,
         )
@@ -313,7 +333,12 @@ async def _handle_admin_kimi_models(request: Request) -> JSONResponse:
     if not isinstance(backend, AnthropicBackend):
         raise RuntimeError("kimi route backend must use the Anthropic Messages wire")
     if backend.catalog_loader is None:
-        raise RuntimeError("kimi route backend does not provide a model catalog")
+        return JSONResponse(
+            server_support._openai_error_body(
+                "not_found_error", "Kimi does not provide a model catalog"
+            ),
+            status_code=404,
+        )
     try:
         catalog = await backend.catalog_loader()
     except KimiAuthError as exc:
@@ -368,27 +393,43 @@ async def _probe_responses_route(
     return model if isinstance(model, str) else target
 
 
-async def _probe_kimi_route(
-    transport: AnthropicMessagesTransport, target_model: str
+async def _probe_anthropic_route(
+    backend: AnthropicBackend, request: Request, target_model: str
 ) -> str:
     claude_request = {
         "model": target_model,
         "max_tokens": 16,
         "messages": [{"role": "user", "content": "ping"}],
     }
-    headers = {
-        "content-type": "application/json",
-        "anthropic-version": "2023-06-01",
-        "anthropic-beta": "oauth-2025-04-20",
-    }
-    response = await transport.send_messages(json.dumps(claude_request).encode(), headers)
+    headers = backend.header_policy(request)
+    response = await backend.transport.send_messages(
+        json.dumps(claude_request).encode(), headers
+    )
+    # httpx auto-closes a fully read stream. Reserve that close for the
+    # explicit ownership paths below so each path attempts it exactly once.
+    close_response = response.aclose
+
+    async def defer_automatic_close() -> None:
+        return None
+
+    response.aclose = defer_automatic_close
     try:
         payload = await response.aread()
-    finally:
-        await response.aclose()
+    except BaseException:
+        response.aclose = close_response
+        try:
+            await close_response()
+        except BaseException:
+            # The read failure is the operation's primary error; cleanup must
+            # not replace it or disclose an unrelated cleanup diagnostic.
+            pass
+        raise
+    else:
+        response.aclose = close_response
+        await close_response()
     try:
         parsed = json.loads(payload)
-    except json.JSONDecodeError:
+    except (ValueError, RecursionError):
         return target_model
     model = parsed.get("model") if isinstance(parsed, dict) else None
     return model if isinstance(model, str) else target_model
@@ -438,25 +479,62 @@ async def _handle_admin_connection_test(request: Request) -> JSONResponse:
     try:
         route = parse_route_target(target, config.route_providers)
     except ConfigError as exc:
+        detail = _safe_route_target_error_detail(exc, config)
         return JSONResponse(
-            server_support._openai_error_body("invalid_request_error", str(exc)), status_code=400
+            server_support._openai_error_body("invalid_request_error", detail),
+            status_code=400,
         )
 
-    backend = _get_route_backend(request, route.provider)
+    custom_provider = None
+    if route.provider in config.custom_providers:
+        try:
+            custom_provider, backend = _get_custom_provider_binding(
+                config, request.app.state.route_backends, route.provider
+            )
+        except RuntimeError:
+            return JSONResponse(
+                server_support._openai_error_body(
+                    "server_error", "custom provider binding is unavailable"
+                ),
+                status_code=500,
+            )
+    else:
+        backend = _get_route_backend(request, route.provider)
     try:
         if isinstance(backend, AnthropicBackend):
-            probe = _probe_kimi_route(backend.transport, route.model)
+            probe = _probe_anthropic_route(backend, request, route.model)
         else:
             probe = _probe_responses_route(
                 backend, route.provider, route.model
             )
         response_model = await asyncio.wait_for(probe, _CONNECTION_TEST_TIMEOUT)
     except UpstreamError as exc:
-        return result(False, exc.status_code, server_support._upstream_error_message(exc.body))
+        detail = (
+            _safe_custom_provider_upstream_detail(
+                exc.body, custom_provider.api_key
+            )
+            if custom_provider is not None
+            else server_support._upstream_error_message(exc.body)
+        )
+        return result(False, exc.status_code, detail)
     except UpstreamAuthError as exc:
-        return result(False, 401, str(exc))
+        detail = (
+            _safe_custom_provider_exception_detail(
+                exc, custom_provider.api_key
+            )
+            if custom_provider is not None
+            else str(exc)
+        )
+        return result(False, 401, detail)
     except TimeoutError:
         return result(False, None, f"no response within {_CONNECTION_TEST_TIMEOUT:.0f}s")
     except httpx.HTTPError as exc:
-        return result(False, None, f"failed to reach the upstream: {exc}")
+        detail = (
+            _safe_custom_provider_exception_detail(
+                exc, custom_provider.api_key
+            )
+            if custom_provider is not None
+            else str(exc)
+        )
+        return result(False, None, f"failed to reach the upstream: {detail}")
     return result(True, 200, response_model=response_model)

@@ -177,6 +177,24 @@ class FailingOpenAICompatibleClient(FakeOpenAICompatibleClient):
         )
 
 
+class SecretBearingStartupClient(FakeOpenAICompatibleClient):
+    def __init__(
+        self,
+        name: str,
+        provider: OpenAICompatibleProvider,
+        *_args: Any,
+        **_kwargs: Any,
+    ) -> None:
+        super().__init__(name, provider)
+        self.catalog_calls = 0
+
+    async def list_models(self) -> list[str]:
+        self.catalog_calls += 1
+        raise httpx.ConnectError(
+            f"startup catalog failed with {self.provider.api_key}"
+        )
+
+
 # The real HOME this process started with, captured before any test ever
 # monkeypatches it -- lets `_create_test_client` tell a still-real HOME
 # (a naive test that never isolated it) apart from one a caller already
@@ -479,6 +497,9 @@ def test_lifespan_builds_complete_parallel_route_backend_registry(
             )
             assert not inspect.iscoroutinefunction(custom_backend.adapt_probe_payload)
             assert custom_backend.signature_namespace == name
+            assert custom_backend.catalog_loader is not None
+            assert custom_backend.catalog_loader.__self__ is state.custom_provider_clients[name]
+            assert custom_backend.catalog_loader.__func__ is FakeOpenAICompatibleClient.list_models
 
         disabled_payload = {"model": "gpt-5.6-sol"}
         disabled_result = asyncio.run(
@@ -617,6 +638,9 @@ def test_lifespan_binds_mixed_custom_provider_families_by_config_type_without_io
             is server._adapt_identity_probe_payload
         )
         assert responses_backend.signature_namespace == "anthropic-by-name"
+        assert responses_backend.catalog_loader is not None
+        assert responses_backend.catalog_loader.__self__ is responses_client
+        assert responses_backend.catalog_loader.__func__ is OpenAICompatibleClient.list_models
 
         anthropic_backend = state.route_backends["openai-by-name"]
         assert isinstance(anthropic_backend, AnthropicBackend)
@@ -634,6 +658,33 @@ def test_lifespan_binds_mixed_custom_provider_families_by_config_type_without_io
         assert set(state.route_backends) == set(config.route_providers)
 
     assert request_count == 0
+
+
+def test_startup_redacts_secret_bearing_custom_provider_http_error(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    config = GatewayConfig(
+        model_map={"opus": "wrtn:upstream-model"},
+        custom_providers={"wrtn": _custom_provider()},
+    )
+    caplog.set_level(logging.WARNING, logger="claudex.server")
+
+    with _create_test_client(
+        monkeypatch,
+        tmp_path,
+        config=config,
+        custom_client=SecretBearingStartupClient,
+    ) as client:
+        selected_client = client.app.state.custom_provider_clients["wrtn"]
+
+    if _CUSTOM_API_KEY in caplog.text:
+        pytest.fail("a configured custom-provider credential was exposed in logs")
+    assert "custom provider unavailable" in caplog.text
+    assert "ConnectError" in caplog.text
+    assert "[REDACTED]" in caplog.text
+    assert selected_client.catalog_calls == 1
 
 
 @pytest.mark.parametrize(
