@@ -20,17 +20,20 @@ from claudex.admin.common import (
     _read_json_object,
     _require_json_content_type,
 )
+from claudex.providers.backends import (
+    AnthropicBackend,
+    AnthropicMessagesTransport,
+    ResponsesBackend,
+    RouteBackend,
+)
 from claudex.providers.codex_auth import CodexAuthError
-from claudex.providers.codex_client import CodexClient, CodexUpstreamError
+from claudex.providers.codex_client import CodexUpstreamError
 from claudex.config import ConfigError, GatewayConfig, parse_route_target
 from claudex.providers.grok_auth import GrokAuthError
-from claudex.providers.grok_client import GrokClient, GrokUpstreamError, sanitize_grok_payload
+from claudex.providers.grok_client import GrokUpstreamError
 from claudex.providers.kimi_auth import KimiAuthError
-from claudex.providers.kimi_client import KimiClient, KimiUpstreamError
-from claudex.providers.openai_compatible_client import (
-    OpenAICompatibleClient,
-    OpenAICompatibleUpstreamError,
-)
+from claudex.providers.kimi_client import KimiUpstreamError
+from claudex.providers.openai_compatible_client import OpenAICompatibleUpstreamError
 from claudex.translate import translate_claude_request_to_codex
 from claudex.upstream_errors import UpstreamAuthError, UpstreamError
 from claudex.claude.usage import fetch_claude_usage
@@ -184,14 +187,31 @@ async def _handle_favicon(request: Request) -> Response:
     )
 
 
+def _get_route_backend(request: Request, provider: str) -> RouteBackend:
+    try:
+        backend = request.app.state.route_backends[provider]
+    except KeyError as exc:
+        raise RuntimeError(
+            f"route backend registry has no binding for provider {provider!r}"
+        ) from exc
+    if not isinstance(backend, (ResponsesBackend, AnthropicBackend)):
+        raise RuntimeError(
+            "route backend registry contains an unsupported binding for "
+            f"provider {provider!r}: {type(backend).__name__}"
+        )
+    return backend
+
+
 async def _handle_admin_codex_models(request: Request) -> JSONResponse:
     """Proxy the live Codex model catalog for the dashboard's model columns."""
     denied = _admin_guard(request)
     if denied is not None:
         return denied
-    codex_client: CodexClient = request.app.state.codex_client
+    backend = _get_route_backend(request, "codex")
+    if not isinstance(backend, ResponsesBackend):
+        raise RuntimeError("codex route backend must use the Responses wire")
     try:
-        models = await codex_client.list_models()
+        models = await backend.transport.list_models()
     except CodexAuthError as exc:
         return JSONResponse(
             server_support._openai_error_body("authentication_error", str(exc)), status_code=401
@@ -220,9 +240,11 @@ async def _handle_admin_grok_models(request: Request) -> JSONResponse:
     denied = _admin_guard(request)
     if denied is not None:
         return denied
-    grok_client: GrokClient = request.app.state.grok_client
+    backend = _get_route_backend(request, "grok")
+    if not isinstance(backend, ResponsesBackend):
+        raise RuntimeError("grok route backend must use the Responses wire")
     try:
-        models = await grok_client.list_models()
+        models = await backend.transport.list_models()
     except GrokAuthError as exc:
         return JSONResponse(
             server_support._openai_error_body("authentication_error", str(exc)), status_code=401
@@ -255,9 +277,11 @@ async def _handle_admin_custom_models(request: Request) -> JSONResponse:
             ),
             status_code=404,
         )
-    custom_client: OpenAICompatibleClient = request.app.state.custom_provider_clients[name]
+    backend = _get_route_backend(request, name)
+    if not isinstance(backend, ResponsesBackend):
+        raise RuntimeError(f"custom provider {name!r} route backend must use the Responses wire")
     try:
-        models = await custom_client.list_models()
+        models = await backend.transport.list_models()
     except OpenAICompatibleUpstreamError as exc:
         error_type = _STATUS_TO_OPENAI_ERROR_TYPE.get(exc.status_code, "server_error")
         return JSONResponse(
@@ -285,9 +309,11 @@ async def _handle_admin_kimi_models(request: Request) -> JSONResponse:
     denied = _admin_guard(request)
     if denied is not None:
         return denied
-    kimi_client: KimiClient = request.app.state.kimi_client
+    backend = _get_route_backend(request, "kimi")
+    if not isinstance(backend, AnthropicBackend):
+        raise RuntimeError("kimi route backend must use the Anthropic Messages wire")
     try:
-        catalog = await kimi_client.list_models()
+        catalog = await backend.transport.list_models()
     except KimiAuthError as exc:
         return JSONResponse(
             server_support._openai_error_body("authentication_error", str(exc)), status_code=401
@@ -309,68 +335,40 @@ async def _handle_admin_kimi_models(request: Request) -> JSONResponse:
 _CONNECTION_TEST_TIMEOUT = 30.0
 
 
-async def _probe_codex_route(codex_client: CodexClient, target: str) -> str:
-    claude_request = {
-        "max_tokens": 16,
-        "messages": [{"role": "user", "content": "ping"}],
-    }
-    payload = translate_claude_request_to_codex(claude_request, target, "low")
-    events = codex_client.stream_responses(payload, payload["prompt_cache_key"])
-    try:
-        first_event = await anext(events, None)
-    finally:
-        await events.aclose()
-    if first_event is None:
-        raise CodexUpstreamError(502, "codex stream ended without any events")
-    response = first_event.get("response") if isinstance(first_event, dict) else None
-    model = response.get("model") if isinstance(response, dict) else None
-    return model if isinstance(model, str) else target
-
-
-async def _probe_grok_route(grok_client: GrokClient, target: str) -> str:
-    claude_request = {
-        "max_tokens": 16,
-        "messages": [{"role": "user", "content": "ping"}],
-    }
-    payload = translate_claude_request_to_codex(claude_request, target, "low")
-    payload = sanitize_grok_payload(payload, target)
-    events = grok_client.stream_responses(payload, payload["prompt_cache_key"])
-    try:
-        first_event = await anext(events, None)
-    finally:
-        await events.aclose()
-    if first_event is None:
-        raise GrokUpstreamError(502, "grok stream ended without any events")
-    response = first_event.get("response") if isinstance(first_event, dict) else None
-    model = response.get("model") if isinstance(response, dict) else None
-    return model if isinstance(model, str) else target
-
-
-async def _probe_custom_route(
-    custom_client: OpenAICompatibleClient, provider_name: str, target: str
+async def _probe_responses_route(
+    backend: ResponsesBackend, provider_name: str, target: str
 ) -> str:
     claude_request = {
         "max_tokens": 16,
         "messages": [{"role": "user", "content": "ping"}],
     }
-    payload = translate_claude_request_to_codex(claude_request, target, "low")
-    events = custom_client.stream_responses(payload, payload["prompt_cache_key"])
+    translated_payload = translate_claude_request_to_codex(
+        claude_request, target, "low"
+    )
+    payload = backend.adapt_probe_payload(translated_payload, target)
+    events = backend.transport.stream_responses(
+        payload, payload["prompt_cache_key"]
+    )
     try:
         first_event = await anext(events, None)
     finally:
         await events.aclose()
     if first_event is None:
-        raise OpenAICompatibleUpstreamError(
-            502,
-            f"custom provider {provider_name!r} stream ended without any events",
-            provider_name,
-        )
+        if backend.signature_namespace is None:
+            detail = f"{provider_name} stream ended without any events"
+        else:
+            detail = (
+                f"custom provider {provider_name!r} stream ended without any events"
+            )
+        raise UpstreamError(502, detail, provider_name)
     response = first_event.get("response") if isinstance(first_event, dict) else None
     model = response.get("model") if isinstance(response, dict) else None
     return model if isinstance(model, str) else target
 
 
-async def _probe_kimi_route(kimi_client: KimiClient, target_model: str) -> str:
+async def _probe_kimi_route(
+    transport: AnthropicMessagesTransport, target_model: str
+) -> str:
     claude_request = {
         "model": target_model,
         "max_tokens": 16,
@@ -381,7 +379,7 @@ async def _probe_kimi_route(kimi_client: KimiClient, target_model: str) -> str:
         "anthropic-version": "2023-06-01",
         "anthropic-beta": "oauth-2025-04-20",
     }
-    response = await kimi_client.send_messages(json.dumps(claude_request).encode(), headers)
+    response = await transport.send_messages(json.dumps(claude_request).encode(), headers)
     try:
         payload = await response.aread()
     finally:
@@ -442,19 +440,14 @@ async def _handle_admin_connection_test(request: Request) -> JSONResponse:
             server_support._openai_error_body("invalid_request_error", str(exc)), status_code=400
         )
 
+    backend = _get_route_backend(request, route.provider)
     try:
-        if route.provider == "kimi":
-            probe = _probe_kimi_route(request.app.state.kimi_client, route.model)
-        elif route.provider == "grok":
-            probe = _probe_grok_route(request.app.state.grok_client, route.model)
-        elif route.provider in config.custom_providers:
-            probe = _probe_custom_route(
-                request.app.state.custom_provider_clients[route.provider],
-                route.provider,
-                route.model,
-            )
+        if isinstance(backend, AnthropicBackend):
+            probe = _probe_kimi_route(backend.transport, route.model)
         else:
-            probe = _probe_codex_route(request.app.state.codex_client, route.model)
+            probe = _probe_responses_route(
+                backend, route.provider, route.model
+            )
         response_model = await asyncio.wait_for(probe, _CONNECTION_TEST_TIMEOUT)
     except UpstreamError as exc:
         return result(False, exc.status_code, server_support._upstream_error_message(exc.body))

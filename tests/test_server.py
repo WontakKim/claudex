@@ -423,6 +423,8 @@ def test_lifespan_builds_complete_parallel_route_backend_registry(
         codex_backend = route_backends["codex"]
         assert isinstance(codex_backend, ResponsesBackend)
         assert codex_backend.transport is state.codex_client
+        assert codex_backend.adapt_probe_payload is server._adapt_identity_probe_payload
+        assert not inspect.iscoroutinefunction(codex_backend.adapt_probe_payload)
         assert codex_backend.signature_namespace is None
 
         kimi_backend = route_backends["kimi"]
@@ -436,12 +438,19 @@ def test_lifespan_builds_complete_parallel_route_backend_registry(
         grok_backend = route_backends["grok"]
         assert isinstance(grok_backend, ResponsesBackend)
         assert grok_backend.transport is state.grok_client
+        assert grok_backend.adapt_probe_payload is server.sanitize_grok_payload
+        assert not inspect.iscoroutinefunction(grok_backend.adapt_probe_payload)
         assert grok_backend.signature_namespace is None
 
         for name in ("wrtn", "gemini-primary"):
             custom_backend = route_backends[name]
             assert isinstance(custom_backend, ResponsesBackend)
             assert custom_backend.transport is state.custom_provider_clients[name]
+            assert (
+                custom_backend.adapt_probe_payload
+                is server._adapt_identity_probe_payload
+            )
+            assert not inspect.iscoroutinefunction(custom_backend.adapt_probe_payload)
             assert custom_backend.signature_namespace == name
 
         disabled_payload = {"model": "gpt-5.6-sol"}
@@ -455,6 +464,14 @@ def test_lifespan_builds_complete_parallel_route_backend_registry(
         state.config = GatewayConfig(
             custom_providers=config.custom_providers, codex_service_tier="fast"
         )
+        probe_payload = {"model": "gpt-5.6-sol"}
+        probe_result = codex_backend.adapt_probe_payload(
+            probe_payload, "gpt-5.6-sol"
+        )
+        assert probe_result is probe_payload
+        assert "service_tier" not in probe_payload
+        assert state.codex_client.fast_tier_models == []
+
         fast_payload = {"model": "gpt-5.6-sol"}
         fast_result = asyncio.run(
             codex_backend.adapt_payload(fast_payload, "gpt-5.6-sol")
@@ -475,6 +492,19 @@ def test_lifespan_builds_complete_parallel_route_backend_registry(
             "unknown-model",
         ]
 
+        grok_probe_payload = {
+            "model": "grok-4.5",
+            "reasoning": {"effort": "future-effort"},
+            "service_tier": "priority",
+        }
+        grok_probe_result = grok_backend.adapt_probe_payload(
+            grok_probe_payload, "grok-4.5"
+        )
+        assert grok_probe_result is not grok_probe_payload
+        assert "service_tier" not in grok_probe_result
+        assert grok_probe_result["reasoning"] is grok_probe_payload["reasoning"]
+        assert grok_probe_payload["reasoning"]["effort"] == "medium"
+
         grok_payload = {
             "model": "grok-4.5",
             "reasoning": {"effort": "future-effort"},
@@ -489,10 +519,13 @@ def test_lifespan_builds_complete_parallel_route_backend_registry(
         assert grok_result["reasoning"]["effort"] == "medium"
 
         custom_payload = {"model": "gemini-2.5-pro", "input": []}
+        custom_backend = route_backends["gemini-primary"]
+        custom_probe_result = custom_backend.adapt_probe_payload(
+            custom_payload, "gemini-2.5-pro"
+        )
+        assert custom_probe_result is custom_payload
         custom_result = asyncio.run(
-            route_backends["gemini-primary"].adapt_payload(
-                custom_payload, "gemini-2.5-pro"
-            )
+            custom_backend.adapt_payload(custom_payload, "gemini-2.5-pro")
         )
         assert custom_result is custom_payload
         assert custom_payload == {"model": "gemini-2.5-pro", "input": []}
@@ -559,8 +592,33 @@ def test_responses_dispatch_reads_route_registry_without_provider_client_branche
     ):
         assert legacy_dispatch not in relay_source
 
-    for unchanged_module in (relay_endpoints, relay_kimi, admin_system):
+    for unchanged_module in (relay_endpoints, relay_kimi):
         assert "route_backends" not in inspect.getsource(unchanged_module)
+
+
+def test_admin_connection_probe_selects_transport_and_payload_policy_from_binding() -> None:
+    handler_source = inspect.getsource(admin_system._handle_admin_connection_test)
+    responses_probe_source = inspect.getsource(admin_system._probe_responses_route)
+    registry_source = inspect.getsource(admin_system._get_route_backend)
+    assert "route_backends" in registry_source
+    assert responses_probe_source.count("backend.adapt_probe_payload(") == 1
+    assert "backend.transport.stream_responses(" in responses_probe_source
+    assert "list_models" not in responses_probe_source
+    assert "adapt_probe_payload" not in inspect.getsource(
+        relay_openai_backend._relay_via_responses_backend
+    )
+    for legacy_selection in (
+        "request.app.state.codex_client",
+        "request.app.state.kimi_client",
+        "request.app.state.grok_client",
+        "request.app.state.custom_provider_clients",
+        'route.provider == "codex"',
+        'route.provider == "grok"',
+        'route.provider == "kimi"',
+        "sanitize_grok_payload",
+    ):
+        assert legacy_selection not in handler_source
+        assert legacy_selection not in responses_probe_source
 
 
 def test_messages_routes_enforce_local_bearer_token(

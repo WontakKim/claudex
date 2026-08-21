@@ -20,6 +20,7 @@ from claudex.providers.backends import (
     AnthropicTokenCounter,
     ResponsesBackend,
     ResponsesPayloadAdapter,
+    ResponsesProbePayloadAdapter,
     ResponsesTransport,
     RouteBackend,
     WireKind,
@@ -72,6 +73,12 @@ async def _adapt_payload(
     return {**payload, "model": model}
 
 
+def _adapt_probe_payload(
+    payload: dict[str, Any], model: str
+) -> dict[str, Any]:
+    return {**payload, "model": model, "probe": True}
+
+
 def _header_policy(request: Request) -> dict[str, str]:
     return {"x-request-path": request.url.path}
 
@@ -111,7 +118,9 @@ def test_wire_kind_is_closed_to_the_two_supported_wire_protocols() -> None:
 
 
 def test_backend_type_determines_wire_kind_without_redundant_instance_field() -> None:
-    responses = ResponsesBackend(_ResponsesTransport(), _adapt_payload, None)
+    responses = ResponsesBackend(
+        _ResponsesTransport(), _adapt_payload, _adapt_probe_payload, None
+    )
     anthropic = AnthropicBackend(
         _AnthropicMessagesTransport(),
         _header_policy,
@@ -122,6 +131,7 @@ def test_backend_type_determines_wire_kind_without_redundant_instance_field() ->
     assert [field.name for field in fields(ResponsesBackend)] == [
         "transport",
         "adapt_payload",
+        "adapt_probe_payload",
         "signature_namespace",
     ]
     assert [field.name for field in fields(AnthropicBackend)] == [
@@ -141,6 +151,7 @@ def test_backend_fields_retain_the_declared_callable_contracts() -> None:
 
     assert responses_hints["transport"] is ResponsesTransport
     assert responses_hints["adapt_payload"] == ResponsesPayloadAdapter
+    assert responses_hints["adapt_probe_payload"] == ResponsesProbePayloadAdapter
     assert responses_hints["signature_namespace"] == str | None
     assert anthropic_hints["transport"] is AnthropicMessagesTransport
     assert anthropic_hints["header_policy"] == AnthropicHeaderPolicy
@@ -150,8 +161,18 @@ def test_backend_fields_retain_the_declared_callable_contracts() -> None:
 
 def test_binding_callables_follow_the_existing_relay_call_shapes() -> None:
     async def scenario() -> None:
-        responses = ResponsesBackend(_ResponsesTransport(), _adapt_payload, "custom")
+        responses = ResponsesBackend(
+            _ResponsesTransport(), _adapt_payload, _adapt_probe_payload, "custom"
+        )
         payload = await responses.adapt_payload({"input": []}, "responses-model")
+        probe_payload = responses.adapt_probe_payload(
+            {"input": []}, "responses-model"
+        )
+        assert probe_payload == {
+            "input": [],
+            "model": "responses-model",
+            "probe": True,
+        }
         events = [
             event
             async for event in responses.transport.stream_responses(payload, "session-1")
@@ -193,6 +214,22 @@ def test_binding_callables_follow_the_existing_relay_call_shapes() -> None:
         assert token_response.json() == {"input_tokens": 2, "header_count": 1}
 
     asyncio.run(scenario())
+
+
+def test_probe_payload_adapter_contract_is_synchronous_and_purely_structural() -> None:
+    parameter_types, return_type = _callable_contract(ResponsesProbePayloadAdapter)
+    assert parameter_types == (dict[str, Any], str)
+    assert return_type == dict[str, Any]
+    assert _parameter_shape(_adapt_probe_payload) == (
+        ("payload", inspect.Parameter.POSITIONAL_OR_KEYWORD),
+        ("model", inspect.Parameter.POSITIONAL_OR_KEYWORD),
+    )
+    assert not inspect.iscoroutinefunction(_adapt_probe_payload)
+    assert get_type_hints(_adapt_probe_payload) == {
+        "payload": dict[str, Any],
+        "model": str,
+        "return": dict[str, Any],
+    }
 
 
 def test_kimi_binding_candidates_match_declared_policy_contracts() -> None:

@@ -12,6 +12,7 @@ from starlette.responses import JSONResponse
 
 import claudex
 from claudex import server_support
+from claudex.providers.backends import ResponsesBackend
 from claudex.providers.codex_auth import CodexAuthError, CodexAuthManager
 from claudex.config import GatewayConfig
 from claudex.providers.grok_auth import GrokAuthError, GrokAuthManager
@@ -101,10 +102,20 @@ async def _handle_health(request: Request) -> JSONResponse:
         providers["grok"] = {"status": "error", "detail": str(exc), "required": grok_required}
 
     custom_providers_ready = True
-    for name, custom_client in request.app.state.custom_provider_clients.items():
+    for name in config.custom_providers:
+        try:
+            backend = request.app.state.route_backends[name]
+        except KeyError as exc:
+            raise RuntimeError(
+                f"route backend registry has no binding for provider {name!r}"
+            ) from exc
+        if not isinstance(backend, ResponsesBackend):
+            raise RuntimeError(
+                f"custom provider {name!r} route backend must use the Responses wire"
+            )
         required = config.maps_to_provider(name)
         try:
-            await custom_client.list_models()
+            await backend.transport.list_models()
             providers[name] = {"status": "ok", "required": required}
         except (UpstreamError, httpx.HTTPError) as exc:
             providers[name] = {"status": "error", "detail": str(exc), "required": required}

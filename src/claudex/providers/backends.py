@@ -53,6 +53,9 @@ class AnthropicMessagesTransport(Protocol):
 ResponsesPayloadAdapter: TypeAlias = Callable[
     [dict[str, Any], str], Awaitable[dict[str, Any]]
 ]
+ResponsesProbePayloadAdapter: TypeAlias = Callable[
+    [dict[str, Any], str], dict[str, Any]
+]
 AnthropicHeaderPolicy: TypeAlias = Callable[[Request], dict[str, str]]
 AnthropicErrorPolicy: TypeAlias = Callable[
     [KimiUpstreamError], tuple[int, dict[str, Any]]
@@ -73,6 +76,7 @@ class ResponsesBackend:
 
     transport: ResponsesTransport
     adapt_payload: ResponsesPayloadAdapter
+    adapt_probe_payload: ResponsesProbePayloadAdapter
     signature_namespace: str | None
 
 

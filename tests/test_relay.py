@@ -1534,6 +1534,11 @@ def test_responses_backend_translates_then_awaits_adapter_and_uses_bound_transpo
         assert payload is translated_payload
         return adapted_payload
 
+    def adapt_probe_payload(
+        payload: dict[str, Any], model: str
+    ) -> dict[str, Any]:
+        return payload
+
     class RecordingTransport(StubCodexClient):
         async def stream_responses(
             self, payload: dict[str, Any], session_id: str
@@ -1567,6 +1572,7 @@ def test_responses_backend_translates_then_awaits_adapter_and_uses_bound_transpo
     client.app.state.route_backends[provider] = ResponsesBackend(
         transport=selected_transport,
         adapt_payload=adapt_payload,
+        adapt_probe_payload=adapt_probe_payload,
         signature_namespace=signature_namespace,
     )
 

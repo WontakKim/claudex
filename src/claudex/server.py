@@ -97,6 +97,12 @@ async def _adapt_identity_payload(
     return payload
 
 
+def _adapt_identity_probe_payload(
+    payload: dict[str, Any], model: str
+) -> dict[str, Any]:
+    return payload
+
+
 def _assemble_route_backends(
     app: Starlette,
     config: GatewayConfig,
@@ -124,6 +130,7 @@ def _assemble_route_backends(
         "codex": ResponsesBackend(
             transport=codex_client,
             adapt_payload=adapt_codex_payload,
+            adapt_probe_payload=_adapt_identity_probe_payload,
             signature_namespace=None,
         ),
         "kimi": AnthropicBackend(
@@ -135,6 +142,7 @@ def _assemble_route_backends(
         "grok": ResponsesBackend(
             transport=grok_client,
             adapt_payload=_adapt_grok_payload,
+            adapt_probe_payload=sanitize_grok_payload,
             signature_namespace=None,
         ),
     }
@@ -143,6 +151,7 @@ def _assemble_route_backends(
             name: ResponsesBackend(
                 transport=client,
                 adapt_payload=_adapt_identity_payload,
+                adapt_probe_payload=_adapt_identity_probe_payload,
                 signature_namespace=name,
             )
             for name, client in custom_provider_clients.items()
