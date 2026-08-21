@@ -38,6 +38,7 @@ from claudex.claude.auth import CLAUDE_TOKEN_URL
 from claudex.balanced.router import ClaudeBalancedRouter
 from claudex.balanced.runtime import ClaudeBalancedRuntime
 from claudex.balanced.selection import derive_session_key
+from claudex.providers.backends import ResponsesBackend
 from claudex.providers.codex_client import (
     CODEX_MODELS_URL,
     CODEX_RESPONSES_URL,
@@ -447,8 +448,9 @@ def _gateway(
     app.state.http_client = httpx.AsyncClient(
         transport=httpx.MockTransport(anthropic_handler)
     )
+    kimi_backend_client: Any = FakeKimiClient()
     if kimi_handler is not None or kimi_auth is not None:
-        app.state.kimi_client = KimiClient(
+        kimi_backend_client = KimiClient(
             kimi_auth or AvailableKimiAuthManager(),
             httpx.AsyncClient(
                 transport=httpx.MockTransport(
@@ -456,9 +458,19 @@ def _gateway(
                 )
             ),
         )
-    if grok_client is not None:
-        app.state.grok_client = grok_client
-    app.state.custom_provider_clients = custom_provider_clients or {}
+    grok_backend_client = grok_client or FakeGrokClient()
+    custom_backend_clients = custom_provider_clients or {}
+    app.state.kimi_client = kimi_backend_client
+    app.state.grok_client = grok_backend_client
+    app.state.custom_provider_clients = custom_backend_clients
+    app.state.route_backends = server._assemble_route_backends(
+        app,
+        config,
+        stub,
+        kimi_backend_client,
+        grok_backend_client,
+        custom_backend_clients,
+    )
     return TestClient(app), stub
 
 
@@ -884,6 +896,9 @@ def test_non_streaming_mid_stream_overflow_reports_numbers() -> None:
     app.state.http_client = httpx.AsyncClient(
         transport=httpx.MockTransport(_failing_anthropic_handler)
     )
+    app.state.route_backends = server._assemble_route_backends(
+        app, config, stub, FakeKimiClient(), FakeGrokClient(), {}
+    )
     client = TestClient(app)
 
     response = client.post("/v1/messages", json=_message_body("claude-opus-4-6"))
@@ -938,6 +953,14 @@ def test_context_window_cache_is_reused_across_requests() -> None:
     )
     app.state.http_client = httpx.AsyncClient(
         transport=httpx.MockTransport(_failing_anthropic_handler)
+    )
+    app.state.route_backends = server._assemble_route_backends(
+        app,
+        config,
+        app.state.codex_client,
+        FakeKimiClient(),
+        FakeGrokClient(),
+        {},
     )
     client = TestClient(app)
 
@@ -1473,6 +1496,109 @@ class StubOpenAICompatibleClient:
             yield event
 
 
+@pytest.mark.parametrize(
+    ("provider", "signature_namespace"),
+    [("codex", None), ("wrtn", "wrtn")],
+)
+def test_responses_backend_translates_then_awaits_adapter_and_uses_bound_transport(
+    monkeypatch: pytest.MonkeyPatch,
+    provider: str,
+    signature_namespace: str | None,
+) -> None:
+    upstream_model = "selected-model"
+    call_order: list[tuple[Any, ...]] = []
+    translated_payload = {
+        "model": upstream_model,
+        "prompt_cache_key": "session-1",
+        "input": [],
+    }
+    adapted_payload = {**translated_payload, "adapted": True}
+
+    def recording_translate(
+        claude_request: dict[str, Any],
+        model: str,
+        reasoning_effort_override: str | None,
+        *,
+        service_tier: str | None = None,
+        custom_provider: str | None = None,
+    ) -> dict[str, Any]:
+        call_order.append(("translate", custom_provider))
+        assert model == upstream_model
+        assert service_tier is None
+        return translated_payload
+
+    async def adapt_payload(
+        payload: dict[str, Any], model: str
+    ) -> dict[str, Any]:
+        call_order.append(("adapt", payload, model))
+        assert payload is translated_payload
+        return adapted_payload
+
+    class RecordingTransport(StubCodexClient):
+        async def stream_responses(
+            self, payload: dict[str, Any], session_id: str
+        ) -> AsyncIterator[dict[str, Any]]:
+            call_order.append(("stream", payload, session_id))
+            self.payloads.append(payload)
+            raise CodexUpstreamError(503, "selected transport")
+            yield
+
+    monkeypatch.setattr(
+        relay_openai_backend,
+        "translate_claude_request_to_codex",
+        recording_translate,
+    )
+    custom_providers = {"wrtn": _custom_provider()} if provider == "wrtn" else {}
+    configured_custom_transport = StubOpenAICompatibleClient()
+    custom_transports = (
+        {"wrtn": configured_custom_transport} if provider == "wrtn" else {}
+    )
+    config = GatewayConfig(
+        model_map={"opus": f"{provider}:{upstream_model}"},
+        context_window_map={f"{provider}:{upstream_model}": 100_000},
+        custom_providers=custom_providers,
+    )
+    client, codex_transport = _gateway(
+        config,
+        _failing_anthropic_handler,
+        custom_provider_clients=custom_transports,
+    )
+    selected_transport = RecordingTransport()
+    client.app.state.route_backends[provider] = ResponsesBackend(
+        transport=selected_transport,
+        adapt_payload=adapt_payload,
+        signature_namespace=signature_namespace,
+    )
+
+    response = client.post(
+        "/v1/messages", json=_message_body("claude-opus-4-6")
+    )
+
+    assert response.status_code == 503
+    assert call_order == [
+        ("translate", signature_namespace),
+        ("adapt", translated_payload, upstream_model),
+        ("stream", adapted_payload, "session-1"),
+    ]
+    assert selected_transport.payloads == [adapted_payload]
+    assert codex_transport.payloads == []
+    assert configured_custom_transport.payloads == []
+
+
+def test_responses_relay_rejects_anthropic_wire_backend() -> None:
+    config = GatewayConfig(model_map={"opus": "codex:gpt-5.6-sol"})
+    client, _ = _gateway(config, _failing_anthropic_handler)
+    client.app.state.route_backends["codex"] = client.app.state.route_backends[
+        "kimi"
+    ]
+
+    with pytest.raises(
+        RuntimeError,
+        match="route backend 'codex' cannot serve the Responses relay",
+    ):
+        client.post("/v1/messages", json=_message_body("claude-opus-4-6"))
+
+
 def test_custom_provider_route_uses_custom_client_without_builtin_payload_mutations(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1484,11 +1610,13 @@ def test_custom_provider_route_uses_custom_client_without_builtin_payload_mutati
         codex_service_tier="fast",
     )
 
-    def unexpected_grok_sanitizer(payload: dict[str, Any], model: str) -> dict[str, Any]:
-        raise AssertionError("Grok sanitizer must not run for a custom provider")
+    async def unexpected_grok_adapter(
+        payload: dict[str, Any], model: str
+    ) -> dict[str, Any]:
+        raise AssertionError("Grok adapter must not run for a custom provider")
 
-    monkeypatch.setattr(relay_openai_backend, "sanitize_grok_payload", unexpected_grok_sanitizer)
-    assert relay_openai_backend.sanitize_grok_payload is unexpected_grok_sanitizer
+    monkeypatch.setattr(server, "_adapt_grok_payload", unexpected_grok_adapter)
+    assert server._adapt_grok_payload is unexpected_grok_adapter
     client, codex_stub = _gateway(
         config,
         _failing_anthropic_handler,

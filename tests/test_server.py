@@ -544,9 +544,23 @@ def test_route_backend_registry_mismatch_fails_at_boot(
     assert str(exc_info.value) == expected_message
 
 
-def test_existing_dispatch_modules_do_not_read_parallel_route_registry() -> None:
-    for module in (relay_endpoints, relay_openai_backend, relay_kimi, admin_system):
-        assert "route_backends" not in inspect.getsource(module)
+def test_responses_dispatch_reads_route_registry_without_provider_client_branches() -> None:
+    relay_source = inspect.getsource(
+        relay_openai_backend._relay_via_responses_backend
+    )
+    assert "route_backends" in relay_source
+    for legacy_dispatch in (
+        "codex_client",
+        "grok_client",
+        "custom_provider_clients",
+        "sanitize_grok_payload",
+        'provider == "codex"',
+        'provider == "grok"',
+    ):
+        assert legacy_dispatch not in relay_source
+
+    for unchanged_module in (relay_endpoints, relay_kimi, admin_system):
+        assert "route_backends" not in inspect.getsource(unchanged_module)
 
 
 def test_messages_routes_enforce_local_bearer_token(
@@ -623,8 +637,9 @@ def _gateway(
     app.state.http_client = httpx.AsyncClient(
         transport=httpx.MockTransport(anthropic_handler)
     )
+    kimi_backend_client: Any = FakeKimiClient()
     if kimi_handler is not None or kimi_auth is not None:
-        app.state.kimi_client = KimiClient(
+        kimi_backend_client = KimiClient(
             kimi_auth or AvailableKimiAuthManager(),
             httpx.AsyncClient(
                 transport=httpx.MockTransport(
@@ -632,9 +647,19 @@ def _gateway(
                 )
             ),
         )
-    if grok_client is not None:
-        app.state.grok_client = grok_client
-    app.state.custom_provider_clients = custom_provider_clients or {}
+    grok_backend_client = grok_client or FakeGrokClient()
+    custom_backend_clients = custom_provider_clients or {}
+    app.state.kimi_client = kimi_backend_client
+    app.state.grok_client = grok_backend_client
+    app.state.custom_provider_clients = custom_backend_clients
+    app.state.route_backends = server._assemble_route_backends(
+        app,
+        config,
+        stub,
+        kimi_backend_client,
+        grok_backend_client,
+        custom_backend_clients,
+    )
     return TestClient(app), stub
 
 
