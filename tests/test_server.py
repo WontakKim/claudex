@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import time
@@ -18,6 +19,8 @@ from starlette.testclient import TestClient
 
 import claudex.admin.settings as admin_settings
 import claudex.admin.system as admin_system
+import claudex.relay.endpoints as relay_endpoints
+import claudex.relay.kimi as relay_kimi
 import claudex.relay.openai_backend as relay_openai_backend
 import claudex.server as server
 import claudex.server_support as server_support
@@ -30,7 +33,8 @@ from claudex.balanced.runtime import ClaudeBalancedRuntime
 from claudex.balanced.selection import derive_session_key
 from claudex.balanced.state_model import RestoreValidationContext
 from claudex.balanced.state_store import ClaudePoolRuntimeStateStore
-from claudex.providers.codex_client import CodexUpstreamError
+from claudex.providers.backends import AnthropicBackend, ResponsesBackend
+from claudex.providers.codex_client import CODEX_FAST_TIER_WIRE_VALUE, CodexUpstreamError
 from claudex.config import ConfigError, GatewayConfig, OpenAICompatibleProvider
 from claudex.providers.kimi_auth import KimiCredentials
 from claudex.providers.kimi_client import KimiClient, KimiUpstreamError
@@ -87,6 +91,11 @@ class MissingKimiAuthManager(AvailableKimiAuthManager):
 class FakeKimiClient:
     def __init__(self, *_args: Any, **_kwargs: Any) -> None:
         pass
+
+    async def count_tokens(
+        self, body: bytes, headers: dict[str, str]
+    ) -> httpx.Response:
+        return httpx.Response(200, json={"input_tokens": 1})
 
 
 class AvailableGrokAuthManager:
@@ -373,6 +382,248 @@ def test_route_ownership_matches_surface_modules() -> None:
     }
 
 
+def test_lifespan_builds_complete_parallel_route_backend_registry(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    class ConfigurableFastTierCodexClient(FakeCodexClient):
+        def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+            self.is_fast_tier_supported = True
+            self.fast_tier_models: list[str] = []
+
+        async def supports_fast_tier(self, model: str) -> bool:
+            self.fast_tier_models.append(model)
+            return self.is_fast_tier_supported
+
+    config = GatewayConfig(
+        custom_providers={
+            "wrtn": _custom_provider(),
+            "gemini-primary": _custom_provider(),
+        }
+    )
+    with _create_test_client(
+        monkeypatch,
+        tmp_path,
+        config=config,
+        codex_client=ConfigurableFastTierCodexClient,
+    ) as client:
+        state = client.app.state
+        route_backends = state.route_backends
+
+        assert set(route_backends) == set(config.route_providers)
+        assert set(route_backends) == {
+            "codex",
+            "kimi",
+            "grok",
+            "wrtn",
+            "gemini-primary",
+        }
+        assert "claude" not in route_backends
+        assert "anthropic" not in route_backends
+
+        codex_backend = route_backends["codex"]
+        assert isinstance(codex_backend, ResponsesBackend)
+        assert codex_backend.transport is state.codex_client
+        assert codex_backend.adapt_probe_payload is server._adapt_identity_probe_payload
+        assert not inspect.iscoroutinefunction(codex_backend.adapt_probe_payload)
+        assert codex_backend.signature_namespace is None
+
+        kimi_backend = route_backends["kimi"]
+        assert isinstance(kimi_backend, AnthropicBackend)
+        assert kimi_backend.transport is state.kimi_client
+        assert kimi_backend.header_policy is relay_kimi._kimi_request_headers
+        assert kimi_backend.error_policy is relay_kimi._kimi_error_to_claude
+        assert kimi_backend.token_counter.__self__ is state.kimi_client
+        assert kimi_backend.token_counter.__func__ is FakeKimiClient.count_tokens
+
+        grok_backend = route_backends["grok"]
+        assert isinstance(grok_backend, ResponsesBackend)
+        assert grok_backend.transport is state.grok_client
+        assert grok_backend.adapt_probe_payload is server.sanitize_grok_payload
+        assert not inspect.iscoroutinefunction(grok_backend.adapt_probe_payload)
+        assert grok_backend.signature_namespace is None
+
+        for name in ("wrtn", "gemini-primary"):
+            custom_backend = route_backends[name]
+            assert isinstance(custom_backend, ResponsesBackend)
+            assert custom_backend.transport is state.custom_provider_clients[name]
+            assert (
+                custom_backend.adapt_probe_payload
+                is server._adapt_identity_probe_payload
+            )
+            assert not inspect.iscoroutinefunction(custom_backend.adapt_probe_payload)
+            assert custom_backend.signature_namespace == name
+
+        disabled_payload = {"model": "gpt-5.6-sol"}
+        disabled_result = asyncio.run(
+            codex_backend.adapt_payload(disabled_payload, "gpt-5.6-sol")
+        )
+        assert disabled_result is disabled_payload
+        assert "service_tier" not in disabled_payload
+        assert state.codex_client.fast_tier_models == []
+
+        state.config = GatewayConfig(
+            custom_providers=config.custom_providers, codex_service_tier="fast"
+        )
+        probe_payload = {"model": "gpt-5.6-sol"}
+        probe_result = codex_backend.adapt_probe_payload(
+            probe_payload, "gpt-5.6-sol"
+        )
+        assert probe_result is probe_payload
+        assert "service_tier" not in probe_payload
+        assert state.codex_client.fast_tier_models == []
+
+        fast_payload = {"model": "gpt-5.6-sol"}
+        fast_result = asyncio.run(
+            codex_backend.adapt_payload(fast_payload, "gpt-5.6-sol")
+        )
+        assert fast_result is fast_payload
+        assert fast_payload["service_tier"] == CODEX_FAST_TIER_WIRE_VALUE
+        assert state.codex_client.fast_tier_models == ["gpt-5.6-sol"]
+
+        state.codex_client.is_fast_tier_supported = False
+        fallback_payload = {"model": "unknown-model"}
+        fallback_result = asyncio.run(
+            codex_backend.adapt_payload(fallback_payload, "unknown-model")
+        )
+        assert fallback_result is fallback_payload
+        assert "service_tier" not in fallback_payload
+        assert state.codex_client.fast_tier_models == [
+            "gpt-5.6-sol",
+            "unknown-model",
+        ]
+
+        grok_probe_payload = {
+            "model": "grok-4.5",
+            "reasoning": {"effort": "future-effort"},
+            "service_tier": "priority",
+        }
+        grok_probe_result = grok_backend.adapt_probe_payload(
+            grok_probe_payload, "grok-4.5"
+        )
+        assert grok_probe_result is not grok_probe_payload
+        assert "service_tier" not in grok_probe_result
+        assert grok_probe_result["reasoning"] is grok_probe_payload["reasoning"]
+        assert grok_probe_payload["reasoning"]["effort"] == "medium"
+
+        grok_payload = {
+            "model": "grok-4.5",
+            "reasoning": {"effort": "future-effort"},
+            "service_tier": "priority",
+        }
+        grok_result = asyncio.run(
+            grok_backend.adapt_payload(grok_payload, "grok-4.5")
+        )
+        assert grok_result is not grok_payload
+        assert "service_tier" not in grok_result
+        assert grok_result["reasoning"] is grok_payload["reasoning"]
+        assert grok_result["reasoning"]["effort"] == "medium"
+
+        custom_payload = {"model": "gemini-2.5-pro", "input": []}
+        custom_backend = route_backends["gemini-primary"]
+        custom_probe_result = custom_backend.adapt_probe_payload(
+            custom_payload, "gemini-2.5-pro"
+        )
+        assert custom_probe_result is custom_payload
+        custom_result = asyncio.run(
+            custom_backend.adapt_payload(custom_payload, "gemini-2.5-pro")
+        )
+        assert custom_result is custom_payload
+        assert custom_payload == {"model": "gemini-2.5-pro", "input": []}
+
+
+@pytest.mark.parametrize(
+    ("config", "custom_provider_clients", "expected_message"),
+    [
+        (
+            GatewayConfig(custom_providers={"wrtn": _custom_provider()}),
+            {},
+            "route backend registry mismatch: "
+            "configured=['codex', 'grok', 'kimi', 'wrtn']; "
+            "clients=['codex', 'grok', 'kimi']; "
+            "backends=['codex', 'grok', 'kimi']",
+        ),
+        (
+            GatewayConfig(),
+            {
+                "wrtn": FakeOpenAICompatibleClient(
+                    "wrtn", _custom_provider()
+                )
+            },
+            "route backend registry mismatch: "
+            "configured=['codex', 'grok', 'kimi']; "
+            "clients=['codex', 'grok', 'kimi', 'wrtn']; "
+            "backends=['codex', 'grok', 'kimi', 'wrtn']",
+        ),
+    ],
+)
+def test_route_backend_registry_mismatch_fails_at_boot(
+    config: GatewayConfig,
+    custom_provider_clients: dict[str, FakeOpenAICompatibleClient],
+    expected_message: str,
+) -> None:
+    app = server.create_app(config)
+    app.state.config = config
+
+    with pytest.raises(RuntimeError, match="route backend registry mismatch") as exc_info:
+        server._assemble_route_backends(
+            app,
+            config,
+            FakeCodexClient(),
+            FakeKimiClient(),
+            FakeGrokClient(),
+            custom_provider_clients,
+        )
+
+    assert str(exc_info.value) == expected_message
+
+
+def test_responses_dispatch_reads_route_registry_without_provider_client_branches() -> None:
+    relay_source = inspect.getsource(
+        relay_openai_backend._relay_via_responses_backend
+    )
+    assert "route_backends" in relay_source
+    for legacy_dispatch in (
+        "codex_client",
+        "grok_client",
+        "custom_provider_clients",
+        "sanitize_grok_payload",
+        'provider == "codex"',
+        'provider == "grok"',
+    ):
+        assert legacy_dispatch not in relay_source
+
+    endpoint_source = inspect.getsource(relay_endpoints)
+    assert "route_backends" in endpoint_source
+    assert 'route.provider == "kimi"' not in endpoint_source
+    assert "kimi_client" not in endpoint_source
+    assert "route_backends" not in inspect.getsource(relay_kimi)
+
+
+def test_admin_connection_probe_selects_transport_and_payload_policy_from_binding() -> None:
+    handler_source = inspect.getsource(admin_system._handle_admin_connection_test)
+    responses_probe_source = inspect.getsource(admin_system._probe_responses_route)
+    registry_source = inspect.getsource(admin_system._get_route_backend)
+    assert "route_backends" in registry_source
+    assert responses_probe_source.count("backend.adapt_probe_payload(") == 1
+    assert "backend.transport.stream_responses(" in responses_probe_source
+    assert "list_models" not in responses_probe_source
+    assert "adapt_probe_payload" not in inspect.getsource(
+        relay_openai_backend._relay_via_responses_backend
+    )
+    for legacy_selection in (
+        "request.app.state.codex_client",
+        "request.app.state.kimi_client",
+        "request.app.state.grok_client",
+        "request.app.state.custom_provider_clients",
+        'route.provider == "codex"',
+        'route.provider == "grok"',
+        'route.provider == "kimi"',
+        "sanitize_grok_payload",
+    ):
+        assert legacy_selection not in handler_source
+        assert legacy_selection not in responses_probe_source
+
+
 def test_messages_routes_enforce_local_bearer_token(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -447,8 +698,9 @@ def _gateway(
     app.state.http_client = httpx.AsyncClient(
         transport=httpx.MockTransport(anthropic_handler)
     )
+    kimi_backend_client: Any = FakeKimiClient()
     if kimi_handler is not None or kimi_auth is not None:
-        app.state.kimi_client = KimiClient(
+        kimi_backend_client = KimiClient(
             kimi_auth or AvailableKimiAuthManager(),
             httpx.AsyncClient(
                 transport=httpx.MockTransport(
@@ -456,9 +708,19 @@ def _gateway(
                 )
             ),
         )
-    if grok_client is not None:
-        app.state.grok_client = grok_client
-    app.state.custom_provider_clients = custom_provider_clients or {}
+    grok_backend_client = grok_client or FakeGrokClient()
+    custom_backend_clients = custom_provider_clients or {}
+    app.state.kimi_client = kimi_backend_client
+    app.state.grok_client = grok_backend_client
+    app.state.custom_provider_clients = custom_backend_clients
+    app.state.route_backends = server._assemble_route_backends(
+        app,
+        config,
+        stub,
+        kimi_backend_client,
+        grok_backend_client,
+        custom_backend_clients,
+    )
     return TestClient(app), stub
 
 

@@ -72,13 +72,26 @@ class TestSanitizeGrokPayload:
             ("high", "high"),
             ("xhigh", "high"),
             ("max", "high"),
+            (" XHIGH ", "high"),
+            ("future", "medium"),
         ],
     )
-    def test_thinking_model_keeps_clamped_effort(self, effort: str, expected: str) -> None:
+    def test_thinking_model_normalizes_and_maps_effort_with_medium_fallback(
+        self, effort: str, expected: str
+    ) -> None:
         sanitized = sanitize_grok_payload(
             _payload(reasoning={"effort": effort, "summary": "auto"}), "grok-4.5"
         )
         assert sanitized["reasoning"] == {"effort": expected, "summary": "auto"}
+
+    def test_thinking_effort_update_preserves_nested_reasoning_alias(self) -> None:
+        payload = _payload(reasoning={"effort": "xhigh", "summary": "auto"})
+
+        sanitized = sanitize_grok_payload(payload, "grok-4.5")
+
+        assert sanitized is not payload
+        assert sanitized["reasoning"] is payload["reasoning"]
+        assert payload["reasoning"] == {"effort": "high", "summary": "auto"}
 
     @pytest.mark.parametrize(
         "model", ["grok-composer-2.5-fast", "grok-build-0.1", "grok-9-unreleased"]

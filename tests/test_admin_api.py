@@ -32,11 +32,15 @@ from claudex.providers.codex_client import (
     CodexUpstreamError,
 )
 from claudex.config import ConfigError, GatewayConfig, OpenAICompatibleProvider
+from claudex.providers.backends import AnthropicBackend, ResponsesBackend
 from claudex.providers.grok_auth import GrokCredentials
 from claudex.providers.grok_client import GrokClient, GrokUpstreamError
 from claudex.providers.kimi_auth import KimiCredentials
 from claudex.providers.kimi_client import KimiClient, KimiUpstreamError
-from claudex.providers.openai_compatible_client import OpenAICompatibleUpstreamError
+from claudex.providers.openai_compatible_client import (
+    OpenAICompatibleClient,
+    OpenAICompatibleUpstreamError,
+)
 
 
 _ADMIN_SOURCE_ROOT = Path(__file__).resolve().parents[1] / "src" / "claudex" / "admin"
@@ -117,9 +121,8 @@ _ADMIN_FUNCTION_MANIFEST = {
         "_handle_admin_grok_models",
         "_handle_admin_custom_models",
         "_handle_admin_kimi_models",
-        "_probe_codex_route",
-        "_probe_grok_route",
-        "_probe_custom_route",
+        "_get_route_backend",
+        "_probe_responses_route",
         "_probe_kimi_route",
         "_handle_admin_connection_test",
     },
@@ -341,6 +344,11 @@ class MissingKimiAuthManager(AvailableKimiAuthManager):
 class FakeKimiClient:
     def __init__(self, *_args: Any, **_kwargs: Any) -> None:
         pass
+
+    async def count_tokens(
+        self, body: bytes, headers: dict[str, str]
+    ) -> httpx.Response:
+        return httpx.Response(200, json={"input_tokens": 1})
 
 
 class AvailableGrokAuthManager:
@@ -581,6 +589,29 @@ def test_health_stays_ready_when_unrequired_custom_provider_fails(
     assert health.json()["status"] == "ok"
     assert health.json()["providers"]["wrtn"]["status"] == "error"
     assert health.json()["providers"]["wrtn"]["required"] is False
+
+
+def test_health_uses_selected_route_transport_for_custom_provider_status(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config = GatewayConfig(
+        model_map={"opus": "wrtn:gpt-5.5"},
+        custom_providers={"wrtn": _custom_provider()},
+    )
+    selected_transport = SelectedResponsesModelTransport(["gpt-5.5"])
+    with _create_test_client(monkeypatch, tmp_path, config=config) as client:
+        _select_route_transport(client, "wrtn", selected_transport)
+        client.app.state.custom_provider_clients["wrtn"] = (
+            FailingOpenAICompatibleClient("wrtn", _custom_provider())
+        )
+        health = client.get("/health")
+
+    assert health.status_code == 200
+    assert health.json()["providers"]["wrtn"] == {
+        "status": "ok",
+        "required": True,
+    }
+    assert selected_transport.calls == 1
 
 
 def test_health_without_custom_providers_keeps_builtin_provider_payload(
@@ -2716,10 +2747,19 @@ class FailingCatalogCodexClient(FakeCodexClient):
 
 
 class ProbeCodexClient(FakeCodexClient):
+    def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+        self.payloads: list[dict[str, Any]] = []
+
     async def stream_responses(
         self, payload: dict[str, Any], session_id: str
     ) -> AsyncIterator[dict[str, Any]]:
+        self.payloads.append(payload)
         yield {"type": "response.created", "response": {"model": payload["model"]}}
+
+
+class FailingFastTierLookupCodexClient(FakeCodexClient):
+    async def supports_fast_tier(self, model: str) -> bool:
+        raise AssertionError("admin probe must not query Codex fast-tier capability")
 
 
 class RejectingCodexClient(FakeCodexClient):
@@ -2741,11 +2781,25 @@ class FailingCatalogKimiClient(FakeKimiClient):
         raise KimiUpstreamError(401, '{"error":{"message":"token expired"}}')
 
 
+class ProbeKimiResponse(httpx.Response):
+    def __init__(self) -> None:
+        super().__init__(200, json={"type": "message", "model": "k3"})
+        self.aclose_calls = 0
+
+    async def aclose(self) -> None:
+        self.aclose_calls += 1
+        await super().aclose()
+
+
 class ProbeKimiClient(FakeKimiClient):
+    def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+        self.response: ProbeKimiResponse | None = None
+
     async def send_messages(self, body: bytes, headers: dict[str, str]) -> httpx.Response:
         # The probe must send the raw model with the prefix already removed.
         assert json.loads(body)["model"] == "k3"
-        return httpx.Response(200, json={"type": "message", "model": "k3"})
+        self.response = ProbeKimiResponse()
+        return self.response
 
 
 class RejectingKimiClient(FakeKimiClient):
@@ -2756,9 +2810,13 @@ class RejectingKimiClient(FakeKimiClient):
 
 
 class ProbeGrokClient(FakeGrokClient):
+    def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+        self.payloads: list[dict[str, Any]] = []
+
     async def stream_responses(
         self, payload: dict[str, Any], session_id: str
     ) -> AsyncIterator[dict[str, Any]]:
+        self.payloads.append(payload)
         yield {"type": "response.created", "response": {"model": payload["model"]}}
 
 
@@ -2787,9 +2845,20 @@ class CatalogOpenAICompatibleClient(FakeOpenAICompatibleClient):
 
 
 class ProbeOpenAICompatibleClient(FakeOpenAICompatibleClient):
+    def __init__(
+        self,
+        name: str,
+        provider: OpenAICompatibleProvider,
+        *_args: Any,
+        **_kwargs: Any,
+    ) -> None:
+        super().__init__(name, provider)
+        self.payloads: list[dict[str, Any]] = []
+
     async def stream_responses(
         self, payload: dict[str, Any], session_id: str
     ) -> AsyncIterator[dict[str, Any]]:
+        self.payloads.append(payload)
         yield {"type": "response.created", "response": {"model": payload["model"]}}
 
 
@@ -2802,6 +2871,47 @@ class RejectingOpenAICompatibleClient(FakeOpenAICompatibleClient):
         raise OpenAICompatibleUpstreamError(
             400, '{"error":{"message":"model_not_found"}}', self.name
         )
+
+
+class SelectedResponsesModelTransport:
+    def __init__(self, models: list[str]) -> None:
+        self.models = models
+        self.calls = 0
+
+    async def list_models(self) -> list[str]:
+        self.calls += 1
+        return self.models
+
+
+class SelectedAnthropicModelTransport:
+    def __init__(self, catalog: Any) -> None:
+        self.catalog = catalog
+        self.calls = 0
+
+    async def list_models(self) -> Any:
+        self.calls += 1
+        return self.catalog
+
+
+def _select_route_transport(
+    client: TestClient, provider: str, transport: Any
+) -> None:
+    backend = client.app.state.route_backends[provider]
+    if isinstance(backend, ResponsesBackend):
+        client.app.state.route_backends[provider] = ResponsesBackend(
+            transport=transport,
+            adapt_payload=backend.adapt_payload,
+            adapt_probe_payload=backend.adapt_probe_payload,
+            signature_namespace=backend.signature_namespace,
+        )
+        return
+    assert isinstance(backend, AnthropicBackend)
+    client.app.state.route_backends[provider] = AnthropicBackend(
+        transport=transport,
+        header_policy=backend.header_policy,
+        error_policy=backend.error_policy,
+        token_counter=backend.token_counter,
+    )
 
 
 def test_codex_client_list_models_filters_hidden_models() -> None:
@@ -2838,11 +2948,17 @@ class TestAdminDashboardApi:
     def test_codex_models_returns_visible_slugs(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
+        selected_transport = SelectedResponsesModelTransport(
+            ["gpt-5.6-sol", "gpt-5.5"]
+        )
         with self._client(monkeypatch, tmp_path, codex_client=CatalogCodexClient) as client:
+            _select_route_transport(client, "codex", selected_transport)
+            assert selected_transport is not client.app.state.codex_client
             response = client.get("/admin/providers/codex/models")
 
         assert response.status_code == 200
         assert response.json() == {"models": ["gpt-5.6-sol", "gpt-5.5"]}
+        assert selected_transport.calls == 1
 
     def test_codex_models_relays_upstream_error(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -2864,11 +2980,17 @@ class TestAdminDashboardApi:
     ) -> None:
         # The catalog passes through unshaped: the map bypasses model IDs
         # untouched, so the raw backend answer is the preset source.
+        selected_transport = SelectedAnthropicModelTransport(
+            {"data": [{"id": "k2.5"}, {"id": "k3"}]}
+        )
         with self._client(monkeypatch, tmp_path, kimi_client=CatalogKimiClient) as client:
+            _select_route_transport(client, "kimi", selected_transport)
+            assert selected_transport is not client.app.state.kimi_client
             response = client.get("/admin/providers/kimi/models")
 
         assert response.status_code == 200
         assert response.json() == {"data": [{"id": "k2.5"}, {"id": "k3"}]}
+        assert selected_transport.calls == 1
 
     def test_kimi_models_relays_upstream_error(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -2888,11 +3010,17 @@ class TestAdminDashboardApi:
     def test_grok_models_returns_catalog_ids(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
+        selected_transport = SelectedResponsesModelTransport(
+            ["grok-4.5", "grok-4.3"]
+        )
         with self._client(monkeypatch, tmp_path, grok_client=CatalogGrokClient) as client:
+            _select_route_transport(client, "grok", selected_transport)
+            assert selected_transport is not client.app.state.grok_client
             response = client.get("/admin/providers/grok/models")
 
         assert response.status_code == 200
         assert response.json() == {"models": ["grok-4.5", "grok-4.3"]}
+        assert selected_transport.calls == 1
 
     def test_grok_models_relays_upstream_error(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -2913,16 +3041,48 @@ class TestAdminDashboardApi:
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         config = GatewayConfig(custom_providers={"wrtn": _custom_provider()})
+        selected_transport = SelectedResponsesModelTransport(
+            ["gpt-5.5", "gemini-3.1-pro"]
+        )
         with self._client(
             monkeypatch,
             tmp_path,
             config=config,
             custom_client=CatalogOpenAICompatibleClient,
         ) as client:
+            _select_route_transport(client, "wrtn", selected_transport)
+            assert selected_transport is not client.app.state.custom_provider_clients["wrtn"]
             response = client.get("/admin/providers/custom/wrtn/models")
 
         assert response.status_code == 200
         assert response.json() == {"models": ["gpt-5.5", "gemini-3.1-pro"]}
+        assert selected_transport.calls == 1
+
+    def test_custom_provider_models_preserves_api_key_redaction(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            assert request.headers["Authorization"] == f"Bearer {_CUSTOM_API_KEY}"
+            return httpx.Response(
+                503,
+                json={"error": {"message": f"credential {_CUSTOM_API_KEY} rejected"}},
+            )
+
+        config = GatewayConfig(custom_providers={"wrtn": _custom_provider()})
+        http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        selected_transport = OpenAICompatibleClient(
+            "wrtn", _custom_provider(), http_client
+        )
+        try:
+            with self._client(monkeypatch, tmp_path, config=config) as client:
+                _select_route_transport(client, "wrtn", selected_transport)
+                response = client.get("/admin/providers/custom/wrtn/models")
+        finally:
+            asyncio.run(http_client.aclose())
+
+        assert response.status_code == 503
+        assert response.json()["error"]["message"] == "credential [REDACTED] rejected"
+        assert _CUSTOM_API_KEY not in response.text
 
     def test_custom_provider_models_returns_404_for_unknown_name(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -2935,14 +3095,16 @@ class TestAdminDashboardApi:
         assert "not configured" in response.json()["error"]["message"]
 
     def test_connection_test_ok(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-        probed_targets: list[str] = []
-
-        async def fake_probe(_client: Any, target: str) -> str:
-            probed_targets.append(target)
-            return target
-
-        monkeypatch.setattr(admin_system, "_probe_codex_route", fake_probe)
-        with self._client(monkeypatch, tmp_path, codex_client=ProbeCodexClient) as client:
+        selected_transport = ProbeCodexClient()
+        config = GatewayConfig(codex_service_tier="fast")
+        with self._client(
+            monkeypatch,
+            tmp_path,
+            config=config,
+            codex_client=FailingFastTierLookupCodexClient,
+        ) as client:
+            _select_route_transport(client, "codex", selected_transport)
+            assert selected_transport is not client.app.state.codex_client
             response = client.post(
                 "/admin/test",
                 json={"target": "codex:gpt-5.6-luna"},
@@ -2954,7 +3116,8 @@ class TestAdminDashboardApi:
         assert result["status"] == 200
         assert result["response_model"] == "gpt-5.6-luna"
         assert isinstance(result["latency_ms"], int)
-        assert probed_targets == ["gpt-5.6-luna"]
+        assert len(selected_transport.payloads) == 1
+        assert "service_tier" not in selected_transport.payloads[0]
 
     def test_connection_test_rejects_bare_target(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -2971,14 +3134,10 @@ class TestAdminDashboardApi:
     def test_connection_test_kimi_target_probes_kimi(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        probed_targets: list[str] = []
-
-        async def fake_probe(_client: Any, target: str) -> str:
-            probed_targets.append(target)
-            return target
-
-        monkeypatch.setattr(admin_system, "_probe_kimi_route", fake_probe)
-        with self._client(monkeypatch, tmp_path, kimi_client=ProbeKimiClient) as client:
+        selected_transport = ProbeKimiClient()
+        with self._client(monkeypatch, tmp_path) as client:
+            _select_route_transport(client, "kimi", selected_transport)
+            assert selected_transport is not client.app.state.kimi_client
             response = client.post(
                 "/admin/test",
                 json={"target": "kimi:k3"},
@@ -2989,7 +3148,8 @@ class TestAdminDashboardApi:
         assert result["ok"] is True
         assert result["status"] == 200
         assert result["response_model"] == "k3"
-        assert probed_targets == ["k3"]
+        assert selected_transport.response is not None
+        assert selected_transport.response.aclose_calls == 1
 
     def test_connection_test_reports_kimi_error(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -3008,14 +3168,21 @@ class TestAdminDashboardApi:
     def test_connection_test_grok_target_probes_grok(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        probed_targets: list[str] = []
-
-        async def fake_probe(_client: Any, target: str) -> str:
-            probed_targets.append(target)
-            return target
-
-        monkeypatch.setattr(admin_system, "_probe_grok_route", fake_probe)
-        with self._client(monkeypatch, tmp_path, grok_client=ProbeGrokClient) as client:
+        translated_payload = {
+            "model": "grok-4.5",
+            "reasoning": {"effort": "future-effort"},
+            "service_tier": "priority",
+            "prompt_cache_key": "grok-probe",
+        }
+        monkeypatch.setattr(
+            admin_system,
+            "translate_claude_request_to_codex",
+            lambda *_args: translated_payload,
+        )
+        selected_transport = ProbeGrokClient()
+        with self._client(monkeypatch, tmp_path) as client:
+            _select_route_transport(client, "grok", selected_transport)
+            assert selected_transport is not client.app.state.grok_client
             response = client.post(
                 "/admin/test",
                 json={"target": "grok:grok-4.5"},
@@ -3026,7 +3193,12 @@ class TestAdminDashboardApi:
         assert result["ok"] is True
         assert result["status"] == 200
         assert result["response_model"] == "grok-4.5"
-        assert probed_targets == ["grok-4.5"]
+        assert len(selected_transport.payloads) == 1
+        probe_payload = selected_transport.payloads[0]
+        assert probe_payload is not translated_payload
+        assert "service_tier" not in probe_payload
+        assert probe_payload["reasoning"] is translated_payload["reasoning"]
+        assert translated_payload["reasoning"]["effort"] == "medium"
 
     def test_connection_test_reports_grok_error(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -3045,22 +3217,20 @@ class TestAdminDashboardApi:
     def test_connection_test_custom_target_probes_custom_provider(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        probed_targets: list[tuple[str, str]] = []
-
-        async def fake_probe(
-            _client: Any, provider_name: str, target: str
-        ) -> str:
-            probed_targets.append((provider_name, target))
-            return target
-
-        monkeypatch.setattr(admin_system, "_probe_custom_route", fake_probe)
+        translated_payload = {
+            "model": "gpt-5.5",
+            "prompt_cache_key": "custom-probe",
+        }
+        monkeypatch.setattr(
+            admin_system,
+            "translate_claude_request_to_codex",
+            lambda *_args: translated_payload,
+        )
         config = GatewayConfig(custom_providers={"wrtn": _custom_provider()})
-        with self._client(
-            monkeypatch,
-            tmp_path,
-            config=config,
-            custom_client=ProbeOpenAICompatibleClient,
-        ) as client:
+        selected_transport = ProbeOpenAICompatibleClient("wrtn", _custom_provider())
+        with self._client(monkeypatch, tmp_path, config=config) as client:
+            _select_route_transport(client, "wrtn", selected_transport)
+            assert selected_transport is not client.app.state.custom_provider_clients["wrtn"]
             response = client.post("/admin/test", json={"target": "wrtn:gpt-5.5"})
 
         assert response.status_code == 200
@@ -3068,7 +3238,8 @@ class TestAdminDashboardApi:
         assert result["ok"] is True
         assert result["status"] == 200
         assert result["response_model"] == "gpt-5.5"
-        assert probed_targets == [("wrtn", "gpt-5.5")]
+        assert selected_transport.payloads == [translated_payload]
+        assert selected_transport.payloads[0] is translated_payload
 
     def test_connection_test_reports_custom_provider_error(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path

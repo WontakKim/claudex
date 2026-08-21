@@ -22,6 +22,7 @@ from typing import Any
 import httpx
 import pytest
 import uvicorn
+from starlette.requests import Request
 from starlette.responses import Response
 from starlette.testclient import TestClient
 
@@ -38,6 +39,7 @@ from claudex.claude.auth import CLAUDE_TOKEN_URL
 from claudex.balanced.router import ClaudeBalancedRouter
 from claudex.balanced.runtime import ClaudeBalancedRuntime
 from claudex.balanced.selection import derive_session_key
+from claudex.providers.backends import AnthropicBackend, ResponsesBackend
 from claudex.providers.codex_client import (
     CODEX_MODELS_URL,
     CODEX_RESPONSES_URL,
@@ -46,12 +48,17 @@ from claudex.providers.codex_client import (
 )
 from claudex.config import GatewayConfig, OpenAICompatibleProvider
 from claudex.providers.kimi_auth import KimiCredentials
-from claudex.providers.kimi_client import KimiClient
+from claudex.providers.kimi_client import KimiClient, KimiUpstreamError
 from claudex.providers.openai_compatible_client import OpenAICompatibleUpstreamError
 from claudex.providers.grok_auth import GrokCredentials
 from claudex.providers.grok_client import GrokUpstreamError
 from claudex.relay.common import _upstream_error_to_claude
-from claudex.relay.kimi import _rewrite_kimi_sse
+from claudex.relay.anthropic_backend import (
+    _AnthropicStreamRelay,
+    _count_tokens_via_anthropic_backend,
+    _relay_via_anthropic_backend,
+)
+from claudex.relay.kimi import _kimi_error_to_claude, _kimi_request_headers
 from claudex.relay.openai_backend import (
     _CompactionStreamRelay,
     _OwnedStreamingResponse,
@@ -98,6 +105,14 @@ _RELAY_SYMBOL_MANIFEST = {
         "_serve_balanced_pinned_message",
         "_serve_balanced_count_tokens",
     },
+    "anthropic_backend": {
+        "_rewrite_message_start_data",
+        "_rewrite_anthropic_sse",
+        "_AnthropicStreamRelay",
+        "_AnthropicStreamingResponse",
+        "_relay_via_anthropic_backend",
+        "_count_tokens_via_anthropic_backend",
+    },
     "openai_backend": {
         "_resolve_context_window",
         "_validate_mapped_claude_request",
@@ -114,13 +129,10 @@ _RELAY_SYMBOL_MANIFEST = {
     },
     "kimi": {
         "_kimi_request_headers",
-        "_kimi_upstream_error_to_claude",
-        "_rewrite_message_start_data",
-        "_rewrite_kimi_sse",
-        "_relay_to_kimi",
-        "_count_tokens_via_kimi",
+        "_kimi_error_to_claude",
     },
     "endpoints": {
+        "_get_route_backend",
         "_route_for_request",
         "_passthrough_to_anthropic",
         "_handle_messages",
@@ -144,7 +156,7 @@ def test_relay_symbol_manifest_has_one_canonical_owner() -> None:
         for module_name in _RELAY_SYMBOL_MANIFEST
     }
 
-    assert len(_RELAY_MANIFEST_SYMBOLS) == 47
+    assert len(_RELAY_MANIFEST_SYMBOLS) == 50
     assert definitions_by_module == _RELAY_SYMBOL_MANIFEST
     for symbol in _RELAY_MANIFEST_SYMBOLS:
         owners = [
@@ -225,6 +237,11 @@ class MissingKimiAuthManager(AvailableKimiAuthManager):
 class FakeKimiClient:
     def __init__(self, *_args: Any, **_kwargs: Any) -> None:
         pass
+
+    async def count_tokens(
+        self, body: bytes, headers: dict[str, str]
+    ) -> httpx.Response:
+        return httpx.Response(200, json={"input_tokens": 1})
 
 
 class AvailableGrokAuthManager:
@@ -442,8 +459,9 @@ def _gateway(
     app.state.http_client = httpx.AsyncClient(
         transport=httpx.MockTransport(anthropic_handler)
     )
+    kimi_backend_client: Any = FakeKimiClient()
     if kimi_handler is not None or kimi_auth is not None:
-        app.state.kimi_client = KimiClient(
+        kimi_backend_client = KimiClient(
             kimi_auth or AvailableKimiAuthManager(),
             httpx.AsyncClient(
                 transport=httpx.MockTransport(
@@ -451,9 +469,19 @@ def _gateway(
                 )
             ),
         )
-    if grok_client is not None:
-        app.state.grok_client = grok_client
-    app.state.custom_provider_clients = custom_provider_clients or {}
+    grok_backend_client = grok_client or FakeGrokClient()
+    custom_backend_clients = custom_provider_clients or {}
+    app.state.kimi_client = kimi_backend_client
+    app.state.grok_client = grok_backend_client
+    app.state.custom_provider_clients = custom_backend_clients
+    app.state.route_backends = server._assemble_route_backends(
+        app,
+        config,
+        stub,
+        kimi_backend_client,
+        grok_backend_client,
+        custom_backend_clients,
+    )
     return TestClient(app), stub
 
 
@@ -879,6 +907,9 @@ def test_non_streaming_mid_stream_overflow_reports_numbers() -> None:
     app.state.http_client = httpx.AsyncClient(
         transport=httpx.MockTransport(_failing_anthropic_handler)
     )
+    app.state.route_backends = server._assemble_route_backends(
+        app, config, stub, FakeKimiClient(), FakeGrokClient(), {}
+    )
     client = TestClient(app)
 
     response = client.post("/v1/messages", json=_message_body("claude-opus-4-6"))
@@ -933,6 +964,14 @@ def test_context_window_cache_is_reused_across_requests() -> None:
     )
     app.state.http_client = httpx.AsyncClient(
         transport=httpx.MockTransport(_failing_anthropic_handler)
+    )
+    app.state.route_backends = server._assemble_route_backends(
+        app,
+        config,
+        app.state.codex_client,
+        FakeKimiClient(),
+        FakeGrokClient(),
+        {},
     )
     client = TestClient(app)
 
@@ -1053,6 +1092,40 @@ def _failing_anthropic_handler(request: httpx.Request) -> httpx.Response:
     return httpx.Response(500, json={"error": "unexpected anthropic passthrough"})
 
 
+class _TrackingByteStream(httpx.AsyncByteStream):
+    def __init__(
+        self,
+        chunks: list[bytes],
+        error: httpx.HTTPError | None = None,
+    ) -> None:
+        self.chunks = chunks
+        self.error = error
+        self.close_calls = 0
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        for chunk in self.chunks:
+            yield chunk
+        if self.error is not None:
+            raise self.error
+
+    async def aclose(self) -> None:
+        self.close_calls += 1
+
+
+def _stream_backend(transport: Any | None = None) -> AnthropicBackend:
+    async def count_tokens(
+        body: bytes, headers: dict[str, str]
+    ) -> httpx.Response:
+        return httpx.Response(200, json={"input_tokens": 1})
+
+    return AnthropicBackend(
+        transport=transport or FakeKimiClient(),
+        header_policy=_kimi_request_headers,
+        error_policy=_kimi_error_to_claude,
+        token_counter=count_tokens,
+    )
+
+
 def test_kimi_mapped_model_relays_with_model_rewrite() -> None:
     captured: list[httpx.Request] = []
 
@@ -1149,7 +1222,7 @@ def test_kimi_stream_rewrites_only_message_start() -> None:
     assert 'data: {"type":"message_stop"}' in lines
 
 
-def test_kimi_stream_yields_complete_sse_events() -> None:
+def test_anthropic_stream_yields_complete_sse_events() -> None:
     sse_body = (
         b'event: message_start\n'
         b'data: {"type":"message_start","message":{"model":"k3"}}\n'
@@ -1161,14 +1234,18 @@ def test_kimi_stream_yields_complete_sse_events() -> None:
         b'data: {"type":"message_stop"}\n'
     )
 
-    async def scenario() -> list[bytes]:
-        response = httpx.Response(200, content=sse_body)
-        return [
+    async def scenario() -> tuple[list[bytes], _TrackingByteStream]:
+        stream = _TrackingByteStream([sse_body])
+        response = httpx.Response(200, stream=stream)
+        chunks = [
             chunk
-            async for chunk in _rewrite_kimi_sse(response, "claude-fable-5")
+            async for chunk in _AnthropicStreamRelay(
+                response, "claude-fable-5", _stream_backend()
+            )
         ]
+        return chunks, stream
 
-    chunks = asyncio.run(scenario())
+    chunks, stream = asyncio.run(scenario())
 
     assert len(chunks) == 3
     assert chunks[0].endswith(b"\n\n")
@@ -1179,10 +1256,53 @@ def test_kimi_stream_yields_complete_sse_events() -> None:
         b"\n"
     )
     assert chunks[2] == b'event: message_stop\ndata: {"type":"message_stop"}\n'
+    assert stream.close_calls == 1
 
 
-def test_kimi_stream_cancellation_interrupts_buffered_events() -> None:
-    closed = False
+def test_anthropic_stream_early_close_before_first_read_closes_once() -> None:
+    async def scenario() -> tuple[bool, int]:
+        stream = _TrackingByteStream([b"event: message_stop\n\n"])
+        response = httpx.Response(200, stream=stream)
+        relay = _AnthropicStreamRelay(
+            response, "claude-fable-5", _stream_backend()
+        )
+        await relay.aclose()
+        await relay.aclose()
+        return response.is_closed, stream.close_calls
+
+    is_closed, close_calls = asyncio.run(scenario())
+
+    assert is_closed is True
+    assert close_calls == 1
+
+
+def test_anthropic_stream_read_failure_emits_error_and_closes_once() -> None:
+    async def scenario() -> tuple[list[bytes], int]:
+        stream = _TrackingByteStream(
+            [b"event: content_block_delta\n"],
+            httpx.ReadError("stream failed"),
+        )
+        response = httpx.Response(200, stream=stream)
+        chunks = [
+            chunk
+            async for chunk in _AnthropicStreamRelay(
+                response, "claude-fable-5", _stream_backend()
+            )
+        ]
+        return chunks, stream.close_calls
+
+    chunks, close_calls = asyncio.run(scenario())
+
+    assert chunks[0] == b"event: content_block_delta\n"
+    assert chunks[1].startswith(b"event: error\ndata: ")
+    error = json.loads(chunks[1].split(b"data: ", 1)[1])
+    assert error["error"]["type"] == "api_error"
+    assert "kimi stream aborted" in error["error"]["message"]
+    assert close_calls == 1
+
+
+def test_anthropic_stream_cancellation_interrupts_buffered_events() -> None:
+    close_calls = 0
     sse_body = b"".join(
         f'event: content_block_delta\ndata: {{"index":{index}}}\n\n'.encode()
         for index in range(20)
@@ -1193,8 +1313,8 @@ def test_kimi_stream_cancellation_interrupts_buffered_events() -> None:
             yield sse_body
 
         async def aclose(self) -> None:
-            nonlocal closed
-            closed = True
+            nonlocal close_calls
+            close_calls += 1
 
     async def scenario() -> list[bytes]:
         response = httpx.Response(200, stream=BufferedStream())
@@ -1202,7 +1322,9 @@ def test_kimi_stream_cancellation_interrupts_buffered_events() -> None:
         first_chunk_seen = asyncio.Event()
 
         async def consume() -> None:
-            async for chunk in _rewrite_kimi_sse(response, "claude-fable-5"):
+            async for chunk in _AnthropicStreamRelay(
+                response, "claude-fable-5", _stream_backend()
+            ):
                 chunks.append(chunk)
                 first_chunk_seen.set()
 
@@ -1216,7 +1338,176 @@ def test_kimi_stream_cancellation_interrupts_buffered_events() -> None:
     chunks = asyncio.run(scenario())
 
     assert chunks == [b'event: content_block_delta\ndata: {"index":0}\n\n']
-    assert closed is True
+    assert close_calls == 1
+
+
+@pytest.mark.parametrize(
+    ("upstream_body", "expected_body"),
+    [
+        (
+            b'{"type":"message","model":"native-model"}',
+            {"type": "message", "model": "claude-fable-5"},
+        ),
+        (b"not-json", b"not-json"),
+    ],
+)
+def test_anthropic_non_streaming_response_closes_once(
+    upstream_body: bytes, expected_body: dict[str, Any] | bytes
+) -> None:
+    stream = _TrackingByteStream([upstream_body])
+    upstream_response = httpx.Response(
+        200,
+        headers={
+            "content-type": "application/x-native-message",
+            "request-id": "req_native",
+        },
+        stream=stream,
+    )
+    sent: list[bytes] = []
+
+    class FakeNativeTransport:
+        async def send_messages(
+            self, body: bytes, headers: dict[str, str]
+        ) -> httpx.Response:
+            sent.append(body)
+            return upstream_response
+
+    request = Request(
+        {"type": "http", "method": "POST", "path": "/v1/messages", "headers": []}
+    )
+    response = asyncio.run(
+        _relay_via_anthropic_backend(
+            request,
+            _message_body("claude-fable-5"),
+            "native-model",
+            _stream_backend(FakeNativeTransport()),
+        )
+    )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "application/x-native-message"
+    assert response.headers["request-id"] == "req_native"
+    if isinstance(expected_body, dict):
+        assert json.loads(response.body) == expected_body
+    else:
+        assert response.body == expected_body
+    assert json.loads(sent[0])["model"] == "native-model"
+    assert upstream_response.is_closed is True
+    assert stream.close_calls == 1
+
+
+def test_anthropic_non_streaming_read_failure_propagates_and_closes_once() -> None:
+    stream = _TrackingByteStream([], httpx.ReadError("body failed"))
+    upstream_response = httpx.Response(200, stream=stream)
+
+    class FakeNativeTransport:
+        async def send_messages(
+            self, body: bytes, headers: dict[str, str]
+        ) -> httpx.Response:
+            return upstream_response
+
+    request = Request(
+        {"type": "http", "method": "POST", "path": "/v1/messages", "headers": []}
+    )
+    with pytest.raises(httpx.ReadError, match="body failed"):
+        asyncio.run(
+            _relay_via_anthropic_backend(
+                request,
+                _message_body("claude-fable-5"),
+                "native-model",
+                _stream_backend(FakeNativeTransport()),
+            )
+        )
+
+    assert upstream_response.is_closed is True
+    assert stream.close_calls == 1
+
+
+def test_anthropic_count_tokens_owns_success_malformed_and_read_failure_responses() -> None:
+    success_stream = _TrackingByteStream([b'{"input_tokens":41}'])
+    success_response = httpx.Response(200, stream=success_stream)
+    malformed_stream = _TrackingByteStream([b"not-json"])
+    malformed_response = httpx.Response(200, stream=malformed_stream)
+    failed_stream = _TrackingByteStream([], httpx.ReadError("count failed"))
+    failed_response = httpx.Response(200, stream=failed_stream)
+    responses = [success_response, malformed_response, failed_response]
+
+    async def token_counter(
+        body: bytes, headers: dict[str, str]
+    ) -> httpx.Response:
+        return responses.pop(0)
+
+    backend = AnthropicBackend(
+        transport=FakeKimiClient(),
+        header_policy=_kimi_request_headers,
+        error_policy=_kimi_error_to_claude,
+        token_counter=token_counter,
+    )
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/messages/count_tokens",
+            "headers": [],
+        }
+    )
+
+    async def scenario() -> tuple[Response | None, Response | None, Response | None]:
+        body = _message_body("claude-fable-5")
+        return (
+            await _count_tokens_via_anthropic_backend(
+                request, body, "native-model", backend
+            ),
+            await _count_tokens_via_anthropic_backend(
+                request, body, "native-model", backend
+            ),
+            await _count_tokens_via_anthropic_backend(
+                request, body, "native-model", backend
+            ),
+        )
+
+    success, malformed, failed = asyncio.run(scenario())
+
+    assert success is not None
+    assert json.loads(success.body) == {"input_tokens": 41}
+    assert malformed is None
+    assert failed is None
+    assert success_stream.close_calls == 1
+    assert malformed_stream.close_calls == 1
+    assert failed_stream.close_calls == 1
+    assert success_response.is_closed is True
+    assert malformed_response.is_closed is True
+    assert failed_response.is_closed is True
+
+
+def test_anthropic_count_tokens_transport_error_returns_no_response() -> None:
+    async def token_counter(
+        body: bytes, headers: dict[str, str]
+    ) -> httpx.Response:
+        raise KimiUpstreamError(503, "counter unavailable")
+
+    backend = AnthropicBackend(
+        transport=FakeKimiClient(),
+        header_policy=_kimi_request_headers,
+        error_policy=_kimi_error_to_claude,
+        token_counter=token_counter,
+    )
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/messages/count_tokens",
+            "headers": [],
+        }
+    )
+
+    counted = asyncio.run(
+        _count_tokens_via_anthropic_backend(
+            request, _message_body("claude-fable-5"), "native-model", backend
+        )
+    )
+
+    assert counted is None
 
 
 def test_kimi_stream_client_reset_stops_closed_socket_writes(
@@ -1250,6 +1541,9 @@ def test_kimi_stream_client_reset_stops_closed_socket_writes(
     app.state.compaction_last_reroute = None
     app.state.compaction_reroute_sequence = 0
     app.state.kimi_client = BurstKimiClient()
+    app.state.route_backends = {
+        "kimi": _stream_backend(app.state.kimi_client),
+    }
 
     listener = socket.socket()
     listener.bind(("127.0.0.1", 0))
@@ -1468,6 +1762,188 @@ class StubOpenAICompatibleClient:
             yield event
 
 
+@pytest.mark.parametrize(
+    ("provider", "signature_namespace"),
+    [("codex", None), ("wrtn", "wrtn")],
+)
+def test_responses_backend_translates_then_awaits_adapter_and_uses_bound_transport(
+    monkeypatch: pytest.MonkeyPatch,
+    provider: str,
+    signature_namespace: str | None,
+) -> None:
+    upstream_model = "selected-model"
+    call_order: list[tuple[Any, ...]] = []
+    translated_payload = {
+        "model": upstream_model,
+        "prompt_cache_key": "session-1",
+        "input": [],
+    }
+    adapted_payload = {**translated_payload, "adapted": True}
+
+    def recording_translate(
+        claude_request: dict[str, Any],
+        model: str,
+        reasoning_effort_override: str | None,
+        *,
+        service_tier: str | None = None,
+        custom_provider: str | None = None,
+    ) -> dict[str, Any]:
+        call_order.append(("translate", custom_provider))
+        assert model == upstream_model
+        assert service_tier is None
+        return translated_payload
+
+    async def adapt_payload(
+        payload: dict[str, Any], model: str
+    ) -> dict[str, Any]:
+        call_order.append(("adapt", payload, model))
+        assert payload is translated_payload
+        return adapted_payload
+
+    def adapt_probe_payload(
+        payload: dict[str, Any], model: str
+    ) -> dict[str, Any]:
+        return payload
+
+    class RecordingTransport(StubCodexClient):
+        async def stream_responses(
+            self, payload: dict[str, Any], session_id: str
+        ) -> AsyncIterator[dict[str, Any]]:
+            call_order.append(("stream", payload, session_id))
+            self.payloads.append(payload)
+            raise CodexUpstreamError(503, "selected transport")
+            yield
+
+    monkeypatch.setattr(
+        relay_openai_backend,
+        "translate_claude_request_to_codex",
+        recording_translate,
+    )
+    custom_providers = {"wrtn": _custom_provider()} if provider == "wrtn" else {}
+    configured_custom_transport = StubOpenAICompatibleClient()
+    custom_transports = (
+        {"wrtn": configured_custom_transport} if provider == "wrtn" else {}
+    )
+    config = GatewayConfig(
+        model_map={"opus": f"{provider}:{upstream_model}"},
+        context_window_map={f"{provider}:{upstream_model}": 100_000},
+        custom_providers=custom_providers,
+    )
+    client, codex_transport = _gateway(
+        config,
+        _failing_anthropic_handler,
+        custom_provider_clients=custom_transports,
+    )
+    selected_transport = RecordingTransport()
+    client.app.state.route_backends[provider] = ResponsesBackend(
+        transport=selected_transport,
+        adapt_payload=adapt_payload,
+        adapt_probe_payload=adapt_probe_payload,
+        signature_namespace=signature_namespace,
+    )
+
+    response = client.post(
+        "/v1/messages", json=_message_body("claude-opus-4-6")
+    )
+
+    assert response.status_code == 503
+    assert call_order == [
+        ("translate", signature_namespace),
+        ("adapt", translated_payload, upstream_model),
+        ("stream", adapted_payload, "session-1"),
+    ]
+    assert selected_transport.payloads == [adapted_payload]
+    assert codex_transport.payloads == []
+    assert configured_custom_transport.payloads == []
+
+
+def test_anthropic_wire_dispatch_is_independent_of_provider_name() -> None:
+    sent: list[tuple[bytes, dict[str, str]]] = []
+    counted: list[tuple[bytes, dict[str, str]]] = []
+    header_paths: list[str] = []
+
+    class FakeNativeTransport:
+        async def send_messages(
+            self, body: bytes, headers: dict[str, str]
+        ) -> httpx.Response:
+            sent.append((body, headers))
+            return httpx.Response(
+                200,
+                json={"type": "message", "model": "native-model"},
+                headers={"request-id": "req_native"},
+            )
+
+    def header_policy(request: Any) -> dict[str, str]:
+        header_paths.append(request.url.path)
+        return {"x-native-policy": "selected"}
+
+    def error_policy(exc: Any) -> tuple[int, dict[str, Any]]:
+        raise AssertionError(f"unexpected native backend error: {exc!r}")
+
+    async def token_counter(
+        body: bytes, headers: dict[str, str]
+    ) -> httpx.Response:
+        counted.append((body, headers))
+        return httpx.Response(200, json={"input_tokens": 73})
+
+    config = GatewayConfig(model_map={"opus": "codex:native-model"})
+    client, codex_transport = _gateway(config, _failing_anthropic_handler)
+    client.app.state.route_backends["codex"] = AnthropicBackend(
+        transport=FakeNativeTransport(),
+        header_policy=header_policy,
+        error_policy=error_policy,
+        token_counter=token_counter,
+    )
+
+    message = client.post(
+        "/v1/messages", json=_message_body("claude-opus-4-6")
+    )
+    count = client.post(
+        "/v1/messages/count_tokens",
+        json=_message_body("claude-opus-4-6"),
+    )
+
+    assert message.status_code == 200
+    assert message.json()["model"] == "claude-opus-4-6"
+    assert message.headers["request-id"] == "req_native"
+    assert count.status_code == 200
+    assert count.json() == {"input_tokens": 73}
+    assert header_paths == ["/v1/messages", "/v1/messages/count_tokens"]
+    assert json.loads(sent[0][0])["model"] == "native-model"
+    assert sent[0][1] == {"x-native-policy": "selected"}
+    assert json.loads(counted[0][0])["model"] == "native-model"
+    assert counted[0][1] == {"x-native-policy": "selected"}
+    assert codex_transport.payloads == []
+
+
+@pytest.mark.parametrize("path", ["/v1/messages", "/v1/messages/count_tokens"])
+def test_mapped_route_fails_clearly_when_backend_binding_is_missing(path: str) -> None:
+    config = GatewayConfig(model_map={"opus": "codex:gpt-5.6-sol"})
+    client, _ = _gateway(config, _failing_anthropic_handler)
+    del client.app.state.route_backends["codex"]
+
+    with pytest.raises(
+        RuntimeError,
+        match="route backend registry has no binding for provider 'codex'",
+    ):
+        client.post(path, json=_message_body("claude-opus-4-6"))
+
+
+def test_mapped_route_fails_clearly_for_unsupported_backend_binding() -> None:
+    config = GatewayConfig(model_map={"opus": "codex:gpt-5.6-sol"})
+    client, _ = _gateway(config, _failing_anthropic_handler)
+    client.app.state.route_backends["codex"] = object()
+
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            "route backend registry contains an unsupported binding for "
+            "provider 'codex': object"
+        ),
+    ):
+        client.post("/v1/messages", json=_message_body("claude-opus-4-6"))
+
+
 def test_custom_provider_route_uses_custom_client_without_builtin_payload_mutations(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1479,11 +1955,13 @@ def test_custom_provider_route_uses_custom_client_without_builtin_payload_mutati
         codex_service_tier="fast",
     )
 
-    def unexpected_grok_sanitizer(payload: dict[str, Any], model: str) -> dict[str, Any]:
-        raise AssertionError("Grok sanitizer must not run for a custom provider")
+    async def unexpected_grok_adapter(
+        payload: dict[str, Any], model: str
+    ) -> dict[str, Any]:
+        raise AssertionError("Grok adapter must not run for a custom provider")
 
-    monkeypatch.setattr(relay_openai_backend, "sanitize_grok_payload", unexpected_grok_sanitizer)
-    assert relay_openai_backend.sanitize_grok_payload is unexpected_grok_sanitizer
+    monkeypatch.setattr(server, "_adapt_grok_payload", unexpected_grok_adapter)
+    assert server._adapt_grok_payload is unexpected_grok_adapter
     client, codex_stub = _gateway(
         config,
         _failing_anthropic_handler,

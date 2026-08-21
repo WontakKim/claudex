@@ -15,15 +15,13 @@ from starlette.responses import JSONResponse, StreamingResponse
 
 import claudex.translate.context_overflow as context_overflow
 from claudex import server_support
-from claudex.providers.codex_client import CODEX_FAST_TIER_WIRE_VALUE, CodexClient
+from claudex.providers.backends import ResponsesBackend, ResponsesTransport
 from claudex.compaction import (
     build_reroute_headers,
     build_reroute_payload,
     is_compaction_request,
 )
 from claudex.config import GatewayConfig, RouteTarget, parse_compaction_model
-from claudex.providers.grok_client import GrokClient, sanitize_grok_payload
-from claudex.providers.openai_compatible_client import OpenAICompatibleClient
 from claudex.relay.common import (
     _ANTHROPIC_API_BASE,
     _format_sse,
@@ -42,14 +40,14 @@ logger = logging.getLogger("claudex.server")
 
 async def _resolve_context_window(
     config: GatewayConfig,
-    client: CodexClient | GrokClient | OpenAICompatibleClient,
+    transport: ResponsesTransport,
     provider: str,
     upstream_model: str,
 ) -> int | None:
     override = config.context_window_map.get(f"{provider}:{upstream_model}")
     if override is not None:
         return override
-    return await client.context_window(upstream_model)
+    return await transport.context_window(upstream_model)
 
 
 def _validate_mapped_claude_request(claude_request: dict[str, Any]) -> str | None:
@@ -74,16 +72,16 @@ async def _relay_via_responses_backend(
     """Relay a Messages request to a Responses-API backend.
 
     Codex, Grok, and custom providers consume the same translated payload and
-    produce the same SSE event family, so one path serves all of them; only the
-    Grok direction adds its payload sanitizer on the way out.
+    produce the same SSE event family. Their bound payload adapters preserve
+    provider-specific wire behavior after translation.
 
     Before translation, a Responses-mapped request also carries the compaction
     reroute trigger: when `config.compaction_model` is set, the
     body is a detected Claude Code compaction request (Signal A), and the
     mapped model's configured or catalog context window is a real (non-bool)
     integer the estimated prompt overflows, the request is diverted to
-    `_reroute_compaction` before `translate_claude_request_to_codex` or
-    `sanitize_grok_payload` ever run. A `None` return from that helper means
+    `_reroute_compaction` before translation or payload adaptation runs. A
+    `None` return from that helper means
     "fall back": translation then runs against the untouched original body
     exactly as an ordinary mapped request would, and the context window
     already resolved for the trigger check is reused rather than looked up
@@ -92,6 +90,12 @@ async def _relay_via_responses_backend(
     config: GatewayConfig = request.app.state.config
     provider = route.provider
     upstream_model = route.model
+    backend = request.app.state.route_backends[provider]
+    if not isinstance(backend, ResponsesBackend):
+        raise RuntimeError(
+            f"route backend {provider!r} cannot serve the Responses relay"
+        )
+    transport = backend.transport
 
     validation_error = _validate_mapped_claude_request(claude_request)
     if validation_error is not None:
@@ -99,19 +103,12 @@ async def _relay_via_responses_backend(
             server_support._claude_error_body("invalid_request_error", validation_error), status_code=400
         )
 
-    custom_client = request.app.state.custom_provider_clients.get(provider)
-    custom_provider_name = provider if custom_client is not None else None
-    if custom_client is not None:
-        client: CodexClient | GrokClient | OpenAICompatibleClient = custom_client
-    elif provider == "grok":
-        client = request.app.state.grok_client
-    else:
-        client = request.app.state.codex_client
-
     context_window: int | None = None
     context_window_resolved = False
     if config.compaction_model is not None and is_compaction_request(claude_request):
-        context_window = await _resolve_context_window(config, client, provider, upstream_model)
+        context_window = await _resolve_context_window(
+            config, transport, provider, upstream_model
+        )
         context_window_resolved = True
         # Booleans are `int` subclasses; a catalog entry that is literally
         # `True`/`False` (e.g. a stubbed or malformed provider response) must
@@ -133,30 +130,17 @@ async def _relay_via_responses_backend(
                     return reroute_response
 
     try:
-        service_tier = None
-        if provider == "codex" and config.codex_service_tier == "fast":
-            # Fast is optional: unknown models and failed catalog refreshes fall
-            # back to the standard tier rather than blocking the request.
-            if await client.supports_fast_tier(upstream_model):
-                service_tier = CODEX_FAST_TIER_WIRE_VALUE
-            else:
-                logger.debug(
-                    "fast tier requested but the codex catalog does not advertise it for %s",
-                    upstream_model,
-                )
         payload = translate_claude_request_to_codex(
             claude_request,
             upstream_model,
             config.reasoning_effort_override,
-            service_tier=service_tier,
-            custom_provider=custom_provider_name,
+            custom_provider=backend.signature_namespace,
         )
     except TranslationError as exc:
         return JSONResponse(
             server_support._claude_error_body("invalid_request_error", str(exc)), status_code=400
         )
-    if provider == "grok":
-        payload = sanitize_grok_payload(payload, upstream_model)
+    payload = await backend.adapt_payload(payload, upstream_model)
     session_id = payload["prompt_cache_key"]
     logger.info(
         "%s -> %s:%s (stream=%s, effort=%s, tier=%s, messages=%d, tools=%d)",
@@ -177,9 +161,11 @@ async def _relay_via_responses_backend(
     # above already resolved this for a detected compaction request, so that
     # result is reused here instead of looked up again.
     if not context_window_resolved:
-        context_window = await _resolve_context_window(config, client, provider, upstream_model)
+        context_window = await _resolve_context_window(
+            config, transport, provider, upstream_model
+        )
 
-    event_stream = client.stream_responses(payload, session_id)
+    event_stream = transport.stream_responses(payload, session_id)
     try:
         first_event = await anext(event_stream, None)
         if first_event is None:
@@ -222,7 +208,7 @@ async def _relay_via_responses_backend(
                 claude_request,
                 upstream_events(),
                 context_window,
-                custom_provider=custom_provider_name,
+                custom_provider=backend.signature_namespace,
             ),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache"},
@@ -231,7 +217,7 @@ async def _relay_via_responses_backend(
         claude_request,
         upstream_events(),
         context_window,
-        custom_provider=custom_provider_name,
+        custom_provider=backend.signature_namespace,
     )
 
 

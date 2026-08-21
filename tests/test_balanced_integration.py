@@ -90,6 +90,11 @@ class _FakeKimiClient:
     def __init__(self, *_args: Any, **_kwargs: Any) -> None:
         pass
 
+    async def count_tokens(
+        self, body: bytes, headers: dict[str, str]
+    ) -> httpx.Response:
+        return httpx.Response(200, json={"input_tokens": 1})
+
 
 class _AvailableGrokAuthManager:
     def __init__(self, *_args: Any, **_kwargs: Any) -> None:
