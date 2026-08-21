@@ -10,7 +10,7 @@ from typing import Any, ClassVar, Protocol, TypeAlias
 import httpx
 from starlette.requests import Request
 
-from claudex.providers.kimi_client import KimiUpstreamError
+from claudex.upstream_errors import UpstreamAuthError, UpstreamError
 
 
 class WireKind(Enum):
@@ -57,8 +57,20 @@ ResponsesProbePayloadAdapter: TypeAlias = Callable[
     [dict[str, Any], str], dict[str, Any]
 ]
 AnthropicHeaderPolicy: TypeAlias = Callable[[Request], dict[str, str]]
+
+
+@dataclass(frozen=True)
+class AnthropicStreamReadFailure:
+    """A Messages stream read failed after its HTTP response was accepted."""
+
+    error: httpx.HTTPError
+
+
+AnthropicRelayError: TypeAlias = (
+    UpstreamAuthError | UpstreamError | httpx.HTTPError | AnthropicStreamReadFailure
+)
 AnthropicErrorPolicy: TypeAlias = Callable[
-    [KimiUpstreamError], tuple[int, dict[str, Any]]
+    [AnthropicRelayError], tuple[int, dict[str, Any]]
 ]
 
 # Native token counters transfer ownership of the returned response to the caller,

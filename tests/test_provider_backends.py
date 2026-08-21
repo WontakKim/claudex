@@ -17,6 +17,8 @@ from claudex.providers.backends import (
     AnthropicErrorPolicy,
     AnthropicHeaderPolicy,
     AnthropicMessagesTransport,
+    AnthropicRelayError,
+    AnthropicStreamReadFailure,
     AnthropicTokenCounter,
     ResponsesBackend,
     ResponsesPayloadAdapter,
@@ -29,7 +31,8 @@ from claudex.providers.codex_client import CodexClient
 from claudex.providers.grok_client import GrokClient
 from claudex.providers.kimi_client import KimiClient, KimiUpstreamError
 from claudex.providers.openai_compatible_client import OpenAICompatibleClient
-from claudex.relay.kimi import _kimi_request_headers, _kimi_upstream_error_to_claude
+from claudex.upstream_errors import UpstreamError
+from claudex.relay.kimi import _kimi_error_to_claude, _kimi_request_headers
 
 
 class _ResponsesTransport:
@@ -83,8 +86,12 @@ def _header_policy(request: Request) -> dict[str, str]:
     return {"x-request-path": request.url.path}
 
 
-def _error_policy(error: KimiUpstreamError) -> tuple[int, dict[str, Any]]:
-    return error.status_code, {"error": {"message": error.body}}
+def _error_policy(error: AnthropicRelayError) -> tuple[int, dict[str, Any]]:
+    if isinstance(error, AnthropicStreamReadFailure):
+        return 502, {"error": {"message": str(error.error)}}
+    if isinstance(error, UpstreamError):
+        return error.status_code, {"error": {"message": error.body}}
+    return 502, {"error": {"message": str(error)}}
 
 
 async def _count_tokens(body: bytes, headers: dict[str, str]) -> httpx.Response:
@@ -246,14 +253,14 @@ def test_kimi_binding_candidates_match_declared_policy_contracts() -> None:
     }
 
     error_parameters, error_return = _callable_contract(AnthropicErrorPolicy)
-    assert error_parameters == (KimiUpstreamError,)
+    assert error_parameters == (AnthropicRelayError,)
     assert error_return == tuple[int, dict[str, Any]]
-    assert _parameter_shape(_kimi_upstream_error_to_claude) == (
+    assert _parameter_shape(_kimi_error_to_claude) == (
         ("exc", inspect.Parameter.POSITIONAL_OR_KEYWORD),
     )
-    assert not inspect.iscoroutinefunction(_kimi_upstream_error_to_claude)
-    assert get_type_hints(_kimi_upstream_error_to_claude) == {
-        "exc": KimiUpstreamError,
+    assert not inspect.iscoroutinefunction(_kimi_error_to_claude)
+    assert get_type_hints(_kimi_error_to_claude) == {
+        "exc": AnthropicRelayError,
         "return": tuple[int, dict[str, Any]],
     }
 
@@ -261,12 +268,12 @@ def test_kimi_binding_candidates_match_declared_policy_contracts() -> None:
     backend = AnthropicBackend(
         transport=kimi_client,
         header_policy=_kimi_request_headers,
-        error_policy=_kimi_upstream_error_to_claude,
+        error_policy=_kimi_error_to_claude,
         token_counter=kimi_client.count_tokens,
     )
     assert backend.transport is kimi_client
     assert backend.header_policy is _kimi_request_headers
-    assert backend.error_policy is _kimi_upstream_error_to_claude
+    assert backend.error_policy is _kimi_error_to_claude
     assert backend.token_counter.__self__ is kimi_client
     assert backend.token_counter.__func__ is KimiClient.count_tokens
 

@@ -60,7 +60,7 @@ from claudex.admin.system import (
     _handle_favicon,
 )
 from claudex.relay import endpoints as relay_endpoints
-from claudex.relay.kimi import _kimi_request_headers, _kimi_upstream_error_to_claude
+from claudex.relay.kimi import _kimi_error_to_claude, _kimi_request_headers
 from claudex.claude.account_pool import AccountCooldownTracker
 from claudex.claude.accounts import AccountRecord, list_accounts
 from claudex.claude.ambient_account import AmbientAccountProvider, is_duplicate_identity
@@ -136,7 +136,7 @@ def _assemble_route_backends(
         "kimi": AnthropicBackend(
             transport=kimi_client,
             header_policy=_kimi_request_headers,
-            error_policy=_kimi_upstream_error_to_claude,
+            error_policy=_kimi_error_to_claude,
             token_counter=kimi_client.count_tokens,
         ),
         "grok": ResponsesBackend(

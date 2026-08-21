@@ -431,7 +431,7 @@ def test_lifespan_builds_complete_parallel_route_backend_registry(
         assert isinstance(kimi_backend, AnthropicBackend)
         assert kimi_backend.transport is state.kimi_client
         assert kimi_backend.header_policy is relay_kimi._kimi_request_headers
-        assert kimi_backend.error_policy is relay_kimi._kimi_upstream_error_to_claude
+        assert kimi_backend.error_policy is relay_kimi._kimi_error_to_claude
         assert kimi_backend.token_counter.__self__ is state.kimi_client
         assert kimi_backend.token_counter.__func__ is FakeKimiClient.count_tokens
 
@@ -592,8 +592,11 @@ def test_responses_dispatch_reads_route_registry_without_provider_client_branche
     ):
         assert legacy_dispatch not in relay_source
 
-    for unchanged_module in (relay_endpoints, relay_kimi):
-        assert "route_backends" not in inspect.getsource(unchanged_module)
+    endpoint_source = inspect.getsource(relay_endpoints)
+    assert "route_backends" in endpoint_source
+    assert 'route.provider == "kimi"' not in endpoint_source
+    assert "kimi_client" not in endpoint_source
+    assert "route_backends" not in inspect.getsource(relay_kimi)
 
 
 def test_admin_connection_probe_selects_transport_and_payload_policy_from_binding() -> None:

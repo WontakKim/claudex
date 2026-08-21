@@ -12,6 +12,7 @@ from starlette.responses import JSONResponse, StreamingResponse
 
 from claudex import server_support
 from claudex.config import GatewayConfig, RouteTarget
+from claudex.providers.backends import AnthropicBackend, ResponsesBackend, RouteBackend
 from claudex.relay import balanced as balanced_relay
 from claudex.relay.balanced import _passthrough_with_claude_balanced
 from claudex.relay.common import (
@@ -19,7 +20,10 @@ from claudex.relay.common import (
     _relay_anthropic_response,
     _send_to_anthropic,
 )
-from claudex.relay.kimi import _count_tokens_via_kimi, _relay_to_kimi
+from claudex.relay.anthropic_backend import (
+    _count_tokens_via_anthropic_backend,
+    _relay_via_anthropic_backend,
+)
 from claudex.relay.openai_backend import _relay_via_responses_backend
 from claudex.relay.registered import (
     _passthrough_with_claude_account,
@@ -27,6 +31,21 @@ from claudex.relay.registered import (
 )
 
 logger = logging.getLogger("claudex.server")
+
+
+def _get_route_backend(request: Request, provider: str) -> RouteBackend:
+    try:
+        backend = request.app.state.route_backends[provider]
+    except KeyError as exc:
+        raise RuntimeError(
+            f"route backend registry has no binding for provider {provider!r}"
+        ) from exc
+    if not isinstance(backend, (ResponsesBackend, AnthropicBackend)):
+        raise RuntimeError(
+            "route backend registry contains an unsupported binding for "
+            f"provider {provider!r}: {type(backend).__name__}"
+        )
+    return backend
 
 
 def _route_for_request(config: GatewayConfig, parsed: Any) -> RouteTarget | None:
@@ -105,8 +124,11 @@ async def _handle_messages(request: Request) -> JSONResponse | StreamingResponse
     if route is None:
         logger.info("%s -> anthropic passthrough", model or "?")
         return await _passthrough_to_anthropic(request, raw_body, claude_request)
-    if route.provider == "kimi":
-        return await _relay_to_kimi(request, claude_request, route.model)
+    backend = _get_route_backend(request, route.provider)
+    if isinstance(backend, AnthropicBackend):
+        return await _relay_via_anthropic_backend(
+            request, claude_request, route.model, backend
+        )
     return await _relay_via_responses_backend(request, claude_request, route)
 
 
@@ -126,8 +148,11 @@ async def _handle_count_tokens(request: Request) -> JSONResponse | StreamingResp
     route = _route_for_request(config, body)
     if route is None:
         return await _passthrough_to_anthropic(request, raw_body, body)
-    if route.provider == "kimi":
-        counted = await _count_tokens_via_kimi(request, body, route.model)
+    backend = _get_route_backend(request, route.provider)
+    if isinstance(backend, AnthropicBackend):
+        counted = await _count_tokens_via_anthropic_backend(
+            request, body, route.model, backend
+        )
         if counted is not None:
             return counted
 
