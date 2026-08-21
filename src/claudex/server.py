@@ -60,16 +60,21 @@ from claudex.admin.system import (
     _handle_favicon,
 )
 from claudex.relay import endpoints as relay_endpoints
+from claudex.relay.kimi import _kimi_request_headers, _kimi_upstream_error_to_claude
 from claudex.claude.account_pool import AccountCooldownTracker
 from claudex.claude.accounts import AccountRecord, list_accounts
 from claudex.claude.ambient_account import AmbientAccountProvider, is_duplicate_identity
 from claudex.balanced.polling import UsagePollAccount
 from claudex.balanced.runtime import ClaudeBalancedRuntime
 from claudex.providers.codex_auth import CodexAuthError, CodexAuthManager
-from claudex.providers.codex_client import CodexClient
+from claudex.providers.backends import AnthropicBackend, ResponsesBackend, RouteBackend
+from claudex.providers.codex_client import (
+    CODEX_FAST_TIER_WIRE_VALUE,
+    CodexClient,
+)
 from claudex.config import GatewayConfig
 from claudex.providers.grok_auth import GrokAuthError, GrokAuthManager
-from claudex.providers.grok_client import GrokClient
+from claudex.providers.grok_client import GrokClient, sanitize_grok_payload
 from claudex.providers.kimi_auth import KimiAuthError, KimiAuthManager
 from claudex.providers.kimi_client import KimiClient
 from claudex.locking import try_file_lock
@@ -78,6 +83,86 @@ from claudex.providers.openai_compatible_client import OpenAICompatibleClient
 logger = logging.getLogger(__name__)
 
 _UPSTREAM_TIMEOUT = httpx.Timeout(connect=15.0, read=600.0, write=30.0, pool=15.0)
+
+
+async def _adapt_grok_payload(
+    payload: dict[str, Any], model: str
+) -> dict[str, Any]:
+    return sanitize_grok_payload(payload, model)
+
+
+async def _adapt_identity_payload(
+    payload: dict[str, Any], model: str
+) -> dict[str, Any]:
+    return payload
+
+
+def _assemble_route_backends(
+    app: Starlette,
+    config: GatewayConfig,
+    codex_client: CodexClient,
+    kimi_client: KimiClient,
+    grok_client: GrokClient,
+    custom_provider_clients: dict[str, OpenAICompatibleClient],
+) -> dict[str, RouteBackend]:
+    async def adapt_codex_payload(
+        payload: dict[str, Any], model: str
+    ) -> dict[str, Any]:
+        current_config: GatewayConfig = app.state.config
+        if current_config.codex_service_tier != "fast":
+            return payload
+        if await codex_client.supports_fast_tier(model):
+            payload["service_tier"] = CODEX_FAST_TIER_WIRE_VALUE
+        else:
+            logger.debug(
+                "fast tier requested but the codex catalog does not advertise it for %s",
+                model,
+            )
+        return payload
+
+    route_backends: dict[str, RouteBackend] = {
+        "codex": ResponsesBackend(
+            transport=codex_client,
+            adapt_payload=adapt_codex_payload,
+            signature_namespace=None,
+        ),
+        "kimi": AnthropicBackend(
+            transport=kimi_client,
+            header_policy=_kimi_request_headers,
+            error_policy=_kimi_upstream_error_to_claude,
+            token_counter=kimi_client.count_tokens,
+        ),
+        "grok": ResponsesBackend(
+            transport=grok_client,
+            adapt_payload=_adapt_grok_payload,
+            signature_namespace=None,
+        ),
+    }
+    route_backends.update(
+        {
+            name: ResponsesBackend(
+                transport=client,
+                adapt_payload=_adapt_identity_payload,
+                signature_namespace=name,
+            )
+            for name, client in custom_provider_clients.items()
+        }
+    )
+
+    configured_provider_names = set(config.route_providers)
+    client_provider_names = {"codex", "kimi", "grok", *custom_provider_clients}
+    backend_provider_names = set(route_backends)
+    if (
+        client_provider_names != configured_provider_names
+        or backend_provider_names != configured_provider_names
+    ):
+        raise RuntimeError(
+            "route backend registry mismatch: "
+            f"configured={sorted(configured_provider_names)!r}; "
+            f"clients={sorted(client_provider_names)!r}; "
+            f"backends={sorted(backend_provider_names)!r}"
+        )
+    return route_backends
 
 
 class _LogBufferHandler(logging.Handler):
@@ -154,6 +239,14 @@ def create_app(config: GatewayConfig, daemon_nonce: str | None = None) -> Starle
                             name, provider, http_client
                         )
                     app.state.custom_provider_clients = custom_provider_clients
+                    app.state.route_backends = _assemble_route_backends(
+                        app,
+                        config,
+                        app.state.codex_client,
+                        app.state.kimi_client,
+                        app.state.grok_client,
+                        custom_provider_clients,
+                    )
                     app.state.http_client = http_client
 
                     if config.claude_account_routing_mode == "balanced":
