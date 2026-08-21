@@ -350,6 +350,9 @@ class FakeKimiClient:
     ) -> httpx.Response:
         return httpx.Response(200, json={"input_tokens": 1})
 
+    async def list_models(self) -> Any:
+        return {"data": []}
+
 
 class AvailableGrokAuthManager:
     def __init__(self, *_args: Any, **_kwargs: Any) -> None:
@@ -2911,6 +2914,9 @@ def _select_route_transport(
         header_policy=backend.header_policy,
         error_policy=backend.error_policy,
         token_counter=backend.token_counter,
+        catalog_loader=(
+            transport.list_models if backend.catalog_loader is not None else None
+        ),
     )
 
 
@@ -2991,6 +2997,28 @@ class TestAdminDashboardApi:
         assert response.status_code == 200
         assert response.json() == {"data": [{"id": "k2.5"}, {"id": "k3"}]}
         assert selected_transport.calls == 1
+
+    def test_kimi_models_without_catalog_capability_performs_no_io(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        selected_transport = SelectedAnthropicModelTransport({"data": []})
+        with self._client(monkeypatch, tmp_path) as client:
+            backend = client.app.state.route_backends["kimi"]
+            assert isinstance(backend, AnthropicBackend)
+            client.app.state.route_backends["kimi"] = AnthropicBackend(
+                transport=selected_transport,
+                header_policy=backend.header_policy,
+                error_policy=backend.error_policy,
+                token_counter=backend.token_counter,
+                catalog_loader=None,
+            )
+            with pytest.raises(
+                RuntimeError,
+                match="kimi route backend does not provide a model catalog",
+            ):
+                client.get("/admin/providers/kimi/models")
+
+        assert selected_transport.calls == 0
 
     def test_kimi_models_relays_upstream_error(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path

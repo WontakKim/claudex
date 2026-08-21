@@ -243,6 +243,9 @@ class FakeKimiClient:
     ) -> httpx.Response:
         return httpx.Response(200, json={"input_tokens": 1})
 
+    async def list_models(self) -> Any:
+        return {"data": []}
+
 
 class AvailableGrokAuthManager:
     def __init__(self, *_args: Any, **_kwargs: Any) -> None:
@@ -1508,6 +1511,40 @@ def test_anthropic_count_tokens_transport_error_returns_no_response() -> None:
     )
 
     assert counted is None
+
+
+def test_anthropic_backend_without_token_counter_uses_exact_local_estimate_without_io() -> None:
+    class MessagesOnlyTransport:
+        async def send_messages(
+            self, body: bytes, headers: dict[str, str]
+        ) -> httpx.Response:
+            raise AssertionError("Messages transport must not handle token counting")
+
+    def header_policy(request: Request) -> dict[str, str]:
+        raise AssertionError("Header policy must not run without a token counter")
+
+    def error_policy(exc: Any) -> tuple[int, dict[str, Any]]:
+        raise AssertionError(f"Unexpected backend error: {exc!r}")
+
+    def anthropic_handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("Local estimation must not perform upstream I/O")
+
+    config = GatewayConfig(model_map={"opus": "codex:native-model"})
+    client, _ = _gateway(config, anthropic_handler)
+    client.app.state.route_backends["codex"] = AnthropicBackend(
+        transport=MessagesOnlyTransport(),
+        header_policy=header_policy,
+        error_policy=error_policy,
+        token_counter=None,
+        catalog_loader=None,
+    )
+    body = _message_body("claude-opus-4-6")
+
+    response = client.post("/v1/messages/count_tokens", json=body)
+
+    expected = max(len(json.dumps(body, ensure_ascii=False)) // 4, 1)
+    assert response.status_code == 200
+    assert response.json() == {"input_tokens": expected}
 
 
 def test_kimi_stream_client_reset_stops_closed_socket_writes(

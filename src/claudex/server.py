@@ -138,6 +138,7 @@ def _assemble_route_backends(
             header_policy=_kimi_request_headers,
             error_policy=_kimi_error_to_claude,
             token_counter=kimi_client.count_tokens,
+            catalog_loader=kimi_client.list_models,
         ),
         "grok": ResponsesBackend(
             transport=grok_client,

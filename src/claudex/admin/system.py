@@ -312,8 +312,10 @@ async def _handle_admin_kimi_models(request: Request) -> JSONResponse:
     backend = _get_route_backend(request, "kimi")
     if not isinstance(backend, AnthropicBackend):
         raise RuntimeError("kimi route backend must use the Anthropic Messages wire")
+    if backend.catalog_loader is None:
+        raise RuntimeError("kimi route backend does not provide a model catalog")
     try:
-        catalog = await backend.transport.list_models()
+        catalog = await backend.catalog_loader()
     except KimiAuthError as exc:
         return JSONResponse(
             server_support._openai_error_body("authentication_error", str(exc)), status_code=401

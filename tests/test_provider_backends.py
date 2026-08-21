@@ -14,6 +14,7 @@ from starlette.requests import Request
 
 from claudex.providers.backends import (
     AnthropicBackend,
+    AnthropicCatalogLoader,
     AnthropicErrorPolicy,
     AnthropicHeaderPolicy,
     AnthropicMessagesTransport,
@@ -66,10 +67,6 @@ class _AnthropicMessagesTransport:
             stream=_OpenResponseStream(),
         )
 
-    async def list_models(self) -> Any:
-        return {"data": [{"id": "messages-model"}]}
-
-
 async def _adapt_payload(
     payload: dict[str, Any], model: str
 ) -> dict[str, Any]:
@@ -99,6 +96,10 @@ async def _count_tokens(body: bytes, headers: dict[str, str]) -> httpx.Response:
         200,
         json={"input_tokens": len(body), "header_count": len(headers)},
     )
+
+
+async def _load_catalog() -> Any:
+    return {"data": [{"id": "messages-model"}]}
 
 
 def _parameter_shape(
@@ -133,6 +134,7 @@ def test_backend_type_determines_wire_kind_without_redundant_instance_field() ->
         _header_policy,
         _error_policy,
         _count_tokens,
+        _load_catalog,
     )
 
     assert [field.name for field in fields(ResponsesBackend)] == [
@@ -146,6 +148,7 @@ def test_backend_type_determines_wire_kind_without_redundant_instance_field() ->
         "header_policy",
         "error_policy",
         "token_counter",
+        "catalog_loader",
     ]
     assert responses.wire_kind is WireKind.RESPONSES
     assert anthropic.wire_kind is WireKind.ANTHROPIC_MESSAGES
@@ -163,7 +166,8 @@ def test_backend_fields_retain_the_declared_callable_contracts() -> None:
     assert anthropic_hints["transport"] is AnthropicMessagesTransport
     assert anthropic_hints["header_policy"] == AnthropicHeaderPolicy
     assert anthropic_hints["error_policy"] == AnthropicErrorPolicy
-    assert anthropic_hints["token_counter"] == AnthropicTokenCounter
+    assert anthropic_hints["token_counter"] == AnthropicTokenCounter | None
+    assert anthropic_hints["catalog_loader"] == AnthropicCatalogLoader | None
 
 
 def test_binding_callables_follow_the_existing_relay_call_shapes() -> None:
@@ -196,6 +200,7 @@ def test_binding_callables_follow_the_existing_relay_call_shapes() -> None:
             _header_policy,
             _error_policy,
             _count_tokens,
+            _load_catalog,
         )
         request = Request(
             {
@@ -217,8 +222,14 @@ def test_binding_callables_follow_the_existing_relay_call_shapes() -> None:
         assert status_code == 429
         assert error_body == {"error": {"message": "rate limited"}}
 
+        assert anthropic.token_counter is not None
         token_response = await anthropic.token_counter(b"{}", headers)
         assert token_response.json() == {"input_tokens": 2, "header_count": 1}
+
+        assert anthropic.catalog_loader is not None
+        assert await anthropic.catalog_loader() == {
+            "data": [{"id": "messages-model"}]
+        }
 
     asyncio.run(scenario())
 
@@ -270,18 +281,24 @@ def test_kimi_binding_candidates_match_declared_policy_contracts() -> None:
         header_policy=_kimi_request_headers,
         error_policy=_kimi_error_to_claude,
         token_counter=kimi_client.count_tokens,
+        catalog_loader=kimi_client.list_models,
     )
     assert backend.transport is kimi_client
     assert backend.header_policy is _kimi_request_headers
     assert backend.error_policy is _kimi_error_to_claude
+    assert backend.token_counter is not None
     assert backend.token_counter.__self__ is kimi_client
     assert backend.token_counter.__func__ is KimiClient.count_tokens
+    assert backend.catalog_loader is not None
+    assert backend.catalog_loader.__self__ is kimi_client
+    assert backend.catalog_loader.__func__ is KimiClient.list_models
 
     counter_parameters, counter_return = _callable_contract(AnthropicTokenCounter)
     assert counter_parameters == (bytes, dict[str, str])
     assert get_origin(counter_return) is Awaitable
     assert get_args(counter_return) == (httpx.Response,)
     bound_counter = backend.token_counter
+    assert bound_counter is not None
     assert _parameter_shape(bound_counter) == (
         ("body", inspect.Parameter.POSITIONAL_OR_KEYWORD),
         ("headers", inspect.Parameter.POSITIONAL_OR_KEYWORD),
@@ -292,6 +309,16 @@ def test_kimi_binding_candidates_match_declared_policy_contracts() -> None:
         "headers": dict[str, str],
         "return": httpx.Response,
     }
+
+    catalog_parameters, catalog_return = _callable_contract(AnthropicCatalogLoader)
+    assert catalog_parameters == ()
+    assert get_origin(catalog_return) is Awaitable
+    assert get_args(catalog_return) == (Any,)
+    bound_catalog_loader = backend.catalog_loader
+    assert bound_catalog_loader is not None
+    assert _parameter_shape(bound_catalog_loader) == ()
+    assert inspect.iscoroutinefunction(bound_catalog_loader)
+    assert get_type_hints(bound_catalog_loader) == {"return": Any}
 
 
 @pytest.mark.parametrize(
@@ -340,9 +367,25 @@ def test_existing_kimi_client_matches_the_open_response_transport_shape() -> Non
     assert inspect.iscoroutinefunction(KimiClient.list_models)
 
 
+def test_optional_anthropic_capabilities_default_to_absence_without_stubs() -> None:
+    backend = AnthropicBackend(
+        transport=_AnthropicMessagesTransport(),
+        header_policy=_header_policy,
+        error_policy=_error_policy,
+    )
+
+    parameters = inspect.signature(AnthropicBackend).parameters
+    assert parameters["token_counter"].default is None
+    assert parameters["catalog_loader"].default is None
+    assert backend.token_counter is None
+    assert backend.catalog_loader is None
+
+
 def test_transport_protocols_remain_structural_only_and_wire_specific() -> None:
     assert not hasattr(ResponsesTransport, "send_messages")
     assert not hasattr(AnthropicMessagesTransport, "stream_responses")
+    assert not hasattr(AnthropicMessagesTransport, "count_tokens")
+    assert not hasattr(AnthropicMessagesTransport, "list_models")
     with pytest.raises(TypeError, match="runtime_checkable"):
         isinstance(_ResponsesTransport(), ResponsesTransport)
     with pytest.raises(TypeError, match="runtime_checkable"):

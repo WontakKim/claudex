@@ -47,8 +47,6 @@ class AnthropicMessagesTransport(Protocol):
         """Return an open response whose ownership transfers to the caller."""
         ...
 
-    async def list_models(self) -> Any: ...
-
 
 ResponsesPayloadAdapter: TypeAlias = Callable[
     [dict[str, Any], str], Awaitable[dict[str, Any]]
@@ -78,6 +76,7 @@ AnthropicErrorPolicy: TypeAlias = Callable[
 AnthropicTokenCounter: TypeAlias = Callable[
     [bytes, dict[str, str]], Awaitable[httpx.Response]
 ]
+AnthropicCatalogLoader: TypeAlias = Callable[[], Awaitable[Any]]
 
 
 @dataclass(frozen=True)
@@ -101,7 +100,8 @@ class AnthropicBackend:
     transport: AnthropicMessagesTransport
     header_policy: AnthropicHeaderPolicy
     error_policy: AnthropicErrorPolicy
-    token_counter: AnthropicTokenCounter
+    token_counter: AnthropicTokenCounter | None = None
+    catalog_loader: AnthropicCatalogLoader | None = None
 
 
 RouteBackend: TypeAlias = ResponsesBackend | AnthropicBackend

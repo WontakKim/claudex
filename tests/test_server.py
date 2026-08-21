@@ -97,6 +97,9 @@ class FakeKimiClient:
     ) -> httpx.Response:
         return httpx.Response(200, json={"input_tokens": 1})
 
+    async def list_models(self) -> Any:
+        return {"data": []}
+
 
 class AvailableGrokAuthManager:
     def __init__(self, *_args: Any, **_kwargs: Any) -> None:
@@ -432,8 +435,12 @@ def test_lifespan_builds_complete_parallel_route_backend_registry(
         assert kimi_backend.transport is state.kimi_client
         assert kimi_backend.header_policy is relay_kimi._kimi_request_headers
         assert kimi_backend.error_policy is relay_kimi._kimi_error_to_claude
+        assert kimi_backend.token_counter is not None
         assert kimi_backend.token_counter.__self__ is state.kimi_client
         assert kimi_backend.token_counter.__func__ is FakeKimiClient.count_tokens
+        assert kimi_backend.catalog_loader is not None
+        assert kimi_backend.catalog_loader.__self__ is state.kimi_client
+        assert kimi_backend.catalog_loader.__func__ is FakeKimiClient.list_models
 
         grok_backend = route_backends["grok"]
         assert isinstance(grok_backend, ResponsesBackend)
