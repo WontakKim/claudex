@@ -8,6 +8,7 @@ import re
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import TypeAlias
 from urllib.parse import urlsplit
 
 DEFAULT_HOST = "127.0.0.1"
@@ -84,6 +85,17 @@ class OpenAICompatibleProvider:
     api_key: str
 
 
+@dataclass(frozen=True)
+class AnthropicCompatibleProvider:
+    """A static Anthropic Messages-compatible upstream configuration."""
+
+    base_url: str
+    api_key: str
+
+
+_CustomProvider: TypeAlias = OpenAICompatibleProvider | AnthropicCompatibleProvider
+
+
 def parse_route_target(value: str, known_providers: Sequence[str]) -> RouteTarget:
     """Parse a provider-prefixed model_map value against registered providers.
 
@@ -113,13 +125,17 @@ def parse_route_target(value: str, known_providers: Sequence[str]) -> RouteTarge
     return RouteTarget(provider=prefix, model=model)
 
 
-def parse_custom_providers(value: object) -> dict[str, OpenAICompatibleProvider]:
+def parse_custom_providers(value: object) -> dict[str, _CustomProvider]:
     """Parse custom provider families from a settings object or env JSON."""
     example = (
         '{"openai_compatible": {"wrtn": {"wire_api": "responses", '
         '"base_url": "https://model.example/api/v1", "api_key": "secret"}}}'
     )
-    valid_families = ("openai_compatible",)
+    family_fields = {
+        "openai_compatible": {"wire_api", "base_url", "api_key"},
+        "anthropic_compatible": {"base_url", "api_key"},
+    }
+    valid_families = tuple(family_fields)
     if isinstance(value, str):
         if not value:
             return {}
@@ -146,115 +162,132 @@ def parse_custom_providers(value: object) -> dict[str, OpenAICompatibleProvider]
             f"valid families: {', '.join(valid_families)}; example: {example}"
         )
 
-    entries = value.get("openai_compatible", {})
-    if not isinstance(entries, dict):
-        raise ConfigError(
-            "custom providers family 'openai_compatible' must be a JSON object "
-            f"mapping provider names, got {type(entries).__name__}; example: {example}"
-        )
-
-    required_fields = {"wire_api", "base_url", "api_key"}
-    providers: dict[str, OpenAICompatibleProvider] = {}
-    for name, entry in entries.items():
-        if not isinstance(name, str) or re.fullmatch(
-            r"[a-z][a-z0-9-]{0,31}", name
-        ) is None:
+    providers: dict[str, _CustomProvider] = {}
+    provider_families: dict[str, str] = {}
+    for family, required_fields in family_fields.items():
+        entries = value.get(family, {})
+        if not isinstance(entries, dict):
             raise ConfigError(
-                f"custom provider name {name!r} is invalid; valid names match "
-                "^[a-z][a-z0-9-]{0,31}$; example: 'wrtn'"
-            )
-        if name in RESERVED_PROVIDER_NAMES:
-            raise ConfigError(
-                f"custom provider name {name!r} is reserved; reserved names: "
-                f"{', '.join(RESERVED_PROVIDER_NAMES)}; example: 'wrtn'"
-            )
-        if not isinstance(entry, dict):
-            raise ConfigError(
-                f"custom provider {name!r} must be a JSON object, got "
-                f"{type(entry).__name__}; example entry: {example}"
-            )
-
-        unknown_fields = sorted(
-            str(field) for field in entry if field not in required_fields
-        )
-        if unknown_fields:
-            raise ConfigError(
-                f"custom provider {name!r} has unknown keys: "
-                f"{', '.join(unknown_fields)}; valid keys: "
-                f"{', '.join(sorted(required_fields))}; example: {example}"
-            )
-        missing_fields = sorted(required_fields - set(entry))
-        if missing_fields:
-            raise ConfigError(
-                f"custom provider {name!r} is missing required keys: "
-                f"{', '.join(missing_fields)}; required keys: "
-                f"{', '.join(sorted(required_fields))}; example: {example}"
-            )
-
-        wire_api = entry["wire_api"]
-        if wire_api == "chat":
-            raise ConfigError(
-                f"custom provider {name!r} uses wire_api 'chat'; chat completions "
-                "upstreams are not supported and only 'responses' is valid; "
+                f"custom providers family {family!r} must be a JSON object "
+                f"mapping provider names, got {type(entries).__name__}; "
                 f"example: {example}"
             )
-        if wire_api != "responses":
-            raise ConfigError(
-                f"custom provider {name!r} wire_api must be exactly 'responses', "
-                f"got {wire_api!r}; example: {example}"
-            )
 
-        raw_base_url = entry["base_url"]
-        if not isinstance(raw_base_url, str) or not raw_base_url.strip():
-            found = (
-                "empty string"
-                if isinstance(raw_base_url, str)
-                else type(raw_base_url).__name__
-            )
-            raise ConfigError(
-                f"custom provider {name!r} base_url must be a non-empty URL string, "
-                f"got {found}; example: 'https://model.example/api/v1'"
-            )
-        base_url = raw_base_url.strip().rstrip("/")
-        try:
-            parsed_url = urlsplit(base_url)
-            base_url_host = parsed_url.hostname
-        except ValueError:
-            parsed_url = None
-            base_url_host = None
-        if parsed_url is None or not parsed_url.scheme or base_url_host is None:
-            raise ConfigError(
-                f"custom provider {name!r} base_url is not a valid absolute URL; "
-                "valid URLs use https, e.g. 'https://model.example/api/v1'"
-            )
-        is_secure = parsed_url.scheme == "https"
-        is_loopback_http = parsed_url.scheme == "http" and is_loopback_host(
-            base_url_host
-        )
-        if not is_secure and not is_loopback_http:
-            raise ConfigError(
-                f"custom provider {name!r} base_url uses scheme "
-                f"{parsed_url.scheme!r} for host {base_url_host!r}; https is required "
-                "except for http loopback URLs, e.g. 'http://127.0.0.1:8080/v1'"
-            )
+        for name, entry in entries.items():
+            if not isinstance(name, str) or re.fullmatch(
+                r"[a-z][a-z0-9-]{0,31}", name
+            ) is None:
+                raise ConfigError(
+                    f"custom provider name {name!r} is invalid; valid names match "
+                    "^[a-z][a-z0-9-]{0,31}$; example: 'wrtn'"
+                )
+            if name in RESERVED_PROVIDER_NAMES:
+                raise ConfigError(
+                    f"custom provider name {name!r} is reserved; reserved names: "
+                    f"{', '.join(RESERVED_PROVIDER_NAMES)}; example: 'wrtn'"
+                )
+            if name in providers:
+                raise ConfigError(
+                    f"custom provider name {name!r} is configured in both "
+                    f"{provider_families[name]!r} and {family!r}; provider names "
+                    "must be unique across families"
+                )
+            if not isinstance(entry, dict):
+                raise ConfigError(
+                    f"custom provider {name!r} must be a JSON object, got "
+                    f"{type(entry).__name__}; example entry: {example}"
+                )
 
-        api_key = entry["api_key"]
-        if not isinstance(api_key, str) or not api_key.strip():
-            found = (
-                "empty string"
-                if isinstance(api_key, str)
-                else type(api_key).__name__
+            unknown_fields = sorted(
+                str(field) for field in entry if field not in required_fields
             )
-            raise ConfigError(
-                f"custom provider {name!r} api_key must be a non-empty string, got "
-                f"{found}; example: 'secret'"
-            )
+            if unknown_fields:
+                raise ConfigError(
+                    f"custom provider {name!r} has unknown keys: "
+                    f"{', '.join(unknown_fields)}; valid keys: "
+                    f"{', '.join(sorted(required_fields))}; example: {example}"
+                )
+            missing_fields = sorted(required_fields - set(entry))
+            if missing_fields:
+                raise ConfigError(
+                    f"custom provider {name!r} is missing required keys: "
+                    f"{', '.join(missing_fields)}; required keys: "
+                    f"{', '.join(sorted(required_fields))}; example: {example}"
+                )
 
-        providers[name] = OpenAICompatibleProvider(
-            wire_api=wire_api,
-            base_url=base_url,
-            api_key=api_key,
-        )
+            if family == "openai_compatible":
+                wire_api = entry["wire_api"]
+                if wire_api == "chat":
+                    raise ConfigError(
+                        f"custom provider {name!r} uses wire_api 'chat'; chat "
+                        "completions upstreams are not supported and only "
+                        f"'responses' is valid; example: {example}"
+                    )
+                if wire_api != "responses":
+                    raise ConfigError(
+                        f"custom provider {name!r} wire_api must be exactly "
+                        f"'responses', got {wire_api!r}; example: {example}"
+                    )
+
+            raw_base_url = entry["base_url"]
+            if not isinstance(raw_base_url, str) or not raw_base_url.strip():
+                found = (
+                    "empty string"
+                    if isinstance(raw_base_url, str)
+                    else type(raw_base_url).__name__
+                )
+                raise ConfigError(
+                    f"custom provider {name!r} base_url must be a non-empty URL "
+                    f"string, got {found}; example: 'https://model.example/api/v1'"
+                )
+            base_url = raw_base_url.strip().rstrip("/")
+            try:
+                parsed_url = urlsplit(base_url)
+                base_url_host = parsed_url.hostname
+            except ValueError:
+                parsed_url = None
+                base_url_host = None
+            if parsed_url is None or not parsed_url.scheme or base_url_host is None:
+                raise ConfigError(
+                    f"custom provider {name!r} base_url is not a valid absolute URL; "
+                    "valid URLs use https, e.g. 'https://model.example/api/v1'"
+                )
+            is_secure = parsed_url.scheme == "https"
+            is_loopback_http = parsed_url.scheme == "http" and is_loopback_host(
+                base_url_host
+            )
+            if not is_secure and not is_loopback_http:
+                raise ConfigError(
+                    f"custom provider {name!r} base_url uses scheme "
+                    f"{parsed_url.scheme!r} for host {base_url_host!r}; https is "
+                    "required except for http loopback URLs, e.g. "
+                    "'http://127.0.0.1:8080/v1'"
+                )
+
+            api_key = entry["api_key"]
+            if not isinstance(api_key, str) or not api_key.strip():
+                found = (
+                    "empty string"
+                    if isinstance(api_key, str)
+                    else type(api_key).__name__
+                )
+                raise ConfigError(
+                    f"custom provider {name!r} api_key must be a non-empty string, "
+                    f"got {found}; example: 'secret'"
+                )
+
+            if family == "openai_compatible":
+                providers[name] = OpenAICompatibleProvider(
+                    wire_api=wire_api,
+                    base_url=base_url,
+                    api_key=api_key,
+                )
+            else:
+                providers[name] = AnthropicCompatibleProvider(
+                    base_url=base_url,
+                    api_key=api_key,
+                )
+            provider_families[name] = family
     return providers
 
 

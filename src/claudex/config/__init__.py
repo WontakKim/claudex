@@ -12,6 +12,7 @@ from .schema import (
     VALID_CODEX_SERVICE_TIERS,
     VALID_LOG_LEVELS,
     VALID_REASONING_EFFORTS,
+    AnthropicCompatibleProvider,
     ClaudeAccountRoutingPolicy,
     ConfigError,
     OpenAICompatibleProvider,

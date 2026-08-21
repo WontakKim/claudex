@@ -7,6 +7,7 @@ import pytest
 
 from claudex.config import (
     BUILTIN_ROUTE_PROVIDERS,
+    AnthropicCompatibleProvider,
     ConfigError,
     GatewayConfig,
     OpenAICompatibleProvider,
@@ -394,6 +395,15 @@ class TestCustomProviders:
         entry.update(overrides)
         return entry
 
+    @staticmethod
+    def _anthropic_entry(**overrides: object) -> dict[str, object]:
+        entry: dict[str, object] = {
+            "base_url": "https://messages.example/api",
+            "api_key": "anthropic-secret-key",
+        }
+        entry.update(overrides)
+        return entry
+
     @classmethod
     def _payload(
         cls,
@@ -406,6 +416,23 @@ class TestCustomProviders:
         return {
             "custom_providers": {
                 "openai_compatible": {
+                    name: entry,
+                }
+            }
+        }
+
+    @classmethod
+    def _anthropic_payload(
+        cls,
+        *,
+        name: str = "messages-api",
+        entry: object | None = None,
+    ) -> dict[str, object]:
+        if entry is None:
+            entry = cls._anthropic_entry()
+        return {
+            "custom_providers": {
+                "anthropic_compatible": {
                     name: entry,
                 }
             }
@@ -453,6 +480,24 @@ class TestCustomProviders:
             )
         }
 
+    def test_mixed_family_env_json_string_is_parsed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        document = {
+            "anthropic_compatible": {"messages-api": self._anthropic_entry()},
+            "openai_compatible": {"responses-api": self._entry()},
+        }
+        monkeypatch.setenv("CLAUDEX_CUSTOM_PROVIDERS", json.dumps(document))
+
+        config = GatewayConfig.from_env()
+
+        assert isinstance(
+            config.custom_providers["responses-api"], OpenAICompatibleProvider
+        )
+        assert isinstance(
+            config.custom_providers["messages-api"], AnthropicCompatibleProvider
+        )
+
     def test_empty_env_means_no_custom_providers(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
@@ -461,20 +506,148 @@ class TestCustomProviders:
 
         assert GatewayConfig.load(settings_file).custom_providers == {}
 
+    def test_both_families_are_parsed_into_one_route_namespace(
+        self, tmp_path: Path
+    ) -> None:
+        payload = {
+            "custom_providers": {
+                "openai_compatible": {"responses-api": self._entry()},
+                "anthropic_compatible": {
+                    "messages-api": self._anthropic_entry()
+                },
+            },
+            "model_map": {"haiku": "messages-api:claude-haiku"},
+            "context_window_map": {
+                "responses-api:gpt-model": 128000,
+                "messages-api:claude-haiku": 200000,
+            },
+        }
+
+        config = GatewayConfig.load(self._write(tmp_path, payload))
+
+        assert config.custom_providers == {
+            "responses-api": OpenAICompatibleProvider(
+                wire_api="responses",
+                base_url="https://model.example/api/v1",
+                api_key="secret-key",
+            ),
+            "messages-api": AnthropicCompatibleProvider(
+                base_url="https://messages.example/api",
+                api_key="anthropic-secret-key",
+            ),
+        }
+        assert config.route_providers == (
+            *BUILTIN_ROUTE_PROVIDERS,
+            "responses-api",
+            "messages-api",
+        )
+        assert config.mapped_route("claude-haiku-4-5") == RouteTarget(
+            "messages-api", "claude-haiku"
+        )
+        assert config.context_window_map == {
+            "responses-api:gpt-model": 128000,
+            "messages-api:claude-haiku": 200000,
+        }
+
+    def test_cross_family_duplicate_provider_name_fails_at_boot(
+        self, tmp_path: Path
+    ) -> None:
+        payload = {
+            "custom_providers": {
+                "openai_compatible": {
+                    "shared": self._entry(api_key="openai-sensitive-key")
+                },
+                "anthropic_compatible": {
+                    "shared": self._anthropic_entry(
+                        api_key="anthropic-sensitive-key"
+                    )
+                },
+            }
+        }
+
+        with pytest.raises(ConfigError) as error:
+            GatewayConfig.load(self._write(tmp_path, payload))
+
+        message = str(error.value)
+        assert "provider name 'shared' is configured in both" in message
+        assert "openai_compatible" in message
+        assert "anthropic_compatible" in message
+        assert "openai-sensitive-key" not in message
+        assert "anthropic-sensitive-key" not in message
+
+    def test_family_order_is_deterministic(self, tmp_path: Path) -> None:
+        payload = {
+            "custom_providers": {
+                "anthropic_compatible": {
+                    "messages-api": self._anthropic_entry()
+                },
+                "openai_compatible": {"responses-api": self._entry()},
+            }
+        }
+
+        config = GatewayConfig.load(self._write(tmp_path, payload))
+
+        assert tuple(config.custom_providers) == ("responses-api", "messages-api")
+
     def test_unknown_family_fails_at_boot(self, tmp_path: Path) -> None:
         settings_file = self._write(
             tmp_path,
-            {"custom_providers": {"anthropic_compatible": {}}},
+            {"custom_providers": {"other_compatible": {}}},
         )
 
         with pytest.raises(
             ConfigError,
             match=(
-                "unknown families: anthropic_compatible.*"
-                "valid families: openai_compatible"
+                "unknown families: other_compatible.*"
+                "valid families: openai_compatible, anthropic_compatible"
             ),
         ):
             GatewayConfig.load(settings_file)
+
+    @pytest.mark.parametrize(
+        ("name", "overrides", "message"),
+        [
+            pytest.param(
+                "messages-api",
+                {"wire_api": "responses"},
+                "unknown keys: wire_api.*valid keys: api_key, base_url",
+                id="wire-api-is-unknown",
+            ),
+            pytest.param(
+                "messages-api",
+                {"base_url": "http://model.example/api"},
+                "https is required except for http loopback",
+                id="invalid-url",
+            ),
+            pytest.param(
+                "messages-api",
+                {"api_key": ""},
+                "api_key must be a non-empty string",
+                id="empty-api-key",
+            ),
+            pytest.param(
+                "anthropic",
+                {},
+                "custom provider name 'anthropic' is reserved",
+                id="reserved-name",
+            ),
+        ],
+    )
+    def test_anthropic_compatible_validation_reuses_existing_rules(
+        self,
+        tmp_path: Path,
+        name: str,
+        overrides: dict[str, object],
+        message: str,
+    ) -> None:
+        entry = self._anthropic_entry(api_key="sensitive-api-key")
+        entry.update(overrides)
+        payload = self._anthropic_payload(name=name, entry=entry)
+
+        with pytest.raises(ConfigError, match=message) as error:
+            GatewayConfig.load(self._write(tmp_path, payload))
+
+        assert "sensitive-api-key" not in str(error.value)
 
     def test_unknown_entry_key_fails_at_boot(self, tmp_path: Path) -> None:
         settings_file = self._write(
@@ -492,6 +665,27 @@ class TestCustomProviders:
 
         with pytest.raises(ConfigError, match="missing required keys: api_key"):
             GatewayConfig.load(settings_file)
+
+    def test_openai_compatible_still_requires_responses_wire_api(
+        self, tmp_path: Path
+    ) -> None:
+        missing_wire_api = self._entry()
+        del missing_wire_api["wire_api"]
+
+        with pytest.raises(ConfigError, match="missing required keys: wire_api"):
+            GatewayConfig.load(
+                self._write(tmp_path, self._payload(entry=missing_wire_api))
+            )
+
+        with pytest.raises(
+            ConfigError, match="wire_api must be exactly 'responses'"
+        ):
+            GatewayConfig.load(
+                self._write(
+                    tmp_path,
+                    self._payload(entry=self._entry(wire_api="messages")),
+                )
+            )
 
     def test_chat_wire_api_fails_with_specific_message(self, tmp_path: Path) -> None:
         settings_file = self._write(
