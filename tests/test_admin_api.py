@@ -3142,6 +3142,16 @@ class ReadAndCloseFailingAnthropicTransport:
         return self.response
 
 
+class ProbeAnthropicTransport:
+    def __init__(self, response: TrackedProbeResponse) -> None:
+        self.response = response
+
+    async def send_messages(
+        self, body: bytes, headers: dict[str, str]
+    ) -> httpx.Response:
+        return self.response
+
+
 class ProbeKimiResponse(httpx.Response):
     def __init__(self) -> None:
         super().__init__(200, json={"type": "message", "model": "k3"})
@@ -3601,7 +3611,7 @@ class TestAdminDashboardApi:
                 _select_route_transport(client, "openai-by-name", transport)
                 response = client.post(
                     "/admin/test",
-                    json={"target": "openai-by-name:claude-upstream"},
+                    json={"target": "openai-by-name:configured-target"},
                     headers={
                         "anthropic-beta": "oauth-2025-04-20,feature-2026-01-01"
                     },
@@ -3626,6 +3636,128 @@ class TestAdminDashboardApi:
         assert response_stream.close_calls == 1
         assert upstream_response.aclose_calls == 1
         assert outbound_url is not None
+
+    @pytest.mark.parametrize(
+        "upstream_body",
+        [
+            pytest.param(b"", id="empty-body"),
+            pytest.param(b"not JSON", id="non-json-body"),
+            pytest.param(b'"message"', id="json-scalar"),
+            pytest.param(b"[]", id="json-list"),
+            pytest.param(
+                b'{"type":"completion","model":"claude-upstream"}',
+                id="wrong-type",
+            ),
+            pytest.param(
+                b'{"model":"claude-upstream"}',
+                id="missing-type",
+            ),
+            pytest.param(b'{"type":"message"}', id="missing-model"),
+            pytest.param(
+                b'{"type":"message","model":123}',
+                id="non-string-model",
+            ),
+            pytest.param(
+                b'{"type":"message","model":""}',
+                id="empty-model",
+            ),
+            pytest.param(
+                b'{"type":"message","model":"   "}',
+                id="whitespace-model",
+            ),
+            pytest.param(
+                b'{"type":"message","model":"claude-upstream","count":'
+                + b"9" * 5000
+                + b"}",
+                id="numeric-parser-limit",
+            ),
+            pytest.param(
+                b"[" * 5000 + b"0" + b"]" * 5000,
+                id="recursion-parser-limit",
+            ),
+        ],
+    )
+    def test_connection_test_rejects_malformed_anthropic_success_envelope(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        upstream_body: bytes,
+    ) -> None:
+        response_stream = TrackedProbeStream(upstream_body)
+        upstream_response = TrackedProbeResponse(200, response_stream)
+        selected_transport = ProbeAnthropicTransport(upstream_response)
+        config = GatewayConfig(
+            custom_providers={"messages-api": _anthropic_custom_provider()}
+        )
+
+        with self._client(monkeypatch, tmp_path, config=config) as client:
+            _select_route_transport(client, "messages-api", selected_transport)
+            response = client.post(
+                "/admin/test",
+                json={"target": "messages-api:claude-upstream"},
+            )
+
+        assert response.status_code == 200
+        result = response.json()
+        assert result["ok"] is False
+        assert result["status"] == 502
+        assert result["response_model"] is None
+        assert (
+            result["detail"]
+            == "upstream returned an invalid Anthropic Messages response"
+        )
+        assert response_stream.read_calls == 1
+        assert response_stream.close_calls == 1
+        assert upstream_response.aclose_calls == 1
+
+    def test_connection_test_rejects_proprietary_anthropic_200_without_disclosure(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        provider = _anthropic_custom_provider()
+        proprietary_message = f"unsupported target with credential {provider.api_key}"
+        provider_key = "private upstream provider key"
+        generated_content = "private generated probe output"
+        upstream_body = json.dumps(
+            {
+                "code": 400,
+                "msg": proprietary_message,
+                "success": False,
+                "provider_key": provider_key,
+                "content": generated_content,
+            }
+        ).encode()
+        response_stream = TrackedProbeStream(upstream_body)
+        upstream_response = TrackedProbeResponse(200, response_stream)
+        selected_transport = ProbeAnthropicTransport(upstream_response)
+        config = GatewayConfig(custom_providers={"glm": provider})
+
+        with self._client(monkeypatch, tmp_path, config=config) as client:
+            _select_route_transport(client, "glm", selected_transport)
+            response = client.post(
+                "/admin/test",
+                json={"target": "glm:glm-5.anything"},
+            )
+
+        _assert_secret_absent(provider.api_key, response.text, caplog.text)
+        _assert_secret_absent(proprietary_message, response.text, caplog.text)
+        _assert_secret_absent(provider_key, response.text, caplog.text)
+        _assert_secret_absent(generated_content, response.text, caplog.text)
+        assert response.status_code == 200
+        assert response.json() == {
+            "ok": False,
+            "status": 502,
+            "latency_ms": response.json()["latency_ms"],
+            "target": "glm:glm-5.anything",
+            "response_model": None,
+            "detail": "upstream returned an invalid Anthropic Messages response",
+        }
+        assert isinstance(response.json()["latency_ms"], int)
+        assert response_stream.read_calls == 1
+        assert response_stream.close_calls == 1
+        assert upstream_response.aclose_calls == 1
 
     @pytest.mark.parametrize("upstream_status", [401, 503])
     def test_connection_test_static_non_success_is_transport_closed_and_redacted(
