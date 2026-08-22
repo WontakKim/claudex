@@ -19,8 +19,8 @@ from .schema import (
     VALID_LOG_LEVELS,
     VALID_REASONING_EFFORTS,
     ConfigError,
-    OpenAICompatibleProvider,
     RouteTarget,
+    _CustomProvider,
     is_loopback_host,
     parse_claude_account_id,
     parse_claude_account_routing,
@@ -48,7 +48,7 @@ class GatewayConfig:
     model_map: dict[str, str] = field(default_factory=dict)
     # Exact provider-prefixed model targets mapped to context-window overrides.
     context_window_map: dict[str, int] = field(default_factory=dict)
-    custom_providers: dict[str, OpenAICompatibleProvider] = field(default_factory=dict)
+    custom_providers: dict[str, _CustomProvider] = field(default_factory=dict)
     # When set, overrides the reasoning effort derived from the Claude request.
     reasoning_effort_override: str | None = None
     # When set to "fast", opts supported Codex models into the Fast tier.

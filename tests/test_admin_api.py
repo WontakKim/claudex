@@ -9,6 +9,7 @@ import json
 import logging
 import time
 from collections.abc import AsyncIterator, Callable
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -31,7 +32,13 @@ from claudex.providers.codex_client import (
     CodexClient,
     CodexUpstreamError,
 )
-from claudex.config import ConfigError, GatewayConfig, OpenAICompatibleProvider
+from claudex.config import (
+    AnthropicCompatibleProvider,
+    ConfigError,
+    GatewayConfig,
+    OpenAICompatibleProvider,
+)
+from claudex.providers.anthropic_compatible_client import AnthropicCompatibleClient
 from claudex.providers.backends import AnthropicBackend, ResponsesBackend
 from claudex.providers.grok_auth import GrokCredentials
 from claudex.providers.grok_client import GrokClient, GrokUpstreamError
@@ -59,6 +66,11 @@ _ADMIN_IMPORTED_MODULES = {
 }
 _ADMIN_FUNCTION_MANIFEST = {
     "common": {
+        "_get_custom_provider_binding",
+        "_redact_configured_credential",
+        "_safe_custom_provider_exception_detail",
+        "_safe_custom_provider_upstream_detail",
+        "_safe_route_target_error_detail",
         "_read_json_object",
         "_handle_hello",
         "_handle_health",
@@ -123,7 +135,7 @@ _ADMIN_FUNCTION_MANIFEST = {
         "_handle_admin_kimi_models",
         "_get_route_backend",
         "_probe_responses_route",
-        "_probe_kimi_route",
+        "_probe_anthropic_route",
         "_handle_admin_connection_test",
     },
 }
@@ -350,6 +362,9 @@ class FakeKimiClient:
     ) -> httpx.Response:
         return httpx.Response(200, json={"input_tokens": 1})
 
+    async def list_models(self) -> Any:
+        return {"data": []}
+
 
 class AvailableGrokAuthManager:
     def __init__(self, *_args: Any, **_kwargs: Any) -> None:
@@ -373,6 +388,12 @@ class FakeGrokClient:
 
 
 _CUSTOM_API_KEY = "sk-custom-secret"
+_ANTHROPIC_CUSTOM_API_KEY = "sk-anthropic-custom-secret"
+
+
+def _assert_secret_absent(secret: str, *values: str) -> None:
+    if any(secret in value for value in values):
+        pytest.fail("a configured custom-provider credential was exposed")
 
 
 def _custom_provider() -> OpenAICompatibleProvider:
@@ -380,6 +401,13 @@ def _custom_provider() -> OpenAICompatibleProvider:
         wire_api="responses",
         base_url="https://models.example/api/v1",
         api_key=_CUSTOM_API_KEY,
+    )
+
+
+def _anthropic_custom_provider() -> AnthropicCompatibleProvider:
+    return AnthropicCompatibleProvider(
+        base_url="https://messages.example/api/v1",
+        api_key=_ANTHROPIC_CUSTOM_API_KEY,
     )
 
 
@@ -623,6 +651,126 @@ def test_health_without_custom_providers_keeps_builtin_provider_payload(
     assert list(health.json()["providers"]) == ["codex", "kimi", "grok"]
 
 
+def test_anthropic_custom_provider_health_and_missing_catalog_perform_no_io(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    request_count = 0
+    async_client_type = httpx.AsyncClient
+
+    async def count_request(_request: httpx.Request) -> httpx.Response:
+        nonlocal request_count
+        request_count += 1
+        return httpx.Response(500)
+
+    transport = httpx.MockTransport(count_request)
+
+    def create_async_client(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
+        kwargs["transport"] = transport
+        return async_client_type(*args, **kwargs)
+
+    monkeypatch.setattr(server.httpx, "AsyncClient", create_async_client)
+    config = GatewayConfig(
+        model_map={"opus": "messages-api:claude-upstream"},
+        custom_providers={"messages-api": _anthropic_custom_provider()},
+    )
+    with _create_test_client(
+        monkeypatch,
+        tmp_path,
+        config=config,
+        base_url="http://127.0.0.1:8787",
+    ) as client:
+        catalog = client.get("/admin/providers/custom/messages-api/models")
+        health = client.get("/health")
+
+    assert catalog.status_code == 404
+    assert catalog.json()["error"]["type"] == "not_found_error"
+    assert health.status_code == 200
+    assert health.json()["providers"]["messages-api"] == {
+        "status": "ok",
+        "required": True,
+    }
+    assert request_count == 0
+
+
+@pytest.mark.parametrize(
+    ("name", "provider", "wrong_backend_name"),
+    [
+        pytest.param("wrtn", _custom_provider(), "kimi", id="openai-compatible"),
+        pytest.param(
+            "messages-api",
+            _anthropic_custom_provider(),
+            "codex",
+            id="anthropic-compatible",
+        ),
+    ],
+)
+@pytest.mark.parametrize("binding_state", ["missing", "mismatched"])
+def test_health_fails_closed_for_invalid_required_custom_binding(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    name: str,
+    provider: OpenAICompatibleProvider | AnthropicCompatibleProvider,
+    wrong_backend_name: str,
+    binding_state: str,
+) -> None:
+    forbidden_catalog_calls = 0
+
+    async def forbidden_catalog() -> list[str]:
+        nonlocal forbidden_catalog_calls
+        forbidden_catalog_calls += 1
+        return []
+
+    config = GatewayConfig(
+        model_map={"opus": f"{name}:upstream-model"},
+        custom_providers={name: provider},
+    )
+    with _create_test_client(monkeypatch, tmp_path, config=config) as client:
+        if binding_state == "missing":
+            client.app.state.route_backends.pop(name)
+        else:
+            wrong_backend = client.app.state.route_backends[wrong_backend_name]
+            client.app.state.route_backends[name] = replace(
+                wrong_backend, catalog_loader=forbidden_catalog
+            )
+        health = client.get("/health")
+
+    _assert_secret_absent(provider.api_key, health.text)
+    assert health.status_code == 503
+    assert health.json()["status"] == "error"
+    assert health.json()["providers"][name] == {
+        "status": "error",
+        "detail": (
+            "custom provider binding is missing"
+            if binding_state == "missing"
+            else "custom provider binding does not match its configured family"
+        ),
+        "required": True,
+    }
+    assert forbidden_catalog_calls == 0
+
+
+def test_health_redacts_secret_bearing_http_error(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    config = GatewayConfig(
+        model_map={"opus": "wrtn:upstream-model"},
+        custom_providers={"wrtn": _custom_provider()},
+    )
+    selected_transport = SecretBearingCatalogTransport(_CUSTOM_API_KEY)
+    with _create_test_client(monkeypatch, tmp_path, config=config) as client:
+        _select_route_transport(client, "wrtn", selected_transport)
+        health = client.get("/health")
+
+    _assert_secret_absent(_CUSTOM_API_KEY, health.text, caplog.text)
+    assert health.status_code == 503
+    assert health.json()["providers"]["wrtn"]["status"] == "error"
+    assert "ConnectError" in health.json()["providers"]["wrtn"]["detail"]
+    assert "[REDACTED]" in health.json()["providers"]["wrtn"]["detail"]
+    assert selected_transport.calls == 1
+
+
 class TestAdminMappingApi:
     """GET/PUT /admin/settings/mapping — runtime map changes persisted to settings.json."""
 
@@ -660,16 +808,175 @@ class TestAdminMappingApi:
         ) as client:
             response = client.get("/admin/settings/mapping")
 
+        _assert_secret_absent(_CUSTOM_API_KEY, response.text)
         assert response.status_code == 200
         assert response.json()["custom_providers"] == [
             {
                 "name": "wrtn",
-                "wire_api": "responses",
+                "family": "openai_compatible",
+                "wire_kind": "responses",
                 "base_url": "https://models.example/api/v1",
+                "catalog_available": True,
             }
         ]
         assert "api_key" not in response.text
-        assert _CUSTOM_API_KEY not in response.text
+
+    def test_get_includes_deterministic_mixed_family_metadata_without_api_keys(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        responses_provider = OpenAICompatibleProvider(
+            wire_api="responses",
+            base_url="https://responses.example/v1",
+            api_key=_CUSTOM_API_KEY,
+        )
+        messages_provider = AnthropicCompatibleProvider(
+            base_url="https://messages.example/v1",
+            api_key=_ANTHROPIC_CUSTOM_API_KEY,
+        )
+        with self._admin_client(
+            monkeypatch,
+            tmp_path,
+            custom_providers={
+                "z-responses": responses_provider,
+                "a-messages": messages_provider,
+            },
+        ) as client:
+            response = client.get("/admin/settings/mapping")
+
+        _assert_secret_absent(
+            _CUSTOM_API_KEY, response.text, repr(responses_provider)
+        )
+        _assert_secret_absent(
+            _ANTHROPIC_CUSTOM_API_KEY, response.text, repr(messages_provider)
+        )
+        assert response.status_code == 200
+        assert response.json()["custom_providers"] == [
+            {
+                "name": "a-messages",
+                "family": "anthropic_compatible",
+                "wire_kind": "anthropic_messages",
+                "base_url": "https://messages.example/v1",
+                "catalog_available": False,
+            },
+            {
+                "name": "z-responses",
+                "family": "openai_compatible",
+                "wire_kind": "responses",
+                "base_url": "https://responses.example/v1",
+                "catalog_available": True,
+            },
+        ]
+        assert "api_key" not in response.text
+
+    @pytest.mark.parametrize(
+        ("name", "provider", "wrong_backend_name"),
+        [
+            pytest.param("wrtn", _custom_provider(), "kimi", id="openai-compatible"),
+            pytest.param(
+                "messages-api",
+                _anthropic_custom_provider(),
+                "codex",
+                id="anthropic-compatible",
+            ),
+        ],
+    )
+    @pytest.mark.parametrize("binding_state", ["missing", "mismatched"])
+    def test_get_rejects_invalid_custom_provider_binding_without_io(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        name: str,
+        provider: OpenAICompatibleProvider | AnthropicCompatibleProvider,
+        wrong_backend_name: str,
+        binding_state: str,
+    ) -> None:
+        forbidden_catalog_calls = 0
+
+        async def forbidden_catalog() -> list[str]:
+            nonlocal forbidden_catalog_calls
+            forbidden_catalog_calls += 1
+            return []
+
+        with self._admin_client(
+            monkeypatch, tmp_path, custom_providers={name: provider}
+        ) as client:
+            if binding_state == "missing":
+                client.app.state.route_backends.pop(name)
+            else:
+                wrong_backend = client.app.state.route_backends[wrong_backend_name]
+                client.app.state.route_backends[name] = replace(
+                    wrong_backend, catalog_loader=forbidden_catalog
+                )
+            response = client.get("/admin/settings/mapping")
+
+        _assert_secret_absent(provider.api_key, response.text)
+        assert response.status_code == 500
+        assert response.json()["error"]["type"] == "server_error"
+        assert (
+            response.json()["error"]["message"]
+            == "custom provider metadata is unavailable"
+        )
+        assert forbidden_catalog_calls == 0
+
+    @pytest.mark.parametrize("overlap_field", ["name", "base_url"])
+    def test_get_fails_closed_when_openai_credential_overlaps_public_metadata(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        overlap_field: str,
+    ) -> None:
+        name = "legacy-provider"
+        base_url = "https://responses.example/v1"
+        if overlap_field == "name":
+            name = f"legacy-{_CUSTOM_API_KEY}"
+        else:
+            base_url = f"https://responses.example/{_CUSTOM_API_KEY}/v1"
+        provider = OpenAICompatibleProvider(
+            wire_api="responses",
+            base_url=base_url,
+            api_key=_CUSTOM_API_KEY,
+        )
+        with self._admin_client(
+            monkeypatch, tmp_path, custom_providers={name: provider}
+        ) as client:
+            response = client.get("/admin/settings/mapping")
+
+        _assert_secret_absent(_CUSTOM_API_KEY, response.text, repr(provider))
+        assert response.status_code == 500
+        assert response.json()["error"]["type"] == "server_error"
+        assert (
+            response.json()["error"]["message"]
+            == "custom provider metadata is unavailable"
+        )
+
+    def test_get_fails_closed_for_cross_provider_credential_overlap(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        cross_provider_secret = "cross-provider-sensitive-key"
+        providers = {
+            "first": OpenAICompatibleProvider(
+                wire_api="responses",
+                base_url="https://first.example/v1",
+                api_key=cross_provider_secret,
+            ),
+            "second": OpenAICompatibleProvider(
+                wire_api="responses",
+                base_url=f"https://second.example/{cross_provider_secret}/v1",
+                api_key=_CUSTOM_API_KEY,
+            ),
+        }
+        with self._admin_client(
+            monkeypatch, tmp_path, custom_providers=providers
+        ) as client:
+            response = client.get("/admin/settings/mapping")
+
+        _assert_secret_absent(cross_provider_secret, response.text)
+        _assert_secret_absent(_CUSTOM_API_KEY, response.text)
+        assert response.status_code == 500
+        assert (
+            response.json()["error"]["message"]
+            == "custom provider metadata is unavailable"
+        )
 
     def test_get_without_custom_providers_keeps_existing_payload_shape(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -2781,6 +3088,60 @@ class FailingCatalogKimiClient(FakeKimiClient):
         raise KimiUpstreamError(401, '{"error":{"message":"token expired"}}')
 
 
+class TrackedProbeStream(httpx.AsyncByteStream):
+    def __init__(self, content: bytes) -> None:
+        self.content = content
+        self.read_calls = 0
+        self.close_calls = 0
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        self.read_calls += 1
+        yield self.content
+
+    async def aclose(self) -> None:
+        self.close_calls += 1
+
+
+class TrackedProbeResponse(httpx.Response):
+    def __init__(self, status_code: int, stream: httpx.AsyncByteStream) -> None:
+        super().__init__(status_code, stream=stream)
+        self.aclose_calls = 0
+
+    async def aclose(self) -> None:
+        self.aclose_calls += 1
+        await super().aclose()
+
+
+class ReadAndCloseFailingProbeResponse(httpx.Response):
+    def __init__(self, credential: str) -> None:
+        super().__init__(200, stream=TrackedProbeStream(b""))
+        self.credential = credential
+        self.aclose_calls = 0
+
+    async def aread(self) -> bytes:
+        raise httpx.ReadError(
+            f"primary read failed with {self.credential}",
+            request=httpx.Request("POST", "https://messages.example/v1/messages"),
+        )
+
+    async def aclose(self) -> None:
+        self.aclose_calls += 1
+        raise httpx.ReadError(
+            f"cleanup close failed with {self.credential}",
+            request=httpx.Request("POST", "https://messages.example/v1/messages"),
+        )
+
+
+class ReadAndCloseFailingAnthropicTransport:
+    def __init__(self, response: ReadAndCloseFailingProbeResponse) -> None:
+        self.response = response
+
+    async def send_messages(
+        self, body: bytes, headers: dict[str, str]
+    ) -> httpx.Response:
+        return self.response
+
+
 class ProbeKimiResponse(httpx.Response):
     def __init__(self) -> None:
         super().__init__(200, json={"type": "message", "model": "k3"})
@@ -2793,11 +3154,13 @@ class ProbeKimiResponse(httpx.Response):
 
 class ProbeKimiClient(FakeKimiClient):
     def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+        self.headers: dict[str, str] | None = None
         self.response: ProbeKimiResponse | None = None
 
     async def send_messages(self, body: bytes, headers: dict[str, str]) -> httpx.Response:
         # The probe must send the raw model with the prefix already removed.
         assert json.loads(body)["model"] == "k3"
+        self.headers = headers
         self.response = ProbeKimiResponse()
         return self.response
 
@@ -2893,6 +3256,18 @@ class SelectedAnthropicModelTransport:
         return self.catalog
 
 
+class SecretBearingCatalogTransport:
+    def __init__(self, credential: str) -> None:
+        self.credential = credential
+        self.calls = 0
+
+    async def list_models(self) -> list[str]:
+        self.calls += 1
+        raise httpx.ConnectError(
+            f"catalog connection failed with {self.credential}"
+        )
+
+
 def _select_route_transport(
     client: TestClient, provider: str, transport: Any
 ) -> None:
@@ -2903,6 +3278,9 @@ def _select_route_transport(
             adapt_payload=backend.adapt_payload,
             adapt_probe_payload=backend.adapt_probe_payload,
             signature_namespace=backend.signature_namespace,
+            catalog_loader=(
+                transport.list_models if backend.catalog_loader is not None else None
+            ),
         )
         return
     assert isinstance(backend, AnthropicBackend)
@@ -2911,6 +3289,9 @@ def _select_route_transport(
         header_policy=backend.header_policy,
         error_policy=backend.error_policy,
         token_counter=backend.token_counter,
+        catalog_loader=(
+            transport.list_models if backend.catalog_loader is not None else None
+        ),
     )
 
 
@@ -2992,6 +3373,26 @@ class TestAdminDashboardApi:
         assert response.json() == {"data": [{"id": "k2.5"}, {"id": "k3"}]}
         assert selected_transport.calls == 1
 
+    def test_kimi_models_without_catalog_capability_performs_no_io(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        selected_transport = SelectedAnthropicModelTransport({"data": []})
+        with self._client(monkeypatch, tmp_path) as client:
+            backend = client.app.state.route_backends["kimi"]
+            assert isinstance(backend, AnthropicBackend)
+            client.app.state.route_backends["kimi"] = AnthropicBackend(
+                transport=selected_transport,
+                header_policy=backend.header_policy,
+                error_policy=backend.error_policy,
+                token_counter=backend.token_counter,
+                catalog_loader=None,
+            )
+            response = client.get("/admin/providers/kimi/models")
+
+        assert response.status_code == 404
+        assert response.json()["error"]["type"] == "not_found_error"
+        assert selected_transport.calls == 0
+
     def test_kimi_models_relays_upstream_error(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
@@ -3062,7 +3463,8 @@ class TestAdminDashboardApi:
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         def handler(request: httpx.Request) -> httpx.Response:
-            assert request.headers["Authorization"] == f"Bearer {_CUSTOM_API_KEY}"
+            if request.headers.get("Authorization") != f"Bearer {_CUSTOM_API_KEY}":
+                pytest.fail("the custom catalog request used the wrong credential")
             return httpx.Response(
                 503,
                 json={"error": {"message": f"credential {_CUSTOM_API_KEY} rejected"}},
@@ -3080,9 +3482,28 @@ class TestAdminDashboardApi:
         finally:
             asyncio.run(http_client.aclose())
 
+        _assert_secret_absent(_CUSTOM_API_KEY, response.text)
         assert response.status_code == 503
         assert response.json()["error"]["message"] == "credential [REDACTED] rejected"
-        assert _CUSTOM_API_KEY not in response.text
+
+    def test_custom_provider_models_redacts_raw_secret_bearing_http_error(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        config = GatewayConfig(custom_providers={"wrtn": _custom_provider()})
+        selected_transport = SecretBearingCatalogTransport(_CUSTOM_API_KEY)
+        with self._client(monkeypatch, tmp_path, config=config) as client:
+            _select_route_transport(client, "wrtn", selected_transport)
+            response = client.get("/admin/providers/custom/wrtn/models")
+
+        _assert_secret_absent(_CUSTOM_API_KEY, response.text, caplog.text)
+        assert response.status_code == 502
+        assert response.json()["error"]["type"] == "server_error"
+        assert "ConnectError" in response.json()["error"]["message"]
+        assert "[REDACTED]" in response.json()["error"]["message"]
+        assert selected_transport.calls == 1
 
     def test_custom_provider_models_returns_404_for_unknown_name(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -3148,8 +3569,141 @@ class TestAdminDashboardApi:
         assert result["ok"] is True
         assert result["status"] == 200
         assert result["response_model"] == "k3"
+        assert selected_transport.headers is not None
+        assert "oauth-2025-04-20" in selected_transport.headers["anthropic-beta"]
         assert selected_transport.response is not None
         assert selected_transport.response.aclose_calls == 1
+
+    def test_connection_test_static_anthropic_uses_policy_and_bearer_auth(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        outbound_headers: httpx.Headers | None = None
+        outbound_url: str | None = None
+        response_stream = TrackedProbeStream(
+            json.dumps({"type": "message", "model": "claude-upstream"}).encode()
+        )
+        upstream_response = TrackedProbeResponse(200, response_stream)
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal outbound_headers, outbound_url
+            outbound_headers = request.headers
+            outbound_url = str(request.url)
+            return upstream_response
+
+        provider = _anthropic_custom_provider()
+        config = GatewayConfig(custom_providers={"openai-by-name": provider})
+        http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        transport = AnthropicCompatibleClient(
+            "openai-by-name", provider, http_client
+        )
+        try:
+            with self._client(monkeypatch, tmp_path, config=config) as client:
+                _select_route_transport(client, "openai-by-name", transport)
+                response = client.post(
+                    "/admin/test",
+                    json={"target": "openai-by-name:claude-upstream"},
+                    headers={
+                        "anthropic-beta": "oauth-2025-04-20,feature-2026-01-01"
+                    },
+                )
+        finally:
+            asyncio.run(http_client.aclose())
+
+        _assert_secret_absent(
+            _ANTHROPIC_CUSTOM_API_KEY, response.text, outbound_url or ""
+        )
+        result = response.json()
+        assert result["ok"] is True
+        assert result["status"] == 200
+        assert result["response_model"] == "claude-upstream"
+        assert outbound_headers is not None
+        if outbound_headers.get("authorization") != (
+            f"Bearer {_ANTHROPIC_CUSTOM_API_KEY}"
+        ):
+            pytest.fail("the static probe did not apply its configured Bearer credential")
+        assert outbound_headers.get("anthropic-beta") == "feature-2026-01-01"
+        assert response_stream.read_calls == 1
+        assert response_stream.close_calls == 1
+        assert upstream_response.aclose_calls == 1
+        assert outbound_url is not None
+
+    @pytest.mark.parametrize("upstream_status", [401, 503])
+    def test_connection_test_static_non_success_is_transport_closed_and_redacted(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+        upstream_status: int,
+    ) -> None:
+        response_stream = TrackedProbeStream(
+            json.dumps(
+                {
+                    "error": {
+                        "message": (
+                            f"credential {_ANTHROPIC_CUSTOM_API_KEY} rejected"
+                        )
+                    }
+                }
+            ).encode()
+        )
+        upstream_response = TrackedProbeResponse(upstream_status, response_stream)
+
+        async def handler(_request: httpx.Request) -> httpx.Response:
+            return upstream_response
+
+        provider = _anthropic_custom_provider()
+        config = GatewayConfig(custom_providers={"messages-api": provider})
+        http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        transport = AnthropicCompatibleClient("messages-api", provider, http_client)
+        try:
+            with self._client(monkeypatch, tmp_path, config=config) as client:
+                _select_route_transport(client, "messages-api", transport)
+                response = client.post(
+                    "/admin/test",
+                    json={"target": "messages-api:claude-upstream"},
+                )
+        finally:
+            asyncio.run(http_client.aclose())
+
+        _assert_secret_absent(
+            _ANTHROPIC_CUSTOM_API_KEY, response.text, caplog.text
+        )
+        result = response.json()
+        assert result["ok"] is False
+        assert result["status"] == upstream_status
+        assert result["detail"] == "credential [REDACTED] rejected"
+        assert response_stream.read_calls == 1
+        assert response_stream.close_calls == 1
+        assert upstream_response.aclose_calls == 1
+
+    def test_connection_test_preserves_read_error_when_close_also_fails(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        provider = _anthropic_custom_provider()
+        config = GatewayConfig(custom_providers={"messages-api": provider})
+        upstream_response = ReadAndCloseFailingProbeResponse(provider.api_key)
+        selected_transport = ReadAndCloseFailingAnthropicTransport(
+            upstream_response
+        )
+        with self._client(monkeypatch, tmp_path, config=config) as client:
+            _select_route_transport(client, "messages-api", selected_transport)
+            response = client.post(
+                "/admin/test",
+                json={"target": "messages-api:claude-upstream"},
+            )
+
+        _assert_secret_absent(provider.api_key, response.text, caplog.text)
+        assert response.status_code == 200
+        result = response.json()
+        assert result["ok"] is False
+        assert result["status"] is None
+        assert "ReadError" in result["detail"]
+        assert "primary read failed" in result["detail"]
+        assert "cleanup close failed" not in result["detail"]
+        assert upstream_response.aclose_calls == 1
 
     def test_connection_test_reports_kimi_error(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -3269,6 +3823,43 @@ class TestAdminDashboardApi:
 
         assert response.status_code == 400
         assert "unknown provider prefix" in response.json()["error"]["message"]
+
+    @pytest.mark.parametrize(
+        ("target", "expected_detail"),
+        [
+            pytest.param(
+                " ", "target must be a non-empty string", id="empty-target"
+            ),
+            pytest.param(
+                "missing:model", "route target is invalid", id="unknown-prefix"
+            ),
+        ],
+    )
+    def test_connection_target_errors_hide_legacy_provider_name_overlap(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+        target: str,
+        expected_detail: str,
+    ) -> None:
+        credential = "route-sensitive-key"
+        unsafe_suffix = "unsafe-provider-detail"
+        provider_name = f"legacy-{credential}-{unsafe_suffix}"
+        provider = OpenAICompatibleProvider(
+            wire_api="responses",
+            base_url="https://responses.example/v1",
+            api_key=credential,
+        )
+        config = GatewayConfig(custom_providers={provider_name: provider})
+        with self._client(monkeypatch, tmp_path, config=config) as client:
+            response = client.post("/admin/test", json={"target": target})
+
+        _assert_secret_absent(credential, response.text, caplog.text)
+        if unsafe_suffix in response.text or unsafe_suffix in caplog.text:
+            pytest.fail("a legacy custom-provider routing detail was exposed")
+        assert response.status_code == 400
+        assert response.json()["error"]["message"] == expected_detail
 
     def test_connection_test_reports_unknown_codex_model(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path

@@ -179,6 +179,9 @@ async def _count_tokens_via_anthropic_backend(
     backend: AnthropicBackend,
 ) -> JSONResponse | None:
     """Use the bound native token counter; None requests local estimation."""
+    if backend.token_counter is None:
+        return None
+
     outgoing = dict(body)
     outgoing["model"] = upstream_model
     try:

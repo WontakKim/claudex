@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import Mapping
 from typing import Any
 
 import httpx
@@ -12,12 +13,116 @@ from starlette.responses import JSONResponse
 
 import claudex
 from claudex import server_support
-from claudex.providers.backends import ResponsesBackend
 from claudex.providers.codex_auth import CodexAuthError, CodexAuthManager
-from claudex.config import GatewayConfig
+from claudex.config import (
+    AnthropicCompatibleProvider,
+    ConfigError,
+    GatewayConfig,
+    OpenAICompatibleProvider,
+)
+from claudex.providers.backends import AnthropicBackend, ResponsesBackend, RouteBackend
 from claudex.providers.grok_auth import GrokAuthError, GrokAuthManager
 from claudex.providers.kimi_auth import KimiAuthError, KimiAuthManager
 from claudex.upstream_errors import UpstreamError
+
+
+def _get_custom_provider_binding(
+    config: GatewayConfig, route_backends: Mapping[str, RouteBackend], name: str
+) -> tuple[OpenAICompatibleProvider | AnthropicCompatibleProvider, RouteBackend]:
+    provider = config.custom_providers.get(name)
+    if provider is None:
+        raise RuntimeError("custom provider configuration is missing")
+    if any(
+        configured_provider.api_key in name
+        or configured_provider.api_key in provider.base_url
+        for configured_provider in config.custom_providers.values()
+    ):
+        raise RuntimeError(
+            "custom provider public fields overlap a configured credential"
+        )
+
+    backend = route_backends.get(name)
+    if backend is None:
+        raise RuntimeError("custom provider binding is missing")
+    if isinstance(provider, OpenAICompatibleProvider):
+        if not isinstance(backend, ResponsesBackend):
+            raise RuntimeError(
+                "custom provider binding does not match its configured family"
+            )
+    elif isinstance(provider, AnthropicCompatibleProvider):
+        if not isinstance(backend, AnthropicBackend):
+            raise RuntimeError(
+                "custom provider binding does not match its configured family"
+            )
+    else:
+        raise RuntimeError("custom provider family is unsupported")
+    return provider, backend
+
+
+def _safe_route_target_error_detail(
+    exc: ConfigError, config: GatewayConfig
+) -> str:
+    try:
+        detail = str(exc)
+    except BaseException:
+        return "route target is invalid"
+    for provider in config.custom_providers.values():
+        redacted_detail = _redact_configured_credential(
+            detail, provider.api_key
+        )
+        if redacted_detail != detail:
+            return "route target is invalid"
+    return detail
+
+
+def _redact_configured_credential(value: str, credential: str) -> str:
+    replacement = "[REDACTED]"
+    if credential in replacement:
+        replacement = "*" if credential != "*" else "?"
+
+    bearer_value = f"Bearer {credential}"
+    credential_bytes = credential.encode("utf-8", errors="replace")
+    bearer_bytes = bearer_value.encode("utf-8", errors="replace")
+    forms = {
+        credential,
+        json.dumps(credential, ensure_ascii=False)[1:-1],
+        json.dumps(credential, ensure_ascii=True)[1:-1],
+        credential.encode("unicode_escape").decode("ascii"),
+        repr(credential),
+        repr(credential)[1:-1],
+        ascii(credential),
+        ascii(credential)[1:-1],
+        repr(credential_bytes),
+        repr(credential_bytes)[2:-1],
+        repr(bearer_value),
+        repr(bearer_value)[1:-1],
+        repr(bearer_bytes),
+        repr(bearer_bytes)[2:-1],
+    }
+    for form in sorted((form for form in forms if form), key=len, reverse=True):
+        value = value.replace(form, replacement)
+    return value.encode("utf-8", errors="replace").decode("utf-8")
+
+
+def _safe_custom_provider_exception_detail(
+    exc: BaseException, credential: str
+) -> str:
+    error_name = type(exc).__name__
+    try:
+        message = str(exc)
+    except BaseException:
+        message = "diagnostic unavailable"
+    detail = f"{error_name}: {message}" if message else error_name
+    return _redact_configured_credential(detail, credential)
+
+
+def _safe_custom_provider_upstream_detail(body: str, credential: str) -> str:
+    redacted_body = _redact_configured_credential(body, credential)
+    try:
+        detail = server_support._upstream_error_message(redacted_body)
+    except (TypeError, ValueError, RecursionError):
+        detail = "upstream returned a malformed error response"
+    return _redact_configured_credential(detail, credential)
 
 
 async def _read_json_object(
@@ -102,23 +207,56 @@ async def _handle_health(request: Request) -> JSONResponse:
         providers["grok"] = {"status": "error", "detail": str(exc), "required": grok_required}
 
     custom_providers_ready = True
-    for name in config.custom_providers:
-        try:
-            backend = request.app.state.route_backends[name]
-        except KeyError as exc:
-            raise RuntimeError(
-                f"route backend registry has no binding for provider {name!r}"
-            ) from exc
-        if not isinstance(backend, ResponsesBackend):
-            raise RuntimeError(
-                f"custom provider {name!r} route backend must use the Responses wire"
-            )
+    for index, (name, configured_provider) in enumerate(
+        config.custom_providers.items(), start=1
+    ):
         required = config.maps_to_provider(name)
+        response_name = (
+            name
+            if not any(
+                provider.api_key in name
+                for provider in config.custom_providers.values()
+            )
+            else f"custom_provider_{index}"
+        )
         try:
-            await backend.transport.list_models()
-            providers[name] = {"status": "ok", "required": required}
-        except (UpstreamError, httpx.HTTPError) as exc:
-            providers[name] = {"status": "error", "detail": str(exc), "required": required}
+            provider, backend = _get_custom_provider_binding(
+                config, request.app.state.route_backends, name
+            )
+        except RuntimeError as exc:
+            providers[response_name] = {
+                "status": "error",
+                "detail": str(exc),
+                "required": required,
+            }
+            if required:
+                custom_providers_ready = False
+            continue
+
+        catalog_loader = backend.catalog_loader
+        if catalog_loader is None:
+            providers[response_name] = {"status": "ok", "required": required}
+            continue
+        try:
+            await catalog_loader()
+            providers[response_name] = {"status": "ok", "required": required}
+        except UpstreamError as exc:
+            detail = _safe_custom_provider_upstream_detail(exc.body, provider.api_key)
+            providers[response_name] = {
+                "status": "error",
+                "detail": f"upstream returned HTTP {exc.status_code}: {detail}",
+                "required": required,
+            }
+            if required:
+                custom_providers_ready = False
+        except httpx.HTTPError as exc:
+            providers[response_name] = {
+                "status": "error",
+                "detail": _safe_custom_provider_exception_detail(
+                    exc, provider.api_key
+                ),
+                "required": required,
+            }
             if required:
                 custom_providers_ready = False
 

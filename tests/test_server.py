@@ -35,10 +35,21 @@ from claudex.balanced.state_model import RestoreValidationContext
 from claudex.balanced.state_store import ClaudePoolRuntimeStateStore
 from claudex.providers.backends import AnthropicBackend, ResponsesBackend
 from claudex.providers.codex_client import CODEX_FAST_TIER_WIRE_VALUE, CodexUpstreamError
-from claudex.config import ConfigError, GatewayConfig, OpenAICompatibleProvider
+from claudex.config import (
+    AnthropicCompatibleProvider,
+    ConfigError,
+    GatewayConfig,
+    OpenAICompatibleProvider,
+)
+from claudex.providers.anthropic_compatible_client import (
+    AnthropicCompatibleClient,
+)
 from claudex.providers.kimi_auth import KimiCredentials
 from claudex.providers.kimi_client import KimiClient, KimiUpstreamError
-from claudex.providers.openai_compatible_client import OpenAICompatibleUpstreamError
+from claudex.providers.openai_compatible_client import (
+    OpenAICompatibleClient,
+    OpenAICompatibleUpstreamError,
+)
 from claudex.providers.grok_auth import GrokCredentials
 from claudex.providers.grok_client import GrokUpstreamError
 from claudex.translate.codex_to_claude import estimate_overflow_prompt_tokens
@@ -97,6 +108,9 @@ class FakeKimiClient:
     ) -> httpx.Response:
         return httpx.Response(200, json={"input_tokens": 1})
 
+    async def list_models(self) -> Any:
+        return {"data": []}
+
 
 class AvailableGrokAuthManager:
     def __init__(self, *_args: Any, **_kwargs: Any) -> None:
@@ -120,6 +134,7 @@ class FakeGrokClient:
 
 
 _CUSTOM_API_KEY = "sk-custom-secret"
+_ANTHROPIC_CUSTOM_API_KEY = "sk-anthropic-custom-secret"
 
 
 def _custom_provider() -> OpenAICompatibleProvider:
@@ -127,6 +142,13 @@ def _custom_provider() -> OpenAICompatibleProvider:
         wire_api="responses",
         base_url="https://models.example/api/v1",
         api_key=_CUSTOM_API_KEY,
+    )
+
+
+def _anthropic_custom_provider() -> AnthropicCompatibleProvider:
+    return AnthropicCompatibleProvider(
+        base_url="https://messages.example/api/v1",
+        api_key=_ANTHROPIC_CUSTOM_API_KEY,
     )
 
 
@@ -155,6 +177,24 @@ class FailingOpenAICompatibleClient(FakeOpenAICompatibleClient):
         )
 
 
+class SecretBearingStartupClient(FakeOpenAICompatibleClient):
+    def __init__(
+        self,
+        name: str,
+        provider: OpenAICompatibleProvider,
+        *_args: Any,
+        **_kwargs: Any,
+    ) -> None:
+        super().__init__(name, provider)
+        self.catalog_calls = 0
+
+    async def list_models(self) -> list[str]:
+        self.catalog_calls += 1
+        raise httpx.ConnectError(
+            f"startup catalog failed with {self.provider.api_key}"
+        )
+
+
 # The real HOME this process started with, captured before any test ever
 # monkeypatches it -- lets `_create_test_client` tell a still-real HOME
 # (a naive test that never isolated it) apart from one a caller already
@@ -175,7 +215,7 @@ def _create_test_client(
     kimi_client: type = FakeKimiClient,
     grok_auth: type = AvailableGrokAuthManager,
     grok_client: type = FakeGrokClient,
-    custom_client: type = FakeOpenAICompatibleClient,
+    custom_client: type | None = FakeOpenAICompatibleClient,
     base_url: str = "http://testserver",
 ) -> TestClient:
     # T-9's lifespan acquires the process-lifetime claude account pool lease
@@ -192,7 +232,8 @@ def _create_test_client(
     monkeypatch.setattr(server, "KimiClient", kimi_client)
     monkeypatch.setattr(server, "GrokAuthManager", grok_auth)
     monkeypatch.setattr(server, "GrokClient", grok_client)
-    monkeypatch.setattr(server, "OpenAICompatibleClient", custom_client)
+    if custom_client is not None:
+        monkeypatch.setattr(server, "OpenAICompatibleClient", custom_client)
     return TestClient(server.create_app(config or GatewayConfig()), base_url=base_url)
 
 
@@ -432,8 +473,12 @@ def test_lifespan_builds_complete_parallel_route_backend_registry(
         assert kimi_backend.transport is state.kimi_client
         assert kimi_backend.header_policy is relay_kimi._kimi_request_headers
         assert kimi_backend.error_policy is relay_kimi._kimi_error_to_claude
+        assert kimi_backend.token_counter is not None
         assert kimi_backend.token_counter.__self__ is state.kimi_client
         assert kimi_backend.token_counter.__func__ is FakeKimiClient.count_tokens
+        assert kimi_backend.catalog_loader is not None
+        assert kimi_backend.catalog_loader.__self__ is state.kimi_client
+        assert kimi_backend.catalog_loader.__func__ is FakeKimiClient.list_models
 
         grok_backend = route_backends["grok"]
         assert isinstance(grok_backend, ResponsesBackend)
@@ -452,6 +497,9 @@ def test_lifespan_builds_complete_parallel_route_backend_registry(
             )
             assert not inspect.iscoroutinefunction(custom_backend.adapt_probe_payload)
             assert custom_backend.signature_namespace == name
+            assert custom_backend.catalog_loader is not None
+            assert custom_backend.catalog_loader.__self__ is state.custom_provider_clients[name]
+            assert custom_backend.catalog_loader.__func__ is FakeOpenAICompatibleClient.list_models
 
         disabled_payload = {"model": "gpt-5.6-sol"}
         disabled_result = asyncio.run(
@@ -531,6 +579,114 @@ def test_lifespan_builds_complete_parallel_route_backend_registry(
         assert custom_payload == {"model": "gemini-2.5-pro", "input": []}
 
 
+def test_lifespan_binds_mixed_custom_provider_families_by_config_type_without_io(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    request_count = 0
+
+    async def count_request(_request: httpx.Request) -> httpx.Response:
+        nonlocal request_count
+        request_count += 1
+        return httpx.Response(500)
+
+    async_client_type = httpx.AsyncClient
+    transport = httpx.MockTransport(count_request)
+
+    def create_async_client(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
+        kwargs["transport"] = transport
+        return async_client_type(*args, **kwargs)
+
+    monkeypatch.setattr(server.httpx, "AsyncClient", create_async_client)
+    responses_provider = _custom_provider()
+    anthropic_provider = _anthropic_custom_provider()
+    config = GatewayConfig(
+        custom_providers={
+            "anthropic-by-name": responses_provider,
+            "openai-by-name": anthropic_provider,
+        },
+        model_map={"haiku": "openai-by-name:upstream-haiku"},
+    )
+
+    with _create_test_client(
+        monkeypatch,
+        tmp_path,
+        config=config,
+        custom_client=None,
+    ) as client:
+        state = client.app.state
+        responses_client = state.custom_provider_clients["anthropic-by-name"]
+        anthropic_client = state.custom_provider_clients["openai-by-name"]
+        assert isinstance(responses_client, OpenAICompatibleClient)
+        assert isinstance(anthropic_client, AnthropicCompatibleClient)
+        assert responses_client._http_client is state.http_client
+        assert anthropic_client._http_client is state.http_client
+        if responses_client._api_key != responses_provider.api_key:
+            pytest.fail(
+                "OpenAI-compatible client did not retain its configured credential"
+            )
+        if anthropic_client._api_key != anthropic_provider.api_key:
+            pytest.fail(
+                "Anthropic-compatible client did not retain its configured credential"
+            )
+
+        responses_backend = state.route_backends["anthropic-by-name"]
+        assert isinstance(responses_backend, ResponsesBackend)
+        assert responses_backend.transport is responses_client
+        assert responses_backend.adapt_payload is server._adapt_identity_payload
+        assert (
+            responses_backend.adapt_probe_payload
+            is server._adapt_identity_probe_payload
+        )
+        assert responses_backend.signature_namespace == "anthropic-by-name"
+        assert responses_backend.catalog_loader is not None
+        assert responses_backend.catalog_loader.__self__ is responses_client
+        assert responses_backend.catalog_loader.__func__ is OpenAICompatibleClient.list_models
+
+        anthropic_backend = state.route_backends["openai-by-name"]
+        assert isinstance(anthropic_backend, AnthropicBackend)
+        assert anthropic_backend.transport is anthropic_client
+        assert (
+            anthropic_backend.header_policy
+            is server._anthropic_compatible_request_headers
+        )
+        assert (
+            anthropic_backend.error_policy
+            is server._anthropic_compatible_error_to_claude
+        )
+        assert anthropic_backend.token_counter is None
+        assert anthropic_backend.catalog_loader is None
+        assert set(state.route_backends) == set(config.route_providers)
+
+    assert request_count == 0
+
+
+def test_startup_redacts_secret_bearing_custom_provider_http_error(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    config = GatewayConfig(
+        model_map={"opus": "wrtn:upstream-model"},
+        custom_providers={"wrtn": _custom_provider()},
+    )
+    caplog.set_level(logging.WARNING, logger="claudex.server")
+
+    with _create_test_client(
+        monkeypatch,
+        tmp_path,
+        config=config,
+        custom_client=SecretBearingStartupClient,
+    ) as client:
+        selected_client = client.app.state.custom_provider_clients["wrtn"]
+
+    if _CUSTOM_API_KEY in caplog.text:
+        pytest.fail("a configured custom-provider credential was exposed in logs")
+    assert "custom provider unavailable" in caplog.text
+    assert "ConnectError" in caplog.text
+    assert "[REDACTED]" in caplog.text
+    assert selected_client.catalog_calls == 1
+
+
 @pytest.mark.parametrize(
     ("config", "custom_provider_clients", "expected_message"),
     [
@@ -552,7 +708,19 @@ def test_lifespan_builds_complete_parallel_route_backend_registry(
             "route backend registry mismatch: "
             "configured=['codex', 'grok', 'kimi']; "
             "clients=['codex', 'grok', 'kimi', 'wrtn']; "
-            "backends=['codex', 'grok', 'kimi', 'wrtn']",
+            "backends=['codex', 'grok', 'kimi']",
+        ),
+        (
+            GatewayConfig(custom_providers={"codex": _custom_provider()}),
+            {
+                "codex": FakeOpenAICompatibleClient(
+                    "codex", _custom_provider()
+                )
+            },
+            "route backend registry mismatch: "
+            "configured=['codex', 'codex', 'grok', 'kimi']; "
+            "clients=['codex', 'codex', 'grok', 'kimi']; "
+            "backends=['codex', 'codex', 'grok', 'kimi']",
         ),
     ],
 )

@@ -7,6 +7,7 @@ import pytest
 
 from claudex.config import (
     BUILTIN_ROUTE_PROVIDERS,
+    AnthropicCompatibleProvider,
     ConfigError,
     GatewayConfig,
     OpenAICompatibleProvider,
@@ -394,6 +395,15 @@ class TestCustomProviders:
         entry.update(overrides)
         return entry
 
+    @staticmethod
+    def _anthropic_entry(**overrides: object) -> dict[str, object]:
+        entry: dict[str, object] = {
+            "base_url": "https://messages.example/api",
+            "api_key": "anthropic-secret-key",
+        }
+        entry.update(overrides)
+        return entry
+
     @classmethod
     def _payload(
         cls,
@@ -406,6 +416,23 @@ class TestCustomProviders:
         return {
             "custom_providers": {
                 "openai_compatible": {
+                    name: entry,
+                }
+            }
+        }
+
+    @classmethod
+    def _anthropic_payload(
+        cls,
+        *,
+        name: str = "messages-api",
+        entry: object | None = None,
+    ) -> dict[str, object]:
+        if entry is None:
+            entry = cls._anthropic_entry()
+        return {
+            "custom_providers": {
+                "anthropic_compatible": {
                     name: entry,
                 }
             }
@@ -453,6 +480,24 @@ class TestCustomProviders:
             )
         }
 
+    def test_mixed_family_env_json_string_is_parsed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        document = {
+            "anthropic_compatible": {"messages-api": self._anthropic_entry()},
+            "openai_compatible": {"responses-api": self._entry()},
+        }
+        monkeypatch.setenv("CLAUDEX_CUSTOM_PROVIDERS", json.dumps(document))
+
+        config = GatewayConfig.from_env()
+
+        assert isinstance(
+            config.custom_providers["responses-api"], OpenAICompatibleProvider
+        )
+        assert isinstance(
+            config.custom_providers["messages-api"], AnthropicCompatibleProvider
+        )
+
     def test_empty_env_means_no_custom_providers(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
@@ -461,20 +506,359 @@ class TestCustomProviders:
 
         assert GatewayConfig.load(settings_file).custom_providers == {}
 
+    def test_both_families_are_parsed_into_one_route_namespace(
+        self, tmp_path: Path
+    ) -> None:
+        payload = {
+            "custom_providers": {
+                "openai_compatible": {"responses-api": self._entry()},
+                "anthropic_compatible": {
+                    "messages-api": self._anthropic_entry()
+                },
+            },
+            "model_map": {"haiku": "messages-api:claude-haiku"},
+            "context_window_map": {
+                "responses-api:gpt-model": 128000,
+                "messages-api:claude-haiku": 200000,
+            },
+        }
+
+        config = GatewayConfig.load(self._write(tmp_path, payload))
+
+        assert config.custom_providers == {
+            "responses-api": OpenAICompatibleProvider(
+                wire_api="responses",
+                base_url="https://model.example/api/v1",
+                api_key="secret-key",
+            ),
+            "messages-api": AnthropicCompatibleProvider(
+                base_url="https://messages.example/api",
+                api_key="anthropic-secret-key",
+            ),
+        }
+        assert config.route_providers == (
+            *BUILTIN_ROUTE_PROVIDERS,
+            "responses-api",
+            "messages-api",
+        )
+        assert config.mapped_route("claude-haiku-4-5") == RouteTarget(
+            "messages-api", "claude-haiku"
+        )
+        assert config.context_window_map == {
+            "responses-api:gpt-model": 128000,
+            "messages-api:claude-haiku": 200000,
+        }
+
+    def test_cross_family_duplicate_provider_name_fails_at_boot(
+        self, tmp_path: Path
+    ) -> None:
+        payload = {
+            "custom_providers": {
+                "openai_compatible": {
+                    "shared": self._entry(api_key="openai-sensitive-key")
+                },
+                "anthropic_compatible": {
+                    "shared": self._anthropic_entry(
+                        api_key="anthropic-sensitive-key"
+                    )
+                },
+            }
+        }
+
+        with pytest.raises(ConfigError) as error:
+            GatewayConfig.load(self._write(tmp_path, payload))
+
+        message = str(error.value)
+        assert "provider name 'shared' is configured in both" in message
+        assert "openai_compatible" in message
+        assert "anthropic_compatible" in message
+        assert "openai-sensitive-key" not in message
+        assert "anthropic-sensitive-key" not in message
+
+    def test_family_order_is_deterministic(self, tmp_path: Path) -> None:
+        payload = {
+            "custom_providers": {
+                "anthropic_compatible": {
+                    "messages-api": self._anthropic_entry()
+                },
+                "openai_compatible": {"responses-api": self._entry()},
+            }
+        }
+
+        config = GatewayConfig.load(self._write(tmp_path, payload))
+
+        assert tuple(config.custom_providers) == ("responses-api", "messages-api")
+
     def test_unknown_family_fails_at_boot(self, tmp_path: Path) -> None:
         settings_file = self._write(
             tmp_path,
-            {"custom_providers": {"anthropic_compatible": {}}},
+            {"custom_providers": {"other_compatible": {}}},
         )
 
         with pytest.raises(
             ConfigError,
             match=(
-                "unknown families: anthropic_compatible.*"
-                "valid families: openai_compatible"
+                "unknown families: other_compatible.*"
+                "valid families: openai_compatible, anthropic_compatible"
             ),
         ):
             GatewayConfig.load(settings_file)
+
+    @pytest.mark.parametrize(
+        ("name", "overrides", "message"),
+        [
+            pytest.param(
+                "messages-api",
+                {"wire_api": "responses"},
+                "unknown keys: wire_api.*valid keys: api_key, base_url",
+                id="wire-api-is-unknown",
+            ),
+            pytest.param(
+                "messages-api",
+                {"base_url": "http://model.example/api"},
+                "https is required except for http loopback",
+                id="invalid-url",
+            ),
+            pytest.param(
+                "messages-api",
+                {"api_key": ""},
+                "api_key must be a non-empty string",
+                id="empty-api-key",
+            ),
+            pytest.param(
+                "anthropic",
+                {},
+                "custom provider name 'anthropic' is reserved",
+                id="reserved-name",
+            ),
+        ],
+    )
+    def test_anthropic_compatible_validation_reuses_existing_rules(
+        self,
+        tmp_path: Path,
+        name: str,
+        overrides: dict[str, object],
+        message: str,
+    ) -> None:
+        entry = self._anthropic_entry(api_key="sensitive-api-key")
+        entry.update(overrides)
+        payload = self._anthropic_payload(name=name, entry=entry)
+
+        with pytest.raises(ConfigError, match=message) as error:
+            GatewayConfig.load(self._write(tmp_path, payload))
+
+        assert "sensitive-api-key" not in str(error.value)
+
+    @pytest.mark.parametrize("overlap_field", ["name", "base_url"])
+    def test_anthropic_compatible_rejects_credential_in_public_field(
+        self, tmp_path: Path, overlap_field: str
+    ) -> None:
+        api_key = "sensitive-overlap-key"
+        name = "messages-api"
+        base_url = "https://messages.example/api/v1"
+        if overlap_field == "name":
+            name = f"messages-{api_key}"
+        else:
+            base_url = f"https://messages.example/{api_key}/v1"
+        payload = self._anthropic_payload(
+            name=name,
+            entry=self._anthropic_entry(base_url=base_url, api_key=api_key),
+        )
+
+        with pytest.raises(ConfigError) as error:
+            GatewayConfig.load(self._write(tmp_path, payload))
+
+        message = str(error.value)
+        if api_key in message:
+            pytest.fail("an Anthropic-compatible credential was exposed")
+        assert message.endswith(
+            "anthropic_compatible custom provider credential overlaps a public field"
+        )
+
+    @pytest.mark.parametrize(
+        "base_url",
+        [
+            pytest.param(
+                "https://messages.example/v1?credential=sensitive-overlap-key-unsafe-query",
+                id="query",
+            ),
+            pytest.param(
+                "https://messages.example/v1#sensitive-overlap-key-unsafe-fragment",
+                id="fragment",
+            ),
+            pytest.param(
+                "https://[sensitive-overlap-key-unsafe-malformed",
+                id="malformed-url",
+            ),
+            pytest.param(
+                "http://sensitive-overlap-key.unsafe-insecure.example/v1",
+                id="insecure-host",
+            ),
+        ],
+    )
+    def test_anthropic_overlap_precedes_unsafe_url_diagnostics(
+        self, tmp_path: Path, base_url: str
+    ) -> None:
+        api_key = "sensitive-overlap-key"
+        payload = self._anthropic_payload(
+            entry=self._anthropic_entry(base_url=base_url, api_key=api_key)
+        )
+
+        with pytest.raises(ConfigError) as error:
+            GatewayConfig.load(self._write(tmp_path, payload))
+
+        message = str(error.value)
+        if api_key in message or "unsafe-" in message:
+            pytest.fail("unsafe Anthropic provider details were exposed")
+        assert message.endswith(
+            "anthropic_compatible custom provider credential overlaps a public field"
+        )
+
+    @pytest.mark.parametrize(
+        "anthropic_credential_owns_overlap", [True, False]
+    )
+    def test_mixed_family_rejects_cross_provider_credential_overlap(
+        self,
+        tmp_path: Path,
+        anthropic_credential_owns_overlap: bool,
+    ) -> None:
+        overlapping_key = "cross-family-sensitive-key"
+        anthropic_key = (
+            overlapping_key
+            if anthropic_credential_owns_overlap
+            else "anthropic-non-overlapping-key"
+        )
+        openai_key = (
+            "openai-non-overlapping-key"
+            if anthropic_credential_owns_overlap
+            else overlapping_key
+        )
+        anthropic_base_url = "https://messages.example/v1"
+        openai_base_url = "https://responses.example/v1"
+        if anthropic_credential_owns_overlap:
+            openai_base_url = (
+                f"http://{overlapping_key}.unsafe-cross.example/v1"
+            )
+        else:
+            anthropic_base_url = (
+                f"https://messages.example/v1?credential={overlapping_key}-unsafe-cross"
+            )
+        payload = {
+            "custom_providers": {
+                "openai_compatible": {
+                    "responses-api": self._entry(
+                        base_url=openai_base_url, api_key=openai_key
+                    )
+                },
+                "anthropic_compatible": {
+                    "messages-api": self._anthropic_entry(
+                        base_url=anthropic_base_url, api_key=anthropic_key
+                    )
+                },
+            }
+        }
+
+        with pytest.raises(ConfigError) as error:
+            GatewayConfig.load(self._write(tmp_path, payload))
+
+        message = str(error.value)
+        if overlapping_key in message or "unsafe-cross" in message:
+            pytest.fail("cross-family provider details were exposed")
+        assert message.endswith(
+            "anthropic_compatible custom provider credential overlaps a public field"
+        )
+
+    @pytest.mark.parametrize("overlap_field", ["name", "base_url"])
+    def test_openai_compatible_public_field_overlap_parsing_is_unchanged(
+        self, tmp_path: Path, overlap_field: str
+    ) -> None:
+        api_key = "legacy-overlap-key"
+        name = "responses-api"
+        base_url = "https://responses.example/api/v1"
+        if overlap_field == "name":
+            name = f"responses-{api_key}"
+        else:
+            base_url = f"https://responses.example/{api_key}/v1"
+        payload = self._payload(
+            name=name, entry=self._entry(base_url=base_url, api_key=api_key)
+        )
+
+        config = GatewayConfig.load(self._write(tmp_path, payload))
+
+        if name not in config.custom_providers:
+            pytest.fail("legacy OpenAI-compatible configuration was rejected")
+
+    @pytest.mark.parametrize(
+        ("base_url", "found"),
+        [
+            (
+                "https://messages.example/api/v1?tenant=sensitive-query",
+                "query",
+            ),
+            (
+                "https://messages.example/api/v1#sensitive-fragment",
+                "fragment",
+            ),
+            (
+                "https://messages.example/api/v1?tenant=one#deployment",
+                "query, fragment",
+            ),
+        ],
+    )
+    def test_anthropic_compatible_rejects_base_url_suffix_semantics(
+        self, tmp_path: Path, base_url: str, found: str
+    ) -> None:
+        settings_file = self._write(
+            tmp_path,
+            self._anthropic_payload(
+                entry=self._anthropic_entry(base_url=base_url)
+            ),
+        )
+
+        with pytest.raises(
+            ConfigError,
+            match=(
+                "anthropic_compatible base_url must be a versioned API prefix "
+                "without a query or fragment"
+            ),
+        ) as error:
+            GatewayConfig.load(settings_file)
+
+        message = str(error.value)
+        assert f"found {found}" in message
+        assert "sensitive-query" not in message
+        assert "sensitive-fragment" not in message
+
+    def test_anthropic_compatible_trailing_slashes_are_stripped(
+        self, tmp_path: Path
+    ) -> None:
+        settings_file = self._write(
+            tmp_path,
+            self._anthropic_payload(
+                entry=self._anthropic_entry(
+                    base_url="https://messages.example/api/v1///"
+                )
+            ),
+        )
+
+        provider = GatewayConfig.load(settings_file).custom_providers[
+            "messages-api"
+        ]
+
+        assert provider.base_url == "https://messages.example/api/v1"
+
+    def test_openai_compatible_base_url_suffix_behavior_is_unchanged(
+        self, tmp_path: Path
+    ) -> None:
+        base_url = "https://model.example/api/v1?tenant=one#deployment"
+        settings_file = self._write(
+            tmp_path,
+            self._payload(entry=self._entry(base_url=base_url)),
+        )
+
+        provider = GatewayConfig.load(settings_file).custom_providers["wrtn"]
+
+        assert provider.base_url == base_url
 
     def test_unknown_entry_key_fails_at_boot(self, tmp_path: Path) -> None:
         settings_file = self._write(
@@ -492,6 +876,27 @@ class TestCustomProviders:
 
         with pytest.raises(ConfigError, match="missing required keys: api_key"):
             GatewayConfig.load(settings_file)
+
+    def test_openai_compatible_still_requires_responses_wire_api(
+        self, tmp_path: Path
+    ) -> None:
+        missing_wire_api = self._entry()
+        del missing_wire_api["wire_api"]
+
+        with pytest.raises(ConfigError, match="missing required keys: wire_api"):
+            GatewayConfig.load(
+                self._write(tmp_path, self._payload(entry=missing_wire_api))
+            )
+
+        with pytest.raises(
+            ConfigError, match="wire_api must be exactly 'responses'"
+        ):
+            GatewayConfig.load(
+                self._write(
+                    tmp_path,
+                    self._payload(entry=self._entry(wire_api="messages")),
+                )
+            )
 
     def test_chat_wire_api_fails_with_specific_message(self, tmp_path: Path) -> None:
         settings_file = self._write(

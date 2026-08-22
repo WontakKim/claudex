@@ -95,6 +95,9 @@ class _FakeKimiClient:
     ) -> httpx.Response:
         return httpx.Response(200, json={"input_tokens": 1})
 
+    async def list_models(self) -> Any:
+        return {"data": []}
+
 
 class _AvailableGrokAuthManager:
     def __init__(self, *_args: Any, **_kwargs: Any) -> None:
