@@ -427,12 +427,17 @@ async def _probe_anthropic_route(
     else:
         response.aclose = close_response
         await close_response()
+    invalid_response_detail = "upstream returned an invalid Anthropic Messages response"
     try:
         parsed = json.loads(payload)
     except (ValueError, RecursionError):
-        return target_model
-    model = parsed.get("model") if isinstance(parsed, dict) else None
-    return model if isinstance(model, str) else target_model
+        raise UpstreamError(502, invalid_response_detail) from None
+    if not isinstance(parsed, dict) or parsed.get("type") != "message":
+        raise UpstreamError(502, invalid_response_detail)
+    model = parsed.get("model")
+    if not isinstance(model, str) or not model.strip():
+        raise UpstreamError(502, invalid_response_detail)
+    return model
 
 
 async def _handle_admin_connection_test(request: Request) -> JSONResponse:
