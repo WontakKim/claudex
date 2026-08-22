@@ -1136,6 +1136,216 @@ def _stream_backend(transport: Any | None = None) -> AnthropicBackend:
     )
 
 
+def _relay_and_capture_native_log(
+    body: dict[str, Any], caplog: pytest.LogCaptureFixture
+) -> tuple[dict[str, Any], str]:
+    sent: list[tuple[bytes, dict[str, str]]] = []
+    header_secret = "Bearer header-secret-must-not-appear"
+
+    class RecordingNativeTransport:
+        async def send_messages(
+            self, request_body: bytes, headers: dict[str, str]
+        ) -> httpx.Response:
+            sent.append((request_body, headers))
+            return httpx.Response(200, json={"type": "message", "model": "native-model"})
+
+    def header_policy(request: Request) -> dict[str, str]:
+        return {"authorization": request.headers["authorization"]}
+
+    def error_policy(exc: Any) -> tuple[int, dict[str, Any]]:
+        raise AssertionError(f"Unexpected native backend error: {exc!r}")
+
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/messages",
+            "headers": [(b"authorization", header_secret.encode())],
+        }
+    )
+    backend = AnthropicBackend(
+        transport=RecordingNativeTransport(),
+        header_policy=header_policy,
+        error_policy=error_policy,
+    )
+    caplog.set_level(logging.INFO, logger="claudex.server")
+
+    response = asyncio.run(
+        _relay_via_anthropic_backend(request, body, "native-model", backend)
+    )
+
+    assert response.status_code == 200
+    assert json.loads(response.body)["model"] == body["model"]
+    assert len(sent) == 1
+    request_body, headers = sent[0]
+    assert headers == {"authorization": header_secret}
+    native_logs = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "claudex.server"
+        and " -> native Messages:" in record.getMessage()
+    ]
+    assert len(native_logs) == 1
+    assert header_secret not in native_logs[0]
+    return json.loads(request_body), native_logs[0]
+
+
+@pytest.mark.parametrize(
+    ("thinking_type", "effort"),
+    [
+        ("enabled", "low"),
+        ("adaptive", "max"),
+        ("auto", "medium"),
+        ("disabled", "high"),
+        ("enabled", "xhigh"),
+    ],
+)
+def test_native_messages_log_reports_canonical_caller_fields_without_payload_leaks(
+    caplog: pytest.LogCaptureFixture, thinking_type: str, effort: str
+) -> None:
+    secret_prompt = "prompt-secret-must-not-appear"
+    secret_system = "system-secret-must-not-appear"
+    secret_tool = "tool-secret-must-not-appear"
+    body = _message_body("claude-fable-5")
+    body["messages"] = [{"role": "user", "content": secret_prompt}]
+    body["system"] = secret_system
+    body["tools"] = [
+        {
+            "name": secret_tool,
+            "description": "tool-description-secret-must-not-appear",
+            "input_schema": {"type": "object"},
+        }
+    ]
+    body["thinking"] = {"type": thinking_type, "budget_tokens": 32000}
+    body["output_config"] = {"effort": effort}
+    original_body = json.loads(json.dumps(body))
+
+    captured_body, log_message = _relay_and_capture_native_log(body, caplog)
+
+    assert body == original_body
+    assert captured_body == {**original_body, "model": "native-model"}
+    assert log_message == (
+        "claude-fable-5 -> native Messages:native-model "
+        f"(stream=False, thinking={thinking_type}, effort={effort}, messages=1)"
+    )
+    for sensitive_value in (
+        secret_prompt,
+        secret_system,
+        secret_tool,
+        "tool-description-secret-must-not-appear",
+        "32000",
+    ):
+        assert sensitive_value not in log_message
+
+
+def test_native_messages_log_uses_sentinels_for_missing_fields(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    body = _message_body("claude-fable-5")
+
+    captured_body, log_message = _relay_and_capture_native_log(body, caplog)
+
+    assert captured_body == {**body, "model": "native-model"}
+    assert log_message == (
+        "claude-fable-5 -> native Messages:native-model "
+        "(stream=False, thinking=-, effort=-, messages=1)"
+    )
+
+
+@pytest.mark.parametrize(
+    ("thinking", "output_config", "forbidden_values"),
+    [
+        (
+            ["enabled-parent-secret"],
+            "max-parent-secret",
+            ("enabled-parent-secret", "max-parent-secret"),
+        ),
+        (None, None, ()),
+        ({"type": 1}, {"effort": True}, ()),
+        (
+            {"type": ["enabled-list-secret"]},
+            {"effort": {"value": "max-object-secret"}},
+            ("enabled-list-secret", "max-object-secret"),
+        ),
+        ({"type": "off"}, {"effort": "minimal"}, ("off", "minimal")),
+        ({"type": "ENABLED"}, {"effort": "MAX"}, ("ENABLED", "MAX")),
+        (
+            {"type": "adaptive\nFORGED_THINKING_LOG"},
+            {"effort": "max\rFORGED_EFFORT_LOG"},
+            ("FORGED_THINKING_LOG", "FORGED_EFFORT_LOG"),
+        ),
+        (
+            {"type": "enabled\x00control-secret"},
+            {"effort": "high\x1bcontrol-secret"},
+            ("control-secret",),
+        ),
+        (
+            {"type": "Bearer thinking-secret-token"},
+            {"effort": "sk-effort-secret-token"},
+            ("thinking-secret-token", "sk-effort-secret-token"),
+        ),
+    ],
+    ids=[
+        "non-dict-parents",
+        "null-parents",
+        "non-string-values",
+        "list-and-object-values",
+        "unknown-values",
+        "uppercase-values",
+        "log-injection-values",
+        "control-character-values",
+        "secret-like-values",
+    ],
+)
+def test_native_messages_log_rejects_noncanonical_fields(
+    caplog: pytest.LogCaptureFixture,
+    thinking: Any,
+    output_config: Any,
+    forbidden_values: tuple[str, ...],
+) -> None:
+    body = _message_body("claude-fable-5")
+    body["thinking"] = thinking
+    body["output_config"] = output_config
+    original_body = json.loads(json.dumps(body))
+
+    captured_body, log_message = _relay_and_capture_native_log(body, caplog)
+
+    assert captured_body == {**original_body, "model": "native-model"}
+    assert log_message == (
+        "claude-fable-5 -> native Messages:native-model "
+        "(stream=False, thinking=-, effort=-, messages=1)"
+    )
+    for forbidden_value in forbidden_values:
+        assert forbidden_value not in log_message
+
+
+def test_native_messages_log_rejects_exception_prone_string_subclasses(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    class ExceptionProneString(str):
+        def __hash__(self) -> int:
+            raise RuntimeError("Unsafe value was hashed")
+
+        def __str__(self) -> str:
+            raise RuntimeError("Unsafe value was stringified")
+
+    thinking_value = ExceptionProneString("thinking-exception-secret")
+    effort_value = ExceptionProneString("effort-exception-secret")
+    body = _message_body("claude-fable-5")
+    body["thinking"] = {"type": thinking_value}
+    body["output_config"] = {"effort": effort_value}
+
+    captured_body, log_message = _relay_and_capture_native_log(body, caplog)
+
+    assert captured_body["thinking"] == {"type": "thinking-exception-secret"}
+    assert captured_body["output_config"] == {"effort": "effort-exception-secret"}
+    assert log_message == (
+        "claude-fable-5 -> native Messages:native-model "
+        "(stream=False, thinking=-, effort=-, messages=1)"
+    )
+    assert "exception-secret" not in log_message
+
+
 def test_kimi_mapped_model_relays_with_model_rewrite() -> None:
     captured: list[httpx.Request] = []
 

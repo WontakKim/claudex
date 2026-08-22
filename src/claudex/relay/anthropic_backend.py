@@ -21,6 +21,11 @@ from claudex.upstream_errors import UpstreamAuthError, UpstreamError
 
 logger = logging.getLogger("claudex.server")
 
+_OBSERVABLE_THINKING_TYPES = frozenset(
+    ("enabled", "adaptive", "auto", "disabled")
+)
+_OBSERVABLE_EFFORTS = frozenset(("low", "medium", "high", "xhigh", "max"))
+
 
 def _rewrite_message_start_data(line: str, requested_model: str) -> str:
     data = line[5:].strip()
@@ -130,11 +135,28 @@ async def _relay_via_anthropic_backend(
     requested_model = str(claude_request.get("model", ""))
     outgoing = dict(claude_request)
     outgoing["model"] = upstream_model
+
+    thinking = claude_request.get("thinking")
+    thinking_type = thinking.get("type") if type(thinking) is dict else None
+    if (
+        type(thinking_type) is not str
+        or thinking_type not in _OBSERVABLE_THINKING_TYPES
+    ):
+        thinking_type = "-"
+
+    output_config = claude_request.get("output_config")
+    effort = output_config.get("effort") if type(output_config) is dict else None
+    if type(effort) is not str or effort not in _OBSERVABLE_EFFORTS:
+        effort = "-"
+
     logger.info(
-        "%s -> native Messages:%s (stream=%s, messages=%d)",
+        "%s -> native Messages:%s "
+        "(stream=%s, thinking=%s, effort=%s, messages=%d)",
         requested_model or "?",
         upstream_model,
         bool(claude_request.get("stream")),
+        thinking_type,
+        effort,
         len(claude_request.get("messages") or []),
     )
 
