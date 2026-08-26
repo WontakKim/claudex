@@ -365,6 +365,35 @@ def test_same_conversation_wait_expires_with_timeout_failure() -> None:
     asyncio.run(scenario())
 
 
+def test_service_uses_environment_overall_timeout_for_start_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GPTPRO_OVERALL_TIMEOUT_SECONDS", "14400")
+    captured_timeouts: list[float | None] = []
+
+    async def provider(
+        question: str,
+        *,
+        on_status: Callable[[str], None] | None = None,
+        on_conversation_id: Callable[[str], None] | None = None,
+        conversation_id: str | None = None,
+        timeout_seconds: float | None = None,
+    ) -> ask.AskOutcome:
+        del question, on_status, on_conversation_id, conversation_id
+        captured_timeouts.append(timeout_seconds)
+        return ask.AskOutcome("answer", "marker", None)
+
+    async def scenario() -> None:
+        service = jobs.AskJobService(provider, clock=lambda: 100.0)
+        started_job = service.start("question")
+        await _wait_for_state(service, started_job.ask_id, "succeeded")
+        await service.aclose()
+
+    asyncio.run(scenario())
+
+    assert captured_timeouts == [14_400.0]
+
+
 def test_provider_receives_remaining_overall_timeout() -> None:
     captured_timeouts: list[float | None] = []
 

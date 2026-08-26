@@ -1,4 +1,9 @@
-"""In-memory lifecycle registry for background ChatGPT Pro asks."""
+"""In-memory lifecycle registry for background ChatGPT Pro asks.
+
+Job and thread registries live only for the process lifetime. A daemon restart
+loses pending jobs and session thread bindings, while callers retain thread_ref
+values to revisit conversations.
+"""
 
 from __future__ import annotations
 
@@ -10,11 +15,8 @@ from dataclasses import dataclass, replace
 from typing import Literal, Protocol
 from uuid import uuid4
 
-from claudex.gptpro.ask import (
-    OVERALL_TIMEOUT_SECONDS,
-    AskOutcome,
-    GptProAskError,
-)
+from claudex.gptpro import ask as ask_module
+from claudex.gptpro.ask import AskOutcome, GptProAskError
 
 JOB_RETENTION_SECONDS = 24.0 * 60 * 60
 SWEEP_INTERVAL_SECONDS = 300.0
@@ -82,7 +84,7 @@ class AskJobService:
         *,
         retention_seconds: float = JOB_RETENTION_SECONDS,
         sweep_interval_seconds: float = SWEEP_INTERVAL_SECONDS,
-        overall_timeout_seconds: float = OVERALL_TIMEOUT_SECONDS,
+        overall_timeout_seconds: float | None = None,
         clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
@@ -94,7 +96,11 @@ class AskJobService:
         ) or {"conversation_id", "timeout_seconds"}.issubset(ask_parameters)
         self._retention_seconds = retention_seconds
         self._sweep_interval_seconds = sweep_interval_seconds
-        self._overall_timeout_seconds = overall_timeout_seconds
+        self._overall_timeout_seconds = (
+            ask_module.overall_timeout_seconds()
+            if overall_timeout_seconds is None
+            else overall_timeout_seconds
+        )
         self._clock = clock
         self._sleep = sleep
         self._jobs: dict[str, AskJob] = {}

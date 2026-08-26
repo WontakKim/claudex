@@ -6,6 +6,7 @@ import asyncio
 import inspect
 import json
 import math
+import os
 import time
 from collections import deque
 from collections.abc import Awaitable, Callable, Mapping
@@ -152,6 +153,19 @@ _monotonic: Callable[[], float] = time.monotonic
 _sleep: Callable[[float], Awaitable[None]] = asyncio.sleep
 
 
+def overall_timeout_seconds() -> float:
+    raw_value = os.environ.get("GPTPRO_OVERALL_TIMEOUT_SECONDS")
+    if raw_value is None:
+        return OVERALL_TIMEOUT_SECONDS
+    try:
+        configured_value = float(raw_value)
+    except ValueError:
+        return OVERALL_TIMEOUT_SECONDS
+    if configured_value <= 0:
+        return OVERALL_TIMEOUT_SECONDS
+    return configured_value
+
+
 def _read_member(value: object, name: str, default: Any = None) -> Any:
     member = getattr(value, name, default)
     if callable(member):
@@ -214,7 +228,9 @@ class _AskExecution:
         self.on_status = on_status
         self.on_conversation_id = on_conversation_id
         timeout_budget = (
-            OVERALL_TIMEOUT_SECONDS if timeout_seconds is None else timeout_seconds
+            overall_timeout_seconds()
+            if timeout_seconds is None
+            else timeout_seconds
         )
         self.deadline = _monotonic() + timeout_budget
         self.marker = build_nonce_marker(str(uuid4()))

@@ -387,6 +387,31 @@ def _dom_state(*, has_stop: bool, length: int = 12) -> dict[str, object]:
     }
 
 
+def test_overall_timeout_defaults_when_environment_variable_is_unset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("GPTPRO_OVERALL_TIMEOUT_SECONDS", raising=False)
+
+    assert ask.overall_timeout_seconds() == ask.OVERALL_TIMEOUT_SECONDS
+
+
+def test_overall_timeout_uses_valid_environment_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GPTPRO_OVERALL_TIMEOUT_SECONDS", "14400")
+
+    assert ask.overall_timeout_seconds() == 14_400.0
+
+
+@pytest.mark.parametrize("raw_value", ["invalid", "0", "-1"])
+def test_overall_timeout_defaults_for_invalid_environment_value(
+    monkeypatch: pytest.MonkeyPatch, raw_value: str
+) -> None:
+    monkeypatch.setenv("GPTPRO_OVERALL_TIMEOUT_SECONDS", raw_value)
+
+    assert ask.overall_timeout_seconds() == ask.OVERALL_TIMEOUT_SECONDS
+
+
 def test_happy_path_returns_finished_server_raw_markdown_and_removes_listeners(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
