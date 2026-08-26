@@ -31,6 +31,13 @@ def test_log_file_is_under_runtime_dir(tmp_path: Path) -> None:
     assert paths.log_file() == tmp_path / ".claudex" / "gateway.log"
 
 
+def test_gptpro_paths_are_under_the_gptpro_runtime_dir(tmp_path: Path) -> None:
+    expected_dir = tmp_path / ".claudex" / "gptpro"
+    assert paths.gptpro_dir() == expected_dir
+    assert paths.gptpro_chrome_profile_dir() == expected_dir / "chrome-profile"
+    assert paths.gptpro_session_file() == expected_dir / "session.json"
+
+
 def test_accounts_dir_is_under_the_accounts_root(tmp_path: Path) -> None:
     assert paths.accounts_dir("claude") == tmp_path / ".claudex" / "accounts" / "claude"
 
@@ -76,6 +83,9 @@ def test_do_not_create_the_runtime_directory(tmp_path: Path) -> None:
     paths.settings_file()
     paths.daemon_record_file()
     paths.log_file()
+    paths.gptpro_dir()
+    paths.gptpro_chrome_profile_dir()
+    paths.gptpro_session_file()
     paths.accounts_dir("claude")
     paths.claude_account_pool_dir()
     paths.claude_account_pool_runtime_db()
@@ -106,6 +116,8 @@ def test_imports_only_stdlib() -> None:
         "config/schema.py",
         "config/settings_io.py",
         "config/gateway.py",
+        "gptpro/login.py",
+        "gptpro/session.py",
     ],
 )
 def test_consumers_use_shared_paths_module(module_name: str) -> None:

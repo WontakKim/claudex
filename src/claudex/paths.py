@@ -29,6 +29,18 @@ def log_file() -> Path:
     return runtime_dir() / "gateway.log"
 
 
+def gptpro_dir() -> Path:
+    return runtime_dir() / "gptpro"
+
+
+def gptpro_chrome_profile_dir() -> Path:
+    return gptpro_dir() / "chrome-profile"
+
+
+def gptpro_session_file() -> Path:
+    return gptpro_dir() / "session.json"
+
+
 def accounts_dir(provider: str) -> Path:
     """Return the accounts directory for `provider`.
 

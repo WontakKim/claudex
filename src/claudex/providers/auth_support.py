@@ -5,11 +5,86 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import sys
+import uuid
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any, TypeVar
 
 _State = TypeVar("_State")
+
+
+def write_private_json_atomic(path: Path, data: Any) -> None:
+    """Durably replace a private JSON file through a same-directory staging file."""
+    ensure_private_directory(path.parent)
+    payload = json.dumps(data, indent=2, ensure_ascii=False).encode("utf-8") + b"\n"
+    staging_path = path.with_name(f".{path.name}.tmp-{uuid.uuid4().hex}")
+
+    file_descriptor = os.open(
+        staging_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600
+    )
+    try:
+        try:
+            os.fchmod(file_descriptor, 0o600)
+            handle = os.fdopen(file_descriptor, "wb")
+        except BaseException:
+            os.close(file_descriptor)
+            raise
+        with handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+    except BaseException:
+        _remove_path_if_exists(staging_path)
+        raise
+
+    try:
+        os.replace(staging_path, path)
+    except BaseException:
+        _remove_path_if_exists(staging_path)
+        raise
+    _fsync_directory(path.parent)
+
+
+def ensure_private_directory(directory: Path) -> None:
+    """Create `directory` and any missing parents with mode 0700.
+
+    `Path.mkdir(parents=True)` applies the requested mode only to the leaf;
+    parents it creates get the umask-influenced default instead. This walks
+    the missing chain explicitly so no intermediate directory is ever wider
+    than 0700.
+    """
+    missing_directories: list[Path] = []
+    current = directory
+    while not current.exists():
+        missing_directories.append(current)
+        parent = current.parent
+        if parent == current:
+            break
+        current = parent
+    for missing_directory in reversed(missing_directories):
+        missing_directory.mkdir(mode=0o700, exist_ok=True)
+        os.chmod(missing_directory, 0o700)
+    if not directory.is_dir():
+        raise NotADirectoryError(f"not a directory: {directory}")
+    os.chmod(directory, 0o700)
+
+
+def _remove_path_if_exists(path: Path) -> None:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def _fsync_directory(directory: Path) -> None:
+    if sys.platform == "win32":
+        return
+    file_descriptor = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(file_descriptor)
+    finally:
+        os.close(file_descriptor)
 
 
 def load_json_credentials(

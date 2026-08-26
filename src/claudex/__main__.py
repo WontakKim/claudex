@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import sys
 
-from claudex.cli import accounts, compact, daemon
+from claudex.cli import accounts, compact, daemon, gptpro
 
 
 def main() -> None:
@@ -27,6 +27,14 @@ def main() -> None:
     # file, so it is dispatched ahead of the ordinary _load_config() below.
     if arguments and arguments[0] == "compact":
         result = compact._compact_main(arguments[1:])
+        if result != 0:
+            raise SystemExit(result)
+        return
+
+    # gptpro setup only touches its browser profile and session file, so it
+    # must remain available when the gateway configuration is broken.
+    if arguments and arguments[0] == "gptpro":
+        result = gptpro._gptpro_main(arguments[1:])
         if result != 0:
             raise SystemExit(result)
         return
