@@ -24,6 +24,20 @@ async def _wait_for_state(
     raise AssertionError(f"job did not reach {expected_state}")
 
 
+async def _wait_for_status_message(
+    service: jobs.AskJobService,
+    ask_id: str,
+    expected_message: str,
+) -> jobs.AskJob:
+    deadline = asyncio.get_running_loop().time() + 1.0
+    while asyncio.get_running_loop().time() < deadline:
+        job = service.status(ask_id)
+        if job is not None and job.status_message == expected_message:
+            return job
+        await asyncio.sleep(0)
+    raise AssertionError(f"job did not report {expected_message!r}")
+
+
 async def _wait_until_missing(
     service: jobs.AskJobService, ask_id: str
 ) -> None:
@@ -38,13 +52,17 @@ async def _wait_until_missing(
 def test_start_returns_running_job_before_successful_completion() -> None:
     provider_started = asyncio.Event()
     release_provider = asyncio.Event()
+    captured_thread_refs: list[str] = []
 
     async def provider(
         question: str,
         *,
         on_status: Callable[[str], None] | None = None,
         on_conversation_id: Callable[[str], None] | None = None,
+        conversation_id: str | None = None,
+        timeout_seconds: float | None = None,
     ) -> ask.AskOutcome:
+        del conversation_id, timeout_seconds
         del on_status, on_conversation_id
         assert question == "question"
         provider_started.set()
@@ -57,7 +75,9 @@ def test_start_returns_running_job_before_successful_completion() -> None:
 
     async def scenario() -> None:
         service = jobs.AskJobService(provider)
-        started_job = service.start("question")
+        started_job = service.start(
+            "question", on_thread_ref=captured_thread_refs.append
+        )
 
         assert started_job.state == "running"
         assert started_job.answer is None
@@ -73,6 +93,7 @@ def test_start_returns_running_job_before_successful_completion() -> None:
         assert completed_job.answer == "answer"
         assert completed_job.nonce_marker == "full nonce marker"
         assert completed_job.thread_ref == "conversation-from-outcome"
+        assert captured_thread_refs == ["conversation-from-outcome"]
         assert completed_job.finished_at is not None
         assert service.result(started_job.ask_id) == completed_job
         assert started_job.state == "running"
@@ -90,7 +111,10 @@ def test_status_callback_updates_latest_status_message() -> None:
         *,
         on_status: Callable[[str], None] | None = None,
         on_conversation_id: Callable[[str], None] | None = None,
+        conversation_id: str | None = None,
+        timeout_seconds: float | None = None,
     ) -> ask.AskOutcome:
+        del conversation_id, timeout_seconds
         del question, on_conversation_id
         assert on_status is not None
         on_status("opening ChatGPT")
@@ -118,13 +142,17 @@ def test_status_callback_updates_latest_status_message() -> None:
 def test_conversation_id_callback_latches_first_thread_ref_while_running() -> None:
     conversation_id_updated = asyncio.Event()
     release_provider = asyncio.Event()
+    captured_thread_refs: list[str] = []
 
     async def provider(
         question: str,
         *,
         on_status: Callable[[str], None] | None = None,
         on_conversation_id: Callable[[str], None] | None = None,
+        conversation_id: str | None = None,
+        timeout_seconds: float | None = None,
     ) -> ask.AskOutcome:
+        del conversation_id, timeout_seconds
         del question, on_status
         assert on_conversation_id is not None
         on_conversation_id("first-conversation")
@@ -135,13 +163,16 @@ def test_conversation_id_callback_latches_first_thread_ref_while_running() -> No
 
     async def scenario() -> None:
         service = jobs.AskJobService(provider)
-        started_job = service.start("question")
+        started_job = service.start(
+            "question", on_thread_ref=captured_thread_refs.append
+        )
 
         await conversation_id_updated.wait()
         running_job = service.status(started_job.ask_id)
         assert running_job is not None
         assert running_job.state == "running"
         assert running_job.thread_ref == "first-conversation"
+        assert captured_thread_refs == ["first-conversation"]
 
         release_provider.set()
         completed_job = await _wait_for_state(
@@ -151,6 +182,236 @@ def test_conversation_id_callback_latches_first_thread_ref_while_running() -> No
         await service.aclose()
 
     asyncio.run(scenario())
+
+
+def test_existing_conversation_is_visible_and_passed_to_provider() -> None:
+    captured_options: list[tuple[str | None, float | None]] = []
+    captured_thread_refs: list[str] = []
+
+    async def provider(
+        question: str,
+        *,
+        on_status: Callable[[str], None] | None = None,
+        on_conversation_id: Callable[[str], None] | None = None,
+        conversation_id: str | None = None,
+        timeout_seconds: float | None = None,
+    ) -> ask.AskOutcome:
+        del question, on_status, on_conversation_id
+        captured_options.append((conversation_id, timeout_seconds))
+        return ask.AskOutcome("answer", "marker", conversation_id)
+
+    async def scenario() -> None:
+        service = jobs.AskJobService(provider, overall_timeout_seconds=5.0)
+        started_job = service.start(
+            "question",
+            conversation_id="existing-conversation",
+            on_thread_ref=captured_thread_refs.append,
+        )
+
+        assert started_job.thread_ref == "existing-conversation"
+        assert captured_thread_refs == []
+
+        completed_job = await _wait_for_state(
+            service, started_job.ask_id, "succeeded"
+        )
+        assert completed_job.thread_ref == "existing-conversation"
+        assert captured_thread_refs == []
+        assert len(captured_options) == 1
+        captured_conversation_id, captured_timeout = captured_options[0]
+        assert captured_conversation_id == "existing-conversation"
+        assert captured_timeout is not None
+        assert 0 < captured_timeout <= 5.0
+        await service.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_same_conversation_asks_run_in_submission_order() -> None:
+    first_provider_started = asyncio.Event()
+    release_first_provider = asyncio.Event()
+    second_provider_started = asyncio.Event()
+    started_questions: list[str] = []
+
+    async def provider(
+        question: str,
+        *,
+        on_status: Callable[[str], None] | None = None,
+        on_conversation_id: Callable[[str], None] | None = None,
+        conversation_id: str | None = None,
+        timeout_seconds: float | None = None,
+    ) -> ask.AskOutcome:
+        del on_status, on_conversation_id, timeout_seconds
+        assert conversation_id == "shared-conversation"
+        started_questions.append(question)
+        if question == "first":
+            first_provider_started.set()
+            await release_first_provider.wait()
+        else:
+            second_provider_started.set()
+        return ask.AskOutcome(f"answer: {question}", "marker", conversation_id)
+
+    async def scenario() -> None:
+        service = jobs.AskJobService(provider)
+        first_job = service.start(
+            "first", conversation_id="shared-conversation"
+        )
+        await first_provider_started.wait()
+
+        second_job = service.start(
+            "second", conversation_id="shared-conversation"
+        )
+        waiting_job = await _wait_for_status_message(
+            service,
+            second_job.ask_id,
+            "waiting for the in-flight answer",
+        )
+        assert waiting_job.state == "running"
+        assert not second_provider_started.is_set()
+        assert started_questions == ["first"]
+
+        release_first_provider.set()
+        await _wait_for_state(service, first_job.ask_id, "succeeded")
+        await second_provider_started.wait()
+        await _wait_for_state(service, second_job.ask_id, "succeeded")
+        assert started_questions == ["first", "second"]
+        await service.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_different_conversation_asks_run_concurrently() -> None:
+    both_providers_started = asyncio.Event()
+    release_providers = asyncio.Event()
+    started_conversations: set[str | None] = set()
+
+    async def provider(
+        question: str,
+        *,
+        on_status: Callable[[str], None] | None = None,
+        on_conversation_id: Callable[[str], None] | None = None,
+        conversation_id: str | None = None,
+        timeout_seconds: float | None = None,
+    ) -> ask.AskOutcome:
+        del question, on_status, on_conversation_id, timeout_seconds
+        started_conversations.add(conversation_id)
+        if len(started_conversations) == 2:
+            both_providers_started.set()
+        await release_providers.wait()
+        return ask.AskOutcome("answer", "marker", conversation_id)
+
+    async def scenario() -> None:
+        service = jobs.AskJobService(provider)
+        first_job = service.start("first", conversation_id="conversation-a")
+        second_job = service.start("second", conversation_id="conversation-b")
+
+        await both_providers_started.wait()
+        assert started_conversations == {"conversation-a", "conversation-b"}
+
+        release_providers.set()
+        await _wait_for_state(service, first_job.ask_id, "succeeded")
+        await _wait_for_state(service, second_job.ask_id, "succeeded")
+        await service.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_same_conversation_wait_expires_with_timeout_failure() -> None:
+    first_provider_started = asyncio.Event()
+    release_first_provider = asyncio.Event()
+    provider_questions: list[str] = []
+
+    async def provider(
+        question: str,
+        *,
+        on_status: Callable[[str], None] | None = None,
+        on_conversation_id: Callable[[str], None] | None = None,
+        conversation_id: str | None = None,
+        timeout_seconds: float | None = None,
+    ) -> ask.AskOutcome:
+        del on_status, on_conversation_id, timeout_seconds
+        assert conversation_id == "shared-conversation"
+        provider_questions.append(question)
+        if question == "first":
+            first_provider_started.set()
+            await release_first_provider.wait()
+        return ask.AskOutcome("answer", "marker", conversation_id)
+
+    async def scenario() -> None:
+        service = jobs.AskJobService(
+            provider, overall_timeout_seconds=0.01
+        )
+        first_job = service.start(
+            "first", conversation_id="shared-conversation"
+        )
+        await first_provider_started.wait()
+        second_job = service.start(
+            "second", conversation_id="shared-conversation"
+        )
+
+        failed_job = await _wait_for_state(
+            service, second_job.ask_id, "failed"
+        )
+        assert failed_job.failure == "timeout"
+        assert failed_job.error_message == (
+            "the ask deadline expired while waiting for the in-flight answer "
+            "on this conversation"
+        )
+        assert provider_questions == ["first"]
+
+        release_first_provider.set()
+        await _wait_for_state(service, first_job.ask_id, "succeeded")
+        await service.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_provider_receives_remaining_overall_timeout() -> None:
+    captured_timeouts: list[float | None] = []
+
+    async def provider(
+        question: str,
+        *,
+        on_status: Callable[[str], None] | None = None,
+        on_conversation_id: Callable[[str], None] | None = None,
+        conversation_id: str | None = None,
+        timeout_seconds: float | None = None,
+    ) -> ask.AskOutcome:
+        del question, on_status, on_conversation_id, conversation_id
+        captured_timeouts.append(timeout_seconds)
+        return ask.AskOutcome("answer", "marker", None)
+
+    async def scenario() -> None:
+        service = jobs.AskJobService(
+            provider, overall_timeout_seconds=12.5
+        )
+        started_job = service.start("question")
+        await _wait_for_state(service, started_job.ask_id, "succeeded")
+        await service.aclose()
+
+    asyncio.run(scenario())
+
+    assert len(captured_timeouts) == 1
+    captured_timeout = captured_timeouts[0]
+    assert captured_timeout is not None
+    assert 0 < captured_timeout <= 12.5
+
+
+def test_thread_registry_returns_bound_thread_and_none_for_unknown_session() -> None:
+    registry = jobs.ThreadRegistry()
+
+    assert registry.lookup("unknown-session") is None
+    registry.bind("session", "thread")
+    assert registry.lookup("session") == "thread"
+
+
+def test_thread_registry_removes_expired_binding_on_lookup() -> None:
+    now = [100.0]
+    registry = jobs.ThreadRegistry(clock=lambda: now[0])
+    registry.bind("session", "thread")
+
+    now[0] += jobs.THREAD_BINDING_TTL_SECONDS
+
+    assert registry.lookup("session") is None
 
 
 @pytest.mark.parametrize(
@@ -174,7 +435,10 @@ def test_provider_failure_transitions_job_to_failed(
         *,
         on_status: Callable[[str], None] | None = None,
         on_conversation_id: Callable[[str], None] | None = None,
+        conversation_id: str | None = None,
+        timeout_seconds: float | None = None,
     ) -> ask.AskOutcome:
+        del conversation_id, timeout_seconds
         del question, on_status, on_conversation_id
         raise provider_error
 
@@ -197,7 +461,10 @@ def test_unknown_ask_id_has_no_status_or_result() -> None:
         *,
         on_status: Callable[[str], None] | None = None,
         on_conversation_id: Callable[[str], None] | None = None,
+        conversation_id: str | None = None,
+        timeout_seconds: float | None = None,
     ) -> ask.AskOutcome:
+        del conversation_id, timeout_seconds
         del question, on_status, on_conversation_id
         return ask.AskOutcome("answer", "marker", None)
 
@@ -218,7 +485,10 @@ def test_sweeper_removes_expired_finished_jobs_but_keeps_running_jobs() -> None:
         *,
         on_status: Callable[[str], None] | None = None,
         on_conversation_id: Callable[[str], None] | None = None,
+        conversation_id: str | None = None,
+        timeout_seconds: float | None = None,
     ) -> ask.AskOutcome:
+        del conversation_id, timeout_seconds
         del on_status, on_conversation_id
         if question == "running":
             running_provider_started.set()
@@ -257,7 +527,10 @@ def test_aclose_cancels_running_job_and_sweeper_and_is_idempotent() -> None:
         *,
         on_status: Callable[[str], None] | None = None,
         on_conversation_id: Callable[[str], None] | None = None,
+        conversation_id: str | None = None,
+        timeout_seconds: float | None = None,
     ) -> ask.AskOutcome:
+        del conversation_id, timeout_seconds
         del question, on_status, on_conversation_id
         provider_started.set()
         try:
