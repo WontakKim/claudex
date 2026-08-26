@@ -38,14 +38,11 @@ class _FakePage:
 
 
 class _FakeContext:
-    def __init__(self, *, new_page_error: BaseException | None = None) -> None:
-        self.new_page_error = new_page_error
+    def __init__(self) -> None:
         self.pages: list[_FakePage] = []
         self.close_calls = 0
 
     async def new_page(self) -> _FakePage:
-        if self.new_page_error is not None:
-            raise self.new_page_error
         page = _FakePage()
         self.pages.append(page)
         return page

@@ -44,25 +44,12 @@ class _FakeResponse:
         status: int,
         *,
         headers: dict[str, str] | None = None,
-        body: str = "",
         request: _FakeRequest | None = None,
     ) -> None:
         self.url = url
         self.status = status
         self.headers = headers or {}
         self.request = request or _FakeRequest(url, "POST")
-        self._body = body
-
-    async def text(self) -> str:
-        return self._body
-
-
-class _FakeKeyboard:
-    def __init__(self) -> None:
-        self.presses: list[str] = []
-
-    async def press(self, key: str) -> None:
-        self.presses.append(key)
 
 
 class _FakePage:
@@ -89,7 +76,6 @@ class _FakePage:
     ) -> None:
         self.url = "https://chatgpt.com/"
         self.signal = signal
-        self.raw_text = raw_text
         self.api_payloads = list(api_payloads or [raw_text])
         self.api_statuses = list(api_statuses or [200])
         self.turn_states = list(
@@ -121,7 +107,6 @@ class _FakePage:
             "requestfinished": [],
             "response": [],
         }
-        self.keyboard = _FakeKeyboard()
         self.composer_value = ""
         self.filled_prompt = ""
         self.click_count = 0
