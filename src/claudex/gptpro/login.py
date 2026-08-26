@@ -11,6 +11,7 @@ from typing import Literal
 
 from claudex import paths
 from claudex.gptpro import browser, session
+from claudex.gptpro.selectors import COMPOSER_SELECTOR
 from claudex.providers.auth_support import ensure_private_directory
 
 CHATGPT_URL = "https://chatgpt.com/"
@@ -116,7 +117,7 @@ async def _probe_saved_session(path: Path) -> tuple[bool, bool]:
 
         try:
             await page.wait_for_selector(
-                "#prompt-textarea",
+                COMPOSER_SELECTOR,
                 state="visible",
                 timeout=browser.COMPOSER_TIMEOUT_MS,
             )

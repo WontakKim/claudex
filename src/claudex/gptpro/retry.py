@@ -6,6 +6,7 @@ import random
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from typing import Literal
 
 MIN_RETRY_AFTER_MS = 1_000
@@ -13,7 +14,7 @@ MAX_RETRY_AFTER_MS = 60_000
 MAX_RATE_LIMIT_JITTER_MS = 2_000
 
 _CHALLENGE_MARKERS = ("cf-chl", "challenge", "captcha", "__cf_bm")
-_DECIMAL_SECONDS_PATTERN = re.compile(r"[0-9]+")
+_DECIMAL_SECONDS_PATTERN = re.compile(r"(?:[0-9]+(?:\.[0-9]+)?|\.[0-9]+)")
 
 
 @dataclass(frozen=True)
@@ -52,8 +53,8 @@ def _parse_retry_after_ms(value: str) -> int:
     if _DECIMAL_SECONDS_PATTERN.fullmatch(stripped) is None:
         return MIN_RETRY_AFTER_MS
     try:
-        retry_after_ms = int(stripped) * 1_000
-    except ValueError:
+        retry_after_ms = int(Decimal(stripped) * 1_000)
+    except (InvalidOperation, ValueError):
         return MIN_RETRY_AFTER_MS
     return max(retry_after_ms, MIN_RETRY_AFTER_MS)
 
@@ -78,8 +79,8 @@ def classify_backend_response(
 
     has_cf_ray = bool(normalized_headers.get("cf-ray"))
 
-    if status == 200:
-        return RetryAction(action="ok", reason="HTTP 200")
+    if 200 <= status < 300:
+        return RetryAction(action="ok", reason=f"HTTP {status}")
 
     if status == 401:
         return RetryAction(

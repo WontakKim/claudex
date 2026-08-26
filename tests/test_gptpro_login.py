@@ -11,7 +11,7 @@ from typing import Any
 
 import pytest
 
-from claudex.gptpro import browser, login, session
+from claudex.gptpro import browser, login, selectors, session
 
 
 class _FakePage:
@@ -192,7 +192,7 @@ def test_run_login_polls_clears_stale_cookie_saves_and_probes(
         (login.CHATGPT_URL, "domcontentloaded", browser.NAVIGATION_TIMEOUT_MS)
     ]
     assert probe_page.selector_calls == [
-        ("#prompt-textarea", "visible", browser.COMPOSER_TIMEOUT_MS)
+        (selectors.COMPOSER_SELECTOR, "visible", browser.COMPOSER_TIMEOUT_MS)
     ]
     assert statuses == [
         "sign in to ChatGPT in the opened browser; waiting up to five minutes",

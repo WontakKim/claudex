@@ -245,3 +245,44 @@ def test_completion_report_url_requires_path_fragment_and_trusted_origin(
 
 def test_build_nonce_marker_uses_frozen_transport_label() -> None:
     assert NONCE_MARKER == f"[gptpro-transport-nonce:{NONCE}]"
+
+
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        ("https://chatgpt.com/", True),
+        ("https://chatgpt.com:443/backend-api/conversation", True),
+        ("https://evil.example/backend-api/conversation", False),
+        ("https://chatgpt.com.evil.example/", False),
+        ("http://chatgpt.com/", False),
+        ("not a url", False),
+    ],
+)
+def test_trusted_origin_url(url: str, expected: bool) -> None:
+    assert conversation.is_trusted_origin_url(url) is expected
+
+
+def test_finished_state_ignores_later_non_text_assistant_nodes() -> None:
+    fixture = _conversation(
+        _node("user", None, "user", [NONCE_MARKER]),
+        _node(
+            "answer",
+            "user",
+            "assistant",
+            ["partial answer"],
+            status="in_progress",
+        ),
+        _node(
+            "thought",
+            "answer",
+            "assistant",
+            ["finished internal state"],
+            content_type="thoughts",
+            status="finished_successfully",
+        ),
+        current_node="thought",
+    )
+
+    assert conversation.extract_assistant_turn(
+        fixture, NONCE_MARKER
+    ) == conversation.AssistantTurn(text="partial answer", finished=False)

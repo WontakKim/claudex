@@ -7,8 +7,12 @@ import pytest
 from claudex.gptpro import retry
 
 
-def test_ok_and_session_expiry_classification() -> None:
-    assert retry.classify_backend_response(200, {}).action == "ok"
+@pytest.mark.parametrize("status", [200, 201, 202, 204, 299])
+def test_all_success_statuses_are_ok(status: int) -> None:
+    assert retry.classify_backend_response(status, {}).action == "ok"
+
+
+def test_session_expiry_classification() -> None:
     expired = retry.classify_backend_response(401, {})
     assert expired.action == "session_expired"
     assert expired.retry_after_ms is None
@@ -53,12 +57,12 @@ def test_403_without_both_challenge_signals_is_entitlement(
     [
         ({"Retry-After": "7"}, 7_000),
         ({}, 1_000),
-        ({"retry-after": "1.5"}, 1_000),
+        ({"retry-after": "1.5"}, 1_500),
         ({"retry-after": "later"}, 1_000),
         ({"retry-after": "0"}, 1_000),
     ],
 )
-def test_429_parses_only_integer_retry_after_without_jitter(
+def test_429_parses_decimal_retry_after_without_jitter(
     headers: dict[str, str], expected_delay: int
 ) -> None:
     action = retry.classify_backend_response(429, headers)

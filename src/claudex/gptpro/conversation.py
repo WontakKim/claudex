@@ -52,6 +52,12 @@ def _has_trusted_origin(parsed: SplitResult) -> bool:
     return normalized_origin == TRUSTED_ORIGIN and port in (None, 443)
 
 
+def is_trusted_origin_url(url: str) -> bool:
+    """Return whether a URL uses the canonical trusted ChatGPT origin."""
+    parsed = _parse_url(url)
+    return parsed is not None and _has_trusted_origin(parsed)
+
+
 def is_conversation_stream_url(url: str) -> bool:
     """Return whether a URL is an exact ChatGPT conversation stream endpoint."""
     parsed = _parse_url(url)
@@ -158,22 +164,25 @@ def extract_assistant_turn(
         return None
 
     texts: list[str] = []
-    last_assistant: Mapping[str, Any] | None = None
+    last_text_assistant: Mapping[str, Any] | None = None
     for node in reversed(chain[:anchor_index]):
         message = node.get("message")
         if _message_role(message) != "assistant" or not isinstance(message, Mapping):
             continue
-        last_assistant = message
+        content = message.get("content")
+        if not isinstance(content, Mapping) or content.get("content_type") != "text":
+            continue
+        last_text_assistant = message
         text = _message_text(message)
         if text:
             texts.append(text)
 
-    if last_assistant is None:
+    if last_text_assistant is None:
         return AssistantTurn(text="", finished=False)
 
     finished = (
-        last_assistant.get("status") == "finished_successfully"
-        or last_assistant.get("end_turn") is True
+        last_text_assistant.get("status") == "finished_successfully"
+        or last_text_assistant.get("end_turn") is True
     )
     return AssistantTurn(text="\n\n".join(texts), finished=finished)
 
