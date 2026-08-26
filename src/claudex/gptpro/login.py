@@ -11,15 +11,14 @@ from typing import Literal
 
 from claudex import locking, paths
 from claudex.gptpro import browser, session
+from claudex.gptpro.conversation import CHATGPT_URL
 from claudex.gptpro.selectors import COMPOSER_SELECTOR
 from claudex.providers.auth_support import ensure_private_directory
 
-CHATGPT_URL = "https://chatgpt.com/"
 LOGIN_TIMEOUT_SECONDS = 5 * 60
 COOKIE_POLL_INTERVAL_SECONDS = 0.5
 PROFILE_LOCK_WAIT_SECONDS = 10.0
 PROFILE_LOCK_POLL_INTERVAL_SECONDS = 0.1
-PROFILE_IN_USE_MESSAGE = browser.PROFILE_IN_USE_MESSAGE
 
 FailureClassification = Literal[
     "dependency_missing",
@@ -179,7 +178,7 @@ async def run_login(*, on_status: Callable[[str], None]) -> LoginResult:
 
     profile_lock = await _acquire_profile_lock()
     if profile_lock is None:
-        return result("error", PROFILE_IN_USE_MESSAGE)
+        return result("error", browser.PROFILE_IN_USE_MESSAGE)
 
     try:
         context = await browser.launch_persistent_profile(

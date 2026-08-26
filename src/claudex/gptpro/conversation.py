@@ -10,6 +10,7 @@ from typing import Any
 from urllib.parse import SplitResult, urlsplit
 
 TRUSTED_ORIGIN = "https://chatgpt.com"
+CHATGPT_URL = f"{TRUSTED_ORIGIN}/"
 TRANSPORT_NONCE_LABEL = "gptpro-transport-nonce"
 COMPLETION_REPORT_PATH_FRAGMENT = "/backend-api/lat/"
 

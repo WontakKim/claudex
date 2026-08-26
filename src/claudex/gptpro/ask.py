@@ -16,6 +16,7 @@ from uuid import uuid4
 
 from claudex.gptpro.browser import COMPOSER_TIMEOUT_MS, NAVIGATION_TIMEOUT_MS
 from claudex.gptpro.conversation import (
+    CHATGPT_URL,
     TRUSTED_ORIGIN,
     build_nonce_marker,
     extract_assistant_turn,
@@ -51,7 +52,6 @@ from claudex.gptpro.selectors import (
     VISIBLE_MODAL_PROBE_JS,
 )
 
-CHATGPT_URL = f"{TRUSTED_ORIGIN}/"
 AUTH_PATH_FRAGMENT = "/auth/login"
 BACKEND_API_PATH_FRAGMENT = "/backend-api/"
 
