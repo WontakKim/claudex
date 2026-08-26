@@ -31,7 +31,7 @@ def main() -> None:
             raise SystemExit(result)
         return
 
-    # gptpro setup only touches its browser profile and session file, so it
+    # gptpro commands only touch their browser profile and session file, so they
     # must remain available when the gateway configuration is broken.
     if arguments and arguments[0] == "gptpro":
         result = gptpro._gptpro_main(arguments[1:])

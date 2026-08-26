@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-from claudex import paths
+from claudex import locking, paths
 from claudex.gptpro import browser, session
 from claudex.gptpro.selectors import COMPOSER_SELECTOR
 from claudex.providers.auth_support import ensure_private_directory
@@ -17,6 +17,9 @@ from claudex.providers.auth_support import ensure_private_directory
 CHATGPT_URL = "https://chatgpt.com/"
 LOGIN_TIMEOUT_SECONDS = 5 * 60
 COOKIE_POLL_INTERVAL_SECONDS = 0.5
+PROFILE_LOCK_WAIT_SECONDS = 10.0
+PROFILE_LOCK_POLL_INTERVAL_SECONDS = 0.1
+PROFILE_IN_USE_MESSAGE = browser.PROFILE_IN_USE_MESSAGE
 
 FailureClassification = Literal[
     "dependency_missing",
@@ -62,6 +65,19 @@ class GptProLoginError(Exception):
 
 def _ignore_status(message: str) -> None:
     del message
+
+
+async def _acquire_profile_lock() -> locking.FileLockHandle | None:
+    deadline = time.monotonic() + PROFILE_LOCK_WAIT_SECONDS
+    while True:
+        profile_lock = locking.try_file_lock(paths.gptpro_profile_lock())
+        if profile_lock is not None:
+            return profile_lock
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        await asyncio.sleep(min(PROFILE_LOCK_POLL_INTERVAL_SECONDS, remaining))
 
 
 def _browser_failure(exc: BaseException) -> GptProLoginError:
@@ -194,9 +210,18 @@ async def run_login(
             "error", "prepare the gptpro browser profile directory and retry"
         )
 
+    profile_lock = await _acquire_profile_lock()
+    if profile_lock is None:
+        return result("error", PROFILE_IN_USE_MESSAGE)
+
     try:
-        context = await browser.launch_persistent_profile(profile_dir)
-    except Exception as exc:
+        context = await browser.launch_persistent_profile(
+            profile_dir, headless=False
+        )
+    except BaseException as exc:
+        profile_lock.release()
+        if not isinstance(exc, Exception):
+            raise
         failure = _browser_failure(exc)
         return result(failure.failure, str(failure))
 
@@ -250,6 +275,8 @@ async def run_login(
                 login_failure = GptProLoginError(
                     "error", "retry after the login browser failed to close cleanly"
                 )
+        finally:
+            profile_lock.release()
 
     if login_failure is not None:
         return result(login_failure.failure, str(login_failure))

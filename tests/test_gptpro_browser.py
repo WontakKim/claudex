@@ -262,3 +262,26 @@ def test_probe_context_removes_headless_user_agent_token(tmp_path: Path) -> None
             "user_agent": "Mozilla/5.0 Chrome/140.0",
         },
     ]
+
+
+def test_persistent_profile_supports_headless_runtime_mode(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    chromium = _FakeChromium()
+    playwright = _FakePlaywright(chromium)
+
+    async def start_playwright() -> _FakePlaywright:
+        return playwright
+
+    monkeypatch.setattr(browser, "_start_playwright", start_playwright)
+
+    async def scenario() -> None:
+        context = await browser.launch_persistent_profile(
+            tmp_path / "profile", headless=True
+        )
+        await browser.close_playwright_resource(context)
+
+    asyncio.run(scenario())
+
+    assert chromium.persistent_calls[0][1]["headless"] is True
+    assert playwright.stopped

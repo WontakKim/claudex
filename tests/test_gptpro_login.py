@@ -125,8 +125,11 @@ def _install_browser_fakes(
 ) -> _FakeProbeBrowser:
     probe_browser = probe_browser or _FakeProbeBrowser()
 
-    async def launch_persistent_profile(profile_dir: Path) -> _FakePersistentContext:
+    async def launch_persistent_profile(
+        profile_dir: Path, *, headless: bool = False
+    ) -> _FakePersistentContext:
         assert profile_dir.name == "chrome-profile"
+        assert headless is False
         return persistent_context
 
     async def launch_headless_probe_chromium() -> _FakeProbeBrowser:
@@ -214,7 +217,9 @@ def test_run_login_times_out_and_closes_the_persistent_context(
     monkeypatch.setenv("HOME", str(tmp_path))
     persistent_context = _FakePersistentContext(_FakePage(), [[]])
 
-    async def launch_persistent_profile(profile_dir: Path) -> _FakePersistentContext:
+    async def launch_persistent_profile(
+        profile_dir: Path, *, headless: bool = False
+    ) -> _FakePersistentContext:
         del profile_dir
         return persistent_context
 
@@ -245,7 +250,9 @@ def test_run_login_classifies_initial_navigation_failure(
         [[_auth_cookie()]],
     )
 
-    async def launch_persistent_profile(profile_dir: Path) -> _FakePersistentContext:
+    async def launch_persistent_profile(
+        profile_dir: Path, *, headless: bool = False
+    ) -> _FakePersistentContext:
         del profile_dir
         return persistent_context
 
@@ -311,7 +318,9 @@ def test_run_login_classifies_missing_playwright_browser(
 ) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
 
-    async def launch_persistent_profile(profile_dir: Path) -> _FakePersistentContext:
+    async def launch_persistent_profile(
+        profile_dir: Path, *, headless: bool = False
+    ) -> _FakePersistentContext:
         del profile_dir
         raise RuntimeError("Executable doesn't exist at /browser/chrome")
 
@@ -383,7 +392,9 @@ def test_run_login_classifies_missing_playwright_dependency(
         "gptpro login"
     )
 
-    async def launch_persistent_profile(profile_dir: Path) -> _FakePersistentContext:
+    async def launch_persistent_profile(
+        profile_dir: Path, *, headless: bool = False
+    ) -> _FakePersistentContext:
         del profile_dir
         raise browser.GptProDependencyError(message)
 
@@ -422,3 +433,28 @@ def test_run_login_hardens_intermediate_profile_directories(
         runtime_dir / "gptpro" / "chrome-profile",
     ):
         assert stat.S_IMODE(directory.stat().st_mode) == 0o700
+
+
+def test_run_login_fails_when_ask_runtime_holds_profile_lock(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    holder = login.locking.try_file_lock(login.paths.gptpro_profile_lock())
+    assert holder is not None
+    monkeypatch.setattr(login, "PROFILE_LOCK_WAIT_SECONDS", 0)
+
+    async def fail_launch(
+        profile_dir: Path, *, headless: bool = False
+    ) -> _FakePersistentContext:
+        del profile_dir, headless
+        raise AssertionError("login must not launch a contended profile")
+
+    monkeypatch.setattr(browser, "launch_persistent_profile", fail_launch)
+    try:
+        result = asyncio.run(login.run_login())
+    finally:
+        holder.release()
+
+    assert not result.success
+    assert result.failure == "error"
+    assert result.message == "another gptpro ask is using the browser profile"

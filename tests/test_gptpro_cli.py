@@ -12,7 +12,9 @@ import pytest
 
 from claudex import __main__ as gateway_main
 from claudex.cli import gptpro as gptpro_cli
+from claudex.gptpro import ask as gptpro_ask
 from claudex.gptpro import login as gptpro_login
+from claudex.gptpro import runtime as gptpro_runtime
 from claudex.gptpro import session as gptpro_session
 
 
@@ -249,3 +251,181 @@ raise SystemExit(_gptpro_main(["status"]))
     assert result.returncode == 0
     assert "run claudex-gateway gptpro login" in result.stdout
     assert result.stderr == ""
+
+
+class _FakeAskPage:
+    def __init__(self) -> None:
+        self.closed = False
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+class _FakeAskContext:
+    def __init__(self) -> None:
+        self.page = _FakeAskPage()
+        self.closed = False
+
+    async def new_page(self) -> _FakeAskPage:
+        return self.page
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+class _FakeAskLock:
+    def __init__(self) -> None:
+        self.released = False
+
+    def release(self) -> None:
+        self.released = True
+
+
+def _install_cli_ask_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[_FakeAskContext, _FakeAskLock]:
+    context = _FakeAskContext()
+    profile_lock = _FakeAskLock()
+
+    async def sleep(_interval: float) -> None:
+        return None
+
+    async def launch_persistent_profile(
+        profile_dir: Path, *, headless: bool = False
+    ) -> _FakeAskContext:
+        assert profile_dir.name == "chrome-profile"
+        assert headless is True
+        return context
+
+    async def close_playwright_resource(
+        resource: _FakeAskContext,
+    ) -> None:
+        assert resource is context
+        await resource.close()
+
+    monkeypatch.setattr(
+        gptpro_runtime.session,
+        "session_status",
+        lambda: {"valid": True, "message": "valid"},
+    )
+    monkeypatch.setattr(gptpro_runtime, "_sleep", sleep)
+    monkeypatch.setattr(
+        gptpro_runtime.locking,
+        "try_file_lock",
+        lambda _path: profile_lock,
+    )
+    monkeypatch.setattr(
+        gptpro_runtime.browser,
+        "launch_persistent_profile",
+        launch_persistent_profile,
+    )
+    monkeypatch.setattr(
+        gptpro_runtime.browser,
+        "close_playwright_resource",
+        close_playwright_resource,
+    )
+    return context, profile_lock
+
+
+def test_gptpro_ask_prints_status_to_stderr_and_answer_once_to_stdout(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    context, profile_lock = _install_cli_ask_runtime(monkeypatch)
+
+    async def execute_ask(
+        page: _FakeAskPage,
+        question: str,
+        *,
+        on_status: object,
+        deadline: float | None = None,
+    ) -> str:
+        del deadline
+        assert page is context.page
+        assert question == "explain the result"
+        assert callable(on_status)
+        on_status("waiting for ChatGPT")
+        return "# Final answer"
+
+    monkeypatch.setattr(gptpro_ask, "execute_ask", execute_ask)
+
+    assert gptpro_cli._gptpro_main(["ask", "explain the result"]) == 0
+    captured = capsys.readouterr()
+    assert captured.out == "# Final answer\n"
+    assert captured.err == "waiting for ChatGPT\n"
+    assert context.page.closed
+    assert context.closed
+    assert profile_lock.released
+
+
+def test_gptpro_ask_domain_failure_uses_stderr_and_exit_one(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _install_cli_ask_runtime(monkeypatch)
+
+    async def execute_ask(
+        page: _FakeAskPage,
+        question: str,
+        *,
+        on_status: object,
+        deadline: float | None = None,
+    ) -> str:
+        del page, question, on_status, deadline
+        raise gptpro_ask.GptProChallengeError(
+            "ChatGPT presented a challenge"
+        )
+
+    monkeypatch.setattr(gptpro_ask, "execute_ask", execute_ask)
+
+    assert gptpro_cli._gptpro_main(["ask", "question"]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "gptpro ask failed [challenge]" in captured.err
+    assert "complete the ChatGPT browser challenge" in captured.err
+
+
+def test_gptpro_ask_session_expired_prints_login_command(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(
+        gptpro_runtime.session,
+        "session_status",
+        lambda: {
+            "valid": False,
+            "message": "the saved gptpro session is expired",
+        },
+    )
+
+    assert gptpro_cli._gptpro_main(["ask", "question"]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "session_expired" in captured.err
+    assert "run claudex-gateway gptpro login" in captured.err
+
+
+def test_gptpro_ask_keyboard_interrupt_closes_runtime_and_returns_130(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    context, profile_lock = _install_cli_ask_runtime(monkeypatch)
+
+    async def execute_ask(
+        page: _FakeAskPage,
+        question: str,
+        *,
+        on_status: object,
+        deadline: float | None = None,
+    ) -> str:
+        del page, question, on_status, deadline
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(gptpro_ask, "execute_ask", execute_ask)
+
+    assert gptpro_cli._gptpro_main(["ask", "question"]) == 130
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert context.page.closed
+    assert context.closed
+    assert profile_lock.released

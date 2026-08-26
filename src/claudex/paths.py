@@ -41,6 +41,10 @@ def gptpro_session_file() -> Path:
     return gptpro_dir() / "session.json"
 
 
+def gptpro_profile_lock() -> Path:
+    return gptpro_dir() / "chrome-profile.lock"
+
+
 def accounts_dir(provider: str) -> Path:
     """Return the accounts directory for `provider`.
 

@@ -1,4 +1,4 @@
-"""Playwright browser launch policy for gptpro session setup."""
+"""Playwright browser launch policy for gptpro commands."""
 
 from __future__ import annotations
 
@@ -26,6 +26,7 @@ _PLAYWRIGHT_INSTALL_MESSAGE = (
     "playwright is not installed; run `uv sync --extra gptpro` to enable "
     "gptpro login"
 )
+PROFILE_IN_USE_MESSAGE = "another gptpro ask is using the browser profile"
 
 
 class GptProDependencyError(Exception):
@@ -44,7 +45,7 @@ def is_browser_missing_error(exc: BaseException) -> bool:
     )
 
 
-def _merge_headed_anti_automation_options(
+def _merge_anti_automation_options(
     args: Sequence[str], ignore_default_args: Sequence[str]
 ) -> dict[str, list[str]]:
     merged_args = list(args)
@@ -88,11 +89,12 @@ async def launch_persistent_profile(
     *,
     args: Sequence[str] = (),
     ignore_default_args: Sequence[str] = (),
+    headless: bool = False,
 ) -> BrowserContext:
-    """Launch a headed persistent profile, preferring system Chrome."""
+    """Launch a persistent profile, preferring system Chrome."""
     options: dict[str, object] = {
-        "headless": False,
-        **_merge_headed_anti_automation_options(args, ignore_default_args),
+        "headless": headless,
+        **_merge_anti_automation_options(args, ignore_default_args),
     }
     playwright = await _start_playwright()
     try:
