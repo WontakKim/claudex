@@ -15,6 +15,7 @@ claudex-gateway = "claudex.__main__:main"
 
 [project.optional-dependencies]
 gptpro = [
+    "mcp>=2.1.1",
     "playwright>=1.62.0",
 ]
 

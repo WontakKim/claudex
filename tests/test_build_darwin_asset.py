@@ -9,7 +9,7 @@ from pathlib import Path
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_playwright_is_only_in_the_gptpro_optional_extra() -> None:
+def test_gptpro_dependencies_are_only_in_the_optional_extra() -> None:
     configuration = tomllib.loads(
         (_REPOSITORY_ROOT / "pyproject.toml").read_text(encoding="utf-8")
     )
@@ -18,8 +18,10 @@ def test_playwright_is_only_in_the_gptpro_optional_extra() -> None:
     gptpro_dependencies = configuration["project"]["optional-dependencies"][
         "gptpro"
     ]
-    assert not any(dependency.startswith("playwright") for dependency in dependencies)
-    assert gptpro_dependencies == ["playwright>=1.62.0"]
+    assert not any(
+        dependency.startswith(("mcp", "playwright")) for dependency in dependencies
+    )
+    assert gptpro_dependencies == ["mcp>=2.1.1", "playwright>=1.62.0"]
 
 
 def test_darwin_asset_export_excludes_gptpro_native_dependencies() -> None:
@@ -44,7 +46,19 @@ def test_darwin_asset_export_excludes_gptpro_native_dependencies() -> None:
         if "==" in line
     }
 
-    assert exported_names.isdisjoint({"playwright", "greenlet", "pyee"})
+    assert exported_names.isdisjoint(
+        {
+            "cffi",
+            "cryptography",
+            "greenlet",
+            "mcp",
+            "mcp-types",
+            "playwright",
+            "pydantic-core",
+            "pyee",
+            "rpds-py",
+        }
+    )
 
 
 def test_darwin_asset_script_installs_without_optional_extras() -> None:

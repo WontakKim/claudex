@@ -92,6 +92,7 @@ from claudex.providers.grok_client import GrokClient, sanitize_grok_payload
 from claudex.providers.kimi_auth import KimiAuthError, KimiAuthManager
 from claudex.providers.kimi_client import KimiClient
 from claudex.locking import try_file_lock
+from claudex.mcp_server import LazyAskRuntime, McpEndpoint
 from claudex.providers.openai_compatible_client import OpenAICompatibleClient
 
 logger = logging.getLogger(__name__)
@@ -234,6 +235,8 @@ class _LogBufferHandler(logging.Handler):
 
 
 def create_app(config: GatewayConfig, daemon_nonce: str | None = None) -> Starlette:
+    gptpro_mcp_endpoint = McpEndpoint()
+
     @contextlib.asynccontextmanager
     async def lifespan(app: Starlette) -> AsyncIterator[None]:
         # Every daemon capable of serving the Claude account pool — disabled,
@@ -396,14 +399,24 @@ def create_app(config: GatewayConfig, daemon_nonce: str | None = None) -> Starle
             finally:
                 logging.getLogger().removeHandler(log_buffer)
         finally:
-            # Process shutdown while settings remain "balanced" preserves the
-            # persisted mode, epoch id/seed, pins, observations, cooldowns, and
-            # capability evidence. Unlike shutdown, an intentional `exit_mode`
-            # invalidates them. Finalization must complete before the process
-            # lease is released, so another process cannot open the runtime store
-            # while this one is still draining or closing it.
-            await app.state.claude_balanced_runtime.shutdown_preserving_epoch()
-            app.state.claude_pool_lease.release()
+            try:
+                await app.state.gptpro_mcp_endpoint.aclose()
+            finally:
+                try:
+                    runtime_close = getattr(
+                        app.state.gptpro_ask_runtime, "aclose", None
+                    )
+                    if runtime_close is not None:
+                        await runtime_close()
+                finally:
+                    # Process shutdown while settings remain "balanced" preserves the
+                    # persisted mode, epoch id/seed, pins, observations, cooldowns, and
+                    # capability evidence. Unlike shutdown, an intentional `exit_mode`
+                    # invalidates them. Finalization must complete before the process
+                    # lease is released, so another process cannot open the runtime store
+                    # while this one is still draining or closing it.
+                    await app.state.claude_balanced_runtime.shutdown_preserving_epoch()
+                    app.state.claude_pool_lease.release()
 
     app = Starlette(
         routes=[
@@ -419,6 +432,7 @@ def create_app(config: GatewayConfig, daemon_nonce: str | None = None) -> Starle
             ),
             Route("/api/hello", _handle_hello, methods=["GET"]),
             Route("/health", _handle_health, methods=["GET"]),
+            Route("/mcp", gptpro_mcp_endpoint),
             # Admin routes use settings/* for gateway-wide settings and
             # providers/{p}/* for each backend's own surface, with top-level
             # logs/usage/test as cross-cutting
@@ -542,6 +556,8 @@ def create_app(config: GatewayConfig, daemon_nonce: str | None = None) -> Starle
         lifespan=lifespan,
     )
     app.state.daemon_nonce = daemon_nonce
+    app.state.gptpro_ask_runtime = LazyAskRuntime()
+    app.state.gptpro_mcp_endpoint = gptpro_mcp_endpoint
     # Lifespan replaces this with one client per configured custom provider.
     app.state.custom_provider_clients = {}
     # Lazily-created ClaudeAccountAuthManager per registered account id.
