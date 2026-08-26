@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Callable
 from typing import Any
 
@@ -10,28 +11,60 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.types import Receive, Scope, Send
 
+from claudex.gptpro import jobs
+
 ASK_GPT_PRO_DESCRIPTION = (
-    "Send a self-contained question to ChatGPT Pro and return its settled "
-    "Markdown answer. Include all necessary code, logs, metadata, and context "
-    "inline in question. If the response begins with GPTPRO_CONTEXT_REQUEST_V1, "
-    "gather the requested material and call this tool again with it included. "
-    "Use this tool only when the user explicitly requests ChatGPT Pro or for a "
-    "consequential judgment where a second opinion materially helps; do not use "
-    "it routinely."
+    "Send a self-contained question to ChatGPT Pro as a background job and return "
+    "immediately with {ask_id, thread_ref}. Include all necessary code, logs, "
+    "metadata, and context inline in question. Poll "
+    "ask_gpt_pro_status(ask_id) until state is succeeded or failed, then fetch "
+    "ask_gpt_pro_result(ask_id) for the settled Markdown answer. If the answer "
+    "begins with GPTPRO_CONTEXT_REQUEST_V1, gather the requested material and "
+    "call this tool again with it included. Use this tool only when the user "
+    "explicitly requests ChatGPT Pro or for a consequential judgment where a "
+    "second opinion materially helps; do not use it routinely."
+)
+ASK_GPT_PRO_STATUS_DESCRIPTION = (
+    "Poll a background ChatGPT Pro ask and return its current state, latest "
+    "status message, and thread reference."
+)
+ASK_GPT_PRO_RESULT_DESCRIPTION = (
+    "Fetch the settled result of a background ChatGPT Pro ask after its status "
+    "is succeeded or failed."
+)
+_THREAD_DESCRIPTION = (
+    "Reserved for conversation continuation; not implemented yet — omit it and "
+    "include full context in question."
 )
 ASK_GPT_PRO_INPUT_SCHEMA: dict[str, Any] = {
     "type": "object",
-    "properties": {"question": {"type": "string"}},
+    "properties": {
+        "question": {"type": "string"},
+        "thread": {"type": "string", "description": _THREAD_DESCRIPTION},
+    },
     "required": ["question"],
+    "additionalProperties": False,
+}
+ASK_GPT_PRO_STATUS_INPUT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {"ask_id": {"type": "string"}},
+    "required": ["ask_id"],
+    "additionalProperties": False,
+}
+ASK_GPT_PRO_RESULT_INPUT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {"ask_id": {"type": "string"}},
+    "required": ["ask_id"],
     "additionalProperties": False,
 }
 
 
 class LazyAskRuntime:
-    """Create the optional ChatGPT Pro runtime on its first ask."""
+    """Create the optional ChatGPT Pro runtime on its first background ask."""
 
     def __init__(self) -> None:
         self._runtime: Any | None = None
+        self._job_service: jobs.AskJobService | None = None
         self._lock = asyncio.Lock()
 
     async def ask(
@@ -39,12 +72,37 @@ class LazyAskRuntime:
         question: str,
         *,
         on_status: Callable[[str], None] | None = None,
-    ) -> str:
+        on_conversation_id: Callable[[str], None] | None = None,
+    ) -> Any:
         runtime = await self._get_runtime()
-        return await runtime.ask(question, on_status=on_status)
+        return await runtime.ask(
+            question,
+            on_status=on_status,
+            on_conversation_id=on_conversation_id,
+        )
+
+    def start_ask(self, question: str) -> jobs.AskJob:
+        if self._job_service is None:
+            self._job_service = jobs.AskJobService(self.ask)
+        return self._job_service.start(question)
+
+    def job_status(self, ask_id: str) -> jobs.AskJob | None:
+        if self._job_service is None:
+            return None
+        return self._job_service.status(ask_id)
+
+    def job_result(self, ask_id: str) -> jobs.AskJob | None:
+        if self._job_service is None:
+            return None
+        return self._job_service.result(ask_id)
 
     async def aclose(self) -> None:
         async with self._lock:
+            job_service = self._job_service
+            self._job_service = None
+            if job_service is not None:
+                await job_service.aclose()
+
             runtime = self._runtime
             self._runtime = None
             if runtime is not None:
@@ -165,42 +223,86 @@ def _create_session_manager(app: Any) -> Any:
                     name="ask_gpt_pro",
                     description=ASK_GPT_PRO_DESCRIPTION,
                     inputSchema=ASK_GPT_PRO_INPUT_SCHEMA,
-                )
+                ),
+                types.Tool(
+                    name="ask_gpt_pro_status",
+                    description=ASK_GPT_PRO_STATUS_DESCRIPTION,
+                    inputSchema=ASK_GPT_PRO_STATUS_INPUT_SCHEMA,
+                ),
+                types.Tool(
+                    name="ask_gpt_pro_result",
+                    description=ASK_GPT_PRO_RESULT_DESCRIPTION,
+                    inputSchema=ASK_GPT_PRO_RESULT_INPUT_SCHEMA,
+                ),
             ]
         )
 
-    async def call_tool(context: Any, params: Any) -> Any:
-        if params.name != "ask_gpt_pro":
-            return _tool_error(types, f"Unknown tool: {params.name}")
+    async def call_tool(_context: Any, params: Any) -> Any:
         arguments = params.arguments
-        question = arguments.get("question") if isinstance(arguments, dict) else None
-        if not isinstance(question, str):
-            return _tool_error(types, "question must be a string")
+        if not isinstance(arguments, dict):
+            arguments = {}
+        runtime = app.state.gptpro_ask_runtime
 
-        progress_tasks: list[asyncio.Task[None]] = []
-        progress = 0
+        if params.name == "ask_gpt_pro":
+            question = arguments.get("question")
+            if not isinstance(question, str):
+                return _tool_error(types, "question must be a string")
+            if "thread" in arguments:
+                return _tool_error(
+                    types,
+                    "The thread parameter is not supported yet; omit it and "
+                    "include full context in question.",
+                )
 
-        def on_status(message: str) -> None:
-            nonlocal progress
-            progress += 1
-            task = asyncio.create_task(
-                context.session.report_progress(float(progress), message=message)
+            job = runtime.start_ask(question)
+            return _json_result(
+                types,
+                {"ask_id": job.ask_id, "thread_ref": job.thread_ref},
             )
-            progress_tasks.append(task)
 
-        try:
-            runtime = app.state.gptpro_ask_runtime
-            answer = await runtime.ask(question, on_status=on_status)
-        except Exception as exc:
-            result = _gptpro_error_result(types, exc)
-            if result is None:
-                raise
-            return result
-        finally:
-            if progress_tasks:
-                await asyncio.gather(*progress_tasks, return_exceptions=True)
+        if params.name == "ask_gpt_pro_status":
+            ask_id = arguments.get("ask_id")
+            if not isinstance(ask_id, str):
+                return _tool_error(types, "ask_id must be a string")
+            job = runtime.job_status(ask_id)
+            if job is None:
+                return _tool_error(types, f"Unknown or expired ask_id: {ask_id}")
+            return _json_result(
+                types,
+                {
+                    "ask_id": job.ask_id,
+                    "state": job.state,
+                    "status_message": job.status_message,
+                    "thread_ref": job.thread_ref,
+                },
+            )
 
-        return types.CallToolResult(content=[types.TextContent(text=answer)])
+        if params.name == "ask_gpt_pro_result":
+            ask_id = arguments.get("ask_id")
+            if not isinstance(ask_id, str):
+                return _tool_error(types, "ask_id must be a string")
+            job = runtime.job_result(ask_id)
+            if job is None:
+                return _tool_error(types, f"Unknown or expired ask_id: {ask_id}")
+            if job.state == "running":
+                return _tool_error(
+                    types,
+                    f"Ask {ask_id} is still running; poll ask_gpt_pro_status.",
+                )
+            if job.state == "failed":
+                return _gptpro_error_result(
+                    types, job.failure, job.error_message
+                )
+            return _json_result(
+                types,
+                {
+                    "ask_id": job.ask_id,
+                    "answer": job.answer,
+                    "thread_ref": job.thread_ref,
+                },
+            )
+
+        return _tool_error(types, f"Unknown tool: {params.name}")
 
     server = Server(
         "claudex-gateway-gptpro",
@@ -214,13 +316,9 @@ def _create_session_manager(app: Any) -> Any:
     )
 
 
-def _gptpro_error_result(types: Any, exc: Exception) -> Any | None:
-    from claudex.gptpro.ask import GptProAskError
-
-    if not isinstance(exc, GptProAskError):
-        return None
-
-    failure = exc.failure
+def _gptpro_error_result(
+    types: Any, failure: str | None, error_message: str | None
+) -> Any:
     if failure == "session_expired":
         message = (
             "ChatGPT Pro session expired; run claudex-gateway gptpro login, then retry."
@@ -237,8 +335,16 @@ def _gptpro_error_result(types: Any, exc: Exception) -> Any | None:
             "ChatGPT Pro request timed out; check ChatGPT and the network, then retry."
         )
     else:
-        message = f"ChatGPT Pro request failed [{failure}]: {exc}"
+        failure_name = failure if failure is not None else "error"
+        detail = error_message if error_message is not None else "unknown error"
+        message = f"ChatGPT Pro request failed [{failure_name}]: {detail}"
     return _tool_error(types, message)
+
+
+def _json_result(types: Any, payload: dict[str, Any]) -> Any:
+    return types.CallToolResult(
+        content=[types.TextContent(text=json.dumps(payload))]
+    )
 
 
 def _tool_error(types: Any, message: str) -> Any:
