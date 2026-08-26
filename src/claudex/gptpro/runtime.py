@@ -99,6 +99,8 @@ class AskRuntime:
         *,
         on_status: Callable[[str], None] | None = None,
         on_conversation_id: Callable[[str], None] | None = None,
+        conversation_id: str | None = None,
+        timeout_seconds: float | None = None,
     ) -> AskOutcome:
         """Execute one ask in a fresh tab of the shared persistent context."""
         status = session.session_status()
@@ -126,6 +128,8 @@ class AskRuntime:
                 question,
                 on_status,
                 on_conversation_id,
+                conversation_id,
+                timeout_seconds,
             )
 
     async def aclose(self) -> None:
@@ -169,17 +173,26 @@ class AskRuntime:
         question: str,
         on_status: Callable[[str], None] | None,
         on_conversation_id: Callable[[str], None] | None,
+        conversation_id: str | None,
+        timeout_seconds: float | None,
     ) -> AskOutcome:
         page: Any | None = None
         primary_failure: BaseException | None = None
         try:
             page = await context.new_page()
             await _harden_page_user_agent(page)
+            execution_options: dict[str, Any] = {
+                "on_status": on_status,
+                "on_conversation_id": on_conversation_id,
+            }
+            if conversation_id is not None:
+                execution_options["conversation_id"] = conversation_id
+            if timeout_seconds is not None:
+                execution_options["timeout_seconds"] = timeout_seconds
             return await ask.execute_ask_outcome(
                 page,
                 question,
-                on_status=on_status,
-                on_conversation_id=on_conversation_id,
+                **execution_options,
             )
         except BaseException as exc:
             primary_failure = exc

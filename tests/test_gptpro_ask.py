@@ -114,6 +114,7 @@ class _FakePage:
         self.session_fetch_count = 0
         self.fetch_arguments: list[dict[str, object]] = []
         self.load_state_calls = 0
+        self.goto_urls: list[str] = []
         self.goto_checked_listeners = False
         self.relock_id = "user-relocked"
 
@@ -128,7 +129,7 @@ class _FakePage:
             listener(value)
 
     async def goto(self, url: str, *, wait_until: str, timeout: int) -> None:
-        assert url == ask.CHATGPT_URL
+        self.goto_urls.append(url)
         assert wait_until == "domcontentloaded"
         assert 0 < timeout <= ask.NAVIGATION_TIMEOUT_MS
         if self.require_listeners_before_goto:
@@ -436,6 +437,91 @@ def test_execute_ask_outcome_returns_tracking_metadata_and_notifies_once(
     )
     assert outcome.conversation_id == _CONVERSATION_ID
     assert captured_conversation_ids == [_CONVERSATION_ID]
+
+
+@pytest.mark.parametrize(
+    ("conversation_id", "expected_url"),
+    [
+        (None, "https://chatgpt.com/"),
+        (
+            _CONVERSATION_ID,
+            f"https://chatgpt.com/c/{_CONVERSATION_ID}",
+        ),
+    ],
+)
+def test_navigation_targets_new_or_existing_conversation(
+    monkeypatch: pytest.MonkeyPatch,
+    conversation_id: str | None,
+    expected_url: str,
+) -> None:
+    _install_clock(monkeypatch)
+    page = _FakePage()
+
+    asyncio.run(
+        ask.execute_ask_outcome(
+            page,
+            "Review this code",
+            conversation_id=conversation_id,
+        )
+    )
+
+    assert page.goto_urls == [expected_url]
+
+
+def test_invalid_conversation_id_is_classified_as_error() -> None:
+    page = _FakePage()
+
+    with pytest.raises(ask.GptProAskError) as raised:
+        asyncio.run(
+            ask.execute_ask_outcome(
+                page,
+                "Review this code",
+                conversation_id=f"WEB:{_CONVERSATION_ID}",
+            )
+        )
+
+    assert raised.value.failure == "error"
+    assert "conversation_id" in str(raised.value)
+    assert page.goto_urls == []
+
+
+def test_provided_conversation_id_is_returned_without_notification(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_clock(monkeypatch)
+    page = _FakePage(signal="weak_then_other_trusted")
+    provided_conversation_id = _CONVERSATION_ID.upper()
+    captured_conversation_ids: list[str] = []
+
+    outcome = asyncio.run(
+        ask.execute_ask_outcome(
+            page,
+            "Review this code",
+            conversation_id=provided_conversation_id,
+            on_conversation_id=captured_conversation_ids.append,
+        )
+    )
+
+    assert outcome.conversation_id == provided_conversation_id
+    assert captured_conversation_ids == []
+
+
+def test_custom_timeout_uses_existing_timeout_classification(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_clock(monkeypatch)
+    page = _FakePage(signal="none")
+
+    with pytest.raises(ask.GptProAskError) as raised:
+        asyncio.run(
+            ask.execute_ask_outcome(
+                page,
+                "Review this code",
+                timeout_seconds=0.01,
+            )
+        )
+
+    assert raised.value.failure == "timeout"
 
 
 @pytest.mark.parametrize("signal", ["strong", "weak"])

@@ -59,6 +59,21 @@ def is_trusted_origin_url(url: str) -> bool:
     return parsed is not None and _has_trusted_origin(parsed)
 
 
+def is_conversation_id(value: object) -> bool:
+    """Return whether a value is a canonical ChatGPT conversation UUID."""
+    return (
+        isinstance(value, str)
+        and _UUID_EXACT_PATTERN.fullmatch(value) is not None
+    )
+
+
+def build_conversation_url(conversation_id: str) -> str:
+    """Build the canonical ChatGPT URL for an existing conversation."""
+    if not is_conversation_id(conversation_id):
+        raise ValueError("conversation_id must be a canonical UUID")
+    return f"{TRUSTED_ORIGIN}/c/{conversation_id.lower()}"
+
+
 def is_conversation_stream_url(url: str) -> bool:
     """Return whether a URL is an exact ChatGPT conversation stream endpoint."""
     parsed = _parse_url(url)

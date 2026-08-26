@@ -18,11 +18,13 @@ from claudex.gptpro.browser import COMPOSER_TIMEOUT_MS, NAVIGATION_TIMEOUT_MS
 from claudex.gptpro.conversation import (
     CHATGPT_URL,
     TRUSTED_ORIGIN,
+    build_conversation_url,
     build_nonce_marker,
     extract_assistant_turn,
     extract_conversation_id_from_body,
     extract_conversation_id_from_url,
     is_completion_report_url,
+    is_conversation_id,
     is_conversation_stream_url,
     is_trusted_origin_url,
 )
@@ -199,14 +201,25 @@ class _AskExecution:
         question: str,
         on_status: Callable[[str], None] | None,
         on_conversation_id: Callable[[str], None] | None,
+        *,
+        conversation_id: str | None = None,
+        timeout_seconds: float | None = None,
     ) -> None:
+        if conversation_id is not None and not is_conversation_id(conversation_id):
+            raise GptProAskError(
+                "error",
+                "conversation_id must be a canonical ChatGPT conversation UUID",
+            )
         self.page = page
         self.on_status = on_status
         self.on_conversation_id = on_conversation_id
-        self.deadline = _monotonic() + OVERALL_TIMEOUT_SECONDS
+        timeout_budget = (
+            OVERALL_TIMEOUT_SECONDS if timeout_seconds is None else timeout_seconds
+        )
+        self.deadline = _monotonic() + timeout_budget
         self.marker = build_nonce_marker(str(uuid4()))
         self.prompt = f"{self.marker}\n\n{question}\n\n{self.marker}"
-        self.network = _NetworkState()
+        self.network = _NetworkState(conversation_id=conversation_id)
         self.listener_tasks: set[asyncio.Task[None]] = set()
         self.request_listener: Callable[[Any], None] | None = None
         self.response_listener: Callable[[Any], None] | None = None
@@ -465,10 +478,15 @@ class _AskExecution:
             raise GptProSessionExpiredError()
 
     async def _navigate(self) -> None:
+        target_url = (
+            CHATGPT_URL
+            if self.network.conversation_id is None
+            else build_conversation_url(self.network.conversation_id)
+        )
         try:
             await self._await_page_operation(
                 self.page.goto(
-                    CHATGPT_URL,
+                    target_url,
                     wait_until="domcontentloaded",
                     timeout=self._timeout_ms(NAVIGATION_TIMEOUT_MS / 1_000),
                 )
@@ -1152,6 +1170,8 @@ async def execute_ask_outcome(
     *,
     on_status: Callable[[str], None] | None = None,
     on_conversation_id: Callable[[str], None] | None = None,
+    conversation_id: str | None = None,
+    timeout_seconds: float | None = None,
 ) -> AskOutcome:
     """Submit one prompt and return its answer with tracking metadata.
 
@@ -1163,6 +1183,8 @@ async def execute_ask_outcome(
         question,
         on_status,
         on_conversation_id,
+        conversation_id=conversation_id,
+        timeout_seconds=timeout_seconds,
     ).run()
 
 

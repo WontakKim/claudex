@@ -13,6 +13,29 @@ NONCE_MARKER = conversation.build_nonce_marker(NONCE)
 CONVERSATION_ID = "0fdbc1f1-8f05-4cba-865b-b677490fba9c"
 
 
+def test_is_conversation_id_accepts_mixed_case_canonical_uuid() -> None:
+    assert conversation.is_conversation_id(CONVERSATION_ID.upper())
+
+
+@pytest.mark.parametrize(
+    "value",
+    [f"WEB:{CONVERSATION_ID}", "", None, 123],
+)
+def test_is_conversation_id_rejects_noncanonical_values(value: object) -> None:
+    assert not conversation.is_conversation_id(value)
+
+
+def test_build_conversation_url_normalizes_conversation_id() -> None:
+    assert conversation.build_conversation_url(CONVERSATION_ID.upper()) == (
+        f"https://chatgpt.com/c/{CONVERSATION_ID}"
+    )
+
+
+def test_build_conversation_url_rejects_invalid_id() -> None:
+    with pytest.raises(ValueError, match="conversation_id"):
+        conversation.build_conversation_url(f"WEB:{CONVERSATION_ID}")
+
+
 def _node(
     node_id: str,
     parent: str | None,
