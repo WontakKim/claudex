@@ -49,7 +49,7 @@ def _print_ask_status(message: str) -> None:
     print(message, file=sys.stderr)
 
 
-async def _execute_runtime_ask(question: str) -> str:
+async def _execute_runtime_ask(question: str) -> gptpro_runtime.AskOutcome:
     ask_runtime = gptpro_runtime.AskRuntime()
     primary_failure: BaseException | None = None
     try:
@@ -88,12 +88,12 @@ def _print_ask_failure(error: gptpro_runtime.GptProAskError) -> None:
 
 def _gptpro_ask(question: str) -> int:
     try:
-        answer = asyncio.run(_execute_runtime_ask(question))
+        outcome = asyncio.run(_execute_runtime_ask(question))
     except gptpro_runtime.GptProAskError as exc:
         _print_ask_failure(exc)
         return 1
 
-    print(answer)
+    print(outcome.text)
     return 0
 
 

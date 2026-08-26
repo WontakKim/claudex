@@ -101,28 +101,40 @@ class _RuntimeFakes:
         await context.close()
 
 
+def _outcome(text: str) -> ask.AskOutcome:
+    return ask.AskOutcome(text=text, marker="marker", conversation_id=None)
+
+
 def test_runtime_initializes_lazily_and_reuses_the_context(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     context = _FakeContext()
     fakes = _RuntimeFakes(monkeypatch, [context])
+    conversation_id_callbacks: list[Callable[[str], None] | None] = []
 
-    async def execute_ask(
+    async def execute_ask_outcome(
         page: _FakePage,
         question: str,
         *,
         on_status: Callable[[str], None] | None = None,
-    ) -> str:
+        on_conversation_id: Callable[[str], None] | None = None,
+    ) -> ask.AskOutcome:
         del page, on_status
-        return f"answer: {question}"
+        conversation_id_callbacks.append(on_conversation_id)
+        return _outcome(f"answer: {question}")
 
-    monkeypatch.setattr(runtime.ask, "execute_ask", execute_ask)
+    monkeypatch.setattr(runtime.ask, "execute_ask_outcome", execute_ask_outcome)
 
     async def scenario() -> None:
         ask_runtime = runtime.AskRuntime()
+        captured_conversation_ids: list[str] = []
+        callback = captured_conversation_ids.append
         assert fakes.launch_calls == []
-        assert await ask_runtime.ask("first") == "answer: first"
-        assert await ask_runtime.ask("second") == "answer: second"
+        first = await ask_runtime.ask("first", on_conversation_id=callback)
+        second = await ask_runtime.ask("second")
+        assert first.text == "answer: first"
+        assert second.text == "answer: second"
+        assert conversation_id_callbacks == [callback, None]
         assert len(fakes.launch_calls) == 1
         assert fakes.launch_calls[0][1] is True
         assert len(context.pages) == 2
@@ -143,14 +155,15 @@ def test_runtime_limits_concurrent_asks_to_two(
     two_started = asyncio.Event()
     release = asyncio.Event()
 
-    async def execute_ask(
+    async def execute_ask_outcome(
         page: _FakePage,
         question: str,
         *,
         on_status: Callable[[str], None] | None = None,
-    ) -> str:
+        on_conversation_id: Callable[[str], None] | None = None,
+    ) -> ask.AskOutcome:
         nonlocal active, maximum_active
-        del page, on_status
+        del page, on_status, on_conversation_id
         active += 1
         maximum_active = max(maximum_active, active)
         started.append(question)
@@ -160,9 +173,9 @@ def test_runtime_limits_concurrent_asks_to_two(
             await release.wait()
         finally:
             active -= 1
-        return question
+        return _outcome(question)
 
-    monkeypatch.setattr(runtime.ask, "execute_ask", execute_ask)
+    monkeypatch.setattr(runtime.ask, "execute_ask_outcome", execute_ask_outcome)
     monkeypatch.setenv("GPTPRO_MAX_CONCURRENT_ASKS", "2")
 
     async def scenario() -> None:
@@ -176,7 +189,8 @@ def test_runtime_limits_concurrent_asks_to_two(
         assert len(started) == 2
         assert maximum_active == 2
         release.set()
-        assert await asyncio.gather(*tasks) == ["one", "two", "three"]
+        outcomes = await asyncio.gather(*tasks)
+        assert [outcome.text for outcome in outcomes] == ["one", "two", "three"]
         assert maximum_active == 2
         await ask_runtime.aclose()
 
@@ -193,21 +207,22 @@ def test_runtime_applies_submission_jitter_after_admission(
         assert (low, high) == (1.0, 2.0)
         return 1.75
 
-    async def execute_ask(
+    async def execute_ask_outcome(
         page: _FakePage,
         question: str,
         *,
         on_status: Callable[[str], None] | None = None,
-    ) -> str:
-        del page, on_status
-        return question
+        on_conversation_id: Callable[[str], None] | None = None,
+    ) -> ask.AskOutcome:
+        del page, on_status, on_conversation_id
+        return _outcome(question)
 
     monkeypatch.setattr(runtime.random, "uniform", uniform)
-    monkeypatch.setattr(runtime.ask, "execute_ask", execute_ask)
+    monkeypatch.setattr(runtime.ask, "execute_ask_outcome", execute_ask_outcome)
 
     async def scenario() -> None:
         ask_runtime = runtime.AskRuntime()
-        assert await ask_runtime.ask("question") == "question"
+        assert (await ask_runtime.ask("question")).text == "question"
         assert fakes.sleep_calls == [1.75]
         await ask_runtime.aclose()
 
@@ -251,16 +266,17 @@ def test_runtime_closes_page_when_execute_ask_fails(
     _RuntimeFakes(monkeypatch, [context])
     failure = ask.GptProAskError("timeout", "deadline expired")
 
-    async def execute_ask(
+    async def execute_ask_outcome(
         page: _FakePage,
         question: str,
         *,
         on_status: Callable[[str], None] | None = None,
-    ) -> str:
-        del page, question, on_status
+        on_conversation_id: Callable[[str], None] | None = None,
+    ) -> ask.AskOutcome:
+        del page, question, on_status, on_conversation_id
         raise failure
 
-    monkeypatch.setattr(runtime.ask, "execute_ask", execute_ask)
+    monkeypatch.setattr(runtime.ask, "execute_ask_outcome", execute_ask_outcome)
 
     async def scenario() -> None:
         ask_runtime = runtime.AskRuntime()
@@ -281,14 +297,15 @@ def test_closed_context_is_discarded_and_reinitialized(
     fakes = _RuntimeFakes(monkeypatch, [first_context, second_context])
     calls = 0
 
-    async def execute_ask(
+    async def execute_ask_outcome(
         page: _FakePage,
         question: str,
         *,
         on_status: Callable[[str], None] | None = None,
-    ) -> str:
+        on_conversation_id: Callable[[str], None] | None = None,
+    ) -> ask.AskOutcome:
         nonlocal calls
-        del page, on_status
+        del page, on_status, on_conversation_id
         calls += 1
         if calls == 1:
             closed_error = RuntimeError(
@@ -297,9 +314,9 @@ def test_closed_context_is_discarded_and_reinitialized(
             raise ask.GptProAskError(
                 "error", "the ChatGPT ask failed unexpectedly"
             ) from closed_error
-        return f"answer: {question}"
+        return _outcome(f"answer: {question}")
 
-    monkeypatch.setattr(runtime.ask, "execute_ask", execute_ask)
+    monkeypatch.setattr(runtime.ask, "execute_ask_outcome", execute_ask_outcome)
 
     async def scenario() -> None:
         ask_runtime = runtime.AskRuntime()
@@ -308,7 +325,7 @@ def test_closed_context_is_discarded_and_reinitialized(
         assert first_context.close_calls == 1
         assert fakes.locks[0].release_calls == 1
 
-        assert await ask_runtime.ask("second") == "answer: second"
+        assert (await ask_runtime.ask("second")).text == "answer: second"
         assert len(fakes.launch_calls) == 2
         await ask_runtime.aclose()
 
@@ -321,16 +338,17 @@ def test_aclose_cleans_up_playwright_once(
     context = _FakeContext()
     fakes = _RuntimeFakes(monkeypatch, [context])
 
-    async def execute_ask(
+    async def execute_ask_outcome(
         page: _FakePage,
         question: str,
         *,
         on_status: Callable[[str], None] | None = None,
-    ) -> str:
-        del page, on_status
-        return question
+        on_conversation_id: Callable[[str], None] | None = None,
+    ) -> ask.AskOutcome:
+        del page, on_status, on_conversation_id
+        return _outcome(question)
 
-    monkeypatch.setattr(runtime.ask, "execute_ask", execute_ask)
+    monkeypatch.setattr(runtime.ask, "execute_ask_outcome", execute_ask_outcome)
 
     async def scenario() -> None:
         ask_runtime = runtime.AskRuntime()
@@ -350,16 +368,17 @@ def test_runtime_holds_profile_lock_until_close(
     context = _FakeContext()
     fakes = _RuntimeFakes(monkeypatch, [context])
 
-    async def execute_ask(
+    async def execute_ask_outcome(
         page: _FakePage,
         question: str,
         *,
         on_status: Callable[[str], None] | None = None,
-    ) -> str:
-        del page, on_status
-        return question
+        on_conversation_id: Callable[[str], None] | None = None,
+    ) -> ask.AskOutcome:
+        del page, on_status, on_conversation_id
+        return _outcome(question)
 
-    monkeypatch.setattr(runtime.ask, "execute_ask", execute_ask)
+    monkeypatch.setattr(runtime.ask, "execute_ask_outcome", execute_ask_outcome)
 
     async def scenario() -> None:
         ask_runtime = runtime.AskRuntime()
@@ -387,16 +406,17 @@ class _HeadlessUserAgentContext(_FakeContext):
 def _install_ask_stub(monkeypatch: pytest.MonkeyPatch, context: _FakeContext) -> None:
     _RuntimeFakes(monkeypatch, [context])
 
-    async def execute_ask(
+    async def execute_ask_outcome(
         page: _FakePage,
         question: str,
         *,
         on_status: Callable[[str], None] | None = None,
-    ) -> str:
-        del page, on_status
-        return f"answer: {question}"
+        on_conversation_id: Callable[[str], None] | None = None,
+    ) -> ask.AskOutcome:
+        del page, on_status, on_conversation_id
+        return _outcome(f"answer: {question}")
 
-    monkeypatch.setattr(runtime.ask, "execute_ask", execute_ask)
+    monkeypatch.setattr(runtime.ask, "execute_ask_outcome", execute_ask_outcome)
 
 
 def test_ask_hardens_headless_user_agent_header(
@@ -409,7 +429,7 @@ def test_ask_hardens_headless_user_agent_header(
 
     async def scenario() -> None:
         ask_runtime = runtime.AskRuntime()
-        assert await ask_runtime.ask("question") == "answer: question"
+        assert (await ask_runtime.ask("question")).text == "answer: question"
         await ask_runtime.aclose()
 
     asyncio.run(scenario())
@@ -427,7 +447,7 @@ def test_ask_leaves_plain_user_agent_header_alone(
 
     async def scenario() -> None:
         ask_runtime = runtime.AskRuntime()
-        assert await ask_runtime.ask("question") == "answer: question"
+        assert (await ask_runtime.ask("question")).text == "answer: question"
         await ask_runtime.aclose()
 
     asyncio.run(scenario())

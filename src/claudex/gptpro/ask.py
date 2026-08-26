@@ -93,6 +93,13 @@ FailureClassification = Literal[
 ]
 
 
+@dataclass(frozen=True)
+class AskOutcome:
+    text: str
+    marker: str
+    conversation_id: str | None
+
+
 class GptProAskError(Exception):
     """Base error for classified gptpro ask failures."""
 
@@ -191,9 +198,11 @@ class _AskExecution:
         page: Any,
         question: str,
         on_status: Callable[[str], None] | None,
+        on_conversation_id: Callable[[str], None] | None,
     ) -> None:
         self.page = page
         self.on_status = on_status
+        self.on_conversation_id = on_conversation_id
         self.deadline = _monotonic() + OVERALL_TIMEOUT_SECONDS
         self.marker = build_nonce_marker(str(uuid4()))
         self.prompt = f"{self.marker}\n\n{question}\n\n{self.marker}"
@@ -216,6 +225,14 @@ class _AskExecution:
             return
         try:
             self.on_status(message)
+        except Exception:
+            return
+
+    def _notify_conversation_id(self, conversation_id: str) -> None:
+        if self.on_conversation_id is None:
+            return
+        try:
+            self.on_conversation_id(conversation_id)
         except Exception:
             return
 
@@ -311,6 +328,7 @@ class _AskExecution:
                 and conversation_id is not None
             ):
                 self.network.conversation_id = conversation_id
+                self._notify_conversation_id(conversation_id)
             if not self.has_submitted:
                 return
             if is_completion_report_url(url):
@@ -1085,7 +1103,7 @@ class _AskExecution:
 
             await self._pause(POLL_INTERVAL_SECONDS)
 
-    async def run(self) -> str:
+    async def run(self) -> AskOutcome:
         try:
             self._install_listeners()
             self._ensure_deadline()
@@ -1096,7 +1114,12 @@ class _AskExecution:
             await self._click_send()
             locked_user_id = await self._lock_user_echo(pre_submit_ids)
             self.has_locked_user_echo = True
-            return await self._monitor_completion(locked_user_id)
+            text = await self._monitor_completion(locked_user_id)
+            return AskOutcome(
+                text=text,
+                marker=self.marker,
+                conversation_id=self.network.conversation_id,
+            )
         except _DeadlineExpired as exc:
             if self.network.saw_rate_limit and not self.has_locked_user_echo:
                 raise GptProAskError(
@@ -1123,15 +1146,32 @@ class _AskExecution:
             await self._remove_listeners()
 
 
+async def execute_ask_outcome(
+    page: Any,
+    question: str,
+    *,
+    on_status: Callable[[str], None] | None = None,
+    on_conversation_id: Callable[[str], None] | None = None,
+) -> AskOutcome:
+    """Submit one prompt and return its answer with tracking metadata.
+
+    The caller owns ``page`` and remains responsible for closing it. Network
+    listeners installed by this function are always removed before it returns.
+    """
+    return await _AskExecution(
+        page,
+        question,
+        on_status,
+        on_conversation_id,
+    ).run()
+
+
 async def execute_ask(
     page: Any,
     question: str,
     *,
     on_status: Callable[[str], None] | None = None,
 ) -> str:
-    """Submit one prompt and return its server raw markdown.
-
-    The caller owns ``page`` and remains responsible for closing it. Network
-    listeners installed by this function are always removed before it returns.
-    """
-    return await _AskExecution(page, question, on_status).run()
+    """Submit one prompt and return its server raw markdown."""
+    outcome = await execute_ask_outcome(page, question, on_status=on_status)
+    return outcome.text

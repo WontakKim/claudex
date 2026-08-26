@@ -321,19 +321,25 @@ def test_gptpro_ask_prints_status_to_stderr_and_answer_once_to_stdout(
 ) -> None:
     context, profile_lock = _install_cli_ask_runtime(monkeypatch)
 
-    async def execute_ask(
+    async def execute_ask_outcome(
         page: _FakeAskPage,
         question: str,
         *,
         on_status: object,
-    ) -> str:
+        on_conversation_id: object,
+    ) -> gptpro_ask.AskOutcome:
         assert page is context.page
         assert question == "explain the result"
         assert callable(on_status)
         on_status("waiting for ChatGPT")
-        return "# Final answer"
+        assert on_conversation_id is None
+        return gptpro_ask.AskOutcome(
+            text="# Final answer",
+            marker="marker",
+            conversation_id=None,
+        )
 
-    monkeypatch.setattr(gptpro_ask, "execute_ask", execute_ask)
+    monkeypatch.setattr(gptpro_ask, "execute_ask_outcome", execute_ask_outcome)
 
     assert gptpro_cli._gptpro_main(["ask", "explain the result"]) == 0
     captured = capsys.readouterr()
@@ -350,18 +356,19 @@ def test_gptpro_ask_domain_failure_uses_stderr_and_exit_one(
 ) -> None:
     _install_cli_ask_runtime(monkeypatch)
 
-    async def execute_ask(
+    async def execute_ask_outcome(
         page: _FakeAskPage,
         question: str,
         *,
         on_status: object,
-    ) -> str:
-        del page, question, on_status
+        on_conversation_id: object,
+    ) -> gptpro_ask.AskOutcome:
+        del page, question, on_status, on_conversation_id
         raise gptpro_ask.GptProChallengeError(
             "ChatGPT presented a challenge"
         )
 
-    monkeypatch.setattr(gptpro_ask, "execute_ask", execute_ask)
+    monkeypatch.setattr(gptpro_ask, "execute_ask_outcome", execute_ask_outcome)
 
     assert gptpro_cli._gptpro_main(["ask", "question"]) == 1
     captured = capsys.readouterr()
@@ -396,16 +403,17 @@ def test_gptpro_ask_keyboard_interrupt_closes_runtime_and_returns_130(
 ) -> None:
     context, profile_lock = _install_cli_ask_runtime(monkeypatch)
 
-    async def execute_ask(
+    async def execute_ask_outcome(
         page: _FakeAskPage,
         question: str,
         *,
         on_status: object,
-    ) -> str:
-        del page, question, on_status
+        on_conversation_id: object,
+    ) -> gptpro_ask.AskOutcome:
+        del page, question, on_status, on_conversation_id
         raise KeyboardInterrupt
 
-    monkeypatch.setattr(gptpro_ask, "execute_ask", execute_ask)
+    monkeypatch.setattr(gptpro_ask, "execute_ask_outcome", execute_ask_outcome)
 
     assert gptpro_cli._gptpro_main(["ask", "question"]) == 130
     captured = capsys.readouterr()

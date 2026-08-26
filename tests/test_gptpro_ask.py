@@ -404,6 +404,40 @@ def test_happy_path_returns_finished_server_raw_markdown_and_removes_listeners(
     assert "echo" not in page.filled_prompt.lower()
 
 
+def test_execute_ask_outcome_returns_tracking_metadata_and_notifies_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_clock(monkeypatch)
+    monkeypatch.setattr(ask, "uuid4", lambda: "fixed-nonce")
+    page = _FakePage(
+        signal="weak_then_other_trusted",
+        raw_text="server **raw** markdown",
+    )
+    captured_conversation_ids: list[str] = []
+
+    def on_conversation_id(conversation_id: str) -> None:
+        captured_conversation_ids.append(conversation_id)
+        raise RuntimeError("observer failure")
+
+    outcome = asyncio.run(
+        ask.execute_ask_outcome(
+            page,
+            "Review this code",
+            on_conversation_id=on_conversation_id,
+        )
+    )
+    legacy_text = _run(_FakePage(raw_text="server **raw** markdown"))
+    expected_marker = ask.build_nonce_marker("fixed-nonce")
+
+    assert outcome.text == legacy_text
+    assert outcome.marker == expected_marker
+    assert page.filled_prompt == (
+        f"{expected_marker}\n\nReview this code\n\n{expected_marker}"
+    )
+    assert outcome.conversation_id == _CONVERSATION_ID
+    assert captured_conversation_ids == [_CONVERSATION_ID]
+
+
 @pytest.mark.parametrize("signal", ["strong", "weak"])
 def test_network_completion_signals_return_raw_turn(
     monkeypatch: pytest.MonkeyPatch, signal: str

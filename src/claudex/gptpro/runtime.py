@@ -15,6 +15,7 @@ DEFAULT_MAX_CONCURRENT_ASKS = 2
 MIN_SUBMISSION_JITTER_SECONDS = 1.0
 MAX_SUBMISSION_JITTER_SECONDS = 2.0
 
+AskOutcome = ask.AskOutcome
 GptProAskError = ask.GptProAskError
 GptProSessionExpiredError = ask.GptProSessionExpiredError
 
@@ -97,7 +98,8 @@ class AskRuntime:
         question: str,
         *,
         on_status: Callable[[str], None] | None = None,
-    ) -> str:
+        on_conversation_id: Callable[[str], None] | None = None,
+    ) -> AskOutcome:
         """Execute one ask in a fresh tab of the shared persistent context."""
         status = session.session_status()
         if not status.get("valid"):
@@ -119,7 +121,12 @@ class AskRuntime:
             # A concurrent page may have observed a browser crash while this
             # ask waited for admission, so re-read the shared context here.
             context = await self._get_context()
-            return await self._execute_in_page(context, question, on_status)
+            return await self._execute_in_page(
+                context,
+                question,
+                on_status,
+                on_conversation_id,
+            )
 
     async def aclose(self) -> None:
         """Close the persistent context, stop Playwright, and release its lock."""
@@ -161,13 +168,19 @@ class AskRuntime:
         context: Any,
         question: str,
         on_status: Callable[[str], None] | None,
-    ) -> str:
+        on_conversation_id: Callable[[str], None] | None,
+    ) -> AskOutcome:
         page: Any | None = None
         primary_failure: BaseException | None = None
         try:
             page = await context.new_page()
             await _harden_page_user_agent(page)
-            return await ask.execute_ask(page, question, on_status=on_status)
+            return await ask.execute_ask_outcome(
+                page,
+                question,
+                on_status=on_status,
+                on_conversation_id=on_conversation_id,
+            )
         except BaseException as exc:
             primary_failure = exc
             if _is_context_closed_error(exc):
