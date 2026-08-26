@@ -93,15 +93,6 @@ FailureClassification = Literal[
 ]
 
 
-@dataclass(frozen=True)
-class AskResult:
-    """Classified outcome returned by higher-level ask adapters."""
-
-    text: str | None
-    failure: FailureClassification | None
-    message: str
-
-
 class GptProAskError(Exception):
     """Base error for classified gptpro ask failures."""
 
@@ -122,9 +113,8 @@ class GptProSessionExpiredError(GptProAskError):
 class GptProChallengeError(GptProAskError):
     """Cloudflare challenged or blocked the browser page."""
 
-    def __init__(self, message: str, *, is_blocked: bool = False) -> None:
+    def __init__(self, message: str) -> None:
         super().__init__("challenge", message)
-        self.is_blocked = is_blocked
 
 
 class _DeadlineExpired(Exception):
@@ -201,15 +191,10 @@ class _AskExecution:
         page: Any,
         question: str,
         on_status: Callable[[str], None] | None,
-        deadline: float | None,
     ) -> None:
         self.page = page
         self.on_status = on_status
-        self.deadline = (
-            deadline
-            if deadline is not None
-            else _monotonic() + OVERALL_TIMEOUT_SECONDS
-        )
+        self.deadline = _monotonic() + OVERALL_TIMEOUT_SECONDS
         self.marker = build_nonce_marker(str(uuid4()))
         self.prompt = f"{self.marker}\n\n{question}\n\n{self.marker}"
         self.network = _NetworkState()
@@ -432,11 +417,11 @@ class _AskExecution:
             if action.action == "session_expired":
                 raise GptProSessionExpiredError(action.reason)
             if action.action in ("challenge", "blocked"):
-                is_blocked = action.action == "blocked"
-                disposition = "blocked" if is_blocked else "challenged"
+                disposition = (
+                    "blocked" if action.action == "blocked" else "challenged"
+                )
                 raise GptProChallengeError(
-                    f"Cloudflare {disposition} the ChatGPT request: {action.reason}",
-                    is_blocked=is_blocked,
+                    f"Cloudflare {disposition} the ChatGPT request: {action.reason}"
                 )
             if action.action == "rate_limit":
                 delay_seconds = rate_limit_delay_ms(action.retry_after_ms) / 1_000
@@ -1143,11 +1128,10 @@ async def execute_ask(
     question: str,
     *,
     on_status: Callable[[str], None] | None = None,
-    deadline: float | None = None,
 ) -> str:
     """Submit one prompt and return its server raw markdown.
 
     The caller owns ``page`` and remains responsible for closing it. Network
     listeners installed by this function are always removed before it returns.
     """
-    return await _AskExecution(page, question, on_status, deadline).run()
+    return await _AskExecution(page, question, on_status).run()

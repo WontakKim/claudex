@@ -338,9 +338,7 @@ def test_gptpro_ask_prints_status_to_stderr_and_answer_once_to_stdout(
         question: str,
         *,
         on_status: object,
-        deadline: float | None = None,
     ) -> str:
-        del deadline
         assert page is context.page
         assert question == "explain the result"
         assert callable(on_status)
@@ -369,9 +367,8 @@ def test_gptpro_ask_domain_failure_uses_stderr_and_exit_one(
         question: str,
         *,
         on_status: object,
-        deadline: float | None = None,
     ) -> str:
-        del page, question, on_status, deadline
+        del page, question, on_status
         raise gptpro_ask.GptProChallengeError(
             "ChatGPT presented a challenge"
         )
@@ -416,9 +413,8 @@ def test_gptpro_ask_keyboard_interrupt_closes_runtime_and_returns_130(
         question: str,
         *,
         on_status: object,
-        deadline: float | None = None,
     ) -> str:
-        del page, question, on_status, deadline
+        del page, question, on_status
         raise KeyboardInterrupt
 
     monkeypatch.setattr(gptpro_ask, "execute_ask", execute_ask)

@@ -115,9 +115,8 @@ def test_runtime_initializes_lazily_and_reuses_the_context(
         question: str,
         *,
         on_status: Callable[[str], None] | None = None,
-        deadline: float | None = None,
     ) -> str:
-        del page, on_status, deadline
+        del page, on_status
         return f"answer: {question}"
 
     monkeypatch.setattr(runtime.ask, "execute_ask", execute_ask)
@@ -152,10 +151,9 @@ def test_runtime_limits_concurrent_asks_to_two(
         question: str,
         *,
         on_status: Callable[[str], None] | None = None,
-        deadline: float | None = None,
     ) -> str:
         nonlocal active, maximum_active
-        del page, on_status, deadline
+        del page, on_status
         active += 1
         maximum_active = max(maximum_active, active)
         started.append(question)
@@ -203,9 +201,8 @@ def test_runtime_applies_submission_jitter_after_admission(
         question: str,
         *,
         on_status: Callable[[str], None] | None = None,
-        deadline: float | None = None,
     ) -> str:
-        del page, on_status, deadline
+        del page, on_status
         return question
 
     monkeypatch.setattr(runtime.random, "uniform", uniform)
@@ -262,9 +259,8 @@ def test_runtime_closes_page_when_execute_ask_fails(
         question: str,
         *,
         on_status: Callable[[str], None] | None = None,
-        deadline: float | None = None,
     ) -> str:
-        del page, question, on_status, deadline
+        del page, question, on_status
         raise failure
 
     monkeypatch.setattr(runtime.ask, "execute_ask", execute_ask)
@@ -293,10 +289,9 @@ def test_closed_context_is_discarded_and_reinitialized(
         question: str,
         *,
         on_status: Callable[[str], None] | None = None,
-        deadline: float | None = None,
     ) -> str:
         nonlocal calls
-        del page, on_status, deadline
+        del page, on_status
         calls += 1
         if calls == 1:
             closed_error = RuntimeError(
@@ -334,9 +329,8 @@ def test_aclose_cleans_up_playwright_once(
         question: str,
         *,
         on_status: Callable[[str], None] | None = None,
-        deadline: float | None = None,
     ) -> str:
-        del page, on_status, deadline
+        del page, on_status
         return question
 
     monkeypatch.setattr(runtime.ask, "execute_ask", execute_ask)
@@ -364,9 +358,8 @@ def test_runtime_holds_profile_lock_until_close(
         question: str,
         *,
         on_status: Callable[[str], None] | None = None,
-        deadline: float | None = None,
     ) -> str:
-        del page, on_status, deadline
+        del page, on_status
         return question
 
     monkeypatch.setattr(runtime.ask, "execute_ask", execute_ask)
@@ -402,9 +395,8 @@ def _install_ask_stub(monkeypatch: pytest.MonkeyPatch, context: _FakeContext) ->
         question: str,
         *,
         on_status: Callable[[str], None] | None = None,
-        deadline: float | None = None,
     ) -> str:
-        del page, on_status, deadline
+        del page, on_status
         return f"answer: {question}"
 
     monkeypatch.setattr(runtime.ask, "execute_ask", execute_ask)

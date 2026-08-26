@@ -387,8 +387,8 @@ def _install_clock(monkeypatch: pytest.MonkeyPatch) -> _FakeClock:
     return clock
 
 
-def _run(page: _FakePage, *, deadline: float | None = None) -> str:
-    return asyncio.run(ask.execute_ask(page, "Review this code", deadline=deadline))
+def _run(page: _FakePage) -> str:
+    return asyncio.run(ask.execute_ask(page, "Review this code"))
 
 
 def _dom_state(*, has_stop: bool, length: int = 12) -> dict[str, object]:
@@ -496,7 +496,6 @@ def test_cf_mitigation_is_typed_challenge(
         _run(page)
 
     assert raised.value.failure == "challenge"
-    assert raised.value.is_blocked is (mitigation == "block")
 
 
 def test_rate_limit_waits_and_does_not_resubmit(
@@ -514,10 +513,11 @@ def test_rate_limit_wait_that_exceeds_deadline_is_classified(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _install_clock(monkeypatch)
+    monkeypatch.setattr(ask, "OVERALL_TIMEOUT_SECONDS", 0.9)
     page = _FakePage(signal="rate_limit")
 
     with pytest.raises(ask.GptProAskError) as raised:
-        _run(page, deadline=0.9)
+        _run(page)
 
     assert raised.value.failure == "rate_limited_timeout"
     assert page.click_count == 1
@@ -577,10 +577,11 @@ def test_expired_overall_deadline_is_timeout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _install_clock(monkeypatch)
+    monkeypatch.setattr(ask, "OVERALL_TIMEOUT_SECONDS", 0.0)
     page = _FakePage()
 
     with pytest.raises(ask.GptProAskError) as raised:
-        _run(page, deadline=0.0)
+        _run(page)
 
     assert raised.value.failure == "timeout"
     assert page.click_count == 0
@@ -732,10 +733,11 @@ def test_hanging_page_operation_obeys_overall_deadline(
 ) -> None:
     _install_clock(monkeypatch)
     monkeypatch.setattr(ask, "PRE_SUBMIT_POLL_INTERVAL_SECONDS", 0.0)
+    monkeypatch.setattr(ask, "OVERALL_TIMEOUT_SECONDS", 0.01)
     page = _FakePage(hang_operation=hang_operation)
 
     with pytest.raises(ask.GptProAskError) as raised:
-        _run(page, deadline=0.01)
+        _run(page)
 
     assert raised.value.failure == "timeout"
     assert page.listeners == {"requestfinished": [], "response": []}
@@ -895,10 +897,11 @@ def test_echo_deadline_after_rate_limit_is_rate_limited_timeout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _install_clock(monkeypatch)
+    monkeypatch.setattr(ask, "OVERALL_TIMEOUT_SECONDS", 2.5)
     page = _FakePage(signal="rate_limit", echo_never=True)
 
     with pytest.raises(ask.GptProAskError) as raised:
-        _run(page, deadline=2.5)
+        _run(page)
 
     assert raised.value.failure == "rate_limited_timeout"
     assert page.click_count == 1
