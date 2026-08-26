@@ -854,3 +854,47 @@ def test_rate_limit_without_user_echo_is_rate_limited_timeout(
 
     assert raised.value.failure == "rate_limited_timeout"
     assert page.click_count == 1
+
+
+def test_recovery_stop_transition_still_waits_for_stable_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = _install_clock(monkeypatch)
+    changing_states = [
+        {
+            **_dom_state(has_stop=index == 0),
+            "assistantMutationKey": f"12:recovery-{index}",
+        }
+        for index in range(10)
+    ]
+    stable_state = {
+        **_dom_state(has_stop=False),
+        "assistantMutationKey": "12:stable-after-stop",
+    }
+    page = _FakePage(
+        signal="id_only",
+        raw_text="raw after stable recovery stop transition",
+        turn_states=[
+            RuntimeError("Execution context was destroyed"),
+            *changing_states,
+            stable_state,
+        ],
+    )
+
+    assert _run(page) == "raw after stable recovery stop transition"
+    assert clock.value >= (
+        ask.RECOVERY_OBSERVE_SECONDS + ask.STABLE_POLLS_REQUIRED
+    )
+
+
+def test_echo_deadline_after_rate_limit_is_rate_limited_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_clock(monkeypatch)
+    page = _FakePage(signal="rate_limit", echo_never=True)
+
+    with pytest.raises(ask.GptProAskError) as raised:
+        _run(page, deadline=2.5)
+
+    assert raised.value.failure == "rate_limited_timeout"
+    assert page.click_count == 1

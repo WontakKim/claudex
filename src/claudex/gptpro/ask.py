@@ -224,6 +224,7 @@ class _AskExecution:
         self.handled_strong_signal = 0
         self.active_page_fetch_url: str | None = None
         self.has_submitted = False
+        self.has_locked_user_echo = False
 
     def _status(self, message: str) -> None:
         if self.on_status is None:
@@ -1048,7 +1049,10 @@ class _AskExecution:
                 saw_stop = True
 
             stop_disappeared = (
-                turn_state.assistant_exists and saw_stop and not turn_state.has_stop
+                turn_state.assistant_exists
+                and saw_stop
+                and not turn_state.has_stop
+                and not recovery_active
             )
             recovery_settled = (
                 recovery_active
@@ -1102,8 +1106,15 @@ class _AskExecution:
             await self._fill_and_verify()
             await self._click_send()
             locked_user_id = await self._lock_user_echo(pre_submit_ids)
+            self.has_locked_user_echo = True
             return await self._monitor_completion(locked_user_id)
         except _DeadlineExpired as exc:
+            if self.network.saw_rate_limit and not self.has_locked_user_echo:
+                raise GptProAskError(
+                    "rate_limited_timeout",
+                    "the ask deadline expired before a rate-limited user turn "
+                    "appeared in ChatGPT",
+                ) from exc
             if self.completion_candidate_seen:
                 raise GptProAskError(
                     "no_raw_turn",
