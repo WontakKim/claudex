@@ -19,7 +19,6 @@ from claudex.gptpro import session as gptpro_session
 
 
 def _login_result(
-    tmp_path: Path,
     *,
     success: bool,
     failure: gptpro_login.FailureClassification | None = None,
@@ -27,13 +26,6 @@ def _login_result(
 ) -> gptpro_login.LoginResult:
     return gptpro_login.LoginResult(
         success=success,
-        session_path=tmp_path / "session.json",
-        profile_prepared=True,
-        cookie_detected=success,
-        session_saved=success,
-        static_validation_passed=success,
-        probe_navigation_passed=success,
-        composer_visible=success,
         failure=failure,
         message=message,
     )
@@ -41,14 +33,12 @@ def _login_result(
 
 def test_gptpro_login_reports_progress_and_success(
     monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     async def run_login(*, on_status: object) -> gptpro_login.LoginResult:
         assert callable(on_status)
         on_status("waiting for sign-in")
         return _login_result(
-            tmp_path,
             success=True,
             message="saved and verified the gptpro session",
         )
@@ -65,13 +55,11 @@ def test_gptpro_login_reports_progress_and_success(
 
 def test_gptpro_login_failure_uses_stderr_and_exit_one(
     monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     async def run_login(*, on_status: object) -> gptpro_login.LoginResult:
         del on_status
         return _login_result(
-            tmp_path,
             success=False,
             failure="session_rejected",
             message="sign in again because the session was rejected",

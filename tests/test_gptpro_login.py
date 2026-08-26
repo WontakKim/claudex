@@ -117,6 +117,10 @@ def _auth_cookie() -> dict[str, object]:
     }
 
 
+def _ignore_status(_message: str) -> None:
+    pass
+
+
 def _install_browser_fakes(
     monkeypatch: pytest.MonkeyPatch,
     persistent_context: _FakePersistentContext,
@@ -179,12 +183,6 @@ def test_run_login_polls_clears_stale_cookie_saves_and_probes(
 
     assert result.success
     assert result.failure is None
-    assert result.profile_prepared
-    assert result.cookie_detected
-    assert result.session_saved
-    assert result.static_validation_passed
-    assert result.probe_navigation_passed
-    assert result.composer_visible
     assert sleep_intervals == [0.5]
     assert len(persistent_context.clear_cookie_names) == 1
     assert (
@@ -205,7 +203,8 @@ def test_run_login_polls_clears_stale_cookie_saves_and_probes(
     assert persistent_context.closed
     assert probe_context.closed
     assert probe_browser.closed
-    assert stat.S_IMODE(result.session_path.stat().st_mode) == 0o600
+    session_path = tmp_path / ".claudex" / "gptpro" / "session.json"
+    assert stat.S_IMODE(session_path.stat().st_mode) == 0o600
     assert stat.S_IMODE(
         (tmp_path / ".claudex" / "gptpro" / "chrome-profile").stat().st_mode
     ) == 0o700
@@ -232,12 +231,10 @@ def test_run_login_times_out_and_closes_the_persistent_context(
     monkeypatch.setattr(browser, "launch_headless_probe_chromium", fail_if_probed)
     monkeypatch.setattr(login, "LOGIN_TIMEOUT_SECONDS", 0)
 
-    result = asyncio.run(login.run_login())
+    result = asyncio.run(login.run_login(on_status=_ignore_status))
 
     assert not result.success
     assert result.failure == "login_timeout"
-    assert not result.cookie_detected
-    assert not result.session_saved
     assert persistent_context.closed
 
 
@@ -260,7 +257,7 @@ def test_run_login_classifies_initial_navigation_failure(
         browser, "launch_persistent_profile", launch_persistent_profile
     )
 
-    result = asyncio.run(login.run_login())
+    result = asyncio.run(login.run_login(on_status=_ignore_status))
 
     assert result.failure == "navigation_failed"
     assert "token-secret" not in result.message
@@ -281,12 +278,9 @@ def test_run_login_classifies_probe_login_redirect_as_session_rejected(
         monkeypatch, persistent_context, probe_context
     )
 
-    result = asyncio.run(login.run_login())
+    result = asyncio.run(login.run_login(on_status=_ignore_status))
 
     assert result.failure == "session_rejected"
-    assert result.static_validation_passed
-    assert result.probe_navigation_passed
-    assert not result.composer_visible
     assert persistent_context.closed
     assert probe_context.closed
     assert probe_browser.closed
@@ -304,12 +298,9 @@ def test_run_login_classifies_missing_composer_as_probe_retry(
     )
     _install_browser_fakes(monkeypatch, persistent_context, probe_context)
 
-    result = asyncio.run(login.run_login())
+    result = asyncio.run(login.run_login(on_status=_ignore_status))
 
     assert result.failure == "probe_retry"
-    assert result.static_validation_passed
-    assert result.probe_navigation_passed
-    assert not result.composer_visible
     assert "token-secret" not in result.message
 
 
@@ -328,11 +319,9 @@ def test_run_login_classifies_missing_playwright_browser(
         browser, "launch_persistent_profile", launch_persistent_profile
     )
 
-    result = asyncio.run(login.run_login())
+    result = asyncio.run(login.run_login(on_status=_ignore_status))
 
     assert result.failure == "chrome_missing"
-    assert result.profile_prepared
-    assert not result.cookie_detected
 
 
 @pytest.mark.parametrize(
@@ -374,11 +363,10 @@ def test_probe_cleanup_errors_do_not_mask_classified_failure(
         probe_browser,
     )
 
-    result = asyncio.run(login.run_login())
+    result = asyncio.run(login.run_login(on_status=_ignore_status))
 
     assert result.failure == expected_failure
     assert result.message == expected_message
-    assert result.probe_navigation_passed
     assert probe_context.closed
     assert probe_browser.closed
 
@@ -402,11 +390,10 @@ def test_run_login_classifies_missing_playwright_dependency(
         browser, "launch_persistent_profile", launch_persistent_profile
     )
 
-    result = asyncio.run(login.run_login())
+    result = asyncio.run(login.run_login(on_status=_ignore_status))
 
     assert result.failure == "dependency_missing"
     assert result.message == message
-    assert not result.cookie_detected
 
 
 def test_run_login_hardens_intermediate_profile_directories(
@@ -421,7 +408,7 @@ def test_run_login_hardens_intermediate_profile_directories(
     # here); every level of the chain must end up 0700 instead.
     previous_umask = os.umask(0o022)
     try:
-        result = asyncio.run(login.run_login())
+        result = asyncio.run(login.run_login(on_status=_ignore_status))
     finally:
         os.umask(previous_umask)
 
@@ -451,7 +438,7 @@ def test_run_login_fails_when_ask_runtime_holds_profile_lock(
 
     monkeypatch.setattr(browser, "launch_persistent_profile", fail_launch)
     try:
-        result = asyncio.run(login.run_login())
+        result = asyncio.run(login.run_login(on_status=_ignore_status))
     finally:
         holder.release()
 

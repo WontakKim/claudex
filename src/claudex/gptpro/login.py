@@ -34,16 +34,9 @@ FailureClassification = Literal[
 
 @dataclass(frozen=True)
 class LoginResult:
-    """Outcome and completed validation stages for one login attempt."""
+    """Outcome of one login attempt."""
 
     success: bool
-    session_path: Path
-    profile_prepared: bool
-    cookie_detected: bool
-    session_saved: bool
-    static_validation_passed: bool
-    probe_navigation_passed: bool
-    composer_visible: bool
     failure: FailureClassification | None
     message: str
 
@@ -55,16 +48,9 @@ class GptProLoginError(Exception):
         self,
         failure: FailureClassification,
         message: str,
-        *,
-        probe_navigation_passed: bool = False,
     ) -> None:
         super().__init__(message)
         self.failure = failure
-        self.probe_navigation_passed = probe_navigation_passed
-
-
-def _ignore_status(message: str) -> None:
-    del message
 
 
 async def _acquire_profile_lock() -> locking.FileLockHandle | None:
@@ -91,7 +77,7 @@ def _browser_failure(exc: BaseException) -> GptProLoginError:
     return GptProLoginError("error", "retry after checking the browser installation")
 
 
-async def _probe_saved_session(path: Path) -> tuple[bool, bool]:
+async def _probe_saved_session(path: Path) -> None:
     try:
         probe_browser = await browser.launch_headless_probe_chromium()
     except Exception as exc:
@@ -128,7 +114,6 @@ async def _probe_saved_session(path: Path) -> tuple[bool, bool]:
             raise GptProLoginError(
                 "session_rejected",
                 "sign in again because ChatGPT rejected the saved session",
-                probe_navigation_passed=True,
             )
 
         try:
@@ -141,9 +126,7 @@ async def _probe_saved_session(path: Path) -> tuple[bool, bool]:
             raise GptProLoginError(
                 "probe_retry",
                 "retry session verification after checking the network or browser challenge",
-                probe_navigation_passed=True,
             ) from exc
-        return True, True
     except BaseException as exc:
         probe_failure = exc
         raise
@@ -173,38 +156,22 @@ async def _probe_saved_session(path: Path) -> tuple[bool, bool]:
             raise cleanup_failure
 
 
-async def run_login(
-    *, on_status: Callable[[str], None] = _ignore_status
-) -> LoginResult:
+async def run_login(*, on_status: Callable[[str], None]) -> LoginResult:
     """Open a login browser, save its auth state, and verify the saved session."""
     profile_dir = paths.gptpro_chrome_profile_dir()
     session_path = paths.gptpro_session_file()
-    profile_prepared = False
-    cookie_detected = False
-    session_saved = False
-    static_validation_passed = False
-    probe_navigation_passed = False
-    composer_visible = False
 
     def result(
         failure: FailureClassification | None, message: str
     ) -> LoginResult:
         return LoginResult(
             success=failure is None,
-            session_path=session_path,
-            profile_prepared=profile_prepared,
-            cookie_detected=cookie_detected,
-            session_saved=session_saved,
-            static_validation_passed=static_validation_passed,
-            probe_navigation_passed=probe_navigation_passed,
-            composer_visible=composer_visible,
             failure=failure,
             message=message,
         )
 
     try:
         ensure_private_directory(profile_dir)
-        profile_prepared = True
     except OSError:
         return result(
             "error", "prepare the gptpro browser profile directory and retry"
@@ -249,7 +216,6 @@ async def run_login(
         while True:
             cookies = await context.cookies()
             if session.find_auth_cookie(cookies) is not None:
-                cookie_detected = True
                 break
             if time.monotonic() >= deadline:
                 raise GptProLoginError(
@@ -260,7 +226,6 @@ async def run_login(
 
         on_status("saving the authenticated ChatGPT session")
         await session.save_storage_state(context, session_path)
-        session_saved = True
     except GptProLoginError as exc:
         login_failure = exc
     except Exception:
@@ -288,11 +253,8 @@ async def run_login(
                 "session_rejected",
                 "sign in again because the saved ChatGPT session is already expired",
             )
-        static_validation_passed = True
         on_status("verifying the saved ChatGPT session")
-        probe_navigation_passed, composer_visible = await _probe_saved_session(
-            session_path
-        )
+        await _probe_saved_session(session_path)
     except session.GptProSessionError:
         login_failure = GptProLoginError(
             "session_rejected",
@@ -300,7 +262,6 @@ async def run_login(
         )
     except GptProLoginError as exc:
         login_failure = exc
-        probe_navigation_passed = exc.probe_navigation_passed
     except Exception:
         login_failure = GptProLoginError(
             "error", "retry after checking the saved session and browser"
