@@ -26,6 +26,8 @@ _REQUEST_HEADERS = {
     "accept": "application/json, text/event-stream",
     "content-type": "application/json",
 }
+_CONVERSATION_A = "11111111-1111-4111-8111-111111111111"
+_CONVERSATION_B = "22222222-2222-4222-8222-222222222222"
 
 
 class FakeAskRuntime:
@@ -40,8 +42,14 @@ class FakeAskRuntime:
         self.conversation_id = conversation_id
         self.error = error
         self.questions: list[str] = []
+        self.provider_conversation_ids: list[str | None] = []
+        self._conversation_id_callbacks: list[
+            Callable[[str], None] | None
+        ] = []
+        self._provider_calls_changed = asyncio.Condition()
         self._release_provider = asyncio.Event()
         self._job_service = jobs.AskJobService(self._ask)
+        self._thread_registry = jobs.ThreadRegistry()
 
     async def _ask(
         self,
@@ -49,9 +57,15 @@ class FakeAskRuntime:
         *,
         on_status: Callable[[str], None] | None = None,
         on_conversation_id: Callable[[str], None] | None = None,
+        conversation_id: str | None = None,
+        timeout_seconds: float | None = None,
     ) -> ask.AskOutcome:
-        del on_conversation_id
-        self.questions.append(question)
+        del timeout_seconds
+        async with self._provider_calls_changed:
+            self.questions.append(question)
+            self.provider_conversation_ids.append(conversation_id)
+            self._conversation_id_callbacks.append(on_conversation_id)
+            self._provider_calls_changed.notify_all()
         if on_status is not None:
             on_status("waiting for ChatGPT Pro")
         await self._release_provider.wait()
@@ -63,14 +77,42 @@ class FakeAskRuntime:
             conversation_id=self.conversation_id,
         )
 
-    def start_ask(self, question: str) -> jobs.AskJob:
-        return self._job_service.start(question)
+    def start_ask(
+        self,
+        question: str,
+        *,
+        conversation_id: str | None = None,
+        on_thread_ref: Callable[[str], None] | None = None,
+    ) -> jobs.AskJob:
+        return self._job_service.start(
+            question,
+            conversation_id=conversation_id,
+            on_thread_ref=on_thread_ref,
+        )
+
+    def lookup_thread(self, session_id: str) -> str | None:
+        return self._thread_registry.lookup(session_id)
+
+    def bind_thread(self, session_id: str, thread_ref: str) -> None:
+        self._thread_registry.bind(session_id, thread_ref)
 
     def job_status(self, ask_id: str) -> jobs.AskJob | None:
         return self._job_service.status(ask_id)
 
     def job_result(self, ask_id: str) -> jobs.AskJob | None:
         return self._job_service.result(ask_id)
+
+    async def wait_for_provider_calls(self, count: int) -> None:
+        async with self._provider_calls_changed:
+            await self._provider_calls_changed.wait_for(
+                lambda: len(self.provider_conversation_ids) >= count
+            )
+
+    async def latch_thread(self, call_index: int, thread_ref: str) -> None:
+        await self.wait_for_provider_calls(call_index + 1)
+        callback = self._conversation_id_callbacks[call_index]
+        assert callback is not None
+        callback(thread_ref)
 
     async def finish_job(self, ask_id: str) -> None:
         self._release_provider.set()
@@ -166,6 +208,23 @@ def _json_tool_payload(result: dict[str, Any]) -> dict[str, Any]:
     return payload
 
 
+def _wait_for_provider_calls(
+    client: TestClient, runtime: FakeAskRuntime, count: int
+) -> None:
+    assert client.portal is not None
+    client.portal.call(runtime.wait_for_provider_calls, count)
+
+
+def _latch_thread(
+    client: TestClient,
+    runtime: FakeAskRuntime,
+    call_index: int,
+    thread_ref: str,
+) -> None:
+    assert client.portal is not None
+    client.portal.call(runtime.latch_thread, call_index, thread_ref)
+
+
 def _finish_job(
     client: TestClient, runtime: FakeAskRuntime, ask_id: str
 ) -> None:
@@ -205,8 +264,9 @@ def test_tools_list_exposes_job_tools_schemas_and_usage_guidance() -> None:
             "thread": {
                 "type": "string",
                 "description": (
-                    "Reserved for conversation continuation; not implemented yet — "
-                    "omit it and include full context in question."
+                    "'new' forces a fresh conversation; a conversation UUID (a "
+                    "previous thread_ref) continues that conversation; omit to "
+                    "continue this session's current conversation."
                 ),
             },
         },
@@ -221,18 +281,29 @@ def test_tools_list_exposes_job_tools_schemas_and_usage_guidance() -> None:
     }
     assert tools["ask_gpt_pro_status"]["inputSchema"] == ask_id_schema
     assert tools["ask_gpt_pro_result"]["inputSchema"] == ask_id_schema
-    assert tools["ask_gpt_pro"]["description"] == (
-        "Send a self-contained question to ChatGPT Pro as a background job and "
-        "return immediately with {ask_id, thread_ref}. Include all necessary code, "
-        "logs, metadata, and context inline in question. Poll "
-        "ask_gpt_pro_status(ask_id) until state is succeeded or failed, then fetch "
-        "ask_gpt_pro_result(ask_id) for the settled Markdown answer. If the answer "
-        "begins with GPTPRO_CONTEXT_REQUEST_V1, gather the requested material and "
-        "call this tool again with it included. Use this tool only when the user "
-        "explicitly requests ChatGPT Pro or for a consequential judgment where a "
-        "second opinion materially helps; do not use it routinely."
+    ask_description = tools["ask_gpt_pro"]["description"]
+    assert "return immediately with {ask_id, thread_ref}" in ask_description
+    assert "ask_gpt_pro_status(ask_id)" in ask_description
+    assert "ask_gpt_pro_result(ask_id)" in ask_description
+    assert "self-contained whenever possible" in ask_description
+    assert "Omitting thread continues this MCP session's current conversation" in (
+        ask_description
     )
-    assert "current state" in tools["ask_gpt_pro_status"]["description"]
+    assert "ChatGPT can see previous turns" in ask_description
+    assert 'Set thread to "new" to force a fresh conversation' in ask_description
+    assert "conversation UUID from a previous thread_ref" in ask_description
+    assert "Asks in the same conversation are serialized" in ask_description
+    assert "status reports that an ask is waiting" in ask_description
+    assert "GPTPRO_CONTEXT_REQUEST_V1" in ask_description
+    assert "omitting thread continues the conversation" in ask_description
+    assert "explicitly requests ChatGPT Pro" in ask_description
+    assert "consequential judgment" in ask_description
+    status_description = tools["ask_gpt_pro_status"]["description"]
+    assert "current state" in status_description
+    assert "thread_ref is preserved throughout the job lifecycle" in (
+        status_description
+    )
+    assert '"waiting for the in-flight answer"' in status_description
     assert "settled result" in tools["ask_gpt_pro_result"]["description"]
 
 
@@ -412,7 +483,107 @@ def test_failed_result_preserves_domain_error_mapping(
     }
 
 
-def test_submit_rejects_thread_parameter() -> None:
+def test_omitted_thread_continues_latched_session_conversation() -> None:
+    runtime = FakeAskRuntime()
+    with _mcp_client(runtime) as client:
+        _payload, headers = _initialize(client)
+        first = _json_tool_payload(
+            _call_tool(
+                client,
+                headers,
+                "ask_gpt_pro",
+                {"question": "Start a conversation."},
+            )
+        )
+        _wait_for_provider_calls(client, runtime, 1)
+
+        assert first["thread_ref"] is None
+        assert runtime.provider_conversation_ids == [None]
+
+        _latch_thread(client, runtime, 0, _CONVERSATION_A)
+        _finish_job(client, runtime, first["ask_id"])
+        second = _json_tool_payload(
+            _call_tool(
+                client,
+                headers,
+                "ask_gpt_pro",
+                {"question": "Follow up."},
+            )
+        )
+        _wait_for_provider_calls(client, runtime, 2)
+
+    assert second["thread_ref"] == _CONVERSATION_A
+    assert runtime.provider_conversation_ids == [None, _CONVERSATION_A]
+
+
+def test_new_thread_forces_fresh_conversation_despite_session_binding() -> None:
+    runtime = FakeAskRuntime()
+    with _mcp_client(runtime) as client:
+        _payload, headers = _initialize(client)
+        bound = _json_tool_payload(
+            _call_tool(
+                client,
+                headers,
+                "ask_gpt_pro",
+                {"question": "Bind this session.", "thread": _CONVERSATION_A},
+            )
+        )
+        _wait_for_provider_calls(client, runtime, 1)
+        fresh = _json_tool_payload(
+            _call_tool(
+                client,
+                headers,
+                "ask_gpt_pro",
+                {"question": "Start over.", "thread": "new"},
+            )
+        )
+        _wait_for_provider_calls(client, runtime, 2)
+
+    assert bound["thread_ref"] == _CONVERSATION_A
+    assert fresh["thread_ref"] is None
+    assert runtime.provider_conversation_ids == [_CONVERSATION_A, None]
+
+
+def test_explicit_thread_updates_session_binding_for_next_omitted_thread() -> None:
+    runtime = FakeAskRuntime()
+    with _mcp_client(runtime) as client:
+        _payload, headers = _initialize(client)
+        explicit = _json_tool_payload(
+            _call_tool(
+                client,
+                headers,
+                "ask_gpt_pro",
+                {"question": "Revisit this.", "thread": _CONVERSATION_B},
+            )
+        )
+        _wait_for_provider_calls(client, runtime, 1)
+
+        assert explicit["thread_ref"] == _CONVERSATION_B
+        assert runtime.provider_conversation_ids == [_CONVERSATION_B]
+
+        _finish_job(client, runtime, explicit["ask_id"])
+        continued = _json_tool_payload(
+            _call_tool(
+                client,
+                headers,
+                "ask_gpt_pro",
+                {"question": "Continue."},
+            )
+        )
+        _wait_for_provider_calls(client, runtime, 2)
+
+    assert continued["thread_ref"] == _CONVERSATION_B
+    assert runtime.provider_conversation_ids == [
+        _CONVERSATION_B,
+        _CONVERSATION_B,
+    ]
+
+
+@pytest.mark.parametrize(
+    "thread_ref",
+    ["not-a-uuid", f"WEB:{_CONVERSATION_A}"],
+)
+def test_submit_rejects_invalid_thread_reference(thread_ref: str) -> None:
     runtime = FakeAskRuntime()
     with _mcp_client(runtime) as client:
         _payload, headers = _initialize(client)
@@ -420,7 +591,7 @@ def test_submit_rejects_thread_parameter() -> None:
             client,
             headers,
             "ask_gpt_pro",
-            {"question": "Question", "thread": "existing-thread"},
+            {"question": "Question", "thread": thread_ref},
         )
 
     assert result == {
@@ -428,14 +599,47 @@ def test_submit_rejects_thread_parameter() -> None:
             {
                 "type": "text",
                 "text": (
-                    "The thread parameter is not supported yet; omit it and "
-                    "include full context in question."
+                    'Invalid thread reference: it must be "new" or a '
+                    "conversation UUID (a previous thread_ref)."
                 ),
             }
         ],
         "isError": True,
     }
-    assert runtime.questions == []
+    assert runtime.provider_conversation_ids == []
+
+
+def test_mcp_sessions_keep_thread_bindings_independent() -> None:
+    runtime = FakeAskRuntime()
+    with _mcp_client(runtime) as client:
+        _payload, session_a_headers = _initialize(client)
+        _payload, session_b_headers = _initialize(client)
+        assert session_a_headers["mcp-session-id"] != session_b_headers[
+            "mcp-session-id"
+        ]
+
+        session_a = _json_tool_payload(
+            _call_tool(
+                client,
+                session_a_headers,
+                "ask_gpt_pro",
+                {"question": "Session A.", "thread": _CONVERSATION_A},
+            )
+        )
+        _wait_for_provider_calls(client, runtime, 1)
+        session_b = _json_tool_payload(
+            _call_tool(
+                client,
+                session_b_headers,
+                "ask_gpt_pro",
+                {"question": "Session B."},
+            )
+        )
+        _wait_for_provider_calls(client, runtime, 2)
+
+    assert session_a["thread_ref"] == _CONVERSATION_A
+    assert session_b["thread_ref"] is None
+    assert runtime.provider_conversation_ids == [_CONVERSATION_A, None]
 
 
 @pytest.mark.parametrize(
