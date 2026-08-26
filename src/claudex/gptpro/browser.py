@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -19,8 +18,6 @@ _CHROME_MISSING_PATTERN = re.compile(
 _PLAYWRIGHT_BROWSER_MISSING_PATTERN = re.compile(
     r"Executable doesn't exist at|playwright install", re.IGNORECASE
 )
-_DISABLE_AUTOMATION_ARGUMENT = "--disable-blink-features=AutomationControlled"
-_ENABLE_AUTOMATION_DEFAULT_ARGUMENT = "--enable-automation"
 _PLAYWRIGHT_OWNERS: dict[int, Any] = {}
 _PLAYWRIGHT_INSTALL_MESSAGE = (
     "playwright is not installed; run `uv sync --extra gptpro` to enable "
@@ -43,23 +40,6 @@ def is_browser_missing_error(exc: BaseException) -> bool:
     return is_chrome_missing_error(exc) or (
         _PLAYWRIGHT_BROWSER_MISSING_PATTERN.search(str(exc)) is not None
     )
-
-
-def _merge_anti_automation_options(
-    args: Sequence[str], ignore_default_args: Sequence[str]
-) -> dict[str, list[str]]:
-    merged_args = list(args)
-    if _DISABLE_AUTOMATION_ARGUMENT not in merged_args:
-        merged_args.append(_DISABLE_AUTOMATION_ARGUMENT)
-
-    merged_ignored_args = list(ignore_default_args)
-    if _ENABLE_AUTOMATION_DEFAULT_ARGUMENT not in merged_ignored_args:
-        merged_ignored_args.append(_ENABLE_AUTOMATION_DEFAULT_ARGUMENT)
-
-    return {
-        "args": merged_args,
-        "ignore_default_args": merged_ignored_args,
-    }
 
 
 async def _start_playwright() -> Any:
@@ -87,14 +67,13 @@ async def _launch_persistent_context(
 async def launch_persistent_profile(
     profile_dir: Path,
     *,
-    args: Sequence[str] = (),
-    ignore_default_args: Sequence[str] = (),
     headless: bool = False,
 ) -> BrowserContext:
     """Launch a persistent profile, preferring system Chrome."""
     options: dict[str, object] = {
         "headless": headless,
-        **_merge_anti_automation_options(args, ignore_default_args),
+        "args": ["--disable-blink-features=AutomationControlled"],
+        "ignore_default_args": ["--enable-automation"],
     }
     playwright = await _start_playwright()
     try:

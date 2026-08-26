@@ -96,11 +96,7 @@ def test_persistent_profile_falls_back_only_for_missing_chrome(
     monkeypatch.setattr(browser, "_start_playwright", start_playwright)
 
     async def scenario() -> None:
-        context = await browser.launch_persistent_profile(
-            tmp_path / "profile",
-            args=["--caller-argument"],
-            ignore_default_args=["--caller-default"],
-        )
+        context = await browser.launch_persistent_profile(tmp_path / "profile")
         assert context is chromium.context
         await browser.close_playwright_resource(context)
 
@@ -115,13 +111,9 @@ def test_persistent_profile_falls_back_only_for_missing_chrome(
     for options in (first_options, second_options):
         assert options["headless"] is False
         assert options["args"] == [
-            "--caller-argument",
-            "--disable-blink-features=AutomationControlled",
+            "--disable-blink-features=AutomationControlled"
         ]
-        assert options["ignore_default_args"] == [
-            "--caller-default",
-            "--enable-automation",
-        ]
+        assert options["ignore_default_args"] == ["--enable-automation"]
     assert chromium.context.closed
     assert playwright.stopped
 
