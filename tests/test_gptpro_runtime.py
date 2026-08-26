@@ -21,8 +21,17 @@ class _FakeLockHandle:
 
 
 class _FakePage:
-    def __init__(self) -> None:
+    def __init__(self, *, user_agent: str = "Mozilla/5.0 Chrome/151.0") -> None:
+        self.user_agent = user_agent
+        self.extra_headers: dict[str, str] | None = None
         self.close_calls = 0
+
+    async def evaluate(self, script: str) -> str:
+        assert "navigator.userAgent" in script
+        return self.user_agent
+
+    async def set_extra_http_headers(self, headers: dict[str, str]) -> None:
+        self.extra_headers = headers
 
     async def close(self) -> None:
         self.close_calls += 1
@@ -372,3 +381,66 @@ def test_runtime_holds_profile_lock_until_close(
         assert fakes.locks[0].release_calls == 1
 
     asyncio.run(scenario())
+
+
+class _HeadlessUserAgentContext(_FakeContext):
+    def __init__(self, user_agent: str) -> None:
+        super().__init__()
+        self._user_agent = user_agent
+
+    async def new_page(self) -> _FakePage:
+        page = _FakePage(user_agent=self._user_agent)
+        self.pages.append(page)
+        return page
+
+
+def _install_ask_stub(monkeypatch: pytest.MonkeyPatch, context: _FakeContext) -> None:
+    _RuntimeFakes(monkeypatch, [context])
+
+    async def execute_ask(
+        page: _FakePage,
+        question: str,
+        *,
+        on_status: Callable[[str], None] | None = None,
+        deadline: float | None = None,
+    ) -> str:
+        del page, on_status, deadline
+        return f"answer: {question}"
+
+    monkeypatch.setattr(runtime.ask, "execute_ask", execute_ask)
+
+
+def test_ask_hardens_headless_user_agent_header(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = _HeadlessUserAgentContext(
+        "Mozilla/5.0 HeadlessChrome/151.0.0.0"
+    )
+    _install_ask_stub(monkeypatch, context)
+
+    async def scenario() -> None:
+        ask_runtime = runtime.AskRuntime()
+        assert await ask_runtime.ask("question") == "answer: question"
+        await ask_runtime.aclose()
+
+    asyncio.run(scenario())
+
+    assert context.pages[0].extra_headers == {
+        "User-Agent": "Mozilla/5.0 Chrome/151.0.0.0"
+    }
+
+
+def test_ask_leaves_plain_user_agent_header_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = _HeadlessUserAgentContext("Mozilla/5.0 Chrome/151.0.0.0")
+    _install_ask_stub(monkeypatch, context)
+
+    async def scenario() -> None:
+        ask_runtime = runtime.AskRuntime()
+        assert await ask_runtime.ask("question") == "answer: question"
+        await ask_runtime.aclose()
+
+    asyncio.run(scenario())
+
+    assert context.pages[0].extra_headers is None

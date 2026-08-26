@@ -21,6 +21,27 @@ GptProSessionExpiredError = ask.GptProSessionExpiredError
 _sleep: Callable[[float], Awaitable[None]] = asyncio.sleep
 
 
+async def _harden_page_user_agent(page: Any) -> None:
+    """Strip the headless marker from the page's outgoing User-Agent header.
+
+    A headless system Chrome advertises `HeadlessChrome/...` in its UA,
+    which Cloudflare challenges on sight. The plugin sent asks with the
+    marker removed via extra HTTP headers; navigator.userAgent stays
+    untouched, matching that behavior.
+    """
+    try:
+        user_agent = await page.evaluate("navigator.userAgent")
+    except Exception:
+        return
+    if not isinstance(user_agent, str) or "Headless" not in user_agent:
+        return
+    hardened = browser.remove_headless_user_agent_token(user_agent)
+    try:
+        await page.set_extra_http_headers({"User-Agent": hardened})
+    except Exception:
+        return
+
+
 def _max_concurrent_asks() -> int:
     raw_value = os.environ.get("GPTPRO_MAX_CONCURRENT_ASKS")
     if raw_value is None:
@@ -147,6 +168,7 @@ class AskRuntime:
         primary_failure: BaseException | None = None
         try:
             page = await context.new_page()
+            await _harden_page_user_agent(page)
             return await ask.execute_ask(page, question, on_status=on_status)
         except BaseException as exc:
             primary_failure = exc

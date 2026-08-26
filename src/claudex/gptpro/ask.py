@@ -580,9 +580,13 @@ class _AskExecution:
             raise GptProAskError(
                 "submit_failed", "could not fill the ChatGPT composer"
             ) from exc
-        if readback != self.prompt:
+        # The composer is a contenteditable editor: newlines round-trip as
+        # <br>/paragraph markup, so an exact-string comparison fails on
+        # well-formed fills. The nonce marker is the fill's contract — if
+        # it made it in, the submit path can anchor on it.
+        if not isinstance(readback, str) or self.marker not in readback:
             raise GptProAskError(
-                "submit_failed", "the ChatGPT composer did not retain the exact prompt"
+                "submit_failed", "the ChatGPT composer did not retain the prompt"
             )
 
     async def _dismiss_modal(self) -> None:

@@ -76,6 +76,7 @@ class _FakePage:
         turn_states: list[dict[str, object] | BaseException] | None = None,
         initial_response: _FakeResponse | None = None,
         readback_mismatch: bool = False,
+        readback_reformatted: bool = False,
         swallow_first_click: bool = False,
         echo_never: bool = False,
         require_listeners_before_goto: bool = False,
@@ -105,6 +106,7 @@ class _FakePage:
         )
         self.initial_response = initial_response
         self.readback_mismatch = readback_mismatch
+        self.readback_reformatted = readback_reformatted
         self.swallow_first_click = swallow_first_click
         self.echo_never = echo_never
         self.require_listeners_before_goto = require_listeners_before_goto
@@ -277,6 +279,8 @@ class _FakePage:
         if expression == selectors.COMPOSER_READBACK_PROBE_JS:
             if self.readback_mismatch:
                 return "changed by the page"
+            if self.readback_reformatted:
+                return self.composer_value.replace("\n\n", "\n")
             return self.composer_value
         if expression == selectors.DISMISS_MODAL_PROBE_JS:
             return "none"
@@ -897,4 +901,14 @@ def test_echo_deadline_after_rate_limit_is_rate_limited_timeout(
         _run(page, deadline=2.5)
 
     assert raised.value.failure == "rate_limited_timeout"
+    assert page.click_count == 1
+
+
+def test_readback_with_reformatted_newlines_still_submits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_clock(monkeypatch)
+    page = _FakePage(readback_reformatted=True)
+
+    assert _run(page) == "server **raw** markdown"
     assert page.click_count == 1
