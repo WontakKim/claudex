@@ -24,10 +24,8 @@ _sleep: Callable[[float], Awaitable[None]] = asyncio.sleep
 async def _harden_page_user_agent(page: Any) -> None:
     """Strip the headless marker from the page's outgoing User-Agent header.
 
-    A headless system Chrome advertises `HeadlessChrome/...` in its UA,
-    which Cloudflare challenges on sight. The plugin sent asks with the
-    marker removed via extra HTTP headers; navigator.userAgent stays
-    untouched, matching that behavior.
+    Cloudflare can challenge `HeadlessChrome/...` user agents. Only the
+    outgoing header is normalized; navigator.userAgent remains unchanged.
     """
     try:
         user_agent = await page.evaluate("navigator.userAgent")
