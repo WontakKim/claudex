@@ -9,10 +9,12 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import tempfile
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, replace
-from typing import Literal, Protocol
+from pathlib import Path
+from typing import Any, Literal, Protocol
 from uuid import uuid4
 
 from claudex.gptpro import ask as ask_module
@@ -21,6 +23,7 @@ from claudex.gptpro.ask import AskOutcome, GptProAskError
 JOB_RETENTION_SECONDS = 24.0 * 60 * 60
 SWEEP_INTERVAL_SECONDS = 300.0
 THREAD_BINDING_TTL_SECONDS = 23 * 60 * 60
+QUESTION_SPILL_THRESHOLD_BYTES = 35_000
 
 AskJobState = Literal["running", "succeeded", "failed"]
 
@@ -48,6 +51,7 @@ class _AskCallable(Protocol):
         on_conversation_id: Callable[[str], None] | None = None,
         conversation_id: str | None = None,
         timeout_seconds: float | None = None,
+        attachment_paths: Sequence[str] | None = None,
     ) -> Awaitable[AskOutcome]: ...
 
 
@@ -114,6 +118,7 @@ class AskJobService:
         *,
         conversation_id: str | None = None,
         on_thread_ref: Callable[[str], None] | None = None,
+        attachment_paths: Sequence[str] | None = None,
     ) -> AskJob:
         ask_id = uuid4().hex
         created_at = self._clock()
@@ -139,6 +144,7 @@ class AskJobService:
                 conversation_id,
                 on_thread_ref,
                 expires_at,
+                attachment_paths,
             )
         )
         self._job_tasks.add(task)
@@ -175,9 +181,11 @@ class AskJobService:
         conversation_id: str | None,
         on_thread_ref: Callable[[str], None] | None,
         expires_at: float,
+        attachment_paths: Sequence[str] | None,
     ) -> None:
         thread_lock: asyncio.Lock | None = None
         has_thread_lock = False
+        spill_path: Path | None = None
         try:
             if conversation_id is not None:
                 thread_lock = self._thread_locks.setdefault(
@@ -224,20 +232,39 @@ class AskJobService:
                     ask_id, captured_conversation_id, on_thread_ref
                 )
 
+            provider_question = question
+            provider_attachment_paths = attachment_paths
+            if len(question.encode("utf-8")) > QUESTION_SPILL_THRESHOLD_BYTES:
+                with tempfile.NamedTemporaryFile(
+                    mode="w",
+                    encoding="utf-8",
+                    prefix="gptpro-spill-",
+                    suffix=".txt",
+                    delete=False,
+                ) as spill_file:
+                    spill_path = Path(spill_file.name)
+                    spill_file.write(question)
+                provider_question = (
+                    "The full question text is attached as "
+                    f"{spill_path.name}; read the attachment and answer it."
+                )
+                provider_attachment_paths = [
+                    str(spill_path),
+                    *(attachment_paths or ()),
+                ]
+
+            ask_options: dict[str, Any] = {
+                "on_status": capture_status,
+                "on_conversation_id": capture_conversation_id,
+            }
             if self._supports_conversation_options:
-                outcome = await self._ask(
-                    question,
-                    on_status=capture_status,
-                    on_conversation_id=capture_conversation_id,
+                ask_options.update(
                     conversation_id=conversation_id,
                     timeout_seconds=remaining,
                 )
-            else:
-                outcome = await self._ask(
-                    question,
-                    on_status=capture_status,
-                    on_conversation_id=capture_conversation_id,
-                )
+            if provider_attachment_paths is not None:
+                ask_options["attachment_paths"] = provider_attachment_paths
+            outcome = await self._ask(provider_question, **ask_options)
             job = self._jobs[ask_id]
             if job.thread_ref is None and outcome.conversation_id is not None:
                 self._on_conversation_id(
@@ -268,6 +295,8 @@ class AskJobService:
             if has_thread_lock:
                 assert thread_lock is not None
                 thread_lock.release()
+            if spill_path is not None:
+                spill_path.unlink(missing_ok=True)
             self._jobs[ask_id] = replace(
                 self._jobs[ask_id], finished_at=self._clock()
             )

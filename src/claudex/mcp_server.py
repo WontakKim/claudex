@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Any
 
 from starlette.requests import Request
@@ -19,7 +19,10 @@ ASK_GPT_PRO_DESCRIPTION = (
     "ask_gpt_pro_status(ask_id) until state is succeeded or failed, then fetch "
     "ask_gpt_pro_result(ask_id) for the settled Markdown answer. Include all "
     "necessary code, logs, metadata, and context inline so the question is "
-    "self-contained whenever possible. Omitting thread continues this MCP "
+    "self-contained whenever possible. Attach up to 10 UTF-8 plain-text "
+    "files totaling 1.2 MB with attachments. Questions over ~35 KB are "
+    "spilled into an attachment automatically, so send the full text. "
+    "Omitting thread continues this MCP "
     "session's current conversation, or starts a new one when the session is "
     "unbound, so ChatGPT can see previous turns and short follow-up questions "
     "may rely on them. Set thread to \"new\" to force a fresh conversation, or "
@@ -43,6 +46,11 @@ ASK_GPT_PRO_RESULT_DESCRIPTION = (
     "Fetch the settled result of a background ChatGPT Pro ask after its status "
     "is succeeded or failed."
 )
+_ATTACHMENTS_DESCRIPTION = (
+    "Optional plain-text file paths to attach (UTF-8 only; at most 10 files "
+    "and 1.2 MB total; questions over ~35 KB are spilled into an attachment "
+    "automatically, so send full text)."
+)
 _THREAD_DESCRIPTION = (
     "'new' forces a fresh conversation; a conversation UUID (a previous "
     "thread_ref) continues that conversation; omit to continue this session's "
@@ -53,6 +61,11 @@ ASK_GPT_PRO_INPUT_SCHEMA: dict[str, Any] = {
     "properties": {
         "question": {"type": "string"},
         "thread": {"type": "string", "description": _THREAD_DESCRIPTION},
+        "attachments": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": _ATTACHMENTS_DESCRIPTION,
+        },
     },
     "required": ["question"],
     "additionalProperties": False,
@@ -88,6 +101,7 @@ class LazyAskRuntime:
         on_conversation_id: Callable[[str], None] | None = None,
         conversation_id: str | None = None,
         timeout_seconds: float | None = None,
+        attachment_paths: Sequence[str] | None = None,
     ) -> Any:
         runtime = await self._get_runtime()
         return await runtime.ask(
@@ -96,6 +110,7 @@ class LazyAskRuntime:
             on_conversation_id=on_conversation_id,
             conversation_id=conversation_id,
             timeout_seconds=timeout_seconds,
+            attachment_paths=attachment_paths,
         )
 
     def start_ask(
@@ -104,6 +119,7 @@ class LazyAskRuntime:
         *,
         conversation_id: str | None = None,
         on_thread_ref: Callable[[str], None] | None = None,
+        attachment_paths: Sequence[str] | None = None,
     ) -> jobs.AskJob:
         if self._job_service is None:
             self._job_service = jobs.AskJobService(self.ask)
@@ -111,6 +127,7 @@ class LazyAskRuntime:
             question,
             conversation_id=conversation_id,
             on_thread_ref=on_thread_ref,
+            attachment_paths=attachment_paths,
         )
 
     def lookup_thread(self, session_id: str) -> str | None:
@@ -280,6 +297,17 @@ def _create_session_manager(app: Any) -> Any:
             question = arguments.get("question")
             if not isinstance(question, str):
                 return _tool_error(types, "question must be a string")
+            attachment_paths = None
+            if "attachments" in arguments:
+                requested_attachments = arguments["attachments"]
+                if not isinstance(requested_attachments, list) or not all(
+                    isinstance(attachment_path, str)
+                    for attachment_path in requested_attachments
+                ):
+                    return _tool_error(
+                        types, "attachments must be an array of strings"
+                    )
+                attachment_paths = requested_attachments
             session_id = _get_mcp_session_id(context)
             if "thread" not in arguments:
                 conversation_id = (
@@ -310,6 +338,7 @@ def _create_session_manager(app: Any) -> Any:
                 question,
                 conversation_id=conversation_id,
                 on_thread_ref=on_thread_ref,
+                attachment_paths=attachment_paths,
             )
             return _json_result(
                 types,

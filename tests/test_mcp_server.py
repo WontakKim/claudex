@@ -8,7 +8,7 @@ import json
 import os
 import subprocess
 import sys
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -43,6 +43,7 @@ class FakeAskRuntime:
         self.error = error
         self.questions: list[str] = []
         self.provider_conversation_ids: list[str | None] = []
+        self.provider_attachment_paths: list[Sequence[str] | None] = []
         self._conversation_id_callbacks: list[
             Callable[[str], None] | None
         ] = []
@@ -59,11 +60,13 @@ class FakeAskRuntime:
         on_conversation_id: Callable[[str], None] | None = None,
         conversation_id: str | None = None,
         timeout_seconds: float | None = None,
+        attachment_paths: Sequence[str] | None = None,
     ) -> ask.AskOutcome:
         del timeout_seconds
         async with self._provider_calls_changed:
             self.questions.append(question)
             self.provider_conversation_ids.append(conversation_id)
+            self.provider_attachment_paths.append(attachment_paths)
             self._conversation_id_callbacks.append(on_conversation_id)
             self._provider_calls_changed.notify_all()
         if on_status is not None:
@@ -83,11 +86,13 @@ class FakeAskRuntime:
         *,
         conversation_id: str | None = None,
         on_thread_ref: Callable[[str], None] | None = None,
+        attachment_paths: Sequence[str] | None = None,
     ) -> jobs.AskJob:
         return self._job_service.start(
             question,
             conversation_id=conversation_id,
             on_thread_ref=on_thread_ref,
+            attachment_paths=attachment_paths,
         )
 
     def lookup_thread(self, session_id: str) -> str | None:
@@ -269,6 +274,16 @@ def test_tools_list_exposes_job_tools_schemas_and_usage_guidance() -> None:
                     "continue this session's current conversation."
                 ),
             },
+            "attachments": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "Optional plain-text file paths to attach (UTF-8 only; at "
+                    "most 10 files and 1.2 MB total; questions over ~35 KB are "
+                    "spilled into an attachment automatically, so send full "
+                    "text)."
+                ),
+            },
         },
         "required": ["question"],
         "additionalProperties": False,
@@ -286,6 +301,9 @@ def test_tools_list_exposes_job_tools_schemas_and_usage_guidance() -> None:
     assert "ask_gpt_pro_status(ask_id)" in ask_description
     assert "ask_gpt_pro_result(ask_id)" in ask_description
     assert "self-contained whenever possible" in ask_description
+    assert "up to 10 UTF-8 plain-text files totaling 1.2 MB" in ask_description
+    assert "Questions over ~35 KB" in ask_description
+    assert "send the full text" in ask_description
     assert "Omitting thread continues this MCP session's current conversation" in (
         ask_description
     )
@@ -356,6 +374,56 @@ def test_submit_returns_immediately_and_status_transitions_to_succeeded() -> Non
         "thread_ref": "conversation-123",
     }
     assert runtime.questions == ["Review this decision."]
+
+
+def test_submit_passes_attachment_paths_to_provider() -> None:
+    runtime = FakeAskRuntime()
+    attachment_paths = ["notes.txt", "context.txt"]
+    with _mcp_client(runtime) as client:
+        _payload, headers = _initialize(client)
+        submitted = _json_tool_payload(
+            _call_tool(
+                client,
+                headers,
+                "ask_gpt_pro",
+                {
+                    "question": "Review the attached context.",
+                    "attachments": attachment_paths,
+                },
+            )
+        )
+        _wait_for_provider_calls(client, runtime, 1)
+        _finish_job(client, runtime, submitted["ask_id"])
+
+    assert runtime.provider_attachment_paths == [attachment_paths]
+
+
+@pytest.mark.parametrize(
+    "attachments",
+    ["notes.txt", ["notes.txt", 42]],
+    ids=["not-an-array", "non-string-item"],
+)
+def test_submit_rejects_invalid_attachments(attachments: Any) -> None:
+    runtime = FakeAskRuntime()
+    with _mcp_client(runtime) as client:
+        _payload, headers = _initialize(client)
+        result = _call_tool(
+            client,
+            headers,
+            "ask_gpt_pro",
+            {"question": "Question", "attachments": attachments},
+        )
+
+    assert result == {
+        "content": [
+            {
+                "type": "text",
+                "text": "attachments must be an array of strings",
+            }
+        ],
+        "isError": True,
+    }
+    assert runtime.provider_attachment_paths == []
 
 
 def test_result_returns_settled_answer_and_thread_ref() -> None:

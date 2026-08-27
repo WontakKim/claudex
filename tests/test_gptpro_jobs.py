@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
+from pathlib import Path
 
 import pytest
 
@@ -423,6 +424,129 @@ def test_provider_receives_remaining_overall_timeout() -> None:
     captured_timeout = captured_timeouts[0]
     assert captured_timeout is not None
     assert 0 < captured_timeout <= 12.5
+
+
+@pytest.mark.parametrize("should_fail", [False, True], ids=["success", "failure"])
+def test_oversized_question_spills_to_temporary_attachment_and_cleans_up(
+    monkeypatch: pytest.MonkeyPatch,
+    should_fail: bool,
+) -> None:
+    monkeypatch.setattr(jobs, "QUESTION_SPILL_THRESHOLD_BYTES", 8)
+    provider_started = asyncio.Event()
+    release_provider = asyncio.Event()
+    captured_questions: list[str] = []
+    captured_attachment_paths: list[Sequence[str] | None] = []
+    original_question = "price: €"
+
+    async def provider(
+        question: str,
+        *,
+        on_status: Callable[[str], None] | None = None,
+        on_conversation_id: Callable[[str], None] | None = None,
+        conversation_id: str | None = None,
+        timeout_seconds: float | None = None,
+        attachment_paths: Sequence[str] | None = None,
+    ) -> ask.AskOutcome:
+        del on_status, on_conversation_id, conversation_id, timeout_seconds
+        captured_questions.append(question)
+        captured_attachment_paths.append(attachment_paths)
+        provider_started.set()
+        await release_provider.wait()
+        if should_fail:
+            raise RuntimeError("provider failed")
+        return ask.AskOutcome("answer", "marker", None)
+
+    async def scenario() -> None:
+        service = jobs.AskJobService(provider)
+        started_job = service.start(original_question)
+
+        await provider_started.wait()
+        attachment_paths = captured_attachment_paths[0]
+        assert attachment_paths is not None
+        assert len(attachment_paths) == 1
+        spill_path = Path(attachment_paths[0])
+        assert spill_path.name.startswith("gptpro-spill-")
+        assert spill_path.suffix == ".txt"
+        assert spill_path.exists()
+        assert spill_path.read_text(encoding="utf-8") == original_question
+        assert captured_questions == [
+            "The full question text is attached as "
+            f"{spill_path.name}; read the attachment and answer it."
+        ]
+
+        release_provider.set()
+        expected_state: jobs.AskJobState = (
+            "failed" if should_fail else "succeeded"
+        )
+        await _wait_for_state(service, started_job.ask_id, expected_state)
+        assert not spill_path.exists()
+        await service.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_question_at_spill_threshold_is_sent_inline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(jobs, "QUESTION_SPILL_THRESHOLD_BYTES", 10)
+    captured_questions: list[str] = []
+    captured_attachment_paths: list[Sequence[str] | None] = []
+
+    async def provider(
+        question: str,
+        *,
+        on_status: Callable[[str], None] | None = None,
+        on_conversation_id: Callable[[str], None] | None = None,
+        conversation_id: str | None = None,
+        timeout_seconds: float | None = None,
+        attachment_paths: Sequence[str] | None = None,
+    ) -> ask.AskOutcome:
+        del on_status, on_conversation_id, conversation_id, timeout_seconds
+        captured_questions.append(question)
+        captured_attachment_paths.append(attachment_paths)
+        return ask.AskOutcome("answer", "marker", None)
+
+    async def scenario() -> None:
+        service = jobs.AskJobService(provider)
+        question = "price: €"
+        started_job = service.start(question)
+        await _wait_for_state(service, started_job.ask_id, "succeeded")
+        assert captured_questions == [question]
+        assert captured_attachment_paths == [None]
+        await service.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_explicit_attachment_paths_are_passed_unchanged() -> None:
+    captured_attachment_paths: list[Sequence[str] | None] = []
+
+    async def provider(
+        question: str,
+        *,
+        on_status: Callable[[str], None] | None = None,
+        on_conversation_id: Callable[[str], None] | None = None,
+        conversation_id: str | None = None,
+        timeout_seconds: float | None = None,
+        attachment_paths: Sequence[str] | None = None,
+    ) -> ask.AskOutcome:
+        del question, on_status, on_conversation_id, conversation_id
+        del timeout_seconds
+        captured_attachment_paths.append(attachment_paths)
+        return ask.AskOutcome("answer", "marker", None)
+
+    async def scenario() -> None:
+        service = jobs.AskJobService(provider)
+        explicit_attachment_paths = ["notes.txt", "context.txt"]
+        started_job = service.start(
+            "question", attachment_paths=explicit_attachment_paths
+        )
+        await _wait_for_state(service, started_job.ask_id, "succeeded")
+        assert captured_attachment_paths == [explicit_attachment_paths]
+        assert captured_attachment_paths[0] is explicit_attachment_paths
+        await service.aclose()
+
+    asyncio.run(scenario())
 
 
 def test_thread_registry_returns_bound_thread_and_none_for_unknown_session() -> None:
