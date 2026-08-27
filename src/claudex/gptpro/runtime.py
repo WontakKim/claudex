@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 import random
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from typing import Any
 
 from claudex import locking, paths
@@ -101,6 +101,7 @@ class AskRuntime:
         on_conversation_id: Callable[[str], None] | None = None,
         conversation_id: str | None = None,
         timeout_seconds: float | None = None,
+        attachment_paths: Sequence[str] | None = None,
     ) -> AskOutcome:
         """Execute one ask in a fresh tab of the shared persistent context."""
         status = session.session_status()
@@ -130,6 +131,7 @@ class AskRuntime:
                 on_conversation_id,
                 conversation_id,
                 timeout_seconds,
+                attachment_paths,
             )
 
     async def aclose(self) -> None:
@@ -175,6 +177,7 @@ class AskRuntime:
         on_conversation_id: Callable[[str], None] | None,
         conversation_id: str | None,
         timeout_seconds: float | None,
+        attachment_paths: Sequence[str] | None,
     ) -> AskOutcome:
         page: Any | None = None
         primary_failure: BaseException | None = None
@@ -189,6 +192,8 @@ class AskRuntime:
                 execution_options["conversation_id"] = conversation_id
             if timeout_seconds is not None:
                 execution_options["timeout_seconds"] = timeout_seconds
+            if attachment_paths is not None:
+                execution_options["attachment_paths"] = attachment_paths
             return await ask.execute_ask_outcome(
                 page,
                 question,

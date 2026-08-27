@@ -9,12 +9,13 @@ import math
 import os
 import time
 from collections import deque
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Literal
 from urllib.parse import urlsplit
 from uuid import uuid4
 
+from claudex.gptpro import attachments
 from claudex.gptpro.browser import COMPOSER_TIMEOUT_MS, NAVIGATION_TIMEOUT_MS
 from claudex.gptpro.conversation import (
     CHATGPT_URL,
@@ -218,6 +219,7 @@ class _AskExecution:
         *,
         conversation_id: str | None = None,
         timeout_seconds: float | None = None,
+        attachment_paths: Sequence[str] | None = None,
     ) -> None:
         if conversation_id is not None and not is_conversation_id(conversation_id):
             raise GptProAskError(
@@ -235,6 +237,7 @@ class _AskExecution:
         self.deadline = _monotonic() + timeout_budget
         self.marker = build_nonce_marker(str(uuid4()))
         self.prompt = f"{self.marker}\n\n{question}\n\n{self.marker}"
+        self.attachment_paths = tuple(attachment_paths or ())
         self.network = _NetworkState(conversation_id=conversation_id)
         self.listener_tasks: set[asyncio.Task[None]] = set()
         self.request_listener: Callable[[Any], None] | None = None
@@ -565,6 +568,24 @@ class _AskExecution:
         raise GptProAskError(
             "navigation_failed", "the ChatGPT composer did not become visible"
         )
+
+    async def _attach_files(self) -> None:
+        self._ensure_deadline()
+        timeout_seconds = min(
+            attachments.ATTACH_SETTLE_TIMEOUT_SECONDS, self._remaining()
+        )
+        try:
+            await attachments.attach_files(
+                self.page,
+                self.attachment_paths,
+                timeout_seconds=timeout_seconds,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            raise GptProAskError(
+                "error", f"ChatGPT attachment upload failed: {exc}"
+            ) from exc
 
     async def _stable_pre_submit_user_ids(self) -> list[str]:
         end = min(self.deadline, _monotonic() + PRE_SUBMIT_STABILITY_TIMEOUT_SECONDS)
@@ -1143,6 +1164,8 @@ class _AskExecution:
             self._ensure_deadline()
             await self._navigate()
             await self._wait_for_composer()
+            if self.attachment_paths:
+                await self._attach_files()
             pre_submit_ids = await self._stable_pre_submit_user_ids()
             await self._fill_and_verify()
             await self._click_send()
@@ -1188,6 +1211,7 @@ async def execute_ask_outcome(
     on_conversation_id: Callable[[str], None] | None = None,
     conversation_id: str | None = None,
     timeout_seconds: float | None = None,
+    attachment_paths: Sequence[str] | None = None,
 ) -> AskOutcome:
     """Submit one prompt and return its answer with tracking metadata.
 
@@ -1201,6 +1225,7 @@ async def execute_ask_outcome(
         on_conversation_id,
         conversation_id=conversation_id,
         timeout_seconds=timeout_seconds,
+        attachment_paths=attachment_paths,
     ).run()
 
 

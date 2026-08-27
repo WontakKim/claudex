@@ -117,6 +117,7 @@ class _FakePage:
         self.goto_urls: list[str] = []
         self.goto_checked_listeners = False
         self.relock_id = "user-relocked"
+        self.call_order: list[str] = []
 
     def on(self, event: str, listener: Callable[[Any], None]) -> None:
         self.listeners[event].append(listener)
@@ -145,12 +146,14 @@ class _FakePage:
         assert selector == selectors.COMPOSER_SELECTOR
         assert state == "visible"
         assert timeout > 0
+        self.call_order.append("composer")
         return object()
 
     async def fill(self, selector: str, value: str) -> None:
         assert selector == selectors.COMPOSER_SELECTOR
         if self.hang_operation == "fill":
             await asyncio.Event().wait()
+        self.call_order.append("fill")
         self.composer_value = value
         self.filled_prompt = value
 
@@ -570,6 +573,88 @@ def test_listener_is_installed_before_navigation_and_submit(
 
     assert page.goto_checked_listeners
     assert page.click_count == 1
+
+
+def test_attachment_upload_runs_after_composer_and_before_fill(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_clock(monkeypatch)
+    page = _FakePage()
+    captured: list[tuple[tuple[str, ...], float | None]] = []
+
+    async def attach_files(
+        attached_page: _FakePage,
+        attachment_paths: tuple[str, ...],
+        *,
+        timeout_seconds: float | None = None,
+    ) -> None:
+        assert attached_page is page
+        page.call_order.append("attach")
+        captured.append((attachment_paths, timeout_seconds))
+
+    monkeypatch.setattr(ask.attachments, "attach_files", attach_files)
+
+    asyncio.run(
+        ask.execute_ask_outcome(
+            page,
+            "Review this code",
+            attachment_paths=["notes.txt"],
+        )
+    )
+
+    assert page.call_order.index("composer") < page.call_order.index("attach")
+    assert page.call_order.index("attach") < page.call_order.index("fill")
+    assert captured == [
+        (("notes.txt",), ask.attachments.ATTACH_SETTLE_TIMEOUT_SECONDS)
+    ]
+
+
+@pytest.mark.parametrize("attachment_paths", [None, []])
+def test_empty_attachment_paths_do_not_invoke_attachment_upload(
+    monkeypatch: pytest.MonkeyPatch,
+    attachment_paths: list[str] | None,
+) -> None:
+    _install_clock(monkeypatch)
+    page = _FakePage()
+
+    async def fail_attach(*_args: Any, **_kwargs: Any) -> None:
+        raise AssertionError("attachment upload must not be invoked")
+
+    monkeypatch.setattr(ask.attachments, "attach_files", fail_attach)
+
+    asyncio.run(
+        ask.execute_ask_outcome(
+            page,
+            "Review this code",
+            attachment_paths=attachment_paths,
+        )
+    )
+
+
+def test_attachment_failure_is_classified_with_attachment_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_clock(monkeypatch)
+    page = _FakePage()
+
+    async def fail_attach(*_args: Any, **_kwargs: Any) -> None:
+        raise ValueError("invalid UTF-8")
+
+    monkeypatch.setattr(ask.attachments, "attach_files", fail_attach)
+
+    with pytest.raises(ask.GptProAskError) as raised:
+        asyncio.run(
+            ask.execute_ask_outcome(
+                page,
+                "Review this code",
+                attachment_paths=["binary.zip"],
+            )
+        )
+
+    assert raised.value.failure == "error"
+    assert "attachment upload failed" in str(raised.value)
+    assert "invalid UTF-8" in str(raised.value)
+    assert "fill" not in page.call_order
 
 
 def test_missing_echo_with_retained_composer_retries_click_once(

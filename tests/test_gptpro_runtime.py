@@ -183,6 +183,40 @@ def test_runtime_propagates_conversation_and_timeout(
     ]
 
 
+def test_runtime_propagates_attachment_paths(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = _FakeContext()
+    _RuntimeFakes(monkeypatch, [context])
+    captured_paths: list[list[str] | None] = []
+
+    async def execute_ask_outcome(
+        page: _FakePage,
+        question: str,
+        *,
+        on_status: Callable[[str], None] | None = None,
+        on_conversation_id: Callable[[str], None] | None = None,
+        attachment_paths: list[str] | None = None,
+    ) -> ask.AskOutcome:
+        del page, on_status, on_conversation_id
+        captured_paths.append(attachment_paths)
+        return _outcome(question)
+
+    monkeypatch.setattr(runtime.ask, "execute_ask_outcome", execute_ask_outcome)
+
+    async def scenario() -> None:
+        ask_runtime = runtime.AskRuntime()
+        outcome = await ask_runtime.ask(
+            "question", attachment_paths=["notes.txt"]
+        )
+        assert outcome.text == "question"
+        await ask_runtime.aclose()
+
+    asyncio.run(scenario())
+
+    assert captured_paths == [["notes.txt"]]
+
+
 def test_runtime_limits_concurrent_asks_to_two(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
