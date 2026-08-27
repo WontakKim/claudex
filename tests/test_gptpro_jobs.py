@@ -208,7 +208,7 @@ def test_status_callback_updates_latest_status_message() -> None:
     asyncio.run(scenario())
 
 
-def test_conversation_id_callback_latches_first_thread_ref_while_running() -> None:
+def test_conversation_id_latches_thread_ref_but_notifies_on_success() -> None:
     conversation_id_updated = asyncio.Event()
     release_provider = asyncio.Event()
     captured_thread_refs: list[str] = []
@@ -241,19 +241,50 @@ def test_conversation_id_callback_latches_first_thread_ref_while_running() -> No
         assert running_job is not None
         assert running_job.state == "running"
         assert running_job.thread_ref == "first-conversation"
-        assert captured_thread_refs == ["first-conversation"]
+        assert captured_thread_refs == []
 
         release_provider.set()
         completed_job = await _wait_for_state(
             service, started_job.ask_id, "succeeded"
         )
         assert completed_job.thread_ref == "first-conversation"
+        assert captured_thread_refs == ["first-conversation"]
         await service.aclose()
 
     asyncio.run(scenario())
 
 
-def test_existing_conversation_is_visible_and_passed_to_provider() -> None:
+def test_failed_job_does_not_notify_latched_thread_ref() -> None:
+    captured_thread_refs: list[str] = []
+
+    async def provider(
+        question: str,
+        *,
+        on_status: Callable[[str], None] | None = None,
+        on_conversation_id: Callable[[str], None] | None = None,
+        conversation_id: str | None = None,
+        timeout_seconds: float | None = None,
+    ) -> ask.AskOutcome:
+        del question, on_status, conversation_id, timeout_seconds
+        assert on_conversation_id is not None
+        on_conversation_id("failed-conversation")
+        raise ask.GptProAskError("error", "provider failed")
+
+    async def scenario() -> None:
+        service = jobs.AskJobService(provider)
+        started_job = service.start(
+            "question", on_thread_ref=captured_thread_refs.append
+        )
+        failed_job = await _wait_for_state(service, started_job.ask_id, "failed")
+
+        assert failed_job.thread_ref == "failed-conversation"
+        assert captured_thread_refs == []
+        await service.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_existing_conversation_notifies_thread_ref_on_success() -> None:
     captured_options: list[tuple[str | None, float | None]] = []
     captured_thread_refs: list[str] = []
 
@@ -284,7 +315,7 @@ def test_existing_conversation_is_visible_and_passed_to_provider() -> None:
             service, started_job.ask_id, "succeeded"
         )
         assert completed_job.thread_ref == "existing-conversation"
-        assert captured_thread_refs == []
+        assert captured_thread_refs == ["existing-conversation"]
         assert len(captured_options) == 1
         captured_conversation_id, captured_timeout = captured_options[0]
         assert captured_conversation_id == "existing-conversation"

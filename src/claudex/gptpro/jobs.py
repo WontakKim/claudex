@@ -128,6 +128,11 @@ class AskJobService:
         on_thread_ref: Callable[[str], None] | None = None,
         attachment_paths: Sequence[str] | None = None,
     ) -> AskJob:
+        """Start an ask and notify `on_thread_ref` only after it succeeds.
+
+        Completion-time notification makes concurrent session bindings follow
+        successful completion order instead of conversation ID discovery order.
+        """
         ask_id = uuid4().hex
         created_at = self._clock()
         expires_at = created_at + self._overall_timeout_seconds
@@ -236,9 +241,7 @@ class AskJobService:
             def capture_conversation_id(
                 captured_conversation_id: str,
             ) -> None:
-                self._on_conversation_id(
-                    ask_id, captured_conversation_id, on_thread_ref
-                )
+                self._on_conversation_id(ask_id, captured_conversation_id)
 
             def capture_marker(marker: str) -> None:
                 self._on_marker(ask_id, marker)
@@ -280,9 +283,7 @@ class AskJobService:
             outcome = await self._ask(provider_question, **ask_options)
             job = self._jobs[ask_id]
             if job.thread_ref is None and outcome.conversation_id is not None:
-                self._on_conversation_id(
-                    ask_id, outcome.conversation_id, on_thread_ref
-                )
+                self._on_conversation_id(ask_id, outcome.conversation_id)
                 job = self._jobs[ask_id]
             self._jobs[ask_id] = replace(
                 job,
@@ -294,6 +295,12 @@ class AskJobService:
                     else outcome.marker
                 ),
             )
+            thread_ref = self._jobs[ask_id].thread_ref
+            if on_thread_ref is not None and thread_ref is not None:
+                try:
+                    on_thread_ref(thread_ref)
+                except Exception:
+                    pass
         except GptProAskError as exc:
             self._jobs[ask_id] = replace(
                 self._jobs[ask_id],
@@ -333,18 +340,11 @@ class AskJobService:
         self,
         ask_id: str,
         conversation_id: str,
-        on_thread_ref: Callable[[str], None] | None,
     ) -> None:
         job = self._jobs[ask_id]
         if job.thread_ref is not None:
             return
         self._jobs[ask_id] = replace(job, thread_ref=conversation_id)
-        if on_thread_ref is None:
-            return
-        try:
-            on_thread_ref(conversation_id)
-        except Exception:
-            return
 
     async def _run_sweeper(self) -> None:
         while True:

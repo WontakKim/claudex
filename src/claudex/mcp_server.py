@@ -22,8 +22,8 @@ ASK_GPT_PRO_DESCRIPTION = (
     "self-contained whenever possible. Attach up to 10 UTF-8 plain-text "
     "files totaling 1.2 MB with attachments. Questions over ~35 KB are "
     "spilled into an attachment automatically, so send the full text. "
-    "Omitting thread continues this MCP "
-    "session's current conversation, or starts a new one when the session is "
+    "Omitting thread continues this MCP session's most recently completed "
+    "conversation, or starts a new one when the session is "
     "unbound, so ChatGPT can see previous turns and short follow-up questions "
     "may rely on them. Set thread to \"new\" to force a fresh conversation, or "
     "pass a conversation UUID from a previous thread_ref to revisit that "
@@ -39,8 +39,10 @@ ASK_GPT_PRO_DESCRIPTION = (
 ASK_GPT_PRO_STATUS_DESCRIPTION = (
     "Poll a background ChatGPT Pro ask and return its current state, latest "
     "status message, and thread_ref. The thread_ref is preserved throughout the "
-    "job lifecycle. A status_message of \"waiting for the in-flight answer\" "
-    "means the previous ask in the same conversation is still finishing."
+    "job lifecycle. A thread_ref can appear while an ask is running, but it "
+    "becomes this MCP session's binding only after the ask succeeds. A "
+    "status_message of \"waiting for the in-flight answer\" means the previous "
+    "ask in the same conversation is still finishing."
 )
 ASK_GPT_PRO_RESULT_DESCRIPTION = (
     "Fetch the settled result of a background ChatGPT Pro ask after its status "
@@ -54,7 +56,7 @@ _ATTACHMENTS_DESCRIPTION = (
 _THREAD_DESCRIPTION = (
     "'new' forces a fresh conversation; a conversation UUID (a previous "
     "thread_ref) continues that conversation; omit to continue this session's "
-    "current conversation."
+    "most recently completed conversation."
 )
 ASK_GPT_PRO_ALLOWED_ARGUMENT_KEYS = ("question", "thread", "attachments")
 ASK_GPT_PRO_STATUS_ALLOWED_ARGUMENT_KEYS = ("ask_id",)
@@ -338,8 +340,6 @@ def _create_session_manager(app: Any) -> Any:
                 )
             else:
                 conversation_id = arguments["thread"]
-                if session_id is not None:
-                    runtime.bind_thread(session_id, conversation_id)
 
             on_thread_ref = None
             if session_id is not None:
