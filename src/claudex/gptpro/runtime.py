@@ -424,6 +424,7 @@ class AskRuntime:
         on_status: Callable[[str], None] | None = None,
         on_conversation_id: Callable[[str], None] | None = None,
         on_marker: Callable[[str], None] | None = None,
+        on_detached: Callable[[], None] | None = None,
         conversation_id: str | None = None,
         timeout_seconds: float | None = None,
         attachment_paths: Sequence[str] | None = None,
@@ -475,6 +476,7 @@ class AskRuntime:
                 on_status,
                 on_conversation_id,
                 on_marker,
+                on_detached,
                 conversation_id,
                 timeout_seconds,
                 attachment_paths,
@@ -531,6 +533,7 @@ class AskRuntime:
         on_status: Callable[[str], None] | None,
         on_conversation_id: Callable[[str], None] | None,
         on_marker: Callable[[str], None] | None,
+        on_detached: Callable[[], None] | None,
         conversation_id: str | None,
         timeout_seconds: float | None,
         attachment_paths: Sequence[str] | None,
@@ -564,6 +567,11 @@ class AskRuntime:
                         "error",
                         "the detached ask did not provide a conversation ID",
                     )
+                if on_detached is not None:
+                    try:
+                        on_detached()
+                    except Exception:
+                        pass
                 future = self._poller.register(
                     conversation_id,
                     submission.marker,

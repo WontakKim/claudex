@@ -32,7 +32,9 @@ WATCHDOG_MIN_SAMPLES = 5
 WATCHDOG_MARGIN_RATIO = 0.5
 WATCHDOG_MIN_BUDGET_SECONDS = 60.0
 
-AskJobState = Literal["running", "succeeded", "failed"]
+AskJobState = Literal[
+    "queued", "running", "detached", "succeeded", "failed"
+]
 
 
 @dataclass(frozen=True)
@@ -64,6 +66,7 @@ class _AskCallable(Protocol):
         on_status: Callable[[str], None] | None = None,
         on_conversation_id: Callable[[str], None] | None = None,
         on_marker: Callable[[str], None] | None = None,
+        on_detached: Callable[[], None] | None = None,
         conversation_id: str | None = None,
         timeout_seconds: float | None = None,
         attachment_paths: Sequence[str] | None = None,
@@ -156,6 +159,9 @@ class AskJobService:
         self._supports_marker_callback = (
             supports_keyword_options or "on_marker" in ask_parameters
         )
+        self._supports_detached_callback = (
+            supports_keyword_options or "on_detached" in ask_parameters
+        )
         self._retention_seconds = retention_seconds
         self._sweep_interval_seconds = sweep_interval_seconds
         self._overall_timeout_seconds = (
@@ -199,7 +205,7 @@ class AskJobService:
         queue_deadline = created_at + self._queue_ttl_seconds
         job = AskJob(
             ask_id=ask_id,
-            state="running",
+            state="queued",
             answer=None,
             failure=None,
             error_message=None,
@@ -293,6 +299,9 @@ class AskJobService:
                     await thread_lock.acquire()
                 has_thread_lock = True
 
+            self._jobs[ask_id] = replace(
+                self._jobs[ask_id], state="running"
+            )
             admitted_at = self._clock()
             remaining = self._watchdog.execution_budget_seconds()
 
@@ -306,6 +315,9 @@ class AskJobService:
 
             def capture_marker(marker: str) -> None:
                 self._on_marker(ask_id, marker)
+
+            def capture_detached() -> None:
+                self._on_detached(ask_id)
 
             provider_question = question
             provider_attachment_paths = attachment_paths
@@ -334,6 +346,8 @@ class AskJobService:
             }
             if self._supports_marker_callback:
                 ask_options["on_marker"] = capture_marker
+            if self._supports_detached_callback:
+                ask_options["on_detached"] = capture_detached
             if self._supports_conversation_options:
                 ask_options.update(
                     conversation_id=conversation_id,
@@ -402,6 +416,12 @@ class AskJobService:
         self._jobs[ask_id] = replace(
             self._jobs[ask_id], status_message=message
         )
+
+    def _on_detached(self, ask_id: str) -> None:
+        job = self._jobs.get(ask_id)
+        if job is None or job.state != "running":
+            return
+        self._jobs[ask_id] = replace(job, state="detached")
 
     def _on_marker(self, ask_id: str, marker: str) -> None:
         job = self._jobs[ask_id]

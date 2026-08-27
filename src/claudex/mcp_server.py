@@ -16,37 +16,52 @@ from claudex.gptpro import conversation, jobs
 ASK_GPT_PRO_DESCRIPTION = (
     "Send a self-contained question to ChatGPT Pro as a background job and return "
     "immediately with {ask_id, thread_ref}. Poll "
-    "ask_gpt_pro_status(ask_id) until state is succeeded or failed, then fetch "
-    "ask_gpt_pro_result(ask_id) for the settled Markdown answer. Include all "
-    "necessary code, logs, metadata, and context inline so the question is "
-    "self-contained whenever possible. Attach up to 10 UTF-8 plain-text "
-    "files totaling 1.2 MB with attachments. Questions over ~35 KB are "
-    "spilled into an attachment automatically, so send the full text. "
+    "ask_gpt_pro_status(ask_id) while state is queued, running, or detached; "
+    "detached asks remain recoverable and normally return through polling. When "
+    "state is succeeded or failed, fetch ask_gpt_pro_result(ask_id) for the "
+    "settled Markdown answer or failure. An expired failure means same-conversation "
+    "queue admission timed out; use the preserved thread_ref, and nonce marker "
+    "when available, to revisit the conversation and attempt answer recovery. "
+    "Include all necessary code, logs, metadata, and context inline so the "
+    "question is self-contained whenever possible. Attach up to 10 UTF-8 "
+    "plain-text files totaling 1.2 MB with attachments. Questions over ~35 KB "
+    "are spilled into an attachment automatically, so send the full text. "
     "Omitting thread continues this MCP session's most recently completed "
-    "conversation, or starts a new one when the session is "
-    "unbound, so ChatGPT can see previous turns and short follow-up questions "
-    "may rely on them. Set thread to \"new\" to force a fresh conversation, or "
-    "pass a conversation UUID from a previous thread_ref to revisit that "
-    "conversation; separate MCP sessions share a conversation only when they "
-    "explicitly pass the same UUID. Asks in the same conversation are serialized, "
-    "and status reports that an ask is waiting while the previous ask finishes. "
-    "If the answer begins with GPTPRO_CONTEXT_REQUEST_V1, gather the requested "
-    "material and call again — omitting thread continues the conversation. Use "
-    "this tool only when the user explicitly requests ChatGPT Pro or for a "
-    "consequential judgment where a second opinion materially helps; do not use "
-    "it routinely."
+    "conversation, or starts a new one when the session is unbound, so ChatGPT "
+    "can see previous turns and short follow-up questions may rely on them. Set "
+    "thread to \"new\" to force a fresh conversation, or pass a conversation "
+    "UUID from a previous thread_ref to revisit that conversation; separate MCP "
+    "sessions share a conversation only when they explicitly pass the same UUID. "
+    "Asks in the same conversation are serialized, and status reports that an "
+    "ask is waiting while the previous ask finishes without blocking asks in "
+    "other conversations. If the answer begins with GPTPRO_CONTEXT_REQUEST_V1, "
+    "gather the requested material and call again — omitting thread continues "
+    "the conversation. Use this tool only when the user explicitly requests "
+    "ChatGPT Pro or for a consequential judgment where a second opinion "
+    "materially helps; do not use it routinely."
 )
 ASK_GPT_PRO_STATUS_DESCRIPTION = (
     "Poll a background ChatGPT Pro ask and return its current state, latest "
     "status message, and thread_ref. The thread_ref is preserved throughout the "
-    "job lifecycle. A thread_ref can appear while an ask is running, but it "
-    "becomes this MCP session's binding only after the ask succeeds. A "
-    "status_message of \"waiting for the in-flight answer\" means the previous "
-    "ask in the same conversation is still finishing."
+    "job lifecycle. queued means awaiting admission, normally "
+    "because the previous ask in the same conversation is still generating; "
+    "asks in other conversations can continue in parallel. running means the "
+    "ask was submitted and ChatGPT is generating the answer. detached means "
+    "server-side generation continues while the gateway polls to recover the "
+    "answer, which normally returns through the job. succeeded and failed are "
+    "terminal. For failed jobs, failure=expired means same-conversation queue "
+    "waiting reached its TTL; thread_ref and any available nonce marker are "
+    "preserved so callers can revisit that conversation with thread and attempt "
+    "answer recovery. A thread_ref can appear before completion, but it becomes "
+    "this MCP session's binding only after the ask succeeds. status_message "
+    "values such as \"waiting for the in-flight answer\" and \"detached; "
+    "polling for the answer\" remain supplemental progress details."
 )
 ASK_GPT_PRO_RESULT_DESCRIPTION = (
-    "Fetch the settled result of a background ChatGPT Pro ask after its status "
-    "is succeeded or failed."
+    "Fetch the settled result of a background ChatGPT Pro ask only after its "
+    "status is succeeded or failed; queued, running, and detached are still in "
+    "progress. For failure=expired, use the preserved thread_ref and any nonce "
+    "marker to revisit the conversation and attempt answer recovery."
 )
 _ATTACHMENTS_DESCRIPTION = (
     "Optional plain-text file paths to attach (UTF-8 only; at most 10 files "
@@ -105,6 +120,7 @@ class LazyAskRuntime:
         on_status: Callable[[str], None] | None = None,
         on_conversation_id: Callable[[str], None] | None = None,
         on_marker: Callable[[str], None] | None = None,
+        on_detached: Callable[[], None] | None = None,
         conversation_id: str | None = None,
         timeout_seconds: float | None = None,
         attachment_paths: Sequence[str] | None = None,
@@ -115,6 +131,7 @@ class LazyAskRuntime:
             on_status=on_status,
             on_conversation_id=on_conversation_id,
             on_marker=on_marker,
+            on_detached=on_detached,
             conversation_id=conversation_id,
             timeout_seconds=timeout_seconds,
             attachment_paths=attachment_paths,
@@ -398,7 +415,7 @@ def _create_session_manager(app: Any) -> Any:
             job = runtime.job_result(ask_id)
             if job is None:
                 return _tool_error(types, f"Unknown or expired ask_id: {ask_id}")
-            if job.state == "running":
+            if job.state in {"queued", "running", "detached"}:
                 return _tool_error(
                     types,
                     f"Ask {ask_id} is still running; poll ask_gpt_pro_status.",

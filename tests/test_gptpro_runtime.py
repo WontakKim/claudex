@@ -966,6 +966,13 @@ def test_runtime_detaches_waiting_answer_when_submitter_contends(
     monkeypatch.setenv("GPTPRO_MAX_CONCURRENT_ASKS", "1")
     first_started = asyncio.Event()
     second_started = asyncio.Event()
+    detached_callback_calls = 0
+
+    def capture_detached() -> None:
+        nonlocal detached_callback_calls
+        assert pollers[0].registrations == []
+        detached_callback_calls += 1
+        raise RuntimeError("callback failed")
 
     async def execute_ask_outcome(
         page: _FakePage,
@@ -1000,7 +1007,9 @@ def test_runtime_detaches_waiting_answer_when_submitter_contends(
 
     async def scenario() -> None:
         ask_runtime = runtime.AskRuntime()
-        first_task = asyncio.create_task(ask_runtime.ask("first"))
+        first_task = asyncio.create_task(
+            ask_runtime.ask("first", on_detached=capture_detached)
+        )
         await first_started.wait()
         second_task = asyncio.create_task(ask_runtime.ask("second"))
         await second_started.wait()
@@ -1009,6 +1018,7 @@ def test_runtime_detaches_waiting_answer_when_submitter_contends(
         assert not first_task.done()
         assert len(context.pages) == 2
         assert context.pages[0].close_calls == 1
+        assert detached_callback_calls == 1
         assert pollers[0].registrations[0][:2] == (
             _CONVERSATION_ID,
             "first-marker",

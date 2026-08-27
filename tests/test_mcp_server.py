@@ -19,7 +19,7 @@ from starlette.testclient import TestClient
 
 from claudex.config import GatewayConfig
 from claudex.gptpro import ask, jobs
-from claudex.mcp_server import McpEndpoint
+from claudex.mcp_server import LazyAskRuntime, McpEndpoint
 
 _PROTOCOL_VERSION = "2025-06-18"
 _REQUEST_HEADERS = {
@@ -308,6 +308,10 @@ def test_tools_list_exposes_job_tools_schemas_and_usage_guidance() -> None:
     assert "return immediately with {ask_id, thread_ref}" in ask_description
     assert "ask_gpt_pro_status(ask_id)" in ask_description
     assert "ask_gpt_pro_result(ask_id)" in ask_description
+    assert "state is queued, running, or detached" in ask_description
+    assert "detached asks remain recoverable" in ask_description
+    assert "An expired failure" in ask_description
+    assert "attempt answer recovery" in ask_description
     assert "self-contained whenever possible" in ask_description
     assert "up to 10 UTF-8 plain-text files totaling 1.2 MB" in ask_description
     assert "Questions over ~35 KB" in ask_description
@@ -332,8 +336,94 @@ def test_tools_list_exposes_job_tools_schemas_and_usage_guidance() -> None:
         status_description
     )
     assert "binding only after the ask succeeds" in status_description
+    assert "queued means awaiting admission" in status_description
+    assert "asks in other conversations can continue in parallel" in (
+        status_description
+    )
+    assert "running means the ask was submitted" in status_description
+    assert "detached means server-side generation continues" in (
+        status_description
+    )
+    assert "succeeded and failed are terminal" in status_description
+    assert "failure=expired" in status_description
+    assert "any available nonce marker are preserved" in status_description
     assert '"waiting for the in-flight answer"' in status_description
-    assert "settled result" in tools["ask_gpt_pro_result"]["description"]
+    assert '"detached; polling for the answer"' in status_description
+    result_description = tools["ask_gpt_pro_result"]["description"]
+    assert "settled result" in result_description
+    assert "queued, running, and detached are still in progress" in (
+        result_description
+    )
+    assert "failure=expired" in result_description
+
+
+def test_lazy_runtime_forwards_detached_callback() -> None:
+    captured_callbacks: list[Callable[[], None] | None] = []
+
+    class ProviderRuntime:
+        async def ask(
+            self,
+            question: str,
+            **options: Any,
+        ) -> ask.AskOutcome:
+            assert question == "question"
+            captured_callbacks.append(options.get("on_detached"))
+            return ask.AskOutcome("answer", "marker", None)
+
+        async def aclose(self) -> None:
+            return None
+
+    async def scenario() -> None:
+        lazy_runtime = LazyAskRuntime()
+        lazy_runtime._runtime = ProviderRuntime()
+        callback = lambda: None
+
+        outcome = await lazy_runtime.ask("question", on_detached=callback)
+
+        assert outcome.text == "answer"
+        assert captured_callbacks == [callback]
+        await lazy_runtime.aclose()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("state", ["queued", "detached"])
+def test_status_exposes_nonterminal_job_states(
+    monkeypatch: pytest.MonkeyPatch,
+    state: jobs.AskJobState,
+) -> None:
+    runtime = FakeAskRuntime()
+    snapshot = jobs.AskJob(
+        ask_id="state-id",
+        state=state,
+        answer=None,
+        failure=None,
+        error_message=None,
+        status_message="progress",
+        nonce_marker="nonce-marker",
+        thread_ref=_CONVERSATION_A,
+        created_at=1.0,
+        finished_at=None,
+    )
+    monkeypatch.setattr(runtime, "job_status", lambda _ask_id: snapshot)
+
+    with _mcp_client(runtime) as client:
+        _payload, headers = _initialize(client)
+        status = _json_tool_payload(
+            _call_tool(
+                client,
+                headers,
+                "ask_gpt_pro_status",
+                {"ask_id": snapshot.ask_id},
+            )
+        )
+
+    assert status == {
+        "ask_id": snapshot.ask_id,
+        "state": state,
+        "status_message": "progress",
+        "thread_ref": _CONVERSATION_A,
+    }
 
 
 def test_submit_returns_immediately_and_status_transitions_to_succeeded() -> None:
