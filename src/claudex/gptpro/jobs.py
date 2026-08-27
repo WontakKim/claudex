@@ -11,9 +11,11 @@ import asyncio
 import inspect
 import tempfile
 import time
+from collections import deque
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
+from statistics import quantiles
 from typing import Any, Literal, Protocol
 from uuid import uuid4
 
@@ -25,6 +27,10 @@ SWEEP_INTERVAL_SECONDS = 300.0
 THREAD_BINDING_TTL_SECONDS = 23 * 60 * 60
 QUEUE_TTL_SECONDS = 900.0
 QUESTION_SPILL_THRESHOLD_BYTES = 35_000
+WATCHDOG_SAMPLE_LIMIT = 64
+WATCHDOG_MIN_SAMPLES = 5
+WATCHDOG_MARGIN_RATIO = 0.5
+WATCHDOG_MIN_BUDGET_SECONDS = 60.0
 
 AskJobState = Literal["running", "succeeded", "failed"]
 
@@ -64,6 +70,39 @@ class _AskCallable(Protocol):
     ) -> Awaitable[AskOutcome]: ...
 
 
+class AnswerWatchdog:
+    """Derive execution budgets from recent successful answer durations."""
+
+    def __init__(
+        self,
+        initial_budget_seconds: float,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._initial_budget_seconds = initial_budget_seconds
+        self._clock = clock
+        self._samples: deque[float] = deque(maxlen=WATCHDOG_SAMPLE_LIMIT)
+
+    def record(self, duration_seconds: float) -> None:
+        if duration_seconds < 0:
+            return
+        self._samples.append(duration_seconds)
+
+    def execution_budget_seconds(self) -> float:
+        if len(self._samples) < WATCHDOG_MIN_SAMPLES:
+            return self._initial_budget_seconds
+
+        p95_seconds = quantiles(
+            self._samples, n=100, method="inclusive"
+        )[94]
+        measured_budget_seconds = p95_seconds * (1 + WATCHDOG_MARGIN_RATIO)
+        # Durations above the operational default indicate a slower system.
+        # Operators must raise that ceiling explicitly through the env override.
+        return min(
+            self._initial_budget_seconds,
+            max(WATCHDOG_MIN_BUDGET_SECONDS, measured_budget_seconds),
+        )
+
+
 class ThreadRegistry:
     """Retain MCP session bindings to ChatGPT conversation threads."""
 
@@ -98,6 +137,7 @@ class AskJobService:
         retention_seconds: float = JOB_RETENTION_SECONDS,
         sweep_interval_seconds: float = SWEEP_INTERVAL_SECONDS,
         overall_timeout_seconds: float | None = None,
+        watchdog: AnswerWatchdog | None = None,
         queue_ttl_seconds: float | None = None,
         on_turn_finished: Callable[[TurnFinished], None] | None = None,
         clock: Callable[[], float] = time.monotonic,
@@ -122,6 +162,11 @@ class AskJobService:
             ask_module.overall_timeout_seconds()
             if overall_timeout_seconds is None
             else overall_timeout_seconds
+        )
+        self._watchdog = (
+            AnswerWatchdog(self._overall_timeout_seconds)
+            if watchdog is None
+            else watchdog
         )
         self._queue_ttl_seconds = (
             QUEUE_TTL_SECONDS
@@ -248,7 +293,8 @@ class AskJobService:
                     await thread_lock.acquire()
                 has_thread_lock = True
 
-            remaining = self._overall_timeout_seconds
+            admitted_at = self._clock()
+            remaining = self._watchdog.execution_budget_seconds()
 
             def capture_status(message: str) -> None:
                 self._on_status(ask_id, message)
@@ -310,6 +356,7 @@ class AskJobService:
                     else outcome.marker
                 ),
             )
+            self._watchdog.record(self._clock() - admitted_at)
             thread_ref = self._jobs[ask_id].thread_ref
             if on_thread_ref is not None and thread_ref is not None:
                 try:

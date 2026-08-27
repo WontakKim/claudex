@@ -556,6 +556,137 @@ def test_queue_ttl_expires_waiting_ask_and_preserves_thread_ref() -> None:
     asyncio.run(scenario())
 
 
+def test_answer_watchdog_ignores_negative_duration_samples() -> None:
+    watchdog = jobs.AnswerWatchdog(initial_budget_seconds=900.0)
+
+    for _ in range(jobs.WATCHDOG_MIN_SAMPLES):
+        watchdog.record(-1.0)
+
+    assert watchdog.execution_budget_seconds() == 900.0
+
+
+def test_successful_duration_samples_update_next_execution_budget() -> None:
+    now = 0.0
+    durations = [100.0, 200.0, 300.0, 400.0, 500.0, 0.0]
+    captured_timeouts: list[float | None] = []
+
+    async def provider(
+        question: str,
+        *,
+        on_status: Callable[[str], None] | None = None,
+        on_conversation_id: Callable[[str], None] | None = None,
+        conversation_id: str | None = None,
+        timeout_seconds: float | None = None,
+    ) -> ask.AskOutcome:
+        nonlocal now
+        del question, on_status, on_conversation_id, conversation_id
+        captured_timeouts.append(timeout_seconds)
+        now += durations[len(captured_timeouts) - 1]
+        return ask.AskOutcome("answer", "marker", None)
+
+    async def scenario() -> None:
+        service = jobs.AskJobService(
+            provider, overall_timeout_seconds=900.0, clock=lambda: now
+        )
+        for index in range(jobs.WATCHDOG_MIN_SAMPLES + 1):
+            started_job = service.start(f"question {index}")
+            await _wait_for_state(service, started_job.ask_id, "succeeded")
+        await service.aclose()
+
+    asyncio.run(scenario())
+
+    assert captured_timeouts[: jobs.WATCHDOG_MIN_SAMPLES] == [
+        900.0
+    ] * jobs.WATCHDOG_MIN_SAMPLES
+    assert captured_timeouts[-1] == pytest.approx(720.0)
+
+
+@pytest.mark.parametrize(
+    ("duration_seconds", "expected_budget_seconds"),
+    [(10.0, 60.0), (700.0, 900.0)],
+    ids=["minimum", "initial-maximum"],
+)
+def test_answer_watchdog_clamps_measured_budget(
+    duration_seconds: float, expected_budget_seconds: float
+) -> None:
+    watchdog = jobs.AnswerWatchdog(initial_budget_seconds=900.0)
+
+    for _ in range(jobs.WATCHDOG_MIN_SAMPLES):
+        watchdog.record(duration_seconds)
+
+    assert watchdog.execution_budget_seconds() == expected_budget_seconds
+
+
+def test_failed_job_does_not_update_answer_watchdog() -> None:
+    now = 0.0
+    captured_timeouts: list[float | None] = []
+    watchdog = jobs.AnswerWatchdog(initial_budget_seconds=900.0)
+    for duration_seconds in [100.0, 200.0, 300.0, 400.0, 500.0]:
+        watchdog.record(duration_seconds)
+
+    async def provider(
+        question: str,
+        *,
+        on_status: Callable[[str], None] | None = None,
+        on_conversation_id: Callable[[str], None] | None = None,
+        conversation_id: str | None = None,
+        timeout_seconds: float | None = None,
+    ) -> ask.AskOutcome:
+        nonlocal now
+        del on_status, on_conversation_id, conversation_id
+        captured_timeouts.append(timeout_seconds)
+        if question == "failure":
+            now += 2_000.0
+            raise ask.GptProAskError("error", "provider failed")
+        return ask.AskOutcome("answer", "marker", None)
+
+    async def scenario() -> None:
+        service = jobs.AskJobService(
+            provider, watchdog=watchdog, clock=lambda: now
+        )
+        failed_job = service.start("failure")
+        await _wait_for_state(service, failed_job.ask_id, "failed")
+        successful_job = service.start("success")
+        await _wait_for_state(service, successful_job.ask_id, "succeeded")
+        await service.aclose()
+
+    asyncio.run(scenario())
+
+    assert captured_timeouts == pytest.approx([720.0, 720.0])
+
+
+def test_injected_overall_timeout_caps_measured_watchdog_budget() -> None:
+    now = 0.0
+    captured_timeouts: list[float | None] = []
+
+    async def provider(
+        question: str,
+        *,
+        on_status: Callable[[str], None] | None = None,
+        on_conversation_id: Callable[[str], None] | None = None,
+        conversation_id: str | None = None,
+        timeout_seconds: float | None = None,
+    ) -> ask.AskOutcome:
+        nonlocal now
+        del question, on_status, on_conversation_id, conversation_id
+        captured_timeouts.append(timeout_seconds)
+        now += 300.0
+        return ask.AskOutcome("answer", "marker", None)
+
+    async def scenario() -> None:
+        service = jobs.AskJobService(
+            provider, overall_timeout_seconds=300.0, clock=lambda: now
+        )
+        for index in range(jobs.WATCHDOG_MIN_SAMPLES + 1):
+            started_job = service.start(f"question {index}")
+            await _wait_for_state(service, started_job.ask_id, "succeeded")
+        await service.aclose()
+
+    asyncio.run(scenario())
+
+    assert captured_timeouts == [300.0] * (jobs.WATCHDOG_MIN_SAMPLES + 1)
+
+
 def test_service_uses_environment_overall_timeout_for_admission_budget(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
