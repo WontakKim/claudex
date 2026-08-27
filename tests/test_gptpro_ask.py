@@ -1153,3 +1153,156 @@ def test_readback_with_reformatted_newlines_still_submits(
 
     assert _run(page) == "server **raw** markdown"
     assert page.click_count == 1
+
+
+def test_contention_detaches_completed_submission_and_returns_poller_outcome(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_clock(monkeypatch)
+    monkeypatch.setattr(ask, "uuid4", lambda: "fixed-nonce")
+    page = _FakePage(signal="id_only")
+    statuses: list[str] = []
+    submissions: list[ask.AskSubmission] = []
+    detached_outcome = ask.AskOutcome(
+        text="answer from detached polling",
+        marker=ask.build_nonce_marker("fixed-nonce"),
+        conversation_id=_CONVERSATION_ID,
+    )
+
+    async def on_detach(submission: ask.AskSubmission) -> ask.AskOutcome:
+        submissions.append(submission)
+        return detached_outcome
+
+    outcome = asyncio.run(
+        ask.execute_ask_outcome(
+            page,
+            "Review this code",
+            on_status=statuses.append,
+            should_detach=lambda: True,
+            on_detach=on_detach,
+        )
+    )
+
+    assert outcome is detached_outcome
+    assert submissions == [
+        ask.AskSubmission(
+            marker=ask.build_nonce_marker("fixed-nonce"),
+            conversation_id=_CONVERSATION_ID,
+        )
+    ]
+    assert statuses[-1] == "detached; polling for the answer"
+    assert page.fetch_count == 0
+    assert page.listeners == {"requestfinished": [], "response": []}
+
+
+def test_detach_is_ignored_without_a_conversation_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_clock(monkeypatch)
+    page = _FakePage(signal="none")
+    submissions: list[ask.AskSubmission] = []
+
+    async def on_detach(submission: ask.AskSubmission) -> ask.AskOutcome:
+        submissions.append(submission)
+        raise AssertionError("an incomplete submission must not detach")
+
+    with pytest.raises(ask.GptProAskError) as raised:
+        asyncio.run(
+            ask.execute_ask_outcome(
+                page,
+                "Review this code",
+                timeout_seconds=1.0,
+                should_detach=lambda: True,
+                on_detach=on_detach,
+            )
+        )
+
+    assert raised.value.failure == "timeout"
+    assert submissions == []
+    assert page.listeners == {"requestfinished": [], "response": []}
+
+
+def test_detach_is_ignored_before_the_user_echo_is_locked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_clock(monkeypatch)
+    page = _FakePage(signal="none")
+    submissions: list[ask.AskSubmission] = []
+
+    async def on_detach(submission: ask.AskSubmission) -> ask.AskOutcome:
+        submissions.append(submission)
+        raise AssertionError("an unlocked submission must not detach")
+
+    execution = ask._AskExecution(
+        page,
+        "Review this code",
+        None,
+        None,
+        None,
+        conversation_id=_CONVERSATION_ID,
+        should_detach=lambda: True,
+        on_detach=on_detach,
+    )
+    page.filled_prompt = execution.prompt
+    execution.network.weak_signal_serial = 1
+
+    completion = asyncio.run(execution._monitor_completion("user-current"))
+
+    assert completion == "server **raw** markdown"
+    assert submissions == []
+
+
+def test_detach_callbacks_are_inert_unless_both_are_configured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_clock(monkeypatch)
+    detach_checks = 0
+
+    def should_detach() -> bool:
+        nonlocal detach_checks
+        detach_checks += 1
+        return True
+
+    outcome = asyncio.run(
+        ask.execute_ask_outcome(
+            _FakePage(raw_text="normal monitored answer"),
+            "Review this code",
+            should_detach=should_detach,
+        )
+    )
+
+    assert outcome.text == "normal monitored answer"
+    assert detach_checks == 0
+
+
+def test_request_detach_sets_the_monitor_detach_flag() -> None:
+    page = _FakePage(signal="none")
+    statuses: list[str] = []
+
+    async def on_detach(submission: ask.AskSubmission) -> ask.AskOutcome:
+        return ask.AskOutcome(
+            text="detached answer",
+            marker=submission.marker,
+            conversation_id=submission.conversation_id,
+        )
+
+    execution = ask._AskExecution(
+        page,
+        "Review this code",
+        statuses.append,
+        None,
+        None,
+        conversation_id=_CONVERSATION_ID,
+        should_detach=lambda: False,
+        on_detach=on_detach,
+    )
+    execution.has_locked_user_echo = True
+    execution.request_detach()
+
+    completion = asyncio.run(execution._monitor_completion("user-current"))
+
+    assert completion == ask.AskSubmission(
+        marker=execution.marker,
+        conversation_id=_CONVERSATION_ID,
+    )
+    assert statuses == ["detached; polling for the answer"]

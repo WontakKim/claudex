@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
@@ -120,6 +120,11 @@ def test_runtime_initializes_lazily_and_reuses_the_context(
         on_status: Callable[[str], None] | None = None,
         on_conversation_id: Callable[[str], None] | None = None,
         on_marker: Callable[[str], None] | None = None,
+        should_detach: Callable[[], bool] | None = None,
+        on_detach: Callable[
+            [ask.AskSubmission], Awaitable[ask.AskOutcome]
+        ]
+        | None = None,
     ) -> ask.AskOutcome:
         del page, on_status
         conversation_id_callbacks.append(on_conversation_id)
@@ -168,6 +173,11 @@ def test_runtime_propagates_conversation_and_timeout(
         on_status: Callable[[str], None] | None = None,
         on_conversation_id: Callable[[str], None] | None = None,
         on_marker: Callable[[str], None] | None = None,
+        should_detach: Callable[[], bool] | None = None,
+        on_detach: Callable[
+            [ask.AskSubmission], Awaitable[ask.AskOutcome]
+        ]
+        | None = None,
         conversation_id: str | None = None,
         timeout_seconds: float | None = None,
     ) -> ask.AskOutcome:
@@ -208,6 +218,11 @@ def test_runtime_propagates_attachment_paths(
         on_status: Callable[[str], None] | None = None,
         on_conversation_id: Callable[[str], None] | None = None,
         on_marker: Callable[[str], None] | None = None,
+        should_detach: Callable[[], bool] | None = None,
+        on_detach: Callable[
+            [ask.AskSubmission], Awaitable[ask.AskOutcome]
+        ]
+        | None = None,
         attachment_paths: list[str] | None = None,
     ) -> ask.AskOutcome:
         del page, on_status, on_conversation_id, on_marker
@@ -247,6 +262,11 @@ def test_runtime_limits_concurrent_asks_to_two(
         on_status: Callable[[str], None] | None = None,
         on_conversation_id: Callable[[str], None] | None = None,
         on_marker: Callable[[str], None] | None = None,
+        should_detach: Callable[[], bool] | None = None,
+        on_detach: Callable[
+            [ask.AskSubmission], Awaitable[ask.AskOutcome]
+        ]
+        | None = None,
     ) -> ask.AskOutcome:
         nonlocal active, maximum_active
         del page, on_status, on_conversation_id, on_marker
@@ -300,6 +320,11 @@ def test_runtime_applies_submission_jitter_after_admission(
         on_status: Callable[[str], None] | None = None,
         on_conversation_id: Callable[[str], None] | None = None,
         on_marker: Callable[[str], None] | None = None,
+        should_detach: Callable[[], bool] | None = None,
+        on_detach: Callable[
+            [ask.AskSubmission], Awaitable[ask.AskOutcome]
+        ]
+        | None = None,
     ) -> ask.AskOutcome:
         del page, on_status, on_conversation_id, on_marker
         return _outcome(question)
@@ -360,6 +385,11 @@ def test_runtime_closes_page_when_execute_ask_fails(
         on_status: Callable[[str], None] | None = None,
         on_conversation_id: Callable[[str], None] | None = None,
         on_marker: Callable[[str], None] | None = None,
+        should_detach: Callable[[], bool] | None = None,
+        on_detach: Callable[
+            [ask.AskSubmission], Awaitable[ask.AskOutcome]
+        ]
+        | None = None,
     ) -> ask.AskOutcome:
         del page, question, on_status, on_conversation_id, on_marker
         raise failure
@@ -392,6 +422,11 @@ def test_closed_context_is_discarded_and_reinitialized(
         on_status: Callable[[str], None] | None = None,
         on_conversation_id: Callable[[str], None] | None = None,
         on_marker: Callable[[str], None] | None = None,
+        should_detach: Callable[[], bool] | None = None,
+        on_detach: Callable[
+            [ask.AskSubmission], Awaitable[ask.AskOutcome]
+        ]
+        | None = None,
     ) -> ask.AskOutcome:
         nonlocal calls
         del page, on_status, on_conversation_id, on_marker
@@ -434,6 +469,11 @@ def test_aclose_cleans_up_playwright_once(
         on_status: Callable[[str], None] | None = None,
         on_conversation_id: Callable[[str], None] | None = None,
         on_marker: Callable[[str], None] | None = None,
+        should_detach: Callable[[], bool] | None = None,
+        on_detach: Callable[
+            [ask.AskSubmission], Awaitable[ask.AskOutcome]
+        ]
+        | None = None,
     ) -> ask.AskOutcome:
         del page, on_status, on_conversation_id, on_marker
         return _outcome(question)
@@ -465,6 +505,11 @@ def test_runtime_holds_profile_lock_until_close(
         on_status: Callable[[str], None] | None = None,
         on_conversation_id: Callable[[str], None] | None = None,
         on_marker: Callable[[str], None] | None = None,
+        should_detach: Callable[[], bool] | None = None,
+        on_detach: Callable[
+            [ask.AskSubmission], Awaitable[ask.AskOutcome]
+        ]
+        | None = None,
     ) -> ask.AskOutcome:
         del page, on_status, on_conversation_id, on_marker
         return _outcome(question)
@@ -504,6 +549,11 @@ def _install_ask_stub(monkeypatch: pytest.MonkeyPatch, context: _FakeContext) ->
         on_status: Callable[[str], None] | None = None,
         on_conversation_id: Callable[[str], None] | None = None,
         on_marker: Callable[[str], None] | None = None,
+        should_detach: Callable[[], bool] | None = None,
+        on_detach: Callable[
+            [ask.AskSubmission], Awaitable[ask.AskOutcome]
+        ]
+        | None = None,
     ) -> ask.AskOutcome:
         del page, on_status, on_conversation_id, on_marker
         return _outcome(f"answer: {question}")
@@ -545,3 +595,514 @@ def test_ask_leaves_plain_user_agent_header_alone(
     asyncio.run(scenario())
 
     assert context.pages[0].extra_headers is None
+
+
+_CONVERSATION_ID = "123e4567-e89b-12d3-a456-426614174000"
+
+
+def _detached_conversation(marker: str, text: str) -> dict[str, object]:
+    return {
+        "current_node": "assistant",
+        "mapping": {
+            "user": {
+                "parent": None,
+                "message": {
+                    "author": {"role": "user"},
+                    "content": {"content_type": "text", "parts": [marker]},
+                },
+            },
+            "assistant": {
+                "parent": "user",
+                "message": {
+                    "author": {"role": "assistant"},
+                    "content": {"content_type": "text", "parts": [text]},
+                    "status": "finished_successfully",
+                    "end_turn": True,
+                },
+            },
+        },
+    }
+
+
+class _PollerFakePage(_FakePage):
+    def __init__(
+        self,
+        marker: str,
+        conversation_responses: list[
+            tuple[int, dict[str, object] | None] | BaseException
+        ],
+        *,
+        on_conversation_fetch: Callable[[], None] | None = None,
+    ) -> None:
+        super().__init__()
+        self.marker = marker
+        self.conversation_responses = list(conversation_responses)
+        self.on_conversation_fetch = on_conversation_fetch
+        self.goto_urls: list[str] = []
+        self.fetch_arguments: list[dict[str, object]] = []
+
+    async def goto(self, url: str, *, wait_until: str, timeout: int) -> None:
+        self.goto_urls.append(url)
+        assert wait_until == "domcontentloaded"
+        assert timeout == browser.NAVIGATION_TIMEOUT_MS
+
+    async def evaluate(self, script: str, argument: Any = None) -> Any:
+        if "navigator.userAgent" in script:
+            return self.user_agent
+        assert script == runtime.PAGE_FETCH_PROBE_JS
+        assert isinstance(argument, dict)
+        self.fetch_arguments.append(argument)
+        if argument["url"] == "https://chatgpt.com/api/auth/session":
+            return {
+                "status": 200,
+                "headers": {},
+                "text": "",
+                "json": {"accessToken": "access-token"},
+                "fetchError": None,
+                "timedOut": False,
+            }
+        if self.on_conversation_fetch is not None:
+            self.on_conversation_fetch()
+        response = self.conversation_responses.pop(0)
+        if isinstance(response, BaseException):
+            raise response
+        status, body = response
+        return {
+            "status": status,
+            "headers": {},
+            "text": "",
+            "json": body,
+            "fetchError": None,
+            "timedOut": False,
+        }
+
+
+class _PollerFakeContext:
+    def __init__(self, page: _PollerFakePage) -> None:
+        self.page = page
+        self.new_page_calls = 0
+
+    async def new_page(self) -> _PollerFakePage:
+        self.new_page_calls += 1
+        return self.page
+
+
+async def _wait_for_poller_idle(poller: runtime.DetachPoller) -> None:
+    while poller._task is not None:
+        await asyncio.sleep(0)
+
+
+def test_detach_poller_completes_finished_marker_turn_and_closes_tab() -> None:
+    marker = "[gptpro-transport-nonce:poller-success]"
+    page = _PollerFakePage(
+        marker,
+        [(200, _detached_conversation(marker, "detached raw answer"))],
+    )
+    context = _PollerFakeContext(page)
+
+    async def scenario() -> None:
+        poller = runtime.DetachPoller(lambda: asyncio.sleep(0, result=context))
+        future = poller.register(
+            _CONVERSATION_ID,
+            marker,
+            deadline=runtime._monotonic() + 100.0,
+        )
+        outcome = await future
+        await _wait_for_poller_idle(poller)
+
+        assert outcome == ask.AskOutcome(
+            text="detached raw answer",
+            marker=marker,
+            conversation_id=_CONVERSATION_ID,
+        )
+        assert context.new_page_calls == 1
+        assert page.goto_urls == ["https://chatgpt.com/"]
+        assert page.fetch_arguments[-1]["headers"] == {
+            "Authorization": "Bearer access-token"
+        }
+        assert page.close_calls == 1
+        await poller.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_detach_poller_backs_off_on_429_and_recovers_on_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker = "[gptpro-transport-nonce:poller-backoff]"
+    page = _PollerFakePage(
+        marker,
+        [
+            (429, None),
+            (200, _detached_conversation(marker, "answer after backoff")),
+        ],
+    )
+    context = _PollerFakeContext(page)
+    observed_backoffs: list[float] = []
+
+    async def scenario() -> None:
+        poller = runtime.DetachPoller(lambda: asyncio.sleep(0, result=context))
+
+        async def sleep(_seconds: float) -> None:
+            observed_backoffs.append(poller.current_backoff_seconds())
+
+        monkeypatch.setattr(runtime, "_sleep", sleep)
+        future = poller.register(
+            _CONVERSATION_ID,
+            marker,
+            deadline=runtime._monotonic() + 100.0,
+        )
+        outcome = await future
+        await _wait_for_poller_idle(poller)
+
+        assert outcome.text == "answer after backoff"
+        assert observed_backoffs == [90.0]
+        assert poller.current_backoff_seconds() == 0.0
+        assert page.close_calls == 1
+        await poller.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_detach_poller_retries_navigation_destroyed_fetch_on_next_cycle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker = "[gptpro-transport-nonce:poller-navigation-retry]"
+    page = _PollerFakePage(
+        marker,
+        [
+            RuntimeError("Execution context was destroyed during navigation"),
+            (200, _detached_conversation(marker, "answer after navigation")),
+        ],
+    )
+    context = _PollerFakeContext(page)
+    sleep_calls: list[float] = []
+
+    async def sleep(seconds: float) -> None:
+        sleep_calls.append(seconds)
+
+    monkeypatch.setattr(runtime, "_sleep", sleep)
+
+    async def scenario() -> None:
+        poller = runtime.DetachPoller(lambda: asyncio.sleep(0, result=context))
+        future = poller.register(
+            _CONVERSATION_ID,
+            marker,
+            deadline=runtime._monotonic() + 100.0,
+        )
+        outcome = await future
+        await _wait_for_poller_idle(poller)
+
+        assert outcome.text == "answer after navigation"
+        assert sleep_calls == [runtime.DETACH_POLL_INTERVAL_SECONDS]
+        assert page.close_calls == 1
+        await poller.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_detach_poller_resets_backoff_when_registrations_become_idle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker = "[gptpro-transport-nonce:poller-idle-reset]"
+    page = _PollerFakePage(marker, [(429, None)])
+    context = _PollerFakeContext(page)
+    now = 0.0
+    observed_backoffs: list[float] = []
+
+    def monotonic() -> float:
+        return now
+
+    async def scenario() -> None:
+        nonlocal now
+        poller = runtime.DetachPoller(lambda: asyncio.sleep(0, result=context))
+
+        async def sleep(seconds: float) -> None:
+            nonlocal now
+            observed_backoffs.append(poller.current_backoff_seconds())
+            now += seconds
+
+        monkeypatch.setattr(runtime, "_monotonic", monotonic)
+        monkeypatch.setattr(runtime, "_sleep", sleep)
+        future = poller.register(_CONVERSATION_ID, marker, deadline=1.0)
+        with pytest.raises(ask.GptProAskError) as raised:
+            await future
+        await _wait_for_poller_idle(poller)
+
+        assert raised.value.failure == "timeout"
+        assert observed_backoffs == [90.0]
+        assert poller.current_backoff_seconds() == 0.0
+        assert page.close_calls == 1
+        await poller.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_detach_poller_times_out_immediately_when_fetch_exhausts_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker = "[gptpro-transport-nonce:poller-fetch-deadline]"
+    now = 0.0
+
+    def expire_budget() -> None:
+        nonlocal now
+        now = 2.0
+
+    page = _PollerFakePage(
+        marker,
+        [(200, _detached_conversation(marker, "late answer"))],
+        on_conversation_fetch=expire_budget,
+    )
+    context = _PollerFakeContext(page)
+    monkeypatch.setattr(runtime, "_monotonic", lambda: now)
+
+    async def fail_sleep(_seconds: float) -> None:
+        raise AssertionError("an expired fetch must not wait for another cycle")
+
+    monkeypatch.setattr(runtime, "_sleep", fail_sleep)
+
+    async def scenario() -> None:
+        poller = runtime.DetachPoller(lambda: asyncio.sleep(0, result=context))
+        future = poller.register(_CONVERSATION_ID, marker, deadline=1.0)
+        with pytest.raises(ask.GptProAskError) as raised:
+            await future
+        await _wait_for_poller_idle(poller)
+
+        assert raised.value.failure == "timeout"
+        assert str(raised.value) == (
+            "the detached ask budget expired while polling for the answer"
+        )
+        assert page.close_calls == 1
+        await poller.aclose()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("status", [401, 403])
+def test_detach_poller_classifies_authorization_failure_as_session_expired(
+    status: int,
+) -> None:
+    marker = "[gptpro-transport-nonce:poller-auth]"
+    page = _PollerFakePage(marker, [(status, None)])
+    context = _PollerFakeContext(page)
+
+    async def scenario() -> None:
+        poller = runtime.DetachPoller(lambda: asyncio.sleep(0, result=context))
+        future = poller.register(
+            _CONVERSATION_ID,
+            marker,
+            deadline=runtime._monotonic() + 100.0,
+        )
+        with pytest.raises(ask.GptProSessionExpiredError):
+            await future
+        await _wait_for_poller_idle(poller)
+        assert page.close_calls == 1
+        await poller.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_detach_poller_sweeps_expired_registration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker = "[gptpro-transport-nonce:poller-expired]"
+    page = _PollerFakePage(marker, [])
+    context = _PollerFakeContext(page)
+    monkeypatch.setattr(runtime, "_monotonic", lambda: 10.0)
+
+    async def scenario() -> None:
+        poller = runtime.DetachPoller(lambda: asyncio.sleep(0, result=context))
+        future = poller.register(_CONVERSATION_ID, marker, deadline=9.0)
+        with pytest.raises(ask.GptProAskError) as raised:
+            await future
+        await _wait_for_poller_idle(poller)
+
+        assert raised.value.failure == "timeout"
+        assert str(raised.value) == (
+            "the detached ask budget expired while polling for the answer"
+        )
+        assert context.new_page_calls == 0
+        await poller.aclose()
+
+    asyncio.run(scenario())
+
+
+class _RuntimeDetachPollerFake:
+    def __init__(self, _get_context: Callable[[], Awaitable[Any]]) -> None:
+        self.future: asyncio.Future[ask.AskOutcome] | None = None
+        self.registrations: list[tuple[str, str, float]] = []
+        self.close_calls = 0
+        self.backoff_seconds = 0.0
+
+    def register(
+        self, conversation_id: str, marker: str, deadline: float
+    ) -> asyncio.Future[ask.AskOutcome]:
+        self.registrations.append((conversation_id, marker, deadline))
+        self.future = asyncio.get_running_loop().create_future()
+        return self.future
+
+    def current_backoff_seconds(self) -> float:
+        return self.backoff_seconds
+
+    async def aclose(self) -> None:
+        self.close_calls += 1
+
+
+def test_runtime_detaches_waiting_answer_when_submitter_contends(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = _FakeContext()
+    _RuntimeFakes(monkeypatch, [context])
+    pollers: list[_RuntimeDetachPollerFake] = []
+
+    def create_poller(
+        get_context: Callable[[], Awaitable[Any]],
+    ) -> _RuntimeDetachPollerFake:
+        poller = _RuntimeDetachPollerFake(get_context)
+        pollers.append(poller)
+        return poller
+
+    monkeypatch.setattr(runtime, "DetachPoller", create_poller)
+    monkeypatch.setenv("GPTPRO_MAX_CONCURRENT_ASKS", "1")
+    first_started = asyncio.Event()
+    second_started = asyncio.Event()
+
+    async def execute_ask_outcome(
+        page: _FakePage,
+        question: str,
+        *,
+        on_status: Callable[[str], None] | None = None,
+        on_conversation_id: Callable[[str], None] | None = None,
+        on_marker: Callable[[str], None] | None = None,
+        should_detach: Callable[[], bool] | None = None,
+        on_detach: Callable[
+            [ask.AskSubmission], Awaitable[ask.AskOutcome]
+        ]
+        | None = None,
+    ) -> ask.AskOutcome:
+        del page, on_status, on_conversation_id, on_marker
+        assert should_detach is not None
+        assert on_detach is not None
+        if question == "first":
+            first_started.set()
+            while not should_detach():
+                await asyncio.sleep(0)
+            return await on_detach(
+                ask.AskSubmission(
+                    marker="first-marker",
+                    conversation_id=_CONVERSATION_ID,
+                )
+            )
+        second_started.set()
+        return _outcome("second answer")
+
+    monkeypatch.setattr(runtime.ask, "execute_ask_outcome", execute_ask_outcome)
+
+    async def scenario() -> None:
+        ask_runtime = runtime.AskRuntime()
+        first_task = asyncio.create_task(ask_runtime.ask("first"))
+        await first_started.wait()
+        second_task = asyncio.create_task(ask_runtime.ask("second"))
+        await second_started.wait()
+
+        assert second_task.done()
+        assert not first_task.done()
+        assert len(context.pages) == 2
+        assert context.pages[0].close_calls == 1
+        assert pollers[0].registrations[0][:2] == (
+            _CONVERSATION_ID,
+            "first-marker",
+        )
+
+        assert pollers[0].future is not None
+        pollers[0].future.set_result(
+            ask.AskOutcome(
+                text="first detached answer",
+                marker="first-marker",
+                conversation_id=_CONVERSATION_ID,
+            )
+        )
+        first, second = await asyncio.gather(first_task, second_task)
+        assert first.text == "first detached answer"
+        assert second.text == "second answer"
+        await ask_runtime.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_runtime_keeps_monitor_path_without_contention(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = _FakeContext()
+    _RuntimeFakes(monkeypatch, [context])
+
+    async def execute_ask_outcome(
+        page: _FakePage,
+        question: str,
+        *,
+        on_status: Callable[[str], None] | None = None,
+        on_conversation_id: Callable[[str], None] | None = None,
+        on_marker: Callable[[str], None] | None = None,
+        should_detach: Callable[[], bool] | None = None,
+        on_detach: Callable[
+            [ask.AskSubmission], Awaitable[ask.AskOutcome]
+        ]
+        | None = None,
+    ) -> ask.AskOutcome:
+        del page, on_status, on_conversation_id, on_marker, on_detach
+        assert should_detach is not None
+        assert not should_detach()
+        return _outcome(f"monitored: {question}")
+
+    monkeypatch.setattr(runtime.ask, "execute_ask_outcome", execute_ask_outcome)
+
+    async def scenario() -> None:
+        ask_runtime = runtime.AskRuntime()
+        outcome = await ask_runtime.ask("question")
+        assert outcome.text == "monitored: question"
+        assert context.pages[0].close_calls == 1
+        await ask_runtime.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_runtime_extends_submission_jitter_during_poller_backoff(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = _FakeContext()
+    fakes = _RuntimeFakes(monkeypatch, [context])
+
+    async def execute_ask_outcome(
+        page: _FakePage,
+        question: str,
+        *,
+        on_status: Callable[[str], None] | None = None,
+        on_conversation_id: Callable[[str], None] | None = None,
+        on_marker: Callable[[str], None] | None = None,
+        should_detach: Callable[[], bool] | None = None,
+        on_detach: Callable[
+            [ask.AskSubmission], Awaitable[ask.AskOutcome]
+        ]
+        | None = None,
+    ) -> ask.AskOutcome:
+        del (
+            page,
+            on_status,
+            on_conversation_id,
+            on_marker,
+            should_detach,
+            on_detach,
+        )
+        return _outcome(question)
+
+    monkeypatch.setattr(runtime.ask, "execute_ask_outcome", execute_ask_outcome)
+
+    async def scenario() -> None:
+        ask_runtime = runtime.AskRuntime()
+        ask_runtime._poller = _RuntimeDetachPollerFake(ask_runtime._get_context)
+        ask_runtime._poller.backoff_seconds = 90.0
+        await ask_runtime.ask("question")
+        assert fakes.sleep_calls == [91.5]
+        await ask_runtime.aclose()
+
+    asyncio.run(scenario())

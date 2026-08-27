@@ -328,6 +328,8 @@ def test_gptpro_ask_prints_status_to_stderr_and_answer_once_to_stdout(
         on_status: object,
         on_conversation_id: object,
         on_marker: object,
+        should_detach: object,
+        on_detach: object,
     ) -> gptpro_ask.AskOutcome:
         assert page is context.page
         assert question == "explain the result"
@@ -335,6 +337,8 @@ def test_gptpro_ask_prints_status_to_stderr_and_answer_once_to_stdout(
         on_status("waiting for ChatGPT")
         assert on_conversation_id is None
         assert on_marker is None
+        assert callable(should_detach)
+        assert callable(on_detach)
         return gptpro_ask.AskOutcome(
             text="# Final answer",
             marker="marker",
@@ -365,8 +369,18 @@ def test_gptpro_ask_domain_failure_uses_stderr_and_exit_one(
         on_status: object,
         on_conversation_id: object,
         on_marker: object,
+        should_detach: object,
+        on_detach: object,
     ) -> gptpro_ask.AskOutcome:
-        del page, question, on_status, on_conversation_id, on_marker
+        del (
+            page,
+            question,
+            on_status,
+            on_conversation_id,
+            on_marker,
+            should_detach,
+            on_detach,
+        )
         raise gptpro_ask.GptProChallengeError(
             "ChatGPT presented a challenge"
         )
@@ -413,8 +427,18 @@ def test_gptpro_ask_keyboard_interrupt_closes_runtime_and_returns_130(
         on_status: object,
         on_conversation_id: object,
         on_marker: object,
+        should_detach: object,
+        on_detach: object,
     ) -> gptpro_ask.AskOutcome:
-        del page, question, on_status, on_conversation_id, on_marker
+        del (
+            page,
+            question,
+            on_status,
+            on_conversation_id,
+            on_marker,
+            should_detach,
+            on_detach,
+        )
         raise KeyboardInterrupt
 
     monkeypatch.setattr(gptpro_ask, "execute_ask_outcome", execute_ask_outcome)

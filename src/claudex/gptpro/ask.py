@@ -106,6 +106,12 @@ class AskOutcome:
     conversation_id: str | None
 
 
+@dataclass(frozen=True)
+class AskSubmission:
+    marker: str
+    conversation_id: str | None
+
+
 class GptProAskError(Exception):
     """Base error for classified gptpro ask failures."""
 
@@ -223,6 +229,8 @@ class _AskExecution:
         conversation_id: str | None = None,
         timeout_seconds: float | None = None,
         attachment_paths: Sequence[str] | None = None,
+        should_detach: Callable[[], bool] | None = None,
+        on_detach: Callable[[AskSubmission], Awaitable[AskOutcome]] | None = None,
     ) -> None:
         if conversation_id is not None and not is_conversation_id(conversation_id):
             raise GptProAskError(
@@ -243,6 +251,8 @@ class _AskExecution:
         self._notify_marker(self.marker)
         self.prompt = f"{self.marker}\n\n{question}\n\n{self.marker}"
         self.attachment_paths = tuple(attachment_paths or ())
+        self.should_detach = should_detach
+        self.on_detach = on_detach
         self.network = _NetworkState(conversation_id=conversation_id)
         self.listener_tasks: set[asyncio.Task[None]] = set()
         self.request_listener: Callable[[Any], None] | None = None
@@ -256,6 +266,10 @@ class _AskExecution:
         self.active_page_fetch_url: str | None = None
         self.has_submitted = False
         self.has_locked_user_echo = False
+        self._is_detach_requested = False
+
+    def request_detach(self) -> None:
+        self._is_detach_requested = True
 
     def _status(self, message: str) -> None:
         if self.on_status is None:
@@ -1046,7 +1060,9 @@ class _AskExecution:
             "unavailable",
         )
 
-    async def _monitor_completion(self, locked_user_id: str) -> str:
+    async def _monitor_completion(
+        self, locked_user_id: str
+    ) -> str | AskSubmission:
         saw_stop = False
         recovery_active = False
         recovery_started_at = 0.0
@@ -1057,6 +1073,18 @@ class _AskExecution:
 
         while True:
             self._ensure_deadline()
+            if (
+                self.should_detach is not None
+                and self.on_detach is not None
+                and (self._is_detach_requested or self.should_detach())
+                and self.network.conversation_id is not None
+                and self.has_locked_user_echo
+            ):
+                self._status("detached; polling for the answer")
+                return AskSubmission(
+                    marker=self.marker,
+                    conversation_id=self.network.conversation_id,
+                )
             await self._process_network_actions()
             self._maybe_heartbeat()
 
@@ -1173,20 +1201,30 @@ class _AskExecution:
 
     async def run(self) -> AskOutcome:
         try:
-            self._install_listeners()
-            self._ensure_deadline()
-            await self._navigate()
-            await self._wait_for_composer()
-            if self.attachment_paths:
-                await self._attach_files()
-            pre_submit_ids = await self._stable_pre_submit_user_ids()
-            await self._fill_and_verify()
-            await self._click_send()
-            locked_user_id = await self._lock_user_echo(pre_submit_ids)
-            self.has_locked_user_echo = True
-            text = await self._monitor_completion(locked_user_id)
+            try:
+                self._install_listeners()
+                self._ensure_deadline()
+                await self._navigate()
+                await self._wait_for_composer()
+                if self.attachment_paths:
+                    await self._attach_files()
+                pre_submit_ids = await self._stable_pre_submit_user_ids()
+                await self._fill_and_verify()
+                await self._click_send()
+                locked_user_id = await self._lock_user_echo(pre_submit_ids)
+                self.has_locked_user_echo = True
+                completion = await self._monitor_completion(locked_user_id)
+            finally:
+                await self._remove_listeners()
+
+            if isinstance(completion, AskSubmission):
+                if self.on_detach is None:
+                    raise GptProAskError(
+                        "error", "the detached ask executor is unavailable"
+                    )
+                return await self.on_detach(completion)
             return AskOutcome(
-                text=text,
+                text=completion,
                 marker=self.marker,
                 conversation_id=self.network.conversation_id,
             )
@@ -1212,8 +1250,6 @@ class _AskExecution:
             raise GptProAskError(
                 "error", "the ChatGPT ask failed unexpectedly"
             ) from exc
-        finally:
-            await self._remove_listeners()
 
 
 async def execute_ask_outcome(
@@ -1226,6 +1262,8 @@ async def execute_ask_outcome(
     conversation_id: str | None = None,
     timeout_seconds: float | None = None,
     attachment_paths: Sequence[str] | None = None,
+    should_detach: Callable[[], bool] | None = None,
+    on_detach: Callable[[AskSubmission], Awaitable[AskOutcome]] | None = None,
 ) -> AskOutcome:
     """Submit one prompt and return its answer with tracking metadata.
 
@@ -1241,6 +1279,8 @@ async def execute_ask_outcome(
         conversation_id=conversation_id,
         timeout_seconds=timeout_seconds,
         attachment_paths=attachment_paths,
+        should_detach=should_detach,
+        on_detach=on_detach,
     ).run()
 
 
