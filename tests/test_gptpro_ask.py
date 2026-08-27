@@ -467,6 +467,29 @@ def test_execute_ask_outcome_returns_tracking_metadata_and_notifies_once(
     assert captured_conversation_ids == [_CONVERSATION_ID]
 
 
+def test_execute_ask_outcome_notifies_marker_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_clock(monkeypatch)
+    monkeypatch.setattr(ask, "uuid4", lambda: "fixed-nonce")
+    captured_markers: list[str] = []
+
+    def on_marker(marker: str) -> None:
+        captured_markers.append(marker)
+        raise RuntimeError("observer failure")
+
+    outcome = asyncio.run(
+        ask.execute_ask_outcome(
+            _FakePage(raw_text="server **raw** markdown"),
+            "Review this code",
+            on_marker=on_marker,
+        )
+    )
+
+    assert captured_markers == [ask.build_nonce_marker("fixed-nonce")]
+    assert captured_markers == [outcome.marker]
+
+
 @pytest.mark.parametrize(
     ("conversation_id", "expected_url"),
     [

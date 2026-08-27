@@ -111,6 +111,7 @@ def test_runtime_initializes_lazily_and_reuses_the_context(
     context = _FakeContext()
     fakes = _RuntimeFakes(monkeypatch, [context])
     conversation_id_callbacks: list[Callable[[str], None] | None] = []
+    marker_callbacks: list[Callable[[str], None] | None] = []
 
     async def execute_ask_outcome(
         page: _FakePage,
@@ -118,9 +119,11 @@ def test_runtime_initializes_lazily_and_reuses_the_context(
         *,
         on_status: Callable[[str], None] | None = None,
         on_conversation_id: Callable[[str], None] | None = None,
+        on_marker: Callable[[str], None] | None = None,
     ) -> ask.AskOutcome:
         del page, on_status
         conversation_id_callbacks.append(on_conversation_id)
+        marker_callbacks.append(on_marker)
         return _outcome(f"answer: {question}")
 
     monkeypatch.setattr(runtime.ask, "execute_ask_outcome", execute_ask_outcome)
@@ -129,12 +132,19 @@ def test_runtime_initializes_lazily_and_reuses_the_context(
         ask_runtime = runtime.AskRuntime()
         captured_conversation_ids: list[str] = []
         callback = captured_conversation_ids.append
+        captured_markers: list[str] = []
+        marker_callback = captured_markers.append
         assert fakes.launch_calls == []
-        first = await ask_runtime.ask("first", on_conversation_id=callback)
+        first = await ask_runtime.ask(
+            "first",
+            on_conversation_id=callback,
+            on_marker=marker_callback,
+        )
         second = await ask_runtime.ask("second")
         assert first.text == "answer: first"
         assert second.text == "answer: second"
         assert conversation_id_callbacks == [callback, None]
+        assert marker_callbacks == [marker_callback, None]
         assert len(fakes.launch_calls) == 1
         assert fakes.launch_calls[0][1] is True
         assert len(context.pages) == 2
@@ -157,10 +167,11 @@ def test_runtime_propagates_conversation_and_timeout(
         *,
         on_status: Callable[[str], None] | None = None,
         on_conversation_id: Callable[[str], None] | None = None,
+        on_marker: Callable[[str], None] | None = None,
         conversation_id: str | None = None,
         timeout_seconds: float | None = None,
     ) -> ask.AskOutcome:
-        del page, on_status, on_conversation_id
+        del page, on_status, on_conversation_id, on_marker
         captured_options.append((conversation_id, timeout_seconds))
         return _outcome(question)
 
@@ -196,9 +207,10 @@ def test_runtime_propagates_attachment_paths(
         *,
         on_status: Callable[[str], None] | None = None,
         on_conversation_id: Callable[[str], None] | None = None,
+        on_marker: Callable[[str], None] | None = None,
         attachment_paths: list[str] | None = None,
     ) -> ask.AskOutcome:
-        del page, on_status, on_conversation_id
+        del page, on_status, on_conversation_id, on_marker
         captured_paths.append(attachment_paths)
         return _outcome(question)
 
@@ -234,9 +246,10 @@ def test_runtime_limits_concurrent_asks_to_two(
         *,
         on_status: Callable[[str], None] | None = None,
         on_conversation_id: Callable[[str], None] | None = None,
+        on_marker: Callable[[str], None] | None = None,
     ) -> ask.AskOutcome:
         nonlocal active, maximum_active
-        del page, on_status, on_conversation_id
+        del page, on_status, on_conversation_id, on_marker
         active += 1
         maximum_active = max(maximum_active, active)
         started.append(question)
@@ -286,8 +299,9 @@ def test_runtime_applies_submission_jitter_after_admission(
         *,
         on_status: Callable[[str], None] | None = None,
         on_conversation_id: Callable[[str], None] | None = None,
+        on_marker: Callable[[str], None] | None = None,
     ) -> ask.AskOutcome:
-        del page, on_status, on_conversation_id
+        del page, on_status, on_conversation_id, on_marker
         return _outcome(question)
 
     monkeypatch.setattr(runtime.random, "uniform", uniform)
@@ -345,8 +359,9 @@ def test_runtime_closes_page_when_execute_ask_fails(
         *,
         on_status: Callable[[str], None] | None = None,
         on_conversation_id: Callable[[str], None] | None = None,
+        on_marker: Callable[[str], None] | None = None,
     ) -> ask.AskOutcome:
-        del page, question, on_status, on_conversation_id
+        del page, question, on_status, on_conversation_id, on_marker
         raise failure
 
     monkeypatch.setattr(runtime.ask, "execute_ask_outcome", execute_ask_outcome)
@@ -376,9 +391,10 @@ def test_closed_context_is_discarded_and_reinitialized(
         *,
         on_status: Callable[[str], None] | None = None,
         on_conversation_id: Callable[[str], None] | None = None,
+        on_marker: Callable[[str], None] | None = None,
     ) -> ask.AskOutcome:
         nonlocal calls
-        del page, on_status, on_conversation_id
+        del page, on_status, on_conversation_id, on_marker
         calls += 1
         if calls == 1:
             closed_error = RuntimeError(
@@ -417,8 +433,9 @@ def test_aclose_cleans_up_playwright_once(
         *,
         on_status: Callable[[str], None] | None = None,
         on_conversation_id: Callable[[str], None] | None = None,
+        on_marker: Callable[[str], None] | None = None,
     ) -> ask.AskOutcome:
-        del page, on_status, on_conversation_id
+        del page, on_status, on_conversation_id, on_marker
         return _outcome(question)
 
     monkeypatch.setattr(runtime.ask, "execute_ask_outcome", execute_ask_outcome)
@@ -447,8 +464,9 @@ def test_runtime_holds_profile_lock_until_close(
         *,
         on_status: Callable[[str], None] | None = None,
         on_conversation_id: Callable[[str], None] | None = None,
+        on_marker: Callable[[str], None] | None = None,
     ) -> ask.AskOutcome:
-        del page, on_status, on_conversation_id
+        del page, on_status, on_conversation_id, on_marker
         return _outcome(question)
 
     monkeypatch.setattr(runtime.ask, "execute_ask_outcome", execute_ask_outcome)
@@ -485,8 +503,9 @@ def _install_ask_stub(monkeypatch: pytest.MonkeyPatch, context: _FakeContext) ->
         *,
         on_status: Callable[[str], None] | None = None,
         on_conversation_id: Callable[[str], None] | None = None,
+        on_marker: Callable[[str], None] | None = None,
     ) -> ask.AskOutcome:
-        del page, on_status, on_conversation_id
+        del page, on_status, on_conversation_id, on_marker
         return _outcome(f"answer: {question}")
 
     monkeypatch.setattr(runtime.ask, "execute_ask_outcome", execute_ask_outcome)

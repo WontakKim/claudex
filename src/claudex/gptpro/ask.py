@@ -218,6 +218,7 @@ class _AskExecution:
         question: str,
         on_status: Callable[[str], None] | None,
         on_conversation_id: Callable[[str], None] | None,
+        on_marker: Callable[[str], None] | None,
         *,
         conversation_id: str | None = None,
         timeout_seconds: float | None = None,
@@ -231,6 +232,7 @@ class _AskExecution:
         self.page = page
         self.on_status = on_status
         self.on_conversation_id = on_conversation_id
+        self.on_marker = on_marker
         timeout_budget = (
             overall_timeout_seconds()
             if timeout_seconds is None
@@ -238,6 +240,7 @@ class _AskExecution:
         )
         self.deadline = _monotonic() + timeout_budget
         self.marker = build_nonce_marker(str(uuid4()))
+        self._notify_marker(self.marker)
         self.prompt = f"{self.marker}\n\n{question}\n\n{self.marker}"
         self.attachment_paths = tuple(attachment_paths or ())
         self.network = _NetworkState(conversation_id=conversation_id)
@@ -259,6 +262,14 @@ class _AskExecution:
             return
         try:
             self.on_status(message)
+        except Exception:
+            return
+
+    def _notify_marker(self, marker: str) -> None:
+        if self.on_marker is None:
+            return
+        try:
+            self.on_marker(marker)
         except Exception:
             return
 
@@ -1211,6 +1222,7 @@ async def execute_ask_outcome(
     *,
     on_status: Callable[[str], None] | None = None,
     on_conversation_id: Callable[[str], None] | None = None,
+    on_marker: Callable[[str], None] | None = None,
     conversation_id: str | None = None,
     timeout_seconds: float | None = None,
     attachment_paths: Sequence[str] | None = None,
@@ -1225,6 +1237,7 @@ async def execute_ask_outcome(
         question,
         on_status,
         on_conversation_id,
+        on_marker,
         conversation_id=conversation_id,
         timeout_seconds=timeout_seconds,
         attachment_paths=attachment_paths,

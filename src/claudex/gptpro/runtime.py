@@ -99,6 +99,7 @@ class AskRuntime:
         *,
         on_status: Callable[[str], None] | None = None,
         on_conversation_id: Callable[[str], None] | None = None,
+        on_marker: Callable[[str], None] | None = None,
         conversation_id: str | None = None,
         timeout_seconds: float | None = None,
         attachment_paths: Sequence[str] | None = None,
@@ -129,6 +130,7 @@ class AskRuntime:
                 question,
                 on_status,
                 on_conversation_id,
+                on_marker,
                 conversation_id,
                 timeout_seconds,
                 attachment_paths,
@@ -175,6 +177,7 @@ class AskRuntime:
         question: str,
         on_status: Callable[[str], None] | None,
         on_conversation_id: Callable[[str], None] | None,
+        on_marker: Callable[[str], None] | None,
         conversation_id: str | None,
         timeout_seconds: float | None,
         attachment_paths: Sequence[str] | None,
@@ -187,6 +190,7 @@ class AskRuntime:
             execution_options: dict[str, Any] = {
                 "on_status": on_status,
                 "on_conversation_id": on_conversation_id,
+                "on_marker": on_marker,
             }
             if conversation_id is not None:
                 execution_options["conversation_id"] = conversation_id

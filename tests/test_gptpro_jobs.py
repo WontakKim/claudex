@@ -103,6 +103,74 @@ def test_start_returns_running_job_before_successful_completion() -> None:
     asyncio.run(scenario())
 
 
+def test_marker_callback_updates_running_job_and_preserves_success_marker() -> None:
+    marker_updated = asyncio.Event()
+    release_provider = asyncio.Event()
+
+    async def provider(
+        question: str,
+        *,
+        on_status: Callable[[str], None] | None = None,
+        on_conversation_id: Callable[[str], None] | None = None,
+        on_marker: Callable[[str], None] | None = None,
+        conversation_id: str | None = None,
+        timeout_seconds: float | None = None,
+    ) -> ask.AskOutcome:
+        del question, on_status, on_conversation_id
+        del conversation_id, timeout_seconds
+        assert on_marker is not None
+        on_marker("full nonce marker")
+        marker_updated.set()
+        await release_provider.wait()
+        return ask.AskOutcome("answer", "full nonce marker", None)
+
+    async def scenario() -> None:
+        service = jobs.AskJobService(provider)
+        started_job = service.start("question")
+
+        await marker_updated.wait()
+        running_job = service.status(started_job.ask_id)
+        assert running_job is not None
+        assert running_job.state == "running"
+        assert running_job.nonce_marker == "full nonce marker"
+
+        release_provider.set()
+        completed_job = await _wait_for_state(
+            service, started_job.ask_id, "succeeded"
+        )
+        assert completed_job.nonce_marker == "full nonce marker"
+        await service.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_marker_callback_preserves_marker_on_failure() -> None:
+    async def provider(
+        question: str,
+        *,
+        on_status: Callable[[str], None] | None = None,
+        on_conversation_id: Callable[[str], None] | None = None,
+        on_marker: Callable[[str], None] | None = None,
+        conversation_id: str | None = None,
+        timeout_seconds: float | None = None,
+    ) -> ask.AskOutcome:
+        del question, on_status, on_conversation_id
+        del conversation_id, timeout_seconds
+        assert on_marker is not None
+        on_marker("failed nonce marker")
+        raise ask.GptProAskError("error", "provider failed")
+
+    async def scenario() -> None:
+        service = jobs.AskJobService(provider)
+        started_job = service.start("question")
+        failed_job = await _wait_for_state(service, started_job.ask_id, "failed")
+
+        assert failed_job.nonce_marker == "failed nonce marker"
+        await service.aclose()
+
+    asyncio.run(scenario())
+
+
 def test_status_callback_updates_latest_status_message() -> None:
     status_updated = asyncio.Event()
     release_provider = asyncio.Event()

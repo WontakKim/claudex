@@ -49,6 +49,7 @@ class _AskCallable(Protocol):
         *,
         on_status: Callable[[str], None] | None = None,
         on_conversation_id: Callable[[str], None] | None = None,
+        on_marker: Callable[[str], None] | None = None,
         conversation_id: str | None = None,
         timeout_seconds: float | None = None,
         attachment_paths: Sequence[str] | None = None,
@@ -94,10 +95,17 @@ class AskJobService:
     ) -> None:
         self._ask = ask
         ask_parameters = inspect.signature(ask).parameters
-        self._supports_conversation_options = any(
+        supports_keyword_options = any(
             parameter.kind is inspect.Parameter.VAR_KEYWORD
             for parameter in ask_parameters.values()
-        ) or {"conversation_id", "timeout_seconds"}.issubset(ask_parameters)
+        )
+        self._supports_conversation_options = (
+            supports_keyword_options
+            or {"conversation_id", "timeout_seconds"}.issubset(ask_parameters)
+        )
+        self._supports_marker_callback = (
+            supports_keyword_options or "on_marker" in ask_parameters
+        )
         self._retention_seconds = retention_seconds
         self._sweep_interval_seconds = sweep_interval_seconds
         self._overall_timeout_seconds = (
@@ -232,6 +240,9 @@ class AskJobService:
                     ask_id, captured_conversation_id, on_thread_ref
                 )
 
+            def capture_marker(marker: str) -> None:
+                self._on_marker(ask_id, marker)
+
             provider_question = question
             provider_attachment_paths = attachment_paths
             if len(question.encode("utf-8")) > QUESTION_SPILL_THRESHOLD_BYTES:
@@ -257,6 +268,8 @@ class AskJobService:
                 "on_status": capture_status,
                 "on_conversation_id": capture_conversation_id,
             }
+            if self._supports_marker_callback:
+                ask_options["on_marker"] = capture_marker
             if self._supports_conversation_options:
                 ask_options.update(
                     conversation_id=conversation_id,
@@ -275,7 +288,11 @@ class AskJobService:
                 job,
                 state="succeeded",
                 answer=outcome.text,
-                nonce_marker=outcome.marker,
+                nonce_marker=(
+                    job.nonce_marker
+                    if job.nonce_marker is not None
+                    else outcome.marker
+                ),
             )
         except GptProAskError as exc:
             self._jobs[ask_id] = replace(
@@ -305,6 +322,12 @@ class AskJobService:
         self._jobs[ask_id] = replace(
             self._jobs[ask_id], status_message=message
         )
+
+    def _on_marker(self, ask_id: str, marker: str) -> None:
+        job = self._jobs[ask_id]
+        if job.nonce_marker is not None:
+            return
+        self._jobs[ask_id] = replace(job, nonce_marker=marker)
 
     def _on_conversation_id(
         self,
