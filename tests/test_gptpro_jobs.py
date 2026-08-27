@@ -103,6 +103,47 @@ def test_start_returns_running_job_before_successful_completion() -> None:
     asyncio.run(scenario())
 
 
+def test_success_emits_turn_finished_once_even_if_callback_raises() -> None:
+    captured_events: list[jobs.TurnFinished] = []
+
+    async def provider(
+        question: str,
+        *,
+        on_status: Callable[[str], None] | None = None,
+        on_conversation_id: Callable[[str], None] | None = None,
+        conversation_id: str | None = None,
+        timeout_seconds: float | None = None,
+    ) -> ask.AskOutcome:
+        del question, on_status, on_conversation_id
+        del conversation_id, timeout_seconds
+        return ask.AskOutcome("answer", "marker", None)
+
+    def capture_turn_finished(event: jobs.TurnFinished) -> None:
+        captured_events.append(event)
+        raise RuntimeError("subscriber failed")
+
+    async def scenario() -> None:
+        service = jobs.AskJobService(
+            provider, on_turn_finished=capture_turn_finished
+        )
+        started_job = service.start("question")
+        completed_job = await _wait_for_state(
+            service, started_job.ask_id, "succeeded"
+        )
+
+        assert completed_job.answer == "answer"
+        assert captured_events == [
+            jobs.TurnFinished(
+                ask_id=started_job.ask_id,
+                thread_ref=None,
+                answer="answer",
+            )
+        ]
+        await service.aclose()
+
+    asyncio.run(scenario())
+
+
 def test_marker_callback_updates_running_job_and_preserves_success_marker() -> None:
     marker_updated = asyncio.Event()
     release_provider = asyncio.Event()
@@ -379,6 +420,56 @@ def test_same_conversation_asks_run_in_submission_order() -> None:
     asyncio.run(scenario())
 
 
+def test_waiting_ask_runs_after_in_flight_ask_fails() -> None:
+    first_provider_started = asyncio.Event()
+    release_first_provider = asyncio.Event()
+    second_provider_started = asyncio.Event()
+    started_questions: list[str] = []
+
+    async def provider(
+        question: str,
+        *,
+        on_status: Callable[[str], None] | None = None,
+        on_conversation_id: Callable[[str], None] | None = None,
+        conversation_id: str | None = None,
+        timeout_seconds: float | None = None,
+    ) -> ask.AskOutcome:
+        del on_status, on_conversation_id, timeout_seconds
+        assert conversation_id == "shared-conversation"
+        started_questions.append(question)
+        if question == "first":
+            first_provider_started.set()
+            await release_first_provider.wait()
+            raise ask.GptProAskError("error", "provider failed")
+        second_provider_started.set()
+        return ask.AskOutcome("second answer", "marker", conversation_id)
+
+    async def scenario() -> None:
+        service = jobs.AskJobService(provider)
+        first_job = service.start(
+            "first", conversation_id="shared-conversation"
+        )
+        await first_provider_started.wait()
+        second_job = service.start(
+            "second", conversation_id="shared-conversation"
+        )
+        await _wait_for_status_message(
+            service,
+            second_job.ask_id,
+            "waiting for the in-flight answer",
+        )
+
+        release_first_provider.set()
+        await _wait_for_state(service, first_job.ask_id, "failed")
+        await second_provider_started.wait()
+        await _wait_for_state(service, second_job.ask_id, "succeeded")
+
+        assert started_questions == ["first", "second"]
+        await service.aclose()
+
+    asyncio.run(scenario())
+
+
 def test_different_conversation_asks_run_concurrently() -> None:
     both_providers_started = asyncio.Event()
     release_providers = asyncio.Event()
@@ -415,7 +506,8 @@ def test_different_conversation_asks_run_concurrently() -> None:
     asyncio.run(scenario())
 
 
-def test_same_conversation_wait_expires_with_timeout_failure() -> None:
+def test_queue_ttl_expires_waiting_ask_and_preserves_thread_ref() -> None:
+    conversation_id = "123e4567-e89b-12d3-a456-426614174000"
     first_provider_started = asyncio.Event()
     release_first_provider = asyncio.Event()
     provider_questions: list[str] = []
@@ -429,7 +521,7 @@ def test_same_conversation_wait_expires_with_timeout_failure() -> None:
         timeout_seconds: float | None = None,
     ) -> ask.AskOutcome:
         del on_status, on_conversation_id, timeout_seconds
-        assert conversation_id == "shared-conversation"
+        assert conversation_id == "123e4567-e89b-12d3-a456-426614174000"
         provider_questions.append(question)
         if question == "first":
             first_provider_started.set()
@@ -438,24 +530,23 @@ def test_same_conversation_wait_expires_with_timeout_failure() -> None:
 
     async def scenario() -> None:
         service = jobs.AskJobService(
-            provider, overall_timeout_seconds=0.01
+            provider,
+            overall_timeout_seconds=30.0,
+            queue_ttl_seconds=0.01,
         )
-        first_job = service.start(
-            "first", conversation_id="shared-conversation"
-        )
+        first_job = service.start("first", conversation_id=conversation_id)
         await first_provider_started.wait()
-        second_job = service.start(
-            "second", conversation_id="shared-conversation"
-        )
+        second_job = service.start("second", conversation_id=conversation_id)
 
         failed_job = await _wait_for_state(
             service, second_job.ask_id, "failed"
         )
-        assert failed_job.failure == "timeout"
+        assert failed_job.failure == "expired"
         assert failed_job.error_message == (
-            "the ask deadline expired while waiting for the in-flight answer "
+            "the queue TTL expired while waiting for the in-flight ask "
             "on this conversation"
         )
+        assert failed_job.thread_ref == conversation_id
         assert provider_questions == ["first"]
 
         release_first_provider.set()
@@ -465,7 +556,7 @@ def test_same_conversation_wait_expires_with_timeout_failure() -> None:
     asyncio.run(scenario())
 
 
-def test_service_uses_environment_overall_timeout_for_start_budget(
+def test_service_uses_environment_overall_timeout_for_admission_budget(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("GPTPRO_OVERALL_TIMEOUT_SECONDS", "14400")
@@ -494,8 +585,11 @@ def test_service_uses_environment_overall_timeout_for_start_budget(
     assert captured_timeouts == [14_400.0]
 
 
-def test_provider_receives_remaining_overall_timeout() -> None:
-    captured_timeouts: list[float | None] = []
+def test_waiting_ask_receives_full_execution_budget_at_admission() -> None:
+    now = 100.0
+    first_provider_started = asyncio.Event()
+    release_first_provider = asyncio.Event()
+    captured_timeouts: list[tuple[str, float | None]] = []
 
     async def provider(
         question: str,
@@ -505,24 +599,44 @@ def test_provider_receives_remaining_overall_timeout() -> None:
         conversation_id: str | None = None,
         timeout_seconds: float | None = None,
     ) -> ask.AskOutcome:
-        del question, on_status, on_conversation_id, conversation_id
-        captured_timeouts.append(timeout_seconds)
-        return ask.AskOutcome("answer", "marker", None)
+        del on_status, on_conversation_id
+        assert conversation_id == "shared-conversation"
+        captured_timeouts.append((question, timeout_seconds))
+        if question == "first":
+            first_provider_started.set()
+            await release_first_provider.wait()
+        return ask.AskOutcome("answer", "marker", conversation_id)
 
     async def scenario() -> None:
+        nonlocal now
         service = jobs.AskJobService(
-            provider, overall_timeout_seconds=12.5
+            provider,
+            overall_timeout_seconds=12.5,
+            queue_ttl_seconds=20.0,
+            clock=lambda: now,
         )
-        started_job = service.start("question")
-        await _wait_for_state(service, started_job.ask_id, "succeeded")
+        first_job = service.start(
+            "first", conversation_id="shared-conversation"
+        )
+        await first_provider_started.wait()
+        second_job = service.start(
+            "second", conversation_id="shared-conversation"
+        )
+        await _wait_for_status_message(
+            service,
+            second_job.ask_id,
+            "waiting for the in-flight answer",
+        )
+
+        now += 10.0
+        release_first_provider.set()
+        await _wait_for_state(service, first_job.ask_id, "succeeded")
+        await _wait_for_state(service, second_job.ask_id, "succeeded")
         await service.aclose()
 
     asyncio.run(scenario())
 
-    assert len(captured_timeouts) == 1
-    captured_timeout = captured_timeouts[0]
-    assert captured_timeout is not None
-    assert 0 < captured_timeout <= 12.5
+    assert captured_timeouts == [("first", 12.5), ("second", 12.5)]
 
 
 @pytest.mark.parametrize("should_fail", [False, True], ids=["success", "failure"])

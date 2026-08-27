@@ -23,6 +23,7 @@ from claudex.gptpro.ask import AskOutcome, GptProAskError
 JOB_RETENTION_SECONDS = 24.0 * 60 * 60
 SWEEP_INTERVAL_SECONDS = 300.0
 THREAD_BINDING_TTL_SECONDS = 23 * 60 * 60
+QUEUE_TTL_SECONDS = 900.0
 QUESTION_SPILL_THRESHOLD_BYTES = 35_000
 
 AskJobState = Literal["running", "succeeded", "failed"]
@@ -40,6 +41,13 @@ class AskJob:
     thread_ref: str | None
     created_at: float
     finished_at: float | None
+
+
+@dataclass(frozen=True)
+class TurnFinished:
+    ask_id: str
+    thread_ref: str | None
+    answer: str
 
 
 class _AskCallable(Protocol):
@@ -90,6 +98,8 @@ class AskJobService:
         retention_seconds: float = JOB_RETENTION_SECONDS,
         sweep_interval_seconds: float = SWEEP_INTERVAL_SECONDS,
         overall_timeout_seconds: float | None = None,
+        queue_ttl_seconds: float | None = None,
+        on_turn_finished: Callable[[TurnFinished], None] | None = None,
         clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
@@ -113,6 +123,12 @@ class AskJobService:
             if overall_timeout_seconds is None
             else overall_timeout_seconds
         )
+        self._queue_ttl_seconds = (
+            QUEUE_TTL_SECONDS
+            if queue_ttl_seconds is None
+            else queue_ttl_seconds
+        )
+        self._on_turn_finished = on_turn_finished
         self._clock = clock
         self._sleep = sleep
         self._jobs: dict[str, AskJob] = {}
@@ -135,7 +151,7 @@ class AskJobService:
         """
         ask_id = uuid4().hex
         created_at = self._clock()
-        expires_at = created_at + self._overall_timeout_seconds
+        queue_deadline = created_at + self._queue_ttl_seconds
         job = AskJob(
             ask_id=ask_id,
             state="running",
@@ -156,7 +172,7 @@ class AskJobService:
                 question,
                 conversation_id,
                 on_thread_ref,
-                expires_at,
+                queue_deadline,
                 attachment_paths,
             )
         )
@@ -193,7 +209,7 @@ class AskJobService:
         question: str,
         conversation_id: str | None,
         on_thread_ref: Callable[[str], None] | None,
-        expires_at: float,
+        queue_deadline: float,
         attachment_paths: Sequence[str] | None,
     ) -> None:
         thread_lock: asyncio.Lock | None = None
@@ -208,32 +224,31 @@ class AskJobService:
                     self._on_status(
                         ask_id, "waiting for the in-flight answer"
                     )
-                    remaining = expires_at - self._clock()
-                    if remaining <= 0:
+                    queue_wait_remaining = (
+                        queue_deadline - self._clock()
+                    )
+                    if queue_wait_remaining <= 0:
                         raise GptProAskError(
-                            "timeout",
-                            "the ask deadline expired while waiting for the "
-                            "in-flight answer on this conversation",
+                            "expired",
+                            "the queue TTL expired while waiting for the "
+                            "in-flight ask on this conversation",
                         )
                     try:
                         await asyncio.wait_for(
-                            thread_lock.acquire(), timeout=remaining
+                            thread_lock.acquire(),
+                            timeout=queue_wait_remaining,
                         )
                     except TimeoutError as exc:
                         raise GptProAskError(
-                            "timeout",
-                            "the ask deadline expired while waiting for the "
-                            "in-flight answer on this conversation",
+                            "expired",
+                            "the queue TTL expired while waiting for the "
+                            "in-flight ask on this conversation",
                         ) from exc
                 else:
                     await thread_lock.acquire()
                 has_thread_lock = True
 
-            remaining = expires_at - self._clock()
-            if remaining <= 0:
-                raise GptProAskError(
-                    "timeout", "the ask deadline expired before provider start"
-                )
+            remaining = self._overall_timeout_seconds
 
             def capture_status(message: str) -> None:
                 self._on_status(ask_id, message)
@@ -299,6 +314,17 @@ class AskJobService:
             if on_thread_ref is not None and thread_ref is not None:
                 try:
                     on_thread_ref(thread_ref)
+                except Exception:
+                    pass
+            if self._on_turn_finished is not None:
+                try:
+                    self._on_turn_finished(
+                        TurnFinished(
+                            ask_id=ask_id,
+                            thread_ref=thread_ref,
+                            answer=outcome.text,
+                        )
+                    )
                 except Exception:
                     pass
         except GptProAskError as exc:
