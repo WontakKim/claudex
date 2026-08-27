@@ -446,6 +446,151 @@ def test_existing_conversation_notifies_thread_ref_on_success() -> None:
     asyncio.run(scenario())
 
 
+def test_fresh_ask_latch_queues_same_conversation_until_completion() -> None:
+    conversation_id = "123e4567-e89b-12d3-a456-426614174000"
+    conversation_latched = asyncio.Event()
+    release_fresh_provider = asyncio.Event()
+    follow_up_provider_started = asyncio.Event()
+    started_questions: list[str] = []
+
+    async def provider(
+        question: str,
+        *,
+        on_status: Callable[[str], None] | None = None,
+        on_conversation_id: Callable[[str], None] | None = None,
+        conversation_id: str | None = None,
+        timeout_seconds: float | None = None,
+    ) -> ask.AskOutcome:
+        del on_status, timeout_seconds
+        started_questions.append(question)
+        if question == "fresh":
+            assert conversation_id is None
+            assert on_conversation_id is not None
+            on_conversation_id(
+                "123e4567-e89b-12d3-a456-426614174000"
+            )
+            conversation_latched.set()
+            await release_fresh_provider.wait()
+        else:
+            assert conversation_id == (
+                "123e4567-e89b-12d3-a456-426614174000"
+            )
+            follow_up_provider_started.set()
+        return ask.AskOutcome("answer", "marker", conversation_id)
+
+    async def scenario() -> None:
+        service = jobs.AskJobService(provider)
+        fresh_job = service.start("fresh")
+        await conversation_latched.wait()
+
+        follow_up_job = service.start(
+            "follow-up", conversation_id=conversation_id
+        )
+        waiting_job = await _wait_for_status_message(
+            service,
+            follow_up_job.ask_id,
+            "waiting for the in-flight answer",
+        )
+        assert waiting_job.state == "queued"
+        assert not follow_up_provider_started.is_set()
+        assert started_questions == ["fresh"]
+
+        release_fresh_provider.set()
+        await _wait_for_state(service, fresh_job.ask_id, "succeeded")
+        await follow_up_provider_started.wait()
+        await _wait_for_state(service, follow_up_job.ask_id, "succeeded")
+        assert started_questions == ["fresh", "follow-up"]
+        await service.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_failed_fresh_ask_latch_releases_waiting_conversation() -> None:
+    conversation_id = "123e4567-e89b-12d3-a456-426614174000"
+    conversation_latched = asyncio.Event()
+    release_fresh_provider = asyncio.Event()
+    follow_up_provider_started = asyncio.Event()
+    started_questions: list[str] = []
+
+    async def provider(
+        question: str,
+        *,
+        on_status: Callable[[str], None] | None = None,
+        on_conversation_id: Callable[[str], None] | None = None,
+        conversation_id: str | None = None,
+        timeout_seconds: float | None = None,
+    ) -> ask.AskOutcome:
+        del on_status, timeout_seconds
+        started_questions.append(question)
+        if question == "fresh":
+            assert conversation_id is None
+            assert on_conversation_id is not None
+            on_conversation_id(
+                "123e4567-e89b-12d3-a456-426614174000"
+            )
+            conversation_latched.set()
+            await release_fresh_provider.wait()
+            raise ask.GptProAskError("error", "provider failed")
+        assert conversation_id == "123e4567-e89b-12d3-a456-426614174000"
+        follow_up_provider_started.set()
+        return ask.AskOutcome("answer", "marker", conversation_id)
+
+    async def scenario() -> None:
+        service = jobs.AskJobService(provider)
+        fresh_job = service.start("fresh")
+        await conversation_latched.wait()
+        follow_up_job = service.start(
+            "follow-up", conversation_id=conversation_id
+        )
+        await _wait_for_status_message(
+            service,
+            follow_up_job.ask_id,
+            "waiting for the in-flight answer",
+        )
+
+        release_fresh_provider.set()
+        await _wait_for_state(service, fresh_job.ask_id, "failed")
+        await follow_up_provider_started.wait()
+        await _wait_for_state(service, follow_up_job.ask_id, "succeeded")
+        assert started_questions == ["fresh", "follow-up"]
+        await service.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_fresh_ask_without_conversation_id_has_no_ownership_side_effects() -> None:
+    captured_conversation_ids: list[str | None] = []
+
+    async def provider(
+        question: str,
+        *,
+        on_status: Callable[[str], None] | None = None,
+        on_conversation_id: Callable[[str], None] | None = None,
+        conversation_id: str | None = None,
+        timeout_seconds: float | None = None,
+    ) -> ask.AskOutcome:
+        del question, on_status, on_conversation_id, timeout_seconds
+        captured_conversation_ids.append(conversation_id)
+        return ask.AskOutcome("answer", "marker", conversation_id)
+
+    async def scenario() -> None:
+        service = jobs.AskJobService(provider)
+        fresh_job = service.start("fresh")
+        completed_fresh_job = await _wait_for_state(
+            service, fresh_job.ask_id, "succeeded"
+        )
+        assert completed_fresh_job.thread_ref is None
+
+        explicit_job = service.start(
+            "explicit", conversation_id="next-conversation"
+        )
+        await _wait_for_state(service, explicit_job.ask_id, "succeeded")
+        assert captured_conversation_ids == [None, "next-conversation"]
+        await service.aclose()
+
+    asyncio.run(scenario())
+
+
 def test_same_conversation_queued_ask_runs_in_submission_order() -> None:
     first_provider_started = asyncio.Event()
     release_first_provider = asyncio.Event()

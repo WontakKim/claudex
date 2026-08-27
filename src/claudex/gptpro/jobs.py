@@ -58,6 +58,12 @@ class TurnFinished:
     answer: str
 
 
+@dataclass(frozen=True)
+class _ConversationOwnership:
+    owner_ask_id: str
+    released: asyncio.Event
+
+
 class _AskCallable(Protocol):
     def __call__(
         self,
@@ -185,7 +191,7 @@ class AskJobService:
         self._jobs: dict[str, AskJob] = {}
         self._job_tasks: set[asyncio.Task[None]] = set()
         self._sweeper_task: asyncio.Task[None] | None = None
-        self._thread_locks: dict[str, asyncio.Lock] = {}
+        self._conversation_owners: dict[str, _ConversationOwnership] = {}
 
     def start(
         self,
@@ -263,15 +269,12 @@ class AskJobService:
         queue_deadline: float,
         attachment_paths: Sequence[str] | None,
     ) -> None:
-        thread_lock: asyncio.Lock | None = None
-        has_thread_lock = False
         spill_path: Path | None = None
         try:
             if conversation_id is not None:
-                thread_lock = self._thread_locks.setdefault(
-                    conversation_id, asyncio.Lock()
-                )
-                if thread_lock.locked():
+                while ownership := self._conversation_owners.get(
+                    conversation_id
+                ):
                     self._on_status(
                         ask_id, "waiting for the in-flight answer"
                     )
@@ -286,7 +289,7 @@ class AskJobService:
                         )
                     try:
                         await asyncio.wait_for(
-                            thread_lock.acquire(),
+                            ownership.released.wait(),
                             timeout=queue_wait_remaining,
                         )
                     except TimeoutError as exc:
@@ -295,9 +298,9 @@ class AskJobService:
                             "the queue TTL expired while waiting for the "
                             "in-flight ask on this conversation",
                         ) from exc
-                else:
-                    await thread_lock.acquire()
-                has_thread_lock = True
+                self._conversation_owners[conversation_id] = (
+                    _ConversationOwnership(ask_id, asyncio.Event())
+                )
 
             self._jobs[ask_id] = replace(
                 self._jobs[ask_id], state="running"
@@ -403,9 +406,15 @@ class AskJobService:
                 error_message=f"{type(exc).__name__}: {exc}",
             )
         finally:
-            if has_thread_lock:
-                assert thread_lock is not None
-                thread_lock.release()
+            owned_conversation_id = self._jobs[ask_id].thread_ref
+            ownership = (
+                self._conversation_owners.get(owned_conversation_id)
+                if owned_conversation_id is not None
+                else None
+            )
+            if ownership is not None and ownership.owner_ask_id == ask_id:
+                del self._conversation_owners[owned_conversation_id]
+                ownership.released.set()
             if spill_path is not None:
                 spill_path.unlink(missing_ok=True)
             self._jobs[ask_id] = replace(
@@ -438,6 +447,10 @@ class AskJobService:
         if job.thread_ref is not None:
             return
         self._jobs[ask_id] = replace(job, thread_ref=conversation_id)
+        self._conversation_owners.setdefault(
+            conversation_id,
+            _ConversationOwnership(ask_id, asyncio.Event()),
+        )
 
     async def _run_sweeper(self) -> None:
         while True:
