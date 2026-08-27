@@ -426,6 +426,87 @@ def test_submit_rejects_invalid_attachments(attachments: Any) -> None:
     assert runtime.provider_attachment_paths == []
 
 
+def test_submit_rejects_thread_ref_argument() -> None:
+    runtime = FakeAskRuntime()
+    with _mcp_client(runtime) as client:
+        _payload, headers = _initialize(client)
+        result = _call_tool(
+            client,
+            headers,
+            "ask_gpt_pro",
+            {"question": "Question", "thread_ref": _CONVERSATION_A},
+        )
+
+    assert result == {
+        "content": [
+            {
+                "type": "text",
+                "text": (
+                    "Unknown argument(s) for ask_gpt_pro: thread_ref — "
+                    "expected parameters: question, thread, attachments"
+                ),
+            }
+        ],
+        "isError": True,
+    }
+    assert runtime.questions == []
+
+
+def test_submit_rejects_unknown_argument_before_question_validation() -> None:
+    runtime = FakeAskRuntime()
+    with _mcp_client(runtime) as client:
+        _payload, headers = _initialize(client)
+        result = _call_tool(
+            client,
+            headers,
+            "ask_gpt_pro",
+            {"unexpected": True},
+        )
+
+    assert result == {
+        "content": [
+            {
+                "type": "text",
+                "text": (
+                    "Unknown argument(s) for ask_gpt_pro: unexpected — "
+                    "expected parameters: question, thread, attachments"
+                ),
+            }
+        ],
+        "isError": True,
+    }
+    assert runtime.questions == []
+
+
+@pytest.mark.parametrize(
+    "tool_name", ["ask_gpt_pro_status", "ask_gpt_pro_result"]
+)
+def test_status_and_result_reject_unknown_arguments_before_ask_id_validation(
+    tool_name: str,
+) -> None:
+    with _mcp_client(FakeAskRuntime()) as client:
+        _payload, headers = _initialize(client)
+        result = _call_tool(
+            client,
+            headers,
+            tool_name,
+            {"unexpected": True},
+        )
+
+    assert result == {
+        "content": [
+            {
+                "type": "text",
+                "text": (
+                    f"Unknown argument(s) for {tool_name}: unexpected — "
+                    "expected parameters: ask_id"
+                ),
+            }
+        ],
+        "isError": True,
+    }
+
+
 def test_result_returns_settled_answer_and_thread_ref() -> None:
     runtime = FakeAskRuntime(
         answer="## Result\n\nThe settled answer.",

@@ -56,6 +56,9 @@ _THREAD_DESCRIPTION = (
     "thread_ref) continues that conversation; omit to continue this session's "
     "current conversation."
 )
+ASK_GPT_PRO_ALLOWED_ARGUMENT_KEYS = ("question", "thread", "attachments")
+ASK_GPT_PRO_STATUS_ALLOWED_ARGUMENT_KEYS = ("ask_id",)
+ASK_GPT_PRO_RESULT_ALLOWED_ARGUMENT_KEYS = ("ask_id",)
 ASK_GPT_PRO_INPUT_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
@@ -294,6 +297,14 @@ def _create_session_manager(app: Any) -> Any:
         runtime = app.state.gptpro_ask_runtime
 
         if params.name == "ask_gpt_pro":
+            unknown_argument_error = _get_unknown_argument_error(
+                types,
+                tool_name="ask_gpt_pro",
+                arguments=arguments,
+                allowed_argument_keys=ASK_GPT_PRO_ALLOWED_ARGUMENT_KEYS,
+            )
+            if unknown_argument_error is not None:
+                return unknown_argument_error
             question = arguments.get("question")
             if not isinstance(question, str):
                 return _tool_error(types, "question must be a string")
@@ -346,6 +357,14 @@ def _create_session_manager(app: Any) -> Any:
             )
 
         if params.name == "ask_gpt_pro_status":
+            unknown_argument_error = _get_unknown_argument_error(
+                types,
+                tool_name="ask_gpt_pro_status",
+                arguments=arguments,
+                allowed_argument_keys=ASK_GPT_PRO_STATUS_ALLOWED_ARGUMENT_KEYS,
+            )
+            if unknown_argument_error is not None:
+                return unknown_argument_error
             ask_id = arguments.get("ask_id")
             if not isinstance(ask_id, str):
                 return _tool_error(types, "ask_id must be a string")
@@ -363,6 +382,14 @@ def _create_session_manager(app: Any) -> Any:
             )
 
         if params.name == "ask_gpt_pro_result":
+            unknown_argument_error = _get_unknown_argument_error(
+                types,
+                tool_name="ask_gpt_pro_result",
+                arguments=arguments,
+                allowed_argument_keys=ASK_GPT_PRO_RESULT_ALLOWED_ARGUMENT_KEYS,
+            )
+            if unknown_argument_error is not None:
+                return unknown_argument_error
             ask_id = arguments.get("ask_id")
             if not isinstance(ask_id, str):
                 return _tool_error(types, "ask_id must be a string")
@@ -439,6 +466,24 @@ def _gptpro_error_result(
 def _json_result(types: Any, payload: dict[str, Any]) -> Any:
     return types.CallToolResult(
         content=[types.TextContent(text=json.dumps(payload))]
+    )
+
+
+def _get_unknown_argument_error(
+    types: Any,
+    *,
+    tool_name: str,
+    arguments: dict[str, Any],
+    allowed_argument_keys: Sequence[str],
+) -> Any | None:
+    unknown_argument_keys = sorted(set(arguments) - set(allowed_argument_keys))
+    if not unknown_argument_keys:
+        return None
+    return _tool_error(
+        types,
+        f"Unknown argument(s) for {tool_name}: "
+        f"{', '.join(unknown_argument_keys)} — expected parameters: "
+        f"{', '.join(allowed_argument_keys)}",
     )
 
 
