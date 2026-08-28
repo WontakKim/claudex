@@ -7,6 +7,7 @@ import asyncio
 import importlib.resources
 import json
 import logging
+import sys
 import time
 from collections.abc import AsyncIterator, Callable
 from dataclasses import replace
@@ -124,6 +125,11 @@ _ADMIN_FUNCTION_MANIFEST = {
     "system": {
         "_handle_admin_logs",
         "_handle_admin_gptpro_session",
+        "_handle_admin_gptpro_login_get",
+        "_handle_admin_gptpro_login_post",
+        "_handle_admin_gptpro_login_delete",
+        "_handle_admin_gptpro_doctor",
+        "_handle_admin_gptpro_mcp",
         "_handle_admin_usage",
         "_handle_admin_codex_reset_credit",
         "_serve_dashboard_asset",
@@ -161,6 +167,8 @@ _ADMIN_CONSTANT_MANIFEST = {
     },
     "system": {
         "_STATUS_TO_OPENAI_ERROR_TYPE",
+        "_GPTPRO_DOCTOR_TIMEOUT",
+        "_GPTPRO_DOCTOR_COMMAND",
         "_FAVICON_SVG",
         "_CONNECTION_TEST_TIMEOUT",
     },
@@ -2083,6 +2091,265 @@ def test_admin_gptpro_session_reports_missing_optional_session(
     assert body["valid"] is False
     assert body["expires_at"] is None
     assert body["expires_in_seconds"] is None
+
+
+class FakeAdminGptProLoginSession:
+    def __init__(
+        self,
+        *,
+        terminal: bool = False,
+        status: dict[str, Any] | None = None,
+    ) -> None:
+        self.is_terminal = terminal
+        self.started = False
+        self.cancel_requested = False
+        self._status = status or {
+            "status": "starting",
+            "started_at": 123.0,
+            "detail": None,
+            "output": "",
+            "error": None,
+        }
+
+    def start(self) -> None:
+        self.started = True
+
+    def status(self) -> dict[str, Any]:
+        return dict(self._status)
+
+    def request_cancel(self) -> None:
+        self.cancel_requested = True
+
+
+class FakeAdminGptProRuntime:
+    def __init__(self, *, active: bool = False) -> None:
+        self.active = active
+        self.released = False
+
+    def has_active_jobs(self) -> bool:
+        return self.active
+
+    async def release_runtime(self) -> None:
+        self.released = True
+
+
+class TestAdminGptProApi:
+    @staticmethod
+    def _client(
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        *,
+        config: GatewayConfig | None = None,
+        base_url: str = "http://127.0.0.1:8787",
+    ) -> TestClient:
+        return _create_test_client(
+            monkeypatch,
+            tmp_path,
+            config=config,
+            base_url=base_url,
+        )
+
+    def test_mcp_reports_default_endpoint(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        with self._client(monkeypatch, tmp_path) as client:
+            response = client.get("/admin/gptpro/mcp")
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "endpoint": "http://127.0.0.1:8787/mcp",
+            "auth_required": False,
+        }
+
+    def test_mcp_normalizes_wildcard_host(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        config = GatewayConfig(host="0.0.0.0", port=9000)
+        with self._client(monkeypatch, tmp_path, config=config) as client:
+            response = client.get("/admin/gptpro/mcp")
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "endpoint": "http://127.0.0.1:9000/mcp",
+            "auth_required": False,
+        }
+
+    def test_mcp_reports_local_auth_requirement(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        config = GatewayConfig(local_token="secret-token")
+        with self._client(monkeypatch, tmp_path, config=config) as client:
+            response = client.get(
+                "/admin/gptpro/mcp",
+                headers={"authorization": "Bearer secret-token"},
+            )
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "endpoint": "http://127.0.0.1:8787/mcp",
+            "auth_required": True,
+        }
+
+    def test_login_post_starts_session_after_releasing_runtime(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        runtime = FakeAdminGptProRuntime()
+        monkeypatch.setattr(
+            admin_system, "GptProLoginSession", FakeAdminGptProLoginSession
+        )
+        with self._client(monkeypatch, tmp_path) as client:
+            client.app.state.gptpro_ask_runtime = runtime
+            response = client.post("/admin/gptpro/login", json={})
+            session = client.app.state.gptpro_login_session
+
+        assert response.status_code == 201
+        assert response.json() == {
+            "status": "starting",
+            "started_at": 123.0,
+            "detail": None,
+            "output": "",
+            "error": None,
+        }
+        assert runtime.released is True
+        assert isinstance(session, FakeAdminGptProLoginSession)
+        assert session.started is True
+
+    def test_login_post_rejects_active_session(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        with self._client(monkeypatch, tmp_path) as client:
+            client.app.state.gptpro_login_session = FakeAdminGptProLoginSession()
+            response = client.post("/admin/gptpro/login", json={})
+
+        assert response.status_code == 409
+        assert response.json()["error"]["code"] == "login-active"
+
+    def test_login_post_rejects_active_asks(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        runtime = FakeAdminGptProRuntime(active=True)
+        with self._client(monkeypatch, tmp_path) as client:
+            client.app.state.gptpro_ask_runtime = runtime
+            response = client.post("/admin/gptpro/login", json={})
+
+        assert response.status_code == 409
+        assert response.json()["error"]["code"] == "asks-active"
+        assert runtime.released is False
+
+    def test_login_post_requires_json_content_type(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        with self._client(monkeypatch, tmp_path) as client:
+            response = client.post("/admin/gptpro/login", content=b"{}")
+
+        assert response.status_code == 415
+
+    def test_login_post_rejects_foreign_host(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        with self._client(
+            monkeypatch, tmp_path, base_url="http://evil.example"
+        ) as client:
+            response = client.post("/admin/gptpro/login", json={})
+
+        assert response.status_code == 403
+
+    def test_login_post_rejects_non_empty_body(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        with self._client(monkeypatch, tmp_path) as client:
+            response = client.post("/admin/gptpro/login", json={"mode": "browser"})
+
+        assert response.status_code == 400
+
+    def test_login_get_is_idle_without_session(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        with self._client(monkeypatch, tmp_path) as client:
+            response = client.get("/admin/gptpro/login")
+
+        assert response.status_code == 200
+        assert response.json() == {"status": "idle"}
+
+    def test_login_get_returns_session_status(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        expected = {
+            "status": "running",
+            "started_at": 456.0,
+            "detail": "waiting for browser login",
+            "output": "open browser\n",
+            "error": None,
+        }
+        with self._client(monkeypatch, tmp_path) as client:
+            client.app.state.gptpro_login_session = FakeAdminGptProLoginSession(
+                status=expected
+            )
+            response = client.get("/admin/gptpro/login")
+
+        assert response.status_code == 200
+        assert response.json() == expected
+
+    def test_login_delete_requests_active_session_cancellation(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        session = FakeAdminGptProLoginSession()
+        with self._client(monkeypatch, tmp_path) as client:
+            client.app.state.gptpro_login_session = session
+            response = client.delete("/admin/gptpro/login")
+
+        assert response.status_code == 200
+        assert response.json() == {"status": "cancelling"}
+        assert session.cancel_requested is True
+
+    def test_login_delete_clears_terminal_session(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        session = FakeAdminGptProLoginSession(terminal=True)
+        with self._client(monkeypatch, tmp_path) as client:
+            client.app.state.gptpro_login_session = session
+            response = client.delete("/admin/gptpro/login")
+            following_status = client.get("/admin/gptpro/login")
+
+        assert response.status_code == 200
+        assert response.json() == {"status": "idle"}
+        assert following_status.json() == {"status": "idle"}
+        assert client.app.state.gptpro_login_session is None
+
+    @pytest.mark.parametrize(("exit_code", "expected_ok"), [(0, True), (1, False)])
+    def test_doctor_reports_subprocess_result(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        exit_code: int,
+        expected_ok: bool,
+    ) -> None:
+        monkeypatch.setattr(
+            admin_system,
+            "_GPTPRO_DOCTOR_COMMAND",
+            (
+                sys.executable,
+                "-c",
+                f"import sys; print('doctor output'); sys.exit({exit_code})",
+            ),
+        )
+        with self._client(monkeypatch, tmp_path) as client:
+            response = client.post("/admin/gptpro/doctor", json={})
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "ok": expected_ok,
+            "exit_code": exit_code,
+            "output": "doctor output\n",
+        }
+
+    def test_doctor_requires_json_content_type(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        with self._client(monkeypatch, tmp_path) as client:
+            response = client.post("/admin/gptpro/doctor", content=b"{}")
+
+        assert response.status_code == 415
 
 
 def test_admin_usage_returns_all_providers(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

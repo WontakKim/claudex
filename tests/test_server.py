@@ -389,6 +389,26 @@ def test_route_ownership_matches_surface_modules() -> None:
             "claudex.admin.system",
             "_handle_admin_gptpro_session",
         ),
+        ("/admin/gptpro/login", route_methods("GET")): (
+            "claudex.admin.system",
+            "_handle_admin_gptpro_login_get",
+        ),
+        ("/admin/gptpro/login", route_methods("POST")): (
+            "claudex.admin.system",
+            "_handle_admin_gptpro_login_post",
+        ),
+        ("/admin/gptpro/login", route_methods("DELETE")): (
+            "claudex.admin.system",
+            "_handle_admin_gptpro_login_delete",
+        ),
+        ("/admin/gptpro/doctor", route_methods("POST")): (
+            "claudex.admin.system",
+            "_handle_admin_gptpro_doctor",
+        ),
+        ("/admin/gptpro/mcp", route_methods("GET")): (
+            "claudex.admin.system",
+            "_handle_admin_gptpro_mcp",
+        ),
         ("/admin/usage", route_methods("GET")): (
             "claudex.admin.system",
             "_handle_admin_usage",

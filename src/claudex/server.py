@@ -56,6 +56,11 @@ from claudex.admin.system import (
     _handle_admin_connection_test,
     _handle_admin_custom_models,
     _handle_admin_grok_models,
+    _handle_admin_gptpro_doctor,
+    _handle_admin_gptpro_login_delete,
+    _handle_admin_gptpro_login_get,
+    _handle_admin_gptpro_login_post,
+    _handle_admin_gptpro_mcp,
     _handle_admin_gptpro_session,
     _handle_admin_kimi_models,
     _handle_admin_logs,
@@ -556,6 +561,31 @@ def create_app(config: GatewayConfig, daemon_nonce: str | None = None) -> Starle
                 _handle_admin_gptpro_session,
                 methods=["GET"],
             ),
+            Route(
+                "/admin/gptpro/login",
+                _handle_admin_gptpro_login_get,
+                methods=["GET"],
+            ),
+            Route(
+                "/admin/gptpro/login",
+                _handle_admin_gptpro_login_post,
+                methods=["POST"],
+            ),
+            Route(
+                "/admin/gptpro/login",
+                _handle_admin_gptpro_login_delete,
+                methods=["DELETE"],
+            ),
+            Route(
+                "/admin/gptpro/doctor",
+                _handle_admin_gptpro_doctor,
+                methods=["POST"],
+            ),
+            Route(
+                "/admin/gptpro/mcp",
+                _handle_admin_gptpro_mcp,
+                methods=["GET"],
+            ),
             Route("/admin/usage", _handle_admin_usage, methods=["GET"]),
             Route("/admin/test", _handle_admin_connection_test, methods=["POST"]),
         ],
@@ -563,6 +593,7 @@ def create_app(config: GatewayConfig, daemon_nonce: str | None = None) -> Starle
     )
     app.state.daemon_nonce = daemon_nonce
     app.state.gptpro_ask_runtime = LazyAskRuntime()
+    app.state.gptpro_login_session = None
     app.state.gptpro_mcp_endpoint = gptpro_mcp_endpoint
     # Lifespan replaces this with one client per configured custom provider.
     app.state.custom_provider_clients = {}
