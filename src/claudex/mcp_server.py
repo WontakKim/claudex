@@ -12,6 +12,7 @@ from starlette.types import Receive, Scope, Send
 
 from claudex import mcp_tools
 from claudex.gptpro import jobs
+from claudex.gptpro.ask import AskCallbacks
 
 
 class LazyAskRuntime:
@@ -27,10 +28,7 @@ class LazyAskRuntime:
         self,
         question: str,
         *,
-        on_status: Callable[[str], None] | None = None,
-        on_conversation_id: Callable[[str], None] | None = None,
-        on_marker: Callable[[str], None] | None = None,
-        on_detached: Callable[[], None] | None = None,
+        callbacks: AskCallbacks | None = None,
         conversation_id: str | None = None,
         timeout_seconds: float | None = None,
         attachment_paths: Sequence[str] | None = None,
@@ -38,10 +36,7 @@ class LazyAskRuntime:
         runtime = await self._get_runtime()
         return await runtime.ask(
             question,
-            on_status=on_status,
-            on_conversation_id=on_conversation_id,
-            on_marker=on_marker,
-            on_detached=on_detached,
+            callbacks=callbacks,
             conversation_id=conversation_id,
             timeout_seconds=timeout_seconds,
             attachment_paths=attachment_paths,

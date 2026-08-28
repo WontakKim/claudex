@@ -452,10 +452,7 @@ class AskRuntime:
         self,
         question: str,
         *,
-        on_status: Callable[[str], None] | None = None,
-        on_conversation_id: Callable[[str], None] | None = None,
-        on_marker: Callable[[str], None] | None = None,
-        on_detached: Callable[[], None] | None = None,
+        callbacks: AskCallbacks | None = None,
         conversation_id: str | None = None,
         timeout_seconds: float | None = None,
         attachment_paths: Sequence[str] | None = None,
@@ -504,10 +501,7 @@ class AskRuntime:
             return await self._execute_in_page(
                 context,
                 question,
-                on_status,
-                on_conversation_id,
-                on_marker,
-                on_detached,
+                callbacks,
                 conversation_id,
                 timeout_seconds,
                 attachment_paths,
@@ -561,16 +555,19 @@ class AskRuntime:
         self,
         context: Any,
         question: str,
-        on_status: Callable[[str], None] | None,
-        on_conversation_id: Callable[[str], None] | None,
-        on_marker: Callable[[str], None] | None,
-        on_detached: Callable[[], None] | None,
+        callbacks: AskCallbacks | None,
         conversation_id: str | None,
         timeout_seconds: float | None,
         attachment_paths: Sequence[str] | None,
         detached_deadline: float,
         release_admission: Callable[[], None],
     ) -> AskOutcome:
+        on_status = callbacks.on_status if callbacks is not None else None
+        on_conversation_id = (
+            callbacks.on_conversation_id if callbacks is not None else None
+        )
+        on_marker = callbacks.on_marker if callbacks is not None else None
+        on_detached = callbacks.on_detached if callbacks is not None else None
         page: Any | None = None
         primary_failure: BaseException | None = None
         try:

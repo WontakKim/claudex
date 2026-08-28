@@ -58,8 +58,7 @@ class FakeAskRuntime:
         self,
         question: str,
         *,
-        on_status: Callable[[str], None] | None = None,
-        on_conversation_id: Callable[[str], None] | None = None,
+        callbacks: ask.AskCallbacks | None = None,
         conversation_id: str | None = None,
         timeout_seconds: float | None = None,
         attachment_paths: Sequence[str] | None = None,
@@ -70,11 +69,15 @@ class FakeAskRuntime:
             self.questions.append(question)
             self.provider_conversation_ids.append(conversation_id)
             self.provider_attachment_paths.append(attachment_paths)
-            self._conversation_id_callbacks.append(on_conversation_id)
+            self._conversation_id_callbacks.append(
+                callbacks.on_conversation_id
+                if callbacks is not None
+                else None
+            )
             self._provider_release_events.append(release_provider)
             self._provider_calls_changed.notify_all()
-        if on_status is not None:
-            on_status("waiting for ChatGPT Pro")
+        if callbacks is not None and callbacks.on_status is not None:
+            callbacks.on_status("waiting for ChatGPT Pro")
         await release_provider.wait()
         if self.error is not None:
             raise self.error
@@ -368,10 +371,17 @@ def test_lazy_runtime_forwards_detached_callback() -> None:
         async def ask(
             self,
             question: str,
-            **options: Any,
+            *,
+            callbacks: ask.AskCallbacks | None = None,
+            conversation_id: str | None = None,
+            timeout_seconds: float | None = None,
+            attachment_paths: Sequence[str] | None = None,
         ) -> ask.AskOutcome:
+            del conversation_id, timeout_seconds, attachment_paths
             assert question == "question"
-            captured_callbacks.append(options.get("on_detached"))
+            captured_callbacks.append(
+                callbacks.on_detached if callbacks is not None else None
+            )
             return ask.AskOutcome("answer", "marker", None)
 
         async def aclose(self) -> None:
@@ -382,7 +392,9 @@ def test_lazy_runtime_forwards_detached_callback() -> None:
         lazy_runtime._runtime = ProviderRuntime()
         callback = lambda: None
 
-        outcome = await lazy_runtime.ask("question", on_detached=callback)
+        outcome = await lazy_runtime.ask(
+            "question", callbacks=ask.AskCallbacks(on_detached=callback)
+        )
 
         assert outcome.text == "answer"
         assert captured_callbacks == [callback]
@@ -454,7 +466,15 @@ def test_release_runtime_closes_warm_runtime_and_preserves_jobs() -> None:
         async def aclose(self) -> None:
             self.close_calls += 1
 
-    async def provider(question: str) -> ask.AskOutcome:
+    async def provider(
+        question: str,
+        *,
+        callbacks: ask.AskCallbacks | None = None,
+        conversation_id: str | None = None,
+        timeout_seconds: float | None = None,
+        attachment_paths: Sequence[str] | None = None,
+    ) -> ask.AskOutcome:
+        del callbacks, conversation_id, timeout_seconds, attachment_paths
         raise AssertionError(f"unexpected provider call: {question}")
 
     async def scenario() -> None:

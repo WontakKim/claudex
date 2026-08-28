@@ -146,7 +146,10 @@ async def _execute_runtime_ask(question: str) -> gptpro_runtime.AskOutcome:
     ask_runtime = gptpro_runtime.AskRuntime()
     primary_failure: BaseException | None = None
     try:
-        return await ask_runtime.ask(question, on_status=_print_ask_status)
+        return await ask_runtime.ask(
+            question,
+            callbacks=gptpro_runtime.AskCallbacks(on_status=_print_ask_status),
+        )
     except BaseException as exc:
         primary_failure = exc
         raise

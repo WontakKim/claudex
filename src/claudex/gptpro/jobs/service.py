@@ -1,7 +1,6 @@
 """Lifecycle, queue, and ownership service for background gptpro asks."""
 
 import asyncio
-import inspect
 import logging
 import tempfile
 import time
@@ -12,7 +11,7 @@ from typing import Any, Protocol
 from uuid import uuid4
 
 from claudex.gptpro import ask as ask_module
-from claudex.gptpro.ask import AskOutcome, GptProAskError
+from claudex.gptpro.ask import AskCallbacks, AskOutcome, GptProAskError
 
 from .models import AskJob, TurnFinished
 from .watchdog import AnswerWatchdog
@@ -29,31 +28,6 @@ ACTIVE_JOB_STATES = frozenset({"queued", "running", "detached"})
 
 
 @dataclass(frozen=True)
-class ProviderCapabilities:
-    """Which optional ask-callable keyword groups a provider accepts."""
-
-    conversation_options: bool
-    marker_callback: bool
-    detached_callback: bool
-
-
-def _provider_capabilities(ask: Callable[..., object]) -> ProviderCapabilities:
-    parameters = inspect.signature(ask).parameters
-    accepts_any_keyword = any(
-        parameter.kind is inspect.Parameter.VAR_KEYWORD
-        for parameter in parameters.values()
-    )
-    return ProviderCapabilities(
-        conversation_options=(
-            accepts_any_keyword
-            or {"conversation_id", "timeout_seconds"}.issubset(parameters)
-        ),
-        marker_callback=accepts_any_keyword or "on_marker" in parameters,
-        detached_callback=accepts_any_keyword or "on_detached" in parameters,
-    )
-
-
-@dataclass(frozen=True)
 class _ConversationOwnership:
     owner_ask_id: str
     released: asyncio.Event
@@ -64,10 +38,7 @@ class _AskCallable(Protocol):
         self,
         question: str,
         *,
-        on_status: Callable[[str], None] | None = None,
-        on_conversation_id: Callable[[str], None] | None = None,
-        on_marker: Callable[[str], None] | None = None,
-        on_detached: Callable[[], None] | None = None,
+        callbacks: AskCallbacks | None = None,
         conversation_id: str | None = None,
         timeout_seconds: float | None = None,
         attachment_paths: Sequence[str] | None = None,
@@ -91,7 +62,6 @@ class AskJobService:
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
         self._ask = ask
-        self._capabilities = _provider_capabilities(ask)
         self._retention_seconds = retention_seconds
         self._sweep_interval_seconds = sweep_interval_seconds
         self._overall_timeout_seconds = (
@@ -301,18 +271,15 @@ class AskJobService:
                 ]
 
             ask_options: dict[str, Any] = {
-                "on_status": capture_status,
-                "on_conversation_id": capture_conversation_id,
+                "callbacks": AskCallbacks(
+                    on_status=capture_status,
+                    on_conversation_id=capture_conversation_id,
+                    on_marker=capture_marker,
+                    on_detached=capture_detached,
+                ),
+                "conversation_id": conversation_id,
+                "timeout_seconds": remaining,
             }
-            if self._capabilities.marker_callback:
-                ask_options["on_marker"] = capture_marker
-            if self._capabilities.detached_callback:
-                ask_options["on_detached"] = capture_detached
-            if self._capabilities.conversation_options:
-                ask_options.update(
-                    conversation_id=conversation_id,
-                    timeout_seconds=remaining,
-                )
             if provider_attachment_paths is not None:
                 ask_options["attachment_paths"] = provider_attachment_paths
             outcome = await self._ask(provider_question, **ask_options)

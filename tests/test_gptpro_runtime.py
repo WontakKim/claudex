@@ -142,8 +142,10 @@ def test_runtime_initializes_lazily_and_reuses_the_context(
         assert fakes.launch_calls == []
         first = await ask_runtime.ask(
             "first",
-            on_conversation_id=callback,
-            on_marker=marker_callback,
+            callbacks=ask.AskCallbacks(
+                on_conversation_id=callback,
+                on_marker=marker_callback,
+            ),
         )
         second = await ask_runtime.ask("second")
         assert first.text == "answer: first"
@@ -1009,7 +1011,10 @@ def test_runtime_detaches_waiting_answer_when_submitter_contends(
     async def scenario() -> None:
         ask_runtime = runtime.AskRuntime()
         first_task = asyncio.create_task(
-            ask_runtime.ask("first", on_detached=capture_detached)
+            ask_runtime.ask(
+                "first",
+                callbacks=ask.AskCallbacks(on_detached=capture_detached),
+            )
         )
         await first_started.wait()
         second_task = asyncio.create_task(ask_runtime.ask("second"))

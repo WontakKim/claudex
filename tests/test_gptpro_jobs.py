@@ -67,12 +67,11 @@ def test_lifecycle_logs_submission_admission_and_success_without_content(
     async def provider(
         provider_question: str,
         *,
-        on_status: Callable[[str], None] | None = None,
-        on_conversation_id: Callable[[str], None] | None = None,
+        callbacks: ask.AskCallbacks | None = None,
         conversation_id: str | None = None,
         timeout_seconds: float | None = None,
     ) -> ask.AskOutcome:
-        del on_status, on_conversation_id
+        del callbacks
         assert provider_question == question
         assert conversation_id == thread_ref
         assert timeout_seconds == 120.0
@@ -133,12 +132,11 @@ def test_queue_wait_log_is_emitted_once_when_status_repeats(
     async def provider(
         question: str,
         *,
-        on_status: Callable[[str], None] | None = None,
-        on_conversation_id: Callable[[str], None] | None = None,
+        callbacks: ask.AskCallbacks | None = None,
         conversation_id: str | None = None,
         timeout_seconds: float | None = None,
     ) -> ask.AskOutcome:
-        del question, on_status, on_conversation_id, timeout_seconds
+        del question, callbacks, timeout_seconds
         return ask.AskOutcome("answer", "marker", conversation_id)
 
     async def scenario() -> jobs.AskJob:
@@ -234,13 +232,12 @@ def test_provider_without_detached_callback_transitions_through_lifecycle() -> N
     async def provider(
         question: str,
         *,
-        on_status: Callable[[str], None] | None = None,
-        on_conversation_id: Callable[[str], None] | None = None,
+        callbacks: ask.AskCallbacks | None = None,
         conversation_id: str | None = None,
         timeout_seconds: float | None = None,
     ) -> ask.AskOutcome:
         del conversation_id, timeout_seconds
-        del on_status, on_conversation_id
+        del callbacks
         assert question == "question"
         provider_started.set()
         await release_provider.wait()
@@ -292,16 +289,14 @@ def test_detached_callback_transitions_job_then_completion_succeeds(
     async def provider(
         question: str,
         *,
-        on_status: Callable[[str], None] | None = None,
-        on_conversation_id: Callable[[str], None] | None = None,
-        on_detached: Callable[[], None] | None = None,
+        callbacks: ask.AskCallbacks | None = None,
         conversation_id: str | None = None,
         timeout_seconds: float | None = None,
     ) -> ask.AskOutcome:
-        del question, on_status, on_conversation_id
-        del conversation_id, timeout_seconds
-        assert on_detached is not None
-        on_detached()
+        del question, conversation_id, timeout_seconds
+        assert callbacks is not None
+        assert callbacks.on_detached is not None
+        callbacks.on_detached()
         detached.set()
         await release_provider.wait()
         return ask.AskOutcome("answer", "marker", None)
@@ -342,16 +337,14 @@ def test_late_detached_callback_does_not_change_completed_job() -> None:
     async def provider(
         question: str,
         *,
-        on_status: Callable[[str], None] | None = None,
-        on_conversation_id: Callable[[str], None] | None = None,
-        on_detached: Callable[[], None] | None = None,
+        callbacks: ask.AskCallbacks | None = None,
         conversation_id: str | None = None,
         timeout_seconds: float | None = None,
     ) -> ask.AskOutcome:
-        del question, on_status, on_conversation_id
-        del conversation_id, timeout_seconds
-        assert on_detached is not None
-        captured_callbacks.append(on_detached)
+        del question, conversation_id, timeout_seconds
+        assert callbacks is not None
+        assert callbacks.on_detached is not None
+        captured_callbacks.append(callbacks.on_detached)
         return ask.AskOutcome("answer", "marker", None)
 
     async def scenario() -> None:
@@ -375,12 +368,11 @@ def test_success_emits_turn_finished_once_even_if_callback_raises() -> None:
     async def provider(
         question: str,
         *,
-        on_status: Callable[[str], None] | None = None,
-        on_conversation_id: Callable[[str], None] | None = None,
+        callbacks: ask.AskCallbacks | None = None,
         conversation_id: str | None = None,
         timeout_seconds: float | None = None,
     ) -> ask.AskOutcome:
-        del question, on_status, on_conversation_id
+        del question, callbacks
         del conversation_id, timeout_seconds
         return ask.AskOutcome("answer", "marker", None)
 
@@ -417,16 +409,14 @@ def test_marker_callback_updates_running_job_and_preserves_success_marker() -> N
     async def provider(
         question: str,
         *,
-        on_status: Callable[[str], None] | None = None,
-        on_conversation_id: Callable[[str], None] | None = None,
-        on_marker: Callable[[str], None] | None = None,
+        callbacks: ask.AskCallbacks | None = None,
         conversation_id: str | None = None,
         timeout_seconds: float | None = None,
     ) -> ask.AskOutcome:
-        del question, on_status, on_conversation_id
-        del conversation_id, timeout_seconds
-        assert on_marker is not None
-        on_marker("full nonce marker")
+        del question, conversation_id, timeout_seconds
+        assert callbacks is not None
+        assert callbacks.on_marker is not None
+        callbacks.on_marker("full nonce marker")
         marker_updated.set()
         await release_provider.wait()
         return ask.AskOutcome("answer", "full nonce marker", None)
@@ -455,16 +445,14 @@ def test_marker_callback_preserves_marker_on_failure() -> None:
     async def provider(
         question: str,
         *,
-        on_status: Callable[[str], None] | None = None,
-        on_conversation_id: Callable[[str], None] | None = None,
-        on_marker: Callable[[str], None] | None = None,
+        callbacks: ask.AskCallbacks | None = None,
         conversation_id: str | None = None,
         timeout_seconds: float | None = None,
     ) -> ask.AskOutcome:
-        del question, on_status, on_conversation_id
-        del conversation_id, timeout_seconds
-        assert on_marker is not None
-        on_marker("failed nonce marker")
+        del question, conversation_id, timeout_seconds
+        assert callbacks is not None
+        assert callbacks.on_marker is not None
+        callbacks.on_marker("failed nonce marker")
         raise ask.GptProAskError("error", "provider failed")
 
     async def scenario() -> None:
@@ -485,16 +473,16 @@ def test_status_callback_updates_latest_status_message() -> None:
     async def provider(
         question: str,
         *,
-        on_status: Callable[[str], None] | None = None,
-        on_conversation_id: Callable[[str], None] | None = None,
+        callbacks: ask.AskCallbacks | None = None,
         conversation_id: str | None = None,
         timeout_seconds: float | None = None,
     ) -> ask.AskOutcome:
         del conversation_id, timeout_seconds
-        del question, on_conversation_id
-        assert on_status is not None
-        on_status("opening ChatGPT")
-        on_status("waiting for answer")
+        del question
+        assert callbacks is not None
+        assert callbacks.on_status is not None
+        callbacks.on_status("opening ChatGPT")
+        callbacks.on_status("waiting for answer")
         status_updated.set()
         await release_provider.wait()
         return ask.AskOutcome("answer", "marker", None)
@@ -523,16 +511,16 @@ def test_conversation_id_latches_thread_ref_but_notifies_on_success() -> None:
     async def provider(
         question: str,
         *,
-        on_status: Callable[[str], None] | None = None,
-        on_conversation_id: Callable[[str], None] | None = None,
+        callbacks: ask.AskCallbacks | None = None,
         conversation_id: str | None = None,
         timeout_seconds: float | None = None,
     ) -> ask.AskOutcome:
         del conversation_id, timeout_seconds
-        del question, on_status
-        assert on_conversation_id is not None
-        on_conversation_id("first-conversation")
-        on_conversation_id("second-conversation")
+        del question
+        assert callbacks is not None
+        assert callbacks.on_conversation_id is not None
+        callbacks.on_conversation_id("first-conversation")
+        callbacks.on_conversation_id("second-conversation")
         conversation_id_updated.set()
         await release_provider.wait()
         return ask.AskOutcome("answer", "marker", "outcome-conversation")
@@ -567,14 +555,14 @@ def test_failed_job_does_not_notify_latched_thread_ref() -> None:
     async def provider(
         question: str,
         *,
-        on_status: Callable[[str], None] | None = None,
-        on_conversation_id: Callable[[str], None] | None = None,
+        callbacks: ask.AskCallbacks | None = None,
         conversation_id: str | None = None,
         timeout_seconds: float | None = None,
     ) -> ask.AskOutcome:
-        del question, on_status, conversation_id, timeout_seconds
-        assert on_conversation_id is not None
-        on_conversation_id("failed-conversation")
+        del question, conversation_id, timeout_seconds
+        assert callbacks is not None
+        assert callbacks.on_conversation_id is not None
+        callbacks.on_conversation_id("failed-conversation")
         raise ask.GptProAskError("error", "provider failed")
 
     async def scenario() -> None:
@@ -598,12 +586,11 @@ def test_existing_conversation_notifies_thread_ref_on_success() -> None:
     async def provider(
         question: str,
         *,
-        on_status: Callable[[str], None] | None = None,
-        on_conversation_id: Callable[[str], None] | None = None,
+        callbacks: ask.AskCallbacks | None = None,
         conversation_id: str | None = None,
         timeout_seconds: float | None = None,
     ) -> ask.AskOutcome:
-        del question, on_status, on_conversation_id
+        del question, callbacks
         captured_options.append((conversation_id, timeout_seconds))
         return ask.AskOutcome("answer", "marker", conversation_id)
 
@@ -643,17 +630,17 @@ def test_fresh_ask_latch_queues_same_conversation_until_completion() -> None:
     async def provider(
         question: str,
         *,
-        on_status: Callable[[str], None] | None = None,
-        on_conversation_id: Callable[[str], None] | None = None,
+        callbacks: ask.AskCallbacks | None = None,
         conversation_id: str | None = None,
         timeout_seconds: float | None = None,
     ) -> ask.AskOutcome:
-        del on_status, timeout_seconds
+        del timeout_seconds
         started_questions.append(question)
         if question == "fresh":
             assert conversation_id is None
-            assert on_conversation_id is not None
-            on_conversation_id(
+            assert callbacks is not None
+            assert callbacks.on_conversation_id is not None
+            callbacks.on_conversation_id(
                 "123e4567-e89b-12d3-a456-426614174000"
             )
             conversation_latched.set()
@@ -702,17 +689,17 @@ def test_failed_fresh_ask_latch_releases_waiting_conversation() -> None:
     async def provider(
         question: str,
         *,
-        on_status: Callable[[str], None] | None = None,
-        on_conversation_id: Callable[[str], None] | None = None,
+        callbacks: ask.AskCallbacks | None = None,
         conversation_id: str | None = None,
         timeout_seconds: float | None = None,
     ) -> ask.AskOutcome:
-        del on_status, timeout_seconds
+        del timeout_seconds
         started_questions.append(question)
         if question == "fresh":
             assert conversation_id is None
-            assert on_conversation_id is not None
-            on_conversation_id(
+            assert callbacks is not None
+            assert callbacks.on_conversation_id is not None
+            callbacks.on_conversation_id(
                 "123e4567-e89b-12d3-a456-426614174000"
             )
             conversation_latched.set()
@@ -751,12 +738,11 @@ def test_fresh_ask_without_conversation_id_has_no_ownership_side_effects() -> No
     async def provider(
         question: str,
         *,
-        on_status: Callable[[str], None] | None = None,
-        on_conversation_id: Callable[[str], None] | None = None,
+        callbacks: ask.AskCallbacks | None = None,
         conversation_id: str | None = None,
         timeout_seconds: float | None = None,
     ) -> ask.AskOutcome:
-        del question, on_status, on_conversation_id, timeout_seconds
+        del question, callbacks, timeout_seconds
         captured_conversation_ids.append(conversation_id)
         return ask.AskOutcome("answer", "marker", conversation_id)
 
@@ -788,12 +774,11 @@ def test_same_conversation_queued_ask_runs_in_submission_order() -> None:
     async def provider(
         question: str,
         *,
-        on_status: Callable[[str], None] | None = None,
-        on_conversation_id: Callable[[str], None] | None = None,
+        callbacks: ask.AskCallbacks | None = None,
         conversation_id: str | None = None,
         timeout_seconds: float | None = None,
     ) -> ask.AskOutcome:
-        del on_status, on_conversation_id, timeout_seconds
+        del callbacks, timeout_seconds
         assert conversation_id == "shared-conversation"
         started_questions.append(question)
         if question == "first":
@@ -847,12 +832,11 @@ def test_waiting_ask_runs_after_in_flight_ask_fails() -> None:
     async def provider(
         question: str,
         *,
-        on_status: Callable[[str], None] | None = None,
-        on_conversation_id: Callable[[str], None] | None = None,
+        callbacks: ask.AskCallbacks | None = None,
         conversation_id: str | None = None,
         timeout_seconds: float | None = None,
     ) -> ask.AskOutcome:
-        del on_status, on_conversation_id, timeout_seconds
+        del callbacks, timeout_seconds
         assert conversation_id == "shared-conversation"
         started_questions.append(question)
         if question == "first":
@@ -896,12 +880,11 @@ def test_different_conversation_asks_run_concurrently() -> None:
     async def provider(
         question: str,
         *,
-        on_status: Callable[[str], None] | None = None,
-        on_conversation_id: Callable[[str], None] | None = None,
+        callbacks: ask.AskCallbacks | None = None,
         conversation_id: str | None = None,
         timeout_seconds: float | None = None,
     ) -> ask.AskOutcome:
-        del question, on_status, on_conversation_id, timeout_seconds
+        del question, callbacks, timeout_seconds
         started_conversations.add(conversation_id)
         if len(started_conversations) == 2:
             both_providers_started.set()
@@ -933,12 +916,11 @@ def test_queue_ttl_expires_waiting_ask_and_preserves_thread_ref() -> None:
     async def provider(
         question: str,
         *,
-        on_status: Callable[[str], None] | None = None,
-        on_conversation_id: Callable[[str], None] | None = None,
+        callbacks: ask.AskCallbacks | None = None,
         conversation_id: str | None = None,
         timeout_seconds: float | None = None,
     ) -> ask.AskOutcome:
-        del on_status, on_conversation_id, timeout_seconds
+        del callbacks, timeout_seconds
         assert conversation_id == "123e4567-e89b-12d3-a456-426614174000"
         provider_questions.append(question)
         if question == "first":
@@ -991,13 +973,12 @@ def test_successful_duration_samples_update_next_execution_budget() -> None:
     async def provider(
         question: str,
         *,
-        on_status: Callable[[str], None] | None = None,
-        on_conversation_id: Callable[[str], None] | None = None,
+        callbacks: ask.AskCallbacks | None = None,
         conversation_id: str | None = None,
         timeout_seconds: float | None = None,
     ) -> ask.AskOutcome:
         nonlocal now
-        del question, on_status, on_conversation_id, conversation_id
+        del question, callbacks, conversation_id
         captured_timeouts.append(timeout_seconds)
         now += durations[len(captured_timeouts) - 1]
         return ask.AskOutcome("answer", "marker", None)
@@ -1045,13 +1026,12 @@ def test_failed_job_does_not_update_answer_watchdog() -> None:
     async def provider(
         question: str,
         *,
-        on_status: Callable[[str], None] | None = None,
-        on_conversation_id: Callable[[str], None] | None = None,
+        callbacks: ask.AskCallbacks | None = None,
         conversation_id: str | None = None,
         timeout_seconds: float | None = None,
     ) -> ask.AskOutcome:
         nonlocal now
-        del on_status, on_conversation_id, conversation_id
+        del callbacks, conversation_id
         captured_timeouts.append(timeout_seconds)
         if question == "failure":
             now += 2_000.0
@@ -1080,13 +1060,12 @@ def test_injected_overall_timeout_caps_measured_watchdog_budget() -> None:
     async def provider(
         question: str,
         *,
-        on_status: Callable[[str], None] | None = None,
-        on_conversation_id: Callable[[str], None] | None = None,
+        callbacks: ask.AskCallbacks | None = None,
         conversation_id: str | None = None,
         timeout_seconds: float | None = None,
     ) -> ask.AskOutcome:
         nonlocal now
-        del question, on_status, on_conversation_id, conversation_id
+        del question, callbacks, conversation_id
         captured_timeouts.append(timeout_seconds)
         now += 300.0
         return ask.AskOutcome("answer", "marker", None)
@@ -1114,12 +1093,11 @@ def test_service_uses_environment_overall_timeout_for_admission_budget(
     async def provider(
         question: str,
         *,
-        on_status: Callable[[str], None] | None = None,
-        on_conversation_id: Callable[[str], None] | None = None,
+        callbacks: ask.AskCallbacks | None = None,
         conversation_id: str | None = None,
         timeout_seconds: float | None = None,
     ) -> ask.AskOutcome:
-        del question, on_status, on_conversation_id, conversation_id
+        del question, callbacks, conversation_id
         captured_timeouts.append(timeout_seconds)
         return ask.AskOutcome("answer", "marker", None)
 
@@ -1143,12 +1121,11 @@ def test_waiting_ask_receives_full_execution_budget_at_admission() -> None:
     async def provider(
         question: str,
         *,
-        on_status: Callable[[str], None] | None = None,
-        on_conversation_id: Callable[[str], None] | None = None,
+        callbacks: ask.AskCallbacks | None = None,
         conversation_id: str | None = None,
         timeout_seconds: float | None = None,
     ) -> ask.AskOutcome:
-        del on_status, on_conversation_id
+        del callbacks
         assert conversation_id == "shared-conversation"
         captured_timeouts.append((question, timeout_seconds))
         if question == "first":
@@ -1203,13 +1180,12 @@ def test_oversized_question_spills_to_temporary_attachment_and_cleans_up(
     async def provider(
         question: str,
         *,
-        on_status: Callable[[str], None] | None = None,
-        on_conversation_id: Callable[[str], None] | None = None,
+        callbacks: ask.AskCallbacks | None = None,
         conversation_id: str | None = None,
         timeout_seconds: float | None = None,
         attachment_paths: Sequence[str] | None = None,
     ) -> ask.AskOutcome:
-        del on_status, on_conversation_id, conversation_id, timeout_seconds
+        del callbacks, conversation_id, timeout_seconds
         captured_questions.append(question)
         captured_attachment_paths.append(attachment_paths)
         provider_started.set()
@@ -1257,13 +1233,12 @@ def test_question_at_spill_threshold_is_sent_inline(
     async def provider(
         question: str,
         *,
-        on_status: Callable[[str], None] | None = None,
-        on_conversation_id: Callable[[str], None] | None = None,
+        callbacks: ask.AskCallbacks | None = None,
         conversation_id: str | None = None,
         timeout_seconds: float | None = None,
         attachment_paths: Sequence[str] | None = None,
     ) -> ask.AskOutcome:
-        del on_status, on_conversation_id, conversation_id, timeout_seconds
+        del callbacks, conversation_id, timeout_seconds
         captured_questions.append(question)
         captured_attachment_paths.append(attachment_paths)
         return ask.AskOutcome("answer", "marker", None)
@@ -1286,13 +1261,12 @@ def test_explicit_attachment_paths_are_passed_unchanged() -> None:
     async def provider(
         question: str,
         *,
-        on_status: Callable[[str], None] | None = None,
-        on_conversation_id: Callable[[str], None] | None = None,
+        callbacks: ask.AskCallbacks | None = None,
         conversation_id: str | None = None,
         timeout_seconds: float | None = None,
         attachment_paths: Sequence[str] | None = None,
     ) -> ask.AskOutcome:
-        del question, on_status, on_conversation_id, conversation_id
+        del question, callbacks, conversation_id
         del timeout_seconds
         captured_attachment_paths.append(attachment_paths)
         return ask.AskOutcome("answer", "marker", None)
@@ -1348,13 +1322,12 @@ def test_provider_failure_transitions_job_to_failed(
     async def provider(
         question: str,
         *,
-        on_status: Callable[[str], None] | None = None,
-        on_conversation_id: Callable[[str], None] | None = None,
+        callbacks: ask.AskCallbacks | None = None,
         conversation_id: str | None = None,
         timeout_seconds: float | None = None,
     ) -> ask.AskOutcome:
         del conversation_id, timeout_seconds
-        del question, on_status, on_conversation_id
+        del question, callbacks
         raise provider_error
 
     async def scenario() -> None:
@@ -1374,7 +1347,15 @@ def test_provider_failure_transitions_job_to_failed(
 def test_has_active_jobs_returns_true_for_active_states(
     state: jobs.AskJobState,
 ) -> None:
-    async def provider(question: str) -> ask.AskOutcome:
+    async def provider(
+        question: str,
+        *,
+        callbacks: ask.AskCallbacks | None = None,
+        conversation_id: str | None = None,
+        timeout_seconds: float | None = None,
+        attachment_paths: Sequence[str] | None = None,
+    ) -> ask.AskOutcome:
+        del callbacks, conversation_id, timeout_seconds, attachment_paths
         raise AssertionError(f"unexpected provider call: {question}")
 
     service = jobs.AskJobService(provider)
@@ -1398,7 +1379,15 @@ def test_has_active_jobs_returns_true_for_active_states(
 def test_has_active_jobs_returns_false_without_active_states(
     state: jobs.AskJobState | None,
 ) -> None:
-    async def provider(question: str) -> ask.AskOutcome:
+    async def provider(
+        question: str,
+        *,
+        callbacks: ask.AskCallbacks | None = None,
+        conversation_id: str | None = None,
+        timeout_seconds: float | None = None,
+        attachment_paths: Sequence[str] | None = None,
+    ) -> ask.AskOutcome:
+        del callbacks, conversation_id, timeout_seconds, attachment_paths
         raise AssertionError(f"unexpected provider call: {question}")
 
     service = jobs.AskJobService(provider)
@@ -1423,13 +1412,12 @@ def test_unknown_ask_id_has_no_status_or_result() -> None:
     async def provider(
         question: str,
         *,
-        on_status: Callable[[str], None] | None = None,
-        on_conversation_id: Callable[[str], None] | None = None,
+        callbacks: ask.AskCallbacks | None = None,
         conversation_id: str | None = None,
         timeout_seconds: float | None = None,
     ) -> ask.AskOutcome:
         del conversation_id, timeout_seconds
-        del question, on_status, on_conversation_id
+        del question, callbacks
         return ask.AskOutcome("answer", "marker", None)
 
     async def scenario() -> None:
@@ -1449,13 +1437,12 @@ def test_sweeper_removes_expired_finished_jobs_but_keeps_running_jobs(
     async def provider(
         question: str,
         *,
-        on_status: Callable[[str], None] | None = None,
-        on_conversation_id: Callable[[str], None] | None = None,
+        callbacks: ask.AskCallbacks | None = None,
         conversation_id: str | None = None,
         timeout_seconds: float | None = None,
     ) -> ask.AskOutcome:
         del conversation_id, timeout_seconds
-        del on_status, on_conversation_id
+        del callbacks
         if question == "running":
             running_provider_started.set()
             await asyncio.Event().wait()
@@ -1498,13 +1485,12 @@ def test_aclose_cancels_running_job_and_sweeper_and_is_idempotent() -> None:
     async def provider(
         question: str,
         *,
-        on_status: Callable[[str], None] | None = None,
-        on_conversation_id: Callable[[str], None] | None = None,
+        callbacks: ask.AskCallbacks | None = None,
         conversation_id: str | None = None,
         timeout_seconds: float | None = None,
     ) -> ask.AskOutcome:
         del conversation_id, timeout_seconds
-        del question, on_status, on_conversation_id
+        del question, callbacks
         provider_started.set()
         try:
             await asyncio.Event().wait()
