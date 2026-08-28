@@ -4,8 +4,13 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import importlib.metadata
+import importlib.util
 import sys
+import time
+from collections.abc import Callable
 
+from claudex import locking, paths
 from claudex.gptpro import login as gptpro_login
 from claudex.gptpro import runtime as gptpro_runtime
 from claudex.gptpro import session as gptpro_session
@@ -18,6 +23,7 @@ def _build_gptpro_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("login")
     subparsers.add_parser("status")
+    subparsers.add_parser("doctor")
     ask_parser = subparsers.add_parser("ask")
     ask_parser.add_argument("question")
     return parser
@@ -43,6 +49,93 @@ def _gptpro_status() -> int:
     status = gptpro_session.session_status()
     print(status["message"])
     return 0
+
+
+def _format_remaining_time(seconds: float) -> str:
+    total_minutes = max(0, int(seconds) // 60)
+    days, remaining_minutes = divmod(total_minutes, 24 * 60)
+    hours, minutes = divmod(remaining_minutes, 60)
+    if days:
+        return f"{days}d {hours}h"
+    if hours:
+        return f"{hours}h {minutes}m"
+    return f"{minutes}m"
+
+
+def _check_gptpro_session() -> tuple[str, str]:
+    status = gptpro_session.session_status()
+    if not status["valid"]:
+        return "FAIL", str(status["message"])
+
+    expires = gptpro_session.load_auth_cookie_expiry(paths.gptpro_session_file())
+    if expires is None or expires <= 0:
+        expiry_description = "authentication cookie has no fixed expiry"
+    else:
+        remaining = _format_remaining_time(expires - time.time())
+        expiry_description = f"authentication cookie expires in {remaining}"
+    return "OK", f'{status["message"]}; {expiry_description}'
+
+
+def _check_gptpro_chrome_profile() -> tuple[str, str]:
+    profile_dir = paths.gptpro_chrome_profile_dir()
+    if profile_dir.exists():
+        return "OK", f"found at {profile_dir}"
+    return (
+        "WARN",
+        f"not found at {profile_dir}; created by the first ask or login",
+    )
+
+
+def _check_gptpro_profile_lock() -> tuple[str, str]:
+    handle = locking.try_file_lock(paths.gptpro_profile_lock())
+    if handle is None:
+        return (
+            "OK",
+            "held by another process "
+            "(a running gateway daemon holds it while its runtime is active)",
+        )
+    handle.release()
+    return "OK", "available"
+
+
+def _check_gptpro_playwright() -> tuple[str, str]:
+    if importlib.util.find_spec("playwright") is None:
+        return "FAIL", "not installed; run uv sync --extra gptpro"
+
+    try:
+        version = importlib.metadata.version("playwright")
+    except Exception:
+        return "OK", "installed"
+    return "OK", f"installed ({version})"
+
+
+def _gptpro_doctor() -> int:
+    checks: tuple[tuple[str, Callable[[], tuple[str, str]]], ...] = (
+        ("Session", _check_gptpro_session),
+        ("Chrome profile", _check_gptpro_chrome_profile),
+        ("Profile lock", _check_gptpro_profile_lock),
+        ("Playwright dependency", _check_gptpro_playwright),
+    )
+    passed = 0
+    failed = 0
+    warned = 0
+
+    for name, check in checks:
+        try:
+            result, description = check()
+        except Exception as exc:
+            result = "FAIL"
+            description = f"check raised {type(exc).__name__}"
+        print(f"{name}: {result} - {description}")
+        if result == "OK":
+            passed += 1
+        elif result == "WARN":
+            warned += 1
+        else:
+            failed += 1
+
+    print(f"Summary: {passed} passed, {failed} failed, {warned} warnings")
+    return 1 if failed else 0
 
 
 def _print_ask_status(message: str) -> None:
@@ -109,6 +202,8 @@ def _gptpro_main(argv: list[str]) -> int:
             return _gptpro_login()
         if args.command == "status":
             return _gptpro_status()
+        if args.command == "doctor":
+            return _gptpro_doctor()
         return _gptpro_ask(args.question)
     except KeyboardInterrupt:
         return 130

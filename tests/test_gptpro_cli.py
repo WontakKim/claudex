@@ -6,11 +6,13 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
 
 from claudex import __main__ as gateway_main
+from claudex import locking, paths
 from claudex.cli import gptpro as gptpro_cli
 from claudex.gptpro import ask as gptpro_ask
 from claudex.gptpro import login as gptpro_login
@@ -239,6 +241,124 @@ raise SystemExit(_gptpro_main(["status"]))
     assert result.returncode == 0
     assert "run claudex-gateway gptpro login" in result.stdout
     assert result.stderr == ""
+
+
+def _write_valid_gptpro_session() -> None:
+    session_file = paths.gptpro_session_file()
+    session_file.parent.mkdir(parents=True, exist_ok=True)
+    session_file.write_text(
+        json.dumps(
+            {
+                "cookies": [
+                    {
+                        "name": gptpro_session.AUTH_COOKIE_PREFIX,
+                        "value": "valid-cookie",
+                        "domain": ".chatgpt.com",
+                        "expires": time.time() + 7_200,
+                    }
+                ],
+                "origins": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def _mock_playwright_installed(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        gptpro_cli.importlib.util,
+        "find_spec",
+        lambda name: object() if name == "playwright" else None,
+    )
+    monkeypatch.setattr(
+        gptpro_cli.importlib.metadata,
+        "version",
+        lambda name: "1.55.0" if name == "playwright" else "unknown",
+    )
+
+
+def test_gptpro_doctor_reports_all_checks_ok(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    _write_valid_gptpro_session()
+    paths.gptpro_chrome_profile_dir().mkdir()
+    _mock_playwright_installed(monkeypatch)
+
+    assert gptpro_cli._gptpro_main(["doctor"]) == 0
+    captured = capsys.readouterr()
+    assert "Session: OK" in captured.out
+    assert "expires in" in captured.out
+    assert "Chrome profile: OK" in captured.out
+    assert "Profile lock: OK - available" in captured.out
+    assert "Playwright dependency: OK - installed (1.55.0)" in captured.out
+    assert "Summary: 4 passed, 0 failed, 0 warnings" in captured.out
+    assert captured.err == ""
+
+
+def test_gptpro_doctor_fails_when_session_is_missing(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    paths.gptpro_chrome_profile_dir().mkdir(parents=True)
+    _mock_playwright_installed(monkeypatch)
+
+    assert gptpro_cli._gptpro_main(["doctor"]) == 1
+    captured = capsys.readouterr()
+    assert "Session: FAIL" in captured.out
+    assert "no gptpro session was found" in captured.out
+    assert "Summary: 3 passed, 1 failed, 0 warnings" in captured.out
+    assert captured.err == ""
+
+
+def test_gptpro_doctor_reports_held_profile_lock_as_ok(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    _write_valid_gptpro_session()
+    paths.gptpro_chrome_profile_dir().mkdir()
+    _mock_playwright_installed(monkeypatch)
+    holder = locking.try_file_lock(paths.gptpro_profile_lock())
+    assert holder is not None
+
+    try:
+        assert gptpro_cli._gptpro_main(["doctor"]) == 0
+    finally:
+        holder.release()
+
+    captured = capsys.readouterr()
+    assert "Profile lock: OK - held by another process" in captured.out
+    assert "running gateway daemon holds it" in captured.out
+    assert "Summary: 4 passed, 0 failed, 0 warnings" in captured.out
+    assert captured.err == ""
+
+
+def test_gptpro_doctor_fails_when_playwright_is_missing(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    _write_valid_gptpro_session()
+    paths.gptpro_chrome_profile_dir().mkdir()
+    monkeypatch.setattr(
+        gptpro_cli.importlib.util,
+        "find_spec",
+        lambda name: None,
+    )
+
+    assert gptpro_cli._gptpro_main(["doctor"]) == 1
+    captured = capsys.readouterr()
+    assert "Playwright dependency: FAIL - not installed" in captured.out
+    assert "uv sync --extra gptpro" in captured.out
+    assert "Summary: 3 passed, 1 failed, 0 warnings" in captured.out
+    assert captured.err == ""
 
 
 class _FakeAskPage:

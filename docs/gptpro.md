@@ -29,6 +29,9 @@ Check the saved session without contacting ChatGPT:
 uv run claudex-gateway gptpro status
 ```
 
+Run `uv run --extra gptpro claudex-gateway gptpro doctor` to diagnose the
+saved session, Chrome profile and lock, and Playwright dependency.
+
 Session state, the persistent Chrome profile, and its lock live under
 `~/.claudex/gptpro/`. The session file is
 `~/.claudex/gptpro/session.json`, and the browser profile is
