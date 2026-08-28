@@ -29,9 +29,10 @@ Check the saved session without contacting ChatGPT:
 uv run claudex-gateway gptpro status
 ```
 
-The dashboard MCP tab shows the saved session status, starts and monitors
-interactive ChatGPT sign-in, and runs the same doctor diagnostic. It also
-provides the MCP endpoint and a copyable Claude Code connection command.
+The dashboard MCP tab leads with gateway-wide Claude Code connection setup,
+including the MCP endpoint and a copyable command. Its GPT Pro backend card
+shows the saved session status, starts and monitors interactive ChatGPT sign-in,
+and runs the same doctor diagnostic.
 
 Run `uv run --extra gptpro claudex-gateway gptpro doctor` to diagnose the
 saved session, Chrome profile and lock, and Playwright dependency.

@@ -220,21 +220,6 @@
 
     <!-- MCP tab -->
     <section id="tab-mcp">
-      <div class="card" id="gptpro-session-card">
-        <div class="ucard-h">
-          <h2>GPT Pro Session</h2>
-          <div class="umeta" id="gptpro-session-updated">Last checked —</div>
-        </div>
-        <div class="sub">Saved ChatGPT Pro web session used by gptpro asks.</div>
-        <div class="stat" id="gptpro-session-stat">
-          <div class="statline" id="gptpro-session-statline"><span class="sk">VALID · Expires in 00d 00h</span></div>
-        </div>
-        <div class="seg">
-          <button id="gptpro-login-btn">Sign in to ChatGPT</button>
-        </div>
-        <div class="cthint" id="gptpro-login-detail"></div>
-        <div class="cthint">No graphical browser available? Run <code>claudex-gateway gptpro login</code> from a terminal.</div>
-      </div>
       <div class="card" id="mcp-connect-card">
         <h2>Connect Claude Code</h2>
         <div class="sub">Register the gateway's GPT Pro tools with Claude Code.</div>
@@ -253,8 +238,23 @@
         </div>
         <div class="cthint" id="mcp-auth-hint" hidden>Replace <code>&lt;CLAUDEX_LOCAL_TOKEN&gt;</code> with the configured local token.</div>
       </div>
-      <div class="card" id="gptpro-doctor-card">
-        <h2>GPT Pro Doctor</h2>
+      <div class="card" id="gptpro-session-card">
+        <div class="ucard-h">
+          <h2>GPT Pro</h2>
+          <div class="umeta" id="gptpro-session-updated">Last checked —</div>
+        </div>
+        <div class="sub">Saved ChatGPT Pro web session used by gptpro asks.</div>
+        <div class="stat" id="gptpro-session-stat">
+          <div class="statline" id="gptpro-session-statline"><span class="sk">VALID · Expires in 00d 00h</span></div>
+        </div>
+        <div class="seg">
+          <button id="gptpro-login-btn">Sign in to ChatGPT</button>
+        </div>
+        <div class="cthint" id="gptpro-login-detail"></div>
+        <div class="cthint">No graphical browser available? Run <code>claudex-gateway gptpro login</code> from a terminal.</div>
+        <div class="tbl-cap">
+          <span class="t">Diagnostics</span>
+        </div>
         <div class="sub">Check the saved session, browser profile, and optional dependencies.</div>
         <div class="seg">
           <button id="gptpro-doctor-btn">Run doctor</button>

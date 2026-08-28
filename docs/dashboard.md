@@ -12,8 +12,9 @@ Opening `http://127.0.0.1:8787/` uses the same guarded admin API as the CLI:
   readiness. Kimi and Grok cards remain cosmetically hidden until a login or
   mapped route makes them relevant; this never affects routing or settings.
   Custom providers do not receive usage or billing cards.
-- **MCP** manages the GPT Pro integration with Claude Code. See
-  [GPT Pro MCP](#gpt-pro-mcp) below.
+- **MCP** keeps gateway-wide Claude Code connection setup above per-backend
+  sections, with GPT Pro as the first backend. See [GPT Pro MCP](#gpt-pro-mcp)
+  below.
 - **Log** reads `GET /admin/logs` and changes the persisted runtime log level
   through `PUT /admin/settings/log-level`.
 - **Router** edits the provider-prefixed model map on a canvas and includes the
@@ -25,18 +26,19 @@ map. Otherwise, Apply sends the complete draft to
 
 ## GPT Pro MCP
 
-The MCP tab contains three cards:
+The MCP tab leads with gateway-wide connection setup, followed by one card per
+MCP backend. GPT Pro is the first backend section:
 
-- **GPT Pro Session** shows the saved ChatGPT Pro session and refreshes it once
-  per minute while the tab is visible. It can start, monitor, and cancel an
-  interactive ChatGPT sign-in. On a machine without a graphical browser, run
-  `claudex-gateway gptpro login` from a terminal instead.
 - **Connect Claude Code** registers the local MCP endpoint in the user scope
   with one click by running `claude mcp add` on the gateway host. When local
   authentication is enabled, registration stores the configured local token as
   a bearer header in Claude Code's MCP settings. A copyable user-scope command
   remains available as a manual fallback.
-- **GPT Pro Doctor** runs the server-side diagnostic and displays its output.
+- **GPT Pro** shows the saved ChatGPT Pro session and refreshes it once per
+  minute while the tab is visible. It can start, monitor, and cancel an
+  interactive ChatGPT sign-in. Its Diagnostics subsection runs the server-side
+  doctor and displays the output. On a machine without a graphical browser,
+  run `claudex-gateway gptpro login` from a terminal instead.
 
 The tab uses these guarded admin API operations:
 

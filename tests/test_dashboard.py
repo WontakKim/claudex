@@ -218,6 +218,23 @@ def test_catalogless_provider_runtime_accepts_manual_model(
     }
 
 
+def test_mcp_tab_leads_with_connection_and_combines_gptpro_tools() -> None:
+    mcp_start = DASHBOARD_HTML.index('id="tab-mcp"')
+    mcp_end = DASHBOARD_HTML.index("</section>", mcp_start)
+    mcp_markup = DASHBOARD_HTML[mcp_start:mcp_end]
+
+    assert re.findall(r'<div class="card" id="([^"]+)"', mcp_markup) == [
+        "mcp-connect-card",
+        "gptpro-session-card",
+    ]
+    gptpro_start = mcp_markup.index('<div class="card" id="gptpro-session-card">')
+    gptpro_markup = mcp_markup[gptpro_start:]
+    assert "<h2>GPT Pro</h2>" in gptpro_markup
+    assert 'id="gptpro-doctor-card"' not in gptpro_markup
+    assert 'id="gptpro-doctor-btn"' in gptpro_markup
+    assert 'id="gptpro-doctor-output"' in gptpro_markup
+
+
 def test_gptpro_session_card_renders_states_and_polls_only_on_mcp(
     dashboard_runtime_result: dict[str, Any],
 ) -> None:
