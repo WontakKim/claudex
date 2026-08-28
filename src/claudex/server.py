@@ -35,6 +35,15 @@ from claudex.admin.common import (
     _handle_hello,
     _safe_custom_provider_exception_detail,
 )
+from claudex.admin.gptpro import (
+    _handle_admin_gptpro_connect,
+    _handle_admin_gptpro_doctor,
+    _handle_admin_gptpro_login_delete,
+    _handle_admin_gptpro_login_get,
+    _handle_admin_gptpro_login_post,
+    _handle_admin_gptpro_mcp,
+    _handle_admin_gptpro_session,
+)
 from claudex.admin.settings import (
     _handle_admin_claude_routing_get,
     _handle_admin_claude_routing_put,
@@ -56,13 +65,6 @@ from claudex.admin.system import (
     _handle_admin_connection_test,
     _handle_admin_custom_models,
     _handle_admin_grok_models,
-    _handle_admin_gptpro_connect,
-    _handle_admin_gptpro_doctor,
-    _handle_admin_gptpro_login_delete,
-    _handle_admin_gptpro_login_get,
-    _handle_admin_gptpro_login_post,
-    _handle_admin_gptpro_mcp,
-    _handle_admin_gptpro_session,
     _handle_admin_kimi_models,
     _handle_admin_logs,
     _handle_admin_usage,

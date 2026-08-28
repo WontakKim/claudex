@@ -21,6 +21,7 @@ from starlette.testclient import TestClient
 
 import claudex.admin.accounts as admin_accounts
 import claudex.admin.common as admin_common
+import claudex.admin.gptpro as admin_gptpro
 import claudex.admin.settings as admin_settings
 import claudex.admin.system as admin_system
 import claudex.server as server
@@ -53,17 +54,19 @@ from claudex.providers.openai_compatible_client import (
 
 
 _ADMIN_SOURCE_ROOT = Path(__file__).resolve().parents[1] / "src" / "claudex" / "admin"
-_ADMIN_MODULE_NAMES = ("common", "settings", "accounts", "system")
+_ADMIN_MODULE_NAMES = ("common", "settings", "accounts", "gptpro", "system")
 _ADMIN_MODULE_PATHS = {
     "common": "claudex.admin.common",
     "settings": "claudex.admin.settings",
     "accounts": "claudex.admin.accounts",
+    "gptpro": "claudex.admin.gptpro",
     "system": "claudex.admin.system",
 }
 _ADMIN_IMPORTED_MODULES = {
     "common": admin_common,
     "settings": admin_settings,
     "accounts": admin_accounts,
+    "gptpro": admin_gptpro,
     "system": admin_system,
 }
 _ADMIN_FUNCTION_MANIFEST = {
@@ -122,8 +125,7 @@ _ADMIN_FUNCTION_MANIFEST = {
         "_handle_admin_claude_login_replace_post",
         "_handle_admin_claude_login_delete",
     },
-    "system": {
-        "_handle_admin_logs",
+    "gptpro": {
         "_handle_admin_gptpro_session",
         "_handle_admin_gptpro_login_get",
         "_handle_admin_gptpro_login_post",
@@ -133,6 +135,9 @@ _ADMIN_FUNCTION_MANIFEST = {
         "_handle_admin_gptpro_doctor",
         "_handle_admin_gptpro_mcp",
         "_handle_admin_gptpro_connect",
+    },
+    "system": {
+        "_handle_admin_logs",
         "_handle_admin_usage",
         "_handle_admin_codex_reset_credit",
         "_serve_dashboard_asset",
@@ -168,11 +173,13 @@ _ADMIN_CONSTANT_MANIFEST = {
         "_LOGIN_ATTEMPT_HEADER",
         "_CONTROL_CHARACTER_PATTERN",
     },
-    "system": {
-        "_STATUS_TO_OPENAI_ERROR_TYPE",
+    "gptpro": {
         "_GPTPRO_DOCTOR_TIMEOUT",
         "_GPTPRO_CONNECT_TIMEOUT",
         "_GPTPRO_DOCTOR_COMMAND",
+    },
+    "system": {
+        "_STATUS_TO_OPENAI_ERROR_TYPE",
         "_FAVICON_SVG",
         "_CONNECTION_TEST_TIMEOUT",
     },
@@ -319,6 +326,7 @@ def test_admin_import_inventory_and_dependency_directions() -> None:
         "common": set(),
         "settings": {"common"},
         "accounts": {"common"},
+        "gptpro": {"common"},
         "system": {"common"},
     }
 
@@ -2030,7 +2038,7 @@ def test_admin_gptpro_session_reports_valid_session_expiry(
     now = 10_000_000.0
     expires_at = now + 8 * 24 * 60 * 60
     monkeypatch.setenv("HOME", str(tmp_path))
-    monkeypatch.setattr(admin_system.time, "time", lambda: now)
+    monkeypatch.setattr(admin_gptpro.time, "time", lambda: now)
     path = paths.gptpro_session_file()
     _write_gptpro_session(path, expires_at)
 
@@ -2056,7 +2064,7 @@ def test_admin_gptpro_session_reports_expired_session(
     now = 10_000_000.0
     expires_at = now - 60
     monkeypatch.setenv("HOME", str(tmp_path))
-    monkeypatch.setattr(admin_system.time, "time", lambda: now)
+    monkeypatch.setattr(admin_gptpro.time, "time", lambda: now)
     path = paths.gptpro_session_file()
     _write_gptpro_session(path, expires_at)
 
@@ -2182,7 +2190,7 @@ class TestAdminGptProApi:
             return FakeAdminSubprocess(exit_code=exit_code, output=output)
 
         monkeypatch.setattr(
-            admin_system.asyncio,
+            admin_gptpro.asyncio,
             "create_subprocess_exec",
             fake_create_subprocess_exec,
         )
@@ -2315,7 +2323,7 @@ class TestAdminGptProApi:
             raise FileNotFoundError("claude")
 
         monkeypatch.setattr(
-            admin_system.asyncio, "create_subprocess_exec", missing_cli
+            admin_gptpro.asyncio, "create_subprocess_exec", missing_cli
         )
         with self._client(monkeypatch, tmp_path) as client:
             response = client.post("/admin/gptpro/connect", json={})
@@ -2347,7 +2355,7 @@ class TestAdminGptProApi:
     ) -> None:
         runtime = FakeAdminGptProRuntime()
         monkeypatch.setattr(
-            admin_system, "GptProLoginSession", FakeAdminGptProLoginSession
+            admin_gptpro, "GptProLoginSession", FakeAdminGptProLoginSession
         )
         with self._client(monkeypatch, tmp_path) as client:
             client.app.state.gptpro_ask_runtime = runtime
@@ -2477,7 +2485,7 @@ class TestAdminGptProApi:
         expected_ok: bool,
     ) -> None:
         monkeypatch.setattr(
-            admin_system,
+            admin_gptpro,
             "_GPTPRO_DOCTOR_COMMAND",
             (
                 sys.executable,
