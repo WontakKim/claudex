@@ -118,18 +118,17 @@ def test_runtime_initializes_lazily_and_reuses_the_context(
         page: _FakePage,
         question: str,
         *,
-        on_status: Callable[[str], None] | None = None,
-        on_conversation_id: Callable[[str], None] | None = None,
-        on_marker: Callable[[str], None] | None = None,
+        callbacks: ask.AskCallbacks | None = None,
         should_detach: Callable[[], bool] | None = None,
         on_detach: Callable[
             [ask.AskSubmission], Awaitable[ask.AskOutcome]
         ]
         | None = None,
     ) -> ask.AskOutcome:
-        del page, on_status
-        conversation_id_callbacks.append(on_conversation_id)
-        marker_callbacks.append(on_marker)
+        del page
+        assert callbacks is not None
+        conversation_id_callbacks.append(callbacks.on_conversation_id)
+        marker_callbacks.append(callbacks.on_marker)
         return _outcome(f"answer: {question}")
 
     monkeypatch.setattr(runtime.ask, "execute_ask_outcome", execute_ask_outcome)
@@ -171,9 +170,7 @@ def test_runtime_propagates_conversation_and_timeout(
         page: _FakePage,
         question: str,
         *,
-        on_status: Callable[[str], None] | None = None,
-        on_conversation_id: Callable[[str], None] | None = None,
-        on_marker: Callable[[str], None] | None = None,
+        callbacks: ask.AskCallbacks | None = None,
         should_detach: Callable[[], bool] | None = None,
         on_detach: Callable[
             [ask.AskSubmission], Awaitable[ask.AskOutcome]
@@ -182,7 +179,7 @@ def test_runtime_propagates_conversation_and_timeout(
         conversation_id: str | None = None,
         timeout_seconds: float | None = None,
     ) -> ask.AskOutcome:
-        del page, on_status, on_conversation_id, on_marker
+        del page, callbacks
         captured_options.append((conversation_id, timeout_seconds))
         return _outcome(question)
 
@@ -216,9 +213,7 @@ def test_runtime_propagates_attachment_paths(
         page: _FakePage,
         question: str,
         *,
-        on_status: Callable[[str], None] | None = None,
-        on_conversation_id: Callable[[str], None] | None = None,
-        on_marker: Callable[[str], None] | None = None,
+        callbacks: ask.AskCallbacks | None = None,
         should_detach: Callable[[], bool] | None = None,
         on_detach: Callable[
             [ask.AskSubmission], Awaitable[ask.AskOutcome]
@@ -226,7 +221,7 @@ def test_runtime_propagates_attachment_paths(
         | None = None,
         attachment_paths: list[str] | None = None,
     ) -> ask.AskOutcome:
-        del page, on_status, on_conversation_id, on_marker
+        del page, callbacks
         captured_paths.append(attachment_paths)
         return _outcome(question)
 
@@ -260,9 +255,7 @@ def test_runtime_limits_concurrent_asks_to_two(
         page: _FakePage,
         question: str,
         *,
-        on_status: Callable[[str], None] | None = None,
-        on_conversation_id: Callable[[str], None] | None = None,
-        on_marker: Callable[[str], None] | None = None,
+        callbacks: ask.AskCallbacks | None = None,
         should_detach: Callable[[], bool] | None = None,
         on_detach: Callable[
             [ask.AskSubmission], Awaitable[ask.AskOutcome]
@@ -270,7 +263,7 @@ def test_runtime_limits_concurrent_asks_to_two(
         | None = None,
     ) -> ask.AskOutcome:
         nonlocal active, maximum_active
-        del page, on_status, on_conversation_id, on_marker
+        del page, callbacks
         active += 1
         maximum_active = max(maximum_active, active)
         started.append(question)
@@ -318,16 +311,14 @@ def test_runtime_applies_submission_jitter_after_admission(
         page: _FakePage,
         question: str,
         *,
-        on_status: Callable[[str], None] | None = None,
-        on_conversation_id: Callable[[str], None] | None = None,
-        on_marker: Callable[[str], None] | None = None,
+        callbacks: ask.AskCallbacks | None = None,
         should_detach: Callable[[], bool] | None = None,
         on_detach: Callable[
             [ask.AskSubmission], Awaitable[ask.AskOutcome]
         ]
         | None = None,
     ) -> ask.AskOutcome:
-        del page, on_status, on_conversation_id, on_marker
+        del page, callbacks
         return _outcome(question)
 
     monkeypatch.setattr(runtime.random, "uniform", uniform)
@@ -383,16 +374,14 @@ def test_runtime_closes_page_when_execute_ask_fails(
         page: _FakePage,
         question: str,
         *,
-        on_status: Callable[[str], None] | None = None,
-        on_conversation_id: Callable[[str], None] | None = None,
-        on_marker: Callable[[str], None] | None = None,
+        callbacks: ask.AskCallbacks | None = None,
         should_detach: Callable[[], bool] | None = None,
         on_detach: Callable[
             [ask.AskSubmission], Awaitable[ask.AskOutcome]
         ]
         | None = None,
     ) -> ask.AskOutcome:
-        del page, question, on_status, on_conversation_id, on_marker
+        del page, question, callbacks
         raise failure
 
     monkeypatch.setattr(runtime.ask, "execute_ask_outcome", execute_ask_outcome)
@@ -420,9 +409,7 @@ def test_closed_context_is_discarded_and_reinitialized(
         page: _FakePage,
         question: str,
         *,
-        on_status: Callable[[str], None] | None = None,
-        on_conversation_id: Callable[[str], None] | None = None,
-        on_marker: Callable[[str], None] | None = None,
+        callbacks: ask.AskCallbacks | None = None,
         should_detach: Callable[[], bool] | None = None,
         on_detach: Callable[
             [ask.AskSubmission], Awaitable[ask.AskOutcome]
@@ -430,7 +417,7 @@ def test_closed_context_is_discarded_and_reinitialized(
         | None = None,
     ) -> ask.AskOutcome:
         nonlocal calls
-        del page, on_status, on_conversation_id, on_marker
+        del page, callbacks
         calls += 1
         if calls == 1:
             closed_error = RuntimeError(
@@ -467,16 +454,14 @@ def test_aclose_cleans_up_playwright_once(
         page: _FakePage,
         question: str,
         *,
-        on_status: Callable[[str], None] | None = None,
-        on_conversation_id: Callable[[str], None] | None = None,
-        on_marker: Callable[[str], None] | None = None,
+        callbacks: ask.AskCallbacks | None = None,
         should_detach: Callable[[], bool] | None = None,
         on_detach: Callable[
             [ask.AskSubmission], Awaitable[ask.AskOutcome]
         ]
         | None = None,
     ) -> ask.AskOutcome:
-        del page, on_status, on_conversation_id, on_marker
+        del page, callbacks
         return _outcome(question)
 
     monkeypatch.setattr(runtime.ask, "execute_ask_outcome", execute_ask_outcome)
@@ -503,16 +488,14 @@ def test_runtime_holds_profile_lock_until_close(
         page: _FakePage,
         question: str,
         *,
-        on_status: Callable[[str], None] | None = None,
-        on_conversation_id: Callable[[str], None] | None = None,
-        on_marker: Callable[[str], None] | None = None,
+        callbacks: ask.AskCallbacks | None = None,
         should_detach: Callable[[], bool] | None = None,
         on_detach: Callable[
             [ask.AskSubmission], Awaitable[ask.AskOutcome]
         ]
         | None = None,
     ) -> ask.AskOutcome:
-        del page, on_status, on_conversation_id, on_marker
+        del page, callbacks
         return _outcome(question)
 
     monkeypatch.setattr(runtime.ask, "execute_ask_outcome", execute_ask_outcome)
@@ -547,16 +530,14 @@ def _install_ask_stub(monkeypatch: pytest.MonkeyPatch, context: _FakeContext) ->
         page: _FakePage,
         question: str,
         *,
-        on_status: Callable[[str], None] | None = None,
-        on_conversation_id: Callable[[str], None] | None = None,
-        on_marker: Callable[[str], None] | None = None,
+        callbacks: ask.AskCallbacks | None = None,
         should_detach: Callable[[], bool] | None = None,
         on_detach: Callable[
             [ask.AskSubmission], Awaitable[ask.AskOutcome]
         ]
         | None = None,
     ) -> ask.AskOutcome:
-        del page, on_status, on_conversation_id, on_marker
+        del page, callbacks
         return _outcome(f"answer: {question}")
 
     monkeypatch.setattr(runtime.ask, "execute_ask_outcome", execute_ask_outcome)
@@ -1000,16 +981,14 @@ def test_runtime_detaches_waiting_answer_when_submitter_contends(
         page: _FakePage,
         question: str,
         *,
-        on_status: Callable[[str], None] | None = None,
-        on_conversation_id: Callable[[str], None] | None = None,
-        on_marker: Callable[[str], None] | None = None,
+        callbacks: ask.AskCallbacks | None = None,
         should_detach: Callable[[], bool] | None = None,
         on_detach: Callable[
             [ask.AskSubmission], Awaitable[ask.AskOutcome]
         ]
         | None = None,
     ) -> ask.AskOutcome:
-        del page, on_status, on_conversation_id, on_marker
+        del page, callbacks
         assert should_detach is not None
         assert on_detach is not None
         if question == "first":
@@ -1072,16 +1051,14 @@ def test_runtime_keeps_monitor_path_without_contention(
         page: _FakePage,
         question: str,
         *,
-        on_status: Callable[[str], None] | None = None,
-        on_conversation_id: Callable[[str], None] | None = None,
-        on_marker: Callable[[str], None] | None = None,
+        callbacks: ask.AskCallbacks | None = None,
         should_detach: Callable[[], bool] | None = None,
         on_detach: Callable[
             [ask.AskSubmission], Awaitable[ask.AskOutcome]
         ]
         | None = None,
     ) -> ask.AskOutcome:
-        del page, on_status, on_conversation_id, on_marker, on_detach
+        del page, callbacks, on_detach
         assert should_detach is not None
         assert not should_detach()
         return _outcome(f"monitored: {question}")
@@ -1108,9 +1085,7 @@ def test_runtime_extends_submission_jitter_during_poller_backoff(
         page: _FakePage,
         question: str,
         *,
-        on_status: Callable[[str], None] | None = None,
-        on_conversation_id: Callable[[str], None] | None = None,
-        on_marker: Callable[[str], None] | None = None,
+        callbacks: ask.AskCallbacks | None = None,
         should_detach: Callable[[], bool] | None = None,
         on_detach: Callable[
             [ask.AskSubmission], Awaitable[ask.AskOutcome]
@@ -1119,9 +1094,7 @@ def test_runtime_extends_submission_jitter_during_poller_backoff(
     ) -> ask.AskOutcome:
         del (
             page,
-            on_status,
-            on_conversation_id,
-            on_marker,
+            callbacks,
             should_detach,
             on_detach,
         )

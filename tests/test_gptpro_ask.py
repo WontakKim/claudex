@@ -452,7 +452,9 @@ def test_execute_ask_outcome_returns_tracking_metadata_and_notifies_once(
         ask.execute_ask_outcome(
             page,
             "Review this code",
-            on_conversation_id=on_conversation_id,
+            callbacks=ask.AskCallbacks(
+                on_conversation_id=on_conversation_id
+            ),
         )
     )
     legacy_text = _run(_FakePage(raw_text="server **raw** markdown"))
@@ -482,7 +484,7 @@ def test_execute_ask_outcome_notifies_marker_once(
         ask.execute_ask_outcome(
             _FakePage(raw_text="server **raw** markdown"),
             "Review this code",
-            on_marker=on_marker,
+            callbacks=ask.AskCallbacks(on_marker=on_marker),
         )
     )
 
@@ -549,7 +551,9 @@ def test_provided_conversation_id_is_returned_without_notification(
             page,
             "Review this code",
             conversation_id=provided_conversation_id,
-            on_conversation_id=captured_conversation_ids.append,
+            callbacks=ask.AskCallbacks(
+                on_conversation_id=captured_conversation_ids.append
+            ),
         )
     )
 
@@ -1177,7 +1181,7 @@ def test_contention_detaches_completed_submission_and_returns_poller_outcome(
         ask.execute_ask_outcome(
             page,
             "Review this code",
-            on_status=statuses.append,
+            callbacks=ask.AskCallbacks(on_status=statuses.append),
             should_detach=lambda: True,
             on_detach=on_detach,
         )
@@ -1237,8 +1241,6 @@ def test_detach_is_ignored_before_the_user_echo_is_locked(
         page,
         "Review this code",
         None,
-        None,
-        None,
         conversation_id=_CONVERSATION_ID,
         should_detach=lambda: True,
         on_detach=on_detach,
@@ -1289,9 +1291,7 @@ def test_request_detach_sets_the_monitor_detach_flag() -> None:
     execution = ask._AskExecution(
         page,
         "Review this code",
-        statuses.append,
-        None,
-        None,
+        ask.AskCallbacks(on_status=statuses.append),
         conversation_id=_CONVERSATION_ID,
         should_detach=lambda: False,
         on_detach=on_detach,

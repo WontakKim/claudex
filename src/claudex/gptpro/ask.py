@@ -112,6 +112,21 @@ class AskSubmission:
     conversation_id: str | None
 
 
+@dataclass(frozen=True)
+class AskCallbacks:
+    """Observation callbacks for one ask execution.
+
+    Providers thread the whole bundle so adding a future callback touches
+    the bundle instead of every signature. `on_detached` is observed by the
+    runtime layer only; execute_ask_outcome ignores it.
+    """
+
+    on_status: Callable[[str], None] | None = None
+    on_conversation_id: Callable[[str], None] | None = None
+    on_marker: Callable[[str], None] | None = None
+    on_detached: Callable[[], None] | None = None
+
+
 class GptProAskError(Exception):
     """Base error for classified gptpro ask failures."""
 
@@ -222,9 +237,7 @@ class _AskExecution:
         self,
         page: Any,
         question: str,
-        on_status: Callable[[str], None] | None,
-        on_conversation_id: Callable[[str], None] | None,
-        on_marker: Callable[[str], None] | None,
+        callbacks: AskCallbacks | None,
         *,
         conversation_id: str | None = None,
         timeout_seconds: float | None = None,
@@ -238,9 +251,7 @@ class _AskExecution:
                 "conversation_id must be a canonical ChatGPT conversation UUID",
             )
         self.page = page
-        self.on_status = on_status
-        self.on_conversation_id = on_conversation_id
-        self.on_marker = on_marker
+        self.callbacks = callbacks if callbacks is not None else AskCallbacks()
         timeout_budget = (
             overall_timeout_seconds()
             if timeout_seconds is None
@@ -272,26 +283,26 @@ class _AskExecution:
         self._is_detach_requested = True
 
     def _status(self, message: str) -> None:
-        if self.on_status is None:
+        if self.callbacks.on_status is None:
             return
         try:
-            self.on_status(message)
+            self.callbacks.on_status(message)
         except Exception:
             return
 
     def _notify_marker(self, marker: str) -> None:
-        if self.on_marker is None:
+        if self.callbacks.on_marker is None:
             return
         try:
-            self.on_marker(marker)
+            self.callbacks.on_marker(marker)
         except Exception:
             return
 
     def _notify_conversation_id(self, conversation_id: str) -> None:
-        if self.on_conversation_id is None:
+        if self.callbacks.on_conversation_id is None:
             return
         try:
-            self.on_conversation_id(conversation_id)
+            self.callbacks.on_conversation_id(conversation_id)
         except Exception:
             return
 
@@ -1256,9 +1267,7 @@ async def execute_ask_outcome(
     page: Any,
     question: str,
     *,
-    on_status: Callable[[str], None] | None = None,
-    on_conversation_id: Callable[[str], None] | None = None,
-    on_marker: Callable[[str], None] | None = None,
+    callbacks: AskCallbacks | None = None,
     conversation_id: str | None = None,
     timeout_seconds: float | None = None,
     attachment_paths: Sequence[str] | None = None,
@@ -1273,9 +1282,7 @@ async def execute_ask_outcome(
     return await _AskExecution(
         page,
         question,
-        on_status,
-        on_conversation_id,
-        on_marker,
+        callbacks,
         conversation_id=conversation_id,
         timeout_seconds=timeout_seconds,
         attachment_paths=attachment_paths,
@@ -1291,5 +1298,7 @@ async def execute_ask(
     on_status: Callable[[str], None] | None = None,
 ) -> str:
     """Submit one prompt and return its server raw markdown."""
-    outcome = await execute_ask_outcome(page, question, on_status=on_status)
+    outcome = await execute_ask_outcome(
+        page, question, callbacks=AskCallbacks(on_status=on_status)
+    )
     return outcome.text

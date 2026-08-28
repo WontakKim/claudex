@@ -445,18 +445,17 @@ def test_gptpro_ask_prints_status_to_stderr_and_answer_once_to_stdout(
         page: _FakeAskPage,
         question: str,
         *,
-        on_status: object,
-        on_conversation_id: object,
-        on_marker: object,
+        callbacks: gptpro_ask.AskCallbacks | None = None,
         should_detach: object,
         on_detach: object,
     ) -> gptpro_ask.AskOutcome:
         assert page is context.page
         assert question == "explain the result"
-        assert callable(on_status)
-        on_status("waiting for ChatGPT")
-        assert on_conversation_id is None
-        assert on_marker is None
+        assert callbacks is not None
+        assert callable(callbacks.on_status)
+        callbacks.on_status("waiting for ChatGPT")
+        assert callbacks.on_conversation_id is None
+        assert callbacks.on_marker is None
         assert callable(should_detach)
         assert callable(on_detach)
         return gptpro_ask.AskOutcome(
@@ -486,18 +485,14 @@ def test_gptpro_ask_domain_failure_uses_stderr_and_exit_one(
         page: _FakeAskPage,
         question: str,
         *,
-        on_status: object,
-        on_conversation_id: object,
-        on_marker: object,
+        callbacks: gptpro_ask.AskCallbacks | None = None,
         should_detach: object,
         on_detach: object,
     ) -> gptpro_ask.AskOutcome:
         del (
             page,
             question,
-            on_status,
-            on_conversation_id,
-            on_marker,
+            callbacks,
             should_detach,
             on_detach,
         )
@@ -544,18 +539,14 @@ def test_gptpro_ask_keyboard_interrupt_closes_runtime_and_returns_130(
         page: _FakeAskPage,
         question: str,
         *,
-        on_status: object,
-        on_conversation_id: object,
-        on_marker: object,
+        callbacks: gptpro_ask.AskCallbacks | None = None,
         should_detach: object,
         on_detach: object,
     ) -> gptpro_ask.AskOutcome:
         del (
             page,
             question,
-            on_status,
-            on_conversation_id,
-            on_marker,
+            callbacks,
             should_detach,
             on_detach,
         )

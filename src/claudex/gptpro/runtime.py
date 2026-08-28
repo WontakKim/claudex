@@ -14,6 +14,7 @@ from typing import Any
 
 from claudex import locking, paths
 from claudex.gptpro import ask, browser, session
+from claudex.gptpro.ask import AskCallbacks
 from claudex.gptpro.conversation import (
     CHATGPT_URL,
     TRUSTED_ORIGIN,
@@ -576,9 +577,11 @@ class AskRuntime:
             page = await context.new_page()
             await _harden_page_user_agent(page)
             execution_options: dict[str, Any] = {
-                "on_status": on_status,
-                "on_conversation_id": on_conversation_id,
-                "on_marker": on_marker,
+                "callbacks": AskCallbacks(
+                    on_status=on_status,
+                    on_conversation_id=on_conversation_id,
+                    on_marker=on_marker,
+                ),
             }
             if conversation_id is not None:
                 execution_options["conversation_id"] = conversation_id
