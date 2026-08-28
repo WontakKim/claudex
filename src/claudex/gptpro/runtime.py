@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import random
 import time
@@ -19,6 +20,8 @@ from claudex.gptpro.conversation import (
     extract_assistant_turn,
 )
 from claudex.gptpro.selectors import PAGE_FETCH_PROBE_JS
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_MAX_CONCURRENT_ASKS = 2
 MIN_SUBMISSION_JITTER_SECONDS = 1.0
@@ -289,6 +292,11 @@ class DetachPoller:
                     conversation_id=registration.conversation_id,
                 )
             )
+            logger.info(
+                "gptpro detached answer recovered (thread=%s chars=%d)",
+                registration.conversation_id,
+                len(turn.text),
+            )
         return status
 
     async def _fetch_json(
@@ -332,6 +340,10 @@ class DetachPoller:
         self._registrations.pop(registration_id, None)
         if not registration.future.done():
             registration.future.set_exception(GptProSessionExpiredError())
+            logger.warning(
+                "gptpro detached ask hit an auth failure (thread=%s)",
+                registration.conversation_id,
+            )
 
     def _complete_if_stale(
         self,
@@ -347,6 +359,10 @@ class DetachPoller:
                     "timeout",
                     "the detached ask budget expired while polling for the answer",
                 )
+            )
+            logger.warning(
+                "gptpro detached ask timed out (thread=%s)",
+                registration.conversation_id,
             )
         return True
 
@@ -376,12 +392,26 @@ class DetachPoller:
         self, *, saw_rate_limit: bool, saw_success: bool
     ) -> None:
         if saw_rate_limit:
+            previous_interval_seconds = self._poll_interval_seconds
             self._poll_interval_seconds = min(
                 DETACH_POLL_MAX_INTERVAL_SECONDS,
                 self._poll_interval_seconds * 2,
             )
+            if self._poll_interval_seconds > previous_interval_seconds:
+                logger.warning(
+                    "gptpro detach poller rate-limited (interval=%.0fs)",
+                    self._poll_interval_seconds,
+                )
         elif saw_success:
+            had_backoff = (
+                self._poll_interval_seconds > DETACH_POLL_INTERVAL_SECONDS
+            )
             self._poll_interval_seconds = DETACH_POLL_INTERVAL_SECONDS
+            if had_backoff:
+                logger.info(
+                    "gptpro detach poller interval restored (%.0fs)",
+                    self._poll_interval_seconds,
+                )
 
     def _fail_all(self, failure: str, message: str) -> None:
         for registration in tuple(self._registrations.values()):

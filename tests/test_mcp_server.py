@@ -44,6 +44,7 @@ class FakeAskRuntime:
         self.questions: list[str] = []
         self.provider_conversation_ids: list[str | None] = []
         self.provider_attachment_paths: list[Sequence[str] | None] = []
+        self.submitted_session_ids: list[str | None] = []
         self._conversation_id_callbacks: list[
             Callable[[str], None] | None
         ] = []
@@ -90,13 +91,16 @@ class FakeAskRuntime:
         conversation_id: str | None = None,
         on_thread_ref: Callable[[str], None] | None = None,
         attachment_paths: Sequence[str] | None = None,
+        session_id: str | None = None,
     ) -> jobs.AskJob:
         job = self._job_service.start(
             question,
             conversation_id=conversation_id,
             on_thread_ref=on_thread_ref,
             attachment_paths=attachment_paths,
+            session_id=session_id,
         )
+        self.submitted_session_ids.append(session_id)
         self._submitted_ask_ids.append(job.ask_id)
         return job
 
@@ -387,6 +391,37 @@ def test_lazy_runtime_forwards_detached_callback() -> None:
     asyncio.run(scenario())
 
 
+def test_lazy_runtime_passes_session_id_to_job_service() -> None:
+    returned_job = object()
+
+    class JobServiceSpy:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, dict[str, Any]]] = []
+
+        def start(self, question: str, **options: Any) -> Any:
+            self.calls.append((question, options))
+            return returned_job
+
+    lazy_runtime = LazyAskRuntime()
+    job_service = JobServiceSpy()
+    lazy_runtime._job_service = job_service
+
+    result = lazy_runtime.start_ask("question", session_id="session-123")
+
+    assert result is returned_job
+    assert job_service.calls == [
+        (
+            "question",
+            {
+                "conversation_id": None,
+                "on_thread_ref": None,
+                "attachment_paths": None,
+                "session_id": "session-123",
+            },
+        )
+    ]
+
+
 def test_lazy_runtime_has_active_jobs_delegates_to_job_service() -> None:
     class JobServiceSpy:
         def __init__(self, result: bool) -> None:
@@ -555,6 +590,24 @@ def test_submit_returns_immediately_and_status_transitions_to_succeeded() -> Non
         "thread_ref": "conversation-123",
     }
     assert runtime.questions == ["Review this decision."]
+
+
+def test_submit_passes_mcp_session_id_to_runtime() -> None:
+    runtime = FakeAskRuntime()
+    with _mcp_client(runtime) as client:
+        _payload, headers = _initialize(client)
+        submitted = _json_tool_payload(
+            _call_tool(
+                client,
+                headers,
+                "ask_gpt_pro",
+                {"question": "Trace this session."},
+            )
+        )
+        _wait_for_provider_calls(client, runtime, 1)
+        _finish_job(client, runtime, submitted["ask_id"])
+
+    assert runtime.submitted_session_ids == [headers["mcp-session-id"]]
 
 
 def test_submit_passes_attachment_paths_to_provider() -> None:

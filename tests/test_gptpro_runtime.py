@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
@@ -728,6 +729,7 @@ def test_detach_poller_completes_finished_marker_turn_and_closes_tab() -> None:
 
 def test_detach_poller_backs_off_on_429_and_recovers_on_success(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     marker = "[gptpro-transport-nonce:poller-backoff]"
     page = _PollerFakePage(
@@ -761,7 +763,15 @@ def test_detach_poller_backs_off_on_429_and_recovers_on_success(
         assert page.close_calls == 1
         await poller.aclose()
 
+    caplog.set_level(logging.INFO, logger="claudex.gptpro.runtime")
     asyncio.run(scenario())
+
+    assert caplog.messages == [
+        "gptpro detach poller rate-limited (interval=90s)",
+        f"gptpro detached answer recovered (thread={_CONVERSATION_ID} "
+        f"chars={len('answer after backoff')})",
+        "gptpro detach poller interval restored (45s)",
+    ]
 
 
 def test_detach_poller_retries_navigation_destroyed_fetch_on_next_cycle(
@@ -881,6 +891,7 @@ def test_detach_poller_times_out_immediately_when_fetch_exhausts_deadline(
 @pytest.mark.parametrize("status", [401, 403])
 def test_detach_poller_classifies_authorization_failure_as_session_expired(
     status: int,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     marker = "[gptpro-transport-nonce:poller-auth]"
     page = _PollerFakePage(marker, [(status, None)])
@@ -899,11 +910,17 @@ def test_detach_poller_classifies_authorization_failure_as_session_expired(
         assert page.close_calls == 1
         await poller.aclose()
 
+    caplog.set_level(logging.WARNING, logger="claudex.gptpro.runtime")
     asyncio.run(scenario())
+
+    assert caplog.messages == [
+        f"gptpro detached ask hit an auth failure (thread={_CONVERSATION_ID})"
+    ]
 
 
 def test_detach_poller_sweeps_expired_registration(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     marker = "[gptpro-transport-nonce:poller-expired]"
     page = _PollerFakePage(marker, [])
@@ -924,7 +941,12 @@ def test_detach_poller_sweeps_expired_registration(
         assert context.new_page_calls == 0
         await poller.aclose()
 
+    caplog.set_level(logging.WARNING, logger="claudex.gptpro.runtime")
     asyncio.run(scenario())
+
+    assert caplog.messages == [
+        f"gptpro detached ask timed out (thread={_CONVERSATION_ID})"
+    ]
 
 
 class _RuntimeDetachPollerFake:

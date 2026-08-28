@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Callable, Sequence
 from pathlib import Path
 
@@ -48,6 +49,180 @@ async def _wait_until_missing(
             return
         await asyncio.sleep(0.002)
     raise AssertionError("job was not removed")
+
+
+def test_lifecycle_logs_submission_admission_and_success_without_content(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    now = 100.0
+    provider_started = asyncio.Event()
+    release_provider = asyncio.Event()
+    started_jobs: list[jobs.AskJob] = []
+    question = "0123456789" * 5 + "\nprivate question tail"
+    answer = "private answer body"
+    nonce_marker = "private nonce marker"
+    thread_ref = "thread-123456789"
+
+    async def provider(
+        provider_question: str,
+        *,
+        on_status: Callable[[str], None] | None = None,
+        on_conversation_id: Callable[[str], None] | None = None,
+        conversation_id: str | None = None,
+        timeout_seconds: float | None = None,
+    ) -> ask.AskOutcome:
+        del on_status, on_conversation_id
+        assert provider_question == question
+        assert conversation_id == thread_ref
+        assert timeout_seconds == 120.0
+        provider_started.set()
+        await release_provider.wait()
+        return ask.AskOutcome(answer, nonce_marker, conversation_id)
+
+    async def scenario() -> None:
+        nonlocal now
+        service = jobs.AskJobService(
+            provider,
+            overall_timeout_seconds=120.0,
+            clock=lambda: now,
+        )
+        started_job = service.start(
+            question,
+            conversation_id=thread_ref,
+            session_id="session-123456789",
+        )
+        started_jobs.append(started_job)
+        now = 102.5
+        await provider_started.wait()
+        now = 110.0
+        release_provider.set()
+        await _wait_for_state(service, started_job.ask_id, "succeeded")
+        await service.aclose()
+
+    caplog.set_level(logging.INFO, logger="claudex.gptpro.jobs")
+    asyncio.run(scenario())
+
+    ask_id = started_jobs[0].ask_id
+    preview = "0123456789" * 4
+    assert (
+        f'gptpro ask {ask_id[:8]} submitted (session=session- thread={thread_ref} '
+        f'question="{preview}…", chars={len(question)})'
+        in caplog.messages
+    )
+    assert (
+        f"gptpro ask {ask_id[:8]} admitted "
+        f"(waited=2.5s budget=120s thread={thread_ref})"
+        in caplog.messages
+    )
+    assert (
+        f"gptpro ask {ask_id[:8]} succeeded "
+        f"(duration=7.5s thread={thread_ref} answer_chars={len(answer)})"
+        in caplog.messages
+    )
+    assert "private question tail" not in caplog.text
+    assert answer not in caplog.text
+    assert nonce_marker not in caplog.text
+
+
+def test_queue_wait_log_is_emitted_once_when_status_repeats(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    conversation_id = "repeated-wait-conversation"
+
+    async def provider(
+        question: str,
+        *,
+        on_status: Callable[[str], None] | None = None,
+        on_conversation_id: Callable[[str], None] | None = None,
+        conversation_id: str | None = None,
+        timeout_seconds: float | None = None,
+    ) -> ask.AskOutcome:
+        del question, on_status, on_conversation_id, timeout_seconds
+        return ask.AskOutcome("answer", "marker", conversation_id)
+
+    async def scenario() -> jobs.AskJob:
+        service = jobs.AskJobService(provider)
+        released = asyncio.Event()
+        released.set()
+        service._conversation_owners[conversation_id] = (
+            jobs._ConversationOwnership("owner", released)
+        )
+        started_job = service.start(
+            "question", conversation_id=conversation_id
+        )
+        await _wait_for_status_message(
+            service,
+            started_job.ask_id,
+            "waiting for the in-flight answer",
+        )
+        for _ in range(3):
+            await asyncio.sleep(0)
+        del service._conversation_owners[conversation_id]
+        await _wait_for_state(service, started_job.ask_id, "succeeded")
+        await service.aclose()
+        return started_job
+
+    caplog.set_level(logging.DEBUG, logger="claudex.gptpro.jobs")
+    started_job = asyncio.run(scenario())
+
+    wait_messages = [
+        message
+        for message in caplog.messages
+        if "waiting for the in-flight answer" in message
+    ]
+    assert wait_messages == [
+        f"gptpro ask {started_job.ask_id[:8]} waiting for the in-flight answer "
+        f"(thread={conversation_id})"
+    ]
+
+
+def test_classified_failure_log_includes_failure_and_thread(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    async def provider(question: str, **_options: object) -> ask.AskOutcome:
+        raise ask.GptProAskError("expired", "queue admission expired")
+
+    async def scenario() -> jobs.AskJob:
+        service = jobs.AskJobService(provider)
+        started_job = service.start(
+            "question", conversation_id="expired-thread"
+        )
+        await _wait_for_state(service, started_job.ask_id, "failed")
+        await service.aclose()
+        return started_job
+
+    caplog.set_level(logging.WARNING, logger="claudex.gptpro.jobs")
+    started_job = asyncio.run(scenario())
+
+    assert caplog.messages == [
+        f"gptpro ask {started_job.ask_id[:8]} failed "
+        "(failure=expired thread=expired-thread): queue admission expired"
+    ]
+
+
+def test_unexpected_failure_log_includes_exception_info(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    async def provider(question: str, **_options: object) -> ask.AskOutcome:
+        raise RuntimeError("browser crashed")
+
+    async def scenario() -> jobs.AskJob:
+        service = jobs.AskJobService(provider)
+        started_job = service.start("question")
+        await _wait_for_state(service, started_job.ask_id, "failed")
+        await service.aclose()
+        return started_job
+
+    caplog.set_level(logging.ERROR, logger="claudex.gptpro.jobs")
+    started_job = asyncio.run(scenario())
+
+    assert len(caplog.records) == 1
+    record = caplog.records[0]
+    assert record.getMessage() == (
+        f"gptpro ask {started_job.ask_id[:8]} failed unexpectedly"
+    )
+    assert record.exc_info is not None
+    assert record.exc_info[0] is RuntimeError
 
 
 def test_provider_without_detached_callback_transitions_through_lifecycle() -> None:
@@ -107,7 +282,9 @@ def test_provider_without_detached_callback_transitions_through_lifecycle() -> N
     asyncio.run(scenario())
 
 
-def test_detached_callback_transitions_job_then_completion_succeeds() -> None:
+def test_detached_callback_transitions_job_then_completion_succeeds(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     detached = asyncio.Event()
     release_provider = asyncio.Event()
 
@@ -146,7 +323,16 @@ def test_detached_callback_transitions_job_then_completion_succeeds() -> None:
         assert completed_job.finished_at is not None
         await service.aclose()
 
+    caplog.set_level(logging.INFO, logger="claudex.gptpro.jobs")
     asyncio.run(scenario())
+
+    detached_messages = [
+        message for message in caplog.messages if " detached " in message
+    ]
+    assert len(detached_messages) == 1
+    assert detached_messages[0].endswith(
+        "detached (thread=new) - polling for the answer"
+    )
 
 
 def test_late_detached_callback_does_not_change_completed_job() -> None:
@@ -1254,7 +1440,9 @@ def test_unknown_ask_id_has_no_status_or_result() -> None:
     asyncio.run(scenario())
 
 
-def test_sweeper_removes_expired_finished_jobs_but_keeps_running_jobs() -> None:
+def test_sweeper_removes_expired_finished_jobs_but_keeps_running_jobs(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     running_provider_started = asyncio.Event()
 
     async def provider(
@@ -1290,7 +1478,14 @@ def test_sweeper_removes_expired_finished_jobs_but_keeps_running_jobs() -> None:
         assert retained_job.state == "running"
         await service.aclose()
 
+    caplog.set_level(logging.DEBUG, logger="claudex.gptpro.jobs")
     asyncio.run(scenario())
+
+    swept_messages = [
+        message for message in caplog.messages if " record swept " in message
+    ]
+    assert len(swept_messages) == 1
+    assert "state=succeeded" in swept_messages[0]
 
 
 def test_aclose_cancels_running_job_and_sweeper_and_is_idempotent() -> None:

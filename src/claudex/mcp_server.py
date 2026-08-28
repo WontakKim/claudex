@@ -144,6 +144,7 @@ class LazyAskRuntime:
         conversation_id: str | None = None,
         on_thread_ref: Callable[[str], None] | None = None,
         attachment_paths: Sequence[str] | None = None,
+        session_id: str | None = None,
     ) -> jobs.AskJob:
         if self._job_service is None:
             self._job_service = jobs.AskJobService(self.ask)
@@ -152,6 +153,7 @@ class LazyAskRuntime:
             conversation_id=conversation_id,
             on_thread_ref=on_thread_ref,
             attachment_paths=attachment_paths,
+            session_id=session_id,
         )
 
     def lookup_thread(self, session_id: str) -> str | None:
@@ -388,6 +390,7 @@ def _create_session_manager(app: Any) -> Any:
                 conversation_id=conversation_id,
                 on_thread_ref=on_thread_ref,
                 attachment_paths=attachment_paths,
+                session_id=session_id,
             )
             return _json_result(
                 types,

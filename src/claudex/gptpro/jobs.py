@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import logging
 import tempfile
 import time
 from collections import deque
@@ -21,6 +22,8 @@ from uuid import uuid4
 
 from claudex.gptpro import ask as ask_module
 from claudex.gptpro.ask import AskOutcome, GptProAskError
+
+logger = logging.getLogger(__name__)
 
 JOB_RETENTION_SECONDS = 24.0 * 60 * 60
 SWEEP_INTERVAL_SECONDS = 300.0
@@ -201,6 +204,7 @@ class AskJobService:
         conversation_id: str | None = None,
         on_thread_ref: Callable[[str], None] | None = None,
         attachment_paths: Sequence[str] | None = None,
+        session_id: str | None = None,
     ) -> AskJob:
         """Start an ask and notify `on_thread_ref` only after it succeeds.
 
@@ -223,6 +227,16 @@ class AskJobService:
             finished_at=None,
         )
         self._jobs[ask_id] = job
+        question_preview = " ".join(question.split())
+        logger.info(
+            'gptpro ask %.8s submitted (session=%.8s thread=%s '
+            'question="%.40s…", chars=%d)',
+            ask_id,
+            session_id or "new",
+            conversation_id or "new",
+            question_preview,
+            len(question),
+        )
 
         task = asyncio.create_task(
             self._run_job(
@@ -276,6 +290,7 @@ class AskJobService:
         attachment_paths: Sequence[str] | None,
     ) -> None:
         spill_path: Path | None = None
+        has_logged_queue_wait = False
         try:
             if conversation_id is not None:
                 while ownership := self._conversation_owners.get(
@@ -284,6 +299,14 @@ class AskJobService:
                     self._on_status(
                         ask_id, "waiting for the in-flight answer"
                     )
+                    if not has_logged_queue_wait:
+                        logger.debug(
+                            "gptpro ask %.8s waiting for the in-flight answer "
+                            "(thread=%s)",
+                            ask_id,
+                            conversation_id,
+                        )
+                        has_logged_queue_wait = True
                     queue_wait_remaining = (
                         queue_deadline - self._clock()
                     )
@@ -313,6 +336,14 @@ class AskJobService:
             )
             admitted_at = self._clock()
             remaining = self._watchdog.execution_budget_seconds()
+            logger.info(
+                "gptpro ask %.8s admitted (waited=%.1fs budget=%.0fs "
+                "thread=%s)",
+                ask_id,
+                admitted_at - self._jobs[ask_id].created_at,
+                remaining,
+                self._jobs[ask_id].thread_ref or "new",
+            )
 
             def capture_status(message: str) -> None:
                 self._on_status(ask_id, message)
@@ -379,8 +410,17 @@ class AskJobService:
                     else outcome.marker
                 ),
             )
-            self._watchdog.record(self._clock() - admitted_at)
+            duration_seconds = self._clock() - admitted_at
             thread_ref = self._jobs[ask_id].thread_ref
+            self._watchdog.record(duration_seconds)
+            logger.info(
+                "gptpro ask %.8s succeeded (duration=%.1fs thread=%s "
+                "answer_chars=%d)",
+                ask_id,
+                duration_seconds,
+                thread_ref or "new",
+                len(outcome.text),
+            )
             if on_thread_ref is not None and thread_ref is not None:
                 try:
                     on_thread_ref(thread_ref)
@@ -404,12 +444,22 @@ class AskJobService:
                 failure=exc.failure,
                 error_message=str(exc),
             )
+            logger.warning(
+                "gptpro ask %.8s failed (failure=%s thread=%s): %s",
+                ask_id,
+                exc.failure,
+                self._jobs[ask_id].thread_ref or "new",
+                exc,
+            )
         except Exception as exc:
             self._jobs[ask_id] = replace(
                 self._jobs[ask_id],
                 state="failed",
                 failure="error",
                 error_message=f"{type(exc).__name__}: {exc}",
+            )
+            logger.exception(
+                "gptpro ask %.8s failed unexpectedly", ask_id
             )
         finally:
             owned_conversation_id = self._jobs[ask_id].thread_ref
@@ -437,6 +487,11 @@ class AskJobService:
         if job is None or job.state != "running":
             return
         self._jobs[ask_id] = replace(job, state="detached")
+        logger.info(
+            "gptpro ask %.8s detached (thread=%s) - polling for the answer",
+            ask_id,
+            job.thread_ref or "new",
+        )
 
     def _on_marker(self, ask_id: str, marker: str) -> None:
         job = self._jobs[ask_id]
@@ -470,4 +525,10 @@ class AskJobService:
                 and job.finished_at + self._retention_seconds <= now
             ]
             for ask_id in expired_ask_ids:
-                del self._jobs[ask_id]
+                job = self._jobs.pop(ask_id)
+                logger.debug(
+                    "gptpro ask %.8s record swept (state=%s age=%.0fs)",
+                    ask_id,
+                    job.state,
+                    now - job.created_at,
+                )
