@@ -675,11 +675,157 @@ function fetchGptProSession(){
   }).catch(function(){renderGptProSessionError("Gateway unreachable")});
 }
 var gptProSessionTimer=null;
-/* The optional session changes slowly, so poll only while Status is visible. */
+/* The optional session changes slowly, so poll only while MCP is visible. */
 function syncGptProSessionTimer(){
-  var active=document.body.dataset.tab==="status";
+  var active=document.body.dataset.tab==="mcp";
   if(active&&!gptProSessionTimer)gptProSessionTimer=setInterval(fetchGptProSession,60000);
   if(!active&&gptProSessionTimer){clearInterval(gptProSessionTimer);gptProSessionTimer=null}
+}
+var mcpCopyWired=false;
+function renderMcpInfo(data){
+  var endpoint=String(data.endpoint||"");
+  var command="claude mcp add --transport http claudex-gptpro "+endpoint;
+  if(data.auth_required)command+=' --header "Authorization: Bearer <CLAUDEX_LOCAL_TOKEN>"';
+  document.getElementById("mcp-connect-command").textContent=command;
+  document.getElementById("mcp-endpoint").textContent=endpoint||"—";
+  document.getElementById("mcp-auth-hint").hidden=!data.auth_required;
+  if(!mcpCopyWired){
+    wireCopy(document.getElementById("mcp-connect-copy"),command);
+    mcpCopyWired=true;
+  }
+}
+function fetchMcpInfo(){
+  jfetch("/admin/gptpro/mcp").then(function(r){
+    if(r.ok){renderMcpInfo(r.body);return}
+    document.getElementById("mcp-endpoint").textContent="Unavailable";
+    showToast('<span class="chip chip-err">ERROR</span><span class="lat">'+r.status+
+      '</span><br>GPT Pro MCP connection<br><span class="dim">'+esc(errDetail(r.body))+"</span>",true);
+  }).catch(function(){
+    document.getElementById("mcp-endpoint").textContent="Unavailable";
+    showToast('<span class="chip chip-err">ERROR</span><br>GPT Pro MCP connection'+
+      '<br><span class="dim">gateway unreachable</span>',true);
+  });
+}
+var gptProLoginTimer=null,loginPolling=false;
+function gptProLoginDetail(data,status){
+  if(status==="succeeded")return data.output||data.detail||"ChatGPT sign-in completed successfully.";
+  if(status==="failed")return data.error||data.detail||data.output||"ChatGPT sign-in failed.";
+  if(status==="cancelled")return data.detail||"ChatGPT sign-in was cancelled.";
+  if(status==="cancelling")return data.detail||"Cancelling ChatGPT sign-in.";
+  if(status==="running")return data.detail||"Waiting for ChatGPT sign-in in the opened browser.";
+  return data.detail||"Starting the ChatGPT sign-in browser.";
+}
+function renderGptProLogin(data){
+  data=data||{status:"idle"};
+  var status=String(data.status||"idle");
+  var isActive=status==="starting"||status==="running"||status==="cancelling";
+  var isTerminal=status==="succeeded"||status==="failed"||status==="cancelled";
+  var button=document.getElementById("gptpro-login-btn");
+  var detail=document.getElementById("gptpro-login-detail");
+  loginPolling=isActive;
+  button.disabled=status==="cancelling";
+  button.textContent=status==="cancelling"?"Cancelling login":(isActive?"Cancel login":"Sign in to ChatGPT");
+  if(status==="idle"){
+    detail.textContent="";
+  }else{
+    detail.textContent=gptProLoginDetail(data,status)+
+      (isActive?" gptpro asks are unavailable while signing in.":"");
+  }
+  if(isTerminal)fetchGptProSession();
+  syncGptProLoginTimer();
+}
+function showGptProLoginError(detail,status){
+  document.getElementById("gptpro-login-detail").textContent=detail;
+  showToast('<span class="chip chip-err">ERROR</span>'+(status?'<span class="lat">'+status+"</span>":"")+
+    '<br>ChatGPT sign-in<br><span class="dim">'+esc(detail)+"</span>",true);
+}
+function fetchGptProLogin(){
+  return jfetch("/admin/gptpro/login").then(function(r){
+    if(r.ok){renderGptProLogin(r.body);return r.body}
+    var detail=errDetail(r.body);
+    if(!loginPolling)renderGptProLogin({status:"idle"});
+    showGptProLoginError(detail,r.status);
+    return null;
+  }).catch(function(){
+    if(!loginPolling)renderGptProLogin({status:"idle"});
+    showGptProLoginError("Gateway unreachable");
+    return null;
+  });
+}
+function startGptProLogin(){
+  var button=document.getElementById("gptpro-login-btn");
+  if(button.disabled)return;
+  setButtonBusy(button);
+  document.getElementById("gptpro-login-detail").textContent="Starting ChatGPT sign-in.";
+  jfetch("/admin/gptpro/login",{
+    method:"POST",headers:JSON_HEADERS,body:"{}"
+  }).then(function(r){
+    var code=r.body&&r.body.error&&r.body.error.code;
+    if(r.ok&&r.status===201){renderGptProLogin(r.body);return}
+    if(r.status===409&&code==="login-active"){
+      renderGptProLogin({status:"starting",detail:"Attaching to the active ChatGPT sign-in."});
+      fetchGptProLogin();
+      return;
+    }
+    if(r.status===409&&code==="asks-active"){
+      renderGptProLogin({status:"idle"});
+      showGptProLoginError(errDetail(r.body),r.status);
+      return;
+    }
+    renderGptProLogin({status:"idle"});
+    showGptProLoginError(errDetail(r.body),r.status);
+  }).catch(function(){
+    renderGptProLogin({status:"idle"});
+    showGptProLoginError("Gateway unreachable");
+  });
+}
+function cancelGptProLogin(){
+  var button=document.getElementById("gptpro-login-btn");
+  if(button.disabled)return;
+  setButtonBusy(button);
+  jfetch("/admin/gptpro/login",{method:"DELETE"}).then(function(r){
+    if(r.ok){
+      renderGptProLogin(r.body.status==="idle"?r.body:{status:"cancelling"});
+      return;
+    }
+    button.disabled=false;button.textContent="Cancel login";
+    showGptProLoginError(errDetail(r.body),r.status);
+  }).catch(function(){
+    button.disabled=false;button.textContent="Cancel login";
+    showGptProLoginError("Gateway unreachable");
+  });
+}
+function pollGptProLogin(){fetchGptProLogin()}
+function syncGptProLoginTimer(){
+  var active=document.body.dataset.tab==="mcp"&&loginPolling;
+  if(active&&!gptProLoginTimer)gptProLoginTimer=setInterval(pollGptProLogin,2000);
+  if(!active&&gptProLoginTimer){clearInterval(gptProLoginTimer);gptProLoginTimer=null}
+}
+function renderGptProDoctor(data){
+  var output=document.getElementById("gptpro-doctor-output");
+  output.hidden=false;
+  output.className="codeblock "+(data.ok?"okv":"err");
+  output.textContent=String(data.output||(data.ok?"Doctor completed with no output.":"Doctor failed with no output."));
+}
+function runGptProDoctor(){
+  var button=document.getElementById("gptpro-doctor-btn");
+  if(button.disabled)return;
+  setButtonBusy(button);
+  jfetch("/admin/gptpro/doctor",{
+    method:"POST",headers:JSON_HEADERS,body:"{}"
+  }).then(function(r){
+    if(r.ok){renderGptProDoctor(r.body);return}
+    var detail=errDetail(r.body);
+    renderGptProDoctor({ok:false,output:detail});
+    showToast('<span class="chip chip-err">ERROR</span><span class="lat">'+r.status+
+      '</span><br>GPT Pro doctor<br><span class="dim">'+esc(detail)+"</span>",true);
+  }).catch(function(){
+    renderGptProDoctor({ok:false,output:"Gateway unreachable"});
+    showToast('<span class="chip chip-err">ERROR</span><br>GPT Pro doctor'+
+      '<br><span class="dim">gateway unreachable</span>',true);
+  }).finally(function(){
+    button.disabled=false;button.textContent="Run doctor";
+  });
 }
 function renderLogLevel(p){
   var box=document.getElementById("loglevel");
@@ -1691,12 +1837,14 @@ function setTab(t){
     if(cat==="accounts")fetchAccounts();
   }else if(location.hash!=="#"+t){history.replaceState(null,"","#"+t)}
   if(t==="map"){drawWires();if(mapNeedsFit){mapNeedsFit=false;fitView()}}
-  if(t==="status"){fetchUsage();fetchGptProSession()}
+  if(t==="status")fetchUsage();
+  if(t==="mcp"){fetchGptProSession();fetchMcpInfo();fetchGptProLogin()}
   if(t==="log")fetchLogs();
   syncLogTimer();
   syncGptProSessionTimer();
+  syncGptProLoginTimer();
 }
-const TAB_NAMES=["settings","status","map","log"];
+const TAB_NAMES=["settings","status","mcp","map","log"];
 /* === Subscription usage in Status provider cards ========================= */
 function fmtPct(v){return (Math.round(v*10)/10)+"%"}
 function fmtReset(epochSec){
@@ -1892,6 +2040,10 @@ document.getElementById("log-live").addEventListener("click",function(){
   if(logLive)fetchLogs();
   syncLogTimer();
 });
+document.getElementById("gptpro-login-btn").addEventListener("click",function(){
+  if(loginPolling)cancelGptProLogin();else startGptProLogin();
+});
+document.getElementById("gptpro-doctor-btn").addEventListener("click",runGptProDoctor);
 document.querySelectorAll("nav.tabs a").forEach(function(a){
   a.addEventListener("click",function(ev){ev.preventDefault();setTab(this.dataset.t)});
 });

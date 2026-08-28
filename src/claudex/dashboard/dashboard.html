@@ -19,6 +19,7 @@
   <nav class="tabs">
     <a href="#settings" data-t="settings">Settings</a>
     <a href="#status" data-t="status">Status</a>
+    <a href="#mcp" data-t="mcp">MCP</a>
     <a href="#map" data-t="map">Router</a>
     <a href="#log" data-t="log">Log</a>
   </nav>
@@ -215,6 +216,10 @@
         </div>
         <div class="ubody" id="usage-body-grok"></div>
       </div>
+    </section>
+
+    <!-- MCP tab -->
+    <section id="tab-mcp">
       <div class="card" id="gptpro-session-card">
         <div class="ucard-h">
           <h2>GPT Pro Session</h2>
@@ -224,6 +229,33 @@
         <div class="stat" id="gptpro-session-stat">
           <div class="statline" id="gptpro-session-statline"><span class="sk">VALID · Expires in 00d 00h</span></div>
         </div>
+        <div class="seg">
+          <button id="gptpro-login-btn">Sign in to ChatGPT</button>
+        </div>
+        <div class="cthint" id="gptpro-login-detail"></div>
+        <div class="cthint">No graphical browser available? Run <code>claudex-gateway gptpro login</code> from a terminal.</div>
+      </div>
+      <div class="card" id="mcp-connect-card">
+        <h2>Connect Claude Code</h2>
+        <div class="sub">Register the gateway's GPT Pro tools with Claude Code.</div>
+        <div class="stat">
+          <div class="codeblock">
+            <span class="tx" id="mcp-connect-command"></span>
+            <button class="cp" id="mcp-connect-copy" title="Copy command" aria-label="Copy command"></button>
+          </div>
+        </div>
+        <div class="kv">
+          <span class="k"><code>ENDPOINT</code></span><span class="v" id="mcp-endpoint">—</span>
+        </div>
+        <div class="cthint" id="mcp-auth-hint" hidden>Replace <code>&lt;CLAUDEX_LOCAL_TOKEN&gt;</code> with the configured local token.</div>
+      </div>
+      <div class="card" id="gptpro-doctor-card">
+        <h2>GPT Pro Doctor</h2>
+        <div class="sub">Check the saved session, browser profile, and optional dependencies.</div>
+        <div class="seg">
+          <button id="gptpro-doctor-btn">Run doctor</button>
+        </div>
+        <pre class="codeblock" id="gptpro-doctor-output" hidden></pre>
       </div>
     </section>
 

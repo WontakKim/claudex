@@ -2566,11 +2566,12 @@ def test_dashboard_settings_tab_leads_and_holds_compaction(
     assert (
         page.index('data-t="settings"')
         < page.index('data-t="status"')
+        < page.index('data-t="mcp"')
         < page.index('data-t="map"')
         < page.index('data-t="log"')
     )
     assert '<body data-tab="settings">' in page
-    assert 'const TAB_NAMES=["settings","status","map","log"]' in javascript
+    assert 'const TAB_NAMES=["settings","status","mcp","map","log"]' in javascript
     # The category rail leads the pane and deep-links its single category.
     assert 'href="#settings/general"' in page
     assert (

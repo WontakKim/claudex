@@ -8,11 +8,12 @@ Opening `http://127.0.0.1:8787/` uses the same guarded admin API as the CLI:
 
 - **Settings** contains the [compaction reroute](compaction.md#compaction-reroute),
   Codex Fast mode, Claude account routing, and registered-account management.
-- **Status** shows built-in login and subscription usage, the saved gptpro
-  session's expiry with a once-per-minute refresh, and custom-provider readiness.
-  Kimi and Grok cards remain cosmetically hidden until a login or
+- **Status** shows built-in login and subscription usage plus custom-provider
+  readiness. Kimi and Grok cards remain cosmetically hidden until a login or
   mapped route makes them relevant; this never affects routing or settings.
   Custom providers do not receive usage or billing cards.
+- **MCP** manages the GPT Pro integration with Claude Code. See
+  [GPT Pro MCP](#gpt-pro-mcp) below.
 - **Log** reads `GET /admin/logs` and changes the persisted runtime log level
   through `PUT /admin/settings/log-level`.
 - **Router** edits the provider-prefixed model map on a canvas and includes the
@@ -21,6 +22,32 @@ Opening `http://127.0.0.1:8787/` uses the same guarded admin API as the CLI:
 The Router becomes view-only when `CLAUDEX_MODEL_MAP` overrides the persisted
 map. Otherwise, Apply sends the complete draft to
 `PUT /admin/settings/mapping`.
+
+## GPT Pro MCP
+
+The MCP tab contains three cards:
+
+- **GPT Pro Session** shows the saved ChatGPT Pro session and refreshes it once
+  per minute while the tab is visible. It can start, monitor, and cancel an
+  interactive ChatGPT sign-in. On a machine without a graphical browser, run
+  `claudex-gateway gptpro login` from a terminal instead.
+- **Connect Claude Code** shows the local MCP endpoint and a copyable
+  `claude mcp add --transport http` command. When local authentication is
+  enabled, the command includes an authorization-header placeholder that must
+  be replaced with the configured `CLAUDEX_LOCAL_TOKEN`.
+- **GPT Pro Doctor** runs the server-side diagnostic and displays its output.
+
+The tab uses these guarded admin API operations:
+
+- `GET /admin/gptpro/session` reads the saved session state.
+- `GET /admin/gptpro/login` reads the current login state.
+- `POST /admin/gptpro/login` starts a login.
+- `DELETE /admin/gptpro/login` cancels an active login or clears a completed one.
+- `POST /admin/gptpro/doctor` runs the diagnostic.
+- `GET /admin/gptpro/mcp` returns the endpoint and authentication requirement.
+
+A login temporarily owns the shared browser profile. GPT Pro asks are
+unavailable while sign-in is starting, running, or being cancelled.
 
 ## Custom-provider metadata and status
 

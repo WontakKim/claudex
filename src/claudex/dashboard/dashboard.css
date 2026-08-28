@@ -29,7 +29,7 @@ nav.tabs a:not(.on):hover{background:var(--inset)}
 nav.tabs .cnt{font:600 12px var(--mono);color:var(--accent);margin-left:6px}
 nav.tabs a.on .cnt{color:var(--canvas)}
 main>section{display:none;padding-top:20px}
-body[data-tab="settings"] #tab-settings,body[data-tab="status"] #tab-status,body[data-tab="map"] #tab-map,body[data-tab="log"] #tab-log{display:block}
+body[data-tab="settings"] #tab-settings,body[data-tab="status"] #tab-status,body[data-tab="mcp"] #tab-mcp,body[data-tab="map"] #tab-map,body[data-tab="log"] #tab-log{display:block}
 /* Cards */
 .card{background:var(--panel);border-radius:8px;padding:18px;box-shadow:0 1px 3px rgba(0,0,0,.07);margin-bottom:16px}
 .card h2{font-size:20px;font-weight:650;margin:0 0 4px}
@@ -233,6 +233,11 @@ body.wiring .node .x{pointer-events:none}
   width:112px;flex:none;padding:11px 0;text-align:center;cursor:pointer}
 .ctrow button:disabled{opacity:.5;cursor:default}
 .cthint{font-size:12.5px;color:var(--muted);margin-top:8px}
+#gptpro-doctor-output{display:block;margin:12px 0 0;padding:12px 14px;white-space:pre-wrap;overflow-wrap:anywhere;
+  font:12.5px/1.7 var(--mono);border-radius:6px;background:var(--inset);color:var(--text)}
+#gptpro-doctor-output.okv{background:var(--ok-soft);color:var(--ok)}
+#gptpro-doctor-output.err{background:var(--err-soft);color:var(--err)}
+#gptpro-doctor-output[hidden]{display:none}
 .toast{position:fixed;bottom:84px;right:18px;z-index:60;width:min(440px,calc(100vw - 36px));background:var(--panel);border-left:4px solid var(--ok);
   border-radius:10px;box-shadow:0 8px 28px rgba(0,0,0,.18);padding:13px 18px;font:14px/1.7 var(--mono);cursor:pointer;
   animation:toastin .25s ease}

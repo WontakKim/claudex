@@ -391,6 +391,67 @@ async function main() {
   });
   gptProSessionStates.missing = statusText(document, "gptpro-session");
 
+  const mcpInfoStates = {};
+  context.renderMcpInfo({
+    endpoint: "http://127.0.0.1:8787/mcp",
+    auth_required: false,
+  });
+  mcpInfoStates.open = {
+    command: document.getElementById("mcp-connect-command").textContent,
+    endpoint: document.getElementById("mcp-endpoint").textContent,
+    authHintHidden: document.getElementById("mcp-auth-hint").hidden,
+  };
+  context.renderMcpInfo({
+    endpoint: "http://127.0.0.1:9000/mcp",
+    auth_required: true,
+  });
+  mcpInfoStates.authenticated = {
+    command: document.getElementById("mcp-connect-command").textContent,
+    endpoint: document.getElementById("mcp-endpoint").textContent,
+    authHintHidden: document.getElementById("mcp-auth-hint").hidden,
+  };
+
+  let gptProSessionRefreshes = 0;
+  context.fetchGptProSession = () => { gptProSessionRefreshes += 1; };
+  const gptProLoginStates = {};
+  const captureGptProLogin = () => ({
+    buttonText: document.getElementById("gptpro-login-btn").textContent,
+    buttonDisabled: document.getElementById("gptpro-login-btn").disabled,
+    detail: document.getElementById("gptpro-login-detail").textContent,
+    polling: Boolean(context.loginPolling),
+  });
+  context.renderGptProLogin({status: "idle"});
+  gptProLoginStates.idle = captureGptProLogin();
+  context.renderGptProLogin({
+    status: "running",
+    detail: "sign in to ChatGPT in the opened browser",
+    output: "",
+    error: null,
+  });
+  gptProLoginStates.running = captureGptProLogin();
+  context.renderGptProLogin({
+    status: "succeeded",
+    detail: "verifying the saved ChatGPT session",
+    output: "saved and verified the gptpro session\n",
+    error: null,
+  });
+  gptProLoginStates.terminal = captureGptProLogin();
+  gptProLoginStates.sessionRefreshes = gptProSessionRefreshes;
+
+  const gptProDoctorStates = {};
+  context.renderGptProDoctor({ok: true, exit_code: 0, output: "doctor passed\n"});
+  gptProDoctorStates.passed = {
+    className: document.getElementById("gptpro-doctor-output").className,
+    text: document.getElementById("gptpro-doctor-output").textContent,
+    hidden: document.getElementById("gptpro-doctor-output").hidden,
+  };
+  context.renderGptProDoctor({ok: false, exit_code: 1, output: "doctor failed\n"});
+  gptProDoctorStates.failed = {
+    className: document.getElementById("gptpro-doctor-output").className,
+    text: document.getElementById("gptpro-doctor-output").textContent,
+    hidden: document.getElementById("gptpro-doctor-output").hidden,
+  };
+
   const requestSnapshot = JSON.stringify(requests);
   const domSnapshot = document.snapshot();
   const credentialLeak = [
@@ -425,6 +486,9 @@ async function main() {
       },
       cards,
       gptProSessionStates,
+      mcpInfoStates,
+      gptProLoginStates,
+      gptProDoctorStates,
       manual: {
         providerButtonPresent: document.getElementById("add-prov").innerHTML.includes(configuredName),
         modelInputAvailable: manualInputAvailable,

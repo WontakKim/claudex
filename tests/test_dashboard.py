@@ -218,12 +218,18 @@ def test_catalogless_provider_runtime_accepts_manual_model(
     }
 
 
-def test_gptpro_session_card_renders_states_and_polls_only_on_status(
+def test_gptpro_session_card_renders_states_and_polls_only_on_mcp(
     dashboard_runtime_result: dict[str, Any],
 ) -> None:
     states = dashboard_runtime_result["gptProSessionStates"]
+    card_index = DASHBOARD_HTML.index('id="gptpro-session-card"')
+    status_start = DASHBOARD_HTML.index('id="tab-status"')
+    status_end = DASHBOARD_HTML.index("</section>", status_start)
+    mcp_start = DASHBOARD_HTML.index('id="tab-mcp"')
+    mcp_end = DASHBOARD_HTML.index("</section>", mcp_start)
 
-    assert 'id="gptpro-session-card"' in DASHBOARD_HTML
+    assert mcp_start < card_index < mcp_end
+    assert not status_start < card_index < status_end
     assert states["valid"] == {
         "className": "stat okv",
         "text": "● VALID Expires in 8d 0h",
@@ -240,7 +246,82 @@ def test_gptpro_session_card_renders_states_and_polls_only_on_status(
     assert states["missing"]["text"].startswith("● NOT CONFIGURED ")
     assert 'jfetch("/admin/gptpro/session")' in DASHBOARD_JAVASCRIPT
     assert "setInterval(fetchGptProSession,60000)" in DASHBOARD_JAVASCRIPT
-    assert 'document.body.dataset.tab==="status"' in DASHBOARD_JAVASCRIPT
+    assert 'document.body.dataset.tab==="mcp"' in DASHBOARD_JAVASCRIPT
+
+
+def test_mcp_tab_assets_wire_admin_operations_and_polling() -> None:
+    assert '<a href="#mcp" data-t="mcp">MCP</a>' in DASHBOARD_HTML
+    assert (
+        'const TAB_NAMES=["settings","status","mcp","map","log"]'
+        in DASHBOARD_JAVASCRIPT
+    )
+    assert 'body[data-tab="mcp"] #tab-mcp' in DASHBOARD_CSS
+    assert 'jfetch("/admin/gptpro/mcp")' in DASHBOARD_JAVASCRIPT
+    assert 'jfetch("/admin/gptpro/login"' in DASHBOARD_JAVASCRIPT
+    assert "setInterval(pollGptProLogin,2000)" in DASHBOARD_JAVASCRIPT
+    assert "claude mcp add --transport http" in DASHBOARD_JAVASCRIPT
+
+
+def test_mcp_runtime_renders_connection_login_and_doctor(
+    dashboard_runtime_result: dict[str, Any],
+) -> None:
+    result = dashboard_runtime_result
+
+    assert result["mcpInfoStates"] == {
+        "open": {
+            "command": (
+                "claude mcp add --transport http claudex-gptpro "
+                "http://127.0.0.1:8787/mcp"
+            ),
+            "endpoint": "http://127.0.0.1:8787/mcp",
+            "authHintHidden": True,
+        },
+        "authenticated": {
+            "command": (
+                "claude mcp add --transport http claudex-gptpro "
+                "http://127.0.0.1:9000/mcp --header "
+                '"Authorization: Bearer <CLAUDEX_LOCAL_TOKEN>"'
+            ),
+            "endpoint": "http://127.0.0.1:9000/mcp",
+            "authHintHidden": False,
+        },
+    }
+    assert result["gptProLoginStates"] == {
+        "idle": {
+            "buttonText": "Sign in to ChatGPT",
+            "buttonDisabled": False,
+            "detail": "",
+            "polling": False,
+        },
+        "running": {
+            "buttonText": "Cancel login",
+            "buttonDisabled": False,
+            "detail": (
+                "sign in to ChatGPT in the opened browser "
+                "gptpro asks are unavailable while signing in."
+            ),
+            "polling": True,
+        },
+        "terminal": {
+            "buttonText": "Sign in to ChatGPT",
+            "buttonDisabled": False,
+            "detail": "saved and verified the gptpro session\n",
+            "polling": False,
+        },
+        "sessionRefreshes": 1,
+    }
+    assert result["gptProDoctorStates"] == {
+        "passed": {
+            "className": "codeblock okv",
+            "text": "doctor passed\n",
+            "hidden": False,
+        },
+        "failed": {
+            "className": "codeblock err",
+            "text": "doctor failed\n",
+            "hidden": False,
+        },
+    }
 
 
 def test_custom_provider_runtime_excludes_usage_and_credentials(
