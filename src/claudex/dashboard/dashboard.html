@@ -124,6 +124,7 @@
     <section id="tab-map">
       <div class="lockband"><b>LOCKED</b> — <code id="lock-env"></code> 환경변수가 우선합니다. 보드는 열람 전용입니다.</div>
       <div class="board" id="board">
+        <div class="wstatus"><span>ROUTER · VECTOR MODE</span></div>
         <svg id="wires"></svg>
         <div id="layer"></div>
         <button class="wdel" id="wdel">remove</button>
@@ -161,6 +162,7 @@
     <section id="tab-status">
       <div class="card">
         <div class="ucard-h">
+          <span class="deco" aria-hidden="true">┌─ </span>
           <h2>Claude Status</h2>
           <button class="urefresh" data-provider="claude">갱신</button>
         </div>
@@ -170,6 +172,7 @@
       </div>
       <div class="card">
         <div class="ucard-h">
+          <span class="deco" aria-hidden="true">┌─ </span>
           <h2>Codex Status</h2>
           <button class="urefresh" data-provider="codex">갱신</button>
         </div>
@@ -186,6 +189,7 @@
       </div>
       <div class="card provider-hidden" id="card-kimi">
         <div class="ucard-h">
+          <span class="deco" aria-hidden="true">┌─ </span>
           <h2>Kimi Status</h2>
           <button class="urefresh" data-provider="kimi">갱신</button>
         </div>
@@ -202,6 +206,7 @@
       </div>
       <div class="card provider-hidden" id="card-grok">
         <div class="ucard-h">
+          <span class="deco" aria-hidden="true">┌─ </span>
           <h2>Grok Status</h2>
           <button class="urefresh" data-provider="grok">갱신</button>
         </div>
@@ -221,10 +226,11 @@
     <!-- MCP tab -->
     <section id="tab-mcp">
       <div class="card" id="mcp-connect-card">
-        <h2>Connect Claude Code</h2>
+        <h2><span class="deco" aria-hidden="true">┌─ </span>Connect Claude Code</h2>
         <div class="sub">Register the gateway's GPT Pro tools with Claude Code.</div>
         <div class="stat">
           <div class="codeblock">
+            <span class="ps1" aria-hidden="true">$</span>
             <span class="tx" id="mcp-connect-command"></span>
             <button class="cp" id="mcp-connect-copy" title="Copy command" aria-label="Copy command"></button>
           </div>
@@ -240,6 +246,7 @@
       </div>
       <div class="card" id="gptpro-session-card">
         <div class="ucard-h">
+          <span class="deco" aria-hidden="true">┌─ </span>
           <h2>GPT Pro</h2>
           <div class="umeta" id="gptpro-session-updated">Last checked —</div>
         </div>
@@ -266,12 +273,12 @@
     <!-- Log tab -->
     <section id="tab-log">
       <div class="card">
-        <h2>Log Level</h2>
+        <h2><span class="deco" aria-hidden="true">┌─ </span>Log Level</h2>
         <div class="sub">게이트웨이 프로세스의 로그 출력 레벨입니다.</div>
         <div class="seg" id="loglevel"></div>
       </div>
       <div class="card">
-        <h2>Logs</h2>
+        <h2><span class="deco" aria-hidden="true">┌─ </span>Logs</h2>
         <div class="sub">게이트웨이 프로세스의 최근 로그입니다.</div>
         <div class="seg">
           <button id="log-refresh">갱신</button>
