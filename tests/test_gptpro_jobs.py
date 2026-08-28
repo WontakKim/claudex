@@ -1183,6 +1183,55 @@ def test_provider_failure_transitions_job_to_failed(
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("state", ["queued", "running", "detached"])
+def test_has_active_jobs_returns_true_for_active_states(
+    state: jobs.AskJobState,
+) -> None:
+    async def provider(question: str) -> ask.AskOutcome:
+        raise AssertionError(f"unexpected provider call: {question}")
+
+    service = jobs.AskJobService(provider)
+    service._jobs["ask-id"] = jobs.AskJob(
+        ask_id="ask-id",
+        state=state,
+        answer=None,
+        failure=None,
+        error_message=None,
+        status_message=None,
+        nonce_marker=None,
+        thread_ref=None,
+        created_at=1.0,
+        finished_at=None,
+    )
+
+    assert service.has_active_jobs() is True
+
+
+@pytest.mark.parametrize("state", [None, "succeeded", "failed"])
+def test_has_active_jobs_returns_false_without_active_states(
+    state: jobs.AskJobState | None,
+) -> None:
+    async def provider(question: str) -> ask.AskOutcome:
+        raise AssertionError(f"unexpected provider call: {question}")
+
+    service = jobs.AskJobService(provider)
+    if state is not None:
+        service._jobs["ask-id"] = jobs.AskJob(
+            ask_id="ask-id",
+            state=state,
+            answer=None,
+            failure=None,
+            error_message=None,
+            status_message=None,
+            nonce_marker=None,
+            thread_ref=None,
+            created_at=1.0,
+            finished_at=2.0,
+        )
+
+    assert service.has_active_jobs() is False
+
+
 def test_unknown_ask_id_has_no_status_or_result() -> None:
     async def provider(
         question: str,

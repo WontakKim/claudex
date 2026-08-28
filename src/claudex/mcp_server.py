@@ -170,6 +170,25 @@ class LazyAskRuntime:
             return None
         return self._job_service.result(ask_id)
 
+    def has_active_jobs(self) -> bool:
+        if self._job_service is None:
+            return False
+        return self._job_service.has_active_jobs()
+
+    async def release_runtime(self) -> None:
+        """Release the warm runtime while preserving the job registry.
+
+        Unlike `aclose()`, this leaves `_job_service` intact so existing job
+        status and result lookups remain available. The login child needs the
+        Chrome profile lock, so the daemon must first give up any warm ask
+        runtime that may own it.
+        """
+        async with self._lock:
+            runtime = self._runtime
+            self._runtime = None
+            if runtime is not None:
+                await runtime.aclose()
+
     async def aclose(self) -> None:
         async with self._lock:
             job_service = self._job_service

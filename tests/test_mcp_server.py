@@ -387,6 +387,86 @@ def test_lazy_runtime_forwards_detached_callback() -> None:
     asyncio.run(scenario())
 
 
+def test_lazy_runtime_has_active_jobs_delegates_to_job_service() -> None:
+    class JobServiceSpy:
+        def __init__(self, result: bool) -> None:
+            self.result = result
+            self.calls = 0
+
+        def has_active_jobs(self) -> bool:
+            self.calls += 1
+            return self.result
+
+    runtime = LazyAskRuntime()
+    assert runtime.has_active_jobs() is False
+
+    inactive_service = JobServiceSpy(False)
+    runtime._job_service = inactive_service
+    assert runtime.has_active_jobs() is False
+    assert inactive_service.calls == 1
+
+    active_service = JobServiceSpy(True)
+    runtime._job_service = active_service
+    assert runtime.has_active_jobs() is True
+    assert active_service.calls == 1
+
+
+def test_release_runtime_closes_warm_runtime_and_preserves_jobs() -> None:
+    class RuntimeSpy:
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        async def aclose(self) -> None:
+            self.close_calls += 1
+
+    async def provider(question: str) -> ask.AskOutcome:
+        raise AssertionError(f"unexpected provider call: {question}")
+
+    async def scenario() -> None:
+        lazy_runtime = LazyAskRuntime()
+        warm_runtime = RuntimeSpy()
+        job_service = jobs.AskJobService(provider)
+        snapshot = jobs.AskJob(
+            ask_id="preserved-id",
+            state="succeeded",
+            answer="answer",
+            failure=None,
+            error_message=None,
+            status_message=None,
+            nonce_marker="marker",
+            thread_ref=_CONVERSATION_A,
+            created_at=1.0,
+            finished_at=2.0,
+        )
+        job_service._jobs[snapshot.ask_id] = snapshot
+        lazy_runtime._runtime = warm_runtime
+        lazy_runtime._job_service = job_service
+
+        await lazy_runtime.release_runtime()
+
+        assert warm_runtime.close_calls == 1
+        assert lazy_runtime._runtime is None
+        assert lazy_runtime._job_service is job_service
+        assert lazy_runtime.job_status(snapshot.ask_id) == snapshot
+        assert lazy_runtime.job_result(snapshot.ask_id) == snapshot
+        await lazy_runtime.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_release_runtime_is_a_no_op_without_a_warm_runtime() -> None:
+    async def scenario() -> None:
+        lazy_runtime = LazyAskRuntime()
+
+        await lazy_runtime.release_runtime()
+        await lazy_runtime.release_runtime()
+
+        assert lazy_runtime._runtime is None
+        assert lazy_runtime._job_service is None
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize("state", ["queued", "detached"])
 def test_status_exposes_nonterminal_job_states(
     monkeypatch: pytest.MonkeyPatch,

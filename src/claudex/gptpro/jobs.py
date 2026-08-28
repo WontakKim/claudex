@@ -31,6 +31,7 @@ WATCHDOG_SAMPLE_LIMIT = 64
 WATCHDOG_MIN_SAMPLES = 5
 WATCHDOG_MARGIN_RATIO = 0.5
 WATCHDOG_MIN_BUDGET_SECONDS = 60.0
+ACTIVE_JOB_STATES = frozenset({"queued", "running", "detached"})
 
 AskJobState = Literal[
     "queued", "running", "detached", "succeeded", "failed"
@@ -246,6 +247,11 @@ class AskJobService:
 
     def result(self, ask_id: str) -> AskJob | None:
         return self._jobs.get(ask_id)
+
+    def has_active_jobs(self) -> bool:
+        return any(
+            job.state in ACTIVE_JOB_STATES for job in self._jobs.values()
+        )
 
     async def aclose(self) -> None:
         sweeper_task = self._sweeper_task
