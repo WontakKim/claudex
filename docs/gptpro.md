@@ -29,6 +29,9 @@ Check the saved session without contacting ChatGPT:
 uv run claudex-gateway gptpro status
 ```
 
+The dashboard Status tab also shows the session expiry and refreshes it once per
+minute while visible.
+
 Run `uv run --extra gptpro claudex-gateway gptpro doctor` to diagnose the
 saved session, Chrome profile and lock, and Playwright dependency.
 

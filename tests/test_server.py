@@ -385,6 +385,10 @@ def test_route_ownership_matches_surface_modules() -> None:
             "claudex.admin.system",
             "_handle_admin_logs",
         ),
+        ("/admin/gptpro/session", route_methods("GET")): (
+            "claudex.admin.system",
+            "_handle_admin_gptpro_session",
+        ),
         ("/admin/usage", route_methods("GET")): (
             "claudex.admin.system",
             "_handle_admin_usage",

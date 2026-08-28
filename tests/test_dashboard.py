@@ -218,6 +218,31 @@ def test_catalogless_provider_runtime_accepts_manual_model(
     }
 
 
+def test_gptpro_session_card_renders_states_and_polls_only_on_status(
+    dashboard_runtime_result: dict[str, Any],
+) -> None:
+    states = dashboard_runtime_result["gptProSessionStates"]
+
+    assert 'id="gptpro-session-card"' in DASHBOARD_HTML
+    assert states["valid"] == {
+        "className": "stat okv",
+        "text": "● VALID Expires in 8d 0h",
+        "title": "",
+    }
+    assert states["expiring"] == {
+        "className": "stat warn",
+        "text": "● EXPIRING SOON Expires in 7d 0h",
+        "title": "",
+    }
+    assert states["expired"]["className"] == "stat err"
+    assert "run claudex-gateway gptpro login" in states["expired"]["text"]
+    assert states["missing"]["className"] == "stat"
+    assert states["missing"]["text"].startswith("● NOT CONFIGURED ")
+    assert 'jfetch("/admin/gptpro/session")' in DASHBOARD_JAVASCRIPT
+    assert "setInterval(fetchGptProSession,60000)" in DASHBOARD_JAVASCRIPT
+    assert 'document.body.dataset.tab==="status"' in DASHBOARD_JAVASCRIPT
+
+
 def test_custom_provider_runtime_excludes_usage_and_credentials(
     dashboard_runtime_result: dict[str, Any],
 ) -> None:

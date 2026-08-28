@@ -8,7 +8,8 @@ import json
 import logging
 import time
 import uuid
-from typing import Any
+from pathlib import Path
+from typing import Any, cast
 
 import httpx
 from starlette.requests import Request
@@ -32,6 +33,7 @@ from claudex.providers.backends import (
 from claudex.providers.codex_auth import CodexAuthError
 from claudex.providers.codex_client import CodexUpstreamError
 from claudex.config import ConfigError, GatewayConfig, parse_route_target
+from claudex.gptpro import session as gptpro_session
 from claudex.providers.grok_auth import GrokAuthError
 from claudex.providers.grok_client import GrokUpstreamError
 from claudex.providers.kimi_auth import KimiAuthError
@@ -68,6 +70,37 @@ async def _handle_admin_logs(request: Request) -> JSONResponse:
         return denied
     log_buffer = request.app.state.log_buffer
     return JSONResponse({"logs": list(log_buffer.records)})
+
+
+async def _handle_admin_gptpro_session(request: Request) -> JSONResponse:
+    denied = _admin_guard(request)
+    if denied is not None:
+        return denied
+
+    status = gptpro_session.session_status()
+    path = cast(Path, status["path"])
+    expires_at: float | None = None
+    if status["has_auth_cookie"] is True:
+        try:
+            expires_at = gptpro_session.load_auth_cookie_expiry(path)
+        except gptpro_session.GptProSessionError:
+            # The optional session may be replaced between the status and expiry reads.
+            status = gptpro_session.session_status()
+            path = cast(Path, status["path"])
+
+    expires_in_seconds = (
+        max(0, int(expires_at - time.time()))
+        if expires_at is not None and expires_at > 0
+        else None
+    )
+    return JSONResponse(
+        {
+            **status,
+            "path": str(path),
+            "expires_at": expires_at,
+            "expires_in_seconds": expires_in_seconds,
+        }
+    )
 
 
 async def _handle_admin_usage(request: Request) -> JSONResponse:

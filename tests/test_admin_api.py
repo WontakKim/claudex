@@ -26,6 +26,7 @@ import claudex.server as server
 import claudex.server_support as server_support
 from claudex import compaction, paths
 from claudex.claude import accounts as claude_accounts
+from claudex.gptpro import session as gptpro_session
 from claudex.providers.codex_client import (
     CODEX_MODELS_URL,
     CODEX_RESPONSES_URL,
@@ -122,6 +123,7 @@ _ADMIN_FUNCTION_MANIFEST = {
     },
     "system": {
         "_handle_admin_logs",
+        "_handle_admin_gptpro_session",
         "_handle_admin_usage",
         "_handle_admin_codex_reset_credit",
         "_serve_dashboard_asset",
@@ -1988,6 +1990,99 @@ def test_admin_logs_returns_recent_records(monkeypatch: pytest.MonkeyPatch, tmp_
 def test_admin_logs_refuses_foreign_host(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
         assert client.get("/admin/logs").status_code == 403
+
+
+def _write_gptpro_session(path: Path, expires_at: float) -> None:
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        json.dumps(
+            {
+                "cookies": [
+                    {
+                        "name": gptpro_session.AUTH_COOKIE_PREFIX,
+                        "value": "session-token",
+                        "domain": ".chatgpt.com",
+                        "expires": expires_at,
+                    }
+                ],
+                "origins": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_admin_gptpro_session_reports_valid_session_expiry(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    now = 10_000_000.0
+    expires_at = now + 8 * 24 * 60 * 60
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(admin_system.time, "time", lambda: now)
+    path = paths.gptpro_session_file()
+    _write_gptpro_session(path, expires_at)
+
+    with _create_test_client(
+        monkeypatch, tmp_path, base_url="http://127.0.0.1:8787"
+    ) as client:
+        response = client.get("/admin/gptpro/session")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["path"] == str(path)
+    assert body["exists"] is True
+    assert body["has_auth_cookie"] is True
+    assert body["expired"] is False
+    assert body["valid"] is True
+    assert body["expires_at"] == expires_at
+    assert body["expires_in_seconds"] == 8 * 24 * 60 * 60
+
+
+def test_admin_gptpro_session_reports_expired_session(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    now = 10_000_000.0
+    expires_at = now - 60
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(admin_system.time, "time", lambda: now)
+    path = paths.gptpro_session_file()
+    _write_gptpro_session(path, expires_at)
+
+    with _create_test_client(
+        monkeypatch, tmp_path, base_url="http://127.0.0.1:8787"
+    ) as client:
+        response = client.get("/admin/gptpro/session")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["exists"] is True
+    assert body["has_auth_cookie"] is True
+    assert body["expired"] is True
+    assert body["valid"] is False
+    assert body["expires_at"] == expires_at
+    assert body["expires_in_seconds"] == 0
+
+
+def test_admin_gptpro_session_reports_missing_optional_session(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    path = paths.gptpro_session_file()
+
+    with _create_test_client(
+        monkeypatch, tmp_path, base_url="http://127.0.0.1:8787"
+    ) as client:
+        response = client.get("/admin/gptpro/session")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["path"] == str(path)
+    assert body["exists"] is False
+    assert body["has_auth_cookie"] is False
+    assert body["expired"] is None
+    assert body["valid"] is False
+    assert body["expires_at"] is None
+    assert body["expires_in_seconds"] is None
 
 
 def test_admin_usage_returns_all_providers(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

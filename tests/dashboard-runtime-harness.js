@@ -369,6 +369,28 @@ async function main() {
   await Promise.resolve();
   await Promise.resolve();
 
+  const gptProSessionStates = {};
+  context.renderGptProSession({
+    exists: true, has_auth_cookie: true, expired: false, valid: true,
+    expires_in_seconds: 8 * 24 * 60 * 60,
+  });
+  gptProSessionStates.valid = statusText(document, "gptpro-session");
+  context.renderGptProSession({
+    exists: true, has_auth_cookie: true, expired: false, valid: true,
+    expires_in_seconds: 7 * 24 * 60 * 60,
+  });
+  gptProSessionStates.expiring = statusText(document, "gptpro-session");
+  context.renderGptProSession({
+    exists: true, has_auth_cookie: true, expired: true, valid: false,
+    expires_in_seconds: 0,
+  });
+  gptProSessionStates.expired = statusText(document, "gptpro-session");
+  context.renderGptProSession({
+    exists: false, has_auth_cookie: false, expired: null, valid: false,
+    expires_in_seconds: null,
+  });
+  gptProSessionStates.missing = statusText(document, "gptpro-session");
+
   const requestSnapshot = JSON.stringify(requests);
   const domSnapshot = document.snapshot();
   const credentialLeak = [
@@ -402,6 +424,7 @@ async function main() {
         error: statusText(document, errorName),
       },
       cards,
+      gptProSessionStates,
       manual: {
         providerButtonPresent: document.getElementById("add-prov").innerHTML.includes(configuredName),
         modelInputAvailable: manualInputAvailable,

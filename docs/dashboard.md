@@ -8,8 +8,9 @@ Opening `http://127.0.0.1:8787/` uses the same guarded admin API as the CLI:
 
 - **Settings** contains the [compaction reroute](compaction.md#compaction-reroute),
   Codex Fast mode, Claude account routing, and registered-account management.
-- **Status** shows built-in login and subscription usage plus custom-provider
-  readiness. Kimi and Grok cards remain cosmetically hidden until a login or
+- **Status** shows built-in login and subscription usage, the saved gptpro
+  session's expiry with a once-per-minute refresh, and custom-provider readiness.
+  Kimi and Grok cards remain cosmetically hidden until a login or
   mapped route makes them relevant; this never affects routing or settings.
   Custom providers do not receive usage or billing cards.
 - **Log** reads `GET /admin/logs` and changes the persisted runtime log level

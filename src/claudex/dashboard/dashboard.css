@@ -48,6 +48,7 @@ body[data-tab="settings"] #tab-settings,body[data-tab="status"] #tab-status,body
    probe wrote into the same box survives. */
 .statline{flex-basis:100%;display:flex;align-items:center;gap:12px;flex-wrap:wrap}
 .stat.err{background:var(--err-soft);color:var(--err)}
+.stat.warn{background:var(--warn-soft);color:var(--warn)}
 .stat.okv{background:var(--ok-soft);color:var(--ok)}
 .stat .detail{font:400 13.5px var(--sans);color:var(--muted)}
 .stat .codeblock{flex-basis:100%;display:flex;align-items:center;gap:10px;background:color-mix(in srgb,var(--text) 8%,transparent);border-radius:6px;padding:8px 12px;font:400 13px var(--mono);color:var(--text);overflow-wrap:anywhere}

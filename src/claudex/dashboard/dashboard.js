@@ -620,6 +620,67 @@ function renderFacts(p){
   document.getElementById("kv-kimi-auth").textContent=p.kimi_code_home||"—";
   document.getElementById("kv-grok-home").textContent=p.grok_home||"—";
 }
+var GPTPRO_EXPIRY_WARNING_SECONDS=7*24*60*60;
+var GPTPRO_LOGIN_COMMAND="run claudex-gateway gptpro login";
+function fmtGptProRemaining(value){
+  var seconds=Math.max(0,Math.floor(value));
+  var days=Math.floor(seconds/86400);
+  var hours=Math.floor(seconds%86400/3600);
+  var minutes=Math.floor(seconds%3600/60);
+  if(days)return days+"d "+hours+"h";
+  if(hours)return hours+"h "+minutes+"m";
+  if(minutes)return minutes+"m";
+  return seconds+"s";
+}
+function gptProLoginHint(){
+  return '<div class="codeblock"><span class="tx">$ '+GPTPRO_LOGIN_COMMAND+"</span></div>";
+}
+function setGptProSessionState(state,label,detail,showLogin){
+  var box=document.getElementById("gptpro-session-stat");
+  box.className="stat"+(state?" "+state:"");
+  document.getElementById("gptpro-session-statline").innerHTML=
+    "● <b>"+label+'</b> <span class="detail">'+esc(detail)+"</span>"+
+    (showLogin?gptProLoginHint():"");
+  document.getElementById("gptpro-session-updated").textContent=
+    "Last checked "+fmtLogTs(Date.now()/1000);
+}
+function renderGptProSession(data){
+  var remaining=typeof data.expires_in_seconds==="number"?data.expires_in_seconds:null;
+  if(data.valid===true){
+    if(remaining===null){
+      setGptProSessionState("okv","VALID","No fixed expiry reported",false);
+      return;
+    }
+    var isExpiringSoon=remaining<=GPTPRO_EXPIRY_WARNING_SECONDS;
+    setGptProSessionState(isExpiringSoon?"warn":"okv",
+      isExpiringSoon?"EXPIRING SOON":"VALID",
+      "Expires in "+fmtGptProRemaining(remaining),false);
+    return;
+  }
+  if(data.expired===true){
+    setGptProSessionState("err","EXPIRED","Sign in again before the next gptpro ask",true);
+  }else if(data.exists===true){
+    setGptProSessionState("err","INVALID","The saved session has no usable authentication cookie",true);
+  }else{
+    setGptProSessionState("","NOT CONFIGURED","No saved GPT Pro session was found",true);
+  }
+}
+function renderGptProSessionError(detail){
+  setGptProSessionState("err","UNAVAILABLE",detail,false);
+}
+function fetchGptProSession(){
+  jfetch("/admin/gptpro/session").then(function(r){
+    if(r.ok)renderGptProSession(r.body);
+    else renderGptProSessionError(errDetail(r.body));
+  }).catch(function(){renderGptProSessionError("Gateway unreachable")});
+}
+var gptProSessionTimer=null;
+/* The optional session changes slowly, so poll only while Status is visible. */
+function syncGptProSessionTimer(){
+  var active=document.body.dataset.tab==="status";
+  if(active&&!gptProSessionTimer)gptProSessionTimer=setInterval(fetchGptProSession,60000);
+  if(!active&&gptProSessionTimer){clearInterval(gptProSessionTimer);gptProSessionTimer=null}
+}
 function renderLogLevel(p){
   var box=document.getElementById("loglevel");
   var locked=!!p.env_locked;
@@ -1630,9 +1691,10 @@ function setTab(t){
     if(cat==="accounts")fetchAccounts();
   }else if(location.hash!=="#"+t){history.replaceState(null,"","#"+t)}
   if(t==="map"){drawWires();if(mapNeedsFit){mapNeedsFit=false;fitView()}}
-  if(t==="status")fetchUsage();
+  if(t==="status"){fetchUsage();fetchGptProSession()}
   if(t==="log")fetchLogs();
   syncLogTimer();
+  syncGptProSessionTimer();
 }
 const TAB_NAMES=["settings","status","map","log"];
 /* === Subscription usage in Status provider cards ========================= */
