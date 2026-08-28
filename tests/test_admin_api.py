@@ -128,8 +128,11 @@ _ADMIN_FUNCTION_MANIFEST = {
         "_handle_admin_gptpro_login_get",
         "_handle_admin_gptpro_login_post",
         "_handle_admin_gptpro_login_delete",
+        "_gptpro_mcp_endpoint",
+        "_build_gptpro_connect_command",
         "_handle_admin_gptpro_doctor",
         "_handle_admin_gptpro_mcp",
+        "_handle_admin_gptpro_connect",
         "_handle_admin_usage",
         "_handle_admin_codex_reset_credit",
         "_serve_dashboard_asset",
@@ -168,6 +171,7 @@ _ADMIN_CONSTANT_MANIFEST = {
     "system": {
         "_STATUS_TO_OPENAI_ERROR_TYPE",
         "_GPTPRO_DOCTOR_TIMEOUT",
+        "_GPTPRO_CONNECT_TIMEOUT",
         "_GPTPRO_DOCTOR_COMMAND",
         "_FAVICON_SVG",
         "_CONNECTION_TEST_TIMEOUT",
@@ -2133,6 +2137,19 @@ class FakeAdminGptProRuntime:
         self.released = True
 
 
+class FakeAdminSubprocess:
+    def __init__(self, *, exit_code: int, output: str) -> None:
+        self.returncode = exit_code
+        self.pid = 12345
+        self._output = output.encode("utf-8")
+
+    async def communicate(self) -> tuple[bytes, None]:
+        return self._output, None
+
+    def kill(self) -> None:
+        pass
+
+
 class TestAdminGptProApi:
     @staticmethod
     def _client(
@@ -2148,6 +2165,28 @@ class TestAdminGptProApi:
             config=config,
             base_url=base_url,
         )
+
+    @staticmethod
+    def _mock_connect_process(
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        exit_code: int = 0,
+        output: str = "MCP server claudex-gptpro added\n",
+    ) -> list[tuple[str, ...]]:
+        commands: list[tuple[str, ...]] = []
+
+        async def fake_create_subprocess_exec(
+            *command: str, **_kwargs: Any
+        ) -> FakeAdminSubprocess:
+            commands.append(command)
+            return FakeAdminSubprocess(exit_code=exit_code, output=output)
+
+        monkeypatch.setattr(
+            admin_system.asyncio,
+            "create_subprocess_exec",
+            fake_create_subprocess_exec,
+        )
+        return commands
 
     def test_mcp_reports_default_endpoint(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -2189,6 +2228,119 @@ class TestAdminGptProApi:
             "endpoint": "http://127.0.0.1:8787/mcp",
             "auth_required": True,
         }
+
+    def test_connect_builds_user_scope_command_without_auth_header(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        commands = self._mock_connect_process(monkeypatch)
+
+        with self._client(monkeypatch, tmp_path) as client:
+            response = client.post("/admin/gptpro/connect", json={})
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "ok": True,
+            "exit_code": 0,
+            "output": "MCP server claudex-gptpro added\n",
+        }
+        assert commands == [
+            (
+                "claude",
+                "mcp",
+                "add",
+                "--transport",
+                "http",
+                "-s",
+                "user",
+                "claudex-gptpro",
+                "http://127.0.0.1:8787/mcp",
+            )
+        ]
+
+    def test_connect_includes_local_bearer_header_without_exposing_token(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        token = "secret-token"
+        commands = self._mock_connect_process(monkeypatch)
+        config = GatewayConfig(local_token=token)
+
+        with self._client(monkeypatch, tmp_path, config=config) as client:
+            response = client.post(
+                "/admin/gptpro/connect",
+                json={},
+                headers={"authorization": f"Bearer {token}"},
+            )
+
+        assert response.status_code == 200
+        assert commands == [
+            (
+                "claude",
+                "mcp",
+                "add",
+                "--transport",
+                "http",
+                "-s",
+                "user",
+                "claudex-gptpro",
+                "http://127.0.0.1:8787/mcp",
+                "--header",
+                f"Authorization: Bearer {token}",
+            )
+        ]
+        assert token not in response.json()["output"]
+
+    def test_connect_reports_cli_failure(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        self._mock_connect_process(
+            monkeypatch, exit_code=1, output="MCP server registration failed\n"
+        )
+
+        with self._client(monkeypatch, tmp_path) as client:
+            response = client.post("/admin/gptpro/connect", json={})
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "ok": False,
+            "exit_code": 1,
+            "output": "MCP server registration failed\n",
+        }
+
+    def test_connect_reports_missing_cli_with_install_hint(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        async def missing_cli(
+            *_command: str, **_kwargs: Any
+        ) -> FakeAdminSubprocess:
+            raise FileNotFoundError("claude")
+
+        monkeypatch.setattr(
+            admin_system.asyncio, "create_subprocess_exec", missing_cli
+        )
+        with self._client(monkeypatch, tmp_path) as client:
+            response = client.post("/admin/gptpro/connect", json={})
+
+        assert response.status_code == 200
+        assert response.json()["ok"] is False
+        assert response.json()["exit_code"] is None
+        assert response.json()["output"].startswith("connect failed to run:")
+        assert "install the Claude Code CLI" in response.json()["output"]
+
+    def test_connect_rejects_non_empty_body(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        with self._client(monkeypatch, tmp_path) as client:
+            response = client.post("/admin/gptpro/connect", json={"scope": "local"})
+
+        assert response.status_code == 400
+
+    def test_connect_requires_json_content_type(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        with self._client(monkeypatch, tmp_path) as client:
+            response = client.post("/admin/gptpro/connect", content=b"{}")
+
+        assert response.status_code == 415
 
     def test_login_post_starts_session_after_releasing_runtime(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path

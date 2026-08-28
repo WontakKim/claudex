@@ -64,6 +64,7 @@ _GPTPRO_DOCTOR_COMMAND: tuple[str, ...] = (
     "doctor",
 )
 _GPTPRO_DOCTOR_TIMEOUT = 30.0
+_GPTPRO_CONNECT_TIMEOUT = 30.0
 
 
 _STATUS_TO_OPENAI_ERROR_TYPE = {
@@ -204,6 +205,34 @@ async def _handle_admin_gptpro_login_delete(request: Request) -> JSONResponse:
     return JSONResponse({"status": "cancelling"})
 
 
+def _gptpro_mcp_endpoint(config: GatewayConfig) -> str:
+    host = "127.0.0.1" if config.host in {"0.0.0.0", "::"} else config.host
+    try:
+        endpoint_host = f"[{host}]" if ipaddress.ip_address(host).version == 6 else host
+    except ValueError:
+        endpoint_host = host
+    return f"http://{endpoint_host}:{config.port}/mcp"
+
+
+def _build_gptpro_connect_command(
+    endpoint: str, token: str | None
+) -> tuple[str, ...]:
+    command = (
+        "claude",
+        "mcp",
+        "add",
+        "--transport",
+        "http",
+        "-s",
+        "user",
+        "claudex-gptpro",
+        endpoint,
+    )
+    if token is not None:
+        command += ("--header", f"Authorization: Bearer {token}")
+    return command
+
+
 async def _handle_admin_gptpro_doctor(request: Request) -> JSONResponse:
     denied = _admin_guard(request)
     if denied is not None:
@@ -277,15 +306,82 @@ async def _handle_admin_gptpro_mcp(request: Request) -> JSONResponse:
         return denied
 
     config: GatewayConfig = request.app.state.config
-    host = "127.0.0.1" if config.host in {"0.0.0.0", "::"} else config.host
-    try:
-        endpoint_host = f"[{host}]" if ipaddress.ip_address(host).version == 6 else host
-    except ValueError:
-        endpoint_host = host
     return JSONResponse(
         {
-            "endpoint": f"http://{endpoint_host}:{config.port}/mcp",
+            "endpoint": _gptpro_mcp_endpoint(config),
             "auth_required": config.local_token is not None,
+        }
+    )
+
+
+async def _handle_admin_gptpro_connect(request: Request) -> JSONResponse:
+    denied = _admin_guard(request)
+    if denied is not None:
+        return denied
+    denied = _require_json_content_type(request)
+    if denied is not None:
+        return denied
+
+    body, error = await _read_json_object(request, server_support._openai_error_body)
+    if error is not None or body is None:
+        return error
+    if body:
+        return JSONResponse(
+            server_support._openai_error_body(
+                "invalid_request_error",
+                f"unexpected keys: {', '.join(sorted(body))}; POST an empty JSON object",
+            ),
+            status_code=400,
+        )
+
+    config: GatewayConfig = request.app.state.config
+    command = _build_gptpro_connect_command(
+        _gptpro_mcp_endpoint(config), config.local_token
+    )
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            start_new_session=True,
+        )
+    except OSError as exc:
+        return JSONResponse(
+            {
+                "ok": False,
+                "exit_code": None,
+                "output": f"connect failed to run: {exc}; install the Claude Code CLI "
+                "and ensure `claude` is on PATH",
+            }
+        )
+
+    try:
+        stdout, _stderr = await asyncio.wait_for(
+            process.communicate(), _GPTPRO_CONNECT_TIMEOUT
+        )
+    except TimeoutError:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except PermissionError:
+            process.kill()
+        await process.communicate()
+        return JSONResponse(
+            {
+                "ok": False,
+                "exit_code": None,
+                "output": "connect failed to run: "
+                f"timed out after {_GPTPRO_CONNECT_TIMEOUT:g}s",
+            }
+        )
+
+    output = stdout.decode("utf-8", errors="replace")
+    return JSONResponse(
+        {
+            "ok": process.returncode == 0,
+            "exit_code": process.returncode,
+            "output": output,
         }
     )
 

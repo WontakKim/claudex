@@ -409,6 +409,10 @@ def test_route_ownership_matches_surface_modules() -> None:
             "claudex.admin.system",
             "_handle_admin_gptpro_mcp",
         ),
+        ("/admin/gptpro/connect", route_methods("POST")): (
+            "claudex.admin.system",
+            "_handle_admin_gptpro_connect",
+        ),
         ("/admin/usage", route_methods("GET")): (
             "claudex.admin.system",
             "_handle_admin_usage",

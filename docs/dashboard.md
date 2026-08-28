@@ -31,10 +31,11 @@ The MCP tab contains three cards:
   per minute while the tab is visible. It can start, monitor, and cancel an
   interactive ChatGPT sign-in. On a machine without a graphical browser, run
   `claudex-gateway gptpro login` from a terminal instead.
-- **Connect Claude Code** shows the local MCP endpoint and a copyable
-  `claude mcp add --transport http` command. When local authentication is
-  enabled, the command includes an authorization-header placeholder that must
-  be replaced with the configured `CLAUDEX_LOCAL_TOKEN`.
+- **Connect Claude Code** registers the local MCP endpoint in the user scope
+  with one click by running `claude mcp add` on the gateway host. When local
+  authentication is enabled, registration stores the configured local token as
+  a bearer header in Claude Code's MCP settings. A copyable user-scope command
+  remains available as a manual fallback.
 - **GPT Pro Doctor** runs the server-side diagnostic and displays its output.
 
 The tab uses these guarded admin API operations:
@@ -45,6 +46,7 @@ The tab uses these guarded admin API operations:
 - `DELETE /admin/gptpro/login` cancels an active login or clears a completed one.
 - `POST /admin/gptpro/doctor` runs the diagnostic.
 - `GET /admin/gptpro/mcp` returns the endpoint and authentication requirement.
+- `POST /admin/gptpro/connect` runs the user-scope Claude Code MCP registration.
 
 A login temporarily owns the shared browser profile. GPT Pro asks are
 unavailable while sign-in is starting, running, or being cancelled.

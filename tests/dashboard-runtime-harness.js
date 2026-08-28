@@ -411,6 +411,20 @@ async function main() {
     authHintHidden: document.getElementById("mcp-auth-hint").hidden,
   };
 
+  const mcpConnectStates = {};
+  context.renderMcpConnect({ok: true, exit_code: 0, output: "added\n"});
+  mcpConnectStates.passed = {
+    className: document.getElementById("mcp-connect-result").className,
+    text: document.getElementById("mcp-connect-result").textContent,
+    hidden: document.getElementById("mcp-connect-result").hidden,
+  };
+  context.renderMcpConnect({ok: false, exit_code: 1, output: "registration failed\n"});
+  mcpConnectStates.failed = {
+    className: document.getElementById("mcp-connect-result").className,
+    text: document.getElementById("mcp-connect-result").textContent,
+    hidden: document.getElementById("mcp-connect-result").hidden,
+  };
+
   let gptProSessionRefreshes = 0;
   context.fetchGptProSession = () => { gptProSessionRefreshes += 1; };
   const gptProLoginStates = {};
@@ -487,6 +501,7 @@ async function main() {
       cards,
       gptProSessionStates,
       mcpInfoStates,
+      mcpConnectStates,
       gptProLoginStates,
       gptProDoctorStates,
       manual: {

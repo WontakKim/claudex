@@ -684,7 +684,7 @@ function syncGptProSessionTimer(){
 var mcpCopyWired=false;
 function renderMcpInfo(data){
   var endpoint=String(data.endpoint||"");
-  var command="claude mcp add --transport http claudex-gptpro "+endpoint;
+  var command="claude mcp add --transport http -s user claudex-gptpro "+endpoint;
   if(data.auth_required)command+=' --header "Authorization: Bearer <CLAUDEX_LOCAL_TOKEN>"';
   document.getElementById("mcp-connect-command").textContent=command;
   document.getElementById("mcp-endpoint").textContent=endpoint||"—";
@@ -704,6 +704,34 @@ function fetchMcpInfo(){
     document.getElementById("mcp-endpoint").textContent="Unavailable";
     showToast('<span class="chip chip-err">ERROR</span><br>GPT Pro MCP connection'+
       '<br><span class="dim">gateway unreachable</span>',true);
+  });
+}
+function renderMcpConnect(data){
+  var result=document.getElementById("mcp-connect-result");
+  result.hidden=false;
+  result.className="codeblock "+(data.ok?"okv":"err");
+  result.textContent=data.ok
+    ?"Claude Code MCP registered successfully. Please restart Claude Code sessions to load it."
+    :String(data.output||"Claude Code MCP registration failed with no output.");
+}
+function connectClaudeCode(){
+  var button=document.getElementById("mcp-connect-btn");
+  if(button.disabled)return;
+  setButtonBusy(button);
+  jfetch("/admin/gptpro/connect",{
+    method:"POST",headers:JSON_HEADERS,body:"{}"
+  }).then(function(r){
+    if(r.ok){renderMcpConnect(r.body);return}
+    var detail=errDetail(r.body);
+    renderMcpConnect({ok:false,output:detail});
+    showToast('<span class="chip chip-err">ERROR</span><span class="lat">'+r.status+
+      '</span><br>Claude Code MCP registration<br><span class="dim">'+esc(detail)+"</span>",true);
+  }).catch(function(){
+    renderMcpConnect({ok:false,output:"Gateway unreachable"});
+    showToast('<span class="chip chip-err">ERROR</span><br>Claude Code MCP registration'+
+      '<br><span class="dim">gateway unreachable</span>',true);
+  }).finally(function(){
+    button.disabled=false;button.textContent="Add to Claude Code";
   });
 }
 var gptProLoginTimer=null,loginPolling=false;
@@ -2043,6 +2071,7 @@ document.getElementById("log-live").addEventListener("click",function(){
 document.getElementById("gptpro-login-btn").addEventListener("click",function(){
   if(loginPolling)cancelGptProLogin();else startGptProLogin();
 });
+document.getElementById("mcp-connect-btn").addEventListener("click",connectClaudeCode);
 document.getElementById("gptpro-doctor-btn").addEventListener("click",runGptProDoctor);
 document.querySelectorAll("nav.tabs a").forEach(function(a){
   a.addEventListener("click",function(ev){ev.preventDefault();setTab(this.dataset.t)});

@@ -257,6 +257,11 @@ def test_mcp_tab_assets_wire_admin_operations_and_polling() -> None:
     )
     assert 'body[data-tab="mcp"] #tab-mcp' in DASHBOARD_CSS
     assert 'jfetch("/admin/gptpro/mcp")' in DASHBOARD_JAVASCRIPT
+    assert 'id="mcp-connect-btn"' in DASHBOARD_HTML
+    assert 'id="mcp-connect-copy"' in DASHBOARD_HTML
+    assert 'id="mcp-connect-result"' in DASHBOARD_HTML
+    assert "function connectClaudeCode(){" in DASHBOARD_JAVASCRIPT
+    assert 'jfetch("/admin/gptpro/connect"' in DASHBOARD_JAVASCRIPT
     assert 'jfetch("/admin/gptpro/login"' in DASHBOARD_JAVASCRIPT
     assert "setInterval(pollGptProLogin,2000)" in DASHBOARD_JAVASCRIPT
     assert "claude mcp add --transport http" in DASHBOARD_JAVASCRIPT
@@ -270,7 +275,7 @@ def test_mcp_runtime_renders_connection_login_and_doctor(
     assert result["mcpInfoStates"] == {
         "open": {
             "command": (
-                "claude mcp add --transport http claudex-gptpro "
+                "claude mcp add --transport http -s user claudex-gptpro "
                 "http://127.0.0.1:8787/mcp"
             ),
             "endpoint": "http://127.0.0.1:8787/mcp",
@@ -278,12 +283,27 @@ def test_mcp_runtime_renders_connection_login_and_doctor(
         },
         "authenticated": {
             "command": (
-                "claude mcp add --transport http claudex-gptpro "
+                "claude mcp add --transport http -s user claudex-gptpro "
                 "http://127.0.0.1:9000/mcp --header "
                 '"Authorization: Bearer <CLAUDEX_LOCAL_TOKEN>"'
             ),
             "endpoint": "http://127.0.0.1:9000/mcp",
             "authHintHidden": False,
+        },
+    }
+    assert result["mcpConnectStates"] == {
+        "passed": {
+            "className": "codeblock okv",
+            "text": (
+                "Claude Code MCP registered successfully. "
+                "Please restart Claude Code sessions to load it."
+            ),
+            "hidden": False,
+        },
+        "failed": {
+            "className": "codeblock err",
+            "text": "registration failed\n",
+            "hidden": False,
         },
     }
     assert result["gptProLoginStates"] == {
