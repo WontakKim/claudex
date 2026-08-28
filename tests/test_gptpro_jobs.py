@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from claudex.gptpro import ask, jobs
+from claudex.gptpro.jobs import service as jobs_service
 
 
 async def _wait_for_state(
@@ -145,7 +146,7 @@ def test_queue_wait_log_is_emitted_once_when_status_repeats(
         released = asyncio.Event()
         released.set()
         service._conversation_owners[conversation_id] = (
-            jobs._ConversationOwnership("owner", released)
+            jobs_service._ConversationOwnership("owner", released)
         )
         started_job = service.start(
             "question", conversation_id=conversation_id
@@ -1192,7 +1193,7 @@ def test_oversized_question_spills_to_temporary_attachment_and_cleans_up(
     monkeypatch: pytest.MonkeyPatch,
     should_fail: bool,
 ) -> None:
-    monkeypatch.setattr(jobs, "QUESTION_SPILL_THRESHOLD_BYTES", 8)
+    monkeypatch.setattr(jobs_service, "QUESTION_SPILL_THRESHOLD_BYTES", 8)
     provider_started = asyncio.Event()
     release_provider = asyncio.Event()
     captured_questions: list[str] = []
@@ -1249,7 +1250,7 @@ def test_oversized_question_spills_to_temporary_attachment_and_cleans_up(
 def test_question_at_spill_threshold_is_sent_inline(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(jobs, "QUESTION_SPILL_THRESHOLD_BYTES", 10)
+    monkeypatch.setattr(jobs_service, "QUESTION_SPILL_THRESHOLD_BYTES", 10)
     captured_questions: list[str] = []
     captured_attachment_paths: list[Sequence[str] | None] = []
 

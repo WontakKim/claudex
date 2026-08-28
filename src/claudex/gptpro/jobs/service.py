@@ -1,65 +1,31 @@
-"""In-memory lifecycle registry for background ChatGPT Pro asks.
-
-Job and thread registries live only for the process lifetime. A daemon restart
-loses pending jobs and session thread bindings, while callers retain thread_ref
-values to revisit conversations.
-"""
-
-from __future__ import annotations
+"""Lifecycle, queue, and ownership service for background gptpro asks."""
 
 import asyncio
 import inspect
 import logging
 import tempfile
 import time
-from collections import deque
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
-from statistics import quantiles
-from typing import Any, Literal, Protocol
+from typing import Any, Protocol
 from uuid import uuid4
 
 from claudex.gptpro import ask as ask_module
 from claudex.gptpro.ask import AskOutcome, GptProAskError
 
-logger = logging.getLogger(__name__)
+from .models import AskJob, TurnFinished
+from .watchdog import AnswerWatchdog
+
+# Keep the historical logger name so operator greps for these lifecycle
+# lines keep matching after the module split.
+logger = logging.getLogger("claudex.gptpro.jobs")
 
 JOB_RETENTION_SECONDS = 24.0 * 60 * 60
 SWEEP_INTERVAL_SECONDS = 300.0
-THREAD_BINDING_TTL_SECONDS = 23 * 60 * 60
 QUEUE_TTL_SECONDS = 900.0
 QUESTION_SPILL_THRESHOLD_BYTES = 35_000
-WATCHDOG_SAMPLE_LIMIT = 64
-WATCHDOG_MIN_SAMPLES = 5
-WATCHDOG_MARGIN_RATIO = 0.5
-WATCHDOG_MIN_BUDGET_SECONDS = 60.0
 ACTIVE_JOB_STATES = frozenset({"queued", "running", "detached"})
-
-AskJobState = Literal[
-    "queued", "running", "detached", "succeeded", "failed"
-]
-
-
-@dataclass(frozen=True)
-class AskJob:
-    ask_id: str
-    state: AskJobState
-    answer: str | None
-    failure: str | None
-    error_message: str | None
-    status_message: str | None
-    nonce_marker: str | None
-    thread_ref: str | None
-    created_at: float
-    finished_at: float | None
-
-
-@dataclass(frozen=True)
-class TurnFinished:
-    ask_id: str
-    thread_ref: str | None
-    answer: str
 
 
 @dataclass(frozen=True)
@@ -81,63 +47,6 @@ class _AskCallable(Protocol):
         timeout_seconds: float | None = None,
         attachment_paths: Sequence[str] | None = None,
     ) -> Awaitable[AskOutcome]: ...
-
-
-class AnswerWatchdog:
-    """Derive execution budgets from recent successful answer durations."""
-
-    def __init__(
-        self,
-        initial_budget_seconds: float,
-        clock: Callable[[], float] = time.monotonic,
-    ) -> None:
-        self._initial_budget_seconds = initial_budget_seconds
-        self._clock = clock
-        self._samples: deque[float] = deque(maxlen=WATCHDOG_SAMPLE_LIMIT)
-
-    def record(self, duration_seconds: float) -> None:
-        if duration_seconds < 0:
-            return
-        self._samples.append(duration_seconds)
-
-    def execution_budget_seconds(self) -> float:
-        if len(self._samples) < WATCHDOG_MIN_SAMPLES:
-            return self._initial_budget_seconds
-
-        p95_seconds = quantiles(
-            self._samples, n=100, method="inclusive"
-        )[94]
-        measured_budget_seconds = p95_seconds * (1 + WATCHDOG_MARGIN_RATIO)
-        # Durations above the operational default indicate a slower system.
-        # Operators must raise that ceiling explicitly through the env override.
-        return min(
-            self._initial_budget_seconds,
-            max(WATCHDOG_MIN_BUDGET_SECONDS, measured_budget_seconds),
-        )
-
-
-class ThreadRegistry:
-    """Retain MCP session bindings to ChatGPT conversation threads."""
-
-    def __init__(
-        self, *, clock: Callable[[], float] = time.monotonic
-    ) -> None:
-        self._clock = clock
-        self._bindings: dict[str, tuple[str, float]] = {}
-
-    def bind(self, session_id: str, thread_ref: str) -> None:
-        expires_at = self._clock() + THREAD_BINDING_TTL_SECONDS
-        self._bindings[session_id] = (thread_ref, expires_at)
-
-    def lookup(self, session_id: str) -> str | None:
-        binding = self._bindings.get(session_id)
-        if binding is None:
-            return None
-        thread_ref, expires_at = binding
-        if expires_at <= self._clock():
-            del self._bindings[session_id]
-            return None
-        return thread_ref
 
 
 class AskJobService:
