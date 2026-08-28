@@ -48,6 +48,7 @@ ANTHROPIC_BASE_URL=http://127.0.0.1:8787 claude
 
 - [Getting started](docs/getting-started.md)
 - [Providers](docs/providers.md)
+- [GPT Pro](docs/gptpro.md)
 - [Claude accounts](docs/claude-accounts.md)
 - [Custom providers](docs/custom-providers.md)
 - [Configuration](docs/configuration.md)
