@@ -56,35 +56,38 @@ from claudex.gptpro.selectors import (
     VISIBLE_MODAL_PROBE_JS,
 )
 
+# Watchdog bound from ask submission.
+# Long-running workloads raise it via GPTPRO_OVERALL_TIMEOUT_SECONDS.
+OVERALL_TIMEOUT_SECONDS = 900.0
+HEARTBEAT_INTERVAL_SECONDS = 30.0
+
 AUTH_PATH_FRAGMENT = "/auth/login"
 BACKEND_API_PATH_FRAGMENT = "/backend-api/"
+CHALLENGE_PROBE_TIMEOUT_SECONDS = 5.0
 
 # Browser navigation and composer budgets come from gptpro.browser.
 COMPOSER_SLICE_SECONDS = 2.0
-CHALLENGE_PROBE_TIMEOUT_SECONDS = 5.0
 SEND_READY_TIMEOUT_SECONDS = 30.0
+PRE_SUBMIT_STABILITY_TIMEOUT_SECONDS = 10.0
+PRE_SUBMIT_POLL_INTERVAL_SECONDS = 0.2
+PRE_SUBMIT_STABLE_TICKS = 3
+MODAL_SETTLE_SECONDS = 1.0
+
 ECHO_PROBE_TIMEOUT_SECONDS = 15.0
 ECHO_RENDER_TIMEOUT_SECONDS = 300.0
+ANCHOR_LOST_TIMEOUT_SECONDS = 60.0
+RECOVERY_SETTLE_SECONDS = 15.0
+RECOVERY_OBSERVE_SECONDS = 8.0
+RELOCK_POLL_INTERVAL_SECONDS = 0.5
+
 POLL_INTERVAL_SECONDS = 0.120
 STABLE_POLLS_REQUIRED = 3
 API_FETCH_TIMEOUT_MS = 15_000
 API_TURN_ATTEMPTS = 3
 API_TURN_RETRY_SECONDS = 3.0
 PAGE_FETCH_TRANSIENT_BACKOFF_SECONDS = (1.0, 2.0)
-IDLE_GRACE_SECONDS = 300.0
-# Watchdog bound from ask submission.
-# Long-running workloads raise it via GPTPRO_OVERALL_TIMEOUT_SECONDS.
-OVERALL_TIMEOUT_SECONDS = 900.0
-HEARTBEAT_INTERVAL_SECONDS = 30.0
-ANCHOR_LOST_TIMEOUT_SECONDS = 60.0
-RECOVERY_SETTLE_SECONDS = 15.0
-RECOVERY_OBSERVE_SECONDS = 8.0
-PRE_SUBMIT_STABILITY_TIMEOUT_SECONDS = 10.0
-PRE_SUBMIT_POLL_INTERVAL_SECONDS = 0.2
-PRE_SUBMIT_STABLE_TICKS = 3
-MODAL_SETTLE_SECONDS = 1.0
-RELOCK_POLL_INTERVAL_SECONDS = 0.5
 PAGE_FETCH_NAVIGATION_RETRIES = 2
+IDLE_GRACE_SECONDS = 300.0
 
 FailureClassification = Literal[
     "session_expired",
@@ -233,6 +236,19 @@ def _string_headers(value: object) -> dict[str, str]:
 
 
 class _AskExecution:
+    """Drive one ask through its linear execution pipeline.
+
+    The pipeline runs listeners, deadline setup, navigation and authentication,
+    composer fill with attachments, pre-submit stability, send, nonce echo lock,
+    completion monitoring, and classification. Methods group callback emission
+    (`_status` and `_notify_*`), deadline/time helpers, network listeners and
+    retry classification, navigation/challenge checks, the submit sequence,
+    nonce echo locking with anchor recovery, and backend turn polling.
+    Raw-server-markdown answers, the nonce-anchored turn, network-first
+    completion, and retry/failure classification are frozen behavior contracts.
+    Callers rely on them, so behavioral changes require live verification.
+    """
+
     def __init__(
         self,
         page: Any,
