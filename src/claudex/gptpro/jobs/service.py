@@ -217,6 +217,13 @@ class AskJobService:
                             "the queue TTL expired while waiting for the "
                             "in-flight ask on this conversation",
                         ) from exc
+                    # wait_for on an already-released event returns without
+                    # yielding to the event loop (Python 3.12+ awaits the
+                    # wait() coroutine inline instead of wrapping it in a
+                    # task), which would spin this re-check loop hot and
+                    # starve the loop. Yield each round so ownership changes
+                    # and the queue TTL check stay observable.
+                    await asyncio.sleep(0)
                 self._conversation_owners[conversation_id] = (
                     _ConversationOwnership(ask_id, asyncio.Event())
                 )
