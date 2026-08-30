@@ -118,8 +118,10 @@ jobs:
       - name: Test
         if: steps.resolve.outputs.skip != 'true'
         run: |
-          uv sync --frozen
-          uv run --frozen pytest
+          # --extra gptpro: the MCP tests need the optional mcp dependency,
+          # and uv syncs exactly — without the flag uv run would strip it.
+          uv sync --frozen --extra gptpro
+          uv run --frozen --extra gptpro pytest
 
       - name: Build darwin-arm64 asset
         if: steps.resolve.outputs.skip != 'true'
