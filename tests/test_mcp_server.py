@@ -364,6 +364,42 @@ def test_tools_list_exposes_job_tools_schemas_and_usage_guidance() -> None:
     assert "failure=expired" in result_description
 
 
+def test_tool_descriptions_enumerate_failure_recovery_actions() -> None:
+    with _mcp_client(FakeAskRuntime()) as client:
+        _payload, headers = _initialize(client)
+        response = client.post(
+            "/mcp",
+            headers=headers,
+            json={"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
+        )
+
+    assert response.status_code == 200
+    tools = {tool["name"]: tool for tool in response.json()["result"]["tools"]}
+    ask_description = tools["ask_gpt_pro"]["description"]
+    status_description = tools["ask_gpt_pro_status"]["description"]
+    result_description = tools["ask_gpt_pro_result"]["description"]
+    failure_action_labels = (
+        "- expired:",
+        "- no_raw_turn:",
+        "- timeout / echo_timeout:",
+        "- rate_limited_timeout:",
+        "- session_expired / challenge:",
+        "- submit_failed / navigation_failed / error:",
+    )
+    for description in (status_description, result_description):
+        for failure_action_label in failure_action_labels:
+            assert failure_action_label in description
+        assert "thread_ref as thread" in description
+        assert "re-emit the previous answer" in description
+
+    assert (
+        "An expired failure means same-conversation queue admission timed out"
+        in ask_description
+    )
+    assert "any available nonce marker are preserved" in status_description
+    assert '"detached; polling for the answer"' in status_description
+
+
 def test_lazy_runtime_forwards_detached_callback() -> None:
     captured_callbacks: list[Callable[[], None] | None] = []
 
@@ -558,7 +594,43 @@ def test_status_exposes_nonterminal_job_states(
         "state": state,
         "status_message": "progress",
         "thread_ref": _CONVERSATION_A,
+        "nonce_marker": "nonce-marker",
     }
+
+
+@pytest.mark.parametrize("nonce_marker", [None, "nonce-marker"])
+def test_status_includes_nullable_nonce_marker(
+    monkeypatch: pytest.MonkeyPatch,
+    nonce_marker: str | None,
+) -> None:
+    runtime = FakeAskRuntime()
+    snapshot = jobs.AskJob(
+        ask_id="status-nonce-id",
+        state="running",
+        answer=None,
+        failure=None,
+        error_message=None,
+        status_message=None,
+        nonce_marker=nonce_marker,
+        thread_ref=_CONVERSATION_A,
+        created_at=1.0,
+        finished_at=None,
+    )
+    monkeypatch.setattr(runtime, "job_status", lambda _ask_id: snapshot)
+
+    with _mcp_client(runtime) as client:
+        _payload, headers = _initialize(client)
+        status = _json_tool_payload(
+            _call_tool(
+                client,
+                headers,
+                "ask_gpt_pro_status",
+                {"ask_id": snapshot.ask_id},
+            )
+        )
+
+    assert "nonce_marker" in status
+    assert status["nonce_marker"] == nonce_marker
 
 
 def test_submit_returns_immediately_and_status_transitions_to_succeeded() -> None:
@@ -591,6 +663,7 @@ def test_submit_returns_immediately_and_status_transitions_to_succeeded() -> Non
             "state": "running",
             "status_message": "waiting for ChatGPT Pro",
             "thread_ref": None,
+            "nonce_marker": None,
         }
 
         _finish_job(client, runtime, ask_id)
@@ -608,6 +681,7 @@ def test_submit_returns_immediately_and_status_transitions_to_succeeded() -> Non
         "state": "succeeded",
         "status_message": "waiting for ChatGPT Pro",
         "thread_ref": "conversation-123",
+        "nonce_marker": "nonce-marker",
     }
     assert runtime.questions == ["Review this decision."]
 
@@ -791,7 +865,40 @@ def test_result_returns_settled_answer_and_thread_ref() -> None:
         "ask_id": ask_id,
         "answer": "## Result\n\nThe settled answer.",
         "thread_ref": "conversation-from-outcome",
+        "nonce_marker": "nonce-marker",
     }
+
+
+def test_succeeded_result_includes_nonce_marker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = FakeAskRuntime()
+    snapshot = jobs.AskJob(
+        ask_id="result-nonce-id",
+        state="succeeded",
+        answer="answer",
+        failure=None,
+        error_message=None,
+        status_message=None,
+        nonce_marker="result-nonce-marker",
+        thread_ref=_CONVERSATION_A,
+        created_at=1.0,
+        finished_at=2.0,
+    )
+    monkeypatch.setattr(runtime, "job_result", lambda _ask_id: snapshot)
+
+    with _mcp_client(runtime) as client:
+        _payload, headers = _initialize(client)
+        result = _json_tool_payload(
+            _call_tool(
+                client,
+                headers,
+                "ask_gpt_pro_result",
+                {"ask_id": snapshot.ask_id},
+            )
+        )
+
+    assert result["nonce_marker"] == "result-nonce-marker"
 
 
 def test_result_reports_when_ask_is_still_running() -> None:
@@ -884,6 +991,41 @@ def test_failed_result_preserves_domain_error_mapping(
         "content": [{"type": "text", "text": expected_message}],
         "isError": True,
     }
+
+
+def test_no_raw_turn_result_explains_thread_recovery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = FakeAskRuntime()
+    snapshot = jobs.AskJob(
+        ask_id="no-raw-turn-id",
+        state="failed",
+        answer=None,
+        failure="no_raw_turn",
+        error_message="no recoverable assistant turn",
+        status_message=None,
+        nonce_marker="failed-nonce-marker",
+        thread_ref=_CONVERSATION_A,
+        created_at=1.0,
+        finished_at=2.0,
+    )
+    monkeypatch.setattr(runtime, "job_result", lambda _ask_id: snapshot)
+
+    with _mcp_client(runtime) as client:
+        _payload, headers = _initialize(client)
+        result = _call_tool(
+            client,
+            headers,
+            "ask_gpt_pro_result",
+            {"ask_id": snapshot.ask_id},
+        )
+
+    assert result["isError"] is True
+    message = result["content"][0]["text"]
+    assert "[no_raw_turn]" in message
+    assert "gateway recovery polling also failed" in message
+    assert "thread_ref as thread" in message
+    assert "re-emit the previous answer" in message
 
 
 def test_omitted_thread_continues_completed_session_conversation() -> None:

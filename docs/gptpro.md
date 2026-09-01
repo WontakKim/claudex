@@ -57,8 +57,8 @@ listed below.
 | Tool | Arguments | Behavior |
 | --- | --- | --- |
 | `ask_gpt_pro` | `question` (required string), `thread` (optional string), `attachments` (optional array of strings) | Starts a background ask and returns immediately with `{"ask_id": ..., "thread_ref": ...}`. A fresh ask can initially have a null `thread_ref`. |
-| `ask_gpt_pro_status` | `ask_id` (required string) | Returns `ask_id`, `state`, the latest nullable `status_message`, and the nullable `thread_ref`. Unknown or expired IDs are tool errors. |
-| `ask_gpt_pro_result` | `ask_id` (required string) | After `succeeded`, returns `ask_id`, the Markdown `answer`, and `thread_ref`. After `failed`, returns an MCP tool error. Calling it while the job is `queued`, `running`, or `detached` is an error. |
+| `ask_gpt_pro_status` | `ask_id` (required string) | Returns `ask_id`, `state`, the latest nullable `status_message`, the nullable `thread_ref`, and the nullable `nonce_marker`. Unknown or expired IDs are tool errors. |
+| `ask_gpt_pro_result` | `ask_id` (required string) | After `succeeded`, returns `ask_id`, the Markdown `answer`, `thread_ref`, and the nullable `nonce_marker`. After `failed`, returns an MCP tool error. Calling it while the job is `queued`, `running`, or `detached` is an error. |
 
 The normal caller flow is:
 
@@ -104,8 +104,8 @@ counts toward the total byte limit.
 | State | Meaning | Next states and recovery |
 | --- | --- | --- |
 | `queued` | The job is waiting for admission, normally behind an in-flight ask on the same conversation. | Becomes `running`, or `failed` with `expired` if same-conversation admission exceeds the 900-second queue TTL. |
-| `running` | The job has been admitted and submission or answer generation is in progress. | Becomes `detached`, `succeeded`, or `failed`. |
-| `detached` | The prompt was submitted, its user echo and conversation ID were secured, and ChatGPT continues generating while the gateway polls the conversation. | Remains recoverable through normal status polling, then becomes `succeeded` or `failed`. |
+| `running` | The job has been admitted and submission or answer generation is in progress. | Becomes `detached` during normal answer recovery or when a `no_raw_turn` outcome starts recovery polling; otherwise becomes `succeeded` or `failed`. |
+| `detached` | The gateway polls the conversation while ChatGPT continues generating or while recovering a `no_raw_turn` outcome. | Remains recoverable through normal status polling, then becomes `succeeded` or `failed`. |
 | `succeeded` | The answer is settled and available from `ask_gpt_pro_result`. | Terminal. The successful `thread_ref` becomes this MCP session's binding. |
 | `failed` | The queue or provider execution ended with a classified failure. | Terminal. Fetch the result for the operational error and use any preserved conversation metadata for recovery. |
 
@@ -113,17 +113,30 @@ counts toward the total byte limit.
 in-flight answer` identifies same-conversation queueing, while `detached; polling
 for the answer` identifies server-side recovery. State remains authoritative.
 
+By default, a `no_raw_turn` outcome moves a `running` job to `detached` while the
+gateway polls for a recoverable server answer for up to
+`GPTPRO_RAW_TURN_RECOVERY_SECONDS` (300 seconds by default). Recovery ends in
+`succeeded` when an answer appears or `failed` with `no_raw_turn` when the window
+expires. A non-positive recovery window disables this polling. The job retains
+conversation ownership throughout recovery, so follow-up asks for the same
+conversation remain queued until recovery settles.
+
 `expired` specifically means the 900-second same-conversation queue wait ended
 before admission; it does not mean the ChatGPT execution budget was consumed.
 The job retains its `thread_ref` and any nonce marker that exists. Revisit the
 conversation by passing the preserved `thread_ref` as `thread`, and use the
 marker when available to locate the turn and attempt answer recovery.
 
-Other actionable failures include `session_expired`, `challenge`,
-`rate_limited_timeout`, `timeout`, and `echo_timeout`. Re-run login for an
-expired session or browser challenge. For rate-limit and timeout failures,
-check ChatGPT and the network, wait when appropriate, and retry deliberately.
-Other executor failures are also surfaced through the result error.
+Other actionable failures include `no_raw_turn`, `session_expired`,
+`challenge`, `rate_limited_timeout`, `timeout`, and `echo_timeout`. A terminal
+`no_raw_turn` means detached recovery polling also failed, but the answer may
+still remain in the ChatGPT conversation. Pass the preserved `thread_ref` as
+`thread` and ask ChatGPT to re-emit the previous answer, or ask again. Re-run
+login for an expired session or browser challenge. For rate-limit and timeout
+failures, check ChatGPT and the network, wait when appropriate, and retry
+deliberately. Other executor failures are also surfaced through the result
+error. Status responses and successful result responses include the nullable
+`nonce_marker` so callers can use it with preserved conversation metadata.
 
 Poll status every 30-60 seconds or longer rather than in a tight loop. Detached
 answer recovery uses a separate server-side polling interval and does not
@@ -156,9 +169,10 @@ execution budget.
 
 Before five successful duration samples exist, the execution budget is the
 configured ceiling. After that, the gateway uses the p95 of up to 64 recent
-successful durations plus 50 percent. The measured budget is clamped toward a
-60-second floor but never above the configured ceiling. Failed asks do not
-update these measurements.
+successful durations plus 50 percent. The measured budget is clamped to the
+configured minimum and ceiling; if the minimum exceeds the ceiling, the ceiling
+wins. Only successful ask durations update these measurements; failed asks do
+not.
 
 ## Operations
 
@@ -166,7 +180,9 @@ The gptpro scheduler reads these environment variables directly:
 
 | Variable | Default | Behavior |
 | --- | --- | --- |
-| `GPTPRO_OVERALL_TIMEOUT_SECONDS` | `900` | Positive floating-point execution-budget ceiling in seconds. Missing, non-numeric, zero, and negative values use the default. |
+| `GPTPRO_OVERALL_TIMEOUT_SECONDS` | `900` | Positive floating-point execution-budget ceiling in seconds. Missing, non-numeric, zero, and negative values use the default. This is only a ceiling: increasing it does not raise a lower measured budget (`p95 × 1.5`); use `GPTPRO_MIN_EXECUTION_BUDGET_SECONDS` to raise that floor. Only successful ask durations affect the measurement; failures do not. |
+| `GPTPRO_MIN_EXECUTION_BUDGET_SECONDS` | `60` | Positive floating-point floor for the execution budget reduced by watchdog measurements. Missing, non-numeric, zero, and negative values use the default. Values above `GPTPRO_OVERALL_TIMEOUT_SECONDS` are clamped to that ceiling. |
+| `GPTPRO_RAW_TURN_RECOVERY_SECONDS` | `300` | Floating-point recovery window for polling after `no_raw_turn`. Positive values enable recovery polling; zero or negative values disable it. |
 | `GPTPRO_MAX_CONCURRENT_ASKS` | `2` | Integer ask-tab concurrency. Non-integer values use the default; values below 1 are clamped to 1. |
 
 Set overrides in the environment that starts the gateway. A background daemon

@@ -35,28 +35,46 @@ ASK_GPT_PRO_DESCRIPTION = (
     "ChatGPT Pro or for a consequential judgment where a second opinion "
     "materially helps; do not use it routinely."
 )
+_GPTPRO_FAILURE_ACTIONS_DESCRIPTION = (
+    "Failure actions:\n"
+    "- expired: the same-conversation queue wait exceeded its 900-second TTL; "
+    "revisit with thread_ref as thread.\n"
+    "- no_raw_turn: the gateway already attempted detached recovery polling and "
+    "found no recoverable server answer; the answer may remain in the "
+    "conversation, so pass thread_ref as thread and ask to re-emit the previous "
+    "answer.\n"
+    "- timeout / echo_timeout: retry.\n"
+    "- rate_limited_timeout: wait, then retry.\n"
+    "- session_expired / challenge: run claudex-gateway gptpro login, then "
+    "retry.\n"
+    "- submit_failed / navigation_failed / error: retry or inspect the gateway."
+)
 ASK_GPT_PRO_STATUS_DESCRIPTION = (
     "Poll a background ChatGPT Pro ask and return its current state, latest "
-    "status message, and thread_ref. The thread_ref is preserved throughout the "
-    "job lifecycle. queued means awaiting admission, normally "
+    "status message, thread_ref, and nonce_marker. The thread_ref is preserved "
+    "throughout the job lifecycle. queued means awaiting admission, normally "
     "because the previous ask in the same conversation is still generating; "
     "asks in other conversations can continue in parallel. running means the "
     "ask was submitted and ChatGPT is generating the answer. detached means "
     "server-side generation continues while the gateway polls to recover the "
-    "answer, which normally returns through the job. succeeded and failed are "
-    "terminal. For failed jobs, failure=expired means same-conversation queue "
-    "waiting reached its TTL; thread_ref and any available nonce marker are "
-    "preserved so callers can revisit that conversation with thread and attempt "
-    "answer recovery. A thread_ref can appear before completion, but it becomes "
-    "this MCP session's binding only after the ask succeeds. status_message "
-    "values such as \"waiting for the in-flight answer\" and \"detached; "
-    "polling for the answer\" remain supplemental progress details."
+    "answer, including recovery polling entered after no_raw_turn; recovery "
+    "normally returns through the job. succeeded and failed are terminal. For "
+    "failed jobs, failure=expired means same-conversation queue waiting reached "
+    "its TTL; thread_ref and any available nonce marker are preserved so callers "
+    "can revisit that conversation with thread and attempt answer recovery. A "
+    "thread_ref can appear before completion, but it becomes this MCP session's "
+    "binding only after the ask succeeds. status_message values such as "
+    "\"waiting for the in-flight answer\" and \"detached; polling for the "
+    "answer\" remain supplemental progress details.\n"
+    + _GPTPRO_FAILURE_ACTIONS_DESCRIPTION
 )
 ASK_GPT_PRO_RESULT_DESCRIPTION = (
     "Fetch the settled result of a background ChatGPT Pro ask only after its "
     "status is succeeded or failed; queued, running, and detached are still in "
-    "progress. For failure=expired, use the preserved thread_ref and any nonce "
-    "marker to revisit the conversation and attempt answer recovery."
+    "progress. Successful results include nonce_marker. For failure=expired, "
+    "use the preserved thread_ref and any nonce marker to revisit the "
+    "conversation and attempt answer recovery.\n"
+    + _GPTPRO_FAILURE_ACTIONS_DESCRIPTION
 )
 _ATTACHMENTS_DESCRIPTION = (
     "Optional plain-text file paths to attach (UTF-8 only; at most 10 files "
@@ -212,6 +230,7 @@ def build_gptpro_server(app: Any) -> Any:
                     "state": job.state,
                     "status_message": job.status_message,
                     "thread_ref": job.thread_ref,
+                    "nonce_marker": job.nonce_marker,
                 },
             )
 
@@ -245,6 +264,7 @@ def build_gptpro_server(app: Any) -> Any:
                     "ask_id": job.ask_id,
                     "answer": job.answer,
                     "thread_ref": job.thread_ref,
+                    "nonce_marker": job.nonce_marker,
                 },
             )
 
@@ -279,6 +299,14 @@ def _gptpro_error_result(
         message = (
             "ChatGPT Pro browser challenge blocked the request; complete the "
             "challenge with claudex-gateway gptpro login, then retry."
+        )
+    elif failure == "no_raw_turn":
+        message = (
+            "ChatGPT Pro request failed [no_raw_turn]: no recoverable server "
+            "answer was obtained, and gateway recovery polling also failed. The "
+            "answer may remain in the conversation; pass the preserved "
+            "thread_ref as thread and ask ChatGPT Pro to re-emit the previous "
+            "answer, or ask again."
         )
     elif failure == "rate_limited_timeout":
         message = "ChatGPT Pro remained rate limited until timeout; retry later."
