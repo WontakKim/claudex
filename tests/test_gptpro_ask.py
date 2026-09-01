@@ -390,6 +390,72 @@ def _dom_state(*, has_stop: bool, length: int = 12) -> dict[str, object]:
     }
 
 
+def test_heartbeat_reports_generation_after_assistant_text_is_observed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = _install_clock(monkeypatch)
+    statuses: list[str] = []
+    execution = ask._AskExecution(
+        _FakePage(signal="none"),
+        "Review this code",
+        ask.AskCallbacks(on_status=statuses.append),
+    )
+    execution.response_wait_started_at = clock.monotonic()
+    execution.last_heartbeat_at = clock.monotonic()
+    execution.has_seen_assistant_text = True
+    clock.value = 20.0
+
+    asyncio.run(execution._pause_while_waiting(41.0))
+
+    assert statuses == [
+        "ChatGPT is still generating (30s elapsed)",
+        "ChatGPT is still generating (60s elapsed)",
+    ]
+
+
+def test_heartbeat_preserves_waiting_message_before_assistant_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = _install_clock(monkeypatch)
+    statuses: list[str] = []
+    execution = ask._AskExecution(
+        _FakePage(signal="none"),
+        "Review this code",
+        ask.AskCallbacks(on_status=statuses.append),
+    )
+    execution.response_wait_started_at = clock.monotonic()
+    execution.last_heartbeat_at = clock.monotonic()
+    clock.value = 20.0
+
+    asyncio.run(execution._pause_while_waiting(11.0))
+
+    assert statuses == [
+        "still waiting for the ChatGPT response (30s elapsed)"
+    ]
+
+
+def test_completion_candidate_status_is_emitted_once_for_repeated_signals(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_clock(monkeypatch)
+    statuses: list[str] = []
+    page = _FakePage(
+        signal="weak",
+        api_payloads=[None, None, None, "raw after repeated signals"],
+        emit_second_lat_after_fetch=3,
+    )
+
+    result = asyncio.run(
+        ask.execute_ask(page, "Review this code", on_status=statuses.append)
+    )
+
+    assert result == "raw after repeated signals"
+    assert page.has_emitted_second_lat
+    assert statuses.count(
+        "completion observed; fetching the server answer"
+    ) == 1
+
+
 def test_overall_timeout_defaults_when_environment_variable_is_unset(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

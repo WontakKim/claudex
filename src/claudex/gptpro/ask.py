@@ -365,25 +365,33 @@ class _AskExecution:
             raise _DeadlineExpired
 
     def _maybe_heartbeat(self) -> None:
-        if self.has_seen_assistant_text or self.response_wait_started_at is None:
+        if self.response_wait_started_at is None:
             return
         now = _monotonic()
         last = self.last_heartbeat_at or self.response_wait_started_at
         if now - last < HEARTBEAT_INTERVAL_SECONDS:
             return
         elapsed = round(now - self.response_wait_started_at)
-        self._status(f"still waiting for the ChatGPT response ({elapsed}s elapsed)")
+        if self.has_seen_assistant_text:
+            self._status(f"ChatGPT is still generating ({elapsed}s elapsed)")
+        else:
+            self._status(
+                f"still waiting for the ChatGPT response ({elapsed}s elapsed)"
+            )
         self.last_heartbeat_at = now
+
+    def _mark_completion_candidate(self) -> None:
+        if self.completion_candidate_seen:
+            return
+        self.completion_candidate_seen = True
+        self._status("completion observed; fetching the server answer")
 
     async def _pause_while_waiting(self, seconds: float) -> None:
         end = _monotonic() + seconds
         while _monotonic() < end:
             self._maybe_heartbeat()
             heartbeat_remaining = HEARTBEAT_INTERVAL_SECONDS
-            if (
-                self.response_wait_started_at is not None
-                and not self.has_seen_assistant_text
-            ):
+            if self.response_wait_started_at is not None:
                 last = self.last_heartbeat_at or self.response_wait_started_at
                 heartbeat_remaining = max(
                     0.001, HEARTBEAT_INTERVAL_SECONDS - (_monotonic() - last)
@@ -1120,7 +1128,7 @@ class _AskExecution:
                 and self.network.conversation_id is not None
             ):
                 self.handled_strong_signal = self.network.strong_signal_serial
-                self.completion_candidate_seen = True
+                self._mark_completion_candidate()
                 text = await self._fetch_finished_turn()
                 if text is not None:
                     return text
@@ -1130,7 +1138,7 @@ class _AskExecution:
                 and self.network.conversation_id is not None
             ):
                 self.handled_weak_signal = self.network.weak_signal_serial
-                self.completion_candidate_seen = True
+                self._mark_completion_candidate()
                 text = await self._fetch_finished_turn()
                 if text is not None:
                     return text
@@ -1153,7 +1161,7 @@ class _AskExecution:
                     ANCHOR_LOST_TIMEOUT_SECONDS
                 )
                 if relocked_id is None:
-                    self.completion_candidate_seen = True
+                    self._mark_completion_candidate()
                     return await self._require_raw_turn()
                 locked_user_id = relocked_id
                 saw_stop = False
@@ -1193,7 +1201,7 @@ class _AskExecution:
                 and _monotonic() - recovery_started_at >= RECOVERY_OBSERVE_SECONDS
             )
             if stop_disappeared or recovery_settled:
-                self.completion_candidate_seen = True
+                self._mark_completion_candidate()
                 return await self._require_raw_turn()
 
             mutation_stable = (
@@ -1205,7 +1213,7 @@ class _AskExecution:
                 and _monotonic() >= next_stable_fetch_at
             )
             if mutation_stable:
-                self.completion_candidate_seen = True
+                self._mark_completion_candidate()
                 text = await self._fetch_finished_turn()
                 if text is not None:
                     return text
@@ -1221,7 +1229,7 @@ class _AskExecution:
                 and _monotonic() - last_activity_at >= IDLE_GRACE_SECONDS
             )
             if idle_grace_elapsed:
-                self.completion_candidate_seen = True
+                self._mark_completion_candidate()
                 return await self._require_raw_turn()
 
             await self._pause(POLL_INTERVAL_SECONDS)
