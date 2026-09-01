@@ -1016,6 +1016,42 @@ def test_answer_watchdog_clamps_measured_budget(
     assert watchdog.execution_budget_seconds() == expected_budget_seconds
 
 
+def test_answer_watchdog_environment_minimum_raises_measured_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GPTPRO_MIN_EXECUTION_BUDGET_SECONDS", "180")
+    watchdog = jobs.AnswerWatchdog(initial_budget_seconds=900.0)
+
+    for _ in range(jobs.WATCHDOG_MIN_SAMPLES):
+        watchdog.record(10.0)
+
+    assert watchdog.execution_budget_seconds() == 180.0
+
+
+def test_answer_watchdog_invalid_environment_minimum_uses_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GPTPRO_MIN_EXECUTION_BUDGET_SECONDS", "invalid")
+    watchdog = jobs.AnswerWatchdog(initial_budget_seconds=900.0)
+
+    for _ in range(jobs.WATCHDOG_MIN_SAMPLES):
+        watchdog.record(10.0)
+
+    assert watchdog.execution_budget_seconds() == 60.0
+
+
+def test_answer_watchdog_environment_minimum_is_capped_by_ceiling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GPTPRO_MIN_EXECUTION_BUDGET_SECONDS", "600")
+    watchdog = jobs.AnswerWatchdog(initial_budget_seconds=300.0)
+
+    for _ in range(jobs.WATCHDOG_MIN_SAMPLES):
+        watchdog.record(10.0)
+
+    assert watchdog.execution_budget_seconds() == 300.0
+
+
 def test_failed_job_does_not_update_answer_watchdog() -> None:
     now = 0.0
     captured_timeouts: list[float | None] = []

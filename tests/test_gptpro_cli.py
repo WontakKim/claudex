@@ -454,8 +454,11 @@ def test_gptpro_ask_prints_status_to_stderr_and_answer_once_to_stdout(
         assert callbacks is not None
         assert callable(callbacks.on_status)
         callbacks.on_status("waiting for ChatGPT")
-        assert callbacks.on_conversation_id is None
-        assert callbacks.on_marker is None
+        # The runtime wraps caller callbacks to capture the conversation ID
+        # and nonce marker for no_raw_turn recovery, so these are always
+        # callable even when the CLI passed None.
+        assert callable(callbacks.on_conversation_id)
+        assert callable(callbacks.on_marker)
         assert callable(should_detach)
         assert callable(on_detach)
         return gptpro_ask.AskOutcome(

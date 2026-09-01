@@ -25,6 +25,7 @@ from claudex.gptpro.selectors import PAGE_FETCH_PROBE_JS
 logger = logging.getLogger(__name__)
 
 DEFAULT_MAX_CONCURRENT_ASKS = 2
+DEFAULT_RAW_TURN_RECOVERY_SECONDS = 300.0
 MIN_SUBMISSION_JITTER_SECONDS = 1.0
 MAX_SUBMISSION_JITTER_SECONDS = 2.0
 DETACH_POLL_INTERVAL_SECONDS = 45.0
@@ -66,6 +67,18 @@ def _max_concurrent_asks() -> int:
     except ValueError:
         return DEFAULT_MAX_CONCURRENT_ASKS
     return max(1, configured_value)
+
+
+def raw_turn_recovery_seconds() -> float:
+    # This window lets generations outlasting the p95 x 1.5 budget finish.
+    raw_value = os.environ.get("GPTPRO_RAW_TURN_RECOVERY_SECONDS")
+    if raw_value is None:
+        return DEFAULT_RAW_TURN_RECOVERY_SECONDS
+    try:
+        configured_value = float(raw_value)
+    except ValueError:
+        return DEFAULT_RAW_TURN_RECOVERY_SECONDS
+    return max(0.0, configured_value)
 
 
 def _is_transient_detach_fetch_error(exc: BaseException) -> bool:
@@ -483,6 +496,32 @@ class AskRuntime:
             has_admission = False
             self._ask_semaphore.release()
 
+        captured_conversation_id = conversation_id
+        captured_marker: str | None = None
+        execution_callbacks = callbacks
+        if callbacks is not None:
+            original_on_conversation_id = callbacks.on_conversation_id
+            original_on_marker = callbacks.on_marker
+
+            def capture_conversation_id(value: str) -> None:
+                nonlocal captured_conversation_id
+                captured_conversation_id = value
+                if original_on_conversation_id is not None:
+                    original_on_conversation_id(value)
+
+            def capture_marker(value: str) -> None:
+                nonlocal captured_marker
+                captured_marker = value
+                if original_on_marker is not None:
+                    original_on_marker(value)
+
+            execution_callbacks = AskCallbacks(
+                on_status=callbacks.on_status,
+                on_conversation_id=capture_conversation_id,
+                on_marker=capture_marker,
+                on_detached=callbacks.on_detached,
+            )
+
         try:
             submission_delay = random.uniform(
                 MIN_SUBMISSION_JITTER_SECONDS,
@@ -498,16 +537,62 @@ class AskRuntime:
                 else timeout_seconds
             )
             detached_deadline = _monotonic() + timeout_budget
-            return await self._execute_in_page(
-                context,
-                question,
-                callbacks,
-                conversation_id,
-                timeout_seconds,
-                attachment_paths,
-                detached_deadline,
-                release_admission,
-            )
+            try:
+                return await self._execute_in_page(
+                    context,
+                    question,
+                    execution_callbacks,
+                    conversation_id,
+                    timeout_seconds,
+                    attachment_paths,
+                    detached_deadline,
+                    release_admission,
+                )
+            except ask.GptProAskError as exc:
+                recovery_seconds = raw_turn_recovery_seconds()
+                if (
+                    callbacks is None
+                    or exc.failure != "no_raw_turn"
+                    or captured_conversation_id is None
+                    or captured_marker is None
+                    or recovery_seconds <= 0
+                ):
+                    raise
+                try:
+                    future = self._poller.register(
+                        captured_conversation_id,
+                        captured_marker,
+                        _monotonic() + recovery_seconds,
+                    )
+                except Exception:
+                    raise exc from None
+                if callbacks.on_detached is not None:
+                    try:
+                        callbacks.on_detached()
+                    except Exception:
+                        pass
+                if callbacks.on_status is not None:
+                    try:
+                        callbacks.on_status(
+                            "detached; polling for the answer"
+                        )
+                    except Exception:
+                        pass
+                release_admission()
+                # Waiting here retains the job service's conversation ownership,
+                # so a follow-up on the same conversation stays queued instead
+                # of being lost during the server-side generation.
+                try:
+                    return await future
+                except asyncio.CancelledError:
+                    future.cancel()
+                    raise
+                except Exception as recovery_exc:
+                    exc.add_note(
+                        "raw turn recovery polling failed with "
+                        f"{type(recovery_exc).__name__}: {recovery_exc}"
+                    )
+                    raise exc from recovery_exc
         finally:
             release_admission()
 

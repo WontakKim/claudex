@@ -106,6 +106,31 @@ def _outcome(text: str) -> ask.AskOutcome:
     return ask.AskOutcome(text=text, marker="marker", conversation_id=None)
 
 
+@pytest.mark.parametrize(
+    ("configured_value", "expected_seconds"),
+    [
+        (None, runtime.DEFAULT_RAW_TURN_RECOVERY_SECONDS),
+        ("invalid", runtime.DEFAULT_RAW_TURN_RECOVERY_SECONDS),
+        ("0", 0.0),
+        ("125.5", 125.5),
+    ],
+    ids=["default", "invalid", "disabled", "positive"],
+)
+def test_raw_turn_recovery_seconds_parses_environment(
+    monkeypatch: pytest.MonkeyPatch,
+    configured_value: str | None,
+    expected_seconds: float,
+) -> None:
+    if configured_value is None:
+        monkeypatch.delenv("GPTPRO_RAW_TURN_RECOVERY_SECONDS", raising=False)
+    else:
+        monkeypatch.setenv(
+            "GPTPRO_RAW_TURN_RECOVERY_SECONDS", configured_value
+        )
+
+    assert runtime.raw_turn_recovery_seconds() == expected_seconds
+
+
 def test_runtime_initializes_lazily_and_reuses_the_context(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -129,6 +154,10 @@ def test_runtime_initializes_lazily_and_reuses_the_context(
         assert callbacks is not None
         conversation_id_callbacks.append(callbacks.on_conversation_id)
         marker_callbacks.append(callbacks.on_marker)
+        if callbacks.on_conversation_id is not None:
+            callbacks.on_conversation_id("captured-conversation")
+        if callbacks.on_marker is not None:
+            callbacks.on_marker("captured-marker")
         return _outcome(f"answer: {question}")
 
     monkeypatch.setattr(runtime.ask, "execute_ask_outcome", execute_ask_outcome)
@@ -150,8 +179,12 @@ def test_runtime_initializes_lazily_and_reuses_the_context(
         second = await ask_runtime.ask("second")
         assert first.text == "answer: first"
         assert second.text == "answer: second"
-        assert conversation_id_callbacks == [callback, None]
-        assert marker_callbacks == [marker_callback, None]
+        assert conversation_id_callbacks[0] is not None
+        assert conversation_id_callbacks[1] is None
+        assert marker_callbacks[0] is not None
+        assert marker_callbacks[1] is None
+        assert captured_conversation_ids == ["captured-conversation"]
+        assert captured_markers == ["captured-marker"]
         assert len(fakes.launch_calls) == 1
         assert fakes.launch_calls[0][1] is True
         assert len(context.pages) == 2
@@ -1041,6 +1074,228 @@ def test_runtime_detaches_waiting_answer_when_submitter_contends(
         first, second = await asyncio.gather(first_task, second_task)
         assert first.text == "first detached answer"
         assert second.text == "second answer"
+        await ask_runtime.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_runtime_recovers_no_raw_turn_through_detach_poller(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = _FakeContext()
+    _RuntimeFakes(monkeypatch, [context])
+    monkeypatch.setenv("GPTPRO_MAX_CONCURRENT_ASKS", "1")
+    monkeypatch.setenv("GPTPRO_RAW_TURN_RECOVERY_SECONDS", "120")
+    now = 100.0
+    monkeypatch.setattr(runtime, "_monotonic", lambda: now)
+    marker = "[gptpro-transport-nonce:raw-turn-recovery]"
+    failure = ask.GptProAskError("no_raw_turn", "raw turn missing")
+    captured_conversation_ids: list[str] = []
+    captured_markers: list[str] = []
+    detached_calls: list[None] = []
+    status_messages: list[str] = []
+
+    async def execute_ask_outcome(
+        page: _FakePage,
+        question: str,
+        *,
+        callbacks: ask.AskCallbacks | None = None,
+        should_detach: Callable[[], bool] | None = None,
+        on_detach: Callable[
+            [ask.AskSubmission], Awaitable[ask.AskOutcome]
+        ]
+        | None = None,
+    ) -> ask.AskOutcome:
+        del page, question, should_detach, on_detach
+        assert callbacks is not None
+        assert callbacks.on_conversation_id is not None
+        assert callbacks.on_marker is not None
+        callbacks.on_conversation_id(_CONVERSATION_ID)
+        callbacks.on_marker(marker)
+        raise failure
+
+    monkeypatch.setattr(runtime.ask, "execute_ask_outcome", execute_ask_outcome)
+
+    async def scenario() -> None:
+        ask_runtime = runtime.AskRuntime()
+        poller = _RuntimeDetachPollerFake(ask_runtime._get_context)
+        ask_runtime._poller = poller
+        outcome_task = asyncio.create_task(
+            ask_runtime.ask(
+                "question",
+                callbacks=ask.AskCallbacks(
+                    on_status=status_messages.append,
+                    on_conversation_id=captured_conversation_ids.append,
+                    on_marker=captured_markers.append,
+                    on_detached=lambda: detached_calls.append(None),
+                ),
+            )
+        )
+        while poller.future is None:
+            await asyncio.sleep(0)
+
+        assert poller.registrations == [
+            (_CONVERSATION_ID, marker, now + 120.0)
+        ]
+        assert poller.registrations[0][2] > now
+        assert captured_conversation_ids == [_CONVERSATION_ID]
+        assert captured_markers == [marker]
+        assert detached_calls == [None]
+        assert status_messages == ["detached; polling for the answer"]
+        assert not ask_runtime._ask_semaphore.locked()
+
+        recovered_outcome = ask.AskOutcome(
+            text="recovered answer",
+            marker=marker,
+            conversation_id=_CONVERSATION_ID,
+        )
+        poller.future.set_result(recovered_outcome)
+        assert await outcome_task == recovered_outcome
+        await ask_runtime.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_runtime_preserves_no_raw_turn_when_recovery_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = _FakeContext()
+    _RuntimeFakes(monkeypatch, [context])
+    monkeypatch.setenv("GPTPRO_RAW_TURN_RECOVERY_SECONDS", "120")
+    marker = "[gptpro-transport-nonce:raw-turn-recovery-failure]"
+    failure = ask.GptProAskError("no_raw_turn", "raw turn missing")
+
+    async def execute_ask_outcome(
+        page: _FakePage,
+        question: str,
+        *,
+        callbacks: ask.AskCallbacks | None = None,
+        should_detach: Callable[[], bool] | None = None,
+        on_detach: Callable[
+            [ask.AskSubmission], Awaitable[ask.AskOutcome]
+        ]
+        | None = None,
+    ) -> ask.AskOutcome:
+        del page, question, should_detach, on_detach
+        assert callbacks is not None
+        assert callbacks.on_conversation_id is not None
+        assert callbacks.on_marker is not None
+        callbacks.on_conversation_id(_CONVERSATION_ID)
+        callbacks.on_marker(marker)
+        raise failure
+
+    monkeypatch.setattr(runtime.ask, "execute_ask_outcome", execute_ask_outcome)
+
+    async def scenario() -> None:
+        ask_runtime = runtime.AskRuntime()
+        poller = _RuntimeDetachPollerFake(ask_runtime._get_context)
+        ask_runtime._poller = poller
+        outcome_task = asyncio.create_task(
+            ask_runtime.ask("question", callbacks=ask.AskCallbacks())
+        )
+        while poller.future is None:
+            await asyncio.sleep(0)
+
+        recovery_failure = RuntimeError("poller failed")
+        poller.future.set_exception(recovery_failure)
+        with pytest.raises(ask.GptProAskError) as raised:
+            await outcome_task
+
+        assert raised.value is failure
+        assert raised.value.failure == "no_raw_turn"
+        assert raised.value.__cause__ is recovery_failure
+        assert any(
+            "RuntimeError: poller failed" in note
+            for note in raised.value.__notes__
+        )
+        await ask_runtime.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_runtime_does_not_recover_other_ask_failures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = _FakeContext()
+    _RuntimeFakes(monkeypatch, [context])
+    monkeypatch.setenv("GPTPRO_RAW_TURN_RECOVERY_SECONDS", "120")
+    failure = ask.GptProAskError("echo_timeout", "echo missing")
+
+    async def execute_ask_outcome(
+        page: _FakePage,
+        question: str,
+        *,
+        callbacks: ask.AskCallbacks | None = None,
+        should_detach: Callable[[], bool] | None = None,
+        on_detach: Callable[
+            [ask.AskSubmission], Awaitable[ask.AskOutcome]
+        ]
+        | None = None,
+    ) -> ask.AskOutcome:
+        del page, question, should_detach, on_detach
+        assert callbacks is not None
+        assert callbacks.on_conversation_id is not None
+        assert callbacks.on_marker is not None
+        callbacks.on_conversation_id(_CONVERSATION_ID)
+        callbacks.on_marker("marker")
+        raise failure
+
+    monkeypatch.setattr(runtime.ask, "execute_ask_outcome", execute_ask_outcome)
+
+    async def scenario() -> None:
+        ask_runtime = runtime.AskRuntime()
+        poller = _RuntimeDetachPollerFake(ask_runtime._get_context)
+        ask_runtime._poller = poller
+        with pytest.raises(ask.GptProAskError) as raised:
+            await ask_runtime.ask("question", callbacks=ask.AskCallbacks())
+
+        assert raised.value is failure
+        assert raised.value.failure == "echo_timeout"
+        assert poller.registrations == []
+        await ask_runtime.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_runtime_disables_no_raw_turn_recovery_with_zero_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = _FakeContext()
+    _RuntimeFakes(monkeypatch, [context])
+    monkeypatch.setenv("GPTPRO_RAW_TURN_RECOVERY_SECONDS", "0")
+    failure = ask.GptProAskError("no_raw_turn", "raw turn missing")
+
+    async def execute_ask_outcome(
+        page: _FakePage,
+        question: str,
+        *,
+        callbacks: ask.AskCallbacks | None = None,
+        should_detach: Callable[[], bool] | None = None,
+        on_detach: Callable[
+            [ask.AskSubmission], Awaitable[ask.AskOutcome]
+        ]
+        | None = None,
+    ) -> ask.AskOutcome:
+        del page, question, should_detach, on_detach
+        assert callbacks is not None
+        assert callbacks.on_conversation_id is not None
+        assert callbacks.on_marker is not None
+        callbacks.on_conversation_id(_CONVERSATION_ID)
+        callbacks.on_marker("marker")
+        raise failure
+
+    monkeypatch.setattr(runtime.ask, "execute_ask_outcome", execute_ask_outcome)
+
+    async def scenario() -> None:
+        ask_runtime = runtime.AskRuntime()
+        poller = _RuntimeDetachPollerFake(ask_runtime._get_context)
+        ask_runtime._poller = poller
+        with pytest.raises(ask.GptProAskError) as raised:
+            await ask_runtime.ask("question", callbacks=ask.AskCallbacks())
+
+        assert raised.value is failure
+        assert raised.value.failure == "no_raw_turn"
+        assert poller.registrations == []
         await ask_runtime.aclose()
 
     asyncio.run(scenario())

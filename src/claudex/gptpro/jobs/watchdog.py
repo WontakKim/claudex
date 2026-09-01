@@ -1,5 +1,6 @@
 """Measured execution budgets for background gptpro asks."""
 
+import os
 import time
 from collections import deque
 from collections.abc import Callable
@@ -9,6 +10,19 @@ WATCHDOG_SAMPLE_LIMIT = 64
 WATCHDOG_MIN_SAMPLES = 5
 WATCHDOG_MARGIN_RATIO = 0.5
 WATCHDOG_MIN_BUDGET_SECONDS = 60.0
+
+
+def _minimum_execution_budget_seconds() -> float:
+    raw_value = os.environ.get("GPTPRO_MIN_EXECUTION_BUDGET_SECONDS")
+    if raw_value is None:
+        return WATCHDOG_MIN_BUDGET_SECONDS
+    try:
+        configured_value = float(raw_value)
+    except ValueError:
+        return WATCHDOG_MIN_BUDGET_SECONDS
+    if configured_value <= 0:
+        return WATCHDOG_MIN_BUDGET_SECONDS
+    return configured_value
 
 
 class AnswerWatchdog:
@@ -38,7 +52,13 @@ class AnswerWatchdog:
         measured_budget_seconds = p95_seconds * (1 + WATCHDOG_MARGIN_RATIO)
         # Durations above the operational default indicate a slower system.
         # Operators must raise that ceiling explicitly through the env override.
+        # Raise GPTPRO_MIN_EXECUTION_BUDGET_SECONDS to lift a measured budget;
+        # GPTPRO_OVERALL_TIMEOUT_SECONDS only sets its ceiling.
+        minimum_budget_seconds = min(
+            self._initial_budget_seconds,
+            _minimum_execution_budget_seconds(),
+        )
         return min(
             self._initial_budget_seconds,
-            max(WATCHDOG_MIN_BUDGET_SECONDS, measured_budget_seconds),
+            max(minimum_budget_seconds, measured_budget_seconds),
         )
