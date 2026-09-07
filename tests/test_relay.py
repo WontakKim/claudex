@@ -39,6 +39,7 @@ from claudex.claude.auth import CLAUDE_TOKEN_URL
 from claudex.balanced.router import ClaudeBalancedRouter
 from claudex.balanced.runtime import ClaudeBalancedRuntime
 from claudex.balanced.selection import derive_session_key
+from claudex.providers.anthropic_compatible_client import AnthropicCompatibleClient
 from claudex.providers.backends import AnthropicBackend, ResponsesBackend
 from claudex.providers.codex_client import (
     CODEX_MODELS_URL,
@@ -46,7 +47,7 @@ from claudex.providers.codex_client import (
     CodexClient,
     CodexUpstreamError,
 )
-from claudex.config import GatewayConfig, OpenAICompatibleProvider
+from claudex.config import AnthropicCompatibleProvider, GatewayConfig, OpenAICompatibleProvider
 from claudex.providers.kimi_auth import KimiCredentials
 from claudex.providers.kimi_client import KimiClient, KimiUpstreamError
 from claudex.providers.openai_compatible_client import OpenAICompatibleUpstreamError
@@ -7591,3 +7592,279 @@ def test_leg_log_emission_failure_preserves_escaping_exception(
         client.post("/v1/messages", json=_account_leg_body())
 
     assert raised.value is signal
+
+
+# Provider-internal tools must not become native server tools or orphan client results.
+@pytest.mark.parametrize("server_tool", ["web_search", "analyze_image"])
+@pytest.mark.parametrize("tool_id", ["ws_legacy", "srvtoolu_gateway_test"])
+@pytest.mark.parametrize("route_kind", ["passthrough", "kimi", "custom"])
+@pytest.mark.parametrize("path", ["/v1/messages", "/v1/messages/count_tokens"])
+def test_messages_routes_replay_incompatible_server_tools_as_text(
+    tool_id: str, route_kind: str, path: str, server_tool: str
+) -> None:
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        forwarded = json.loads(request.content)
+        content = forwarded["messages"][0]["content"]
+        if any(block["type"] != "text" for block in content):
+            return httpx.Response(400, json={"error": {"type": "invalid_request_error"}})
+        return httpx.Response(200, json={"model": "upstream", "input_tokens": 42})
+
+    config = GatewayConfig()
+    custom_clients = {}
+    if route_kind == "kimi":
+        config = _kimi_config()
+    elif route_kind == "custom":
+        provider = AnthropicCompatibleProvider(
+            base_url="https://messages.example/v1", api_key="test-key"
+        )
+        config = GatewayConfig(
+            model_map={"opus": "messages-api:upstream"},
+            custom_providers={"messages-api": provider},
+        )
+        custom_clients["messages-api"] = AnthropicCompatibleClient(
+            "messages-api", provider,
+            httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+        )
+    client, stub = _gateway(
+        config, handler, kimi_handler=handler, custom_provider_clients=custom_clients
+    )
+    body = _message_body("claude-opus-4-6")
+    body["messages"] = [{"role": "assistant", "content": [
+        {"type": "server_tool_use", "id": tool_id, "name": "web_search",
+         "input": {"query": "python release date"}},
+        {"type": "web_search_tool_result", "tool_use_id": tool_id, "content": [
+            {"type": "web_search_result", "title": "Python release",
+             "url": "https://python.org/news", "page_age": None},
+        ]},
+    ]}, {"role": "user", "content": "Continue"}]
+    if server_tool == "analyze_image":
+        call, result = body["messages"][0]["content"]
+        call["name"] = "analyze_image"
+        result["type"] = "tool_result"
+    response = client.post(path, json=body)
+    assert response.status_code == 200
+    assert stub.payloads == []
+    if route_kind == "custom" and path.endswith("count_tokens"):
+        assert captured == []  # This provider has no remote token counter.
+        return
+    (upstream,) = captured
+    content = json.loads(upstream.content)["messages"][0]["content"]
+    assert all(block["type"] == "text" for block in content)
+    assert "python release date" in content[0]["text"]
+    assert "Python release" in content[1]["text"]
+    assert "https://python.org/news" in content[1]["text"]
+
+
+@pytest.mark.parametrize("path", ["/v1/messages", "/v1/messages/count_tokens"])
+def test_native_web_search_passthrough_preserves_exact_request_bytes(path: str) -> None:
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(200, json={"input_tokens": 42})
+
+    client, _ = _gateway(GatewayConfig(), handler)
+    body = _message_body("claude-fable-5")
+    body["messages"] = [{"role": "assistant", "content": [
+        {"type": "server_tool_use", "id": "srvtoolu_native", "name": "web_search",
+         "input": {"query": "q"}},
+        {"type": "web_search_tool_result", "tool_use_id": "srvtoolu_native", "content": [
+            {"type": "web_search_result", "title": "Native", "url": "https://example.org",
+             "encrypted_content": "native-opaque-data", "page_age": None},
+        ]},
+    ]}]
+    raw = json.dumps(body, indent=3).encode()
+    response = client.post(path, content=raw, headers={"content-type": "application/json"})
+    assert response.status_code == 200
+    assert captured[0].content == raw
+
+
+@pytest.mark.parametrize("server_tool", ["web_search", "analyze_image"])
+@pytest.mark.parametrize("mode", ["disabled", "fallback"])
+@pytest.mark.parametrize("path", ["/v1/messages", "/v1/messages/count_tokens"])
+def test_account_routes_normalize_server_tools_before_metadata_rewrite(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, mode: str, path: str, server_tool: str
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    account_id = _register_serving_account()
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(200, json={"input_tokens": 42})
+
+    client, _ = _gateway(
+        GatewayConfig(claude_account_id=account_id, claude_account_routing_mode=mode),
+        handler,
+    )
+    body = _account_body()
+    body["messages"].insert(0, {"role": "assistant", "content": [
+        {"type": "server_tool_use", "id": "ws_legacy", "name": server_tool,
+         "input": {"query": "q"}},
+        {"type": "tool_result" if server_tool == "analyze_image" else "web_search_tool_result",
+         "tool_use_id": "ws_legacy", "content": []},
+    ]})
+    response = client.post(path, json=body)
+    assert response.status_code == 200
+    (upstream,) = captured
+    assert upstream.headers["authorization"] == "Bearer pool-access-1"
+    forwarded = json.loads(upstream.content)
+    assert json.loads(forwarded["metadata"]["user_id"])["account_uuid"] == "serving-account-uuid"
+    assert [block["type"] for block in forwarded["messages"][0]["content"]] == ["text", "text"]
+
+
+@pytest.mark.parametrize("server_tool", ["web_search", "analyze_image"])
+@pytest.mark.parametrize("path", ["/v1/messages", "/v1/messages/count_tokens"])
+def test_balanced_routes_normalize_server_tool_history(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, path: str, server_tool: str
+) -> None:
+    _balanced_env(monkeypatch, tmp_path)
+    _, access_token = _register_balanced_accounts(1)[0]
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(200, json={"input_tokens": 42})
+
+    with _create_test_client(
+        monkeypatch, tmp_path, config=GatewayConfig(), base_url="http://127.0.0.1:8787"
+    ) as client:
+        _enable_balanced(client, handler)
+        body = _balanced_body(_new_session_id())
+        body["messages"].insert(0, {"role": "assistant", "content": [
+            {"type": "server_tool_use", "id": "ws_legacy", "name": server_tool,
+             "input": {"query": "q"}},
+            {"type": "tool_result" if server_tool == "analyze_image" else "web_search_tool_result",
+         "tool_use_id": "ws_legacy", "content": []},
+        ]})
+        response = client.post(path, json=body)
+        assert response.status_code == 200
+        (upstream,) = captured
+        assert upstream.headers["authorization"] == f"Bearer {access_token}"
+        content = json.loads(upstream.content)["messages"][0]["content"]
+        assert [block["type"] for block in content] == ["text", "text"]
+
+
+@pytest.mark.parametrize("server_tool", ["web_search", "analyze_image"])
+@pytest.mark.parametrize("status_code", [200, 400])
+def test_compaction_reroute_normalizes_server_tools_without_mutating_fallback(
+    monkeypatch: pytest.MonkeyPatch, status_code: int, server_tool: str
+) -> None:
+    body = _compaction_body("claude-opus-4-6")
+    body["messages"].insert(0, {"role": "assistant", "content": [
+        {"type": "server_tool_use", "id": "ws_legacy", "name": server_tool,
+         "input": {"query": "q"}},
+        {"type": "tool_result" if server_tool == "analyze_image" else "web_search_tool_result",
+         "tool_use_id": "ws_legacy", "content": []},
+    ]})
+    window = context_overflow.estimate_overflow_prompt_tokens(body) - 1
+    captured: list[httpx.Request] = []
+    fallback_bodies: list[dict] = []
+    translate = relay_openai_backend.translate_claude_request_to_codex
+
+    def capture_translation(request_body: dict, *args: Any, **kwargs: Any) -> dict:
+        fallback_bodies.append(request_body)
+        return translate(request_body, *args, **kwargs)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(status_code, json={"id": "msg_1"})
+
+    monkeypatch.setattr(relay_openai_backend, "translate_claude_request_to_codex", capture_translation)
+    client, _ = _gateway(
+        _compaction_config({"opus": "codex:gpt-5.1-codex-max"}), handler,
+        codex_context_window=window,
+    )
+    response = client.post("/v1/messages", json=body, headers=_ANTHROPIC_CREDENTIAL_HEADERS)
+    assert response.status_code == (200 if status_code == 200 else 503)
+    (upstream,) = captured
+    content = json.loads(upstream.content)["messages"][0]["content"]
+    assert [block["type"] for block in content] == ["text", "text"]
+    assert fallback_bodies == ([] if status_code == 200 else [body])
+
+
+@pytest.mark.parametrize("target", ["anthropic", "codex", "grok", "responses-api"])
+@pytest.mark.parametrize("stream", [False, True])
+def test_provider_image_analysis_history_survives_backend_switch(target: str, stream: bool) -> None:
+    tool_id = "call_120ce1bcb52744d6a5034c48"
+    source_content = [
+        {"type": "server_tool_use", "name": "analyze_image", "id": tool_id, "input": {}},
+        {"type": "tool_result", "tool_use_id": tool_id,
+         "content": [{"type": "text", "text": "The image shows a blue triangle."}]},
+    ]
+    forwarded_bodies: list[dict] = []
+
+    def source_handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={
+            "type": "message", "role": "assistant", "model": "source-model",
+            "content": source_content, "stop_reason": "end_turn",
+        })
+
+    def target_handler(request: httpx.Request) -> httpx.Response:
+        forwarded_bodies.append(json.loads(request.content))
+        if stream:
+            return httpx.Response(200, headers={"content-type": "text/event-stream"},
+                                  content=b'event: message_stop\ndata: {"type":"message_stop"}\n\n')
+        return httpx.Response(200, json={"type": "message", "content": []})
+
+    provider = AnthropicCompatibleProvider(base_url="https://source.example/v1", api_key="test-key")
+    source_client = AnthropicCompatibleClient(
+        "messages-api", provider, httpx.AsyncClient(transport=httpx.MockTransport(source_handler))
+    )
+    response_events = [
+        {"type": "response.created", "response": {"id": "resp_test", "model": "target-model"}},
+        {"type": "response.output_text.delta", "delta": "Analysis received."},
+        {"type": "response.completed", "response": {"id": "resp_test", "usage": {}, "output": []}},
+    ]
+    responses_client = StubOpenAICompatibleClient(response_events)
+    config = GatewayConfig(
+        model_map={"opus": "messages-api:source-model"},
+        custom_providers={"messages-api": provider},
+    )
+    if target != "anthropic":
+        config.model_map["sonnet"] = f"{target}:target-model"
+    if target == "responses-api":
+        config.custom_providers["responses-api"] = OpenAICompatibleProvider(
+            wire_api="responses", base_url="https://responses.example/v1", api_key="test-key"
+        )
+    custom_clients = {"messages-api": source_client}
+    if target == "responses-api":
+        custom_clients["responses-api"] = responses_client
+    client, codex = _gateway(
+        config, target_handler, grok_client=responses_client,
+        custom_provider_clients=custom_clients,
+    )
+    codex.stream_responses = responses_client.stream_responses
+    initial = _message_body("claude-opus-5")
+    first = client.post("/v1/messages", json=initial)
+    assert first.status_code == 200
+    assert first.json()["content"] == source_content
+
+    followup = _message_body("claude-sonnet-5")
+    followup["stream"] = stream
+    followup["messages"] = [*initial["messages"],
+        {"role": "assistant", "content": first.json()["content"]},
+        {"role": "user", "content": "Continue with that analysis."},
+    ]
+    second = client.post("/v1/messages", json=followup)
+    assert second.status_code == 200
+    if target == "anthropic":
+        (forwarded,) = forwarded_bodies
+        repaired = forwarded["messages"][1]["content"]
+        assert [block["type"] for block in repaired] == ["text", "text"]
+        assert "analyze_image" in repaired[0]["text"]
+        assert "The image shows a blue triangle." in repaired[1]["text"]
+    else:
+        (forwarded,) = responses_client.payloads
+        assert all(item["type"] not in ("function_call", "function_call_output")
+                   for item in forwarded["input"])
+        assistant_text = "\n".join(
+            part["text"] for item in forwarded["input"] if item.get("role") == "assistant"
+            for part in item["content"]
+        )
+        assert "analyze_image" in assistant_text
+        assert "The image shows a blue triangle." in assistant_text
+    assert followup["messages"][1]["content"] == source_content

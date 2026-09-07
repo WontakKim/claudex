@@ -29,6 +29,7 @@ from claudex.relay.registered import (
     _passthrough_with_claude_account,
     _passthrough_with_claude_pool,
 )
+from claudex.translate.server_tool_history import normalize_server_tool_history
 
 logger = logging.getLogger("claudex.server")
 
@@ -76,8 +77,14 @@ async def _passthrough_to_anthropic(
     gate: it spreads sessions across the whole registered pool by weighted
     HRW and never falls through to single-account or fallback routing. It
     dispatches only through an active `ClaudeBalancedRuntime`, otherwise it
-    returns the reserved fail-closed 503.
+    returns the reserved fail-closed 503. Incompatible server-tool history is
+    replayed as text; requests without such history keep their original bytes.
     """
+    normalized_body = normalize_server_tool_history(parsed_body)
+    if normalized_body is not parsed_body:
+        parsed_body = normalized_body
+        raw_body = json.dumps(parsed_body, ensure_ascii=False).encode()
+
     config: GatewayConfig = request.app.state.config
     if config.claude_account_routing_mode == "balanced":
         return await _passthrough_with_claude_balanced(request, raw_body, parsed_body)

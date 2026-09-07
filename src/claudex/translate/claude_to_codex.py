@@ -19,6 +19,7 @@ import re
 import uuid
 from typing import Any
 
+from .server_tool_history import normalize_server_tool_history
 from .thought_signature import (
     decode_call_signature_carrier,
     is_call_signature_carrier,
@@ -479,6 +480,7 @@ def translate_claude_request_to_codex(
     custom_provider: str | None = None,
 ) -> dict[str, Any]:
     """Build a Codex Responses API payload, optionally with a service tier."""
+    claude_request = normalize_server_tool_history(claude_request)
     name_map = build_tool_name_shortening_map(claude_request)
 
     payload: dict[str, Any] = {

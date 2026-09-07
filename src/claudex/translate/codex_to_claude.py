@@ -20,10 +20,12 @@ import json
 import re
 from dataclasses import dataclass, field
 from typing import Any
+from uuid import uuid4
 
 import claudex.translate.context_overflow as context_overflow
 from claudex.translate.claude_to_codex import build_tool_name_shortening_map, shorten_call_id
 from claudex.translate.thought_signature import encode_call_signature_carrier
+from claudex.translate.server_tool_history import GATEWAY_SERVER_TOOL_ID_PREFIX
 
 # Claude tool_use ids only allow this alphabet.
 _TOOL_ID_SANITIZER = re.compile(r"[^a-zA-Z0-9_-]")
@@ -155,6 +157,7 @@ class CodexToClaudeStreamTranslator:
     _last_pending_key: str = ""
     _closed_function_calls: list[_ClosedFunctionCall] = field(default_factory=list)
     _emitted_carrier_tool_ids: set[str] = field(default_factory=set)
+    _web_search_tool_id_map: dict[str, str] = field(default_factory=dict)
     _web_search_tool_use_ids: set[str] = field(default_factory=set)
     _web_search_tool_result_ids: set[str] = field(default_factory=set)
     _last_web_search_tool_use_id: str = ""
@@ -479,20 +482,28 @@ class CodexToClaudeStreamTranslator:
     # --- web search (server tool) events --------------------------------------
 
     def _web_search_tool_use_id(self, event: dict[str, Any], item: dict[str, Any]) -> str:
-        for key in ("id", "output_item_id", "call_id"):
+        upstream_key = ""
+        for key in ("id", "output_item_id", "call_id", "item_id"):
             for source in (item, event):
                 value = source.get(key)
                 if isinstance(value, str) and value.strip():
-                    return value.strip()
-        if self._last_web_search_tool_use_id:
-            return self._last_web_search_tool_use_id
-        for source in (item, event):
-            value = source.get("item_id")
-            if isinstance(value, str) and value.strip():
-                return value.strip()
-        generated = f"web_search_{self._block_index}"
-        self._last_web_search_tool_use_id = generated
-        return generated
+                    upstream_key = f"id:{value.strip()}"
+                    break
+            if upstream_key:
+                break
+        if not upstream_key and isinstance(event.get("output_index"), int):
+            upstream_key = f"index:{event['output_index']}"
+        if upstream_key:
+            if upstream_key not in self._web_search_tool_id_map:
+                # The namespace distinguishes unsigned Responses search results
+                # from native Anthropic server tools when history is replayed.
+                self._web_search_tool_id_map[upstream_key] = (
+                    f"{GATEWAY_SERVER_TOOL_ID_PREFIX}{uuid4().hex}"
+                )
+            return self._web_search_tool_id_map[upstream_key]
+        if not self._last_web_search_tool_use_id:
+            self._last_web_search_tool_use_id = f"{GATEWAY_SERVER_TOOL_ID_PREFIX}{uuid4().hex}"
+        return self._last_web_search_tool_use_id
 
     @staticmethod
     def _web_search_query(event: dict[str, Any], item: dict[str, Any]) -> str:

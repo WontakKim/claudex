@@ -17,6 +17,7 @@ from claudex.relay.common import (
     _PASSTHROUGH_SKIP_RESPONSE_HEADERS,
     _format_sse,
 )
+from claudex.translate.server_tool_history import normalize_server_tool_history
 from claudex.upstream_errors import UpstreamAuthError, UpstreamError
 
 logger = logging.getLogger("claudex.server")
@@ -133,7 +134,7 @@ async def _relay_via_anthropic_backend(
 ) -> Response:
     """Relay a mapped Messages request through its bound native backend."""
     requested_model = str(claude_request.get("model", ""))
-    outgoing = dict(claude_request)
+    outgoing = dict(normalize_server_tool_history(claude_request))
     outgoing["model"] = upstream_model
 
     thinking = claude_request.get("thinking")
@@ -204,7 +205,7 @@ async def _count_tokens_via_anthropic_backend(
     if backend.token_counter is None:
         return None
 
-    outgoing = dict(body)
+    outgoing = dict(normalize_server_tool_history(body))
     outgoing["model"] = upstream_model
     try:
         upstream_response = await backend.token_counter(
