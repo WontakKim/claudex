@@ -5,7 +5,8 @@
 - Serves `POST /v1/messages` in Anthropic Messages format: models with a
   `CLAUDEX_MODEL_MAP` entry are routed to the provider-prefixed target
   backend, while everything else is forwarded byte-for-byte to the real
-  Anthropic API with the client's own credentials.
+  Anthropic API with the client's own credentials, except for incompatible
+  server-tool history described below.
 - Answers as the Claude model the client requested. The mapped upstream model
   is restored in Responses-family output and in both streaming and non-streaming
   native Messages output, so Claude Code heuristics keyed on model names keep
@@ -42,9 +43,9 @@ CLAUDEX_MODEL_MAP='{"fable":"grok:grok-4.5","opus":"kimi:k3","sonnet":"codex:gpt
 
 Keys match exactly first, then as substrings, where the longest matching key
 wins (`claude-haiku` beats a catch-all `claude`). A request with no match is
-relayed verbatim to Anthropic. Values with an unknown provider prefix (or an
-empty model after the prefix) are rejected at startup and by the mapping API,
-so a typo like `"kim:k2.5"` fails loudly instead of surfacing as a baffling
+relayed to Anthropic, preserving native request content. Values with an unknown
+provider prefix (or an empty model after the prefix) are rejected at startup and
+by the mapping API, so a typo like `"kim:k2.5"` fails loudly instead of surfacing as a baffling
 upstream error.
 
 `GET /health` returns `200` with `status: "ok"` when required provider
@@ -71,9 +72,11 @@ fallback. See [Custom providers](custom-providers.md#custom-providers).
 ## Mixing Claude and Codex models
 
 The map decides per request: mapped models are translated to Codex, unmapped
-models are forwarded byte-for-byte (headers, betas, credentials) to the real
-Anthropic API. Model names stay real Claude names on both paths, so every
-Claude Code heuristic keyed on the model name keeps working.
+models are forwarded to the real Anthropic API with their headers, betas,
+and credentials. Native request bodies retain their original bytes;
+incompatible server-tool history is the exception described below. Model names
+stay real Claude names on both paths, so every Claude Code heuristic keyed on
+the model name keeps working.
 
 ```sh
 CLAUDEX_MODEL_MAP='{"opus":"codex:gpt-5.6-sol","haiku":"codex:gpt-5.6-luna"}' \
@@ -98,3 +101,43 @@ Both constraints disappear when a [registered account is
 selected](claude-accounts.md#serving-with-a-registered-account-account-use): the gateway then
 consumes client credentials instead of forwarding them, so a dummy token —
 or the local token itself — is exactly what the client should send.
+
+### Server-tool history across backends
+
+Some Messages-compatible providers perform internal operations such as
+`analyze_image` and emit a `server_tool_use` followed by a `tool_result` inside
+the assistant response. Those are not client-executed function calls. Native
+Anthropic rejects their nonstandard server-tool IDs, while Responses rejects a
+function-call output if its server-side call was omitted during translation.
+
+Before either Messages replay or Responses translation, the gateway converts
+incompatible server calls and their assistant-side results to ordinary text.
+It retains the tool name, input, result content, error indication, and cache
+control without fabricating a client call or discarding the analysis. Pairing
+covers consecutive assistant messages, because streaming clients may store one
+response in several records. A user turn ends that pairing scope; later client
+calls reusing an ID keep their own results.
+
+Normal client `tool_use`/user `tool_result` pairs and valid native Anthropic
+server-tool blocks are not reclassified. Unrelated orphan client results are
+not silently deleted. Existing transcript files remain unchanged: repair is
+applied to the outgoing request only.
+
+Responses web-search calls are exposed to Claude Code using valid
+`srvtoolu_gateway_...` IDs. A call and its result share the same ID. Repeated
+events identified by the same upstream call ID or output index do not produce
+duplicate blocks.
+
+Responses results do not contain Anthropic's native `encrypted_content`. Before
+replaying that history, the gateway converts the synthetic
+call and result blocks to text, preserving their search input, result titles,
+URLs, and other result data. This also repairs older histories whose server-tool
+IDs lack the required `srvtoolu_` prefix or contain invalid characters. Native-ID
+search results missing `encrypted_content` are converted together with their
+matching calls.
+
+The same repair applies to Anthropic passthrough, registered-account routing,
+Kimi, custom Messages providers, native token counting, Anthropic compaction
+reroutes, and built-in or custom Responses providers. Existing client transcripts are not modified. Native Anthropic search
+calls and signed results remain untouched, including their citations. Requests
+that need no repair keep the usual passthrough behavior.

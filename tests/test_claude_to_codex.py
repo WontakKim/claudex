@@ -1,5 +1,7 @@
 """Tests for the Anthropic Messages -> Codex Responses request translation."""
 
+from copy import deepcopy
+
 import pytest
 
 from claudex.translate.claude_to_codex import (
@@ -737,3 +739,145 @@ def test_shorten_call_id_is_stable_and_bounded() -> None:
     assert first == second
     assert len(first) <= 64
     assert shorten_call_id("toolu_short") == "toolu_short"
+
+
+_IMAGE_ANALYSIS_CALL_ID = "call_120ce1bcb52744d6a5034c48"
+
+
+def _image_analysis_messages(*, merged: bool, result_content: object) -> list[dict]:
+    call = {
+        "type": "server_tool_use",
+        "name": "analyze_image",
+        "id": _IMAGE_ANALYSIS_CALL_ID,
+        "input": {},
+    }
+    result = {
+        "type": "tool_result",
+        "tool_use_id": _IMAGE_ANALYSIS_CALL_ID,
+        "content": result_content,
+    }
+    if merged:
+        return [{"role": "assistant", "content": [call, result]}]
+    return [
+        {"role": "assistant", "content": [call]},
+        {"role": "assistant", "content": [result]},
+    ]
+
+
+@pytest.mark.parametrize("merged", [False, True], ids=["separate", "merged"])
+@pytest.mark.parametrize(
+    "result_content",
+    [
+        "The image shows a blue triangle.",
+        [
+            {"type": "text", "text": "The image shows a blue triangle."},
+            {"type": "text", "text": "A small caption is visible."},
+        ],
+    ],
+    ids=["string-result", "text-block-result"],
+)
+def test_image_analysis_history_becomes_text_without_orphan_function_output(
+    merged: bool, result_content: object
+) -> None:
+    request = {
+        "messages": [
+            {"role": "user", "content": "Describe the image."},
+            *_image_analysis_messages(merged=merged, result_content=result_content),
+            {"role": "user", "content": "Read the accompanying file."},
+            {"role": "assistant", "content": [_tool_use_block("call_client", "read_file")]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "call_client", "content": "File contents."},
+            ]},
+        ],
+    }
+    original = deepcopy(request)
+
+    payload = translate_claude_request_to_codex(request, codex_model="gpt-5.5")
+
+    assert request == original
+    assert _find_items(payload, "function_call") == [{
+        "type": "function_call", "call_id": "call_client",
+        "name": "read_file", "arguments": "{}",
+    }]
+    assert _find_items(payload, "function_call_output") == [{
+        "type": "function_call_output", "call_id": "call_client", "output": "File contents.",
+    }]
+    assistant_parts = [
+        part
+        for item in _find_items(payload, "message") if item["role"] == "assistant"
+        for part in item["content"]
+    ]
+    assert all(part["type"] == "output_text" for part in assistant_parts)
+    assistant_text = "\n".join(part["text"] for part in assistant_parts)
+    assert "analyze_image" in assistant_text
+    assert "{}" in assistant_text
+    assert "The image shows a blue triangle." in assistant_text
+    if isinstance(result_content, list):
+        assert "A small caption is visible." in assistant_text
+
+
+def test_image_analysis_id_reused_by_later_client_tool_keeps_legitimate_result() -> None:
+    request = {"messages": [
+        {"role": "user", "content": "Describe the image."},
+        *_image_analysis_messages(merged=False, result_content="An internal image analysis."),
+        {"role": "user", "content": "Read the accompanying file."},
+        {"role": "assistant", "content": [_tool_use_block(_IMAGE_ANALYSIS_CALL_ID, "read_file")]},
+        {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": _IMAGE_ANALYSIS_CALL_ID,
+             "content": "Later client tool result."},
+        ]},
+    ]}
+    original = deepcopy(request)
+
+    payload = translate_claude_request_to_codex(request, codex_model="gpt-5.5")
+
+    assert request == original
+    assert _find_items(payload, "function_call") == [{
+        "type": "function_call", "call_id": _IMAGE_ANALYSIS_CALL_ID,
+        "name": "read_file", "arguments": "{}",
+    }]
+    assert _find_items(payload, "function_call_output") == [{
+        "type": "function_call_output", "call_id": _IMAGE_ANALYSIS_CALL_ID,
+        "output": "Later client tool result.",
+    }]
+    assert "An internal image analysis." in str(_find_items(payload, "message"))
+
+
+def test_image_analysis_repair_does_not_make_native_search_a_client_function_call() -> None:
+    request = {
+        "messages": [
+            {"role": "user", "content": "Describe the image."},
+            *_image_analysis_messages(merged=True, result_content="An internal image analysis."),
+            {"role": "user", "content": "Search for context and read the file."},
+            {"role": "assistant", "content": [
+                {"type": "server_tool_use", "name": "web_search",
+                 "id": "srvtoolu_native_search", "input": {"query": "image context"}},
+                {"type": "web_search_tool_result", "tool_use_id": "srvtoolu_native_search",
+                 "content": [{"type": "web_search_result", "title": "Context",
+                              "url": "https://example.invalid/context", "page_age": None,
+                              "encrypted_content": "native-opaque-content"}]},
+                _tool_use_block("call_client", "read_file"),
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "call_client", "content": "File contents."},
+            ]},
+        ],
+        "tools": [
+            {"type": "web_search_20250305", "name": "web_search"},
+            {"name": "read_file", "input_schema": {"type": "object", "properties": {}}},
+        ],
+    }
+    original = deepcopy(request)
+
+    payload = translate_claude_request_to_codex(request, codex_model="gpt-5.5")
+
+    assert request == original
+    assert _find_items(payload, "function_call") == [{
+        "type": "function_call", "call_id": "call_client",
+        "name": "read_file", "arguments": "{}",
+    }]
+    assert _find_items(payload, "function_call_output") == [{
+        "type": "function_call_output", "call_id": "call_client", "output": "File contents.",
+    }]
+    assert {"type": "web_search"} in payload["tools"]
+    assert "An internal image analysis." in str(_find_items(payload, "message"))

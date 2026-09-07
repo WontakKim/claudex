@@ -91,9 +91,12 @@ or `429`.
 The generic Messages relay supports streaming and non-streaming requests. It
 changes the outgoing top-level model to the mapped upstream model, then restores
 the Claude model requested by the caller in a non-streaming JSON response or the
-streaming `message_start` event. Other request content remains structurally
-unchanged. This preserves tool-use/tool-result continuation and passes native
-thinking and signature blocks through without interpreting them. Other
+streaming `message_start` event. Incompatible provider-internal tool history,
+such as `analyze_image` calls with assistant-side results, and unsigned Responses
+search history are [replayed as text](model-mapping.md#server-tool-history-across-backends).
+This also repairs histories created before a backend switch. Other request
+content remains structurally unchanged. Normal client tool calls and results,
+native thinking, and signature blocks pass through without interpretation. Other
 streaming events are relayed unchanged apart from normal response-header
 filtering and error handling.
 

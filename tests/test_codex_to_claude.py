@@ -1567,9 +1567,11 @@ def test_web_search_call_emits_server_tool_use_and_result() -> None:
 
     tool_use_start = events[1][1]
     assert tool_use_start["index"] == 0
+    tool_use_id = tool_use_start["content_block"]["id"]
+    assert re.fullmatch(r"srvtoolu_[a-zA-Z0-9_]+", tool_use_id)
     assert tool_use_start["content_block"] == {
         "type": "server_tool_use",
-        "id": "ws_1",
+        "id": tool_use_id,
         "name": "web_search",
         "input": {},
     }
@@ -1581,7 +1583,7 @@ def test_web_search_call_emits_server_tool_use_and_result() -> None:
     assert result_start["index"] == 1
     assert result_start["content_block"] == {
         "type": "web_search_tool_result",
-        "tool_use_id": "ws_1",
+        "tool_use_id": tool_use_id,
         "content": [
             {
                 "type": "web_search_result",
@@ -1653,3 +1655,79 @@ def test_incomplete_response_maps_max_tokens_stop_reason() -> None:
     )
     message_delta = next(payload for name, payload in events if name == "message_delta")
     assert message_delta["delta"]["stop_reason"] == "max_tokens"
+
+
+@pytest.mark.parametrize(
+    ("item_fields", "event_fields"),
+    [
+        ({"id": "ws_1"}, {}),
+        ({"id": "ws-with.dots/검색"}, {}),
+        ({"id": "srvtoolu_native"}, {}),
+        ({"output_item_id": "search-1"}, {}),
+        ({"call_id": "call-1"}, {}),
+        ({}, {"item_id": "ws-1"}),
+        ({}, {"id": "event-1"}),
+        ({"id": "  "}, {"output_index": 0}),
+    ],
+)
+def test_web_search_ids_are_valid_paired_and_deduplicated(
+    item_fields: dict, event_fields: dict
+) -> None:
+    done = {
+        "type": "response.output_item.done",
+        **event_fields,
+        "item": {
+            "type": "web_search_call",
+            "action": {"type": "search", "query": "q"},
+            **item_fields,
+        },
+    }
+    events = _run_stream({}, [done, done])
+    blocks = [payload["content_block"] for name, payload in events
+              if name == "content_block_start"]
+    assert len(blocks) == 2
+    assert re.fullmatch(r"srvtoolu_[a-zA-Z0-9_]+", blocks[0]["id"])
+    assert blocks[0]["id"].startswith("srvtoolu_gateway_")
+    assert blocks[1]["tool_use_id"] == blocks[0]["id"]
+
+
+def test_distinct_web_search_ids_do_not_collide_after_sanitization() -> None:
+    events = _run_stream({}, [
+        {
+            "type": "response.output_item.done",
+            "item": {
+                "type": "web_search_call", "id": upstream_id,
+                "action": {"type": "search", "query": "q"},
+            },
+        }
+        for upstream_id in ("ws-a", "ws.a", "ws_a")
+    ])
+    blocks = [payload["content_block"] for name, payload in events
+              if name == "content_block_start"]
+    call_ids = [block["id"] for block in blocks if block["type"] == "server_tool_use"]
+    result_ids = [block["tool_use_id"] for block in blocks
+                  if block["type"] == "web_search_tool_result"]
+    assert len(set(call_ids)) == 3
+    assert result_ids == call_ids
+    assert all(re.fullmatch(r"srvtoolu_[a-zA-Z0-9_]+", value) for value in call_ids)
+
+
+@pytest.mark.parametrize("item_fields", [{}, {"id": "ws_1"}])
+def test_web_search_ids_are_unique_across_responses(item_fields: dict) -> None:
+    done = {
+        "type": "response.output_item.done",
+        "item": {
+            "type": "web_search_call",
+            "action": {"type": "search", "query": "q"},
+            **item_fields,
+        },
+    }
+    call_ids = []
+    for _ in range(2):
+        events = _run_stream({}, [done])
+        blocks = [payload["content_block"] for name, payload in events
+                  if name == "content_block_start"]
+        assert re.fullmatch(r"srvtoolu_[a-zA-Z0-9_]+", blocks[0]["id"])
+        assert blocks[1]["tool_use_id"] == blocks[0]["id"]
+        call_ids.append(blocks[0]["id"])
+    assert call_ids[0] != call_ids[1]

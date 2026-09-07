@@ -23,6 +23,8 @@ import hmac
 from collections.abc import Mapping
 from typing import Any
 
+from claudex.translate.server_tool_history import normalize_server_tool_history
+
 # These three literals were extracted from the Claude Code 2.1.223 client
 # binary and form a versioned contract with that exact release. They must
 # only be changed after re-verifying the new literal text against the
@@ -88,10 +90,10 @@ def build_reroute_payload(body: dict, target_model_id: str) -> dict:
     translating a non-Anthropic backend's response is never a valid
     Anthropic signature, so it cannot be replayed to Anthropic. A message
     left with an empty content list after stripping is dropped entirely.
-    String content, non-thinking blocks, and every other field are left
-    untouched. No nested mutable object in the return value aliases `body`,
-    so the caller can still send the original, unmodified request for
-    mapped fallback.
+    Incompatible server-tool blocks are replayed as text; other non-thinking
+    content and every other field are left untouched. No nested mutable
+    object in the return value aliases `body`, so the caller can still send
+    the original, unmodified request for mapped fallback.
     """
     payload = copy.deepcopy(body)
     payload["model"] = target_model_id
@@ -114,7 +116,7 @@ def build_reroute_payload(body: dict, target_model_id: str) -> dict:
             message["content"] = stripped_content
         kept_messages.append(message)
     payload["messages"] = kept_messages
-    return payload
+    return normalize_server_tool_history(payload)
 
 
 _DEFAULT_ANTHROPIC_VERSION = "2023-06-01"
