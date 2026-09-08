@@ -56,6 +56,24 @@ an `ok` state confirms configuration and binding only, not remote entitlement or
 Messages compatibility. Use `POST /admin/test` with a complete mapped target for
 explicit remote verification.
 
+### Manually mapping Codex Astra
+
+The Router model field accepts manual IDs even when they do not appear in the
+live catalog suggestions. To route Opus requests to Astra, enter the complete
+target `codex:gpt-6-astra`, or configure the same target directly:
+
+```sh
+CLAUDEX_MODEL_MAP='{"opus":"codex:gpt-6-astra"}' uv run claudex-gateway
+```
+
+The `codex:` prefix selects the Codex backend, and the gateway forwards the
+`gpt-6-astra` suffix unchanged. Accepting this mapping confirms only the local
+routing contract; it does not confirm that the selected Codex account can use
+the model. The upstream service remains authoritative and may reject the
+request. A successful connection-test status alone does not prove that the
+upstream served the exact model unless its response makes model identity
+observable.
+
 ## Custom provider targets
 
 Custom provider names become model-map prefixes. The configured family, not the
