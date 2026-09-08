@@ -642,6 +642,17 @@ def test_mapped_model_routes_to_codex() -> None:
     assert captured == []
 
 
+def test_codex_astra_model_is_forwarded_unchanged() -> None:
+    config = GatewayConfig(model_map={"opus": "codex:gpt-6-astra"})
+    client, stub = _gateway(config, _failing_anthropic_handler)
+
+    response = client.post("/v1/messages", json=_message_body("claude-opus-4-6"))
+
+    assert response.status_code == 503
+    assert len(stub.payloads) == 1
+    assert stub.payloads[0]["model"] == "gpt-6-astra"
+
+
 def test_codex_fast_tier_is_sent_for_supported_model(
     caplog: pytest.LogCaptureFixture,
 ) -> None:

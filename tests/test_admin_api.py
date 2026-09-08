@@ -2750,8 +2750,8 @@ def test_dashboard_settings_tab_leads_and_holds_compaction(
 def test_dashboard_optional_providers_hidden_until_detected(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    # Kimi and Grok are extensions: their Status cards and the Router
-    # add-node provider buttons ship hidden and are revealed from /health
+    # Kimi and Grok are extensions: their Status cards and the quick-add
+    # chooser's provider options ship hidden and are revealed from /health
     # only when a local login is detected — or when the map already routes
     # to them, where hiding a required-login error would mislead. The gating
     # is cosmetic only; routing, settings.json, and the admin API are
@@ -2767,8 +2767,10 @@ def test_dashboard_optional_providers_hidden_until_detected(
     assert 'id="card-codex"' not in page
     assert "function setProviderVisibility(" in javascript
     assert 'info.status==="ok"||info.required===true' in javascript
-    # The Router provider picker builds optional providers hidden too.
-    assert '''(p==="codex"?"":' class="provider-hidden"')''' in javascript
+    # The quick-add provider select builds optional providers hidden too:
+    # options follow PROVIDER_VISIBLE, and a visibility change refreshes them.
+    assert "function renderProviderOptions(){" in javascript
+    assert "PROVIDER_VISIBLE[p]!==false" in javascript
     # Bulk usage refresh only probes visible cards.
     assert "PROVIDER_VISIBLE[p]!==false" in javascript
 
@@ -2845,6 +2847,51 @@ def test_dashboard_served_at_root(monkeypatch: pytest.MonkeyPatch, tmp_path: Pat
     assert "Claudex Gateway" in response.text
     assert 'rel="stylesheet" href="/dashboard.css"' in response.text
     assert 'src="/dashboard.js"' in response.text
+
+
+def test_dashboard_serves_canvas_quick_add_with_stable_hooks(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        page = _dashboard_sources(client)["html"]
+
+    router_start = page.index('id="tab-map"')
+    router_end = page.index("</section>", router_start)
+    router = page[router_start:router_end]
+    assert (
+        router.index('class="lockband"')
+        < router.index('class="board" id="board"')
+        < router.index('id="model-picker"')
+    )
+    # No persistent above-canvas provider toolbar: creation moved onto the
+    # canvas itself.
+    assert "addtoolbar" not in page
+    for legacy_id in ("add-prov", "add-model", "add-catalog", "add-go"):
+        assert f'id="{legacy_id}"' not in page
+    # The board is keyboard-focusable so the Shift+A shortcut has a target
+    # that typing in a field can never reach.
+    assert 'id="board" tabindex="0"' in page
+    board_start = router.index('class="board" id="board"')
+    board_end = router.index('id="model-picker"', board_start)
+    board = router[board_start:board_end]
+    # The always-visible fallback button lives inside the board, after the
+    # transformed node layer, so pan and zoom never move it.
+    assert board.index('id="layer"') < board.index('id="node-add"')
+    assert 'aria-haspopup="dialog"' in board
+    assert ">+ 노드 추가</button>" in board
+    for element_id in (
+        "node-add",
+        "model-picker",
+        "provider-select",
+        "model-query",
+        "picker-state",
+        "model-options",
+        "picker-close",
+    ):
+        assert page.count(f'id="{element_id}"') == 1
+    # The chooser is transient: hidden by default and position:fixed when
+    # open, so it consumes no idle layout space.
+    assert '<div id="model-picker" class="addpick" hidden role="dialog"' in page
 
 
 @pytest.mark.parametrize(
@@ -2985,10 +3032,12 @@ def test_dashboard_board_shows_only_referenced_targets(
         html = sources["html"]
 
     # With several providers a catalog dump is unusable as a board, so target
-    # nodes are only what the map references plus what the add-node box
-    # stages; the catalogs survive purely as autocomplete for that box.
+    # nodes are only what the map references plus what the quick-add chooser
+    # stages; the catalogs survive purely as suggestions for that chooser.
     assert "concat(Object.values(DIR.mapping),addedTargets)" in page
-    assert 'list="add-catalog"' in html
+    assert "function renderPicker(){" in page
+    assert "CATALOG[addProvider]" in page
+    assert "datalist" not in html
     # All provider catalogs feed it, so the dashboard depends on the Kimi
     # and Grok endpoints too — not just the Codex one.
     assert '"/admin/providers/kimi/models"' in page

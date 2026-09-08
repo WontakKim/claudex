@@ -17,12 +17,40 @@ Opening `http://127.0.0.1:8787/` uses the same guarded admin API as the CLI:
   below.
 - **Log** reads `GET /admin/logs` and changes the persisted runtime log level
   through `PUT /admin/settings/log-level`.
-- **Router** edits the provider-prefixed model map on a canvas and includes the
-  existing manual model input and `POST /admin/test` connection test.
+- **Router** edits the provider-prefixed model map on a canvas. Targets are
+  added through an in-canvas quick-add chooser, and `POST /admin/test` checks
+  connections before wiring.
+
+Open the chooser with the **+ 노드 추가** button pinned at the board's
+bottom-right corner, by double-clicking or right-clicking empty canvas, or by
+focusing the board (click empty canvas, then Tab) and pressing Shift+A. The
+last two place the new node at the clicked lane; the button and shortcut use
+the default stacking below the existing nodes. Nodes, ports, wires, and the
+zoom controls never open it — right-clicking them keeps the native menu — and
+the shortcut only fires while the board itself is focused, so typing in any
+field cannot trigger it.
+
+The chooser lists the providers the dashboard currently shows. Switching
+providers clears the search and refocuses it. Catalog suggestions appear as
+you type; a model ID no catalog suggests — including differently-cased IDs
+with extra colons — can still be entered verbatim and committed with Enter,
+in every catalog state (loading, failed, or not configured). The chooser
+closes on Escape, the 닫기 button, an outside click, or leaving the Router
+tab. The chooser opens right-aligned above the add button with an 8px gap
+between its bottom edge and the button's top edge, clamped inside the visible
+canvas and viewport; the footer hint's own bottom padding is a separate 8px.
+
+Committing stages the target as an unwired node; adding alone never wires,
+marks the draft dirty, saves, or contacts a provider. Wire it to a source to
+change the draft, use Discard to clear staged changes, and use Apply to send
+the complete draft to `PUT /admin/settings/mapping`. Duplicate targets are
+shown only once, and a duplicate commit keeps the chooser open. Contextually
+placed nodes land at the clicked height, nudged down past any node already
+occupying that lane; every other node keeps its position.
 
 The Router becomes view-only when `CLAUDEX_MODEL_MAP` overrides the persisted
-map. Otherwise, Apply sends the complete draft to
-`PUT /admin/settings/mapping`.
+map. The add button, the chooser, and every creation gesture are disabled
+while this lock is active, and an open chooser closes when the lock engages.
 
 ## GPT Pro MCP
 
@@ -87,7 +115,7 @@ verification path.
 
 ## Model catalogs and manual entry
 
-Built-in add-node suggestions use:
+Built-in quick-add suggestions use:
 
 - `GET /admin/providers/codex/models`
 - `GET /admin/providers/kimi/models`
@@ -95,10 +123,10 @@ Built-in add-node suggestions use:
 
 Catalog-capable custom providers use
 `GET /admin/providers/custom/{name}/models`. Catalog failures only remove
-autocomplete suggestions. The existing manual model field remains authoritative:
-a typed model ID can be staged and mapped even when it did not come from a
-catalog. Catalog-less Anthropic-compatible providers therefore require manual
-model IDs; the dashboard does not add a separate provider-specific model UI.
+suggestions. The chooser's manual entry remains authoritative: a typed model
+ID can be staged and mapped even when it did not come from a catalog.
+Catalog-less Anthropic-compatible providers therefore require manual model
+IDs; the chooser shows a short notice for them instead of an empty list.
 
 Custom provider names can be arbitrary valid configured names, including names
 that sound like another API family. Names never determine wire labels, catalog
