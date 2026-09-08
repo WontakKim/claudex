@@ -146,6 +146,7 @@ var WIRE_DEFS='<defs>'+
 function renderChrome(){
   document.getElementById("lock-env").textContent=DIR.envName;
   document.body.classList.toggle("env-locked",!!DIR.locked);
+  syncAddLock();
 }
 function render(){
   // The target column follows the map, so it is rebuilt on every render.
@@ -252,6 +253,9 @@ board.addEventListener("click",function(ev){
   if(ev.target===board||ev.target===svg){DIR.sel=null;document.getElementById("wdel").classList.remove("show");drawWires()}
 });
 board.addEventListener("pointerdown",function(ev){
+  // Non-primary buttons never pan, drag a wire, or move a node: the right
+  // button belongs to the blank-canvas context menu.
+  if(ev.button!==0)return;
   var port=ev.target.closest?ev.target.closest(".node.src .port"):null;
   if(port){
     // Source port: drag rightward to a target node.
@@ -381,59 +385,293 @@ board.addEventListener("wheel",function(ev){
   zoom=next;
   applyView();drawWires();
 },{passive:false});
-/* === Target node staging ================================================= */
+/* === Canvas quick-add chooser ============================================ */
+var PICKER_GAP=8;    /* external gap between the chooser's bottom and the add button's top */
+var PICKER_INSET=8;  /* how far the chooser stays inside the board and viewport edges */
+var modelPicker=document.getElementById("model-picker"),
+  providerSel=document.getElementById("provider-select"),
+  pickerCloseBtn=document.getElementById("picker-close"),
+  modelQuery=document.getElementById("model-query"),
+  pickerState=document.getElementById("picker-state"),
+  modelOptions=document.getElementById("model-options"),
+  nodeAddBtn=document.getElementById("node-add");
+var pickerOptions=[],pickerActive=-1,pickerComposing=false,pickerTrigger=board,pickerY=null;
+/* Providers whose configuration ships no catalog endpoint: suggestions can
+   never load, so the chooser says so instead of looking silently empty. */
+var CATALOGLESS={};
 var addProvider="codex";
-document.getElementById("add-prov").innerHTML=ROUTE_PROVIDERS.map(function(p){
-  // Optional providers start hidden; setProviderVisibility reveals them
-  // once /health confirms a local login (or a map route that needs one).
-  return'<button data-p="'+p+'"'+(p==="codex"?"":' class="provider-hidden"')+">"+p+"</button>";
-}).join("");
-/* The provider buttons are built once and only toggled: re-rendering them
-   would detach the clicked one mid-event, and the outside-click listener
-   below would then see a node with no .addnode ancestor and close the form. */
-function renderAddForm(){
-  document.querySelectorAll("#add-prov button").forEach(function(b){
-    b.classList.toggle("on",b.dataset.p===addProvider);
-  });
-  document.getElementById("add-catalog").innerHTML=CATALOG[addProvider].map(function(id){
-    return'<option value="'+esc(id).replace(/"/g,"&quot;")+'">';
-  }).join("");
-}
-function openAddForm(open){
-  document.getElementById("add-form").classList.toggle("open",open);
-  if(open){renderAddForm();document.getElementById("add-model").focus()}
-}
-function addTargetNode(){
-  var input=document.getElementById("add-model"),model=input.value.trim();
-  if(!model)return;
-  // The catalog only suggests: a typed ID the gateway has never heard of is
-  // still valid, exactly as a hand-written model_map value would be.
+
+/* Target staging: an added node is unwired until a wire is drawn to it, so
+   this never touches DIR.mapping, dirties the draft, or talks to the
+   gateway. The catalog only suggests: a typed ID is authoritative, exactly
+   as a hand-written model_map value would be. */
+function stageTarget(model,y){
+  if(DIR.locked||!model)return false;
   var value=routeValue(addProvider,model);
-  if(addedTargets.indexOf(value)<0)addedTargets.push(value);
-  input.value="";openAddForm(false);render();
+  var already=addedTargets.indexOf(value)>=0||
+    DIR.targets.some(function(t){return t.id===value});
+  if(already)return false;
+  addedTargets.push(value);
+  /* A contextual entry seeds the clicked lane position (rebuildColumn keeps
+     preseeded DIR.targets entries); every other entry keeps the existing
+     stacking, and the target-side default x never changes. */
+  if(y!=null)DIR.targets.push({id:value,y:freeLaneY(y)});
+  render();
+  return true;
 }
-document.getElementById("add-open").addEventListener("click",function(){
-  openAddForm(!document.getElementById("add-form").classList.contains("open"));
+/* Nudge a contextual y down past occupied lanes. The step measures a real
+   rendered node when one exists; the band matches the node-drag clamp. */
+function freeLaneY(y){
+  var probe=layer.querySelector(".node.tgt");
+  var step=probe&&probe.offsetHeight?probe.offsetHeight+10:48;
+  var lo=-260,hi=860;
+  var used=DIR.targets.map(function(t){return t.y});
+  var cand=Math.round(Math.max(lo,Math.min(hi,y)));
+  for(var pass=0;pass<2;pass++){
+    while(cand<=hi&&used.some(function(ty){return Math.abs(ty-cand)<step}))cand+=step;
+    if(cand<=hi)return cand;
+    cand=lo;
+  }
+  return Math.round(y);
+}
+/* Native provider select: options follow live visibility, so kimi/grok
+   appear with a detected login and configured customs stay listed. */
+function renderProviderOptions(){
+  var visible=ROUTE_PROVIDERS.filter(function(p){return PROVIDER_VISIBLE[p]!==false});
+  if(visible.indexOf(addProvider)<0)addProvider=visible[0]||"codex";
+  providerSel.replaceChildren();
+  visible.forEach(function(p){
+    var option=document.createElement("option");
+    option.value=p;option.textContent=p;
+    providerSel.appendChild(option);
+  });
+  providerSel.value=addProvider;
+}
+/* A late catalog reply only refreshes an already-open chooser; it can never
+   open one (e.g. after the user left the Router tab). */
+function refreshOpenPicker(name){
+  if(!modelPicker.hidden&&addProvider===name)renderPicker();
+}
+/* Locking disables every creation route and closes an open chooser. */
+function syncAddLock(){
+  var locked=!!DIR.locked;
+  nodeAddBtn.disabled=locked;
+  providerSel.disabled=locked;
+  modelQuery.disabled=locked;
+  pickerCloseBtn.disabled=locked;
+  renderProviderOptions();
+  if(locked)closePicker(false);
+}
+function renderPicker(){
+  if(modelPicker.hidden)return;
+  var raw=modelQuery.value.trim(),low=raw.toLowerCase();
+  /* filter on the trimmed query so padded input still hits suggestions */
+  var hits=(CATALOG[addProvider]||[]).filter(function(id){
+    return !low||String(id).toLowerCase().indexOf(low)>=0;
+  });
+  pickerOptions=hits.map(function(id){return{id:id,kind:"catalog"}});
+  /* Exact case-sensitive check: a differently-cased or extra-colon ID stays
+     a manual candidate in every catalog state. */
+  if(raw&&hits.indexOf(raw)<0)pickerOptions.push({id:raw,kind:"manual"});
+  pickerActive=pickerOptions.length?0:-1;
+  var onBoard={};
+  DIR.targets.forEach(function(t){onBoard[t.id]=true});
+  modelOptions.replaceChildren();
+  pickerOptions.forEach(function(o,i){
+    var el=document.createElement("div");
+    el.className="addpick-option"+(o.kind==="manual"?" manual":"");
+    el.id="add-opt-"+i;
+    el.setAttribute("role","option");
+    el.setAttribute("data-i",String(i));
+    var id=document.createElement("span");
+    id.className="addpick-id";id.textContent=o.id;
+    el.appendChild(id);
+    var value=routeValue(addProvider,o.id);
+    if(o.kind==="manual"||onBoard[value]){
+      var note=document.createElement("small");
+      note.textContent=o.kind==="manual"?"직접 입력 · 카탈로그에 없어도 추가":"이미 추가됨";
+      el.appendChild(note);
+    }
+    modelOptions.appendChild(el);
+  });
+  /* Ordinary ready catalogs hide the status line entirely, including its
+     space; only a capability boundary carries information. */
+  if(CATALOGLESS[addProvider]){
+    pickerState.hidden=false;
+    pickerState.textContent="카탈로그 없음 · 모델 ID를 직접 입력하세요";
+  }else pickerState.hidden=true;
+  syncPickerActive();
+  placePicker();
+}
+function syncPickerActive(){
+  Array.from(modelOptions.children).forEach(function(el,i){
+    el.setAttribute("aria-selected",String(i===pickerActive));
+  });
+  if(pickerActive>=0)modelQuery.setAttribute("aria-activedescendant","add-opt-"+pickerActive);
+  else modelQuery.removeAttribute("aria-activedescendant");
+  var activeEl=modelOptions.children[pickerActive];
+  if(activeEl)activeEl.scrollIntoView({block:"nearest"});
+}
+/* Allowed rectangle: the visible board inset by PICKER_INSET, intersected
+   with the viewport and, when it is showing, the fixed apply bar. The
+   chooser can never cover the tabs above the board or spill below it. */
+function pickerBounds(){
+  var cr=board.getBoundingClientRect();
+  var bottom=Math.min(cr.bottom-PICKER_INSET,window.innerHeight-PICKER_INSET);
+  var bar=document.querySelector(".applybar");
+  if(bar){
+    var br=bar.getBoundingClientRect();
+    if(br.height)bottom=Math.min(bottom,br.top-PICKER_INSET);
+  }
+  var left=Math.max(cr.left+PICKER_INSET,PICKER_INSET);
+  return{
+    left:left,
+    right:Math.max(left,Math.min(cr.right-PICKER_INSET,window.innerWidth-PICKER_INSET)),
+    top:Math.max(cr.top+PICKER_INSET,PICKER_INSET),
+    bottom:bottom,
+    visible:cr.bottom>0&&cr.top<window.innerHeight&&cr.right>0&&cr.left<window.innerWidth
+  };
+}
+/* Anchors to the add button's CURRENT rect for every entry path: exact
+   right-edge alignment with the button, chooser bottom PICKER_GAP above the
+   button top. Width is budgeted leftward from the button's right edge and
+   height upward from the same gap-adjusted anchor, so clamping can neither
+   nudge the chooser sideways nor erase the gap. Placement never touches the
+   staging y hint captured at invocation. */
+function placePicker(){
+  if(modelPicker.hidden)return;
+  var b=pickerBounds();
+  /* board wholly offscreen: cancel instead of floating over other UI */
+  if(!b.visible||b.right-b.left<=0||b.bottom-b.top<=0){closePicker(false);return}
+  var btn=nodeAddBtn.getBoundingClientRect();
+  var rightEdge=Math.min(btn.right,b.right);
+  var anchorBottom=Math.min(btn.top-PICKER_GAP,b.bottom);
+  modelPicker.style.maxWidth=Math.max(0,rightEdge-b.left)+"px";
+  modelPicker.style.maxHeight=Math.max(0,anchorBottom-b.top)+"px";
+  var pr=modelPicker.getBoundingClientRect(),w=pr.width,h=pr.height;
+  var left=rightEdge-w;               /* right edges align with the button */
+  if(left<b.left)left=b.left;         /* alignment impossible: stay inset */
+  var top=anchorBottom-h;             /* bottom sits GAP px above the button */
+  if(top+h>b.bottom)top=b.bottom-h;   /* apply-bar/viewport cut: gap only grows */
+  if(top<b.top)top=b.top;             /* never above the board */
+  /* The layout box is fractional (offsetHeight rounds it); anchoring and
+     positioning on the actual box keeps the gap exact instead of compounding
+     integer rounding into the anchor. */
+  modelPicker.style.left=left+"px";
+  modelPicker.style.top=top+"px";
+}
+function openPicker(entry,y){
+  if(DIR.locked)return;
+  pickerY=y!=null?y:null;   /* graph-relative hint; null -> existing stacking */
+  pickerTrigger=entry==="button"?nodeAddBtn:board;
+  modelPicker.dataset.entry=entry;
+  modelPicker.hidden=false;
+  modelQuery.value="";
+  pickerComposing=false;    /* fresh invocation: no stale query from a previous open */
+  renderProviderOptions();
+  renderPicker();           /* content first; may close the chooser when offscreen */
+  if(modelPicker.hidden)return;
+  modelQuery.focus();
+  modelQuery.select();
+  modelQuery.setAttribute("aria-expanded","true");
+  nodeAddBtn.setAttribute("aria-expanded","true");
+}
+function closePicker(restoreFocus){
+  if(!modelPicker.hidden){
+    modelPicker.hidden=true;
+    modelPicker.removeAttribute("data-entry");
+    modelPicker.style.left=modelPicker.style.top="";
+  }
+  modelQuery.setAttribute("aria-expanded","false");
+  nodeAddBtn.setAttribute("aria-expanded","false");
+  if(restoreFocus)pickerTrigger.focus();
+}
+function commitPicker(id){
+  if(DIR.locked){closePicker(true);return}
+  if(stageTarget(id,pickerY))closePicker(true);
+  else{modelQuery.focus();modelQuery.select()}   /* duplicate: one node stays, chooser stays usable */
+}
+/* Blank-canvas gestures only: nodes, ports, wires, and the board chrome
+   (zoom tools, the fallback button) never trigger creation. */
+function blankBoard(ev){return ev.target===board||ev.target===svg}
+board.addEventListener("dblclick",function(ev){
+  if(!blankBoard(ev)||DIR.locked)return;
+  ev.preventDefault();
+  openPicker("dblclick",graphY(ev));
 });
-document.getElementById("add-prov").addEventListener("click",function(ev){
-  var b=ev.target.closest("button");
-  if(!b||b.dataset.p===addProvider)return;
-  addProvider=b.dataset.p;renderAddForm();
-  var input=document.getElementById("add-model");
-  /* The datalist filters its suggestions by the input's current value, so
-     keeping another provider's model id would hide every fresh option —
-     the dropdown looks dead until the text is deleted by hand. */
-  input.value="";
-  input.focus();
+board.addEventListener("contextmenu",function(ev){
+  /* on a node or when locked, the native menu stays available */
+  if(!blankBoard(ev)||DIR.locked)return;
+  ev.preventDefault();
+  openPicker("contextmenu",graphY(ev));
 });
-document.getElementById("add-go").addEventListener("click",addTargetNode);
-document.getElementById("add-model").addEventListener("keydown",function(ev){
-  if(ev.key==="Enter")addTargetNode();
-  else if(ev.key==="Escape")openAddForm(false);
+/* Shift+A fires only on the board element itself, so typing in any field —
+   the chooser's included — can never reach it. */
+board.addEventListener("keydown",function(ev){
+  if(ev.target!==board)return;
+  if(pickerComposing||ev.isComposing||ev.keyCode===229)return;
+  if(!ev.shiftKey||ev.altKey||ev.ctrlKey||ev.metaKey)return;
+  if(ev.key!=="A"&&ev.key!=="a")return;
+  if(DIR.locked)return;
+  ev.preventDefault();
+  openPicker("shortcut");
 });
-document.addEventListener("click",function(ev){
-  if(!ev.target.closest||!ev.target.closest(".addnode"))openAddForm(false);
+/* The invocation y captured through the live pan/zoom, so the node lands
+   where the user pointed regardless of the current view. */
+function graphY(ev){
+  var b=board.getBoundingClientRect();
+  return Math.max(32,Math.round((ev.clientY-b.top-pan.y)/zoom));
+}
+/* Always-visible fallback: opens above the button with default placement. */
+document.getElementById("node-add").addEventListener("click",function(){
+  if(DIR.locked)return;
+  openPicker("button");
 });
+providerSel.addEventListener("change",function(){
+  addProvider=providerSel.value;
+  /* keeping another provider's query would look like a dead filter */
+  modelQuery.value="";
+  pickerComposing=false;
+  renderPicker();
+  modelQuery.focus();
+});
+modelQuery.addEventListener("input",renderPicker);
+modelQuery.addEventListener("compositionstart",function(){pickerComposing=true});
+modelQuery.addEventListener("compositionend",function(){pickerComposing=false});
+modelQuery.addEventListener("keydown",function(ev){
+  if(pickerComposing||ev.isComposing||ev.keyCode===229)return;  /* IME safety: never add mid-composition */
+  if(ev.key==="ArrowDown"||ev.key==="ArrowUp"){
+    ev.preventDefault();
+    if(pickerOptions.length){
+      pickerActive=(pickerActive+(ev.key==="ArrowDown"?1:-1)+pickerOptions.length)%pickerOptions.length;
+      syncPickerActive();
+    }
+  }else if(ev.key==="Enter"){
+    ev.preventDefault();
+    if(pickerActive>=0)commitPicker(pickerOptions[pickerActive].id);
+    else if(modelQuery.value.trim())commitPicker(modelQuery.value.trim());
+  }  /* Tab falls through untouched: it never adds */
+});
+modelOptions.addEventListener("click",function(ev){
+  var el=ev.target&&ev.target.closest?ev.target.closest('[role="option"]'):null;
+  if(el)commitPicker(pickerOptions[Number(el.dataset.i)].id);
+});
+pickerCloseBtn.addEventListener("click",function(){closePicker(true)});
+document.addEventListener("keydown",function(ev){
+  if(modelPicker.hidden||pickerComposing||ev.isComposing)return;
+  if(ev.key==="Escape"){ev.preventDefault();closePicker(true)}
+});
+document.addEventListener("pointerdown",function(ev){
+  if(modelPicker.hidden)return;
+  if(!modelPicker.contains(ev.target)&&!nodeAddBtn.contains(ev.target))closePicker(false);
+},true);
+modelPicker.addEventListener("focusout",function(){
+  setTimeout(function(){
+    if(!modelPicker.hidden&&!modelPicker.contains(document.activeElement))closePicker(false);
+  },0);
+});
+window.addEventListener("resize",placePicker);
+window.addEventListener("scroll",placePicker,{passive:true});  /* page scroll moves the board rect */
 var toastTimer=null;
 function showToast(html,isErr){
   var t=document.getElementById("toast");
@@ -539,11 +777,8 @@ function configureCustomProviders(providers){
   CUSTOM_PROVIDERS.forEach(function(provider){
     var name=provider.name,wireLabel=customProviderWireLabel(provider);
     CATALOG[name]=[];
+    CATALOGLESS[name]=provider.catalog_available===false;
     PROVIDER_VISIBLE[name]=true;
-    if(!document.querySelector('#add-prov button[data-p="'+name+'"]')){
-      document.getElementById("add-prov").insertAdjacentHTML("beforeend",
-        '<button data-p="'+name+'" class="provider-hidden">'+esc(name)+"</button>");
-    }
     if(!document.getElementById("card-"+name)){
       var card=document.createElement("div");
       card.className="card provider-hidden";
@@ -557,11 +792,13 @@ function configureCustomProviders(providers){
     if(provider.catalog_available===false)return;
     jfetch("/admin/providers/custom/"+encodeURIComponent(name)+"/models").then(function(r){
       if(r.ok)CATALOG[name]=catalogIds(r.body);
-      if(addProvider===name&&document.getElementById("add-form").classList.contains("open"))renderAddForm();
+      refreshOpenPicker(name);
     }).catch(function(){
       CATALOG[name]=[];
+      refreshOpenPicker(name);
     });
   });
+  renderProviderOptions();
 }
 /* Purely cosmetic gating for first-run clarity: kimi/grok are extensions, so
    they appear only when detected or required. A custom provider was explicitly
@@ -574,9 +811,8 @@ function setProviderVisibility(h){
     PROVIDER_VISIBLE[p]=visible;
     var card=document.getElementById("card-"+p);
     if(card)card.classList.toggle("provider-hidden",!visible);
-    var btn=document.querySelector('#add-prov button[data-p="'+p+'"]');
-    if(btn)btn.classList.toggle("provider-hidden",!visible);
   });
+  renderProviderOptions();
 }
 function renderProviderHealth(provider,info,successDetail,account,unusedDetail,errorDetail,command){
   if(info.status==="ok"){
@@ -1856,6 +2092,7 @@ function fitView(){
    the map tab becomes visible it gets its fit-to-view pass here. */
 var mapNeedsFit=true;
 function setTab(t){
+  if(t!=="map")closePicker(false);   /* leaving Router closes the chooser */
   document.body.dataset.tab=t;
   document.querySelectorAll("nav.tabs a").forEach(function(a){a.classList.toggle("on",a.dataset.t===t)});
   if(t==="settings"){

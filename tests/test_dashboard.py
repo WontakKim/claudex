@@ -135,6 +135,9 @@ def dashboard_runtime_result() -> dict[str, Any]:
 def expected_dashboard_jfetch_requests(
     names: dict[str, str],
 ) -> list[dict[str, Any]]:
+    # The third custom-models request re-registers the connected provider
+    # after the tab-leave check: its late catalog reply must refresh nothing
+    # once the chooser has closed.
     return [
         {
             "url": f'/admin/providers/custom/{names["connectedName"]}/models',
@@ -142,6 +145,10 @@ def expected_dashboard_jfetch_requests(
         },
         {
             "url": f'/admin/providers/custom/{names["unusedName"]}/models',
+            "options": None,
+        },
+        {
+            "url": f'/admin/providers/custom/{names["connectedName"]}/models',
             "options": None,
         },
         {"url": "/admin/usage", "options": None},
@@ -211,11 +218,275 @@ def test_catalogless_provider_runtime_accepts_manual_model(
     dashboard_runtime_result: dict[str, Any],
 ) -> None:
     assert dashboard_runtime_result["manual"] == {
-        "providerButtonPresent": True,
-        "modelInputAvailable": True,
+        "providerOptionPresent": True,
+        "modelQueryAvailable": True,
         "targetAccepted": True,
-        "inputCleared": True,
+        "stateLineShown": True,
     }
+
+
+def test_picker_runtime_guards_locked_controls_and_forced_events(
+    dashboard_runtime_result: dict[str, Any],
+) -> None:
+    picker = dashboard_runtime_result["picker"]
+
+    assert picker["lockedControls"] == {
+        "addButtonDisabled": True,
+        "providerSelectDisabled": True,
+        "modelQueryDisabled": True,
+        "pickerCloseDisabled": True,
+    }
+    assert picker["nativeLockGuards"] == {"pickerHidden": True, "targetsEmpty": True}
+    assert picker["forcedLockGuards"] == {
+        "dblclickHidden": True,
+        "contextmenuHidden": True,
+        "shortcutHidden": True,
+        "targetsEmpty": True,
+    }
+    assert picker["unlockedControls"] == {
+        "addButtonEnabled": True,
+        "providerSelectEnabled": True,
+        "modelQueryEnabled": True,
+        "pickerCloseEnabled": True,
+    }
+
+
+def test_picker_runtime_opens_focused_and_switches_provider_cleanly(
+    dashboard_runtime_result: dict[str, Any],
+) -> None:
+    picker = dashboard_runtime_result["picker"]
+    names = dashboard_runtime_result["names"]
+
+    assert picker["opened"] == {
+        "pickerHidden": False,
+        "entry": "button",
+        "queryEmpty": True,
+        "queryFocused": True,
+        "stateHidden": True,
+    }
+    assert picker["providerSwitch"] == {
+        "selectedProvider": names["connectedName"],
+        "queryCleared": True,
+        "queryFocused": True,
+        "suggestionsBefore": [],
+    }
+    assert picker["catalogAfterResolution"] == {
+        "selectedProvider": names["connectedName"],
+        "suggestions": ["late-model", "late:model:variant"],
+        "stateHidden": True,
+    }
+    assert picker["cataloglessState"]["stateHidden"] is False
+    assert "카탈로그" in picker["cataloglessState"]["stateText"]
+
+
+def test_picker_runtime_enter_and_options_stage_exact_clean_targets(
+    dashboard_runtime_result: dict[str, Any],
+) -> None:
+    staging = dashboard_runtime_result["picker"]["stagingState"]
+    names = dashboard_runtime_result["names"]
+    colon_target = f'{names["configuredName"]}:manual:model:alpha'
+    enter_target = f'{names["configuredName"]}:manual-enter-beta'
+
+    assert staging["selectedProvider"] == names["connectedName"]
+    assert staging["blankIgnored"] is True
+    assert staging["afterManualEnter"] == [colon_target]
+    assert staging["closedAfterCommit"] is True
+    assert staging["afterEnter"] == [colon_target, enter_target]
+    assert staging["afterDuplicate"] == [colon_target, enter_target]
+    assert staging["duplicateStaysOpen"] is True
+    assert staging["mapping"] == {"sonnet": "codex:existing-model"}
+    assert staging["counts"] == {"wired": 0, "rewired": 0, "unwired": 0}
+    assert staging["isDirty"] is False
+
+
+def test_picker_runtime_stages_contextual_targets_at_transformed_y(
+    dashboard_runtime_result: dict[str, Any],
+) -> None:
+    contextual = dashboard_runtime_result["picker"]["contextual"]
+    names = dashboard_runtime_result["names"]
+
+    # clientY 320 with pan.y 20 and zoom 2 lands at graph y 150; the live
+    # target keeps the default stacking position 28.
+    assert contextual["contextmenuEntry"] == "contextmenu"
+    assert contextual["first"] == [
+        {"id": "codex:existing-model", "y": 28},
+        {"id": f'{names["connectedName"]}:manual-at-y', "y": 150},
+    ]
+    # A second node at graph y 155 collides with 150 and is nudged one node
+    # height clear of it; default stacking never moves.
+    assert contextual["dblclickEntry"] == "dblclick"
+    assert contextual["secondId"] == f'{names["connectedName"]}:manual-second-y'
+    assert contextual["secondY"] == 203
+
+
+def test_picker_runtime_excludes_nodes_and_right_button_pan(
+    dashboard_runtime_result: dict[str, Any],
+) -> None:
+    assert dashboard_runtime_result["picker"]["guards"] == {
+        "nodeDblclickHidden": True,
+        "nodeContextmenuNative": True,
+        "blankContextmenuPrevented": True,
+        "rightButtonNoPan": True,
+        "leftButtonPan": True,
+    }
+
+
+def test_picker_runtime_blocks_ime_and_tab_commits(
+    dashboard_runtime_result: dict[str, Any],
+) -> None:
+    assert dashboard_runtime_result["picker"]["ime"] == {
+        "composingBlocked": True,
+        "isComposingBlocked": True,
+        "tabNeverAdds": True,
+    }
+
+
+def test_picker_runtime_arrows_commit_the_active_suggestion(
+    dashboard_runtime_result: dict[str, Any],
+) -> None:
+    names = dashboard_runtime_result["names"]
+
+    assert dashboard_runtime_result["picker"]["arrows"] == {
+        "activeDescendant": "add-opt-1",
+        "commitTarget": f'{names["connectedName"]}:late:model:variant',
+    }
+
+
+def test_picker_runtime_closes_on_tab_leave_and_late_callbacks(
+    dashboard_runtime_result: dict[str, Any],
+) -> None:
+    assert dashboard_runtime_result["picker"]["tabLeave"] == {
+        "closedOnTabLeave": True,
+        "lateCallbackNoReopen": True,
+    }
+
+
+def test_picker_runtime_discard_restores_live_map_and_drops_staging(
+    dashboard_runtime_result: dict[str, Any],
+) -> None:
+    picker = dashboard_runtime_result["picker"]
+    names = dashboard_runtime_result["names"]
+
+    assert picker["dirtyBeforeDiscard"] == {
+        "mapping": {
+            "sonnet": f'{names["configuredName"]}:manual:model:alpha'
+        },
+        "counts": {"wired": 0, "rewired": 1, "unwired": 0},
+        "isDirty": True,
+    }
+    assert picker["discardedState"] == {
+        "mapping": {"sonnet": "codex:existing-model"},
+        "addedTargets": [],
+        "targets": [{"id": "codex:existing-model", "y": 28}],
+        "counts": {"wired": 0, "rewired": 0, "unwired": 0},
+        "isDirty": False,
+    }
+
+
+def test_quick_add_gestures_target_blank_board_only() -> None:
+    # Creation gestures live on the board itself: double-click and
+    # right-click only on blank canvas (board or wire backdrop), and the
+    # keyboard shortcut only while the board itself is focused.
+    assert 'board.addEventListener("dblclick"' in DASHBOARD_JAVASCRIPT
+    assert 'board.addEventListener("contextmenu"' in DASHBOARD_JAVASCRIPT
+    assert 'board.addEventListener("keydown"' in DASHBOARD_JAVASCRIPT
+    dblclick_section = javascript_section(
+        'board.addEventListener("dblclick"', 'board.addEventListener("contextmenu"'
+    )
+    contextmenu_section = javascript_section(
+        'board.addEventListener("contextmenu"', 'board.addEventListener("keydown"'
+    )
+    shortcut_section = javascript_section(
+        'board.addEventListener("keydown"', "function graphY("
+    )
+    for section in (dblclick_section, contextmenu_section):
+        assert "blankBoard(ev)" in section
+    assert "ev.preventDefault()" in contextmenu_section
+    assert "ev.target!==board" in shortcut_section
+    assert 'ev.key!=="A"&&ev.key!=="a"' in shortcut_section
+    assert "ev.keyCode===229" in shortcut_section
+    # Non-primary pointer starts never pan, drag a wire, or move a node:
+    # the right button is reserved for the blank-canvas context menu.
+    pointerdown_section = javascript_section(
+        'board.addEventListener("pointerdown"', 'document.addEventListener("pointermove"'
+    )
+    # The guard sits at the very top of the handler, before any pan/drag branch.
+    assert pointerdown_section.startswith(',function(ev){')
+    assert "if(ev.button!==0)return;" in pointerdown_section[:200]
+
+
+def test_quick_add_geometry_keeps_distinct_eight_pixel_values() -> None:
+    # The chooser anchors to the current add-button rect: right edges align,
+    # its bottom sits 8px ABOVE the button (external gap), and the footer's
+    # own bottom padding is a separate 8px.
+    assert "#node-add{position:absolute;right:10px;bottom:10px;" in DASHBOARD_CSS
+    assert ".addpick{position:fixed;" in DASHBOARD_CSS
+    # .addpick sets author display:flex, which outranks the UA [hidden] rule;
+    # without this companion rule the chooser renders on load (browser-verified).
+    assert ".addpick[hidden]{display:none}" in DASHBOARD_CSS
+    assert ".addpick-foot{margin:0;padding:7px 10px 8px;" in DASHBOARD_CSS
+    assert "var PICKER_GAP=8" in DASHBOARD_JAVASCRIPT
+    assert "var PICKER_INSET=8" in DASHBOARD_JAVASCRIPT
+    place_section = javascript_section("function placePicker(){", "function openPicker(")
+    assert "btn.top-PICKER_GAP" in place_section
+    assert "btn.right" in place_section
+
+
+def test_quick_add_gap_anchors_on_the_actual_layout_box(
+    dashboard_runtime_result: dict[str, Any],
+) -> None:
+    # Real layout paints fractional box heights while offsetHeight reports a
+    # rounded integer (248.5 -> 249). Anchoring the chooser bottom on the
+    # rounded integer compounds rounding into an 8.5px gap; placement must
+    # use the actual layout box so the external gap stays exactly PICKER_GAP
+    # (browser-measured at 760px, light and dark).
+    geometry = dashboard_runtime_result["picker"]["fractionalGeometry"]
+    assert geometry["gapExactlyEight"] is True
+    assert geometry["rightEdgeDelta"] == 0
+
+
+def test_quick_add_state_line_hidden_including_its_space_when_ready() -> None:
+    # The picker markup ships the status line hidden by default; renderPicker
+    # only reveals it for states that carry information (e.g. a provider with
+    # no catalog endpoint), never for ordinary ready catalogs or no matches.
+    assert '<div id="picker-state" role="status" aria-live="polite" hidden>' in DASHBOARD_HTML
+    render_section = javascript_section("function renderPicker(){", "function syncPickerActive(")
+    assert "pickerState.hidden=true" in render_section
+    assert "CATALOGLESS[addProvider]" in render_section
+    # Suggestions are DOM text, never untrusted provider/model HTML.
+    assert "textContent=o.id" in render_section
+    assert "replaceChildren" in render_section
+
+
+def test_quick_add_staging_never_wires_or_dirties_the_map() -> None:
+    stage_section = javascript_section("function stageTarget(", "function freeLaneY(")
+    assert "addedTargets.push" in stage_section
+    assert "DIR.mapping" not in stage_section
+    # Contextual placement preserves existing positions and the target-side
+    # default x; the y hint seeds DIR.targets, which rebuildColumn keeps.
+    lane_section = javascript_section("function freeLaneY(", "function renderProviderOptions(")
+    assert "DIR.targets" in lane_section
+    assert ".x=" not in lane_section
+
+
+def test_quick_add_leaves_router_tab_closed_and_impossible_to_reopen_late() -> None:
+    set_tab_section = javascript_section("function setTab(", "const TAB_NAMES=")
+    assert 'if(t!=="map"' in set_tab_section
+    refresh_section = javascript_section(
+        "function refreshOpenPicker(", "function graphY("
+    )
+    assert "modelPicker.hidden" in refresh_section
+
+
+def test_quick_add_keeps_credentials_and_catalogs_on_existing_channels() -> None:
+    # The picker reuses the live CATALOG/jfetch closure: no new endpoints and
+    # no hardcoded model snapshot may ride along with the new surface.
+    assert "CATALOG={codex:[],kimi:[],grok:[]}" in DASHBOARD_JAVASCRIPT
+    assert "gpt-5" not in DASHBOARD_JAVASCRIPT
+    picker_section = javascript_section(
+        'document.getElementById("node-add").addEventListener', "var toastTimer=null"
+    )
+    assert "/admin/" not in picker_section
 
 
 def test_mcp_tab_leads_with_connection_and_combines_gptpro_tools() -> None:
