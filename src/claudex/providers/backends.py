@@ -90,6 +90,13 @@ class ResponsesBackend:
     adapt_probe_payload: ResponsesProbePayloadAdapter
     signature_namespace: str | None
     catalog_loader: CatalogLoader | None = None
+    # True only for the Codex binding: its upstream rejects ECMAScript
+    # \p{...} property escapes -- the validator behaves like Python's re
+    # module (inferred from the upstream rejection, not verified against
+    # its implementation) -- so those escapes must be rewritten. Other
+    # Responses backends may validate with a JavaScript engine and get
+    # schemas verbatim.
+    codex_regex_compat: bool = False
 
 
 @dataclass(frozen=True)

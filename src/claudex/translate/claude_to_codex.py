@@ -16,6 +16,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import unicodedata
 import uuid
 from typing import Any
 
@@ -117,14 +118,450 @@ def derive_session_id(claude_request: dict[str, Any]) -> str:
     return str(uuid.uuid4())
 
 
-def _normalize_tool_parameters(schema: Any) -> dict[str, Any]:
+# Claude Code emits ECMAScript u-mode regexes whose \p{...} Unicode property
+# escapes the Codex upstream rejects with "'<pattern>' is not a 'regex'"
+# (its validator behaves like Python's re module, which does not accept
+# property escapes; that is inferred from the upstream error, not verified
+# against its implementation). These four categories are small closed sets
+# that expand exactly into explicit codepoint ranges; any other property
+# fails fast here instead of weakening or dropping the constraint.
+_SUPPORTED_PROPERTY_CATEGORIES = frozenset({"Cc", "Cf", "Zl", "Zp"})
+
+_PROPERTY_CLASS_FRAGMENTS: dict[str, str] | None = None
+
+# Exact-JS-equivalent replacements for the constructs whose bare Python re
+# meaning diverges from ECMAScript u mode: the u-mode dot excludes every
+# line terminator, and \d/\w (and their negations) stay ASCII-only even in
+# u mode, while Python's are Unicode-aware.
+_DOT_CLASS = "[^\\n\\r\\u2028\\u2029]"
+_STRICT_END_ANCHOR = "$(?![\\s\\S])"
+_ATOM_SHORTHANDS = {
+    "d": "[0-9]",
+    "D": "[^0-9]",
+    "w": "[0-9A-Za-z_]",
+    "W": "[^0-9A-Za-z_]",
+}
+_CLASS_SHORTHANDS = {"d": "0-9", "w": "0-9A-Za-z_"}
+
+# Matches the flag list of a scoped or bare inline flag group, e.g. the
+# "s" in "(?s:" or the "i-m" in "(?i-m)" -- the group body up to the ':' or
+# ')' must consist solely of letters and at most one dash.
+_INLINE_FLAG_GROUP = re.compile(r"[a-zA-Z]+(?:-[a-zA-Z]+)?[:)]")
+
+# Reference instructions at schema positions. A renamed patternProperties
+# key can dangle any of them: same-resource targets arrive not only as
+# '#/...' fragments but as percent-encoded fragments, absolute or relative
+# URIs with a fragment, and $dynamicRef/$recursiveRef address keys the same
+# way, so a rename plus any reference instruction fails fast rather than
+# guessing locality from the URI spelling.
+_REFERENCE_KEYWORDS = frozenset({"$ref", "$dynamicRef", "$recursiveRef"})
+
+# JSON Schema keywords whose values are subschemas. The sanitizer descends
+# only through these, which is what tells schema positions apart from literal
+# example/default/const/enum data and from object properties that merely
+# happen to be named "pattern".
+_SUBSCHEMA_MAP_KEYWORDS = frozenset(
+    {"properties", "definitions", "$defs", "dependencies", "dependentSchemas"}
+)
+_SUBSCHEMA_LIST_KEYWORDS = frozenset(
+    {"allOf", "anyOf", "oneOf", "items", "prefixItems"}
+)
+_SUBSCHEMA_KEYWORDS = frozenset(
+    {
+        "additionalProperties",
+        "additionalItems",
+        # "items" also appears in _SUBSCHEMA_LIST_KEYWORDS: draft-07 lets it
+        # hold a single schema (here) or its older tuple form, an array of
+        # schemas (there).
+        "items",
+        "propertyNames",
+        "not",
+        "if",
+        "then",
+        "else",
+        "contains",
+        "unevaluatedProperties",
+        "unevaluatedItems",
+    }
+)
+
+
+def _escape_codepoint_for_class(codepoint: int) -> str:
+    if codepoint <= 0xFF:
+        return f"\\x{codepoint:02x}"
+    if codepoint <= 0xFFFF:
+        return f"\\u{codepoint:04x}"
+    # Astral codepoints stay as raw literal characters: the fixed-width \U
+    # escape is valid for Python's re but not for ECMAScript u mode.
+    return chr(codepoint)
+
+
+def _class_text_for_range(start: int, end: int) -> str:
+    low = _escape_codepoint_for_class(start)
+    if start == end:
+        return low
+    return f"{low}-{_escape_codepoint_for_class(end)}"
+
+
+def _property_class_fragment(category: str) -> str:
+    """Character-class text covering one supported Unicode general category.
+
+    Built once per process from the runtime Unicode database (a ~0.16 s scan
+    that also finds the astral Cf codepoints, e.g. the plane-14 tag
+    characters). BMP codepoints use fixed-width hex escapes so the fragment
+    stays unambiguous next to literal hex-digit text in the surrounding
+    pattern; astral codepoints are raw literal characters (see
+    _escape_codepoint_for_class).
+    """
+    global _PROPERTY_CLASS_FRAGMENTS
+    if _PROPERTY_CLASS_FRAGMENTS is None:
+        codepoints: dict[str, list[int]] = {
+            name: [] for name in _SUPPORTED_PROPERTY_CATEGORIES
+        }
+        for codepoint in range(0x110000):
+            # Surrogates are Cs and never belong to the supported categories.
+            if 0xD800 <= codepoint <= 0xDFFF:
+                continue
+            name = unicodedata.category(chr(codepoint))
+            if name in codepoints:
+                codepoints[name].append(codepoint)
+        fragments: dict[str, str] = {}
+        for name, found in codepoints.items():
+            pieces: list[str] = []
+            start = previous = None
+            for codepoint in found:
+                if previous is not None and codepoint == previous + 1:
+                    previous = codepoint
+                    continue
+                if start is not None:
+                    pieces.append(_class_text_for_range(start, previous))
+                start = previous = codepoint
+            if start is not None:
+                pieces.append(_class_text_for_range(start, previous))
+            fragments[name] = "".join(pieces)
+        _PROPERTY_CLASS_FRAGMENTS = fragments
+    return _PROPERTY_CLASS_FRAGMENTS[category]
+
+
+def _read_property_name(pattern: str, escape_index: int) -> tuple[str, int]:
+    """Read the property name after \\p or \\P at escape_index and return it
+    with the index just past the escape."""
+    start = escape_index + 2
+    length = len(pattern)
+    if start < length and pattern[start] == "{":
+        closing = pattern.find("}", start)
+        if closing != -1:
+            return pattern[start + 1 : closing], closing + 1
+    elif start < length:
+        return pattern[start], start + 1
+    raise TranslationError(
+        f"tool schema regex {pattern!r} contains a malformed "
+        "Unicode property escape"
+    )
+
+
+def _divergent_construct_error(pattern: str, construct: str) -> TranslationError:
+    return TranslationError(
+        f"tool schema regex {pattern!r} uses {construct}, whose ECMAScript "
+        "u-mode and Python re meanings diverge, so it cannot be translated "
+        "for mapped Codex models"
+    )
+
+
+def _has_property_escape(pattern: str) -> bool:
+    """Report whether the pattern holds a real \\p/\\P escape.
+
+    The scan is escape-aware: a doubled backslash makes the following p or P
+    literal text, not an escape. Patterns without a real escape must return
+    from translation untouched and unjudged, so no divergent-construct
+    rejection may run for them.
+    """
+    index = 0
+    length = len(pattern)
+    while index < length:
+        if pattern[index] == "\\":
+            if index + 1 >= length:
+                return False
+            if pattern[index + 1] in ("p", "P"):
+                return True
+            index += 2
+            continue
+        index += 1
+    return False
+
+
+def _translate_regex_unicode_properties(pattern: str) -> str:
+    """Rewrite ECMAScript \\p{...} property escapes into Python re classes.
+
+    An escape-aware scan decides first: a pattern whose \\p/\\P text is only
+    literal (behind an escaped backslash) returns byte-identical and is never
+    judged against the grammar below. A real property escape outside a
+    character class becomes a bracketed class (same atom-level precedence);
+    inside one, its codepoints are spliced into the class. Because a
+    rewritten pattern keeps running under Python re while the original ran
+    under a u-mode engine, the other constructs whose two meanings differ
+    are either rewritten to an exact equivalent (the dot, \\d/\\w shorthands,
+    the end anchor) or rejected (whitespace shorthands, word boundaries,
+    negated shorthands in classes, surrogate escapes, empty classes, numeric
+    backreferences, inline flag groups): rewriting only part of a pattern
+    would silently change what it accepts. Unsupported or malformed escapes
+    raise TranslationError, and the rewritten pattern is compile-checked so
+    a broken translation can never reach the upstream. Constructs valid in
+    only one engine (a JS named group, a Python (?P<name>) group or \\U
+    escape) are left to that compile check or pass through with their
+    original, undefined cross-engine semantics.
+    """
+    if not _has_property_escape(pattern):
+        return pattern
+    pieces: list[str] = []
+    index = 0
+    length = len(pattern)
+    in_class = False
+    while index < length:
+        char = pattern[index]
+        if char == "\\":
+            if index + 1 >= length:
+                pieces.append(char)
+                break
+            escaped = pattern[index + 1]
+            if escaped not in ("p", "P"):
+                if escaped.isdigit() and escaped != "0":
+                    # A backreference to a group that did not participate
+                    # matches empty in JavaScript but fails in Python re.
+                    raise _divergent_construct_error(
+                        pattern, f"the numeric backreference \\{escaped}"
+                    )
+                if escaped in ("s", "S"):
+                    # JS \s is a fixed WhiteSpace+LineTerminator set;
+                    # Python's is Unicode-aware with no compact overlap.
+                    raise _divergent_construct_error(
+                        pattern, f"the shorthand \\{escaped}"
+                    )
+                if escaped in ("b", "B") and not in_class:
+                    # Word boundaries are ASCII-based in JS but Unicode-aware
+                    # in Python; inside a class \b is a backspace in both.
+                    raise _divergent_construct_error(
+                        pattern, f"the word boundary \\{escaped}"
+                    )
+                if escaped in ("D", "W") and in_class:
+                    # Negated shorthands inside a class have no equivalent
+                    # class text in Python re.
+                    raise _divergent_construct_error(
+                        pattern, f"the negated shorthand \\{escaped}"
+                    )
+                if escaped in _ATOM_SHORTHANDS:
+                    pieces.append(
+                        _CLASS_SHORTHANDS[escaped]
+                        if in_class
+                        else _ATOM_SHORTHANDS[escaped]
+                    )
+                    index += 2
+                    continue
+                if escaped == "u":
+                    hex_digits = pattern[index + 2 : index + 6]
+                    if len(hex_digits) == 4:
+                        try:
+                            code_unit = int(hex_digits, 16)
+                        except ValueError:
+                            code_unit = -1
+                        if 0xD800 <= code_unit <= 0xDFFF:
+                            # JS treats these escapes as UTF-16 code units
+                            # that pair up into astral characters; Python
+                            # treats them as lone surrogate characters.
+                            raise _divergent_construct_error(
+                                pattern, "a surrogate escape"
+                            )
+                    pieces.append(char)
+                    pieces.append(escaped)
+                    index += 2
+                    continue
+                pieces.append(char)
+                pieces.append(escaped)
+                index += 2
+                continue
+            property_name, index = _read_property_name(pattern, index)
+            if escaped == "P":
+                raise TranslationError(
+                    f"tool schema regex {pattern!r} uses the negated Unicode "
+                    "property escape "
+                    f"\\P{{{property_name}}}, which cannot be translated for "
+                    "mapped Codex models"
+                )
+            if property_name not in _SUPPORTED_PROPERTY_CATEGORIES:
+                raise TranslationError(
+                    f"tool schema regex {pattern!r} uses the Unicode property "
+                    f"escape \\p{{{property_name}}}; only \\p{{Cc}}, \\p{{Cf}}, "
+                    "\\p{Zl} and \\p{Zp} can be translated for mapped Codex "
+                    "models"
+                )
+            fragment = _property_class_fragment(property_name)
+            pieces.append(fragment if in_class else f"[{fragment}]")
+            continue
+        if not in_class and char == "[":
+            if pattern[index + 1 : index + 2] == "]":
+                # JS: a never-matching empty class; Python: a literal ].
+                raise _divergent_construct_error(pattern, "an empty class []")
+            if (
+                pattern[index + 1 : index + 2] == "^"
+                and pattern[index + 2 : index + 3] == "]"
+            ):
+                # JS: any character; Python: an unterminated set.
+                raise _divergent_construct_error(
+                    pattern, "a negated empty class [^]"
+                )
+            in_class = True
+        elif in_class and char == "]":
+            in_class = False
+        elif char == "$" and not in_class:
+            # Python's $ also matches before one trailing newline; the u-mode
+            # original without the m flag does not.
+            pieces.append(_STRICT_END_ANCHOR)
+            index += 1
+            continue
+        elif char == "." and not in_class:
+            pieces.append(_DOT_CLASS)
+            index += 1
+            continue
+        elif (
+            char == "("
+            and not in_class
+            and pattern[index + 1 : index + 2] == "?"
+            and _INLINE_FLAG_GROUP.match(pattern, index + 2)
+        ):
+            # Inline flags change what the dot or the anchors mean
+            # (dotAll includes \\n; JavaScript multiline line terminators
+            # include \\r and U+2028/U+2029 while Python's include only \\n),
+            # and bare forms like (?m) are not even JavaScript-valid.
+            raise _divergent_construct_error(pattern, "an inline flag group")
+        pieces.append(char)
+        index += 1
+    translated = "".join(pieces)
+    try:
+        re.compile(translated)
+    except (re.error, OverflowError, RecursionError, ValueError) as exc:
+        # re.compile can raise beyond re.error: OverflowError for a
+        # repetition count at or beyond the compiler's repetition limit
+        # (_sre.MAXREPEAT), ValueError for a repetition-count literal past
+        # the interpreter's decimal string conversion limit, and
+        # RecursionError for deeply nested groups.
+        raise TranslationError(
+            f"tool schema regex {pattern!r} cannot be translated into a "
+            f"regex the mapped Codex backend accepts: {exc}"
+        ) from exc
+    return translated
+
+
+class _SchemaRewriteState:
+    """Effects accumulated while rewriting one tool schema.
+
+    renamed_keys records patternProperties keys as (original, translated)
+    pairs. has_reference reports a reference instruction ($ref,
+    $dynamicRef, $recursiveRef) at a schema position -- its target may be
+    anywhere, including a renamed key via a plain, percent-encoded,
+    absolute or relative URI. Literal default/example values are data, not
+    references the validator follows, and the walk never enters them.
+    """
+
+    def __init__(self) -> None:
+        self.renamed_keys: list[tuple[str, str]] = []
+        self.has_reference = False
+
+
+def _sanitize_schema_patterns(node: Any, state: _SchemaRewriteState) -> Any:
+    """Translate \\p{...} escapes in regexes at schema positions only.
+
+    Nodes are rebuilt only when something below them changed, so the caller's
+    input is never mutated and schemas without property escapes pass through
+    untouched. patternProperties key rewrites and schema-position local $ref
+    values are recorded in state so the caller can guard the pointers
+    against the renames.
+    """
+    if not isinstance(node, dict):
+        return node
+    changed = False
+    sanitized: dict[str, Any] = {}
+    for key, value in node.items():
+        if key in _REFERENCE_KEYWORDS:
+            state.has_reference = True
+        sanitized_value = value
+        if key == "pattern" and isinstance(value, str):
+            sanitized_value = _translate_regex_unicode_properties(value)
+        elif key == "patternProperties" and isinstance(value, dict):
+            # patternProperties keys are regexes too, unlike properties keys.
+            # Two different keys can map onto the same translated key, which
+            # would silently drop one subschema, so that must fail fast.
+            if len(value) > 1:
+                translated_keys = {
+                    _translate_regex_unicode_properties(sub_key)
+                    if isinstance(sub_key, str)
+                    else sub_key
+                    for sub_key in value
+                }
+                if len(translated_keys) != len(value):
+                    raise TranslationError(
+                        "tool schema patternProperties keys collide after "
+                        "regex translation, which would drop a subschema"
+                    )
+            translated: dict[Any, Any] = {}
+            for sub_key, sub_value in value.items():
+                translated_key = sub_key
+                if isinstance(sub_key, str):
+                    translated_key = _translate_regex_unicode_properties(sub_key)
+                    if translated_key != sub_key:
+                        state.renamed_keys.append((sub_key, translated_key))
+                translated[translated_key] = _sanitize_schema_patterns(
+                    sub_value, state
+                )
+            sanitized_value = translated if translated != value else value
+        elif key in _SUBSCHEMA_MAP_KEYWORDS and isinstance(value, dict):
+            sanitized_map = {
+                sub_key: _sanitize_schema_patterns(sub_value, state)
+                for sub_key, sub_value in value.items()
+            }
+            sanitized_value = sanitized_map if sanitized_map != value else value
+        elif key in _SUBSCHEMA_LIST_KEYWORDS and isinstance(value, list):
+            sanitized_list = [
+                _sanitize_schema_patterns(item, state) for item in value
+            ]
+            sanitized_value = sanitized_list if sanitized_list != value else value
+        elif key in _SUBSCHEMA_KEYWORDS and isinstance(value, (dict, list)):
+            sanitized_value = _sanitize_schema_patterns(value, state)
+        if sanitized_value is not value:
+            changed = True
+        sanitized[key] = sanitized_value
+    return sanitized if changed else node
+
+
+def _normalize_tool_parameters(
+    schema: Any, *, codex_regex_compat: bool = False
+) -> dict[str, Any]:
     if not isinstance(schema, dict):
         return {"type": "object", "properties": {}}
     normalized = {key: value for key, value in schema.items() if key != "$schema"}
     normalized.setdefault("type", "object")
     if normalized.get("type") == "object" and "properties" not in normalized:
         normalized["properties"] = {}
-    return normalized
+    if not codex_regex_compat:
+        # Regex translation is Codex-specific: other Responses backends may
+        # validate patterns with a JavaScript engine that accepts \p{...}
+        # natively, so their schemas pass through verbatim.
+        return normalized
+    state = _SchemaRewriteState()
+    sanitized = _sanitize_schema_patterns(normalized, state)
+    if state.renamed_keys and state.has_reference:
+        # A renamed patternProperties key invalidates any reference whose
+        # target addresses the old key -- plain or percent-encoded fragment,
+        # absolute or relative URI, $dynamicRef or $recursiveRef -- and
+        # deciding which references are safe would need URI resolution
+        # machinery, so refuse the combination instead.
+        raise TranslationError(
+            "tool schema patternProperties keys were rewritten for Codex "
+            "regex compatibility, but the schema also holds a reference "
+            "instruction ($ref, $dynamicRef or $recursiveRef) whose target "
+            "may be a renamed key"
+        )
+    return sanitized
+
 
 
 def _image_data_url(source: dict[str, Any]) -> str | None:
@@ -389,7 +826,10 @@ def _translate_web_search_tool(tool: dict[str, Any]) -> dict[str, Any]:
 
 
 def _translate_tools(
-    claude_request: dict[str, Any], name_map: dict[str, str]
+    claude_request: dict[str, Any],
+    name_map: dict[str, str],
+    *,
+    codex_regex_compat: bool = False,
 ) -> list[dict[str, Any]] | None:
     tools = claude_request.get("tools")
     if not isinstance(tools, list):
@@ -406,7 +846,9 @@ def _translate_tools(
         function_tool: dict[str, Any] = {
             "type": "function",
             "name": name_map.get(name, shorten_tool_name(name)),
-            "parameters": _normalize_tool_parameters(tool.get("input_schema")),
+            "parameters": _normalize_tool_parameters(
+                tool.get("input_schema"), codex_regex_compat=codex_regex_compat
+            ),
             "strict": False,
         }
         if tool.get("description"):
@@ -478,8 +920,16 @@ def translate_claude_request_to_codex(
     *,
     service_tier: str | None = None,
     custom_provider: str | None = None,
+    codex_regex_compat: bool = False,
 ) -> dict[str, Any]:
-    """Build a Codex Responses API payload, optionally with a service tier."""
+    """Build a Codex Responses API payload, optionally with a service tier.
+
+    codex_regex_compat rewrites ECMAScript property escapes (\\p{...})
+    in tool
+    schemas into Python re classes; it must only be enabled for routes whose
+    upstream validates schemas like Python's re module (the Codex backend),
+    because the rewrite rejects patterns a JavaScript engine accepts.
+    """
     claude_request = normalize_server_tool_history(claude_request)
     name_map = build_tool_name_shortening_map(claude_request)
 
@@ -503,7 +953,9 @@ def translate_claude_request_to_codex(
     if service_tier is not None:
         payload["service_tier"] = service_tier
 
-    tools = _translate_tools(claude_request, name_map)
+    tools = _translate_tools(
+        claude_request, name_map, codex_regex_compat=codex_regex_compat
+    )
     # An empty tools list means "no tools": neither field may go out, since
     # Grok 400s on tool_choice without tools and Codex rejects
     # parallel_tool_calls without tools.

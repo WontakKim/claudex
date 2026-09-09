@@ -143,6 +143,7 @@ def test_backend_type_determines_wire_kind_without_redundant_instance_field() ->
         "adapt_probe_payload",
         "signature_namespace",
         "catalog_loader",
+        "codex_regex_compat",
     ]
     assert [field.name for field in fields(AnthropicBackend)] == [
         "transport",
@@ -165,6 +166,7 @@ def test_backend_fields_retain_the_declared_callable_contracts() -> None:
     assert responses_hints["adapt_probe_payload"] == ResponsesProbePayloadAdapter
     assert responses_hints["signature_namespace"] == str | None
     assert responses_hints["catalog_loader"] == CatalogLoader | None
+    assert responses_hints["codex_regex_compat"] is bool
     assert anthropic_hints["transport"] is AnthropicMessagesTransport
     assert anthropic_hints["header_policy"] == AnthropicHeaderPolicy
     assert anthropic_hints["error_policy"] == AnthropicErrorPolicy
