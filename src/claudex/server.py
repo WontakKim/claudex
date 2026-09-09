@@ -194,6 +194,7 @@ def _assemble_route_backends(
                 error_policy=_anthropic_compatible_error_to_claude,
                 token_counter=None,
                 catalog_loader=None,
+                tool_schema_regex_compat=provider.tool_schema_regex_compat,
             )
 
     configured_provider_names = config.route_providers

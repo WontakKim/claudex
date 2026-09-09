@@ -25,7 +25,8 @@ Define either or both families in `~/.claudex/settings.json`:
     "anthropic_compatible": {
       "messages-local": {
         "base_url": "https://messages.example/v1",
-        "api_key": "replace-with-static-key"
+        "api_key": "replace-with-static-key",
+        "tool_schema_regex_compat": true
       }
     }
   }
@@ -69,13 +70,30 @@ or retry a custom OpenAI-compatible credential.
 
 ## Anthropic-compatible schema
 
-Each `custom_providers.anthropic_compatible` entry requires exactly these
-fields:
+Each `custom_providers.anthropic_compatible` entry requires `base_url` and
+`api_key` and accepts one optional compatibility field:
 
 - `base_url`: a versioned API prefix, such as an installation's documented
   `/v1` prefix. The gateway strips trailing slashes and appends exactly
   `/messages` for inference. A query string or fragment is invalid.
 - `api_key`: a non-empty static credential.
+- `tool_schema_regex_compat`: an optional JSON boolean, defaulting to `false`.
+  Set it to `true` only when the configured upstream is known to reject
+  ECMAScript Unicode property escapes in tool input schemas and accept the
+  gateway's Python-compatible form. The setting is explicit per provider;
+  provider names, URLs, and model IDs never enable it automatically.
+
+When enabled, the gateway rewrites supported `\p{Cc}`, `\p{Cf}`, `\p{Zl}`,
+and `\p{Zp}` escapes only at JSON Schema regex positions within
+`tools[*].input_schema`. It preserves the surrounding native schema, including
+`$schema`, defaults, examples, constraints, extension keywords, tool fields,
+and all non-tool request content. Literal default/example data is not scanned.
+Boolean schemas and schemas without a real property escape pass through
+unchanged. The bounded translator rejects unsupported or semantically divergent
+patterns, pattern-key collisions, and unsafe reference-plus-renamed-key
+combinations with a local `400 invalid_request_error` before transport in both
+streaming and non-streaming modes. With the option absent or `false`, every
+native tool schema retains the default verbatim behavior.
 
 There is no `wire_api` field for this family. The transport does not infer or
 probe `/models` or `/messages/count_tokens`, and those operations must not be
@@ -95,10 +113,11 @@ streaming `message_start` event. Incompatible provider-internal tool history,
 such as `analyze_image` calls with assistant-side results, and unsigned Responses
 search history are [replayed as text](model-mapping.md#server-tool-history-across-backends).
 This also repairs histories created before a backend switch. Other request
-content remains structurally unchanged. Normal client tool calls and results,
-native thinking, and signature blocks pass through without interpretation. Other
-streaming events are relayed unchanged apart from normal response-header
-filtering and error handling.
+content remains structurally unchanged, except for the explicit
+`tool_schema_regex_compat` adaptation described above when enabled. Normal
+client tool calls and results, native thinking, and signature blocks pass
+through without interpretation. Other streaming events are relayed unchanged
+apart from normal response-header filtering and error handling.
 
 The transport returns an open successful response to the generic relay. The
 relay then owns and closes that response on normal completion, cancellation,

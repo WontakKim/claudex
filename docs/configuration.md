@@ -55,7 +55,8 @@ A custom-provider document can contain both supported families:
     "anthropic_compatible": {
       "messages-local": {
         "base_url": "https://messages.example/v1",
-        "api_key": "replace-with-static-key"
+        "api_key": "replace-with-static-key",
+        "tool_schema_regex_compat": true
       }
     }
   }
@@ -63,7 +64,9 @@ A custom-provider document can contain both supported families:
 ```
 
 The OpenAI-compatible entry keeps the required `wire_api: "responses"` field.
-The Anthropic-compatible entry has only `base_url` and `api_key`; its
+The Anthropic-compatible entry requires `base_url` and `api_key`. Its
+optional `tool_schema_regex_compat` JSON boolean defaults to `false` and should
+be enabled only for an upstream with the documented regex limitation. Its
 `base_url` is a versioned API prefix to which the transport appends exactly
 `/messages`. Query and fragment suffixes are invalid. See
 [Custom providers](custom-providers.md#anthropic-compatible-schema) for the

@@ -12,10 +12,15 @@ import httpx
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response, StreamingResponse
 
+from claudex import server_support
 from claudex.providers.backends import AnthropicBackend, AnthropicStreamReadFailure
 from claudex.relay.common import (
     _PASSTHROUGH_SKIP_RESPONSE_HEADERS,
     _format_sse,
+)
+from claudex.translate.claude_to_codex import (
+    TranslationError,
+    normalize_tool_schema_regex,
 )
 from claudex.translate.server_tool_history import normalize_server_tool_history
 from claudex.upstream_errors import UpstreamAuthError, UpstreamError
@@ -134,7 +139,35 @@ async def _relay_via_anthropic_backend(
 ) -> Response:
     """Relay a mapped Messages request through its bound native backend."""
     requested_model = str(claude_request.get("model", ""))
-    outgoing = dict(normalize_server_tool_history(claude_request))
+    normalized = normalize_server_tool_history(claude_request)
+    if backend.tool_schema_regex_compat:
+        try:
+            tools = normalized.get("tools")
+            normalized_tools: list[Any] | None = None
+            if isinstance(tools, list):
+                for index, tool in enumerate(tools):
+                    if not isinstance(tool, dict) or "input_schema" not in tool:
+                        continue
+                    schema = tool["input_schema"]
+                    normalized_schema = normalize_tool_schema_regex(schema)
+                    if normalized_schema is schema:
+                        continue
+                    if normalized_tools is None:
+                        normalized_tools = list(tools)
+                    normalized_tools[index] = {
+                        **tool,
+                        "input_schema": normalized_schema,
+                    }
+            if normalized_tools is not None:
+                normalized = {**normalized, "tools": normalized_tools}
+        except TranslationError as exc:
+            return JSONResponse(
+                server_support._claude_error_body(
+                    "invalid_request_error", str(exc)
+                ),
+                status_code=400,
+            )
+    outgoing = dict(normalized)
     outgoing["model"] = upstream_model
 
     thinking = claude_request.get("thinking")

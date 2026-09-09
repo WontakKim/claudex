@@ -71,15 +71,18 @@ def _mapping_payload(
                 raise RuntimeError(
                     f"custom provider {name!r} has an unsupported family"
                 )
-            custom_provider_metadata.append(
-                {
-                    "name": name,
-                    "family": family,
-                    "wire_kind": backend.wire_kind.value,
-                    "base_url": provider.base_url,
-                    "catalog_available": backend.catalog_loader is not None,
-                }
-            )
+            metadata = {
+                "name": name,
+                "family": family,
+                "wire_kind": backend.wire_kind.value,
+                "base_url": provider.base_url,
+                "catalog_available": backend.catalog_loader is not None,
+            }
+            if isinstance(provider, AnthropicCompatibleProvider):
+                metadata["tool_schema_regex_compat"] = (
+                    provider.tool_schema_regex_compat
+                )
+            custom_provider_metadata.append(metadata)
         payload["custom_providers"] = custom_provider_metadata
     return payload
 

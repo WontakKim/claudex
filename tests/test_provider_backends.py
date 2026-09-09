@@ -151,9 +151,11 @@ def test_backend_type_determines_wire_kind_without_redundant_instance_field() ->
         "error_policy",
         "token_counter",
         "catalog_loader",
+        "tool_schema_regex_compat",
     ]
     assert responses.wire_kind is WireKind.RESPONSES
     assert anthropic.wire_kind is WireKind.ANTHROPIC_MESSAGES
+    assert anthropic.tool_schema_regex_compat is False
     assert set(get_args(RouteBackend)) == {ResponsesBackend, AnthropicBackend}
 
 
@@ -172,6 +174,7 @@ def test_backend_fields_retain_the_declared_callable_contracts() -> None:
     assert anthropic_hints["error_policy"] == AnthropicErrorPolicy
     assert anthropic_hints["token_counter"] == AnthropicTokenCounter | None
     assert anthropic_hints["catalog_loader"] == CatalogLoader | None
+    assert anthropic_hints["tool_schema_regex_compat"] is bool
 
 
 def test_binding_callables_follow_the_existing_relay_call_shapes() -> None:

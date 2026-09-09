@@ -498,6 +498,94 @@ class TestCustomProviders:
             config.custom_providers["messages-api"], AnthropicCompatibleProvider
         )
 
+    def test_anthropic_tool_schema_regex_compat_defaults_off(
+        self, tmp_path: Path
+    ) -> None:
+        config = GatewayConfig.load(
+            self._write(tmp_path, self._anthropic_payload())
+        )
+
+        provider = config.custom_providers["messages-api"]
+        assert isinstance(provider, AnthropicCompatibleProvider)
+        assert provider.tool_schema_regex_compat is False
+
+    @pytest.mark.parametrize("configured", [False, True])
+    def test_anthropic_tool_schema_regex_compat_accepts_json_booleans(
+        self, tmp_path: Path, configured: bool
+    ) -> None:
+        config = GatewayConfig.load(
+            self._write(
+                tmp_path,
+                self._anthropic_payload(
+                    entry=self._anthropic_entry(
+                        tool_schema_regex_compat=configured
+                    )
+                ),
+            )
+        )
+
+        provider = config.custom_providers["messages-api"]
+        assert isinstance(provider, AnthropicCompatibleProvider)
+        assert provider.tool_schema_regex_compat is configured
+
+    def test_anthropic_tool_schema_regex_compat_loads_from_env_json(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        document = {
+            "anthropic_compatible": {
+                "messages-api": self._anthropic_entry(
+                    tool_schema_regex_compat=True
+                )
+            }
+        }
+        monkeypatch.setenv("CLAUDEX_CUSTOM_PROVIDERS", json.dumps(document))
+
+        provider = GatewayConfig.from_env().custom_providers["messages-api"]
+        assert isinstance(provider, AnthropicCompatibleProvider)
+        assert provider.tool_schema_regex_compat is True
+
+    @pytest.mark.parametrize(
+        "configured",
+        [None, 0, 1, "false", "true", [], {}],
+        ids=["null", "zero", "one", "false-string", "true-string", "list", "object"],
+    )
+    def test_anthropic_tool_schema_regex_compat_rejects_non_booleans(
+        self, tmp_path: Path, configured: object
+    ) -> None:
+        settings_file = self._write(
+            tmp_path,
+            self._anthropic_payload(
+                entry=self._anthropic_entry(
+                    tool_schema_regex_compat=configured
+                )
+            ),
+        )
+
+        with pytest.raises(
+            ConfigError,
+            match="tool_schema_regex_compat must be a JSON boolean",
+        ):
+            GatewayConfig.load(settings_file)
+
+    def test_settings_update_preserves_anthropic_regex_compat_option(
+        self, tmp_path: Path
+    ) -> None:
+        payload = self._anthropic_payload(
+            entry=self._anthropic_entry(tool_schema_regex_compat=True)
+        )
+        settings_file = self._write(tmp_path, payload)
+
+        update_settings_file(
+            settings_file,
+            {"model_map": {"sonnet": "messages-api:upstream-sonnet"}},
+        )
+
+        written = json.loads(settings_file.read_text(encoding="utf-8"))
+        assert written["custom_providers"] == payload["custom_providers"]
+        provider = GatewayConfig.load(settings_file).custom_providers["messages-api"]
+        assert isinstance(provider, AnthropicCompatibleProvider)
+        assert provider.tool_schema_regex_compat is True
+
     def test_empty_env_means_no_custom_providers(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:

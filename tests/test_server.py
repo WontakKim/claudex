@@ -145,10 +145,16 @@ def _custom_provider() -> OpenAICompatibleProvider:
     )
 
 
-def _anthropic_custom_provider() -> AnthropicCompatibleProvider:
+def _anthropic_custom_provider(
+    *, tool_schema_regex_compat: bool = False
+) -> AnthropicCompatibleProvider:
+    kwargs: dict[str, Any] = {}
+    if tool_schema_regex_compat:
+        kwargs["tool_schema_regex_compat"] = True
     return AnthropicCompatibleProvider(
         base_url="https://messages.example/api/v1",
         api_key=_ANTHROPIC_CUSTOM_API_KEY,
+        **kwargs,
     )
 
 
@@ -683,9 +689,29 @@ def test_lifespan_binds_mixed_custom_provider_families_by_config_type_without_io
         )
         assert anthropic_backend.token_counter is None
         assert anthropic_backend.catalog_loader is None
+        assert anthropic_backend.tool_schema_regex_compat is False
         assert set(state.route_backends) == set(config.route_providers)
 
     assert request_count == 0
+
+
+def test_lifespan_binds_anthropic_regex_compat_only_for_opted_in_provider(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    provider = _anthropic_custom_provider(tool_schema_regex_compat=True)
+    config = GatewayConfig(custom_providers={"messages-api": provider})
+
+    with _create_test_client(
+        monkeypatch,
+        tmp_path,
+        config=config,
+        custom_client=None,
+    ) as client:
+        backends = client.app.state.route_backends
+
+        assert backends["messages-api"].tool_schema_regex_compat is True
+        assert backends["kimi"].tool_schema_regex_compat is False
+        assert set(backends) == set(config.route_providers)
 
 
 def test_startup_redacts_secret_bearing_custom_provider_http_error(

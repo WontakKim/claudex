@@ -53,8 +53,10 @@ _SUPPORTED_DOCUMENT_MEDIA_TYPE = "application/pdf"
 
 
 class TranslationError(Exception):
-    """Raised when a mapped Claude request contains content that cannot be
-    represented on the Codex backend; surfaced as invalid_request_error."""
+    """Raised when mapped request content cannot be represented upstream.
+
+    Serving paths surface this as invalid_request_error before transport.
+    """
 
 
 def is_gpt_reasoning_signature(signature: str) -> bool:
@@ -264,7 +266,7 @@ def _divergent_construct_error(pattern: str, construct: str) -> TranslationError
     return TranslationError(
         f"tool schema regex {pattern!r} uses {construct}, whose ECMAScript "
         "u-mode and Python re meanings diverge, so it cannot be translated "
-        "for mapped Codex models"
+        "for regex compatibility"
     )
 
 
@@ -385,14 +387,14 @@ def _translate_regex_unicode_properties(pattern: str) -> str:
                     f"tool schema regex {pattern!r} uses the negated Unicode "
                     "property escape "
                     f"\\P{{{property_name}}}, which cannot be translated for "
-                    "mapped Codex models"
+                    "regex compatibility"
                 )
             if property_name not in _SUPPORTED_PROPERTY_CATEGORIES:
                 raise TranslationError(
                     f"tool schema regex {pattern!r} uses the Unicode property "
                     f"escape \\p{{{property_name}}}; only \\p{{Cc}}, \\p{{Cf}}, "
-                    "\\p{Zl} and \\p{Zp} can be translated for mapped Codex "
-                    "models"
+                    "\\p{Zl} and \\p{Zp} can be translated for regex "
+                    "compatibility"
                 )
             fragment = _property_class_fragment(property_name)
             pieces.append(fragment if in_class else f"[{fragment}]")
@@ -446,7 +448,7 @@ def _translate_regex_unicode_properties(pattern: str) -> str:
         # RecursionError for deeply nested groups.
         raise TranslationError(
             f"tool schema regex {pattern!r} cannot be translated into a "
-            f"regex the mapped Codex backend accepts: {exc}"
+            f"regex the configured backend accepts: {exc}"
         ) from exc
     return translated
 
@@ -532,6 +534,30 @@ def _sanitize_schema_patterns(node: Any, state: _SchemaRewriteState) -> Any:
     return sanitized if changed else node
 
 
+def normalize_tool_schema_regex(schema: Any) -> Any:
+    """Translate supported Unicode regexes without normalizing schema shape.
+
+    Only regex-bearing JSON Schema positions are examined. Schema keywords,
+    provider extensions, and literal default/example data remain untouched,
+    and non-object schemas pass through unchanged.
+    """
+    state = _SchemaRewriteState()
+    sanitized = _sanitize_schema_patterns(schema, state)
+    if state.renamed_keys and state.has_reference:
+        # A renamed patternProperties key invalidates any reference whose
+        # target addresses the old key -- plain or percent-encoded fragment,
+        # absolute or relative URI, $dynamicRef or $recursiveRef -- and
+        # deciding which references are safe would need URI resolution
+        # machinery, so refuse the combination instead.
+        raise TranslationError(
+            "tool schema patternProperties keys were rewritten for regex "
+            "compatibility, but the schema also holds a reference instruction "
+            "($ref, $dynamicRef or $recursiveRef) whose target may be a "
+            "renamed key"
+        )
+    return sanitized
+
+
 def _normalize_tool_parameters(
     schema: Any, *, codex_regex_compat: bool = False
 ) -> dict[str, Any]:
@@ -546,21 +572,7 @@ def _normalize_tool_parameters(
         # validate patterns with a JavaScript engine that accepts \p{...}
         # natively, so their schemas pass through verbatim.
         return normalized
-    state = _SchemaRewriteState()
-    sanitized = _sanitize_schema_patterns(normalized, state)
-    if state.renamed_keys and state.has_reference:
-        # A renamed patternProperties key invalidates any reference whose
-        # target addresses the old key -- plain or percent-encoded fragment,
-        # absolute or relative URI, $dynamicRef or $recursiveRef -- and
-        # deciding which references are safe would need URI resolution
-        # machinery, so refuse the combination instead.
-        raise TranslationError(
-            "tool schema patternProperties keys were rewritten for Codex "
-            "regex compatibility, but the schema also holds a reference "
-            "instruction ($ref, $dynamicRef or $recursiveRef) whose target "
-            "may be a renamed key"
-        )
-    return sanitized
+    return normalize_tool_schema_regex(normalized)
 
 
 

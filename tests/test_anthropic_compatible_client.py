@@ -877,3 +877,262 @@ def test_policies_and_client_match_existing_anthropic_backend_contracts() -> Non
             await response.aclose()
 
     asyncio.run(scenario())
+
+_ARTIFACT_UNICODE_PATTERN = (
+    "^(?!__.*__$)[^\\p{Cc}\\p{Cf}\\p{Zl}\\p{Zp}"
+    "\"\\\\./[\\]]{1,200}$"
+)
+
+
+def _native_backend_with_regex_compat(
+    transport: Any, *, enabled: bool
+) -> AnthropicBackend:
+    return AnthropicBackend(
+        transport=transport,
+        header_policy=lambda _request: {"x-test": "header"},
+        error_policy=_anthropic_compatible_error_to_claude,
+        tool_schema_regex_compat=enabled,
+    )
+
+
+def test_opted_in_native_relay_rewrites_only_tool_input_schema_regexes() -> None:
+    sent: list[tuple[bytes, dict[str, str]]] = []
+
+    class RecordingTransport:
+        async def send_messages(
+            self, body: bytes, headers: dict[str, str]
+        ) -> httpx.Response:
+            sent.append((body, headers))
+            return httpx.Response(
+                200,
+                json={"type": "message", "model": "upstream-model"},
+            )
+
+    request_body = {
+        "model": "requested-model",
+        "max_tokens": 128,
+        "messages": [
+            {"role": "user", "content": "publish"},
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "thinking",
+                        "thinking": "native thought",
+                        "signature": "native-signature",
+                    }
+                ],
+            },
+        ],
+        "tools": [
+            {
+                "name": "Artifact",
+                "description": "Publish a file",
+                "input_schema": {
+                    "$schema": "https://json-schema.org/draft/2020-12/schema",
+                    "type": "object",
+                    "properties": {
+                        "data": {
+                            "type": "object",
+                            "propertyNames": {
+                                "pattern": _ARTIFACT_UNICODE_PATTERN
+                            },
+                        }
+                    },
+                    "default": {"pattern": "\\p{Cc}"},
+                    "examples": [{"pattern": "\\p{Zl}"}],
+                },
+                "cache_control": {"type": "ephemeral"},
+                "strict": True,
+                "x-unknown-tool-field": {"pattern": "\\p{Cf}"},
+            },
+            {"type": "web_search_20260209", "name": "web_search"},
+            {"name": "boolean-schema", "input_schema": True},
+        ],
+        "thinking": {"type": "adaptive"},
+        "output_config": {"effort": "high"},
+        "metadata": {"user_id": "opaque-user"},
+    }
+    original = json.loads(json.dumps(request_body))
+    backend = _native_backend_with_regex_compat(
+        RecordingTransport(), enabled=True
+    )
+
+    response = asyncio.run(
+        _relay_via_anthropic_backend(
+            _request([]), request_body, "upstream-model", backend
+        )
+    )
+
+    assert response.status_code == 200
+    assert request_body == original
+    assert len(sent) == 1
+    outgoing = json.loads(sent[0][0])
+    assert sent[0][1] == {"x-test": "header"}
+    assert outgoing["model"] == "upstream-model"
+    assert outgoing["messages"] == original["messages"]
+    assert outgoing["thinking"] == original["thinking"]
+    assert outgoing["output_config"] == original["output_config"]
+    assert outgoing["metadata"] == original["metadata"]
+    assert outgoing["tools"][1:] == original["tools"][1:]
+
+    tool = outgoing["tools"][0]
+    original_tool = original["tools"][0]
+    assert {
+        key: value for key, value in tool.items() if key != "input_schema"
+    } == {
+        key: value for key, value in original_tool.items() if key != "input_schema"
+    }
+    schema = tool["input_schema"]
+    original_schema = original_tool["input_schema"]
+    assert schema["$schema"] == original_schema["$schema"]
+    assert schema["type"] == "object"
+    assert schema["properties"].keys() == original_schema["properties"].keys()
+    translated = schema["properties"]["data"]["propertyNames"]["pattern"]
+    assert translated != _ARTIFACT_UNICODE_PATTERN
+    assert "\\p{" not in translated
+    assert schema["default"] == original_schema["default"]
+    assert schema["examples"] == original_schema["examples"]
+
+
+def test_native_regex_compat_is_off_by_default_and_preserves_schema() -> None:
+    sent: list[bytes] = []
+
+    class RecordingTransport:
+        async def send_messages(
+            self, body: bytes, headers: dict[str, str]
+        ) -> httpx.Response:
+            sent.append(body)
+            return httpx.Response(
+                200,
+                json={"type": "message", "model": "upstream-model"},
+            )
+
+    schema = {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+            "upper": {"type": "string", "pattern": "^\\p{Lu}+$"}
+        },
+    }
+    request_body = {
+        "model": "requested-model",
+        "messages": [],
+        "tools": [{"name": "native", "input_schema": schema}],
+    }
+    backend = AnthropicBackend(
+        transport=RecordingTransport(),
+        header_policy=lambda _request: {},
+        error_policy=_anthropic_compatible_error_to_claude,
+    )
+
+    response = asyncio.run(
+        _relay_via_anthropic_backend(
+            _request([]), request_body, "upstream-model", backend
+        )
+    )
+
+    assert response.status_code == 200
+    assert len(sent) == 1
+    assert json.loads(sent[0])["tools"][0]["input_schema"] == schema
+
+
+@pytest.mark.parametrize("tools", [None, True, {"name": "not-a-list"}, []])
+def test_opted_in_native_relay_preserves_absent_or_non_list_tools(
+    tools: Any,
+) -> None:
+    sent: list[bytes] = []
+
+    class RecordingTransport:
+        async def send_messages(
+            self, body: bytes, headers: dict[str, str]
+        ) -> httpx.Response:
+            sent.append(body)
+            return httpx.Response(
+                200,
+                json={"type": "message", "model": "upstream-model"},
+            )
+
+    request_body: dict[str, Any] = {
+        "model": "requested-model",
+        "messages": [],
+    }
+    if tools is not None:
+        request_body["tools"] = tools
+    original = json.loads(json.dumps(request_body))
+    backend = _native_backend_with_regex_compat(
+        RecordingTransport(), enabled=True
+    )
+
+    response = asyncio.run(
+        _relay_via_anthropic_backend(
+            _request([]), request_body, "upstream-model", backend
+        )
+    )
+
+    assert response.status_code == 200
+    assert request_body == original
+    outgoing = json.loads(sent[0])
+    assert outgoing == {**original, "model": "upstream-model"}
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_native_regex_translation_error_is_400_before_headers_or_transport(
+    stream: bool,
+) -> None:
+    transport_calls = 0
+    header_calls = 0
+
+    class ForbiddenTransport:
+        async def send_messages(
+            self, body: bytes, headers: dict[str, str]
+        ) -> httpx.Response:
+            nonlocal transport_calls
+            transport_calls += 1
+            raise AssertionError("transport must not run")
+
+    def forbidden_headers(_request: Request) -> dict[str, str]:
+        nonlocal header_calls
+        header_calls += 1
+        raise AssertionError("header policy must not run")
+
+    request_body = {
+        "model": "requested-model",
+        "stream": stream,
+        "messages": [],
+        "tools": [
+            {
+                "name": "unsupported",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "pattern": "^\\p{Lu}+$",
+                        }
+                    },
+                },
+            }
+        ],
+    }
+    original = json.loads(json.dumps(request_body))
+    backend = AnthropicBackend(
+        transport=ForbiddenTransport(),
+        header_policy=forbidden_headers,
+        error_policy=_anthropic_compatible_error_to_claude,
+        tool_schema_regex_compat=True,
+    )
+
+    response = asyncio.run(
+        _relay_via_anthropic_backend(
+            _request([]), request_body, "upstream-model", backend
+        )
+    )
+
+    assert response.status_code == 400
+    assert json.loads(response.body)["type"] == "error"
+    assert json.loads(response.body)["error"]["type"] == "invalid_request_error"
+    assert "Unicode property escape" in json.loads(response.body)["error"]["message"]
+    assert transport_calls == 0
+    assert header_calls == 0
+    assert request_body == original
