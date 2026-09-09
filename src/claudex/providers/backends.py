@@ -110,6 +110,7 @@ class AnthropicBackend:
     error_policy: AnthropicErrorPolicy
     token_counter: AnthropicTokenCounter | None = None
     catalog_loader: CatalogLoader | None = None
+    tool_schema_regex_compat: bool = False
 
 
 RouteBackend: TypeAlias = ResponsesBackend | AnthropicBackend

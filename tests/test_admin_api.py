@@ -426,10 +426,16 @@ def _custom_provider() -> OpenAICompatibleProvider:
     )
 
 
-def _anthropic_custom_provider() -> AnthropicCompatibleProvider:
+def _anthropic_custom_provider(
+    *, tool_schema_regex_compat: bool = False
+) -> AnthropicCompatibleProvider:
+    kwargs: dict[str, Any] = {}
+    if tool_schema_regex_compat:
+        kwargs["tool_schema_regex_compat"] = True
     return AnthropicCompatibleProvider(
         base_url="https://messages.example/api/v1",
         api_key=_ANTHROPIC_CUSTOM_API_KEY,
+        **kwargs,
     )
 
 
@@ -879,6 +885,7 @@ class TestAdminMappingApi:
                 "wire_kind": "anthropic_messages",
                 "base_url": "https://messages.example/v1",
                 "catalog_available": False,
+                "tool_schema_regex_compat": False,
             },
             {
                 "name": "z-responses",
@@ -889,6 +896,30 @@ class TestAdminMappingApi:
             },
         ]
         assert "api_key" not in response.text
+
+    def test_get_reports_anthropic_regex_compat_opt_in_without_api_key(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        provider = _anthropic_custom_provider(tool_schema_regex_compat=True)
+        with self._admin_client(
+            monkeypatch,
+            tmp_path,
+            custom_providers={"messages-api": provider},
+        ) as client:
+            response = client.get("/admin/settings/mapping")
+
+        _assert_secret_absent(_ANTHROPIC_CUSTOM_API_KEY, response.text)
+        assert response.status_code == 200
+        assert response.json()["custom_providers"] == [
+            {
+                "name": "messages-api",
+                "family": "anthropic_compatible",
+                "wire_kind": "anthropic_messages",
+                "base_url": "https://messages.example/api/v1",
+                "catalog_available": False,
+                "tool_schema_regex_compat": True,
+            }
+        ]
 
     @pytest.mark.parametrize(
         ("name", "provider", "wrong_backend_name"),
@@ -1027,6 +1058,52 @@ class TestAdminMappingApi:
         # ... and persisted without clobbering unrelated settings keys.
         saved = json.loads(settings_file.read_text(encoding="utf-8"))
         assert saved == {"port": 9317, "model_map": {"opus": "codex:gpt-5.6-sol"}}
+
+    def test_put_preserves_anthropic_regex_compat_provider_settings(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.delenv("CLAUDEX_MODEL_MAP", raising=False)
+        provider_document = {
+            "anthropic_compatible": {
+                "messages-api": {
+                    "base_url": "https://messages.example/api/v1",
+                    "api_key": _ANTHROPIC_CUSTOM_API_KEY,
+                    "tool_schema_regex_compat": True,
+                }
+            }
+        }
+        settings_file = tmp_path / "settings.json"
+        settings_file.write_text(
+            json.dumps({"custom_providers": provider_document}),
+            encoding="utf-8",
+        )
+        provider = _anthropic_custom_provider(tool_schema_regex_compat=True)
+
+        with self._admin_client(
+            monkeypatch,
+            tmp_path,
+            custom_providers={"messages-api": provider},
+        ) as client:
+            response = client.put(
+                "/admin/settings/mapping",
+                json={
+                    "model_map": {
+                        "sonnet": "messages-api:upstream-sonnet"
+                    }
+                },
+            )
+
+        _assert_secret_absent(_ANTHROPIC_CUSTOM_API_KEY, response.text)
+        assert response.status_code == 200
+        assert response.json()["custom_providers"][0][
+            "tool_schema_regex_compat"
+        ] is True
+        saved = json.loads(settings_file.read_text(encoding="utf-8"))
+        assert saved["custom_providers"] == provider_document
+        loaded = GatewayConfig.load(settings_file)
+        configured = loaded.custom_providers["messages-api"]
+        assert isinstance(configured, AnthropicCompatibleProvider)
+        assert configured.tool_schema_regex_compat is True
 
     def test_put_rejected_when_env_overrides(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path

@@ -7,6 +7,7 @@ from copy import deepcopy
 
 import pytest
 
+import claudex.translate.claude_to_codex as claude_to_codex
 from claudex.translate.claude_to_codex import (
     TranslationError,
     build_tool_name_shortening_map,
@@ -920,6 +921,34 @@ def test_schemas_without_unicode_escapes_are_unchanged() -> None:
         "type": "object",
         "properties": schema["properties"],
     }
+
+
+def test_tool_schema_regex_normalization_preserves_native_schema_shape() -> None:
+    schema = {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "propertyNames": {"pattern": "^[^\\p{Cc}]{1,4}$"},
+        "default": {"pattern": "\\p{Cc}"},
+        "examples": [{"pattern": "\\p{Zl}"}],
+        "x-provider-keyword": {"pattern": "\\p{Cf}"},
+    }
+    original = deepcopy(schema)
+
+    normalized = claude_to_codex.normalize_tool_schema_regex(schema)
+
+    assert schema == original
+    assert normalized["$schema"] == schema["$schema"]
+    assert normalized["type"] == "object"
+    assert "properties" not in normalized
+    assert "\\p{" not in normalized["propertyNames"]["pattern"]
+    assert normalized["default"] == schema["default"]
+    assert normalized["examples"] == schema["examples"]
+    assert normalized["x-provider-keyword"] == schema["x-provider-keyword"]
+
+    plain = {"type": "string", "pattern": "^[a-z]+$"}
+    assert claude_to_codex.normalize_tool_schema_regex(plain) is plain
+    assert claude_to_codex.normalize_tool_schema_regex(True) is True
+    assert claude_to_codex.normalize_tool_schema_regex(False) is False
 
 
 def test_literal_pattern_shaped_text_is_not_rewritten() -> None:

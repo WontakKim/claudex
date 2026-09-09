@@ -105,10 +105,14 @@ class AnthropicCompatibleProvider:
 
     base_url: str
     api_key: str = field(repr=False)
+    tool_schema_regex_compat: bool = False
 
     def __repr__(self) -> str:
         base_url = _redact_provider_credential(self.base_url, self.api_key)
-        return f"AnthropicCompatibleProvider(base_url={base_url!r})"
+        return (
+            f"AnthropicCompatibleProvider(base_url={base_url!r}, "
+            f"tool_schema_regex_compat={self.tool_schema_regex_compat!r})"
+        )
 
 
 _CustomProvider: TypeAlias = OpenAICompatibleProvider | AnthropicCompatibleProvider
@@ -150,6 +154,14 @@ def parse_custom_providers(value: object) -> dict[str, _CustomProvider]:
         '"base_url": "https://model.example/api/v1", "api_key": "secret"}}}'
     )
     family_fields = {
+        "openai_compatible": {"wire_api", "base_url", "api_key"},
+        "anthropic_compatible": {
+            "base_url",
+            "api_key",
+            "tool_schema_regex_compat",
+        },
+    }
+    required_family_fields = {
         "openai_compatible": {"wire_api", "base_url", "api_key"},
         "anthropic_compatible": {"base_url", "api_key"},
     }
@@ -212,7 +224,7 @@ def parse_custom_providers(value: object) -> dict[str, _CustomProvider]:
 
     providers: dict[str, _CustomProvider] = {}
     provider_families: dict[str, str] = {}
-    for family, required_fields in family_fields.items():
+    for family, allowed_fields in family_fields.items():
         entries = value.get(family, {})
         if not isinstance(entries, dict):
             raise ConfigError(
@@ -247,14 +259,15 @@ def parse_custom_providers(value: object) -> dict[str, _CustomProvider]:
                 )
 
             unknown_fields = sorted(
-                str(field) for field in entry if field not in required_fields
+                str(field) for field in entry if field not in allowed_fields
             )
             if unknown_fields:
                 raise ConfigError(
                     f"custom provider {name!r} has unknown keys: "
                     f"{', '.join(unknown_fields)}; valid keys: "
-                    f"{', '.join(sorted(required_fields))}; example: {example}"
+                    f"{', '.join(sorted(allowed_fields))}; example: {example}"
                 )
+            required_fields = required_family_fields[family]
             missing_fields = sorted(required_fields - set(entry))
             if missing_fields:
                 raise ConfigError(
@@ -275,6 +288,17 @@ def parse_custom_providers(value: object) -> dict[str, _CustomProvider]:
                     raise ConfigError(
                         f"custom provider {name!r} wire_api must be exactly "
                         f"'responses', got {wire_api!r}; example: {example}"
+                    )
+
+            tool_schema_regex_compat = False
+            if family == "anthropic_compatible":
+                tool_schema_regex_compat = entry.get(
+                    "tool_schema_regex_compat", False
+                )
+                if type(tool_schema_regex_compat) is not bool:
+                    raise ConfigError(
+                        f"custom provider {name!r} tool_schema_regex_compat "
+                        "must be a JSON boolean"
                     )
 
             raw_base_url = entry["base_url"]
@@ -348,6 +372,7 @@ def parse_custom_providers(value: object) -> dict[str, _CustomProvider]:
                 providers[name] = AnthropicCompatibleProvider(
                     base_url=base_url,
                     api_key=api_key,
+                    tool_schema_regex_compat=tool_schema_regex_compat,
                 )
             provider_families[name] = family
 
