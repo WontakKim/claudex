@@ -135,6 +135,7 @@ async def _relay_via_responses_backend(
             upstream_model,
             config.reasoning_effort_override,
             custom_provider=backend.signature_namespace,
+            codex_regex_compat=backend.codex_regex_compat,
         )
     except TranslationError as exc:
         return JSONResponse(

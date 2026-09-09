@@ -158,6 +158,7 @@ def _assemble_route_backends(
             adapt_payload=adapt_codex_payload,
             adapt_probe_payload=_adapt_identity_probe_payload,
             signature_namespace=None,
+            codex_regex_compat=True,
         ),
         "kimi": AnthropicBackend(
             transport=kimi_client,

@@ -1,5 +1,8 @@
 """Tests for the Anthropic Messages -> Codex Responses request translation."""
 
+import json
+import re
+import urllib.parse
 from copy import deepcopy
 
 import pytest
@@ -697,6 +700,740 @@ def test_empty_tools_emit_no_tool_fields() -> None:
         assert "tools" not in payload
         assert "tool_choice" not in payload
         assert "parallel_tool_calls" not in payload
+
+
+# Claude Code emits ECMAScript u-mode regexes whose \p{...} Unicode property
+# escapes the Codex upstream rejects with "'<pattern>' is not a 'regex'". The
+# upstream validator behaves like Python's re module (inferred from that
+# error message, not verified against its implementation). This is the
+# retained Artifact tool regex in a reconstructed propertyNames fixture;
+# the original full schema and the field's product role were not captured.
+# Codex regex compatibility is opt-in per request
+# because the same translation serves custom Responses backends that may
+# validate with a JavaScript engine instead.
+_ARTIFACT_PROPERTY_NAMES_PATTERN = (
+    "^(?!__.*__$)[^\\p{Cc}\\p{Cf}\\p{Zl}\\p{Zp}\"\\\\./[\\]]{1,200}$"
+)
+
+
+def _artifact_property_names_tool() -> dict:
+    return {
+        "name": "Artifact",
+        "description": "Publish a file",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "data": {
+                    "type": "object",
+                    "propertyNames": {"pattern": _ARTIFACT_PROPERTY_NAMES_PATTERN},
+                },
+            },
+        },
+    }
+
+
+def _artifact_property_names_pattern(payload: dict) -> str:
+    parameters = payload["tools"][0]["parameters"]
+    return parameters["properties"]["data"]["propertyNames"]["pattern"]
+
+
+def _translate_single_pattern(pattern: str) -> str:
+    payload = translate_claude_request_to_codex(
+        {
+            "messages": [],
+            "tools": [
+                {
+                    "name": "tool",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"x": {"type": "string", "pattern": pattern}},
+                    },
+                }
+            ],
+        },
+        codex_model="gpt-5.5",
+        codex_regex_compat=True,
+    )
+    return payload["tools"][0]["parameters"]["properties"]["x"]["pattern"]
+
+
+def test_artifact_property_names_pattern_is_translated_to_a_python_regex() -> None:
+    request = {
+        "messages": [{"role": "user", "content": "publish"}],
+        "tools": [_artifact_property_names_tool()],
+    }
+    original = deepcopy(request)
+
+    payload = translate_claude_request_to_codex(
+        request, codex_model="gpt-6-astra", codex_regex_compat=True
+    )
+
+    assert request == original
+    translated = _artifact_property_names_pattern(payload)
+    assert translated != _ARTIFACT_PROPERTY_NAMES_PATTERN
+    assert "\\p{" not in translated
+    # Astral codepoints stay as raw literal characters: the fixed-width \U
+    # escape is valid for Python's re but not for JavaScript's u mode.
+    assert "\\U" not in translated
+    # The u-mode lookahead's dot is rewritten to the exact JS dot class so
+    # the translated Python regex excludes the same line terminators, and
+    # the $ inside the lookahead gets the same strict end anchor.
+    assert "(?!__[^\\n\\r\\u2028\\u2029]*__$(?![\\s\\S]))" in translated
+    re.compile(translated)
+
+
+def test_translated_property_names_pattern_keeps_the_original_semantics() -> None:
+    payload = translate_claude_request_to_codex(
+        {"messages": [], "tools": [_artifact_property_names_tool()]},
+        codex_model="gpt-6-astra",
+        codex_regex_compat=True,
+    )
+    compiled = re.compile(_artifact_property_names_pattern(payload))
+
+    accepted = [
+        "hello",
+        "My Page",
+        "안녕하세요",
+        "título",
+        "a b",  # U+0020 is Zs; only the Zl/Zp separators are forbidden
+        "a",
+        "a" * 200,  # upper length boundary, counted in codepoints
+        "__ab",  # the reserved rule rejects only __...__ (both ends)
+        "a__b__",
+        "__",
+        "😀😀😀",
+        "😀" * 200,  # astral characters count as one codepoint, like the u flag
+        "🇰🇷",
+        "é",
+    ]
+    for value in accepted:
+        assert compiled.search(value), f"expected to accept {value!r}"
+
+    rejected = [
+        "",
+        "a" * 201,
+        "__reserved__",
+        "____",
+        "a\tb",  # Cc controls
+        "a\nb",
+        "a\x7fb",
+        "a\x00b",
+        "a\u200bb",  # Cf format characters (U+200B, U+00AD, U+FEFF, U+202E)
+        "a\xadb",
+        "a\ufeffb",
+        "a\u202eb",
+        "a\u2028b",  # Zl line separator (U+2028)
+        "a\u2029b",  # Zp paragraph separator (U+2029)
+        "a\U000e0020b",  # astral Cf tag space (U+E0020)
+        "a\"b",  # forbidden separators/quotes/backslash/brackets
+        "a\\b",
+        "a.b",
+        "a/b",
+        "a[b",
+        "a]b",
+        # The u-mode original rejects a trailing newline before its end
+        # anchor; Python's bare $ would accept one, so the translation must
+        # not (a strict end-of-input rewrite, not re's newline leniency).
+        "a\n",
+        "a" * 200 + "\n",
+    ]
+    for value in rejected:
+        assert not compiled.search(value), f"expected to reject {value!r}"
+
+
+def test_unicode_property_patterns_are_translated_at_every_schema_position() -> None:
+    schema = {
+        "type": "object",
+        "properties": {
+            "plain": {"type": "string", "pattern": "^[a-z]+$"},
+            "label": {"type": "string", "pattern": "^[^\\p{Cc}]{1,4}$"},
+            "pair": {
+                "type": "array",
+                "items": {"type": "string", "pattern": "^\\p{Zl}?$"},
+            },
+            "triple": {
+                "type": "array",
+                "items": [
+                    {"type": "string"},
+                    {"type": "string", "pattern": "^\\p{Zp}?$"},
+                ],
+            },
+            "combo": {
+                "allOf": [{"type": "string", "pattern": "^\\p{Cc}?$"}],
+                "anyOf": [{"type": "string", "pattern": "^\\p{Cf}?$"}],
+                "oneOf": [{"type": "string"}],
+                "not": {"type": "string", "pattern": "^\\p{Zl}$"},
+            },
+        },
+        "additionalProperties": {"type": "string", "pattern": "^\\p{Zp}$"},
+        "patternProperties": {"^[a-z]\\p{Cc}$": {"type": "string"}},
+        "definitions": {"name": {"type": "string", "pattern": "^\\p{Cf}$"}},
+        "$defs": {"slug": {"type": "string", "pattern": "^\\p{Cc}$"}},
+    }
+    request = {"messages": [], "tools": [{"name": "mix", "input_schema": schema}]}
+    original = deepcopy(request)
+
+    payload = translate_claude_request_to_codex(
+        request, codex_model="gpt-5.5", codex_regex_compat=True
+    )
+
+    assert request == original
+    assert "\\p{" not in json.dumps(payload)
+
+    properties = payload["tools"][0]["parameters"]["properties"]
+    assert properties["plain"]["pattern"] == "^[a-z]+$"
+    re.compile(properties["label"]["pattern"])
+    re.compile(properties["pair"]["items"]["pattern"])
+    re.compile(properties["triple"]["items"][1]["pattern"])
+    re.compile(properties["combo"]["allOf"][0]["pattern"])
+    re.compile(properties["combo"]["anyOf"][0]["pattern"])
+    assert "pattern" not in properties["combo"]["oneOf"][0]
+    re.compile(properties["combo"]["not"]["pattern"])
+    re.compile(payload["tools"][0]["parameters"]["additionalProperties"]["pattern"])
+    (translated_key,) = payload["tools"][0]["parameters"]["patternProperties"]
+    assert translated_key != "^[a-z]\\p{Cc}$"
+    re.compile(translated_key)
+    re.compile(payload["tools"][0]["parameters"]["definitions"]["name"]["pattern"])
+    re.compile(payload["tools"][0]["parameters"]["$defs"]["slug"]["pattern"])
+
+
+def test_schemas_without_unicode_escapes_are_unchanged() -> None:
+    schema = {
+        "type": "object",
+        "properties": {
+            "path": {
+                "type": "string",
+                "pattern": "^[a-z]+$",
+                "default": "home",
+                "examples": ["home", "work"],
+            },
+            "count": {"type": "integer", "minimum": 0},
+        },
+    }
+    payload = translate_claude_request_to_codex(
+        {"messages": [], "tools": [{"name": "read", "input_schema": schema}]},
+        codex_model="gpt-5.5",
+        codex_regex_compat=True,
+    )
+    assert payload["tools"][0]["parameters"] == {
+        "type": "object",
+        "properties": schema["properties"],
+    }
+
+
+def test_literal_pattern_shaped_text_is_not_rewritten() -> None:
+    # Literal example/default values, and a property that merely happens to be
+    # named "pattern", must survive translation verbatim: only a "pattern"
+    # string at a schema position is a regex.
+    property_schema = {
+        "type": "string",
+        "enum": ["\\p{Cc}", "\\p{Zl}"],
+        "const": "\\p{Cf}",
+        "default": "\\p{Zp}",
+        "examples": ["\\p{Cc}"],
+    }
+    schema = {"type": "object", "properties": {"pattern": property_schema}}
+    request = {"messages": [], "tools": [{"name": "echo", "input_schema": schema}]}
+    original = deepcopy(request)
+
+    payload = translate_claude_request_to_codex(
+        request, codex_model="gpt-5.5", codex_regex_compat=True
+    )
+
+    assert request == original
+    assert payload["tools"][0]["parameters"] == {
+        "type": "object",
+        "properties": {"pattern": property_schema},
+    }
+
+
+@pytest.mark.parametrize(
+    "pattern",
+    [
+        "^\\p{Lu}+$",  # category too large for a compact expansion
+        "\\p{Script=Greek}",  # script property
+        "\\P{Cc}",  # negated property escape
+        "\\p{Cc",  # unterminated property
+        "\\pZ",  # single-letter separator class Z
+    ],
+)
+def test_unsupported_unicode_property_escapes_raise_translation_error(
+    pattern: str,
+) -> None:
+    with pytest.raises(TranslationError, match="Unicode property escape"):
+        translate_claude_request_to_codex(
+            {
+                "messages": [],
+                "tools": [
+                    {
+                        "name": "tool",
+                        "input_schema": {
+                            "type": "object",
+                            "properties": {
+                                "x": {"type": "string", "pattern": pattern}
+                            },
+                        },
+                    }
+                ],
+            },
+            codex_model="gpt-5.5",
+            codex_regex_compat=True,
+        )
+
+
+def test_escaped_literal_backslash_p_text_is_left_alone() -> None:
+    # In JavaScript u mode a "{Zl}" after literal text is an incomplete
+    # quantifier, so a real client escapes the braces: an escaped backslash
+    # makes the leading "\\p\{Zl\}" literal text, and only the real escape
+    # in the class after it must be translated.
+    pattern = "\\\\p\\{Zl\\}[\\p{Zp}]"
+    translated = _translate_single_pattern(pattern)
+
+    assert translated.startswith("\\\\p\\{Zl\\}")
+    assert "\\p{Zp}" not in translated
+    compiled = re.compile(translated)
+    assert compiled.search("\\p{Zl}\u2029")
+
+
+def test_codex_regex_compat_is_opt_in_and_off_by_default() -> None:
+    # Without the compatibility mode the schema must pass through verbatim:
+    # custom Responses backends may validate patterns with a JavaScript
+    # engine, and a global rewrite previously turned JS-valid patterns such
+    # as \p{Lu} into hard TranslationError rejections for them.
+    schema = {
+        "type": "object",
+        "properties": {
+            "upper": {"type": "string", "pattern": "^\\p{Lu}+$"},
+            "control": {"type": "string", "pattern": "^[^\\p{Cc}]{1,4}$"},
+        },
+        "patternProperties": {"^\\p{Zl}$": {"type": "string"}},
+    }
+    request = {"messages": [], "tools": [{"name": "t", "input_schema": schema}]}
+    original = deepcopy(request)
+
+    payload = translate_claude_request_to_codex(request, codex_model="gpt-5.5")
+
+    assert request == original
+    parameters = payload["tools"][0]["parameters"]
+    assert parameters["properties"]["upper"]["pattern"] == "^\\p{Lu}+$"
+    assert parameters["properties"]["control"]["pattern"] == "^[^\\p{Cc}]{1,4}$"
+    assert list(parameters["patternProperties"]) == ["^\\p{Zl}$"]
+
+
+def test_strict_anchor_rewrite_only_touches_unescaped_out_of_class_dollars() -> None:
+    # Only a rewritten pattern gets the strict $(?![\s\S]) end anchor; an
+    # escaped \$, a $ inside a character class, and any pattern without a
+    # property escape keep the original text untouched.
+    escaped_dollar = _translate_single_pattern("^\\p{Zl}\\$$")
+    # Only the final unescaped $ becomes a strict anchor; the escaped \\
+    # literal dollar before it keeps its exact text.
+    assert escaped_dollar.count("$(?![\\s\\S])") == 1
+    assert "\\$" in escaped_dollar
+
+    in_class = _translate_single_pattern("^\\p{Zl}[$]$")
+    assert in_class.count("$(?![\\s\\S])") == 1
+    assert "[$]" in in_class
+
+    untouched = _translate_single_pattern("^\\$[a]+$")
+    assert untouched == "^\\$[a]+$"
+
+    escaped_brace_dollar = _translate_single_pattern("^\\p{Zl}[\\$]$")
+    assert escaped_brace_dollar.count("$(?![\\s\\S])") == 1
+    assert "[\\$]" in escaped_brace_dollar
+
+
+def test_translated_patterns_reject_a_trailing_newline_before_the_end_anchor() -> None:
+    # Python's bare $ also matches just before one trailing newline; the
+    # JavaScript u-mode original never does. Rewritten patterns must keep
+    # the original's strict end-of-input meaning.
+    translated = _translate_single_pattern("^\\p{Zl}x*$")
+    assert translated != "^\\p{Zl}x*$"
+    compiled = re.compile(translated)
+    assert compiled.search("\u2028xxx")
+    assert not compiled.search("\u2028xxx\n")
+    assert not compiled.search("\u2028xxx\r")
+
+
+def test_divergent_shorthands_and_dots_are_translated_to_equivalents() -> None:
+    # \d, \w and their negations are ASCII-only in JavaScript (even in u
+    # mode) and the u-mode dot excludes \r and U+2028/U+2029, while Python's
+    # versions are Unicode-aware or narrower. Rewritten patterns use classes
+    # that mean the same thing in both engines.
+    digit = re.compile(_translate_single_pattern("^(?:\\p{Zl}|\\d)$"))
+    assert digit.search("5")
+    assert not digit.search("\u0661")  # Arabic-Indic digit: JS \d rejects it
+
+    non_digit = re.compile(_translate_single_pattern("^(?:\\p{Zl}|\\D)$"))
+    assert non_digit.search("\u0661")
+    assert not non_digit.search("5")
+
+    word = re.compile(_translate_single_pattern("^(?:\\p{Zl}|\\w)$"))
+    assert word.search("a")
+    assert not word.search("\u00e0")
+
+    non_word = re.compile(_translate_single_pattern("^(?:\\p{Zl}|\\W)$"))
+    assert non_word.search("\u00e0")
+    assert not non_word.search("a")
+
+    dot = re.compile(_translate_single_pattern("^(?:\\p{Zl}|.)$"))
+    assert dot.search("a")
+    assert not dot.search("\r")
+    assert not dot.search("\u2029")
+    assert dot.search("\u0661")
+
+    in_class_digit = re.compile(_translate_single_pattern("^[\\p{Zl}\\d]$"))
+    assert in_class_digit.search("5")
+    assert not in_class_digit.search("\u0661")
+
+    in_class_word = re.compile(_translate_single_pattern("^[\\p{Zl}\\w]$"))
+    assert in_class_word.search("a")
+    assert not in_class_word.search("\u00e0")
+
+    # A dot inside a character class is a literal dot in both engines and
+    # must not be rewritten.
+    literal_dot = _translate_single_pattern("^[.\\p{Zl}]$")
+    assert "[." in literal_dot
+    assert re.compile(literal_dot).search(".")
+
+
+@pytest.mark.parametrize(
+    "pattern",
+    [
+        "\\p{Zl}\\s",  # whitespace sets differ between the engines
+        "\\p{Zl}\\S",
+        "[\\p{Zl}\\s]",
+        "[\\p{Zl}\\D]",  # negated shorthands have no in-class equivalent
+        "[\\p{Zl}\\W]",
+        "[\\p{Zl}\\S]",
+        "\\p{Zl}\\b",  # \b is ASCII-based in JS, Unicode-aware in Python
+        "\\p{Zl}\\B",
+        "\\p{Zl}\\uD83D\\uDE00",  # surrogate escapes are UTF-16 code units in JS
+        "[\\p{Zl}\\uD83D]",
+        "\\p{Zl}[]",  # JS: never-matching empty class; Python: literal ]
+        "\\p{Zl}[^]",  # JS: any character; Python: unterminated set
+    ],
+)
+def test_cross_engine_divergent_constructs_raise_translation_error(
+    pattern: str,
+) -> None:
+    with pytest.raises(TranslationError, match="diverg"):
+        _translate_single_pattern(pattern)
+
+
+def test_patterns_without_property_escapes_keep_divergent_constructs() -> None:
+    # A pattern the rewrite never touches keeps its original text, even for
+    # constructs that would be rejected in a rewritten pattern.
+    for pattern in [
+        "^\\d\\s.$",
+        "a[]b",
+        "^\\uD83D\\uDE00$",
+        "^\\w\\b$",
+        "^(a)\\1$",
+        "(?s:.)",
+        "(?i)x",
+    ]:
+        assert _translate_single_pattern(pattern) == pattern
+
+
+def test_pattern_properties_key_collisions_after_translation_fail_fast() -> None:
+    # Two different patternProperties keys can map onto the same translated
+    # key, which would silently drop one subschema. The translated key
+    # includes the strict anchor rewrite, so the colliding key must too.
+    def schema_with(keys: list) -> dict:
+        return {"type": "object", "patternProperties": {key: True for key in keys}}
+
+    solo = translate_claude_request_to_codex(
+        {
+            "messages": [],
+            "tools": [
+                {"name": "t", "input_schema": schema_with(["^\\p{Zl}$"])}
+            ],
+        },
+        codex_model="gpt-5.5",
+        codex_regex_compat=True,
+    )
+    (translated_key,) = solo["tools"][0]["parameters"]["patternProperties"]
+    assert translated_key != "^\\p{Zl}$"
+    assert translated_key.endswith("$(?![\\s\\S])")
+
+    for first, second in [
+        ("^\\p{Zl}$", translated_key),
+        (translated_key, "^\\p{Zl}$"),
+    ]:
+        with pytest.raises(TranslationError, match="patternProperties"):
+            translate_claude_request_to_codex(
+                {
+                    "messages": [],
+                    "tools": [
+                        {"name": "t", "input_schema": schema_with([first, second])}
+                    ],
+                },
+                codex_model="gpt-5.5",
+                codex_regex_compat=True,
+            )
+
+
+def test_pattern_properties_renames_with_local_refs_fail_fast() -> None:
+    # A renamed patternProperties key invalidates any local $ref JSON
+    # Pointer that addresses the old key, so the translation must stop
+    # instead of shipping a schema whose reference now dangles.
+    schema = {
+        "type": "object",
+        "$defs": {
+            "holder": {
+                "patternProperties": {r"\p{Zl}": {"type": "string"}},
+            }
+        },
+        "properties": {
+            "data": {"$ref": "#/$defs/holder/patternProperties/%5Cp%7BZl%7D"}
+        },
+    }
+    # The pointer resolves to the key in the original schema (the key and
+    # the pointer token must be the same text).
+    assert _reference_resolves(
+        schema, "#/$defs/holder/patternProperties/%5Cp%7BZl%7D"
+    )
+    with pytest.raises(TranslationError, match="\\$ref"):
+        translate_claude_request_to_codex(
+            {"messages": [], "tools": [{"name": "t", "input_schema": schema}]},
+            codex_model="gpt-5.5",
+            codex_regex_compat=True,
+        )
+
+    # Without a $ref in the schema, renaming keys stays safe.
+    no_ref = {
+        "type": "object",
+        "patternProperties": {r"\p{Zl}": {"type": "string"}},
+    }
+    payload = translate_claude_request_to_codex(
+        {"messages": [], "tools": [{"name": "t", "input_schema": no_ref}]},
+        codex_model="gpt-5.5",
+        codex_regex_compat=True,
+    )
+    (renamed,) = payload["tools"][0]["parameters"]["patternProperties"]
+    assert renamed != "^\\p{Zl}$"
+
+
+@pytest.mark.parametrize(
+    "pattern",
+    [
+        # re.compile raises OverflowError at or beyond the compiler's
+        # repetition limit (_sre.MAXREPEAT).
+        "^\\p{Zl}{4294967296}",
+        # A repetition count literal past the interpreter's decimal string
+        # conversion limit raises ValueError inside re.compile.
+        "\\p{Zl}{" + "1" * 4301 + "}",
+        # Deeply nested groups exhaust the parser's recursion and raise
+        # RecursionError.
+        "(?:" * 600 + "\\p{Zl}" + ")" * 600,
+    ],
+    ids=["huge-repetition", "digit-limit-repetition", "deep-nesting"],
+)
+def test_compiler_limits_raise_translation_error(pattern: str) -> None:
+    with pytest.raises(TranslationError, match="cannot be translated"):
+        _translate_single_pattern(pattern)
+
+
+def test_no_property_patterns_skip_the_compile_check_entirely() -> None:
+    # Patterns without a real property escape are returned before any
+    # compile check runs, so even compiler-crashing shapes pass through.
+    for pattern in ["(?:" * 600 + "x" + ")" * 600, "x{" + "1" * 4301 + "}"]:
+        assert _translate_single_pattern(pattern) == pattern
+
+
+
+
+def test_patterns_with_only_literal_property_text_stay_byte_identical() -> None:
+    # A doubled backslash makes the following p/P literal text, so these
+    # patterns contain no real property escape. They must stay byte-identical
+    # even when they hold constructs the rewrite would reject, because a
+    # pattern that is never rewritten is never subject to the bounded
+    # grammar.
+    for pattern in [
+        "\\\\p\\{Zl\\}\\s",
+        "\\\\P{Cc}\\S",
+        "\\\\p\\{Zl\\}[]",
+        "\\\\p\\{Zl\\}\\b",
+        "\\\\p\\{Zl\\}\\uD83D",
+    ]:
+        assert _translate_single_pattern(pattern) == pattern
+
+    # Control: an escaped backslash followed by a REAL escape is still
+    # detected escape-aware and translated.
+    transformed = _translate_single_pattern("\\\\\\p{Zl}")
+    assert transformed != "\\\\\\p{Zl}"
+    assert "\\p{Zl}" not in transformed
+    re.compile(transformed)
+
+
+def _pointer_tokens(fragment: str) -> list[str]:
+    # Stdlib URI-fragment JSON Pointer tokens, sufficient for the fixtures
+    # below: percent-decode each segment, then unescape ~1/~0.
+    decoded = urllib.parse.unquote(fragment)
+    return [
+        token.replace("~1", "/").replace("~0", "~")
+        for token in decoded.split("/")
+        if token
+    ]
+
+
+def _reference_resolves(schema: dict, ref: str) -> bool:
+    # Focused same-resource resolution check for these fixtures: when the
+    # schema declares an $id, the ref's base (the ref resolved against it)
+    # must be that same resource, and the fragment must walk to a node.
+    parsed = urllib.parse.urlsplit(ref)
+    if not parsed.fragment:
+        return False
+    base = schema.get("$id")
+    if base is not None:
+        if urllib.parse.urljoin(base, ref).split("#", 1)[0] != base:
+            return False
+    node: Any = schema
+    for token in _pointer_tokens(parsed.fragment):
+        if not isinstance(node, dict) or token not in node:
+            return False
+        node = node[token]
+    return True
+
+
+def test_reference_instructions_with_renamed_keys_fail_fast() -> None:
+    # A renamed patternProperties key can dangle any reference instruction:
+    # same-resource refs arrive not only as '#/...' fragments but as
+    # percent-encoded fragments, absolute URIs with a fragment, and relative
+    # URIs with a fragment, and $dynamicRef/$recursiveRef address keys the
+    # same way. The guard therefore rejects any schema-position reference
+    # when a key was renamed, rather than guessing locality from the URI
+    # spelling.
+    refs = [
+        "#/$defs/holder/patternProperties/%5Cp%7BZl%7D",
+        "#%2F$defs%2Fholder%2FpatternProperties%2F%5Cp%7BZl%7D",
+        "https://example.test/tool.json#/$defs/holder/patternProperties/%5Cp%7BZl%7D",
+        "tool.json#/$defs/holder/patternProperties/%5Cp%7BZl%7D",
+    ]
+    for ref in refs:
+        schema = {
+            "$id": "https://example.test/tool.json",
+            "type": "object",
+            "$defs": {
+                "holder": {
+                    "patternProperties": {r"\p{Zl}": {"type": "string"}}
+                }
+            },
+            "properties": {"x": {"$ref": ref}},
+        }
+        # The original ref genuinely resolves to the key about to be renamed.
+        assert _reference_resolves(schema, ref)
+        with pytest.raises(TranslationError, match="\\$ref"):
+            translate_claude_request_to_codex(
+                {"messages": [], "tools": [{"name": "t", "input_schema": schema}]},
+                codex_model="gpt-5.5",
+                codex_regex_compat=True,
+            )
+
+    for keyword in ("$dynamicRef", "$recursiveRef"):
+        ref = "#/$defs/holder/patternProperties/%5Cp%7BZl%7D"
+        schema = {
+            "type": "object",
+            "$defs": {
+                "holder": {
+                    "patternProperties": {r"\p{Zl}": {"type": "string"}}
+                }
+            },
+            "properties": {"x": {keyword: ref}},
+        }
+        assert _reference_resolves(schema, ref)
+        with pytest.raises(TranslationError, match="reference instruction"):
+            translate_claude_request_to_codex(
+                {"messages": [], "tools": [{"name": "t", "input_schema": schema}]},
+                codex_model="gpt-5.5",
+                codex_regex_compat=True,
+            )
+
+
+def test_external_refs_with_renamed_keys_are_rejected_conservatively() -> None:
+    # Documented conservative boundary: even a genuinely external ref is
+    # rejected in combination with a renamed key. Establishing true
+    # externality would need resolved resource identifiers, which the guard
+    # deliberately does not attempt.
+    schema = {
+        "type": "object",
+        "patternProperties": {r"\p{Zl}": {"type": "string"}},
+        "properties": {"x": {"$ref": "https://elsewhere.test/other.json#/x"}},
+    }
+    with pytest.raises(TranslationError, match="\\$ref"):
+        translate_claude_request_to_codex(
+            {"messages": [], "tools": [{"name": "t", "input_schema": schema}]},
+            codex_model="gpt-5.5",
+            codex_regex_compat=True,
+        )
+
+
+def test_references_without_renames_pass_through_unchanged() -> None:
+    # With no patternProperties key renamed, reference instructions keep
+    # their exact text: the guard is rename-gated, not reference-gated.
+    schema = {
+        "$id": "https://example.test/tool.json",
+        "type": "object",
+        "$defs": {
+            "holder": {"patternProperties": {"^[a-z]+$": {"type": "string"}}}
+        },
+        "properties": {
+            "x": {"$ref": "#/$defs/holder/patternProperties/%5E%5Ba-z%5D%2B%24"},
+        },
+        "default": {"$ref": "#/anything"},
+    }
+    payload = translate_claude_request_to_codex(
+        {"messages": [], "tools": [{"name": "t", "input_schema": schema}]},
+        codex_model="gpt-5.5",
+        codex_regex_compat=True,
+    )
+    assert payload["tools"][0]["parameters"] == schema
+
+
+def test_literal_ref_shaped_data_is_not_a_reference_instruction() -> None:
+    # $ref text inside default/examples values is literal data, not a
+    # reference the validator follows, so a rename elsewhere must not fail
+    # the translation on its behalf.
+    schema = {
+        "type": "object",
+        "patternProperties": {"^\\p{Zl}$": {"type": "string"}},
+        "default": {"$ref": "#/patternProperties/%5Cp%7BZl%7D"},
+        "examples": [{"$ref": "#%2Fanything"}],
+    }
+    payload = translate_claude_request_to_codex(
+        {"messages": [], "tools": [{"name": "t", "input_schema": schema}]},
+        codex_model="gpt-5.5",
+        codex_regex_compat=True,
+    )
+    parameters = payload["tools"][0]["parameters"]
+    (renamed_key,) = parameters["patternProperties"]
+    assert renamed_key != "^\\p{Zl}$"
+    assert parameters["default"] == {"$ref": "#/patternProperties/%5Cp%7BZl%7D"}
+
+
+@pytest.mark.parametrize(
+    "pattern",
+    [
+        # A backreference to a group that did not participate matches empty
+        # in JavaScript but fails in Python re.
+        "^(a)?\\1\\p{Zl}$",
+        # Scoped inline flags change what the dot or the anchors mean
+        # (dotAll includes \n; JS multiline line terminators include
+        # \r and U+2028/U+2029 while Python's include only \n).
+        "(?s:.\\p{Zl})",
+        "(?im:.)\\p{Zl}",
+        # Bare inline flags are Python-valid but not JavaScript-valid; a
+        # rewritten pattern must not carry them either.
+        "(?i)\\p{Zl}$",
+        "(?m)\\p{Zl}$",
+    ],
+)
+def test_backreferences_and_inline_flags_raise_translation_error(
+    pattern: str,
+) -> None:
+    with pytest.raises(TranslationError, match="diverg"):
+        _translate_single_pattern(pattern)
 
 
 def test_thinking_budget_to_reasoning_effort() -> None:

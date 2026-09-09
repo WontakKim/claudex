@@ -2056,10 +2056,12 @@ def test_responses_backend_translates_then_awaits_adapter_and_uses_bound_transpo
         *,
         service_tier: str | None = None,
         custom_provider: str | None = None,
+        codex_regex_compat: bool = False,
     ) -> dict[str, Any]:
-        call_order.append(("translate", custom_provider))
+        call_order.append(("translate", custom_provider, codex_regex_compat))
         assert model == upstream_model
         assert service_tier is None
+        assert codex_regex_compat == (provider == "codex")
         return translated_payload
 
     async def adapt_payload(
@@ -2109,6 +2111,7 @@ def test_responses_backend_translates_then_awaits_adapter_and_uses_bound_transpo
         adapt_payload=adapt_payload,
         adapt_probe_payload=adapt_probe_payload,
         signature_namespace=signature_namespace,
+        codex_regex_compat=provider == "codex",
     )
 
     response = client.post(
@@ -2117,7 +2120,7 @@ def test_responses_backend_translates_then_awaits_adapter_and_uses_bound_transpo
 
     assert response.status_code == 503
     assert call_order == [
-        ("translate", signature_namespace),
+        ("translate", signature_namespace, provider == "codex"),
         ("adapt", translated_payload, upstream_model),
         ("stream", adapted_payload, "session-1"),
     ]
@@ -2248,6 +2251,119 @@ def test_custom_provider_route_uses_custom_client_without_builtin_payload_mutati
     assert payload["reasoning"]["effort"] == "max"
     assert "service_tier" not in payload
     assert "max_output_tokens" not in payload
+
+
+def test_custom_provider_receives_the_original_schema_without_regex_translation(
+) -> None:
+    # Codex regex compatibility must be scoped to the codex provider: a
+    # custom Responses backend that validates patterns with a JavaScript
+    # engine gets the schema exactly as the client sent it, including
+    # property escapes the Codex translator cannot represent.
+    custom_stub = StubOpenAICompatibleClient()
+    config = GatewayConfig(
+        model_map={"opus": "wrtn:gpt-5.5"},
+        custom_providers={"wrtn": _custom_provider()},
+    )
+    schema = {
+        "type": "object",
+        "properties": {
+            "upper": {"type": "string", "pattern": "^\\p{Lu}+$"},
+            "control": {
+                "type": "string",
+                "pattern": "^(?!__.*__$)[^\\p{Cc}\\p{Cf}\\p{Zl}\\p{Zp}\"\\\\./[\\]]{1,200}$",
+            },
+        },
+        "patternProperties": {"^\\p{Zl}$": {"type": "string"}},
+    }
+    body = _message_body("claude-opus-4-6")
+    body["tools"] = [{"name": "tool", "input_schema": schema}]
+
+    client, codex_stub = _gateway(
+        config,
+        _failing_anthropic_handler,
+        custom_provider_clients={"wrtn": custom_stub},
+    )
+    response = client.post("/v1/messages", json=body)
+
+    assert response.status_code == 503
+    assert codex_stub.payloads == []
+    (payload,) = custom_stub.payloads
+    assert payload["tools"][0]["parameters"] == schema
+
+
+def test_codex_route_translates_unicode_property_patterns() -> None:
+    config = GatewayConfig(model_map={"opus": "codex:selected-model"})
+    schema = {
+        "type": "object",
+        "properties": {
+            "data": {
+                "type": "object",
+                "propertyNames": {
+                    "pattern": (
+                        "^(?!__.*__$)"
+                        "[^\\p{Cc}\\p{Cf}\\p{Zl}\\p{Zp}\"\\\\./[\\]]{1,200}$"
+                    )
+                },
+            },
+        },
+    }
+    body = _message_body("claude-opus-4-6")
+    body["tools"] = [{"name": "Artifact", "input_schema": schema}]
+
+    client, codex_stub = _gateway(config, _failing_anthropic_handler)
+    response = client.post("/v1/messages", json=body)
+
+    assert response.status_code == 503
+    (payload,) = codex_stub.payloads
+    translated = payload["tools"][0]["parameters"]["properties"]["data"][
+        "propertyNames"
+    ]["pattern"]
+    assert "\\p{" not in json.dumps(payload)
+    assert "\\U" not in translated
+    assert translated.endswith("$(?![\\s\\S])")
+    re.compile(translated)
+
+
+@pytest.mark.parametrize(
+    "pattern",
+    [
+        "^\\p{Zl}{4294967296}",  # OverflowError: past _sre.MAXREPEAT
+        "\\p{Zl}{" + "1" * 4301 + "}",  # ValueError: decimal conversion limit
+        "(?:" * 600 + "\\p{Zl}" + ")" * 600,  # RecursionError: deep nesting
+    ],
+    ids=["huge-repetition", "digit-limit-repetition", "deep-nesting"],
+)
+def test_codex_route_answers_compiler_limit_patterns_with_a_controlled_400(
+    pattern: str,
+) -> None:
+    # re.compile can raise beyond re.error -- OverflowError at or beyond the
+    # compiler's repetition limit (_sre.MAXREPEAT), ValueError for a
+    # repetition literal past the interpreter's decimal conversion limit,
+    # and RecursionError for deeply nested groups. All of them compile in
+    # the original JavaScript u mode, so the relay must answer a controlled
+    # 400 instead of crashing on the unhandled exception.
+    config = GatewayConfig(model_map={"opus": "codex:selected-model"})
+    body = _message_body("claude-opus-4-6")
+    body["tools"] = [
+        {
+            "name": "tool",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "x": {"type": "string", "pattern": pattern}
+                },
+            },
+        }
+    ]
+
+    client, codex_stub = _gateway(config, _failing_anthropic_handler)
+    response = client.post("/v1/messages", json=body)
+
+    assert response.status_code == 400
+    error = response.json()["error"]
+    assert error["type"] == "invalid_request_error"
+    assert "cannot be translated" in error["message"]
+    assert codex_stub.payloads == []
 
 
 def test_context_window_override_is_scoped_to_provider() -> None:
@@ -2965,6 +3081,7 @@ def test_compaction_reroute_fallback_translates_untouched_original_body_once(
         *,
         service_tier: str | None = None,
         custom_provider: str | None = None,
+        codex_regex_compat: bool = False,
     ) -> dict[str, Any]:
         # A deep, JSON-round-tripped copy: proves equality without ever
         # aliasing the mutable dict the caller still holds.
@@ -3439,6 +3556,7 @@ def test_compaction_stream_reroute_fallback_translates_untouched_original_body_w
         *,
         service_tier: str | None = None,
         custom_provider: str | None = None,
+        codex_regex_compat: bool = False,
     ) -> dict[str, Any]:
         # A deep, JSON-round-tripped copy: proves equality without ever
         # aliasing the mutable dict the caller still holds.
