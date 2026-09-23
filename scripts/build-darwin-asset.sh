@@ -5,19 +5,16 @@
 #   - asset name:  claudex-gateway-<version>-darwin-arm64.tar.gz
 #   - tar root:    bin/claudex-gateway executable entrypoint
 #
-# The gateway is pure Python, so the tarball is assembled from parts instead
-# of compiled. This works on any build host (the linux-arm64 CI runner or a
-# developer Mac):
+# The gateway is assembled from a wheel, bundled CPython, and darwin-arm64
+# dependency wheels on an arm64 Mac:
 #   bin/claudex-gateway   POSIX shell shim that execs the bundled runtime
 #   bin/claudex           launches Claude Code through the local gateway
 #   python/               python-build-standalone darwin-arm64 (checksum-pinned)
 #   python/lib/.../site-packages
 #                         project wheel + uv.lock-pinned deps, cross-installed
 #
-# IMPORTANT: runtime dependencies must stay pure Python (py3-none-any wheels).
-# A native wheel (e.g. uvicorn[standard]'s uvloop) cannot be verified on the
-# linux builder and would break the single-artifact model — the gate below
-# fails the build if one sneaks in.
+# Native dependencies are accepted only when they support arm64; the bundled
+# runtime smoke test verifies they load without relying on the build host.
 #
 # Output: build/claudex-gateway-<version>-darwin-arm64.tar.gz
 set -euo pipefail
@@ -40,6 +37,10 @@ fail() { echo "error: $1" >&2; exit 1; }
 
 command -v uv >/dev/null 2>&1 \
   || fail "uv is required to build the asset (https://docs.astral.sh/uv/)"
+[ "$(uname -s)" = "Darwin" ] && [ "$(uname -m)" = "arm64" ] \
+  || fail "building the gptpro release asset requires a Darwin arm64 host"
+command -v lipo >/dev/null 2>&1 \
+  || fail "lipo is required to verify arm64 native dependencies (install Xcode command line tools)"
 
 VERSION="$(sed -n 's/^version = "\(.*\)"$/\1/p' pyproject.toml | head -1)"
 [ -n "${VERSION}" ] || fail "could not read version from pyproject.toml"
@@ -71,7 +72,7 @@ tar -xzf "build/downloads/${PBS_TARBALL}" -C "${STAGE}"
 
 echo "==> Cross-installing project wheel + uv.lock-pinned deps into the bundled site-packages"
 uv build --wheel
-uv export --frozen --no-dev --no-emit-project --no-hashes -o build/requirements.txt
+uv export --frozen --extra gptpro --no-dev --no-emit-project --no-hashes -o build/requirements.txt
 uv pip install \
   --target "${SITE_PACKAGES}" \
   --python-version "${PBS_SERIES}" \
@@ -82,10 +83,12 @@ uv pip install \
 # Console scripts are unused — the shim runs `python -m claudex`.
 rm -rf "${SITE_PACKAGES}/bin"
 
-echo "==> Enforcing the pure-Python gate"
-NATIVE_FILES="$(find "${SITE_PACKAGES}" \( -name '*.so' -o -name '*.dylib' \) -print)"
-[ -z "${NATIVE_FILES}" ] || fail "native extension files in site-packages break the pure-Python artifact contract:
-${NATIVE_FILES}"
+echo "==> Verifying native dependency architecture"
+find "${SITE_PACKAGES}" \( -name '*.so' -o -name '*.dylib' \) -print0 |
+  while IFS= read -r -d '' native_file; do
+    lipo "${native_file}" -verify_arch arm64 >/dev/null 2>&1 \
+      || fail "native dependency lacks arm64 support: ${native_file}"
+  done
 
 echo "==> Writing launcher shims"
 mkdir -p "${STAGE}/bin"
@@ -127,23 +130,38 @@ HEADER="$(head -c 8 "${STAGE}/python/bin/python3" | od -An -tx1 | tr -d ' \n')"
 [ "${HEADER}" = "cffaedfe0c000001" ] \
   || fail "python/bin/python3 is not Mach-O arm64 (header: ${HEADER})"
 
-echo "==> Smoke-testing the bundle"
-# An unknown argument must print usage and exit 2 — this imports the package
-# and loads config without starting the server. On a Mac the real shim runs;
-# elsewhere the darwin binary cannot execute, so the (platform-independent)
-# site-packages run on a host CPython of the same series instead.
+echo "==> Smoke-testing the bundled runtime"
+# Use a fresh home and disable host Python packages; never start the gateway
+# server or a browser during the build.
+SMOKE_HOME="${PWD}/build/smoke-home"
+mkdir -p "${SMOKE_HOME}"
 SMOKE_RC=0
-if [ "$(uname -s)" = "Darwin" ] && [ "$(uname -m)" = "arm64" ]; then
-  SMOKE_OUT="$("${STAGE}/bin/${TOOL}" definitely-not-a-subcommand 2>&1)" || SMOKE_RC=$?
-else
-  SMOKE_OUT="$(PYTHONPATH="${SITE_PACKAGES}" uv run --no-project --python "${PBS_SERIES}" \
-    python -m claudex definitely-not-a-subcommand 2>&1)" || SMOKE_RC=$?
-fi
+SMOKE_OUT="$(HOME="${SMOKE_HOME}" PYTHONPATH= PYTHONNOUSERSITE=1 \
+  "${STAGE}/bin/${TOOL}" definitely-not-a-subcommand 2>&1)" || SMOKE_RC=$?
 [ "${SMOKE_RC}" = "2" ] || fail "smoke test exited with ${SMOKE_RC}, expected usage error 2: ${SMOKE_OUT}"
 case "${SMOKE_OUT}" in
   *"usage: claudex-gateway"*) ;;
   *) fail "smoke test did not print the usage line: ${SMOKE_OUT}" ;;
 esac
+HOME="${SMOKE_HOME}" PYTHONPATH= PYTHONNOUSERSITE=1 \
+  "${STAGE}/python/bin/python3" - <<'PY'
+import asyncio
+
+from claudex.mcp_tools import build_gptpro_server
+from playwright.async_api import async_playwright
+
+build_gptpro_server(None)
+
+async def verify_driver():
+    playwright = await async_playwright().start()
+    try:
+        assert playwright.chromium.executable_path
+    finally:
+        await playwright.stop()
+
+asyncio.run(verify_driver())
+print("bundled MCP import and Playwright driver startup passed")
+PY
 
 echo "==> Packing ${ASSET}"
 # COPYFILE_DISABLE keeps macOS builds from adding ._* AppleDouble entries.

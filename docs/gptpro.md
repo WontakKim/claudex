@@ -11,22 +11,21 @@ answer.
 
 ## Setup
 
-Install the optional MCP and browser dependencies:
+The macOS release tarball includes the MCP and Playwright dependencies. From
+the extracted release directory, run:
+
+```sh
+./bin/claudex-gateway gptpro login
+./bin/claudex-gateway gptpro status
+./bin/claudex-gateway gptpro doctor
+```
+
+A source checkout needs the optional dependencies first:
 
 ```sh
 uv sync --extra gptpro
-```
-
-Sign in through the interactive browser and save the session:
-
-```sh
-uv run claudex-gateway gptpro login
-```
-
-Check the saved session without contacting ChatGPT:
-
-```sh
-uv run claudex-gateway gptpro status
+uv run --extra gptpro claudex-gateway gptpro login
+uv run --extra gptpro claudex-gateway gptpro status
 ```
 
 The dashboard MCP tab leads with gateway-wide Claude Code connection setup,
@@ -41,7 +40,12 @@ Session state, the persistent Chrome profile, and its lock live under
 `~/.claudex/gptpro/`. The session file is
 `~/.claudex/gptpro/session.json`, and the browser profile is
 `~/.claudex/gptpro/chrome-profile/`. Google Chrome or a Playwright Chromium
-browser must be available.
+browser must be available. If neither is installed, install Google Chrome or
+run `<python> -m playwright install chromium` with the same Python executable
+that runs the gateway (the login error prints the exact command for your
+installation). If a release installation reports that Playwright itself is
+missing, reinstall the latest release tarball; in a source checkout, rerun
+`uv sync --extra gptpro`.
 
 The ask runtime lazily starts one warm, headless persistent browser context and
 reuses it. Login uses the same profile in a visible browser. A profile lock

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import shlex
+import sys
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -71,7 +73,9 @@ def _browser_failure(exc: BaseException) -> GptProLoginError:
     if browser.is_browser_missing_error(exc):
         return GptProLoginError(
             "chrome_missing",
-            "install Google Chrome or the Playwright Chromium browser and retry",
+            "install Google Chrome or run "
+            f"`{shlex.quote(sys.executable)} -m playwright install chromium` "
+            "to install Playwright Chromium, then retry",
         )
     return GptProLoginError("error", "retry after checking the browser installation")
 
