@@ -29,7 +29,7 @@ from claudex.locking import try_file_lock
 # Serves the given JSON payload on every GET; "__SELF_PID__": true is
 # replaced with the fake server's own pid so identity checks can match.
 _FAKE_SERVER = """
-import http.server, json, os, sys
+import http.server, json, os, socketserver, sys
 payload = json.loads(sys.argv[2])
 if payload.pop("__SELF_PID__", False):
     payload["pid"] = os.getpid()
@@ -43,7 +43,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(body)
     def log_message(self, *args):
         pass
-http.server.HTTPServer(("127.0.0.1", int(sys.argv[1])), Handler).serve_forever()
+# TCPServer avoids HTTPServer's reverse-DNS lookup before listening.
+socketserver.TCPServer(("127.0.0.1", int(sys.argv[1])), Handler).serve_forever()
 """
 
 
@@ -202,6 +203,26 @@ def _spawn_fake_server(port: int, payload: dict) -> subprocess.Popen[bytes]:
         time.sleep(0.1)
     process.kill()
     raise RuntimeError("fake server did not start listening")
+
+
+def test_fake_server_starts_without_reverse_dns(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        sys.modules[__name__],
+        "_FAKE_SERVER",
+        "import socket\n"
+        "def fail_reverse_dns_lookup(host):\n"
+        "    raise RuntimeError('reverse DNS lookup unavailable')\n"
+        "socket.getfqdn = fail_reverse_dns_lookup\n"
+        + _FAKE_SERVER,
+    )
+    port = _free_port()
+    fake = _spawn_fake_server(port, {"service": "fake"})
+    try:
+        assert _fetch_hello(port) == {"service": "fake"}
+    finally:
+        with contextlib.suppress(ProcessLookupError):
+            fake.kill()
+        fake.wait()
 
 
 def test_start_restarts_a_stale_version_daemon(tmp_path: Path) -> None:
