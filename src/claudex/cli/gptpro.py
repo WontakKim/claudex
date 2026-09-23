@@ -11,6 +11,7 @@ import time
 from collections.abc import Callable
 
 from claudex import locking, paths
+from claudex.gptpro import browser as gptpro_browser
 from claudex.gptpro import login as gptpro_login
 from claudex.gptpro import runtime as gptpro_runtime
 from claudex.gptpro import session as gptpro_session
@@ -100,7 +101,7 @@ def _check_gptpro_profile_lock() -> tuple[str, str]:
 
 def _check_gptpro_playwright() -> tuple[str, str]:
     if importlib.util.find_spec("playwright") is None:
-        return "FAIL", "not installed; run uv sync --extra gptpro"
+        return "FAIL", gptpro_browser.PLAYWRIGHT_INSTALL_MESSAGE
 
     try:
         version = importlib.metadata.version("playwright")

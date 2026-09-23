@@ -76,8 +76,8 @@ def test_lazy_playwright_import_has_actionable_dependency_error(
         asyncio.run(browser._start_playwright())
 
     assert str(raised.value) == (
-        "playwright is not installed; run `uv sync --extra gptpro` to enable "
-        "gptpro login"
+        "playwright is not installed; reinstall the latest release tarball or run "
+        "`uv sync --extra gptpro` in a source checkout"
     )
     assert isinstance(raised.value.__cause__, ModuleNotFoundError)
 

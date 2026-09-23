@@ -19,9 +19,9 @@ _PLAYWRIGHT_BROWSER_MISSING_PATTERN = re.compile(
     r"Executable doesn't exist at|playwright install", re.IGNORECASE
 )
 _PLAYWRIGHT_OWNERS: dict[int, Any] = {}
-_PLAYWRIGHT_INSTALL_MESSAGE = (
-    "playwright is not installed; run `uv sync --extra gptpro` to enable "
-    "gptpro login"
+PLAYWRIGHT_INSTALL_MESSAGE = (
+    "playwright is not installed; reinstall the latest release tarball or run "
+    "`uv sync --extra gptpro` in a source checkout"
 )
 PROFILE_IN_USE_MESSAGE = "another gptpro ask is using the browser profile"
 
@@ -46,7 +46,7 @@ async def _start_playwright() -> Any:
     try:
         from playwright.async_api import async_playwright
     except ImportError as exc:
-        raise GptProDependencyError(_PLAYWRIGHT_INSTALL_MESSAGE) from exc
+        raise GptProDependencyError(PLAYWRIGHT_INSTALL_MESSAGE) from exc
 
     return await async_playwright().start()
 

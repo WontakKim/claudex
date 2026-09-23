@@ -355,8 +355,11 @@ def test_gptpro_doctor_fails_when_playwright_is_missing(
 
     assert gptpro_cli._gptpro_main(["doctor"]) == 1
     captured = capsys.readouterr()
-    assert "Playwright dependency: FAIL - not installed" in captured.out
-    assert "uv sync --extra gptpro" in captured.out
+    assert (
+        "Playwright dependency: FAIL - playwright is not installed; "
+        "reinstall the latest release tarball or run `uv sync --extra gptpro` "
+        "in a source checkout"
+    ) in captured.out
     assert "Summary: 3 passed, 1 failed, 0 warnings" in captured.out
     assert captured.err == ""
 

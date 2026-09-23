@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+import shlex
 import stat
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -322,6 +324,11 @@ def test_run_login_classifies_missing_playwright_browser(
     result = asyncio.run(login.run_login(on_status=_ignore_status))
 
     assert result.failure == "chrome_missing"
+    assert "install Google Chrome" in result.message
+    assert (
+        f"{shlex.quote(sys.executable)} -m playwright install chromium"
+        in result.message
+    )
 
 
 @pytest.mark.parametrize(
