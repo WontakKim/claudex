@@ -26,7 +26,8 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-_LOGIN_SESSION_TIMEOUT_SECONDS = 360.0
+# Keep the bounded install separate from login, navigation, and verification.
+_LOGIN_SESSION_TIMEOUT_SECONDS = 13 * 60.0
 _OUTPUT_CAP_CHARS = 4096
 _PROCESS_GROUP_GRACE_SECONDS = 5.0
 _LOGIN_COMMAND: tuple[str, ...] = (
@@ -199,9 +200,9 @@ def _process_group_alive(pgid: int) -> bool:
 async def _terminate_process_group(
     pgid: int, process: asyncio.subprocess.Process
 ) -> None:
-    """SIGTERM the group, wait for extinction, then SIGKILL and reap."""
+    """Request CLI cancellation, then SIGKILL the group and reap."""
     try:
-        os.killpg(pgid, signal.SIGTERM)
+        os.killpg(pgid, signal.SIGINT)
     except (ProcessLookupError, PermissionError):
         await process.wait()
         return

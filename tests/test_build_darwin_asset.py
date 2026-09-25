@@ -118,6 +118,16 @@ def test_gptpro_setup_documents_both_installations() -> None:
     assert "latest release tarball" in documentation
     assert "--extra" not in documentation
     assert "sync the project dependencies first" in documentation
+    normalized_documentation = " ".join(documentation.split())
+    assert (
+        "downloads the matching Playwright Chromium automatically"
+        in normalized_documentation
+    )
+    assert "normal per-user cache" in normalized_documentation
+    assert (
+        "does not write a browser into the extracted release directory"
+        in normalized_documentation
+    )
 
 
 def test_gptpro_copy_describes_default_dependencies() -> None:

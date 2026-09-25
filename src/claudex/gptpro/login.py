@@ -9,7 +9,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 from claudex import locking, paths
 from claudex.gptpro import browser, session
@@ -24,6 +24,7 @@ PROFILE_LOCK_POLL_INTERVAL_SECONDS = 0.1
 
 FailureClassification = Literal[
     "dependency_missing",
+    "browser_install_failed",
     "chrome_missing",
     "navigation_failed",
     "login_timeout",
@@ -78,6 +79,42 @@ def _browser_failure(exc: BaseException) -> GptProLoginError:
             "to install Playwright Chromium, then retry",
         )
     return GptProLoginError("error", "retry after checking the browser installation")
+
+
+async def _launch_login_browser(
+    profile_dir: Path, on_status: Callable[[str], None]
+) -> Any:
+    on_status("checking for system Chrome or Playwright Chromium")
+    try:
+        return await browser.launch_persistent_profile(profile_dir, headless=False)
+    except Exception as exc:
+        if isinstance(exc, browser.GptProDependencyError) or not (
+            browser.is_browser_missing_error(exc)
+        ):
+            raise _browser_failure(exc) from exc
+
+    on_status("no compatible browser found; installing Playwright Chromium")
+    try:
+        await browser.install_chromium()
+    except browser.BrowserInstallError as exc:
+        raise GptProLoginError(
+            "browser_install_failed",
+            f"automatic Playwright Chromium installation failed: {exc}",
+        ) from exc
+
+    on_status("Playwright Chromium installed; opening the ChatGPT sign-in browser")
+    try:
+        return await browser.launch_persistent_profile(profile_dir, headless=False)
+    except Exception as exc:
+        if browser.is_browser_missing_error(exc):
+            raise GptProLoginError(
+                "chrome_missing",
+                "automatic Chromium installation completed, but no compatible "
+                "browser could be launched; install Google Chrome or run "
+                f"`{shlex.quote(sys.executable)} -m playwright install chromium` "
+                "and retry",
+            ) from exc
+        raise _browser_failure(exc) from exc
 
 
 async def _probe_saved_session(path: Path) -> None:
@@ -185,14 +222,12 @@ async def run_login(*, on_status: Callable[[str], None]) -> LoginResult:
         return result("error", browser.PROFILE_IN_USE_MESSAGE)
 
     try:
-        context = await browser.launch_persistent_profile(
-            profile_dir, headless=False
-        )
+        context = await _launch_login_browser(profile_dir, on_status)
     except BaseException as exc:
         profile_lock.release()
         if not isinstance(exc, Exception):
             raise
-        failure = _browser_failure(exc)
+        failure = exc if isinstance(exc, GptProLoginError) else _browser_failure(exc)
         return result(failure.failure, str(failure))
 
     login_failure: GptProLoginError | None = None
