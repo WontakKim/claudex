@@ -43,8 +43,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(body)
     def log_message(self, *args):
         pass
-# TCPServer avoids HTTPServer's reverse-DNS lookup before listening.
-socketserver.TCPServer(("127.0.0.1", int(sys.argv[1])), Handler).serve_forever()
+# TCPServer avoids reverse-DNS lookup; address reuse lets restarted daemons
+# bind on Linux while the fake server's connections remain in TIME_WAIT.
+class _ReusableServer(socketserver.TCPServer):
+    allow_reuse_address = True
+_ReusableServer(("127.0.0.1", int(sys.argv[1])), Handler).serve_forever()
 """
 
 

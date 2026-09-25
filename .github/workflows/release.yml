@@ -6,7 +6,7 @@ name: Release
 # Releasing is automatic and idempotent: on every push to main the
 # pyproject.toml version is checked, and if no release v<version> exists yet
 # the tarball is built and the release (plus its v<version> tag) is created.
-# Merges that don't bump the version are skipped early, so they stay green.
+# Linux tests run on each matching event; publishing skips existing releases.
 # Bump the version in pyproject.toml to ship a release.
 #
 # Tarball contract:
@@ -19,8 +19,8 @@ name: Release
 #
 # workflow_dispatch with dry_run=true (the default) uploads the tarball as an
 # actions artifact instead of creating a release, so the output can be
-# inspected without tagging. PRs that touch this workflow or the build script
-# get the same dry-run treatment automatically (GitHub only registers
+# inspected without tagging. Matching PRs get the same dry-run treatment
+# automatically (GitHub only registers
 # workflow_dispatch for workflows on the default branch, so this is also how
 # changes to these files are verified before merge).
 
@@ -32,6 +32,8 @@ on:
       - '.github/workflows/release.yml'
       - 'scripts/build-darwin-asset.sh'
       - 'scripts/verify_darwin_architecture.py'
+      - 'src/**'
+      - 'tests/**'
       - 'pyproject.toml'
       - 'uv.lock'
   workflow_dispatch:
@@ -49,7 +51,41 @@ permissions:
   contents: write
 
 jobs:
+  linux-tests:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    container:
+      image: ghcr.io/astral-sh/uv:python3.12-bookworm
+      options: --init
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Verify platform and install dashboard test runtime
+        run: |
+          test "$(uname -s)" = Linux
+          test "$(uname -m)" = aarch64
+          apt-get update
+          apt-get install -y --no-install-recommends nodejs
+
+      - name: Test on Linux arm64
+        run: |
+          uv sync --frozen
+          uv run --frozen pytest
+
+      - name: Repeat daemon lifecycle tests
+        run: |
+          for attempt in 1 2 3; do
+            echo "Daemon lifecycle test run ${attempt}/3"
+            uv run --frozen pytest tests/test_main.py
+          done
+
   release:
+    needs: linux-tests
     # GitHub-hosted M1 runner runs the bundled darwin-arm64 Python smoke tests.
     runs-on: macos-15
     steps:
@@ -76,8 +112,7 @@ jobs:
         run: |
           # The release version is whatever pyproject.toml says — merging a
           # version bump to main is what ships a release. If that version is
-          # already released, every remaining step is skipped so unrelated
-          # merges stay green and cheap.
+          # already released, the remaining release steps are skipped.
           VERSION="$(sed -n 's/^version = "\(.*\)"$/\1/p' pyproject.toml | head -1)"
           if [ -z "${VERSION}" ]; then
             echo "::error::Could not read version from pyproject.toml."
