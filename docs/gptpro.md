@@ -58,6 +58,37 @@ prevents login and an ask runtime, or two ask runtimes, from using that profile
 at the same time. If login reports that another gptpro ask is using the browser
 profile, stop the gateway process that owns the runtime before logging in again.
 
+## Release build hosts
+
+Run `./scripts/build-darwin-asset.sh` to assemble
+`build/claudex-gateway-<version>-darwin-arm64.tar.gz`. The build supports macOS
+arm64 and cross-build hosts such as Linux arm64. It requires `uv`, `curl`, and
+the standard shell/archive tools; cross-builds also use a host CPython matching
+the bundled series (currently 3.12), located or downloaded by `uv`. The build
+host does not change the target: the extracted release still runs on macOS
+arm64, with the same `bin/` and `python/` layout and bundled dependencies.
+
+All builds verify the checksum-pinned runtime and require Mach-O arm64 support
+in bundled Python, every `.so`/`.dylib`, and Playwright's `driver/node`.
+Universal binaries are accepted when they contain an arm64 slice.
+
+- **macOS arm64:** requires `lipo` from the Xcode command line tools and runs the
+  bundled launcher usage check, MCP server construction, and Playwright driver
+  startup. These checks do not launch or download a browser.
+- **Cross-build hosts:** validate Mach-O headers without macOS tools, then use
+  host CPython with the bundled site-packages to check the platform-independent
+  CLI usage error. The build explicitly logs that bundled Darwin runtime
+  verification was skipped. This does not verify native-library loading, the
+  bundled launcher, or MCP/Playwright execution on macOS.
+
+Smoke tests use an isolated home and do not write Python bytecode into the
+bundle. A Linux-assembled asset can receive full runtime verification on an
+arm64 Mac; successful cross-assembly alone does not provide that guarantee.
+
+Forks may select their own CI runner. Before building, run `uv sync --frozen`
+and `uv run --frozen pytest`; MCP and Playwright are default dependencies, so
+workflows must not request the removed `gptpro` extra.
+
 ## MCP tool contract
 
 The gateway exposes three tools. Each schema rejects keys other than those

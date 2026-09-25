@@ -6,15 +6,19 @@
 #   - tar root:    bin/claudex-gateway executable entrypoint
 #
 # The gateway is assembled from a wheel, bundled CPython, and darwin-arm64
-# dependency wheels on an arm64 Mac:
+# dependency wheels on macOS or a cross-build host such as Linux arm64:
 #   bin/claudex-gateway   POSIX shell shim that execs the bundled runtime
 #   bin/claudex           launches Claude Code through the local gateway
 #   python/               python-build-standalone darwin-arm64 (checksum-pinned)
 #   python/lib/.../site-packages
 #                         project wheel + uv.lock-pinned deps, cross-installed
 #
-# Native dependencies are accepted only when they support arm64; the bundled
-# runtime smoke test verifies they load without relying on the build host.
+# Every native library, bundled Python, and Playwright Node must support
+# Mach-O arm64. Darwin arm64 uses lipo and runs the bundled runtime, MCP, and
+# Playwright driver. Other hosts use a portable Mach-O check and host CPython
+# of the same series for a CLI usage smoke; bundled-runtime execution is skipped.
+# Cross-builds require uv to locate or download that host CPython. The resulting
+# asset still runs only on macOS arm64, regardless of its build host.
 #
 # Output: build/claudex-gateway-<version>-darwin-arm64.tar.gz
 set -euo pipefail
@@ -37,10 +41,20 @@ fail() { echo "error: $1" >&2; exit 1; }
 
 command -v uv >/dev/null 2>&1 \
   || fail "uv is required to build the asset (https://docs.astral.sh/uv/)"
-[ "$(uname -s)" = "Darwin" ] && [ "$(uname -m)" = "arm64" ] \
-  || fail "building the gptpro release asset requires a Darwin arm64 host"
-command -v lipo >/dev/null 2>&1 \
-  || fail "lipo is required to verify arm64 native dependencies (install Xcode command line tools)"
+HOST_OS="$(uname -s)"
+HOST_ARCH="$(uname -m)"
+IS_NATIVE_HOST=false
+if [ "${HOST_OS}" = "Darwin" ] && [ "${HOST_ARCH}" = "arm64" ]; then
+  IS_NATIVE_HOST=true
+  command -v lipo >/dev/null 2>&1 \
+    || fail "lipo is required to verify arm64 native dependencies (install Xcode command line tools)"
+else
+  HOST_PYTHON="$(env -u VIRTUAL_ENV -u PYTHONHOME -u PYTHONPATH \
+    uv run --no-project --python "cpython@${PBS_SERIES}" \
+    python -S -c 'import sys; print(sys.executable)')" \
+    || fail "could not obtain host CPython ${PBS_SERIES} through uv for cross-build verification"
+  [ -x "${HOST_PYTHON}" ] || fail "host CPython is not executable: ${HOST_PYTHON}"
+fi
 
 VERSION="$(sed -n 's/^version = "\(.*\)"$/\1/p' pyproject.toml | head -1)"
 [ -n "${VERSION}" ] || fail "could not read version from pyproject.toml"
@@ -84,11 +98,21 @@ uv pip install \
 rm -rf "${SITE_PACKAGES}/bin"
 
 echo "==> Verifying native dependency architecture"
-find "${SITE_PACKAGES}" \( -name '*.so' -o -name '*.dylib' \) -print0 |
-  while IFS= read -r -d '' native_file; do
-    lipo "${native_file}" -verify_arch arm64 >/dev/null 2>&1 \
-      || fail "native dependency lacks arm64 support: ${native_file}"
-  done
+PLAYWRIGHT_NODE="${SITE_PACKAGES}/playwright/driver/node"
+[ -x "${PLAYWRIGHT_NODE}" ] || fail "missing or non-executable Playwright driver: ${PLAYWRIGHT_NODE}"
+native_files() {
+  printf '%s\0' "${STAGE}/python/bin/python3" "${PLAYWRIGHT_NODE}"
+  find "${STAGE}/python" \( -name '*.so' -o -name '*.dylib' \) -print0
+}
+if [ "${IS_NATIVE_HOST}" = true ]; then
+  native_files |
+    while IFS= read -r -d '' native_file; do
+      lipo "${native_file}" -verify_arch arm64 >/dev/null 2>&1 \
+        || fail "native dependency lacks arm64 support: ${native_file}"
+    done
+else
+  native_files | "${HOST_PYTHON}" -S "${ROOT}/scripts/verify_darwin_architecture.py"
+fi
 
 echo "==> Writing launcher shims"
 mkdir -p "${STAGE}/bin"
@@ -123,28 +147,36 @@ echo "==> Verifying assembled layout"
 [ -x "${STAGE}/bin/${TOOL}" ] || fail "${STAGE}/bin/${TOOL} is missing or not executable"
 [ -x "${STAGE}/bin/claudex" ] || fail "${STAGE}/bin/claudex is missing or not executable"
 [ -f "${SITE_PACKAGES}/claudex/__main__.py" ] || fail "claudex package missing from site-packages"
-# The python binary must be Mach-O arm64. `file` may be absent on the CI
-# container — check the Mach-O 64-bit magic (cf fa ed fe) and arm64 cputype
-# (0c 00 00 01) directly.
-HEADER="$(head -c 8 "${STAGE}/python/bin/python3" | od -An -tx1 | tr -d ' \n')"
-[ "${HEADER}" = "cffaedfe0c000001" ] \
-  || fail "python/bin/python3 is not Mach-O arm64 (header: ${HEADER})"
 
-echo "==> Smoke-testing the bundled runtime"
-# Use a fresh home and disable host Python packages; never start the gateway
-# server or a browser during the build.
+# Smoke tests must not use developer configuration or add host-specific bytecode
+# to the archive. Never start the gateway server or a browser during the build.
 SMOKE_HOME="${PWD}/build/smoke-home"
 mkdir -p "${SMOKE_HOME}"
+run_smoke() (
+  for variable in "${!CLAUDEX_@}"; do unset "${variable}"; done
+  unset PYTHONHOME PLAYWRIGHT_NODEJS_PATH
+  export HOME="${SMOKE_HOME}" PYTHONNOUSERSITE=1 PYTHONDONTWRITEBYTECODE=1
+  cd "${SMOKE_HOME}" || exit 1
+  "$@"
+)
 SMOKE_RC=0
-SMOKE_OUT="$(HOME="${SMOKE_HOME}" PYTHONPATH= PYTHONNOUSERSITE=1 \
-  "${STAGE}/bin/${TOOL}" definitely-not-a-subcommand 2>&1)" || SMOKE_RC=$?
+if [ "${IS_NATIVE_HOST}" = true ]; then
+  echo "==> Smoke-testing the bundled runtime"
+  SMOKE_OUT="$(PYTHONPATH= run_smoke "${ROOT}/${STAGE}/bin/${TOOL}" \
+    definitely-not-a-subcommand 2>&1)" || SMOKE_RC=$?
+else
+  echo "==> Skipping bundled Darwin runtime verification on ${HOST_OS} ${HOST_ARCH} (Python/launcher, MCP, Playwright driver)"
+  echo "==> Smoke-testing platform-independent CLI with host CPython ${PBS_SERIES}"
+  SMOKE_OUT="$(PYTHONPATH="${ROOT}/${SITE_PACKAGES}" run_smoke "${HOST_PYTHON}" \
+    -S -m claudex definitely-not-a-subcommand 2>&1)" || SMOKE_RC=$?
+fi
 [ "${SMOKE_RC}" = "2" ] || fail "smoke test exited with ${SMOKE_RC}, expected usage error 2: ${SMOKE_OUT}"
 case "${SMOKE_OUT}" in
   *"usage: claudex-gateway"*) ;;
   *) fail "smoke test did not print the usage line: ${SMOKE_OUT}" ;;
 esac
-HOME="${SMOKE_HOME}" PYTHONPATH= PYTHONNOUSERSITE=1 \
-  "${STAGE}/python/bin/python3" - <<'PY'
+if [ "${IS_NATIVE_HOST}" = true ]; then
+  PYTHONPATH= run_smoke "${ROOT}/${STAGE}/python/bin/python3" - <<'PY'
 import asyncio
 
 from claudex.mcp_tools import build_gptpro_server
@@ -162,6 +194,7 @@ async def verify_driver():
 asyncio.run(verify_driver())
 print("bundled MCP import and Playwright driver startup passed")
 PY
+fi
 
 echo "==> Packing ${ASSET}"
 # COPYFILE_DISABLE keeps macOS builds from adding ._* AppleDouble entries.
