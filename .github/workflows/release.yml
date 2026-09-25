@@ -31,6 +31,7 @@ on:
     paths:
       - '.github/workflows/release.yml'
       - 'scripts/build-darwin-asset.sh'
+      - 'scripts/verify_darwin_architecture.py'
       - 'pyproject.toml'
       - 'uv.lock'
   workflow_dispatch:
