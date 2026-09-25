@@ -61,7 +61,7 @@ jobs:
       options: --init
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           persist-credentials: false
 
@@ -90,7 +90,7 @@ jobs:
     runs-on: macos-15
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           # This workflow holds contents:write and also runs on PRs — don't
           # leave the token in .git/config where code run by build steps
@@ -163,7 +163,7 @@ jobs:
 
       - name: Upload artifact (dry run)
         if: github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && inputs.dry_run)
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: claudex-gateway-${{ env.VERSION }}-darwin-arm64
           path: build/${{ env.ASSET }}
