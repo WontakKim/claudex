@@ -802,6 +802,13 @@ async function main() {
   });
   gptProLoginStates.running = captureGptProLogin();
   context.renderGptProLogin({
+    status: "running",
+    detail: "no compatible browser found; installing Playwright Chromium",
+    output: "",
+    error: null,
+  });
+  gptProLoginStates.installing = captureGptProLogin();
+  context.renderGptProLogin({
     status: "succeeded",
     detail: "verifying the saved ChatGPT session",
     output: "saved and verified the gptpro session\n",

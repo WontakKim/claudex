@@ -179,6 +179,13 @@ def test_run_login_polls_clears_stale_cookie_saves_and_probes(
         sleep_intervals.append(interval)
 
     monkeypatch.setattr(login.asyncio, "sleep", fake_sleep)
+
+    async def fail_if_installed() -> None:
+        raise AssertionError("an available browser must not trigger installation")
+
+    monkeypatch.setattr(
+        browser, "install_chromium", fail_if_installed
+    )
     statuses: list[str] = []
 
     result = asyncio.run(login.run_login(on_status=statuses.append))
@@ -198,6 +205,7 @@ def test_run_login_polls_clears_stale_cookie_saves_and_probes(
         (selectors.COMPOSER_SELECTOR, "visible", browser.COMPOSER_TIMEOUT_MS)
     ]
     assert statuses == [
+        "checking for system Chrome or Playwright Chromium",
         "sign in to ChatGPT in the opened browser; waiting up to five minutes",
         "saving the authenticated ChatGPT session",
         "verifying the saved ChatGPT session",
@@ -306,25 +314,38 @@ def test_run_login_classifies_missing_composer_as_probe_retry(
     assert "token-secret" not in result.message
 
 
-def test_run_login_classifies_missing_playwright_browser(
+def test_run_login_retries_once_when_browser_is_still_missing_after_install(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
+    launch_calls = 0
+    install_calls = 0
 
     async def launch_persistent_profile(
         profile_dir: Path, *, headless: bool = False
     ) -> _FakePersistentContext:
-        del profile_dir
+        nonlocal launch_calls
+        del profile_dir, headless
+        launch_calls += 1
         raise RuntimeError("Executable doesn't exist at /browser/chrome")
+
+    async def install_chromium() -> None:
+        nonlocal install_calls
+        install_calls += 1
 
     monkeypatch.setattr(
         browser, "launch_persistent_profile", launch_persistent_profile
     )
+    monkeypatch.setattr(
+        browser, "install_chromium", install_chromium
+    )
 
     result = asyncio.run(login.run_login(on_status=_ignore_status))
 
+    assert launch_calls == 2
+    assert install_calls == 1
     assert result.failure == "chrome_missing"
-    assert "install Google Chrome" in result.message
+    assert "automatic Chromium installation completed" in result.message
     assert (
         f"{shlex.quote(sys.executable)} -m playwright install chromium"
         in result.message
@@ -393,8 +414,16 @@ def test_run_login_classifies_missing_playwright_dependency(
         del profile_dir
         raise browser.GptProDependencyError(message)
 
+    async def fail_if_installed() -> None:
+        raise AssertionError(
+            "a missing dependency must not trigger browser installation"
+        )
+
     monkeypatch.setattr(
         browser, "launch_persistent_profile", launch_persistent_profile
+    )
+    monkeypatch.setattr(
+        browser, "install_chromium", fail_if_installed
     )
 
     result = asyncio.run(login.run_login(on_status=_ignore_status))
@@ -452,3 +481,185 @@ def test_run_login_fails_when_ask_runtime_holds_profile_lock(
     assert not result.success
     assert result.failure == "error"
     assert result.message == "another gptpro ask is using the browser profile"
+
+
+def test_run_login_installs_missing_chromium_and_retries(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    persistent_context = _FakePersistentContext(_FakePage(), [[_auth_cookie()]])
+    probe_context = _FakeProbeContext(_FakePage())
+    _install_browser_fakes(monkeypatch, persistent_context, probe_context)
+    launch_calls = 0
+    install_calls = 0
+
+    async def launch_persistent_profile(
+        profile_dir: Path, *, headless: bool = False
+    ) -> _FakePersistentContext:
+        nonlocal launch_calls
+        assert profile_dir.name == "chrome-profile"
+        assert headless is False
+        launch_calls += 1
+        if launch_calls == 1:
+            raise RuntimeError("Executable doesn't exist at /browser/chrome")
+        return persistent_context
+
+    async def install_chromium() -> None:
+        nonlocal install_calls
+        install_calls += 1
+
+    monkeypatch.setattr(
+        browser, "launch_persistent_profile", launch_persistent_profile
+    )
+    monkeypatch.setattr(
+        browser, "install_chromium", install_chromium
+    )
+    statuses: list[str] = []
+
+    result = asyncio.run(login.run_login(on_status=statuses.append))
+
+    assert result.success
+    assert launch_calls == 2
+    assert install_calls == 1
+    assert statuses == [
+        "checking for system Chrome or Playwright Chromium",
+        "no compatible browser found; installing Playwright Chromium",
+        "Playwright Chromium installed; opening the ChatGPT sign-in browser",
+        "sign in to ChatGPT in the opened browser; waiting up to five minutes",
+        "saving the authenticated ChatGPT session",
+        "verifying the saved ChatGPT session",
+    ]
+
+
+def test_run_login_does_not_install_for_unrecognized_launch_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    async def launch_persistent_profile(
+        profile_dir: Path, *, headless: bool = False
+    ) -> _FakePersistentContext:
+        del profile_dir, headless
+        raise RuntimeError("browser profile is already in use")
+
+    async def fail_if_installed() -> None:
+        raise AssertionError(
+            "an unrecognized launch error must not install a browser"
+        )
+
+    monkeypatch.setattr(
+        browser, "launch_persistent_profile", launch_persistent_profile
+    )
+    monkeypatch.setattr(
+        browser, "install_chromium", fail_if_installed
+    )
+
+    result = asyncio.run(login.run_login(on_status=_ignore_status))
+
+    assert result.failure == "error"
+    assert result.message == "retry after checking the browser installation"
+    lock = login.locking.try_file_lock(login.paths.gptpro_profile_lock())
+    assert lock is not None
+    lock.release()
+
+
+def test_run_login_does_not_install_for_missing_system_dependencies(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    launch_calls = 0
+    install_calls = 0
+
+    async def launch_persistent_profile(
+        profile_dir: Path, *, headless: bool = False
+    ) -> _FakePersistentContext:
+        nonlocal launch_calls
+        del profile_dir, headless
+        launch_calls += 1
+        raise RuntimeError(
+            "Host system is missing dependencies to run browsers. "
+            "Please run sudo playwright install-deps."
+        )
+
+    async def install_chromium() -> None:
+        nonlocal install_calls
+        install_calls += 1
+
+    monkeypatch.setattr(
+        browser, "launch_persistent_profile", launch_persistent_profile
+    )
+    monkeypatch.setattr(browser, "install_chromium", install_chromium)
+
+    result = asyncio.run(login.run_login(on_status=_ignore_status))
+
+    assert launch_calls == 1
+    assert install_calls == 0
+    assert result.failure == "error"
+    assert result.message == "retry after checking the browser installation"
+
+
+def test_run_login_install_failure_releases_profile_lock(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    async def launch_persistent_profile(
+        profile_dir: Path, *, headless: bool = False
+    ) -> _FakePersistentContext:
+        del profile_dir, headless
+        raise RuntimeError("Executable doesn't exist at /browser/chrome")
+
+    async def install_chromium() -> None:
+        raise browser.BrowserInstallError(
+            "network unavailable while downloading Chromium"
+        )
+
+    monkeypatch.setattr(
+        browser, "launch_persistent_profile", launch_persistent_profile
+    )
+    monkeypatch.setattr(
+        browser, "install_chromium", install_chromium
+    )
+
+    result = asyncio.run(login.run_login(on_status=_ignore_status))
+
+    assert result.failure == "browser_install_failed"
+    assert "network unavailable while downloading Chromium" in result.message
+    lock = login.locking.try_file_lock(login.paths.gptpro_profile_lock())
+    assert lock is not None
+    lock.release()
+
+
+def test_run_login_install_cancellation_releases_profile_lock(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    install_started = asyncio.Event()
+
+    async def launch_persistent_profile(
+        profile_dir: Path, *, headless: bool = False
+    ) -> _FakePersistentContext:
+        del profile_dir, headless
+        raise RuntimeError("Executable doesn't exist at /browser/chrome")
+
+    async def install_chromium() -> None:
+        install_started.set()
+        await asyncio.Future()
+
+    monkeypatch.setattr(
+        browser, "launch_persistent_profile", launch_persistent_profile
+    )
+    monkeypatch.setattr(browser, "install_chromium", install_chromium)
+
+    async def scenario() -> None:
+        task = asyncio.create_task(login.run_login(on_status=_ignore_status))
+        await asyncio.wait_for(install_started.wait(), 1.0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(scenario())
+
+    lock = login.locking.try_file_lock(login.paths.gptpro_profile_lock())
+    assert lock is not None
+    lock.release()

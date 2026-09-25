@@ -610,6 +610,15 @@ def test_mcp_runtime_renders_connection_login_and_doctor(
             ),
             "polling": True,
         },
+        "installing": {
+            "buttonText": "Cancel login",
+            "buttonDisabled": False,
+            "detail": (
+                "no compatible browser found; installing Playwright Chromium "
+                "gptpro asks are unavailable while signing in."
+            ),
+            "polling": True,
+        },
         "terminal": {
             "buttonText": "Sign in to ChatGPT",
             "buttonDisabled": False,

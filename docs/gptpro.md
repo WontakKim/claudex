@@ -39,13 +39,18 @@ saved session, Chrome profile and lock, and Playwright dependency.
 Session state, the persistent Chrome profile, and its lock live under
 `~/.claudex/gptpro/`. The session file is
 `~/.claudex/gptpro/session.json`, and the browser profile is
-`~/.claudex/gptpro/chrome-profile/`. Google Chrome or a Playwright Chromium
-browser must be available. If neither is installed, install Google Chrome or
-run `<python> -m playwright install chromium` with the same Python executable
-that runs the gateway (the login error prints the exact command for your
-installation). If a release installation reports that Playwright itself is
-missing, reinstall the latest release tarball; in a source checkout, rerun
-`uv sync`.
+`~/.claudex/gptpro/chrome-profile/`. Sign-in tries system Chrome first, then the
+matching Playwright Chromium. If neither is available, sign-in
+downloads the matching Playwright Chromium automatically with the same Python
+executable that runs the gateway, then retries once. Source installs therefore
+use the project virtual environment, while release installs use the bundled
+Python and do not depend on `uv` or a system Python. Playwright stores the
+download in its normal per-user cache, honors `PLAYWRIGHT_BROWSERS_PATH`, and
+does not write a browser
+into the extracted release directory. Generic gateway startup, status, doctor,
+and asks never download a browser. If a release installation reports that
+Playwright itself is missing, reinstall the latest release tarball; in a source
+checkout, rerun `uv sync`.
 
 The ask runtime lazily starts one warm, headless persistent browser context and
 reuses it. Login uses the same profile in a visible browser. A profile lock
