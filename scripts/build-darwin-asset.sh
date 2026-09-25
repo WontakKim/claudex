@@ -72,7 +72,7 @@ tar -xzf "build/downloads/${PBS_TARBALL}" -C "${STAGE}"
 
 echo "==> Cross-installing project wheel + uv.lock-pinned deps into the bundled site-packages"
 uv build --wheel
-uv export --frozen --extra gptpro --no-dev --no-emit-project --no-hashes -o build/requirements.txt
+uv export --frozen --no-dev --no-emit-project --no-hashes -o build/requirements.txt
 uv pip install \
   --target "${SITE_PACKAGES}" \
   --python-version "${PBS_SERIES}" \

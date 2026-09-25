@@ -2,7 +2,7 @@
 
 The daemon runs the existing `claudex-gateway gptpro login` CLI in its own
 process group, captures its merged output, and exposes a small polling state
-machine without importing the optional Playwright dependency into the daemon
+machine without importing Playwright into the daemon
 at module import time.
 
 States:

@@ -383,7 +383,7 @@ def test_run_login_classifies_missing_playwright_dependency(
 ) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
     message = (
-        "playwright is not installed; run `uv sync --extra gptpro` to enable "
+        "playwright is not installed; run `uv sync` to enable "
         "gptpro login"
     )
 

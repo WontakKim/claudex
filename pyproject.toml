@@ -1,23 +1,19 @@
 [project]
 name = "claudex-gateway"
-version = "0.15.0"
+version = "0.16.0"
 description = "Local multi-provider gateway that routes Claude Code requests to Anthropic, Codex, Kimi, Grok, and custom backends."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "httpx>=0.27",
+    "mcp>=2.1.1",
+    "playwright>=1.62.0",
     "starlette>=0.40",
     "uvicorn>=0.30",
 ]
 
 [project.scripts]
 claudex-gateway = "claudex.__main__:main"
-
-[project.optional-dependencies]
-gptpro = [
-    "mcp>=2.1.1",
-    "playwright>=1.62.0",
-]
 
 [build-system]
 requires = ["hatchling"]

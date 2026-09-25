@@ -20,12 +20,12 @@ the extracted release directory, run:
 ./bin/claudex-gateway gptpro doctor
 ```
 
-A source checkout needs the optional dependencies first:
+In a source checkout, sync the project dependencies first:
 
 ```sh
-uv sync --extra gptpro
-uv run --extra gptpro claudex-gateway gptpro login
-uv run --extra gptpro claudex-gateway gptpro status
+uv sync
+uv run claudex-gateway gptpro login
+uv run claudex-gateway gptpro status
 ```
 
 The dashboard MCP tab leads with gateway-wide Claude Code connection setup,
@@ -33,7 +33,7 @@ including the MCP endpoint and a copyable command. Its GPT Pro backend card
 shows the saved session status, starts and monitors interactive ChatGPT sign-in,
 and runs the same doctor diagnostic.
 
-Run `uv run --extra gptpro claudex-gateway gptpro doctor` to diagnose the
+Run `uv run claudex-gateway gptpro doctor` to diagnose the
 saved session, Chrome profile and lock, and Playwright dependency.
 
 Session state, the persistent Chrome profile, and its lock live under
@@ -45,7 +45,7 @@ run `<python> -m playwright install chromium` with the same Python executable
 that runs the gateway (the login error prints the exact command for your
 installation). If a release installation reports that Playwright itself is
 missing, reinstall the latest release tarball; in a source checkout, rerun
-`uv sync --extra gptpro`.
+`uv sync`.
 
 The ask runtime lazily starts one warm, headless persistent browser context and
 reuses it. Login uses the same profile in a visible browser. A profile lock
