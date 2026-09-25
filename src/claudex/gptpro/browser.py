@@ -21,13 +21,13 @@ _PLAYWRIGHT_BROWSER_MISSING_PATTERN = re.compile(
 _PLAYWRIGHT_OWNERS: dict[int, Any] = {}
 PLAYWRIGHT_INSTALL_MESSAGE = (
     "playwright is not installed; reinstall the latest release tarball or run "
-    "`uv sync --extra gptpro` in a source checkout"
+    "`uv sync` in a source checkout"
 )
 PROFILE_IN_USE_MESSAGE = "another gptpro ask is using the browser profile"
 
 
 class GptProDependencyError(Exception):
-    """Raised when the optional Playwright dependency is unavailable."""
+    """Raised when the Playwright dependency is unavailable."""
 
 
 def is_chrome_missing_error(exc: BaseException) -> bool:

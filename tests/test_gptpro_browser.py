@@ -77,7 +77,7 @@ def test_lazy_playwright_import_has_actionable_dependency_error(
 
     assert str(raised.value) == (
         "playwright is not installed; reinstall the latest release tarball or run "
-        "`uv sync --extra gptpro` in a source checkout"
+        "`uv sync` in a source checkout"
     )
     assert isinstance(raised.value.__cause__, ModuleNotFoundError)
 

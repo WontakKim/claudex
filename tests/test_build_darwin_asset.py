@@ -2,8 +2,7 @@
 
 from __future__ import annotations
 
-import re
-import shlex
+import importlib.metadata
 import subprocess
 import tomllib
 from pathlib import Path
@@ -11,31 +10,29 @@ from pathlib import Path
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_gptpro_dependencies_are_only_in_the_optional_extra() -> None:
+def test_gptpro_dependencies_are_required_by_default() -> None:
     configuration = tomllib.loads(
         (_REPOSITORY_ROOT / "pyproject.toml").read_text(encoding="utf-8")
     )
 
     dependencies = configuration["project"]["dependencies"]
-    gptpro_dependencies = configuration["project"]["optional-dependencies"][
-        "gptpro"
-    ]
-    assert not any(
-        dependency.startswith(("mcp", "playwright")) for dependency in dependencies
+    optional_dependencies = configuration["project"].get(
+        "optional-dependencies", {}
     )
-    assert gptpro_dependencies == ["mcp>=2.1.1", "playwright>=1.62.0"]
+    assert {"mcp>=2.1.1", "playwright>=1.62.0"} <= set(dependencies)
+    assert "gptpro" not in optional_dependencies
 
 
-def test_darwin_asset_export_includes_gptpro_dependencies() -> None:
-    script = (_REPOSITORY_ROOT / "scripts" / "build-darwin-asset.sh").read_text(
-        encoding="utf-8"
-    )
-    export_command = re.search(
-        r"^uv export (.+) -o build/requirements.txt$", script, re.MULTILINE
-    )
-    assert export_command is not None
+def test_default_export_includes_gptpro_dependencies() -> None:
     result = subprocess.run(
-        ["uv", "export", *shlex.split(export_command.group(1))],
+        [
+            "uv",
+            "export",
+            "--frozen",
+            "--no-dev",
+            "--no-emit-project",
+            "--no-hashes",
+        ],
         cwd=_REPOSITORY_ROOT,
         capture_output=True,
         text=True,
@@ -51,15 +48,13 @@ def test_darwin_asset_export_includes_gptpro_dependencies() -> None:
     assert {"mcp", "playwright", "greenlet", "cryptography"} <= exported_names
 
 
-def test_darwin_asset_script_installs_gptpro_and_checks_native_architecture() -> None:
+def test_darwin_asset_script_installs_default_dependencies_and_checks_architecture() -> None:
     script = (_REPOSITORY_ROOT / "scripts" / "build-darwin-asset.sh").read_text(
         encoding="utf-8"
     )
 
-    assert (
-        "uv export --frozen --extra gptpro --no-dev --no-emit-project --no-hashes"
-        in script
-    )
+    assert "uv export --frozen --no-dev --no-emit-project --no-hashes" in script
+    assert "--extra" not in script
     assert "--all-extras" not in script
     assert '"dist/claudex_gateway-${VERSION}-py3-none-any.whl"' in script
     assert "-name '*.so' -o -name '*.dylib'" in script
@@ -88,6 +83,27 @@ def test_release_workflow_builds_on_arm64_macos() -> None:
     assert "runs-on: macos-15" in workflow
     assert "      - 'pyproject.toml'" in workflow
     assert "      - 'uv.lock'" in workflow
+    assert "uv sync --frozen\n" in workflow
+    assert "uv run --frozen pytest" in workflow
+    assert "--extra" not in workflow
+
+
+def test_release_version_matches_lock_and_installed_metadata() -> None:
+    configuration = tomllib.loads(
+        (_REPOSITORY_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    )
+    lockfile = tomllib.loads(
+        (_REPOSITORY_ROOT / "uv.lock").read_text(encoding="utf-8")
+    )
+    project_version = configuration["project"]["version"]
+    project_package = next(
+        package
+        for package in lockfile["package"]
+        if package.get("source") == {"editable": "."}
+    )
+
+    assert project_package["version"] == project_version
+    assert importlib.metadata.version("claudex-gateway") == project_version
 
 
 def test_gptpro_setup_documents_both_installations() -> None:
@@ -97,5 +113,25 @@ def test_gptpro_setup_documents_both_installations() -> None:
 
     assert "./bin/claudex-gateway gptpro login" in documentation
     assert "./bin/claudex-gateway gptpro doctor" in documentation
-    assert "uv sync --extra gptpro" in documentation
+    assert "uv sync" in documentation
+    assert "uv run claudex-gateway gptpro login" in documentation
     assert "latest release tarball" in documentation
+    assert "--extra" not in documentation
+    assert "sync the project dependencies first" in documentation
+
+
+def test_gptpro_copy_describes_default_dependencies() -> None:
+    browser_source = (
+        _REPOSITORY_ROOT / "src" / "claudex" / "gptpro" / "browser.py"
+    ).read_text(encoding="utf-8")
+    login_source = (
+        _REPOSITORY_ROOT / "src" / "claudex" / "gptpro" / "login_session.py"
+    ).read_text(encoding="utf-8")
+    dashboard = (
+        _REPOSITORY_ROOT / "src" / "claudex" / "dashboard" / "dashboard.html"
+    ).read_text(encoding="utf-8")
+
+    assert "`uv sync` in a source checkout" in browser_source
+    assert "Raised when the Playwright dependency is unavailable." in browser_source
+    assert "without importing Playwright into the daemon" in login_source
+    assert "browser profile, and browser dependencies." in dashboard
