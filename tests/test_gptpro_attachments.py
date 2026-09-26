@@ -77,7 +77,7 @@ class _FakePage:
             for _ in range(file_count):
                 for listener in tuple(self.listeners["response"]):
                     listener(_FakeResponse())
-            return "#thread-bottom-container"
+            return "form[data-chatgpt-composer]"
         if script == attachments.READ_BODY_INNER_TEXT_JS:
             return self.body_text
         raise AssertionError("unexpected page evaluation")
@@ -156,6 +156,16 @@ def test_attach_files_dispatches_drop_and_waits_for_settlement(
     assert page.evaluate_calls[1][0] == attachments.READ_BODY_INNER_TEXT_JS
     assert page.listeners == {"response": []}
     assert all(handle.dispose_calls == 1 for handle in page.handles)
+
+
+def test_drop_dispatch_targets_redesigned_composer_form() -> None:
+    drop_js = attachments.DISPATCH_ATTACHMENT_DROP_JS
+
+    assert (
+        "const preferredSelector = 'form[data-chatgpt-composer]'" in drop_js
+    )
+    assert "#thread-bottom-container" not in drop_js
+    assert "const fallbackSelector = 'main'" in drop_js
 
 
 def test_attach_files_timeout_reports_settle_state(

@@ -35,7 +35,7 @@ CREATE_ATTACHMENT_DATA_TRANSFER_JS = """(files) => {
 }"""
 
 DISPATCH_ATTACHMENT_DROP_JS = """(dataTransfer) => {
-  const preferredSelector = '#thread-bottom-container';
+  const preferredSelector = 'form[data-chatgpt-composer]';
   const fallbackSelector = 'main';
   const target =
     document.querySelector(preferredSelector) ??
