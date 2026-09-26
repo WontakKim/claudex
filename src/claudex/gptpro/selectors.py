@@ -2,12 +2,22 @@
 
 from __future__ import annotations
 
-COMPOSER_SELECTOR = "#prompt-textarea"
-SEND_BUTTON_SELECTOR = '[data-testid="send-button"]'
-USER_MESSAGE_SELECTOR = '[data-message-author-role="user"]'
-ASSISTANT_MESSAGE_SELECTOR = '[data-message-author-role="assistant"]'
-STOP_BUTTON_SELECTOR = '[data-testid="stop-button"]'
-MESSAGE_ID_ATTRIBUTE = "data-message-id"
+COMPOSER_SELECTOR = (
+    'form[data-chatgpt-composer] div.ProseMirror[contenteditable="true"]'
+    '[role="textbox"][aria-label="Ask ChatGPT"]'
+)
+SEND_BUTTON_SELECTOR = (
+    'form[data-chatgpt-composer] button[type="submit"][aria-label="Send"]'
+)
+STOP_BUTTON_SELECTOR = 'form[data-chatgpt-composer] button[aria-label="Stop"]'
+# Message units carry a search-unit key whose prefix ("fallback-turn-N") is
+# index-based and changes between renders; only the ":user"/":assistant"
+# suffix is stable, so units are addressed by suffix match. The message-ids
+# attribute holds one id on a user unit and space-separated ids on an
+# assistant unit — probes read it on user units only, where it is the anchor.
+USER_MESSAGE_SELECTOR = '[data-chatgpt-search-unit-key$=":user"]'
+ASSISTANT_MESSAGE_SELECTOR = '[data-chatgpt-search-unit-key$=":assistant"]'
+MESSAGE_ID_ATTRIBUTE = "data-chatgpt-search-message-ids"
 MODAL_SELECTOR = '[id*="modal"], [role="dialog"]'
 MODAL_BUTTON_TEXTS = ("Got it", "OK")
 
@@ -40,7 +50,7 @@ CHALLENGE_DOM_PROBE_JS = r"""
 """
 
 TOP_LEVEL_ROLE_PREDICATE_JS = (
-    "(node) => !node.parentElement?.closest('[data-message-author-role]')"
+    "(node) => !node.parentElement?.closest('[data-chatgpt-search-unit-key]')"
 )
 
 TOP_LEVEL_USER_IDS_PROBE_JS = r"""
