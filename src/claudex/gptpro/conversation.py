@@ -17,7 +17,7 @@ COMPLETION_REPORT_PATH_FRAGMENT = "/backend-api/lat/"
 _UUID_SOURCE = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
 _UUID_EXACT_PATTERN = re.compile(rf"{_UUID_SOURCE}", re.IGNORECASE)
 _CONVERSATION_ID_PATH_PATTERN = re.compile(
-    rf"/backend-api/[^?#]*conversation/(?:gen_title/)?({_UUID_SOURCE})(?:/|$)",
+    rf"/backend-api/[^?#]*conversations?/(?:gen_title/)?({_UUID_SOURCE})(?:/|$)",
     re.IGNORECASE,
 )
 _CONVERSATION_STREAM_PATHS = {
