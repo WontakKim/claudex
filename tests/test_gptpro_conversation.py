@@ -193,6 +193,16 @@ def test_parent_cycle_is_bounded_and_can_still_resolve_the_turn() -> None:
             f"https://chatgpt.com/backend-api/f/conversation/{CONVERSATION_ID}/",
             CONVERSATION_ID,
         ),
+        (
+            f"https://chatgpt.com/backend-api/conversations/{CONVERSATION_ID}",
+            CONVERSATION_ID,
+        ),
+        (
+            f"https://chatgpt.com/backend-api/conversations/{CONVERSATION_ID}/",
+            CONVERSATION_ID,
+        ),
+        ("https://chatgpt.com/backend-api/conversations/batch", None),
+        ("https://chatgpt.com/backend-api/conversations", None),
         (f"https://chatgpt.com/backend-api/conversation/WEB:{CONVERSATION_ID}", None),
         (f"https://chatgpt.com/backend-api/lat/r?conversation_id={CONVERSATION_ID}", None),
         (f"https://chatgpt.com/conversation/{CONVERSATION_ID}", None),
