@@ -141,6 +141,43 @@ def test_nonce_marked_unanswered_user_returns_empty_unfinished_turn() -> None:
     ) == conversation.AssistantTurn(text="", finished=False)
 
 
+def test_nonce_anchored_turn_stops_at_the_next_user_message() -> None:
+    fixture = _conversation(
+        _node("original-user", None, "user", [NONCE_MARKER]),
+        _node(
+            "original-answer",
+            "original-user",
+            "assistant",
+            ["Original answer."],
+            end_turn=True,
+        ),
+        _node("next-user", "original-answer", "user", ["Unrelated question"]),
+        _node(
+            "next-answer", "next-user", "assistant", ["Unrelated answer."], end_turn=True
+        ),
+        current_node="next-answer",
+    )
+
+    assert conversation.extract_assistant_turn(
+        fixture, NONCE_MARKER
+    ) == conversation.AssistantTurn(text="Original answer.", finished=True)
+
+
+def test_nonce_anchored_unanswered_turn_ignores_later_answer() -> None:
+    fixture = _conversation(
+        _node("original-user", None, "user", [NONCE_MARKER]),
+        _node("next-user", "original-user", "user", ["Unrelated question"]),
+        _node(
+            "next-answer", "next-user", "assistant", ["Unrelated answer."], end_turn=True
+        ),
+        current_node="next-answer",
+    )
+
+    assert conversation.extract_assistant_turn(
+        fixture, NONCE_MARKER
+    ) == conversation.AssistantTurn(text="", finished=False)
+
+
 def test_missing_nonce_returns_none_instead_of_stale_answer() -> None:
     fixture = _conversation(
         _node("user", None, "user", ["ordinary prompt"]),

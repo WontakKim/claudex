@@ -679,7 +679,7 @@ def test_submit_returns_immediately_and_status_transitions_to_succeeded() -> Non
     assert succeeded == {
         "ask_id": ask_id,
         "state": "succeeded",
-        "status_message": "waiting for ChatGPT Pro",
+        "status_message": None,
         "thread_ref": "conversation-123",
         "nonce_marker": "nonce-marker",
     }

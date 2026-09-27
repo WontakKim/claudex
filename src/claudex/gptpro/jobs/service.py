@@ -12,6 +12,7 @@ from uuid import uuid4
 
 from claudex.gptpro import ask as ask_module
 from claudex.gptpro.ask import AskCallbacks, AskOutcome, GptProAskError
+from claudex.gptpro.conversation import is_conversation_id
 
 from .models import AskJob, TurnFinished
 from .watchdog import AnswerWatchdog
@@ -25,6 +26,12 @@ SWEEP_INTERVAL_SECONDS = 300.0
 QUEUE_TTL_SECONDS = 900.0
 QUESTION_SPILL_THRESHOLD_BYTES = 35_000
 ACTIVE_JOB_STATES = frozenset({"queued", "running", "detached"})
+
+
+def _ownership_key(conversation_id: str) -> str:
+    if is_conversation_id(conversation_id):
+        return conversation_id.lower()
+    return conversation_id
 
 
 @dataclass(frozen=True)
@@ -168,6 +175,16 @@ class AskJobService:
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
 
+        for ask_id, job in self._jobs.items():
+            if job.state in ACTIVE_JOB_STATES:
+                self._jobs[ask_id] = replace(
+                    job,
+                    state="failed",
+                    failure="cancelled",
+                    error_message="the ask was cancelled",
+                    status_message=None,
+                    finished_at=self._clock(),
+                )
         self._job_tasks.difference_update(job_tasks)
 
     async def _run_job(
@@ -183,8 +200,9 @@ class AskJobService:
         has_logged_queue_wait = False
         try:
             if conversation_id is not None:
+                ownership_key = _ownership_key(conversation_id)
                 while ownership := self._conversation_owners.get(
-                    conversation_id
+                    ownership_key
                 ):
                     self._on_status(
                         ask_id, "waiting for the in-flight answer"
@@ -224,7 +242,7 @@ class AskJobService:
                     # starve the loop. Yield each round so ownership changes
                     # and the queue TTL check stay observable.
                     await asyncio.sleep(0)
-                self._conversation_owners[conversation_id] = (
+                self._conversation_owners[ownership_key] = (
                     _ConversationOwnership(ask_id, asyncio.Event())
                 )
 
@@ -331,6 +349,14 @@ class AskJobService:
                     )
                 except Exception:
                     pass
+        except asyncio.CancelledError:
+            self._jobs[ask_id] = replace(
+                self._jobs[ask_id],
+                state="failed",
+                failure="cancelled",
+                error_message="the ask was cancelled",
+            )
+            raise
         except GptProAskError as exc:
             self._jobs[ask_id] = replace(
                 self._jobs[ask_id],
@@ -357,24 +383,32 @@ class AskJobService:
             )
         finally:
             owned_conversation_id = self._jobs[ask_id].thread_ref
-            ownership = (
-                self._conversation_owners.get(owned_conversation_id)
+            ownership_key = (
+                _ownership_key(owned_conversation_id)
                 if owned_conversation_id is not None
                 else None
             )
+            ownership = (
+                self._conversation_owners.get(ownership_key)
+                if ownership_key is not None
+                else None
+            )
             if ownership is not None and ownership.owner_ask_id == ask_id:
-                del self._conversation_owners[owned_conversation_id]
+                del self._conversation_owners[ownership_key]
                 ownership.released.set()
             if spill_path is not None:
                 spill_path.unlink(missing_ok=True)
             self._jobs[ask_id] = replace(
-                self._jobs[ask_id], finished_at=self._clock()
+                self._jobs[ask_id],
+                status_message=None,
+                finished_at=self._clock(),
             )
 
     def _on_status(self, ask_id: str, message: str) -> None:
-        self._jobs[ask_id] = replace(
-            self._jobs[ask_id], status_message=message
-        )
+        job = self._jobs[ask_id]
+        if job.state not in ACTIVE_JOB_STATES:
+            return
+        self._jobs[ask_id] = replace(job, status_message=message)
 
     def _on_detached(self, ask_id: str) -> None:
         job = self._jobs.get(ask_id)
@@ -403,7 +437,7 @@ class AskJobService:
             return
         self._jobs[ask_id] = replace(job, thread_ref=conversation_id)
         self._conversation_owners.setdefault(
-            conversation_id,
+            _ownership_key(conversation_id),
             _ConversationOwnership(ask_id, asyncio.Event()),
         )
 
