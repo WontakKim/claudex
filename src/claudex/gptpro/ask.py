@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import logging
 import math
 import os
 import re
@@ -195,6 +196,7 @@ class _TurnState:
     has_stop: bool
 
 
+logger = logging.getLogger(__name__)
 _monotonic: Callable[[], float] = time.monotonic
 _sleep: Callable[[float], Awaitable[None]] = asyncio.sleep
 
@@ -350,8 +352,12 @@ class _AskExecution:
         if self.callbacks.on_evidence is not None:
             try:
                 self.callbacks.on_evidence(self.evidence)
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning(
+                    "evidence observer failed at %s (%s)",
+                    self.stage,
+                    type(exc).__name__,
+                )
 
     def _record_evidence(self, **changes: Any) -> None:
         updated = replace(self.evidence, **changes)

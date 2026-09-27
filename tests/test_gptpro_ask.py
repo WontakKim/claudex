@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from collections.abc import Callable
 from typing import Any
 
@@ -1522,6 +1523,38 @@ def test_timeout_before_first_click_preserves_not_attempted_evidence(
     assert getattr(raised.value, "evidence", None) is not None
     assert raised.value.evidence.submission == "not_attempted"
     assert raised.value.evidence.failure_stage == "composer"
+
+
+def test_failed_evidence_observer_logs_safely_and_retains_uncertain_submission(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    _install_clock(monkeypatch)
+    page = _FakePage(echo_never=True)
+    question = "private question tail"
+    cookie = "secret session cookie"
+    observed: list[ask.AskEvidence] = []
+
+    def on_evidence(evidence: ask.AskEvidence) -> None:
+        observed.append(evidence)
+        if evidence.submission == "uncertain":
+            raise RuntimeError(f"{question}; {cookie}")
+
+    with caplog.at_level(logging.WARNING, logger=ask.__name__):
+        with pytest.raises(ask.GptProAskError) as raised:
+            asyncio.run(ask.execute_ask_outcome(
+                page, question, timeout_seconds=1.0,
+                callbacks=ask.AskCallbacks(on_evidence=on_evidence),
+            ))
+
+    assert page.click_count == 1
+    assert any(evidence.submission == "uncertain" for evidence in observed)
+    assert raised.value.evidence.submission == "uncertain"
+    assert raised.value.evidence.failure_stage == "echo"
+    assert "evidence observer failed at submission (RuntimeError)" in caplog.messages
+    assert question not in caplog.text
+    assert cookie not in caplog.text
+    assert all(record.exc_info is None for record in caplog.records)
 
 
 def test_late_navigation_error_keeps_nonce_correlated_thread_and_stage(
