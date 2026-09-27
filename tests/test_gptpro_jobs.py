@@ -296,7 +296,9 @@ def test_detached_callback_transitions_job_then_completion_succeeds(
         del question, conversation_id, timeout_seconds
         assert callbacks is not None
         assert callbacks.on_detached is not None
+        assert callbacks.on_status is not None
         callbacks.on_detached()
+        callbacks.on_status("detached; polling for the answer")
         detached.set()
         await release_provider.wait()
         return ask.AskOutcome("answer", "marker", None)
@@ -317,6 +319,7 @@ def test_detached_callback_transitions_job_then_completion_succeeds(
         )
         assert completed_job.answer == "answer"
         assert completed_job.finished_at is not None
+        assert completed_job.status_message is None
         await service.aclose()
 
     caplog.set_level(logging.INFO, logger="claudex.gptpro.jobs")
@@ -497,7 +500,39 @@ def test_status_callback_updates_latest_status_message() -> None:
         assert current_job.status_message == "waiting for answer"
 
         release_provider.set()
-        await _wait_for_state(service, started_job.ask_id, "succeeded")
+        completed_job = await _wait_for_state(
+            service, started_job.ask_id, "succeeded"
+        )
+        assert completed_job.status_message is None
+        await service.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_late_status_callback_does_not_change_completed_job() -> None:
+    captured_callbacks: list[Callable[[str], None]] = []
+
+    async def provider(
+        question: str,
+        *,
+        callbacks: ask.AskCallbacks | None = None,
+        conversation_id: str | None = None,
+        timeout_seconds: float | None = None,
+    ) -> ask.AskOutcome:
+        del question, conversation_id, timeout_seconds
+        assert callbacks is not None
+        assert callbacks.on_status is not None
+        captured_callbacks.append(callbacks.on_status)
+        return ask.AskOutcome("answer", "marker", None)
+
+    async def scenario() -> None:
+        service = jobs.AskJobService(provider)
+        started_job = service.start("question")
+        completed_job = await _wait_for_state(
+            service, started_job.ask_id, "succeeded"
+        )
+        captured_callbacks[0]("waiting for answer")
+        assert service.status(started_job.ask_id) == completed_job
         await service.aclose()
 
     asyncio.run(scenario())
@@ -641,7 +676,7 @@ def test_fresh_ask_latch_queues_same_conversation_until_completion() -> None:
             assert callbacks is not None
             assert callbacks.on_conversation_id is not None
             callbacks.on_conversation_id(
-                "123e4567-e89b-12d3-a456-426614174000"
+                "123E4567-E89B-12D3-A456-426614174000"
             )
             conversation_latched.set()
             await release_fresh_provider.wait()
@@ -759,6 +794,49 @@ def test_fresh_ask_without_conversation_id_has_no_ownership_side_effects() -> No
         )
         await _wait_for_state(service, explicit_job.ask_id, "succeeded")
         assert captured_conversation_ids == [None, "next-conversation"]
+        await service.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_uuid_case_variants_share_conversation_ownership() -> None:
+    conversation_id = "123e4567-e89b-12d3-a456-426614174000"
+    first_provider_started = asyncio.Event()
+    release_first_provider = asyncio.Event()
+    second_provider_started = asyncio.Event()
+
+    async def provider(
+        question: str,
+        *,
+        callbacks: ask.AskCallbacks | None = None,
+        conversation_id: str | None = None,
+        timeout_seconds: float | None = None,
+    ) -> ask.AskOutcome:
+        del callbacks, timeout_seconds
+        if question == "first":
+            assert conversation_id == "123E4567-E89B-12D3-A456-426614174000"
+            first_provider_started.set()
+            await release_first_provider.wait()
+        else:
+            assert conversation_id == "123e4567-e89b-12d3-a456-426614174000"
+            second_provider_started.set()
+        return ask.AskOutcome("answer", "marker", conversation_id)
+
+    async def scenario() -> None:
+        service = jobs.AskJobService(provider)
+        first_job = service.start("first", conversation_id=conversation_id.upper())
+        await first_provider_started.wait()
+        second_job = service.start("second", conversation_id=conversation_id)
+        waiting_job = await _wait_for_status_message(
+            service, second_job.ask_id, "waiting for the in-flight answer"
+        )
+        assert waiting_job.state == "queued"
+        assert not second_provider_started.is_set()
+
+        release_first_provider.set()
+        await _wait_for_state(service, first_job.ask_id, "succeeded")
+        await second_provider_started.wait()
+        await _wait_for_state(service, second_job.ask_id, "succeeded")
         await service.aclose()
 
     asyncio.run(scenario())
@@ -947,6 +1025,7 @@ def test_queue_ttl_expires_waiting_ask_and_preserves_thread_ref() -> None:
             "on this conversation"
         )
         assert failed_job.thread_ref == conversation_id
+        assert failed_job.status_message is None
         assert provider_questions == ["first"]
 
         release_first_provider.set()
@@ -1363,7 +1442,10 @@ def test_provider_failure_transitions_job_to_failed(
         timeout_seconds: float | None = None,
     ) -> ask.AskOutcome:
         del conversation_id, timeout_seconds
-        del question, callbacks
+        del question
+        assert callbacks is not None
+        assert callbacks.on_status is not None
+        callbacks.on_status("waiting for answer")
         raise provider_error
 
     async def scenario() -> None:
@@ -1373,6 +1455,7 @@ def test_provider_failure_transitions_job_to_failed(
 
         assert failed_job.failure == expected_failure
         assert failed_job.error_message == expected_message
+        assert failed_job.status_message is None
         assert failed_job.finished_at is not None
         await service.aclose()
 
@@ -1512,6 +1595,67 @@ def test_sweeper_removes_expired_finished_jobs_but_keeps_running_jobs(
     assert "state=succeeded" in swept_messages[0]
 
 
+def test_aclose_marks_job_cancelled_before_it_starts() -> None:
+    async def provider(question: str, **_options: object) -> ask.AskOutcome:
+        raise AssertionError(f"unexpected provider call: {question}")
+
+    async def scenario() -> None:
+        service = jobs.AskJobService(provider)
+        started_job = service.start("question")
+        await service.aclose()
+
+        cancelled_job = service.status(started_job.ask_id)
+        assert cancelled_job is not None
+        assert cancelled_job.state == "failed"
+        assert cancelled_job.failure == "cancelled"
+        assert cancelled_job.error_message == "the ask was cancelled"
+        assert cancelled_job.finished_at is not None
+        assert not service.has_active_jobs()
+
+    asyncio.run(scenario())
+
+
+def test_aclose_cancels_queued_and_running_jobs_as_terminal() -> None:
+    conversation_id = "shared-conversation"
+    provider_started = asyncio.Event()
+
+    async def provider(
+        question: str,
+        *,
+        callbacks: ask.AskCallbacks | None = None,
+        conversation_id: str | None = None,
+        timeout_seconds: float | None = None,
+    ) -> ask.AskOutcome:
+        del callbacks, conversation_id, timeout_seconds
+        assert question == "first"
+        provider_started.set()
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    async def scenario() -> None:
+        service = jobs.AskJobService(provider)
+        first_job = service.start("first", conversation_id=conversation_id)
+        await provider_started.wait()
+        second_job = service.start("second", conversation_id=conversation_id)
+        await _wait_for_status_message(
+            service, second_job.ask_id, "waiting for the in-flight answer"
+        )
+
+        await service.aclose()
+        for ask_id in (first_job.ask_id, second_job.ask_id):
+            cancelled_job = service.status(ask_id)
+            assert cancelled_job is not None
+            assert cancelled_job.state == "failed"
+            assert cancelled_job.failure == "cancelled"
+            assert cancelled_job.thread_ref == conversation_id
+            assert cancelled_job.status_message is None
+            assert cancelled_job.finished_at is not None
+        assert not service.has_active_jobs()
+        assert not service._conversation_owners
+
+    asyncio.run(scenario())
+
+
 def test_aclose_cancels_running_job_and_sweeper_and_is_idempotent() -> None:
     provider_started = asyncio.Event()
     provider_cancelled = asyncio.Event()
@@ -1546,13 +1690,297 @@ def test_aclose_cancels_running_job_and_sweeper_and_is_idempotent() -> None:
 
     async def scenario() -> None:
         service = jobs.AskJobService(provider, sleep=sleep)
-        service.start("question")
+        started_job = service.start("question")
         await provider_started.wait()
         await sweeper_started.wait()
 
         await service.aclose()
         assert provider_cancelled.is_set()
         assert sweeper_cancelled.is_set()
+        cancelled_job = service.status(started_job.ask_id)
+        assert cancelled_job is not None
+        assert cancelled_job.state == "failed"
+        assert cancelled_job.failure == "cancelled"
+        assert cancelled_job.finished_at is not None
+        assert cancelled_job.status_message is None
+        assert not service.has_active_jobs()
+        await service.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_failed_job_preserves_independent_evidence_and_original_stage() -> None:
+    conversation_id = "123e4567-e89b-12d3-a456-426614174000"
+    marker = "[gptpro-transport-nonce:job-failure]"
+
+    async def provider(
+        question: str, *, callbacks: ask.AskCallbacks | None = None,
+        conversation_id: str | None = None, timeout_seconds: float | None = None,
+    ) -> ask.AskOutcome:
+        del question, conversation_id, timeout_seconds
+        assert callbacks is not None
+        assert callbacks.on_marker is not None
+        assert callbacks.on_conversation_id is not None
+        callbacks.on_marker(marker)
+        callbacks.on_conversation_id(conversation_id_value)
+        raise ask.GptProAskError("echo_timeout", "echo was not visible")
+
+    conversation_id_value = conversation_id
+
+    async def scenario() -> None:
+        service = jobs.AskJobService(provider)
+        started = service.start("question")
+        failed = await _wait_for_state(service, started.ask_id, "failed")
+        assert failed.thread_ref == conversation_id
+        assert failed.nonce_marker == marker
+        assert failed.failure == "echo_timeout"
+        assert failed.evidence.submission != "not_attempted"
+        assert failed.evidence.failure_stage == "echo"
+        assert failed.evidence.raw_extracted is False
+        await service.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_later_partial_evidence_does_not_erase_observed_facts() -> None:
+    thread = "123e4567-e89b-12d3-a456-426614174000"
+    marker = "[gptpro-transport-nonce:retained]"
+
+    async def provider(
+        question: str, *, callbacks: ask.AskCallbacks | None = None,
+        **_kwargs: object,
+    ) -> ask.AskOutcome:
+        del question
+        assert callbacks is not None
+        assert callbacks.on_conversation_id is not None
+        assert callbacks.on_evidence is not None
+        callbacks.on_conversation_id(thread)
+        callbacks.on_evidence(ask.AskEvidence(
+            submission="confirmed", conversation_id=thread,
+            upload_receipts=1, ready_attachments=1,
+            generation_observed=True, answer_seen=True, raw_extracted=True,
+        ))
+        callbacks.on_evidence(ask.AskEvidence())
+        raise ask.GptProAskError("error", "later observation failed")
+
+    async def scenario() -> None:
+        service = jobs.AskJobService(provider)
+        started = service.start("question")
+        failed = await _wait_for_state(service, started.ask_id, "failed")
+        assert failed.evidence.conversation_id == thread
+        assert failed.evidence.submission == "confirmed"
+        assert failed.evidence.upload_receipts == 1
+        assert failed.evidence.ready_attachments == 1
+        assert failed.evidence.generation_observed is True
+        assert failed.evidence.answer_seen is True
+        assert failed.evidence.raw_extracted is True
+        await service.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_read_only_recovery_keeps_failed_ask_and_conversation_ownership() -> None:
+    thread = "123e4567-e89b-12d3-a456-426614174000"
+    marker = "[gptpro-transport-nonce:failed-job]"
+    release_recovery = asyncio.Event()
+    recovery_started = asyncio.Event()
+    submitted_questions: list[str] = []
+    recovery_calls: list[tuple[str, str]] = []
+
+    async def provider(
+        question: str, *, callbacks: ask.AskCallbacks | None = None,
+        conversation_id: str | None = None, timeout_seconds: float | None = None,
+    ) -> ask.AskOutcome:
+        del timeout_seconds
+        submitted_questions.append(question)
+        if question == "original":
+            assert callbacks is not None
+            assert callbacks.on_marker is not None
+            callbacks.on_marker(marker)
+            raise ask.GptProAskError("echo_timeout", "echo lost")
+        return ask.AskOutcome("follow-up answer", "follow-up-marker", conversation_id)
+
+    async def recover(conversation_id: str, nonce: str) -> ask.AskOutcome:
+        recovery_calls.append((conversation_id, nonce))
+        recovery_started.set()
+        await release_recovery.wait()
+        return ask.AskOutcome("original answer", nonce, conversation_id)
+
+    async def scenario() -> None:
+        service = jobs.AskJobService(provider, recover=recover)
+        original = service.start("original", conversation_id=thread)
+        failed = await _wait_for_state(service, original.ask_id, "failed")
+        recovered = service.start_recovery(ask_id=original.ask_id)
+        await recovery_started.wait()
+        assert (await _wait_for_state(service, recovered.ask_id, "detached")).source_ask_id == original.ask_id
+        followup = service.start("follow-up", conversation_id=thread)
+        await _wait_for_state(service, followup.ask_id, "queued")
+        assert submitted_questions == ["original"]
+        with pytest.raises(ValueError, match="already pending"):
+            service.start_recovery(ask_id=original.ask_id)
+        release_recovery.set()
+        settled = await _wait_for_state(service, recovered.ask_id, "succeeded")
+        await _wait_for_state(service, followup.ask_id, "succeeded")
+        assert settled.answer == "original answer"
+        assert settled.evidence.failure_stage == "echo"
+        assert settled.evidence.recovery == "recovered"
+        assert settled.evidence.submission == "confirmed"
+        assert service.status(original.ask_id) == failed
+        assert recovery_calls == [(thread, marker)]
+        assert submitted_questions == ["original", "follow-up"]
+        await service.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_explicit_recovery_after_restart_requires_no_original_prompt() -> None:
+    thread = "123e4567-e89b-12d3-a456-426614174000"
+    marker = "[gptpro-transport-nonce:saved]"
+    submitted: list[str] = []
+
+    async def provider(question: str, **_kwargs: object) -> ask.AskOutcome:
+        submitted.append(question)
+        raise AssertionError("recovery must not invoke provider ask")
+
+    async def recover(conversation_id: str, nonce: str) -> ask.AskOutcome:
+        assert (conversation_id, nonce) == (thread, marker)
+        return ask.AskOutcome("saved raw answer", nonce, conversation_id)
+
+    async def scenario() -> None:
+        service = jobs.AskJobService(provider, recover=recover)
+        started = service.start_recovery(conversation_id=thread, marker=marker)
+        succeeded = await _wait_for_state(service, started.ask_id, "succeeded")
+        assert succeeded.answer == "saved raw answer"
+        assert succeeded.source_ask_id is None
+        assert submitted == []
+        await service.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_read_only_recovery_rejects_mismatched_or_empty_answer() -> None:
+    thread = "123e4567-e89b-12d3-a456-426614174000"
+    marker = "[gptpro-transport-nonce:expected]"
+
+    async def provider(question: str, **_kwargs: object) -> ask.AskOutcome:
+        raise AssertionError(f"should not submit {question}")
+
+    async def scenario(text: str, returned_marker: str) -> None:
+        async def recover(conversation_id: str, nonce: str) -> ask.AskOutcome:
+            return ask.AskOutcome(text, returned_marker, conversation_id)
+
+        service = jobs.AskJobService(provider, recover=recover)
+        started = service.start_recovery(conversation_id=thread, marker=marker)
+        failed = await _wait_for_state(service, started.ask_id, "failed")
+        assert failed.answer is None
+        assert failed.evidence.raw_extracted is False
+        await service.aclose()
+
+    asyncio.run(scenario("", marker))
+    asyncio.run(scenario("other turn answer", "[gptpro-transport-nonce:other]"))
+
+
+def test_recovery_queue_expiry_keeps_original_turn_identifiers() -> None:
+    thread = "123e4567-e89b-12d3-a456-426614174000"
+    marker = "[gptpro-transport-nonce:queue-expired]"
+    release_owner = asyncio.Event()
+    recovery_calls = 0
+
+    async def provider(
+        question: str, *, callbacks: ask.AskCallbacks | None = None,
+        conversation_id: str | None = None, **_kwargs: object,
+    ) -> ask.AskOutcome:
+        if question == "original":
+            assert callbacks is not None and callbacks.on_marker is not None
+            callbacks.on_marker(marker)
+            raise ask.GptProAskError("echo_timeout", "original echo lost")
+        await release_owner.wait()
+        return ask.AskOutcome("owner done", "owner-marker", conversation_id)
+
+    async def recover(conversation_id: str, nonce: str) -> ask.AskOutcome:
+        nonlocal recovery_calls
+        recovery_calls += 1
+        raise AssertionError((conversation_id, nonce))
+
+    async def scenario() -> None:
+        service = jobs.AskJobService(
+            provider, recover=recover, queue_ttl_seconds=0,
+        )
+        original = service.start("original", conversation_id=thread)
+        original_failure = await _wait_for_state(service, original.ask_id, "failed")
+        owner = service.start("owner", conversation_id=thread)
+        await _wait_for_state(service, owner.ask_id, "running")
+        recovery = service.start_recovery(ask_id=original.ask_id)
+        expired = await _wait_for_state(service, recovery.ask_id, "failed")
+        assert expired.failure == "expired"
+        assert expired.evidence.failure_stage == "queue"
+        assert expired.evidence.recovery == "unavailable"
+        assert (expired.thread_ref, expired.nonce_marker) == (thread, marker)
+        assert service.status(original.ask_id) == original_failure
+        assert recovery_calls == 0
+        release_owner.set()
+        await _wait_for_state(service, owner.ask_id, "succeeded")
+        await service.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_explicit_recovery_failure_preserves_actionable_diagnostics() -> None:
+    thread = "123e4567-e89b-12d3-a456-426614174000"
+    marker = "[gptpro-transport-nonce:diagnostic]"
+
+    async def provider(question: str, **_kwargs: object) -> ask.AskOutcome:
+        raise AssertionError(f"must not submit {question}")
+
+    async def scenario(error: Exception, expected_recovery: str) -> None:
+        async def recover(conversation_id: str, nonce: str) -> ask.AskOutcome:
+            raise error
+
+        service = jobs.AskJobService(provider, recover=recover)
+        started = service.start_recovery(conversation_id=thread, marker=marker)
+        failed = await _wait_for_state(service, started.ask_id, "failed")
+        assert failed.error_message
+        assert failed.evidence.failure_stage == "recovery"
+        assert failed.evidence.recovery == expected_recovery
+        assert failed.evidence.recovery_failure
+        assert failed.evidence.recovery_detail
+        assert failed.thread_ref == thread
+        assert failed.nonce_marker == marker
+        await service.aclose()
+
+    asyncio.run(scenario(TimeoutError(), "exhausted"))
+    disabled = ask.GptProAskError("error", "answer recovery is disabled")
+    disabled.evidence = ask.AskEvidence(
+        recovery="unavailable", recovery_failure="disabled",
+        recovery_detail="answer recovery is disabled",
+    )
+    asyncio.run(scenario(disabled, "unavailable"))
+    asyncio.run(scenario(ask.GptProSessionExpiredError(), "unavailable"))
+
+
+def test_recovery_rejects_pending_ask_and_contradictory_identifiers() -> None:
+    thread = "123e4567-e89b-12d3-a456-426614174000"
+    marker = "[gptpro-transport-nonce:saved]"
+
+    async def provider(question: str, **_kwargs: object) -> ask.AskOutcome:
+        await asyncio.Event().wait()
+        raise AssertionError(question)
+
+    async def recover(conversation_id: str, nonce: str) -> ask.AskOutcome:
+        raise AssertionError((conversation_id, nonce))
+
+    async def scenario() -> None:
+        service = jobs.AskJobService(provider, recover=recover)
+        pending = service.start("pending", conversation_id=thread)
+        await _wait_for_state(service, pending.ask_id, "running")
+        with pytest.raises(ValueError, match="only a failed ask"):
+            service.start_recovery(ask_id=pending.ask_id)
+        with pytest.raises(ValueError, match="not both"):
+            service.start_recovery(ask_id=pending.ask_id, marker=marker)
+        with pytest.raises(ValueError, match="nonce_marker"):
+            service.start_recovery(conversation_id=thread)
+        with pytest.raises(ValueError, match="unknown or expired"):
+            service.start_recovery(ask_id="lost-record")
         await service.aclose()
 
     asyncio.run(scenario())

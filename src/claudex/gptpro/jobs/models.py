@@ -1,7 +1,9 @@
 """Job and turn data models for background gptpro asks."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal
+
+from claudex.gptpro.ask import AskEvidence
 
 AskJobState = Literal[
     "queued", "running", "detached", "succeeded", "failed"
@@ -20,6 +22,8 @@ class AskJob:
     thread_ref: str | None
     created_at: float
     finished_at: float | None
+    evidence: AskEvidence = field(default_factory=AskEvidence)
+    source_ask_id: str | None = None
 
 
 @dataclass(frozen=True)

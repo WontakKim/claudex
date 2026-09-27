@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 import pytest
+from playwright.async_api import async_playwright
 
 from claudex.gptpro import attachments
 
@@ -47,8 +49,16 @@ class _FakeHandle:
 
 
 class _FakePage:
-    def __init__(self, body_text: str) -> None:
-        self.body_text = body_text
+    def __init__(
+        self,
+        *,
+        states: list[dict[str, Any]] | None = None,
+        responses: list[Any] | None = None,
+        existing_names: list[str] | None = None,
+    ) -> None:
+        self.states = iter(states or [])
+        self.responses = responses
+        self.existing_names = existing_names or []
         self.listeners: dict[str, list[Callable[[Any], None]]] = {
             "response": []
         }
@@ -74,12 +84,20 @@ class _FakePage:
         self.evaluate_calls.append((script, argument))
         if script == attachments.DISPATCH_ATTACHMENT_DROP_JS:
             file_count = len(self.evaluate_handle_calls) - 1
-            for _ in range(file_count):
+            responses = self.responses
+            if responses is None:
+                responses = [_FakeResponse() for _ in range(file_count)]
+            for response in responses:
                 for listener in tuple(self.listeners["response"]):
-                    listener(_FakeResponse())
+                    listener(response)
             return "form[data-chatgpt-composer]"
-        if script == attachments.READ_BODY_INNER_TEXT_JS:
-            return self.body_text
+        if script == attachments.READ_EXISTING_ATTACHMENT_NAMES_JS:
+            return self.existing_names
+        if script == attachments.READ_COMPOSER_ATTACHMENT_STATE_JS:
+            return next(
+                self.states,
+                {"ready": {}, "processing": {}, "failed": {}},
+            )
         raise AssertionError("unexpected page evaluation")
 
 
@@ -118,6 +136,30 @@ def test_attachment_must_not_contain_nul_bytes(tmp_path: Path) -> None:
         asyncio.run(attachments.attach_files(object(), [str(attachment)]))
 
 
+def test_plain_text_attachments_preserve_original_filenames(
+    tmp_path: Path,
+) -> None:
+    names = [
+        "effect.ts", "effect.ts.txt", "effect.ts", "data.json",
+        "caps.TXT", "name with [brackets].md",
+    ]
+    paths = []
+    for index, name in enumerate(names):
+        directory = tmp_path / str(index)
+        directory.mkdir()
+        path = directory / name
+        path.write_text(f"synthetic-{index}", encoding="utf-8")
+        paths.append(str(path))
+
+    descriptors = attachments._load_descriptors(paths)
+
+    assert [descriptor["name"] for descriptor in descriptors] == names
+    assert [base64.b64decode(item["bytesBase64"]) for item in descriptors] == [
+        f"synthetic-{index}".encode() for index in range(len(names))
+    ]
+    assert all(item["mime"] == "text/plain" for item in descriptors)
+
+
 def test_attach_files_dispatches_drop_and_waits_for_settlement(
     tmp_path: Path,
 ) -> None:
@@ -125,7 +167,16 @@ def test_attach_files_dispatches_drop_and_waits_for_settlement(
     second = tmp_path / "second.txt"
     first.write_text("first body", encoding="utf-8")
     second.write_text("second body", encoding="utf-8")
-    page = _FakePage("first.txt\nsecond.txt")
+    page = _FakePage(
+        states=[
+            {"ready": {}, "processing": {}, "failed": {}},
+            {
+                "ready": {"first.txt": 1, "second.txt": 1},
+                "processing": {},
+                "failed": {},
+            },
+        ],
+    )
 
     asyncio.run(
         attachments.attach_files(page, [str(first), str(second)])
@@ -149,11 +200,13 @@ def test_attach_files_dispatches_drop_and_waits_for_settlement(
         "text/plain",
     )
     assert page.evaluate_handle_calls[2][1] == page.handles[:2]
-    assert page.evaluate_calls[0] == (
-        attachments.DISPATCH_ATTACHMENT_DROP_JS,
-        page.handles[2],
+    assert (
+        attachments.DISPATCH_ATTACHMENT_DROP_JS, page.handles[2]
+    ) in page.evaluate_calls
+    assert any(
+        script == attachments.READ_COMPOSER_ATTACHMENT_STATE_JS
+        for script, _ in page.evaluate_calls
     )
-    assert page.evaluate_calls[1][0] == attachments.READ_BODY_INNER_TEXT_JS
     assert page.listeners == {"response": []}
     assert all(handle.dispose_calls == 1 for handle in page.handles)
 
@@ -173,7 +226,7 @@ def test_attach_files_timeout_reports_settle_state(
 ) -> None:
     attachment = tmp_path / "missing-chip.txt"
     attachment.write_text("body", encoding="utf-8")
-    page = _FakePage("composer without the filename")
+    page = _FakePage()
     clock = _FakeClock()
     monkeypatch.setattr(attachments, "_monotonic", clock.monotonic)
     monkeypatch.setattr(attachments, "_sleep", clock.sleep)
@@ -190,5 +243,761 @@ def test_attach_files_timeout_reports_settle_state(
     message = str(raised.value)
     assert "1/1 completed POST /backend-api/files responses" in message
     assert "expected filename chips for 'missing-chip.txt'" in message
+    assert "conversation not established" not in message
     assert page.listeners == {"response": []}
     assert all(handle.dispose_calls == 1 for handle in page.handles)
+
+
+def _attachment_state(
+    *,
+    ready: dict[str, int] | None = None,
+    processing: dict[str, int] | None = None,
+    failed: dict[str, int] | None = None,
+    unknown: dict[str, int] | None = None,
+) -> dict[str, Any]:
+    return {
+        "ready": ready or {},
+        "processing": processing or {},
+        "failed": failed or {},
+        "unknown": unknown or {},
+    }
+
+
+def test_upload_receipt_without_composer_chip_does_not_confirm_upload(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    attachment = tmp_path / "history.txt"
+    attachment.write_text("body", encoding="utf-8")
+    page = _FakePage(states=[_attachment_state()] * 3)
+    clock = _FakeClock()
+    monkeypatch.setattr(attachments, "_monotonic", clock.monotonic)
+    monkeypatch.setattr(attachments, "_sleep", clock.sleep)
+
+    with pytest.raises(attachments.AttachmentSettleTimeoutError):
+        asyncio.run(
+            attachments.attach_files(
+                page, [str(attachment)], timeout_seconds=0.5
+            )
+        )
+
+    assert page.evaluate_calls
+
+
+def test_completed_upload_waits_for_delayed_ready_chip(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    attachment = tmp_path / "delayed.txt"
+    attachment.write_text("body", encoding="utf-8")
+    page = _FakePage(
+        states=[
+            _attachment_state(),
+            _attachment_state(processing={"delayed.txt": 1}),
+            _attachment_state(processing={"delayed.txt": 1}),
+            _attachment_state(ready={"delayed.txt": 1}),
+        ],
+    )
+    clock = _FakeClock()
+    monkeypatch.setattr(attachments, "_monotonic", clock.monotonic)
+    monkeypatch.setattr(attachments, "_sleep", clock.sleep)
+
+    asyncio.run(attachments.attach_files(page, [str(attachment)], timeout_seconds=1))
+
+    probes = [
+        call for call in page.evaluate_calls
+        if call[0] == attachments.READ_COMPOSER_ATTACHMENT_STATE_JS
+    ]
+    assert len(probes) == 4
+
+
+@pytest.mark.parametrize(
+    ("state", "expected_error"),
+    [
+        ("processing", attachments.AttachmentSettleTimeoutError),
+        ("failed", attachments.AttachmentUploadFailedError),
+    ],
+)
+def test_unready_chip_does_not_confirm_upload(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    state: str,
+    expected_error: type[Exception],
+) -> None:
+    attachment = tmp_path / "stuck.txt"
+    attachment.write_text("body", encoding="utf-8")
+    page = _FakePage(states=[
+        _attachment_state(),
+        *[_attachment_state(**{state: {"stuck.txt": 1}})] * 4,
+    ])
+    clock = _FakeClock()
+    monkeypatch.setattr(attachments, "_monotonic", clock.monotonic)
+    monkeypatch.setattr(attachments, "_sleep", clock.sleep)
+
+    with pytest.raises(expected_error) as raised:
+        asyncio.run(
+            attachments.attach_files(
+                page, [str(attachment)], timeout_seconds=0.5
+            )
+        )
+
+    if state == "processing":
+        assert raised.value.completed_file_create_responses == 1
+        assert raised.value.ready_attachments == 0
+    else:
+        assert "stuck.txt" in str(raised.value)
+
+
+def test_timeout_reports_file_statuses_and_unattributed_receipt_ids(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    class IdentifiedResponse(_FakeResponse):
+        def __init__(self, file_id: str) -> None:
+            self.file_id = file_id
+
+        async def json(self) -> dict[str, str]:
+            return {"file_id": self.file_id, "status": "success"}
+
+    names = ["ready.txt", "pending.txt", "missing.txt"]
+    paths = []
+    for name in names:
+        path = tmp_path / name
+        path.write_text("synthetic", encoding="utf-8")
+        paths.append(str(path))
+    page = _FakePage(
+        states=[
+            _attachment_state(),
+            *[
+                {**_attachment_state(ready={"ready.txt": 1},
+                                     processing={"pending.txt": 1}),
+                 "unknown": {"missing.txt": 1}}
+            ] * 3,
+        ],
+        responses=[IdentifiedResponse(f"file_{index}") for index in (2, 0, 1)],
+    )
+    clock = _FakeClock()
+    monkeypatch.setattr(attachments, "_monotonic", clock.monotonic)
+    monkeypatch.setattr(attachments, "_sleep", clock.sleep)
+
+    with pytest.raises(attachments.AttachmentSettleTimeoutError) as raised:
+        asyncio.run(attachments.attach_files(page, paths, timeout_seconds=0.5))
+
+    message = str(raised.value)
+    for name, status in (
+        ("ready.txt", "ready"),
+        ("pending.txt", "processing"),
+        ("missing.txt", "unknown"),
+    ):
+        assert f"{name!r}: {status}" in message
+    assert "file_2" in message and "file_0" in message and "file_1" in message
+    assert "unattributed" in message
+    assert raised.value.completed_file_create_responses == 3
+    assert raised.value.ready_attachments == 1
+
+
+def test_out_of_order_receipt_ids_match_request_file_names(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    class NamedResponse(_FakeResponse):
+        def __init__(self, filename: str, file_id: str) -> None:
+            self.request = type("NamedRequest", (), {
+                "method": "POST", "post_data_json": {"file_name": filename},
+            })()
+            self.file_id = file_id
+
+        async def json(self) -> dict[str, str]:
+            return {"file_id": self.file_id, "status": "success"}
+
+    first = tmp_path / "first.txt"
+    second = tmp_path / "second.txt"
+    first.write_text("first", encoding="utf-8")
+    second.write_text("second", encoding="utf-8")
+    page = _FakePage(
+        states=[_attachment_state(), *[_attachment_state(
+            ready={"first.txt": 1}, unknown={"second.txt": 1},
+        )] * 3],
+        responses=[
+            NamedResponse("second.txt", "file_second"),
+            NamedResponse("first.txt", "file_first"),
+        ],
+    )
+    clock = _FakeClock()
+    monkeypatch.setattr(attachments, "_monotonic", clock.monotonic)
+    monkeypatch.setattr(attachments, "_sleep", clock.sleep)
+
+    with pytest.raises(attachments.AttachmentSettleTimeoutError) as raised:
+        asyncio.run(attachments.attach_files(
+            page, [str(first), str(second)], timeout_seconds=0.5,
+        ))
+
+    assert "'first.txt': ready" in str(raised.value)
+    assert "'second.txt': unknown" in str(raised.value)
+    assert "'first.txt': ready" in str(raised.value).split("file_first")[0]
+    assert "file_first" in str(raised.value).split("'second.txt': unknown")[0]
+    assert "file_second" in str(raised.value).split("'second.txt': unknown")[1]
+
+
+class _NamedCreateResponse(_FakeResponse):
+    def __init__(self, filename: str, file_id: str) -> None:
+        self.request = type("NamedRequest", (), {
+            "method": "POST", "post_data_json": {"file_name": filename},
+        })()
+        self.file_id = file_id
+
+    async def json(self) -> dict[str, str]:
+        return {"file_id": self.file_id, "status": "success"}
+
+
+class _ProcessingResponse(_FakeResponse):
+    url = "https://chatgpt.com/backend-api/files/process_upload_stream"
+    status = 200
+
+    def __init__(self, frames: list[dict[str, Any]], *, url: str | None = None) -> None:
+        self.request = type("ProcessingRequest", (), {"method": "POST"})()
+        if url is not None:
+            self.url = url
+        self.frames = frames
+
+    async def text(self) -> str:
+        return "\n".join(json.dumps(frame) for frame in self.frames)
+
+
+def _processing_frames(file_id: str, display_name: str) -> list[dict[str, Any]]:
+    return [
+        {"file_id": file_id, "event": "file.indexing.completed", "extra": {
+            "library_file_name": display_name,
+        }},
+        {"file_id": file_id, "event": "file.processing.completed"},
+    ]
+
+
+def test_server_renamed_attachment_settles_under_authoritative_display_name(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    original = tmp_path / "effect.ts"
+    original.write_text("synthetic", encoding="utf-8")
+    renamed = "effect(20260927-120843).ts"
+    page = _FakePage(
+        states=[_attachment_state(), _attachment_state(processing={"effect.ts": 1}),
+                *[_attachment_state(ready={renamed: 1})] * 3],
+        responses=[
+            _ProcessingResponse(_processing_frames("file_effect", renamed)),
+            _NamedCreateResponse("effect.ts", "file_effect"),
+        ],
+    )
+    clock = _FakeClock()
+    monkeypatch.setattr(attachments, "_monotonic", clock.monotonic)
+    monkeypatch.setattr(attachments, "_sleep", clock.sleep)
+
+    counts = asyncio.run(attachments.attach_files(
+        page, [str(original)], timeout_seconds=0.5,
+    ))
+
+    assert counts == {renamed: (0, 1)}
+    assert original.name == "effect.ts"
+    probes = [argument for script, argument in page.evaluate_calls
+              if script == attachments.READ_COMPOSER_ATTACHMENT_STATE_JS]
+    assert [renamed] in probes
+
+
+@pytest.mark.parametrize("frames", [
+    _processing_frames("file_unrelated", "effect(20260927-120843).ts"),
+    _processing_frames("file_effect", "effect(20260927-120843).ts")[:1],
+    [{"file_id": "file_effect", "event": "file.processing.completed"}],
+])
+def test_unattributed_or_incomplete_rename_fails_closed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, frames: list[dict[str, Any]],
+) -> None:
+    original = tmp_path / "effect.ts"
+    original.write_text("synthetic", encoding="utf-8")
+    renamed = "effect(20260927-120843).ts"
+    page = _FakePage(states=[
+        _attachment_state(), *[_attachment_state(ready={renamed: 1})] * 3,
+    ], responses=[
+        _NamedCreateResponse("effect.ts", "file_effect"),
+        _ProcessingResponse(frames),
+    ])
+    clock = _FakeClock()
+    monkeypatch.setattr(attachments, "_monotonic", clock.monotonic)
+    monkeypatch.setattr(attachments, "_sleep", clock.sleep)
+
+    with pytest.raises(attachments.AttachmentSettleTimeoutError) as raised:
+        asyncio.run(attachments.attach_files(
+            page, [str(original)], timeout_seconds=0.5,
+        ))
+
+    assert raised.value.ready_attachments == 0
+    assert "file_effect" in str(raised.value)
+
+
+def test_preexisting_renamed_chip_is_not_new_upload_evidence(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    original = tmp_path / "effect.ts"
+    original.write_text("synthetic", encoding="utf-8")
+    renamed = "effect(20260927-120843).ts"
+    page = _FakePage(states=[
+        _attachment_state(ready={renamed: 1}),
+        *[_attachment_state(ready={renamed: 1})] * 3,
+    ], existing_names=[renamed], responses=[
+        _NamedCreateResponse("effect.ts", "file_effect"),
+        _ProcessingResponse(_processing_frames("file_effect", renamed)),
+    ])
+    clock = _FakeClock()
+    monkeypatch.setattr(attachments, "_monotonic", clock.monotonic)
+    monkeypatch.setattr(attachments, "_sleep", clock.sleep)
+
+    with pytest.raises(attachments.AttachmentSettleTimeoutError) as raised:
+        asyncio.run(attachments.attach_files(
+            page, [str(original)], timeout_seconds=0.5,
+        ))
+
+    assert raised.value.ready_attachments == 0
+
+
+def test_processing_failure_blocks_even_ready_original_chip(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    original = tmp_path / "effect.ts"
+    original.write_text("synthetic", encoding="utf-8")
+    page = _FakePage(states=[
+        _attachment_state(), *[_attachment_state(ready={"effect.ts": 1})] * 3,
+    ], responses=[
+        _NamedCreateResponse("effect.ts", "file_effect"),
+        _ProcessingResponse([{
+            "file_id": "file_effect", "event": "file.processing.failed",
+            "message": "do not leak raw server text",
+        }]),
+    ])
+    clock = _FakeClock()
+    monkeypatch.setattr(attachments, "_monotonic", clock.monotonic)
+    monkeypatch.setattr(attachments, "_sleep", clock.sleep)
+
+    with pytest.raises(attachments.AttachmentUploadFailedError) as raised:
+        asyncio.run(attachments.attach_files(
+            page, [str(original)], timeout_seconds=0.5,
+        ))
+
+    assert "do not leak raw server text" not in str(raised.value)
+    assert "file_effect" in str(raised.value)
+
+
+def test_duplicate_file_id_cannot_count_as_two_requested_files(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    paths = []
+    for name in ("first.ts", "second.ts"):
+        file = tmp_path / name
+        file.write_text("synthetic", encoding="utf-8")
+        paths.append(str(file))
+    page = _FakePage(states=[
+        _attachment_state(),
+        *[_attachment_state(ready={"first.ts": 1, "second.ts": 1})] * 3,
+    ], responses=[
+        _NamedCreateResponse("first.ts", "file_reused"),
+        _NamedCreateResponse("second.ts", "file_reused"),
+    ])
+    clock = _FakeClock()
+    monkeypatch.setattr(attachments, "_monotonic", clock.monotonic)
+    monkeypatch.setattr(attachments, "_sleep", clock.sleep)
+
+    with pytest.raises(attachments.AttachmentUploadFailedError, match="file_reused"):
+        asyncio.run(attachments.attach_files(page, paths, timeout_seconds=0.5))
+
+
+def test_stream_identity_change_during_composer_probe_requires_new_name(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    file = tmp_path / "effect.ts"
+    file.write_text("synthetic", encoding="utf-8")
+    renamed = "effect(20260927-120843).ts"
+    stream = _ProcessingResponse(_processing_frames("file_effect", renamed))
+
+    class ChangingPage(_FakePage):
+        changed = False
+
+        async def evaluate(self, script: str, argument: Any = None) -> Any:
+            if (script == attachments.READ_COMPOSER_ATTACHMENT_STATE_JS
+                    and argument == ["effect.ts"] and not self.changed
+                    and self.evaluate_handle_calls):
+                self.changed = True
+                for listener in tuple(self.listeners["response"]):
+                    listener(stream)
+                await asyncio.sleep(0)
+                return _attachment_state(ready={"effect.ts": 1})
+            return await super().evaluate(script, argument)
+
+    page = ChangingPage(states=[
+        _attachment_state(),
+        *[_attachment_state(ready={renamed: 1})] * 3,
+    ], responses=[_NamedCreateResponse("effect.ts", "file_effect")])
+    clock = _FakeClock()
+    monkeypatch.setattr(attachments, "_monotonic", clock.monotonic)
+    monkeypatch.setattr(attachments, "_sleep", clock.sleep)
+
+    counts = asyncio.run(attachments.attach_files(page, [str(file)], timeout_seconds=1))
+
+    assert counts == {renamed: (0, 1)}
+
+
+def test_seven_renamed_files_correlate_out_of_order_streams(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    original_names = [f"synthetic-{index}.ts" for index in range(7)]
+    renamed = [f"synthetic-{index}(20260927-120843).ts" for index in range(7)]
+    paths = []
+    for name in original_names:
+        path = tmp_path / name
+        path.write_text("synthetic", encoding="utf-8")
+        paths.append(str(path))
+    page = _FakePage(states=[
+        _attachment_state(),
+        *[_attachment_state(ready={name: 1 for name in renamed})] * 3,
+    ], responses=[
+        *[_ProcessingResponse(_processing_frames(f"file_{index}", renamed[index]))
+          for index in range(6, -1, -1)],
+        *[_NamedCreateResponse(original_names[index], f"file_{index}")
+          for index in range(7)],
+    ])
+    clock = _FakeClock()
+    monkeypatch.setattr(attachments, "_monotonic", clock.monotonic)
+    monkeypatch.setattr(attachments, "_sleep", clock.sleep)
+
+    counts = asyncio.run(attachments.attach_files(page, paths, timeout_seconds=1))
+
+    assert counts == {name: (0, 1) for name in renamed}
+
+
+def test_receipt_json_failure_reports_optional_metadata_loss(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    class InvalidJsonResponse(_FakeResponse):
+        async def json(self) -> dict[str, str]:
+            raise ValueError("do not expose response body")
+
+    file = tmp_path / "pending.txt"
+    file.write_text("synthetic", encoding="utf-8")
+    page = _FakePage(responses=[InvalidJsonResponse()])
+    clock = _FakeClock()
+    monkeypatch.setattr(attachments, "_monotonic", clock.monotonic)
+    monkeypatch.setattr(attachments, "_sleep", clock.sleep)
+
+    with pytest.raises(attachments.AttachmentSettleTimeoutError) as raised:
+        asyncio.run(attachments.attach_files(
+            page, [str(file)], timeout_seconds=0.5,
+        ))
+
+    assert "receipt metadata unavailable (ValueError)" in str(raised.value)
+    assert raised.value.completed_file_create_responses == 1
+
+
+def test_duplicate_filenames_require_distinct_ready_chips(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    first = tmp_path / "first" / "same.txt"
+    second = tmp_path / "second" / "same.txt"
+    first.parent.mkdir()
+    second.parent.mkdir()
+    first.write_text("first", encoding="utf-8")
+    second.write_text("second", encoding="utf-8")
+    page = _FakePage(states=[
+        _attachment_state(),
+        _attachment_state(ready={"same.txt": 1}),
+        _attachment_state(ready={"same.txt": 2}),
+    ])
+    clock = _FakeClock()
+    monkeypatch.setattr(attachments, "_monotonic", clock.monotonic)
+    monkeypatch.setattr(attachments, "_sleep", clock.sleep)
+
+    asyncio.run(attachments.attach_files(page, [str(first), str(second)]))
+
+    assert len([
+        call for call in page.evaluate_calls
+        if call[0] == attachments.READ_COMPOSER_ATTACHMENT_STATE_JS
+    ]) == 3
+
+
+def test_duplicate_filename_partial_readiness_is_not_claimed_per_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    paths = []
+    for index in range(2):
+        directory = tmp_path / str(index)
+        directory.mkdir()
+        file = directory / "same.txt"
+        file.write_text(f"synthetic-{index}", encoding="utf-8")
+        paths.append(str(file))
+    page = _FakePage(states=[
+        _attachment_state(),
+        *[_attachment_state(ready={"same.txt": 1})] * 3,
+    ])
+    clock = _FakeClock()
+    monkeypatch.setattr(attachments, "_monotonic", clock.monotonic)
+    monkeypatch.setattr(attachments, "_sleep", clock.sleep)
+
+    with pytest.raises(attachments.AttachmentSettleTimeoutError) as raised:
+        asyncio.run(attachments.attach_files(page, paths, timeout_seconds=0.5))
+
+    assert "'same.txt': ambiguous (1/2 ready)" in str(raised.value)
+    assert raised.value.ready_attachments == 1
+
+
+def test_settled_upload_returns_total_ready_counts_for_pre_send_check(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    attachment = tmp_path / "existing.txt"
+    attachment.write_text("new body", encoding="utf-8")
+    page = _FakePage(states=[
+        _attachment_state(ready={"existing.txt": 1}),
+        _attachment_state(ready={"existing.txt": 2}),
+    ])
+
+    expected_ready_counts = asyncio.run(
+        attachments.attach_files(page, [str(attachment)])
+    )
+
+    assert expected_ready_counts == {"existing.txt": (1, 1)}
+
+
+def test_existing_composer_chip_is_not_new_upload_evidence(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    attachment = tmp_path / "existing.txt"
+    attachment.write_text("new body", encoding="utf-8")
+    page = _FakePage(states=[
+        _attachment_state(ready={"existing.txt": 1}),
+        _attachment_state(ready={"existing.txt": 1}),
+        _attachment_state(ready={"existing.txt": 2}),
+    ])
+    clock = _FakeClock()
+    monkeypatch.setattr(attachments, "_monotonic", clock.monotonic)
+    monkeypatch.setattr(attachments, "_sleep", clock.sleep)
+
+    asyncio.run(attachments.attach_files(page, [str(attachment)]))
+
+    assert len([
+        call for call in page.evaluate_calls
+        if call[0] == attachments.READ_COMPOSER_ATTACHMENT_STATE_JS
+    ]) == 3
+
+
+def test_ready_chip_without_upload_receipt_is_not_confirmation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    attachment = tmp_path / "orphan.txt"
+    attachment.write_text("body", encoding="utf-8")
+    page = _FakePage(states=[
+        _attachment_state(),
+        *[_attachment_state(ready={"orphan.txt": 1})] * 3,
+    ], responses=[])
+    clock = _FakeClock()
+    monkeypatch.setattr(attachments, "_monotonic", clock.monotonic)
+    monkeypatch.setattr(attachments, "_sleep", clock.sleep)
+
+    with pytest.raises(attachments.AttachmentSettleTimeoutError) as raised:
+        asyncio.run(
+            attachments.attach_files(
+                page, [str(attachment)], timeout_seconds=0.5
+            )
+        )
+
+    assert raised.value.completed_file_create_responses == 0
+    assert raised.value.ready_attachments == 1
+
+
+def test_processing_events_only_count_trusted_exact_endpoint() -> None:
+    frame = _processing_frames("file_effect", "effect-renamed.ts")
+    assert attachments._is_file_processing_response(_ProcessingResponse(frame))
+    assert not attachments._is_file_processing_response(_ProcessingResponse(
+        frame, url="https://chatgpt.com.evil.test/backend-api/files/process_upload_stream",
+    ))
+    assert not attachments._is_file_processing_response(_ProcessingResponse(
+        frame, url="https://chatgpt.com/backend-api/files/process_upload_stream_extra",
+    ))
+
+
+def test_upload_receipts_only_count_trusted_file_posts() -> None:
+    class Response:
+        request = _FakeRequest()
+        status = 201
+
+        def __init__(self, url: str) -> None:
+            self.url = url
+
+    assert attachments._is_completed_file_create_response(
+        Response("https://chatgpt.com/backend-api/files")
+    )
+    assert not attachments._is_completed_file_create_response(
+        Response("https://example.com/backend-api/files")
+    )
+    assert not attachments._is_completed_file_create_response(
+        Response("https://chatgpt.com.evil.test/backend-api/files")
+    )
+
+
+def _probe_attachment_markup(markup: str, filenames: list[str]) -> dict[str, Any]:
+    async def run() -> dict[str, Any]:
+        async with async_playwright() as playwright:
+            executable = Path(playwright.chromium.executable_path)
+            if not executable.is_file():
+                cache = Path.home() / "Library/Caches/ms-playwright"
+                candidates = sorted(cache.glob(
+                    "chromium-*/chrome-mac*/Google Chrome for Testing.app/"
+                    "Contents/MacOS/Google Chrome for Testing"
+                ))
+                if not candidates:
+                    pytest.skip("No local Chromium executable available")
+                executable = candidates[-1]
+            browser = await playwright.chromium.launch(
+                executable_path=str(executable), headless=True
+            )
+            try:
+                page = await browser.new_page()
+                await page.set_content(markup)
+                return await page.evaluate(
+                    attachments.READ_COMPOSER_ATTACHMENT_STATE_JS, filenames
+                )
+            finally:
+                await browser.close()
+
+    return asyncio.run(run())
+
+
+def test_nested_processing_indicator_blocks_filename_readiness() -> None:
+    state = _probe_attachment_markup(
+        '<form data-chatgpt-composer>'
+        '<div class="chip" aria-busy="true"><div><span>nested.txt</span></div>'
+        '<div role="progressbar"></div></div></form>',
+        ["nested.txt"],
+    )
+
+    assert state == _attachment_state(processing={"nested.txt": 1})
+
+
+def test_outer_chip_processing_overrides_nested_action() -> None:
+    state = _probe_attachment_markup(
+        '<form data-chatgpt-composer>'
+        '<div aria-busy="true"><div><span>nested-action.txt</span>'
+        '<button type="button" aria-label="Remove attachment"></button></div>'
+        '<div role="progressbar"></div></div></form>',
+        ["nested-action.txt"],
+    )
+
+    assert state == _attachment_state(processing={"nested-action.txt": 1})
+
+
+def test_same_chip_filename_label_and_action_count_once() -> None:
+    state = _probe_attachment_markup(
+        '<form data-chatgpt-composer><div class="chip">'
+        '<span title="same.txt">same.txt</span>'
+        '<button type="button" aria-label="same.txt"></button>'
+        '</div></form>',
+        ["same.txt"],
+    )
+
+    assert state == _attachment_state(ready={"same.txt": 1})
+
+
+def test_unrelated_composer_text_or_neighboring_busy_chip_is_not_ready() -> None:
+    state = _probe_attachment_markup(
+        '<form data-chatgpt-composer>'
+        '<p>arbitrary.txt</p>'
+        '<div><div><span>neighbor.txt</span></div>'
+        '<button type="button" aria-label="Remove attachment"></button></div>'
+        '<div aria-busy="true"><span>other.txt</span>'
+        '<div role="progressbar"></div></div>'
+        '</form>',
+        ["arbitrary.txt", "neighbor.txt"],
+    )
+
+    assert state == _attachment_state(
+        ready={"neighbor.txt": 1}, unknown={"arbitrary.txt": 1},
+    )
+
+
+def test_preexisting_processing_chip_becoming_ready_is_not_new_attachment(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    attachment = tmp_path / "existing.txt"
+    attachment.write_text("new body", encoding="utf-8")
+    page = _FakePage(states=[
+        _attachment_state(processing={"existing.txt": 1}),
+        _attachment_state(ready={"existing.txt": 1}),
+        _attachment_state(ready={"existing.txt": 2}),
+    ])
+    clock = _FakeClock()
+    monkeypatch.setattr(attachments, "_monotonic", clock.monotonic)
+    monkeypatch.setattr(attachments, "_sleep", clock.sleep)
+
+    asyncio.run(attachments.attach_files(page, [str(attachment)]))
+
+    assert len([
+        call for call in page.evaluate_calls
+        if call[0] == attachments.READ_COMPOSER_ATTACHMENT_STATE_JS
+    ]) == 3
+
+
+def test_observed_file_without_action_is_unknown_until_ready() -> None:
+    filename = "synthetic.txt"
+    pending = _probe_attachment_markup(
+        '<form data-chatgpt-composer><span><span><svg></svg>'
+        '<span>synthetic.txt</span></span><span></span><span></span>'
+        '</span></form>',
+        [filename],
+    )
+    ready = _probe_attachment_markup(
+        '<form data-chatgpt-composer><span><span><svg></svg>'
+        '<span>synthetic.txt</span></span><span></span><span></span>'
+        '<button type="button" aria-label="Remove attachment"></button>'
+        '</span></form>',
+        [filename],
+    )
+
+    assert pending == {
+        "ready": {}, "processing": {}, "failed": {},
+        "unknown": {filename: 1},
+    }
+    assert ready == {
+        "ready": {filename: 1}, "processing": {}, "failed": {},
+        "unknown": {},
+    }
+
+
+def test_attachment_probe_runs_in_local_synthetic_dom() -> None:
+    state = _probe_attachment_markup(
+        """
+        <main>
+          <div data-chatgpt-search-unit-key="old:user">history.txt</div>
+          <form data-chatgpt-composer>
+            <div contenteditable="true">draft.txt</div>
+            <div class="chip"><span>split</span><span>.txt</span><button type="button" aria-label="Remove attachment"></button></div>
+            <div class="chip" title="attribute.txt"></div>
+            <div class="chip" data-filename="data.txt"></div>
+            <div class="chip" title="title-pending.txt"><span>Processing</span></div>
+            <div class="chip"><span>same.txt</span><button type="button" aria-label="Remove attachment"></button></div>
+            <div class="chip"><span>same.txt</span><button type="button" aria-label="Remove attachment"></button></div>
+            <div class="chip" aria-busy="true"><span>busy.txt</span></div>
+            <div class="chip"><span>progress.txt</span><div role="progressbar"></div></div>
+            <div class="chip" data-state="failed"><span>failed.txt</span></div>
+            <div class="chip"><span>uploading.txt</span><span>Uploading</span></div>
+            <div class="chip"><span>error.txt</span><span>Upload failed</span></div>
+            <div class="chip"><span>history.txt.bak</span></div>
+          </form>
+        </main>
+        """,
+        [
+            "history.txt", "draft.txt", "split.txt", "attribute.txt",
+            "data.txt", "same.txt", "busy.txt", "progress.txt", "failed.txt",
+            "uploading.txt", "error.txt", "title-pending.txt",
+        ],
+    )
+
+    assert state == _attachment_state(
+        ready={
+            "split.txt": 1, "attribute.txt": 1,
+            "data.txt": 1, "same.txt": 2,
+        },
+        processing={
+            "busy.txt": 1, "progress.txt": 1,
+            "uploading.txt": 1, "title-pending.txt": 1,
+        },
+        failed={"failed.txt": 1, "error.txt": 1},
+    )

@@ -51,7 +51,7 @@ class FakeAskRuntime:
         self._provider_calls_changed = asyncio.Condition()
         self._provider_release_events: list[asyncio.Event] = []
         self._submitted_ask_ids: list[str] = []
-        self._job_service = jobs.AskJobService(self._ask)
+        self._job_service = jobs.AskJobService(self._ask, recover=self._recover)
         self._thread_registry = jobs.ThreadRegistry()
 
     async def _ask(
@@ -80,11 +80,26 @@ class FakeAskRuntime:
             callbacks.on_status("waiting for ChatGPT Pro")
         await release_provider.wait()
         if self.error is not None:
+            if callbacks is not None and callbacks.on_marker is not None:
+                callbacks.on_marker("[gptpro-transport-nonce:fake]")
             raise self.error
         return ask.AskOutcome(
             text=self.answer,
             marker="nonce-marker",
             conversation_id=self.conversation_id,
+        )
+
+    async def _recover(
+        self, conversation_id: str, marker: str,
+    ) -> ask.AskOutcome:
+        return ask.AskOutcome(self.answer, marker, conversation_id)
+
+    def start_recovery(
+        self, *, ask_id: str | None = None,
+        conversation_id: str | None = None, marker: str | None = None,
+    ) -> jobs.AskJob:
+        return self._job_service.start_recovery(
+            ask_id=ask_id, conversation_id=conversation_id, marker=marker,
         )
 
     def start_ask(
@@ -275,7 +290,9 @@ def test_tools_list_exposes_job_tools_schemas_and_usage_guidance() -> None:
         "ask_gpt_pro",
         "ask_gpt_pro_status",
         "ask_gpt_pro_result",
+        "recover_gpt_pro",
     }
+    assert tools["recover_gpt_pro"]["inputSchema"]["additionalProperties"] is False
     assert tools["ask_gpt_pro"]["inputSchema"] == {
         "type": "object",
         "properties": {
@@ -318,7 +335,7 @@ def test_tools_list_exposes_job_tools_schemas_and_usage_guidance() -> None:
     assert "state is queued, running, or detached" in ask_description
     assert "detached asks remain recoverable" in ask_description
     assert "An expired failure" in ask_description
-    assert "attempt answer recovery" in ask_description
+    assert "recover_gpt_pro" in ask_description
     assert "self-contained whenever possible" in ask_description
     assert "up to 10 UTF-8 plain-text files totaling 1.2 MB" in ask_description
     assert "Questions over ~35 KB" in ask_description
@@ -347,10 +364,11 @@ def test_tools_list_exposes_job_tools_schemas_and_usage_guidance() -> None:
     assert "asks in other conversations can continue in parallel" in (
         status_description
     )
-    assert "running means the ask was submitted" in status_description
-    assert "detached means server-side generation continues" in (
+    assert "running means navigation, submission, or answer observation" in (
         status_description
     )
+    assert "submission must be read from evidence" in status_description
+    assert "detached means read-only server polling" in status_description
     assert "succeeded and failed are terminal" in status_description
     assert "failure=expired" in status_description
     assert "any available nonce marker are preserved" in status_description
@@ -389,12 +407,13 @@ def test_tool_descriptions_enumerate_failure_recovery_actions() -> None:
     for description in (status_description, result_description):
         for failure_action_label in failure_action_labels:
             assert failure_action_label in description
-        assert "thread_ref as thread" in description
-        assert "re-emit the previous answer" in description
+        # Unknown submission must not be described as safe to retry.
+        assert "recover_gpt_pro" in description
+        assert "Unknown outcome is not proof" in description
 
     assert (
-        "An expired failure means same-conversation queue admission timed out"
-        in ask_description
+        "An expired failure means same-conversation queue admission ended "
+        "before this ask submitted" in ask_description
     )
     assert "any available nonce marker are preserved" in status_description
     assert '"detached; polling for the answer"' in status_description
@@ -595,6 +614,18 @@ def test_status_exposes_nonterminal_job_states(
         "status_message": "progress",
         "thread_ref": _CONVERSATION_A,
         "nonce_marker": "nonce-marker",
+        "failure": None,
+        "error_message": None,
+        "evidence": {
+            "submission": "not_attempted", "conversation_id": None,
+            "upload_receipts": None, "ready_attachments": None,
+            "generation_observed": False, "answer_seen": False,
+            "raw_extracted": False, "failure_stage": None,
+            "recovery_failure": None, "recovery_detail": None,
+            "recovery": "not_attempted",
+        },
+        "source_ask_id": None,
+        "recovery_guidance": None,
     }
 
 
@@ -658,13 +689,14 @@ def test_submit_returns_immediately_and_status_transitions_to_succeeded() -> Non
                 {"ask_id": ask_id},
             )
         )
-        assert running == {
-            "ask_id": ask_id,
-            "state": "running",
-            "status_message": "waiting for ChatGPT Pro",
-            "thread_ref": None,
-            "nonce_marker": None,
-        }
+        assert running["ask_id"] == ask_id
+        assert running["state"] == "running"
+        assert running["status_message"] == "waiting for ChatGPT Pro"
+        assert running["thread_ref"] is None
+        assert running["nonce_marker"] is None
+        assert running["failure"] is None
+        assert running["evidence"]["submission"] == "not_attempted"
+        assert running["evidence"]["raw_extracted"] is False
 
         _finish_job(client, runtime, ask_id)
         succeeded = _json_tool_payload(
@@ -676,13 +708,14 @@ def test_submit_returns_immediately_and_status_transitions_to_succeeded() -> Non
             )
         )
 
-    assert succeeded == {
-        "ask_id": ask_id,
-        "state": "succeeded",
-        "status_message": "waiting for ChatGPT Pro",
-        "thread_ref": "conversation-123",
-        "nonce_marker": "nonce-marker",
-    }
+    assert succeeded["ask_id"] == ask_id
+    assert succeeded["state"] == "succeeded"
+    assert succeeded["status_message"] is None
+    assert succeeded["thread_ref"] == "conversation-123"
+    assert succeeded["nonce_marker"] == "nonce-marker"
+    assert succeeded["evidence"]["raw_extracted"] is True
+    assert succeeded["evidence"]["answer_seen"] is True
+    assert succeeded["failure"] is None
     assert runtime.questions == ["Review this decision."]
 
 
@@ -861,12 +894,12 @@ def test_result_returns_settled_answer_and_thread_ref() -> None:
             )
         )
 
-    assert result == {
-        "ask_id": ask_id,
-        "answer": "## Result\n\nThe settled answer.",
-        "thread_ref": "conversation-from-outcome",
-        "nonce_marker": "nonce-marker",
-    }
+    assert result["ask_id"] == ask_id
+    assert result["answer"] == "## Result\n\nThe settled answer."
+    assert result["thread_ref"] == "conversation-from-outcome"
+    assert result["nonce_marker"] == "nonce-marker"
+    assert result["source_ask_id"] is None
+    assert result["evidence"]["raw_extracted"] is True
 
 
 def test_succeeded_result_includes_nonce_marker(
@@ -934,38 +967,18 @@ def test_result_reports_when_ask_is_still_running() -> None:
 
 
 @pytest.mark.parametrize(
-    ("provider_error", "expected_message"),
+    "provider_error",
     [
-        (
-            ask.GptProSessionExpiredError("expired"),
-            "ChatGPT Pro session expired; run claudex-gateway gptpro login, then retry.",
-        ),
-        (
-            ask.GptProAskError("challenge", "blocked"),
-            "ChatGPT Pro browser challenge blocked the request; complete the "
-            "challenge with claudex-gateway gptpro login, then retry.",
-        ),
-        (
-            ask.GptProAskError("rate_limited_timeout", "limited"),
-            "ChatGPT Pro remained rate limited until timeout; retry later.",
-        ),
-        (
-            ask.GptProAskError("timeout", "deadline"),
-            "ChatGPT Pro request timed out; check ChatGPT and the network, then retry.",
-        ),
-        (
-            ask.GptProAskError("echo_timeout", "missing echo"),
-            "ChatGPT Pro request timed out; check ChatGPT and the network, then retry.",
-        ),
-        (
-            ask.GptProAskError("submit_failed", "button unavailable"),
-            "ChatGPT Pro request failed [submit_failed]: button unavailable",
-        ),
+        ask.GptProSessionExpiredError("expired"),
+        ask.GptProAskError("challenge", "blocked"),
+        ask.GptProAskError("rate_limited_timeout", "limited"),
+        ask.GptProAskError("timeout", "deadline"),
+        ask.GptProAskError("echo_timeout", "missing echo"),
+        ask.GptProAskError("submit_failed", "button unavailable"),
     ],
 )
 def test_failed_result_preserves_domain_error_mapping(
-    provider_error: Exception,
-    expected_message: str,
+    provider_error: ask.GptProAskError,
 ) -> None:
     runtime = FakeAskRuntime(error=provider_error)
     with _mcp_client(runtime) as client:
@@ -987,10 +1000,16 @@ def test_failed_result_preserves_domain_error_mapping(
             {"ask_id": ask_id},
         )
 
-    assert result == {
-        "content": [{"type": "text", "text": expected_message}],
-        "isError": True,
-    }
+    # Previous retry-only messages concealed uncertainty; preserve the error
+    # flag and require factual classification plus structured diagnostics.
+    assert result["isError"] is True
+    assert f"[{provider_error.failure}]" in result["content"][0]["text"]
+    assert str(provider_error) in result["content"][0]["text"]
+    detail = json.loads(result["content"][1]["text"])
+    assert detail["failure"] == provider_error.failure
+    assert detail["error_message"] == str(provider_error)
+    assert detail["ask_id"] == ask_id
+    assert detail["evidence"]["raw_extracted"] is False
 
 
 def test_no_raw_turn_result_explains_thread_recovery(
@@ -1004,10 +1023,14 @@ def test_no_raw_turn_result_explains_thread_recovery(
         failure="no_raw_turn",
         error_message="no recoverable assistant turn",
         status_message=None,
-        nonce_marker="failed-nonce-marker",
+        nonce_marker="[gptpro-transport-nonce:failed]",
         thread_ref=_CONVERSATION_A,
         created_at=1.0,
         finished_at=2.0,
+        evidence=ask.AskEvidence(
+            submission="confirmed", conversation_id=_CONVERSATION_A,
+            failure_stage="answer", recovery="exhausted",
+        ),
     )
     monkeypatch.setattr(runtime, "job_result", lambda _ask_id: snapshot)
 
@@ -1022,10 +1045,12 @@ def test_no_raw_turn_result_explains_thread_recovery(
 
     assert result["isError"] is True
     message = result["content"][0]["text"]
-    assert "[no_raw_turn]" in message
-    assert "gateway recovery polling also failed" in message
-    assert "thread_ref as thread" in message
-    assert "re-emit the previous answer" in message
+    assert "[no_raw_turn] at answer" in message
+    assert "recover_gpt_pro" in message
+    assert _CONVERSATION_A in message
+    detail = json.loads(result["content"][1]["text"])
+    assert detail["evidence"]["recovery"] == "exhausted"
+    assert detail["evidence"]["raw_extracted"] is False
 
 
 def test_omitted_thread_continues_completed_session_conversation() -> None:
@@ -1382,3 +1407,114 @@ assert "mcp_types" not in sys.modules
     )
 
     assert result.returncode == 0, result.stderr
+
+
+def test_recovery_tool_rejects_missing_identifiers_without_submitting() -> None:
+    runtime = FakeAskRuntime()
+    with _mcp_client(runtime) as client:
+        _response, headers = _initialize(client)
+        result = _call_tool(client, headers, "recover_gpt_pro", {})
+        assert result["isError"] is True
+        assert "ask_id or both thread_ref and nonce_marker" in result["content"][0]["text"]
+        assert runtime.questions == []
+
+
+def test_recovery_tool_accepts_explicit_identifiers_after_restart_without_prompt() -> None:
+    runtime = FakeAskRuntime()
+    with _mcp_client(runtime) as client:
+        _response, headers = _initialize(client)
+        result = _call_tool(client, headers, "recover_gpt_pro", {
+            "thread_ref": _CONVERSATION_A,
+            "nonce_marker": "[gptpro-transport-nonce:existing]",
+        })
+        payload = _json_tool_payload(result)
+        assert payload["thread_ref"] == _CONVERSATION_A
+        assert isinstance(payload["ask_id"], str)
+        assert runtime.questions == []
+
+
+def test_failed_status_and_result_include_diagnostics_and_identifiers() -> None:
+    runtime = FakeAskRuntime(
+        error=ask.GptProAskError("echo_timeout", "echo unavailable"),
+        conversation_id=_CONVERSATION_A,
+    )
+    with _mcp_client(runtime) as client:
+        _response, headers = _initialize(client)
+        submitted = _json_tool_payload(_call_tool(client, headers, "ask_gpt_pro", {
+            "question": "one", "thread": _CONVERSATION_A,
+        }))
+        ask_id = submitted["ask_id"]
+        _finish_job(client, runtime, ask_id)
+        status = _json_tool_payload(_call_tool(client, headers, "ask_gpt_pro_status", {
+            "ask_id": ask_id,
+        }))
+        result = _call_tool(client, headers, "ask_gpt_pro_result", {
+            "ask_id": ask_id,
+        })
+        assert status["failure"] == "echo_timeout"
+        assert status["thread_ref"] == _CONVERSATION_A
+        assert status["evidence"]["failure_stage"] == "echo"
+        assert result["isError"] is True
+        detail = json.loads(result["content"][1]["text"])
+        assert detail["failure"] == "echo_timeout"
+        assert detail["thread_ref"] == _CONVERSATION_A
+        assert detail["evidence"]["submission"] != "not_attempted"
+        assert "recover_gpt_pro" in detail["recovery_guidance"]
+
+
+def test_recover_failed_ask_read_only_and_poll_new_job() -> None:
+    runtime = FakeAskRuntime(
+        error=ask.GptProAskError("echo_timeout", "confirmation lost"),
+        conversation_id=_CONVERSATION_A,
+    )
+    with _mcp_client(runtime) as client:
+        _response, headers = _initialize(client)
+        original = _json_tool_payload(_call_tool(client, headers, "ask_gpt_pro", {
+            "question": "original", "thread": _CONVERSATION_A,
+        }))
+        _finish_job(client, runtime, original["ask_id"])
+        recovered = _json_tool_payload(_call_tool(
+            client, headers, "recover_gpt_pro", {"ask_id": original["ask_id"]},
+        ))
+        assert recovered["source_ask_id"] == original["ask_id"]
+        assert recovered["thread_ref"] == _CONVERSATION_A
+        assert client.portal is not None
+        async def wait_for_recovery() -> None:
+            while runtime.job_status(recovered["ask_id"]).state != "succeeded":
+                await asyncio.sleep(0)
+        client.portal.call(wait_for_recovery)
+        result = _json_tool_payload(_call_tool(client, headers, "ask_gpt_pro_result", {
+            "ask_id": recovered["ask_id"],
+        }))
+        original_status = _json_tool_payload(_call_tool(client, headers, "ask_gpt_pro_status", {
+            "ask_id": original["ask_id"],
+        }))
+        assert result["answer"] == runtime.answer
+        assert result["source_ask_id"] == original["ask_id"]
+        assert result["evidence"]["recovery"] == "recovered"
+        assert original_status["state"] == "failed"
+        assert runtime.questions == ["original"]
+
+
+@pytest.mark.parametrize("arguments, error_fragment", [
+    ({"ask_id": "unknown"}, "unknown or expired ask_id"),
+    ({"thread_ref": _CONVERSATION_A}, "both thread_ref and nonce_marker"),
+    ({"ask_id": "x", "thread_ref": _CONVERSATION_A}, "not both"),
+    ({"thread_ref": "new", "nonce_marker": "[gptpro-transport-nonce:saved]"},
+     "thread_ref UUID"),
+    ({"thread_ref": _CONVERSATION_A, "nonce_marker": "arbitrary"},
+     "nonce_marker"),
+    ({"thread_ref": _CONVERSATION_A,
+      "nonce_marker": "[gptpro-transport-nonce:saved]", "question": "oops"},
+     "Unknown argument(s)"),
+])
+def test_recovery_validation_never_submits(
+    arguments: dict[str, str], error_fragment: str,
+) -> None:
+    runtime = FakeAskRuntime()
+    with _mcp_client(runtime) as client:
+        _response, headers = _initialize(client)
+        result = _call_tool(client, headers, "recover_gpt_pro", arguments)
+        assert result["isError"] is True
+        assert error_fragment in result["content"][0]["text"]
+        assert runtime.questions == []

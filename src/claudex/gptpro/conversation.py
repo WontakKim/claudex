@@ -183,7 +183,10 @@ def extract_assistant_turn(
     last_text_assistant: Mapping[str, Any] | None = None
     for node in reversed(chain[:anchor_index]):
         message = node.get("message")
-        if _message_role(message) != "assistant" or not isinstance(message, Mapping):
+        role = _message_role(message)
+        if role == "user":
+            break
+        if role != "assistant" or not isinstance(message, Mapping):
             continue
         content = message.get("content")
         if not isinstance(content, Mapping) or content.get("content_type") != "text":
