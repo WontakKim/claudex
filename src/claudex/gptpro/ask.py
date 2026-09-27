@@ -7,10 +7,11 @@ import inspect
 import json
 import math
 import os
+import re
 import time
 from collections import deque
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Literal
 from urllib.parse import urlsplit
 from uuid import uuid4
@@ -24,7 +25,6 @@ from claudex.gptpro.conversation import (
     build_nonce_marker,
     extract_assistant_turn,
     extract_conversation_id_from_body,
-    extract_conversation_id_from_url,
     is_completion_report_url,
     is_conversation_id,
     is_conversation_stream_url,
@@ -116,6 +116,23 @@ class AskSubmission:
 
 
 @dataclass(frozen=True)
+class AskEvidence:
+    submission: Literal["not_attempted", "uncertain", "confirmed"] = "not_attempted"
+    conversation_id: str | None = None
+    upload_receipts: int | None = None
+    ready_attachments: int | None = None
+    generation_observed: bool = False
+    answer_seen: bool = False
+    raw_extracted: bool = False
+    failure_stage: str | None = None
+    recovery_failure: str | None = None
+    recovery_detail: str | None = None
+    recovery: Literal[
+        "not_attempted", "polling", "unavailable", "exhausted", "recovered"
+    ] = "not_attempted"
+
+
+@dataclass(frozen=True)
 class AskCallbacks:
     """Observation callbacks for one ask execution.
 
@@ -128,6 +145,7 @@ class AskCallbacks:
     on_conversation_id: Callable[[str], None] | None = None
     on_marker: Callable[[str], None] | None = None
     on_detached: Callable[[], None] | None = None
+    on_evidence: Callable[[AskEvidence], None] | None = None
 
 
 class GptProAskError(Exception):
@@ -136,6 +154,7 @@ class GptProAskError(Exception):
     def __init__(self, failure: FailureClassification, message: str) -> None:
         super().__init__(message)
         self.failure = failure
+        self.evidence: AskEvidence | None = None
 
 
 class GptProSessionExpiredError(GptProAskError):
@@ -281,6 +300,11 @@ class _AskExecution:
         self.should_detach = should_detach
         self.on_detach = on_detach
         self.network = _NetworkState(conversation_id=conversation_id)
+        self.evidence = AskEvidence(conversation_id=conversation_id)
+        self.stage = "navigation"
+        self.has_correlated_request = False
+        self.observed_requests: dict[int, Any] = {}
+        self._notify_evidence()
         self.listener_tasks: set[asyncio.Task[None]] = set()
         self.request_listener: Callable[[Any], None] | None = None
         self.response_listener: Callable[[Any], None] | None = None
@@ -321,6 +345,42 @@ class _AskExecution:
             self.callbacks.on_conversation_id(conversation_id)
         except Exception:
             return
+
+    def _notify_evidence(self) -> None:
+        if self.callbacks.on_evidence is not None:
+            try:
+                self.callbacks.on_evidence(self.evidence)
+            except Exception:
+                pass
+
+    def _record_evidence(self, **changes: Any) -> None:
+        updated = replace(self.evidence, **changes)
+        if updated != self.evidence:
+            self.evidence = updated
+            self._notify_evidence()
+
+    def _latch_conversation_id(self, conversation_id: str) -> None:
+        if self.network.conversation_id is not None:
+            return
+        self.network.conversation_id = conversation_id
+        self._record_evidence(conversation_id=conversation_id)
+        self._notify_conversation_id(conversation_id)
+
+    def _capture_trusted_page_conversation(self) -> None:
+        if not (self.has_correlated_request or self.has_locked_user_echo):
+            return
+        url = _page_url(self.page)
+        if not is_trusted_origin_url(url):
+            return
+        try:
+            path = urlsplit(url).path
+        except ValueError:
+            return
+        if not path.startswith("/c/"):
+            return
+        conversation_id = path.removeprefix("/c/").strip("/")
+        if is_conversation_id(conversation_id):
+            self._latch_conversation_id(conversation_id.lower())
 
     def _remaining(self) -> float:
         return self.deadline - _monotonic()
@@ -411,24 +471,26 @@ class _AskExecution:
             url = _read_member(request, "url", "")
             if not isinstance(url, str) or not is_trusted_origin_url(url):
                 return
-            conversation_id = extract_conversation_id_from_url(url)
-            if conversation_id is None and _is_backend_api_url(url):
-                post_data = _read_member(request, "post_data", None)
-                if isinstance(post_data, str):
-                    conversation_id = extract_conversation_id_from_body(post_data)
-            if (
-                self.has_submitted
-                and self.network.conversation_id is None
-                and conversation_id is not None
-            ):
-                self.network.conversation_id = conversation_id
-                self._notify_conversation_id(conversation_id)
-            if not self.has_submitted:
+            if not self.has_submitted or id(request) in self.observed_requests:
                 return
-            if is_completion_report_url(url):
-                self.network.strong_signal_serial += 1
+            self.observed_requests[id(request)] = request
             method = _read_member(request, "method", "")
-            if method == "POST" and is_conversation_stream_url(url):
+            is_stream = method == "POST" and is_conversation_stream_url(url)
+            post_data = _read_member(request, "post_data", None)
+            is_correlated = (
+                is_stream and isinstance(post_data, str)
+                and self.marker in post_data
+            )
+            if is_correlated:
+                self.has_correlated_request = True
+                conversation_id = extract_conversation_id_from_body(post_data)
+                if conversation_id is not None:
+                    self._latch_conversation_id(conversation_id)
+            if is_completion_report_url(url) and (
+                self.has_correlated_request or self.has_locked_user_echo
+            ):
+                self.network.strong_signal_serial += 1
+            if is_stream and is_correlated:
                 self.network.weak_signal_serial += 1
         except Exception:
             return
@@ -488,6 +550,7 @@ class _AskExecution:
         self.request_listener = self._capture_request
         self.response_listener = self._capture_response
         try:
+            self.page.on("request", self.request_listener)
             self.page.on("requestfinished", self.request_listener)
             self.page.on("response", self.response_listener)
         except Exception as exc:
@@ -497,6 +560,7 @@ class _AskExecution:
 
     async def _remove_listeners(self) -> None:
         for event, listener in (
+            ("request", self.request_listener),
             ("requestfinished", self.request_listener),
             ("response", self.response_listener),
         ):
@@ -641,10 +705,19 @@ class _AskExecution:
                 self.page,
                 self.attachment_paths,
                 timeout_seconds=timeout_seconds,
+                on_progress=lambda receipts, ready: self._record_evidence(
+                    upload_receipts=receipts, ready_attachments=ready,
+                ),
             )
+            self._record_evidence(ready_attachments=len(self.attachment_paths))
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            if isinstance(exc, attachments.AttachmentSettleTimeoutError):
+                self._record_evidence(
+                    upload_receipts=exc.completed_file_create_responses,
+                    ready_attachments=exc.ready_attachments,
+                )
             raise GptProAskError(
                 "error", f"ChatGPT attachment upload failed: {exc}"
             ) from exc
@@ -700,11 +773,15 @@ class _AskExecution:
             raise GptProAskError(
                 "submit_failed", "could not fill the ChatGPT composer"
             ) from exc
-        # The composer is a contenteditable editor: newlines round-trip as
-        # <br>/paragraph markup, so an exact-string comparison fails on
-        # well-formed fills. The nonce marker is the fill's contract — if
-        # it made it in, the submit path can anchor on it.
-        if not isinstance(readback, str) or self.marker not in readback:
+        # Contenteditable can collapse blank lines and normalize line endings;
+        # those changes are safe, but dropping prompt text is not.
+        def normalize(value: str) -> str:
+            lines = value.replace("\r\n", "\n").replace("\r", "\n")
+            return re.sub(r"\n+", "\n", lines)
+
+        if not isinstance(readback, str) or normalize(readback) != normalize(
+            self.prompt
+        ):
             raise GptProAskError(
                 "submit_failed", "the ChatGPT composer did not retain the prompt"
             )
@@ -777,6 +854,7 @@ class _AskExecution:
         await self._process_network_actions()
         try:
             self.has_submitted = True
+            self._record_evidence(submission="uncertain")
             await self._await_page_operation(
                 self.page.click(
                     SEND_BUTTON_SELECTOR,
@@ -836,23 +914,7 @@ class _AskExecution:
         if echo_id is not None:
             return echo_id
 
-        try:
-            composer_value = await self._await_page_operation(
-                self.page.evaluate(
-                    COMPOSER_READBACK_PROBE_JS,
-                    {"selector": COMPOSER_SELECTOR},
-                )
-            )
-        except _DeadlineExpired:
-            raise
-        except Exception:
-            composer_value = None
-        if composer_value == self.prompt and not self.network.saw_rate_limit:
-            self._status(
-                "the first send click was not accepted; retrying the click once"
-            )
-            await self._click_send()
-
+        self._capture_trusted_page_conversation()
         echo_id = await self._wait_for_echo(pre_ids, ECHO_RENDER_TIMEOUT_SECONDS)
         if echo_id is None:
             if self.network.saw_rate_limit:
@@ -1079,8 +1141,13 @@ class _AskExecution:
             conversation = await self._page_fetch_conversation()
             if conversation is not None:
                 turn = extract_assistant_turn(conversation, self.marker)
-                if turn is not None and turn.finished and turn.text:
-                    return turn.text
+                if turn is not None and turn.text:
+                    self._record_evidence(
+                        generation_observed=True, answer_seen=True,
+                    )
+                    if turn.finished:
+                        self._record_evidence(raw_extracted=True)
+                        return turn.text
             if attempt + 1 < API_TURN_ATTEMPTS:
                 await self._pause_while_waiting(API_TURN_RETRY_SECONDS)
         return None
@@ -1172,6 +1239,11 @@ class _AskExecution:
             mutation_changed = (
                 turn_state.assistant_mutation_key != last_mutation_key
             )
+            if turn_state.assistant_exists:
+                if turn_state.assistant_text_length > 0:
+                    self._record_evidence(generation_observed=True, answer_seen=True)
+                else:
+                    self._record_evidence(generation_observed=True)
             if turn_state.assistant_text_length > 0:
                 if mutation_changed or not self.has_seen_assistant_text:
                     last_activity_at = _monotonic()
@@ -1240,14 +1312,22 @@ class _AskExecution:
                 self._install_listeners()
                 self._ensure_deadline()
                 await self._navigate()
+                self.stage = "composer"
                 await self._wait_for_composer()
                 if self.attachment_paths:
+                    self.stage = "attachments"
                     await self._attach_files()
+                self.stage = "composer"
                 pre_submit_ids = await self._stable_pre_submit_user_ids()
                 await self._fill_and_verify()
+                self.stage = "submission"
                 await self._click_send()
+                self.stage = "echo"
                 locked_user_id = await self._lock_user_echo(pre_submit_ids)
                 self.has_locked_user_echo = True
+                self._record_evidence(submission="confirmed")
+                self._capture_trusted_page_conversation()
+                self.stage = "answer"
                 completion = await self._monitor_completion(locked_user_id)
             finally:
                 await self._remove_listeners()
@@ -1303,7 +1383,7 @@ async def execute_ask_outcome(
     The caller owns ``page`` and remains responsible for closing it. Network
     listeners installed by this function are always removed before it returns.
     """
-    return await _AskExecution(
+    execution = _AskExecution(
         page,
         question,
         callbacks,
@@ -1312,7 +1392,14 @@ async def execute_ask_outcome(
         attachment_paths=attachment_paths,
         should_detach=should_detach,
         on_detach=on_detach,
-    ).run()
+    )
+    try:
+        return await execution.run()
+    except GptProAskError as exc:
+        execution._capture_trusted_page_conversation()
+        execution._record_evidence(failure_stage=execution.stage)
+        exc.evidence = execution.evidence
+        raise
 
 
 async def execute_ask(

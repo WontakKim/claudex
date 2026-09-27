@@ -104,6 +104,7 @@ class _FakePage:
         self.hang_operation = hang_operation
         self.has_emitted_second_lat = False
         self.listeners: dict[str, list[Callable[[Any], None]]] = {
+            "request": [],
             "requestfinished": [],
             "response": [],
         }
@@ -166,12 +167,13 @@ class _FakePage:
         if self.swallow_first_click and self.click_count == 1:
             return
         self.composer_value = ""
-        post_data = json.dumps({"conversation_id": _CONVERSATION_ID})
+        post_data = json.dumps({"conversation_id": _CONVERSATION_ID, "messages": [{"content": {"parts": [self.filled_prompt]}}]})
         if self.signal == "weak":
             self._emit(
                 "requestfinished", _FakeRequest(_STREAM_URL, "POST", post_data)
             )
         elif self.signal == "strong":
+            self._emit("request", _FakeRequest(_STREAM_URL, "POST", post_data))
             self._emit("requestfinished", _FakeRequest(_LAT_URL, "POST", post_data))
         elif self.signal in ("weak_then_evil", "weak_then_other_trusted"):
             self._emit(
@@ -191,6 +193,7 @@ class _FakePage:
                 ),
             )
         elif self.signal == "id_only":
+            self.url = f"https://chatgpt.com/c/{_CONVERSATION_ID}"
             self._emit(
                 "requestfinished",
                 _FakeRequest(
@@ -493,7 +496,7 @@ def test_happy_path_returns_finished_server_raw_markdown_and_removes_listeners(
     assert page.goto_checked_listeners
     assert page.click_count == 1
     assert page.fetch_count == 1
-    assert page.listeners == {"requestfinished": [], "response": []}
+    assert page.listeners == {"request": [], "requestfinished": [], "response": []}
     marker = page.filled_prompt.splitlines()[0]
     assert page.filled_prompt == f"{marker}\n\nReview this code\n\n{marker}"
     assert "echo" not in page.filled_prompt.lower()
@@ -680,6 +683,7 @@ def test_attachment_upload_runs_after_composer_and_before_fill(
         attachment_paths: tuple[str, ...],
         *,
         timeout_seconds: float | None = None,
+        on_progress: Callable[[int, int], None] | None = None,
     ) -> None:
         assert attached_page is page
         page.call_order.append("attach")
@@ -750,15 +754,43 @@ def test_attachment_failure_is_classified_with_attachment_context(
     assert "fill" not in page.call_order
 
 
-def test_missing_echo_with_retained_composer_retries_click_once(
+def test_missing_echo_with_retained_composer_does_not_click_again(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # A retained composer is not positive proof that the first click did not
+    # submit; a second click could create a duplicate turn.
     clock = _install_clock(monkeypatch)
-    page = _FakePage(swallow_first_click=True)
+    page = _FakePage(swallow_first_click=True, readback_reformatted=True)
 
-    assert _run(page) == "server **raw** markdown"
-    assert page.click_count == 2
+    with pytest.raises(ask.GptProAskError) as raised:
+        _run(page)
+
+    assert raised.value.failure == "echo_timeout"
+    assert page.click_count == 1
+    assert raised.value.evidence.submission == "uncertain"
     assert clock.value >= ask.ECHO_PROBE_TIMEOUT_SECONDS
+
+
+def test_send_button_never_ready_does_not_attempt_click(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_clock(monkeypatch)
+    page = _FakePage()
+    original_evaluate = page.evaluate
+
+    async def never_ready(expression: str, argument: Any = None) -> Any:
+        if expression == selectors.SEND_BUTTON_READY_PROBE_JS:
+            return False
+        return await original_evaluate(expression, argument)
+
+    page.evaluate = never_ready  # type: ignore[method-assign]
+    with pytest.raises(ask.GptProAskError) as raised:
+        _run(page)
+
+    assert raised.value.failure == "submit_failed"
+    assert raised.value.evidence.submission == "not_attempted"
+    assert raised.value.evidence.failure_stage == "submission"
+    assert page.click_count == 0
 
 
 def test_readback_mismatch_is_submit_failed(
@@ -1048,7 +1080,7 @@ def test_hanging_page_operation_obeys_overall_deadline(
         _run(page)
 
     assert raised.value.failure == "timeout"
-    assert page.listeners == {"requestfinished": [], "response": []}
+    assert page.listeners == {"request": [], "requestfinished": [], "response": []}
 
 
 def test_navigation_recovery_preserves_completion_signal(
@@ -1262,7 +1294,7 @@ def test_contention_detaches_completed_submission_and_returns_poller_outcome(
     ]
     assert statuses[-1] == "detached; polling for the answer"
     assert page.fetch_count == 0
-    assert page.listeners == {"requestfinished": [], "response": []}
+    assert page.listeners == {"request": [], "requestfinished": [], "response": []}
 
 
 def test_detach_is_ignored_without_a_conversation_id(
@@ -1289,7 +1321,7 @@ def test_detach_is_ignored_without_a_conversation_id(
 
     assert raised.value.failure == "timeout"
     assert submissions == []
-    assert page.listeners == {"requestfinished": [], "response": []}
+    assert page.listeners == {"request": [], "requestfinished": [], "response": []}
 
 
 def test_detach_is_ignored_before_the_user_echo_is_locked(
@@ -1372,3 +1404,163 @@ def test_request_detach_sets_the_monitor_detach_flag() -> None:
         conversation_id=_CONVERSATION_ID,
     )
     assert statuses == ["detached; polling for the answer"]
+
+
+def test_truncated_prompt_with_nonce_is_not_submitted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_clock(monkeypatch)
+    page = _FakePage()
+    original_evaluate = page.evaluate
+
+    async def truncated_readback(expression: str, argument: Any = None) -> Any:
+        if expression == selectors.COMPOSER_READBACK_PROBE_JS:
+            return page.filled_prompt.splitlines()[0] + "\ntruncated"
+        return await original_evaluate(expression, argument)
+
+    page.evaluate = truncated_readback  # type: ignore[method-assign]
+    with pytest.raises(ask.GptProAskError) as raised:
+        _run(page)
+    assert raised.value.failure == "submit_failed"
+    assert page.click_count == 0
+
+
+def test_correlated_outgoing_request_captures_id_before_requestfinished(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_clock(monkeypatch)
+    page = _FakePage(signal="none", echo_never=True)
+    observed: list[str] = []
+    original_click = page.click
+
+    async def click_then_lose_confirmation(selector: str, *, timeout: int) -> None:
+        page._emit(
+            "request",
+            _FakeRequest(
+                _STREAM_URL,
+                "POST",
+                json.dumps({
+                    "conversation_id": _CONVERSATION_ID,
+                    "messages": [{"content": {"parts": [page.filled_prompt]}}],
+                }),
+            ),
+        )
+        await original_click(selector, timeout=timeout)
+        raise RuntimeError("navigation destroyed click confirmation")
+
+    page.click = click_then_lose_confirmation  # type: ignore[method-assign]
+    page.listeners["request"] = []
+    with pytest.raises(ask.GptProAskError) as raised:
+        asyncio.run(
+            ask.execute_ask_outcome(
+                page, "question", callbacks=ask.AskCallbacks(
+                    on_conversation_id=observed.append,
+                ),
+            )
+        )
+    assert raised.value.failure == "submit_failed"
+    assert observed == [_CONVERSATION_ID]
+    assert page.click_count == 1
+    assert raised.value.evidence.submission == "uncertain"
+
+
+def test_echo_confirms_submission_after_outgoing_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_clock(monkeypatch)
+    observations: list[ask.AskEvidence] = []
+    asyncio.run(ask.execute_ask_outcome(
+        _FakePage(), "question",
+        callbacks=ask.AskCallbacks(on_evidence=observations.append),
+    ))
+    assert any(evidence.submission == "confirmed" for evidence in observations)
+
+
+def test_unrelated_outgoing_request_does_not_latch_conversation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_clock(monkeypatch)
+    execution = ask._AskExecution(_FakePage(), "target", None)
+    execution.has_submitted = True
+    execution._capture_request(_FakeRequest(
+        _STREAM_URL, "POST", json.dumps({
+            "conversation_id": _EVIL_CONVERSATION_ID,
+            "messages": [{"content": {"parts": ["unrelated"]}}],
+        }),
+    ))
+    assert execution.network.conversation_id is None
+
+
+def test_unrelated_backend_fetch_after_correlated_send_does_not_latch_thread() -> None:
+    execution = ask._AskExecution(_FakePage(), "target", None)
+    execution.has_submitted = True
+    execution._capture_request(_FakeRequest(
+        _STREAM_URL, "POST", json.dumps({
+            "messages": [{"content": {"parts": [execution.marker]}}],
+        }),
+    ))
+    assert execution.has_correlated_request
+    execution._capture_request(_FakeRequest(
+        f"https://chatgpt.com/backend-api/conversation/{_EVIL_CONVERSATION_ID}",
+        "GET",
+    ))
+    assert execution.network.conversation_id is None
+
+
+def test_timeout_before_first_click_preserves_not_attempted_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_clock(monkeypatch)
+    page = _FakePage(hang_operation="fill")
+    with pytest.raises(ask.GptProAskError) as raised:
+        asyncio.run(ask.execute_ask_outcome(
+            page, "question", timeout_seconds=0.01,
+            callbacks=ask.AskCallbacks(on_status=lambda _: None),
+        ))
+    assert raised.value.failure == "timeout"
+    assert page.click_count == 0
+    assert getattr(raised.value, "evidence", None) is not None
+    assert raised.value.evidence.submission == "not_attempted"
+    assert raised.value.evidence.failure_stage == "composer"
+
+
+def test_late_navigation_error_keeps_nonce_correlated_thread_and_stage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_clock(monkeypatch)
+    page = _FakePage(
+        signal="weak", api_payloads=[None],
+        turn_states=[RuntimeError("DOM changed")],
+    )
+    with pytest.raises(ask.GptProAskError) as raised:
+        _run(page)
+    assert raised.value.failure == "error"
+    assert raised.value.evidence.conversation_id == _CONVERSATION_ID
+    assert raised.value.evidence.failure_stage == "answer"
+    assert raised.value.evidence.submission == "confirmed"
+    assert page.click_count == 1
+
+
+def test_attachment_receipts_do_not_claim_composer_ready(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_clock(monkeypatch)
+    page = _FakePage()
+
+    async def unsettled(*_args: Any, **_kwargs: Any) -> None:
+        raise ask.attachments.AttachmentSettleTimeoutError(
+            "one receipt, unready composer",
+            completed_file_create_responses=1,
+            ready_attachments=0,
+        )
+
+    monkeypatch.setattr(ask.attachments, "attach_files", unsettled)
+    with pytest.raises(ask.GptProAskError) as raised:
+        asyncio.run(ask.execute_ask_outcome(
+            page, "question", attachment_paths=["pending.txt"],
+        ))
+    assert raised.value.failure == "error"
+    assert raised.value.evidence.upload_receipts == 1
+    assert raised.value.evidence.ready_attachments == 0
+    assert raised.value.evidence.submission == "not_attempted"
+    assert page.click_count == 0

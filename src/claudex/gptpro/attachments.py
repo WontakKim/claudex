@@ -7,7 +7,7 @@ import base64
 import inspect
 import time
 from collections import Counter
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -234,6 +234,7 @@ async def attach_files(
     attachment_paths: Sequence[str],
     *,
     timeout_seconds: float | None = None,
+    on_progress: Callable[[int, int], None] | None = None,
 ) -> None:
     """Upload UTF-8 text files and wait for receipts and ready composer chips."""
     if not attachment_paths:
@@ -249,6 +250,12 @@ async def attach_files(
     drop_started = False
     ready_attachments = 0
 
+    def report_progress() -> None:
+        if on_progress is not None:
+            on_progress(completed_file_create_responses, ready_attachments)
+
+    report_progress()
+
     async def record_completed_response(response: Any) -> None:
         nonlocal completed_file_create_responses
         try:
@@ -256,6 +263,7 @@ async def attach_files(
         except Exception:
             return
         completed_file_create_responses += 1
+        report_progress()
 
     def on_response(response: Any) -> None:
         if not drop_started or not _is_completed_file_create_response(response):
@@ -344,6 +352,7 @@ async def attach_files(
                 )
                 for filename, count in expected_counts.items()
             )
+            report_progress()
             await asyncio.sleep(0)
             if (
                 completed_file_create_responses >= len(filenames)

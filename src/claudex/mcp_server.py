@@ -42,6 +42,23 @@ class LazyAskRuntime:
             attachment_paths=attachment_paths,
         )
 
+    async def recover(self, conversation_id: str, marker: str) -> Any:
+        runtime = await self._get_runtime()
+        return await runtime.recover(conversation_id, marker)
+
+    def start_recovery(
+        self,
+        *,
+        ask_id: str | None = None,
+        conversation_id: str | None = None,
+        marker: str | None = None,
+    ) -> jobs.AskJob:
+        if self._job_service is None:
+            self._job_service = jobs.AskJobService(self.ask, recover=self.recover)
+        return self._job_service.start_recovery(
+            ask_id=ask_id, conversation_id=conversation_id, marker=marker,
+        )
+
     def start_ask(
         self,
         question: str,
@@ -52,7 +69,7 @@ class LazyAskRuntime:
         session_id: str | None = None,
     ) -> jobs.AskJob:
         if self._job_service is None:
-            self._job_service = jobs.AskJobService(self.ask)
+            self._job_service = jobs.AskJobService(self.ask, recover=self.recover)
         return self._job_service.start(
             question,
             conversation_id=conversation_id,

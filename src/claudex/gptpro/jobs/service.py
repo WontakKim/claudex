@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import re
 import tempfile
 import time
 from collections.abc import Awaitable, Callable, Sequence
@@ -11,7 +12,7 @@ from typing import Any, Protocol
 from uuid import uuid4
 
 from claudex.gptpro import ask as ask_module
-from claudex.gptpro.ask import AskCallbacks, AskOutcome, GptProAskError
+from claudex.gptpro.ask import AskCallbacks, AskEvidence, AskOutcome, GptProAskError
 from claudex.gptpro.conversation import is_conversation_id
 
 from .models import AskJob, TurnFinished
@@ -26,6 +27,7 @@ SWEEP_INTERVAL_SECONDS = 300.0
 QUEUE_TTL_SECONDS = 900.0
 QUESTION_SPILL_THRESHOLD_BYTES = 35_000
 ACTIVE_JOB_STATES = frozenset({"queued", "running", "detached"})
+_NONCE_PATTERN = re.compile(r"^\[gptpro-transport-nonce:[^\]\r\n]{1,128}\]$")
 
 
 def _ownership_key(conversation_id: str) -> str:
@@ -52,6 +54,12 @@ class _AskCallable(Protocol):
     ) -> Awaitable[AskOutcome]: ...
 
 
+class _RecoverCallable(Protocol):
+    def __call__(
+        self, conversation_id: str, marker: str,
+    ) -> Awaitable[AskOutcome]: ...
+
+
 class AskJobService:
     """Run asks in the background and retain immutable lifecycle snapshots."""
 
@@ -59,6 +67,7 @@ class AskJobService:
         self,
         ask: _AskCallable,
         *,
+        recover: _RecoverCallable | None = None,
         retention_seconds: float = JOB_RETENTION_SECONDS,
         sweep_interval_seconds: float = SWEEP_INTERVAL_SECONDS,
         overall_timeout_seconds: float | None = None,
@@ -69,6 +78,7 @@ class AskJobService:
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
         self._ask = ask
+        self._recover = recover
         self._retention_seconds = retention_seconds
         self._sweep_interval_seconds = sweep_interval_seconds
         self._overall_timeout_seconds = (
@@ -122,6 +132,7 @@ class AskJobService:
             thread_ref=conversation_id,
             created_at=created_at,
             finished_at=None,
+            evidence=AskEvidence(conversation_id=conversation_id),
         )
         self._jobs[ask_id] = job
         question_preview = " ".join(question.split())
@@ -152,6 +163,192 @@ class AskJobService:
             self._sweeper_task = asyncio.create_task(self._run_sweeper())
 
         return job
+
+    def start_recovery(
+        self,
+        *,
+        ask_id: str | None = None,
+        conversation_id: str | None = None,
+        marker: str | None = None,
+    ) -> AskJob:
+        """Poll an existing turn by retained ask ID or explicit identifiers."""
+        if ask_id is not None and (conversation_id is not None or marker is not None):
+            raise ValueError("provide ask_id or thread_ref and nonce_marker, not both")
+        source: AskJob | None = None
+        if ask_id is not None:
+            source = self.status(ask_id)
+            if source is None:
+                raise ValueError(
+                    "unknown or expired ask_id; provide saved thread_ref and "
+                    "nonce_marker to recover after restart"
+                )
+            if source.state != "failed":
+                raise ValueError("only a failed ask can start recovery; poll pending jobs")
+            conversation_id, marker = source.thread_ref, source.nonce_marker
+        if (
+            not is_conversation_id(conversation_id)
+            or not isinstance(marker, str)
+            or not _NONCE_PATTERN.fullmatch(marker)
+        ):
+            raise ValueError(
+                "recovery requires a known ChatGPT thread_ref UUID and "
+                "nonce_marker; no prompt is submitted"
+            )
+        if self._recover is None:
+            raise ValueError("read-only answer recovery is unavailable")
+        for job in self._jobs.values():
+            if (
+                job.state in ACTIVE_JOB_STATES
+                and job.thread_ref is not None
+                and _ownership_key(job.thread_ref) == _ownership_key(conversation_id)
+                and job.nonce_marker == marker
+            ):
+                raise ValueError(
+                    "recovery already pending for this turn; poll its ask_id"
+                )
+        recovery_id = uuid4().hex
+        created_at = self._clock()
+        evidence = (
+            source.evidence if source is not None else AskEvidence(
+                conversation_id=conversation_id, submission="uncertain",
+            )
+        )
+        job = AskJob(
+            ask_id=recovery_id, state="queued", answer=None, failure=None,
+            error_message=None, status_message=None, nonce_marker=marker,
+            thread_ref=conversation_id, created_at=created_at, finished_at=None,
+            evidence=replace(evidence, recovery="not_attempted"),
+            source_ask_id=ask_id,
+        )
+        self._jobs[recovery_id] = job
+        task = asyncio.create_task(self._run_recovery(
+            recovery_id, created_at + self._queue_ttl_seconds,
+        ))
+        self._job_tasks.add(task)
+        task.add_done_callback(self._job_tasks.discard)
+        if self._sweeper_task is None:
+            self._sweeper_task = asyncio.create_task(self._run_sweeper())
+        return job
+
+    async def _run_recovery(self, ask_id: str, queue_deadline: float) -> None:
+        job = self._jobs[ask_id]
+        assert job.thread_ref is not None and job.nonce_marker is not None
+        try:
+            await self._claim_conversation(ask_id, job.thread_ref, queue_deadline)
+            job = replace(
+                self._jobs[ask_id], state="detached",
+                status_message="detached; polling for the answer",
+                evidence=replace(self._jobs[ask_id].evidence, recovery="polling"),
+            )
+            self._jobs[ask_id] = job
+            assert self._recover is not None
+            outcome = await self._recover(job.thread_ref, job.nonce_marker)
+            if (
+                not outcome.text or outcome.marker != job.nonce_marker
+                or not is_conversation_id(outcome.conversation_id)
+                or _ownership_key(outcome.conversation_id) != _ownership_key(job.thread_ref)
+            ):
+                raise GptProAskError(
+                    "no_raw_turn", "recovery did not return a finished "
+                    "nonce-correlated answer for this conversation",
+                )
+            self._jobs[ask_id] = replace(
+                job, state="succeeded", answer=outcome.text,
+                evidence=replace(
+                    job.evidence, recovery="recovered", submission="confirmed",
+                    raw_extracted=True, answer_seen=True, generation_observed=True,
+                ),
+            )
+        except asyncio.CancelledError:
+            self._jobs[ask_id] = replace(
+                self._jobs[ask_id], state="failed", failure="cancelled",
+                error_message="the recovery was cancelled",
+            )
+            raise
+        except Exception as exc:
+            failure = (
+                exc.failure if isinstance(exc, GptProAskError)
+                else "timeout" if isinstance(exc, TimeoutError) else "error"
+            )
+            detail = str(exc) or (
+                "the bounded answer recovery window expired"
+                if isinstance(exc, TimeoutError) else type(exc).__name__
+            )
+            recovery_evidence = (
+                exc.evidence if isinstance(exc, GptProAskError) else None
+            )
+            is_unavailable = (
+                self._jobs[ask_id].state != "detached"
+                or failure in {"session_expired", "challenge"}
+                or recovery_evidence is not None
+                and recovery_evidence.recovery == "unavailable"
+            )
+            self._jobs[ask_id] = replace(
+                self._jobs[ask_id], state="failed", failure=failure,
+                error_message=detail,
+                evidence=replace(
+                    self._jobs[ask_id].evidence,
+                    failure_stage=(
+                        "queue" if self._jobs[ask_id].state == "queued"
+                        else "recovery"
+                    ),
+                    recovery="unavailable" if is_unavailable else "exhausted",
+                    recovery_failure=(
+                        recovery_evidence.recovery_failure
+                        if recovery_evidence is not None
+                        and recovery_evidence.recovery_failure is not None
+                        else failure
+                    ),
+                    recovery_detail=detail,
+                ),
+            )
+        finally:
+            self._release_conversation(ask_id)
+            self._jobs[ask_id] = replace(
+                self._jobs[ask_id], status_message=None, finished_at=self._clock(),
+            )
+
+    async def _claim_conversation(
+        self, ask_id: str, conversation_id: str, queue_deadline: float,
+    ) -> None:
+        ownership_key = _ownership_key(conversation_id)
+        has_logged_wait = False
+        while ownership := self._conversation_owners.get(ownership_key):
+            self._on_status(ask_id, "waiting for the in-flight answer")
+            if not has_logged_wait:
+                logger.debug(
+                    "gptpro ask %.8s waiting for the in-flight answer (thread=%s)",
+                    ask_id, conversation_id,
+                )
+                has_logged_wait = True
+            remaining = queue_deadline - self._clock()
+            if remaining <= 0:
+                raise GptProAskError(
+                    "expired", "the queue TTL expired while waiting for the "
+                    "in-flight ask on this conversation",
+                )
+            try:
+                await asyncio.wait_for(ownership.released.wait(), remaining)
+            except TimeoutError as exc:
+                raise GptProAskError(
+                    "expired", "the queue TTL expired while waiting for the "
+                    "in-flight ask on this conversation",
+                ) from exc
+            # An already-released event may return without yielding.
+            await asyncio.sleep(0)
+        self._conversation_owners[ownership_key] = _ConversationOwnership(
+            ask_id, asyncio.Event()
+        )
+
+    def _release_conversation(self, ask_id: str) -> None:
+        conversation_id = self._jobs[ask_id].thread_ref
+        if conversation_id is None:
+            return
+        key = _ownership_key(conversation_id)
+        ownership = self._conversation_owners.get(key)
+        if ownership is not None and ownership.owner_ask_id == ask_id:
+            del self._conversation_owners[key]
+            ownership.released.set()
 
     def status(self, ask_id: str) -> AskJob | None:
         return self._jobs.get(ask_id)
@@ -197,53 +394,10 @@ class AskJobService:
         attachment_paths: Sequence[str] | None,
     ) -> None:
         spill_path: Path | None = None
-        has_logged_queue_wait = False
         try:
             if conversation_id is not None:
-                ownership_key = _ownership_key(conversation_id)
-                while ownership := self._conversation_owners.get(
-                    ownership_key
-                ):
-                    self._on_status(
-                        ask_id, "waiting for the in-flight answer"
-                    )
-                    if not has_logged_queue_wait:
-                        logger.debug(
-                            "gptpro ask %.8s waiting for the in-flight answer "
-                            "(thread=%s)",
-                            ask_id,
-                            conversation_id,
-                        )
-                        has_logged_queue_wait = True
-                    queue_wait_remaining = (
-                        queue_deadline - self._clock()
-                    )
-                    if queue_wait_remaining <= 0:
-                        raise GptProAskError(
-                            "expired",
-                            "the queue TTL expired while waiting for the "
-                            "in-flight ask on this conversation",
-                        )
-                    try:
-                        await asyncio.wait_for(
-                            ownership.released.wait(),
-                            timeout=queue_wait_remaining,
-                        )
-                    except TimeoutError as exc:
-                        raise GptProAskError(
-                            "expired",
-                            "the queue TTL expired while waiting for the "
-                            "in-flight ask on this conversation",
-                        ) from exc
-                    # wait_for on an already-released event returns without
-                    # yielding to the event loop (Python 3.12+ awaits the
-                    # wait() coroutine inline instead of wrapping it in a
-                    # task), which would spin this re-check loop hot and
-                    # starve the loop. Yield each round so ownership changes
-                    # and the queue TTL check stay observable.
-                    await asyncio.sleep(0)
-                self._conversation_owners[ownership_key] = (
-                    _ConversationOwnership(ask_id, asyncio.Event())
+                await self._claim_conversation(
+                    ask_id, conversation_id, queue_deadline
                 )
 
             self._jobs[ask_id] = replace(
@@ -274,6 +428,9 @@ class AskJobService:
             def capture_detached() -> None:
                 self._on_detached(ask_id)
 
+            def capture_evidence(evidence: AskEvidence) -> None:
+                self._on_evidence(ask_id, evidence)
+
             provider_question = question
             provider_attachment_paths = attachment_paths
             if len(question.encode("utf-8")) > QUESTION_SPILL_THRESHOLD_BYTES:
@@ -301,6 +458,7 @@ class AskJobService:
                     on_conversation_id=capture_conversation_id,
                     on_marker=capture_marker,
                     on_detached=capture_detached,
+                    on_evidence=capture_evidence,
                 ),
                 "conversation_id": conversation_id,
                 "timeout_seconds": remaining,
@@ -316,6 +474,11 @@ class AskJobService:
                 job,
                 state="succeeded",
                 answer=outcome.text,
+                evidence=replace(
+                    job.evidence, submission="confirmed",
+                    generation_observed=True, answer_seen=True,
+                    raw_extracted=True,
+                ),
                 nonce_marker=(
                     job.nonce_marker
                     if job.nonce_marker is not None
@@ -358,11 +521,29 @@ class AskJobService:
             )
             raise
         except GptProAskError as exc:
+            if exc.evidence is not None:
+                self._on_evidence(ask_id, exc.evidence)
+            job = self._jobs[ask_id]
+            evidence = job.evidence
+            stage = evidence.failure_stage or {
+                "echo_timeout": "echo", "no_raw_turn": "answer",
+                "submit_failed": "submission", "navigation_failed": "navigation",
+                "expired": "queue",
+            }.get(exc.failure, "provider")
+            submission = evidence.submission
+            if submission == "not_attempted" and exc.failure in {
+                "echo_timeout", "no_raw_turn",
+            }:
+                submission = "uncertain"
             self._jobs[ask_id] = replace(
-                self._jobs[ask_id],
+                job,
                 state="failed",
                 failure=exc.failure,
                 error_message=str(exc),
+                evidence=replace(
+                    evidence, failure_stage=stage, submission=submission,
+                    conversation_id=job.thread_ref,
+                ),
             )
             logger.warning(
                 "gptpro ask %.8s failed (failure=%s thread=%s): %s",
@@ -382,20 +563,7 @@ class AskJobService:
                 "gptpro ask %.8s failed unexpectedly", ask_id
             )
         finally:
-            owned_conversation_id = self._jobs[ask_id].thread_ref
-            ownership_key = (
-                _ownership_key(owned_conversation_id)
-                if owned_conversation_id is not None
-                else None
-            )
-            ownership = (
-                self._conversation_owners.get(ownership_key)
-                if ownership_key is not None
-                else None
-            )
-            if ownership is not None and ownership.owner_ask_id == ask_id:
-                del self._conversation_owners[ownership_key]
-                ownership.released.set()
+            self._release_conversation(ask_id)
             if spill_path is not None:
                 spill_path.unlink(missing_ok=True)
             self._jobs[ask_id] = replace(
@@ -403,6 +571,54 @@ class AskJobService:
                 status_message=None,
                 finished_at=self._clock(),
             )
+
+    def _on_evidence(self, ask_id: str, evidence: AskEvidence) -> None:
+        job = self._jobs[ask_id]
+        if job.state not in ACTIVE_JOB_STATES:
+            return
+        if job.thread_ref is None and evidence.conversation_id is not None:
+            self._on_conversation_id(ask_id, evidence.conversation_id)
+            job = self._jobs[ask_id]
+        previous = job.evidence
+        submission_order = ("not_attempted", "uncertain", "confirmed")
+        merged = replace(
+            evidence,
+            submission=max(
+                (previous.submission, evidence.submission),
+                key=submission_order.index,
+            ),
+            conversation_id=(
+                evidence.conversation_id or job.thread_ref
+                or previous.conversation_id
+            ),
+            upload_receipts=max(
+                (value for value in (
+                    previous.upload_receipts, evidence.upload_receipts
+                ) if value is not None),
+                default=None,
+            ),
+            ready_attachments=max(
+                (value for value in (
+                    previous.ready_attachments, evidence.ready_attachments
+                ) if value is not None),
+                default=None,
+            ),
+            generation_observed=(
+                previous.generation_observed or evidence.generation_observed
+            ),
+            answer_seen=previous.answer_seen or evidence.answer_seen,
+            raw_extracted=previous.raw_extracted or evidence.raw_extracted,
+            failure_stage=evidence.failure_stage or previous.failure_stage,
+            recovery=(
+                evidence.recovery if evidence.recovery != "not_attempted"
+                else previous.recovery
+            ),
+            recovery_failure=(
+                evidence.recovery_failure or previous.recovery_failure
+            ),
+            recovery_detail=evidence.recovery_detail or previous.recovery_detail,
+        )
+        self._jobs[ask_id] = replace(job, evidence=merged)
 
     def _on_status(self, ask_id: str, message: str) -> None:
         job = self._jobs[ask_id]
@@ -435,7 +651,10 @@ class AskJobService:
         job = self._jobs[ask_id]
         if job.thread_ref is not None:
             return
-        self._jobs[ask_id] = replace(job, thread_ref=conversation_id)
+        self._jobs[ask_id] = replace(
+            job, thread_ref=conversation_id,
+            evidence=replace(job.evidence, conversation_id=conversation_id),
+        )
         self._conversation_owners.setdefault(
             _ownership_key(conversation_id),
             _ConversationOwnership(ask_id, asyncio.Event()),

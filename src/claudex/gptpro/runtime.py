@@ -9,12 +9,12 @@ import os
 import random
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from claudex import locking, paths
 from claudex.gptpro import ask, browser, session
-from claudex.gptpro.ask import AskCallbacks
+from claudex.gptpro.ask import AskCallbacks, AskEvidence
 from claudex.gptpro.conversation import (
     CHATGPT_URL,
     TRUSTED_ORIGIN,
@@ -186,7 +186,15 @@ class DetachPoller:
                 self._sweep_stale()
                 if not self._registrations:
                     break
-                await self._ensure_page()
+                remaining = min(
+                    entry.deadline - _monotonic()
+                    for entry in self._registrations.values()
+                )
+                try:
+                    await asyncio.wait_for(self._ensure_page(), max(0.001, remaining))
+                except TimeoutError:
+                    self._sweep_stale()
+                    continue
                 saw_rate_limit = False
                 saw_success = False
                 for registration_id, registration in tuple(
@@ -196,9 +204,13 @@ class DetachPoller:
                         self._registrations.pop(registration_id, None)
                         continue
                     try:
-                        status = await self._poll_registration(
-                            registration_id, registration
+                        status = await asyncio.wait_for(
+                            self._poll_registration(registration_id, registration),
+                            max(0.001, registration.deadline - _monotonic()),
                         )
+                    except TimeoutError:
+                        self._complete_if_stale(registration_id, registration)
+                        continue
                     except Exception as exc:
                         if _is_transient_detach_fetch_error(exc):
                             break
@@ -498,10 +510,12 @@ class AskRuntime:
 
         captured_conversation_id = conversation_id
         captured_marker: str | None = None
+        captured_evidence: AskEvidence | None = None
         execution_callbacks = callbacks
         if callbacks is not None:
             original_on_conversation_id = callbacks.on_conversation_id
             original_on_marker = callbacks.on_marker
+            original_on_evidence = callbacks.on_evidence
 
             def capture_conversation_id(value: str) -> None:
                 nonlocal captured_conversation_id
@@ -515,11 +529,18 @@ class AskRuntime:
                 if original_on_marker is not None:
                     original_on_marker(value)
 
+            def capture_evidence(evidence: AskEvidence) -> None:
+                nonlocal captured_evidence
+                captured_evidence = evidence
+                if original_on_evidence is not None:
+                    original_on_evidence(evidence)
+
             execution_callbacks = AskCallbacks(
                 on_status=callbacks.on_status,
                 on_conversation_id=capture_conversation_id,
                 on_marker=capture_marker,
                 on_detached=callbacks.on_detached,
+                on_evidence=capture_evidence,
             )
 
         try:
@@ -550,13 +571,32 @@ class AskRuntime:
                 )
             except ask.GptProAskError as exc:
                 recovery_seconds = raw_turn_recovery_seconds()
-                if (
-                    callbacks is None
-                    or exc.failure != "no_raw_turn"
-                    or captured_conversation_id is None
-                    or captured_marker is None
-                    or recovery_seconds <= 0
-                ):
+                evidence = exc.evidence or captured_evidence
+                may_have_submitted = (
+                    evidence is not None and evidence.submission != "not_attempted"
+                )
+                if exc.failure in {"no_raw_turn", "echo_timeout"}:
+                    may_have_submitted = True
+                recoverable = (
+                    exc.failure in {
+                        "no_raw_turn", "echo_timeout", "timeout",
+                        "navigation_failed", "submit_failed", "error",
+                    }
+                    and may_have_submitted
+                    and captured_conversation_id is not None
+                    and captured_marker is not None
+                )
+                if not recoverable or recovery_seconds <= 0:
+                    if recoverable and recovery_seconds <= 0:
+                        detail = "answer recovery is disabled by the configured window"
+                        exc.evidence = replace(
+                            evidence or AskEvidence(conversation_id=captured_conversation_id),
+                            recovery="unavailable", recovery_failure="disabled",
+                            recovery_detail=detail,
+                        )
+                        exc.args = (f"{exc}; recovery disabled: {detail}",)
+                        if callbacks is not None and callbacks.on_evidence is not None:
+                            callbacks.on_evidence(exc.evidence)
                     raise
                 try:
                     future = self._poller.register(
@@ -564,37 +604,108 @@ class AskRuntime:
                         captured_marker,
                         _monotonic() + recovery_seconds,
                     )
-                except Exception:
-                    raise exc from None
-                if callbacks.on_detached is not None:
-                    try:
-                        callbacks.on_detached()
-                    except Exception:
-                        pass
-                if callbacks.on_status is not None:
-                    try:
-                        callbacks.on_status(
-                            "detached; polling for the answer"
-                        )
-                    except Exception:
-                        pass
+                except Exception as recovery_exc:
+                    detail = str(recovery_exc) or type(recovery_exc).__name__
+                    exc.evidence = replace(
+                        evidence or AskEvidence(conversation_id=captured_conversation_id),
+                        recovery="unavailable", recovery_failure="error",
+                        recovery_detail=detail,
+                    )
+                    exc.args = (f"{exc}; recovery unavailable: {detail}",)
+                    if callbacks is not None and callbacks.on_evidence is not None:
+                        callbacks.on_evidence(exc.evidence)
+                    raise exc from recovery_exc
+                if callbacks is not None:
+                    if evidence is not None and callbacks.on_evidence is not None:
+                        callbacks.on_evidence(replace(evidence, recovery="polling"))
+                    if callbacks.on_detached is not None:
+                        try:
+                            callbacks.on_detached()
+                        except Exception:
+                            pass
+                    if callbacks.on_status is not None:
+                        try:
+                            callbacks.on_status("detached; polling for the answer")
+                        except Exception:
+                            pass
                 release_admission()
-                # Waiting here retains the job service's conversation ownership,
-                # so a follow-up on the same conversation stays queued instead
-                # of being lost during the server-side generation.
+                # Retain job ownership until the nonce-correlated answer settles.
                 try:
-                    return await future
+                    outcome = await asyncio.wait_for(future, recovery_seconds)
+                    if (
+                        evidence is not None
+                        and callbacks is not None
+                        and callbacks.on_evidence is not None
+                    ):
+                        callbacks.on_evidence(replace(
+                            evidence, recovery="recovered", submission="confirmed",
+                            generation_observed=True, answer_seen=True,
+                            raw_extracted=True,
+                        ))
+                    return outcome
                 except asyncio.CancelledError:
                     future.cancel()
                     raise
                 except Exception as recovery_exc:
-                    exc.add_note(
-                        "raw turn recovery polling failed with "
-                        f"{type(recovery_exc).__name__}: {recovery_exc}"
+                    future.cancel()
+                    recovery_failure = (
+                        recovery_exc.failure
+                        if isinstance(recovery_exc, ask.GptProAskError)
+                        else "timeout" if isinstance(recovery_exc, TimeoutError)
+                        else "error"
                     )
+                    detail = str(recovery_exc) or (
+                        "the bounded answer recovery window expired"
+                        if isinstance(recovery_exc, TimeoutError)
+                        else type(recovery_exc).__name__
+                    )
+                    exc.evidence = replace(
+                        evidence or AskEvidence(conversation_id=captured_conversation_id),
+                        recovery=(
+                            "unavailable" if recovery_failure in {
+                                "session_expired", "challenge"
+                            } else "exhausted"
+                        ),
+                        recovery_failure=recovery_failure,
+                        recovery_detail=detail,
+                    )
+                    exc.args = (
+                        f"{exc}; recovery {recovery_failure}: {detail}",
+                    )
+                    if callbacks is not None and callbacks.on_evidence is not None:
+                        callbacks.on_evidence(exc.evidence)
                     raise exc from recovery_exc
         finally:
             release_admission()
+
+    async def recover(
+        self, conversation_id: str, marker: str,
+    ) -> AskOutcome:
+        """Read one existing nonce-correlated turn without submitting a prompt."""
+        recovery_seconds = raw_turn_recovery_seconds()
+        if recovery_seconds <= 0:
+            detail = (
+                "answer recovery is disabled; configure a positive "
+                "GPTPRO_RAW_TURN_RECOVERY_SECONDS"
+            )
+            failure = GptProAskError("error", detail)
+            failure.evidence = AskEvidence(
+                conversation_id=conversation_id, recovery="unavailable",
+                recovery_failure="disabled", recovery_detail=detail,
+            )
+            raise failure
+        future = self._poller.register(
+            conversation_id, marker, _monotonic() + recovery_seconds,
+        )
+        try:
+            return await asyncio.wait_for(future, recovery_seconds)
+        except TimeoutError as exc:
+            raise GptProAskError(
+                "timeout", "the bounded answer recovery window expired"
+            ) from exc
+        finally:
+            if not future.done():
+                future.cancel()
 
     async def aclose(self) -> None:
         """Close the persistent context, stop Playwright, and release its lock."""
@@ -652,6 +763,7 @@ class AskRuntime:
             callbacks.on_conversation_id if callbacks is not None else None
         )
         on_marker = callbacks.on_marker if callbacks is not None else None
+        on_evidence = callbacks.on_evidence if callbacks is not None else None
         on_detached = callbacks.on_detached if callbacks is not None else None
         page: Any | None = None
         primary_failure: BaseException | None = None
@@ -663,6 +775,7 @@ class AskRuntime:
                     on_status=on_status,
                     on_conversation_id=on_conversation_id,
                     on_marker=on_marker,
+                    on_evidence=on_evidence,
                 ),
             }
             if conversation_id is not None:
