@@ -9,8 +9,13 @@ ProseMirror contenteditable composer with aria-labeled buttons, and
 
 from __future__ import annotations
 
+import asyncio
 import re
 from collections.abc import Iterator
+from pathlib import Path
+
+import pytest
+from playwright.async_api import async_playwright
 
 from claudex.gptpro import selectors
 
@@ -224,6 +229,71 @@ def test_send_button_selector_targets_the_composer_form_submit_button() -> None:
     )
 
     assert _select(dom, selectors.SEND_BUTTON_SELECTOR) == [submit]
+
+
+@pytest.mark.parametrize(
+    ("disabled", "covered", "expected_ready"),
+    [(False, False, True), (True, False, False), (False, True, False)],
+)
+def test_send_readiness_scrolls_only_enabled_active_button_before_hit_test(
+    disabled: bool, covered: bool, expected_ready: bool,
+) -> None:
+    async def run() -> tuple[bool, int, float, float]:
+        async with async_playwright() as playwright:
+            executable = Path(playwright.chromium.executable_path)
+            if not executable.is_file():
+                candidates = sorted((Path.home() / "Library/Caches/ms-playwright").glob(
+                    "chromium-*/chrome-mac*/Google Chrome for Testing.app/"
+                    "Contents/MacOS/Google Chrome for Testing"
+                ))
+                if not candidates:
+                    pytest.skip("No local Chromium executable available")
+                executable = candidates[-1]
+            browser = await playwright.chromium.launch(
+                executable_path=str(executable), headless=True,
+            )
+            try:
+                page = await browser.new_page(viewport={"width": 400, "height": 300})
+                await page.set_content(
+                    '<style>body {margin:0}.spacer {height:900px}'
+                    'button {width:40px;height:40px}</style>'
+                    '<div class="spacer"></div>'
+                    '<form data-chatgpt-composer><button type="submit" '
+                    f'aria-label="Send" {"disabled" if disabled else ""}>'
+                    '<span>Send</span></button></form>'
+                    + ('<div style="position:fixed;inset:0;z-index:1000;'
+                       'background:#ccc"></div>' if covered else '')
+                )
+                await page.evaluate("""() => {
+                  window.sendClickCount = 0;
+                  document.querySelector('button[aria-label="Send"]').addEventListener(
+                    'click', () => { window.sendClickCount += 1; }
+                  );
+                }""")
+                before = await page.evaluate(
+                    "document.querySelector('button[aria-label=Send]').getBoundingClientRect().top"
+                )
+                ready = await page.evaluate(
+                    selectors.SEND_BUTTON_READY_PROBE_JS,
+                    {"selector": selectors.SEND_BUTTON_SELECTOR},
+                )
+                after = await page.evaluate(
+                    "document.querySelector('button[aria-label=Send]').getBoundingClientRect().top"
+                )
+                clicks = await page.evaluate("window.sendClickCount")
+                return ready, clicks, before, after
+            finally:
+                await browser.close()
+
+    ready, clicks, before, after = asyncio.run(run())
+
+    assert before >= 300
+    assert ready is expected_ready
+    assert clicks == 0
+    if expected_ready:
+        assert 0 <= after < 300
+    if disabled:
+        assert after == before
 
 
 def test_stop_button_selector_targets_the_generating_stop_button() -> None:

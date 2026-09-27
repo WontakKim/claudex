@@ -118,7 +118,7 @@ SEND_BUTTON_READY_PROBE_JS = r"""
     return false;
   }
   const style = getComputedStyle(button);
-  const rect = button.getBoundingClientRect();
+  let rect = button.getBoundingClientRect();
   if (
     style.display === 'none' || style.visibility === 'hidden' ||
     style.pointerEvents === 'none' || Number(style.opacity) === 0 ||
@@ -126,10 +126,18 @@ SEND_BUTTON_READY_PROBE_JS = r"""
   ) {
     return false;
   }
-  const topElement = document.elementFromPoint(
-    rect.left + rect.width / 2,
-    rect.top + rect.height / 2
-  );
+  let centerX = rect.left + rect.width / 2;
+  let centerY = rect.top + rect.height / 2;
+  if (centerX < 0 || centerX >= innerWidth || centerY < 0 || centerY >= innerHeight) {
+    button.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+    rect = button.getBoundingClientRect();
+    centerX = rect.left + rect.width / 2;
+    centerY = rect.top + rect.height / 2;
+  }
+  if (centerX < 0 || centerX >= innerWidth || centerY < 0 || centerY >= innerHeight) {
+    return false;
+  }
+  const topElement = document.elementFromPoint(centerX, centerY);
   return topElement === button || (topElement !== null && button.contains(topElement));
 }
 """

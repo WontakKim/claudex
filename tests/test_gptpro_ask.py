@@ -281,6 +281,8 @@ class _FakePage:
             return False
         if expression == selectors.SEND_BUTTON_READY_PROBE_JS:
             return True
+        if expression == ask.attachments.READ_COMPOSER_ATTACHMENT_STATE_JS:
+            return {"ready": {"notes.txt": 1}, "processing": {}, "failed": {}, "unknown": {}}
         if expression == selectors.USER_ECHO_PROBE_JS:
             if self.echo_never:
                 return None
@@ -685,10 +687,11 @@ def test_attachment_upload_runs_after_composer_and_before_fill(
         *,
         timeout_seconds: float | None = None,
         on_progress: Callable[[int, int], None] | None = None,
-    ) -> None:
+    ) -> dict[str, tuple[int, int]]:
         assert attached_page is page
         page.call_order.append("attach")
         captured.append((attachment_paths, timeout_seconds))
+        return {"notes.txt": (0, 1)}
 
     monkeypatch.setattr(ask.attachments, "attach_files", attach_files)
 
@@ -705,6 +708,140 @@ def test_attachment_upload_runs_after_composer_and_before_fill(
     assert captured == [
         (("notes.txt",), ask.attachments.ATTACH_SETTLE_TIMEOUT_SECONDS)
     ]
+
+
+def test_renamed_attachment_is_checked_again_before_send(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_clock(monkeypatch)
+
+    class RenamedAttachmentPage(_FakePage):
+        attachment_checks = 0
+
+        async def evaluate(self, expression: str, argument: Any = None) -> Any:
+            if expression == ask.attachments.READ_COMPOSER_ATTACHMENT_STATE_JS:
+                self.attachment_checks += 1
+                assert argument == ["effect(20260927-120843).ts"]
+                return {
+                    "ready": {"effect(20260927-120843).ts": 1}
+                    if self.attachment_checks == 1 else {},
+                    "processing": {}, "failed": {}, "unknown": {},
+                }
+            return await super().evaluate(expression, argument)
+
+    page = RenamedAttachmentPage()
+
+    async def attach_files(*_args: Any, **_kwargs: Any) -> dict[str, tuple[int, int]]:
+        return {"effect(20260927-120843).ts": (0, 1)}
+
+    monkeypatch.setattr(ask.attachments, "attach_files", attach_files)
+
+    with pytest.raises(ask.GptProAskError, match="effect\\(20260927-120843\\).ts") as raised:
+        asyncio.run(ask.execute_ask_outcome(
+            page, "Review this code", attachment_paths=["effect.ts"],
+        ))
+
+    assert page.attachment_checks == 2
+    assert page.click_count == 0
+    assert raised.value.evidence.submission == "not_attempted"
+    assert raised.value.evidence.ready_attachments == 0
+
+
+def test_disappearing_attachment_blocks_enabled_send_button(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_clock(monkeypatch)
+
+    class ReRenderedPage(_FakePage):
+        async def evaluate(self, expression: str, argument: Any = None) -> Any:
+            if expression == ask.attachments.READ_COMPOSER_ATTACHMENT_STATE_JS:
+                return {
+                    "ready": {} if self.filled_prompt else {"notes.txt": 1},
+                    "processing": {}, "failed": {}, "unknown": {},
+                }
+            return await super().evaluate(expression, argument)
+
+    page = ReRenderedPage()
+
+    async def attach_files(*_args: Any, **_kwargs: Any) -> dict[str, tuple[int, int]]:
+        return {"notes.txt": (0, 1)}
+
+    monkeypatch.setattr(ask.attachments, "attach_files", attach_files)
+
+    with pytest.raises(ask.GptProAskError, match="notes.txt") as raised:
+        asyncio.run(ask.execute_ask_outcome(
+            page, "Review this code", attachment_paths=["notes.txt"],
+        ))
+
+    assert page.click_count == 0
+    assert raised.value.evidence is not None
+    assert raised.value.evidence.submission == "not_attempted"
+    assert raised.value.evidence.ready_attachments == 0
+
+
+def test_attachment_disappearing_after_send_ready_still_blocks_click(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_clock(monkeypatch)
+
+    class LateRerenderPage(_FakePage):
+        attachment_checks = 0
+
+        async def evaluate(self, expression: str, argument: Any = None) -> Any:
+            if expression == ask.attachments.READ_COMPOSER_ATTACHMENT_STATE_JS:
+                self.attachment_checks += 1
+                return {
+                    "ready": {"notes.txt": 1} if self.attachment_checks == 1 else {},
+                    "processing": {}, "failed": {}, "unknown": {},
+                }
+            return await super().evaluate(expression, argument)
+
+    page = LateRerenderPage()
+
+    async def attach_files(*_args: Any, **_kwargs: Any) -> dict[str, tuple[int, int]]:
+        return {"notes.txt": (0, 1)}
+
+    monkeypatch.setattr(ask.attachments, "attach_files", attach_files)
+
+    with pytest.raises(ask.GptProAskError, match="notes.txt") as raised:
+        asyncio.run(ask.execute_ask_outcome(
+            page, "Review this code", attachment_paths=["notes.txt"],
+        ))
+
+    assert page.attachment_checks == 2
+    assert page.click_count == 0
+    assert raised.value.evidence is not None
+    assert raised.value.evidence.submission == "not_attempted"
+    assert raised.value.evidence.ready_attachments == 0
+
+
+@pytest.mark.parametrize("count", ["1", -1, True])
+def test_invalid_composer_attachment_count_blocks_send(
+    monkeypatch: pytest.MonkeyPatch, count: object,
+) -> None:
+    _install_clock(monkeypatch)
+
+    class InvalidAttachmentPage(_FakePage):
+        async def evaluate(self, expression: str, argument: Any = None) -> Any:
+            if expression == ask.attachments.READ_COMPOSER_ATTACHMENT_STATE_JS:
+                return {"ready": {"notes.txt": count}}
+            return await super().evaluate(expression, argument)
+
+    page = InvalidAttachmentPage()
+
+    async def attach_files(*_args: Any, **_kwargs: Any) -> dict[str, tuple[int, int]]:
+        return {"notes.txt": (0, 1)}
+
+    monkeypatch.setattr(ask.attachments, "attach_files", attach_files)
+
+    with pytest.raises(ask.GptProAskError, match="invalid state") as raised:
+        asyncio.run(ask.execute_ask_outcome(
+            page, "Review this code", attachment_paths=["notes.txt"],
+        ))
+
+    assert raised.value.failure == "submit_failed"
+    assert raised.value.evidence.submission == "not_attempted"
+    assert page.click_count == 0
 
 
 @pytest.mark.parametrize("attachment_paths", [None, []])
@@ -753,6 +890,33 @@ def test_attachment_failure_is_classified_with_attachment_context(
     assert "attachment upload failed" in str(raised.value)
     assert "invalid UTF-8" in str(raised.value)
     assert "fill" not in page.call_order
+
+
+def test_existing_thread_attachment_error_retains_conversation_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_clock(monkeypatch)
+    page = _FakePage()
+
+    async def fail_attach(*_args: Any, **_kwargs: Any) -> None:
+        raise ask.attachments.AttachmentSettleTimeoutError(
+            "attachment not ready", completed_file_create_responses=1,
+            ready_attachments=0,
+        )
+
+    monkeypatch.setattr(ask.attachments, "attach_files", fail_attach)
+
+    with pytest.raises(ask.GptProAskError) as raised:
+        asyncio.run(ask.execute_ask_outcome(
+            page, "Review this code", conversation_id=_CONVERSATION_ID,
+            attachment_paths=["notes.txt"],
+        ))
+
+    assert raised.value.evidence is not None
+    assert raised.value.evidence.conversation_id == _CONVERSATION_ID
+    assert raised.value.evidence.submission == "not_attempted"
+    assert "conversation not established" not in str(raised.value)
+    assert page.click_count == 0
 
 
 def test_missing_echo_with_retained_composer_does_not_click_again(

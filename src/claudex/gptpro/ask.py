@@ -299,6 +299,7 @@ class _AskExecution:
         self._notify_marker(self.marker)
         self.prompt = f"{self.marker}\n\n{question}\n\n{self.marker}"
         self.attachment_paths = tuple(attachment_paths or ())
+        self.attachment_ready_counts: dict[str, tuple[int, int]] = {}
         self.should_detach = should_detach
         self.on_detach = on_detach
         self.network = _NetworkState(conversation_id=conversation_id)
@@ -707,7 +708,7 @@ class _AskExecution:
             attachments.ATTACH_SETTLE_TIMEOUT_SECONDS, self._remaining()
         )
         try:
-            await attachments.attach_files(
+            ready_counts = await attachments.attach_files(
                 self.page,
                 self.attachment_paths,
                 timeout_seconds=timeout_seconds,
@@ -715,6 +716,14 @@ class _AskExecution:
                     upload_receipts=receipts, ready_attachments=ready,
                 ),
             )
+            if not isinstance(ready_counts, dict) or not ready_counts or not all(
+                isinstance(name, str) and isinstance(counts, tuple)
+                and len(counts) == 2 and all(isinstance(n, int) for n in counts)
+                and counts[0] >= 0 and counts[1] > 0
+                for name, counts in ready_counts.items()
+            ):
+                raise RuntimeError("Attachment readiness counts were not returned")
+            self.attachment_ready_counts = ready_counts
             self._record_evidence(ready_attachments=len(self.attachment_paths))
         except asyncio.CancelledError:
             raise
@@ -829,8 +838,41 @@ class _AskExecution:
                 "submit_failed", "a visible modal still blocks the send button"
             )
 
+    async def _missing_ready_attachments(self) -> list[str]:
+        if not self.attachment_ready_counts:
+            return []
+        try:
+            state = await self._await_page_operation(
+                self.page.evaluate(
+                    attachments.READ_COMPOSER_ATTACHMENT_STATE_JS,
+                    list(self.attachment_ready_counts),
+                )
+            )
+        except _DeadlineExpired:
+            raise
+        except Exception as exc:
+            raise GptProAskError(
+                "submit_failed", "could not inspect attachments in the active composer"
+            ) from exc
+        if not attachments._is_valid_composer_attachment_state(state):
+            raise GptProAskError(
+                "submit_failed", "active composer attachment probe returned invalid state"
+            )
+        missing = [
+            name for name, (prior, requested) in self.attachment_ready_counts.items()
+            if state["ready"].get(name, 0) < prior + requested
+        ]
+        self._record_evidence(
+            ready_attachments=sum(
+                min(requested, max(0, state["ready"].get(name, 0) - prior))
+                for name, (prior, requested) in self.attachment_ready_counts.items()
+            )
+        )
+        return missing
+
     async def _wait_for_send_ready(self) -> None:
         end = min(self.deadline, _monotonic() + SEND_READY_TIMEOUT_SECONDS)
+        missing_attachments: list[str] = []
         while _monotonic() < end:
             await self._process_network_actions()
             try:
@@ -846,10 +888,16 @@ class _AskExecution:
                 raise GptProAskError(
                     "submit_failed", "could not inspect the ChatGPT send button"
                 ) from exc
-            if ready is True:
+            missing_attachments = await self._missing_ready_attachments()
+            if ready is True and not missing_attachments:
                 return
             await self._pause(min(POLL_INTERVAL_SECONDS, end - _monotonic()))
         self._ensure_deadline()
+        if missing_attachments:
+            raise GptProAskError(
+                "submit_failed", "attachments no longer ready in the active "
+                "composer: " + ", ".join(repr(name) for name in missing_attachments)
+            )
         raise GptProAskError(
             "submit_failed", "the ChatGPT send button did not become ready"
         )
@@ -858,6 +906,12 @@ class _AskExecution:
         await self._dismiss_modal()
         await self._wait_for_send_ready()
         await self._process_network_actions()
+        missing_attachments = await self._missing_ready_attachments()
+        if missing_attachments:
+            raise GptProAskError(
+                "submit_failed", "attachments no longer ready in the active "
+                "composer: " + ", ".join(repr(name) for name in missing_attachments)
+            )
         try:
             self.has_submitted = True
             self._record_evidence(submission="uncertain")

@@ -137,7 +137,13 @@ conversation only when callers explicitly pass the same UUID.
 
 `attachments` contains file paths on the gateway host. Files must be UTF-8
 plain text without NUL bytes. An ask accepts at most 10 files and 1,200,000
-bytes in total.
+bytes in total. A completed file-create response does not confirm composer
+readiness: ChatGPT may rename a file during indexing, so a renamed composer
+chip counts only when its displayed name comes from the trusted processing
+stream for that file's create-receipt ID and processing completes. Any missing,
+failed, or unsettled attachment blocks submission, including immediately before
+Send; failure details show requested and resolved names, available file IDs, and
+observed composer states.
 
 Questions larger than 35,000 UTF-8 bytes are automatically moved into a
 temporary text attachment, so callers should send the complete question rather
