@@ -254,6 +254,7 @@ class AskJobService:
                 )
             self._jobs[ask_id] = replace(
                 job, state="succeeded", answer=outcome.text,
+                files=outcome.files, files_complete=outcome.files_complete,
                 evidence=replace(
                     job.evidence, recovery="recovered", submission="confirmed",
                     raw_extracted=True, answer_seen=True, generation_observed=True,
@@ -474,6 +475,8 @@ class AskJobService:
                 job,
                 state="succeeded",
                 answer=outcome.text,
+                files=outcome.files,
+                files_complete=outcome.files_complete,
                 evidence=replace(
                     job.evidence, submission="confirmed",
                     generation_observed=True, answer_seen=True,

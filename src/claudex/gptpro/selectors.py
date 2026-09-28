@@ -283,3 +283,96 @@ async (args) => {
   }
 }
 """
+
+# Fetches one response body as base64 with at most args.maxBytes bytes read,
+# whether or not the server declares a Content-Length. Redirects are refused
+# so credentials and signed URLs never follow a response to another location.
+FILE_DOWNLOAD_PROBE_JS = r"""
+async (args) => {
+  const failure = (fetchError, timedOut) => ({
+    status: 0,
+    headers: {},
+    bodyBase64: null,
+    byteLength: 0,
+    tooLarge: false,
+    redirected: false,
+    url: '',
+    fetchError,
+    timedOut,
+  });
+  if (location.origin !== args.origin) {
+    return failure(`Untrusted page origin ${location.origin}`, false);
+  }
+  let timedOut = false;
+  const controller = new AbortController();
+  const timer = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, args.timeoutMs);
+  try {
+    const response = await fetch(args.url, {
+      method: 'GET',
+      headers: args.headers,
+      credentials: 'include',
+      redirect: 'error',
+      signal: controller.signal,
+    });
+    const result = {
+      status: response.status,
+      headers: Object.fromEntries(response.headers.entries()),
+      bodyBase64: null,
+      byteLength: 0,
+      tooLarge: false,
+      redirected: response.redirected,
+      url: response.url,
+      fetchError: null,
+      timedOut: false,
+    };
+    const declaredLength = Number(response.headers.get('content-length'));
+    if (Number.isFinite(declaredLength) && declaredLength > args.maxBytes) {
+      result.tooLarge = true;
+      controller.abort();
+      return result;
+    }
+    const chunks = [];
+    let total = 0;
+    if (response.body) {
+      const reader = response.body.getReader();
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        total += value.byteLength;
+        if (total > args.maxBytes) {
+          result.tooLarge = true;
+          result.byteLength = total;
+          controller.abort();
+          return result;
+        }
+        chunks.push(value);
+      }
+    }
+    const bytes = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of chunks) {
+      bytes.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    let binary = '';
+    for (let index = 0; index < bytes.length; index += 0x8000) {
+      binary += String.fromCharCode.apply(null, bytes.subarray(index, index + 0x8000));
+    }
+    result.bodyBase64 = btoa(binary);
+    result.byteLength = total;
+    return result;
+  } catch (error) {
+    const name = error && error.name ? String(error.name) : 'Error';
+    const message = error && error.message ? String(error.message) : String(error);
+    return failure(
+      timedOut ? `Timeout: request exceeded ${args.timeoutMs}ms` : `${name}: ${message}`,
+      timedOut,
+    );
+  } finally {
+    clearTimeout(timer);
+  }
+}
+"""

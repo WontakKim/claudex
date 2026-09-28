@@ -7,12 +7,13 @@ import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import SplitResult, urlsplit
+from urllib.parse import SplitResult, unquote, urlsplit
 
 TRUSTED_ORIGIN = "https://chatgpt.com"
 CHATGPT_URL = f"{TRUSTED_ORIGIN}/"
 TRANSPORT_NONCE_LABEL = "gptpro-transport-nonce"
 COMPLETION_REPORT_PATH_FRAGMENT = "/backend-api/lat/"
+_SANDBOX_SCHEME = "sandbox:"
 
 _UUID_SOURCE = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
 _UUID_EXACT_PATTERN = re.compile(rf"{_UUID_SOURCE}", re.IGNORECASE)
@@ -24,14 +25,43 @@ _CONVERSATION_STREAM_PATHS = {
     "/backend-api/conversation",
     "/backend-api/f/conversation",
 }
+# A fenced code block runs from an opening ``` or ~~~ line to a line starting
+# with the same fence, or to the end of the text when it is never closed.
+_FENCED_CODE_PATTERN = re.compile(
+    r"^ {0,3}(`{3,}|~{3,}).*?(?:^ {0,3}\1|\Z)", re.MULTILINE | re.DOTALL
+)
+# What may follow a link destination: an optional title in double quotes,
+# single quotes, or parentheses after whitespace, then the closing ")".
+_LINK_TAIL_PATTERN = re.compile(
+    r"""(?:\s+(?:"[^"]*"|'[^']*'|\([^()]*\)))?\s*\)"""
+)
+# An inline code span is delimited by equal-length backtick runs.
+_INLINE_CODE_PATTERN = re.compile(r"(?<!`)(`+)(?!`).+?(?<!`)\1(?!`)", re.DOTALL)
+
+
+@dataclass(frozen=True)
+class SandboxFileReference:
+    """A ``sandbox:`` file link in one answer message.
+
+    ``sandbox_path`` is the percent-decoded link path exactly as linked; it is
+    not validated here, so callers must validate it before any use.
+    ``message_id`` is the linking message's ``id``, when it has one.
+    """
+
+    message_id: str | None
+    sandbox_path: str
 
 
 @dataclass(frozen=True)
 class AssistantTurn:
-    """Raw markdown and completion state for one assistant turn."""
+    """Raw markdown, completion state, and linked files for one assistant turn.
+
+    ``file_references`` come only from the messages whose text forms ``text``.
+    """
 
     text: str
     finished: bool
+    file_references: tuple[SandboxFileReference, ...] = ()
 
 
 def _parse_url(url: str) -> SplitResult | None:
@@ -143,6 +173,65 @@ def _message_role(message: object) -> str | None:
     return role if isinstance(role, str) else None
 
 
+def _sandbox_link_targets(text: str) -> list[str]:
+    """Return the ``sandbox:`` destinations of inline Markdown links in order.
+
+    Links inside code blocks and code spans are examples, not links. A
+    destination is either ``<...>`` or runs until the ``)`` that closes the
+    link, allowing balanced parentheses inside it as Markdown does. An
+    optional link title may follow; a destination that the link's ``)`` does
+    not close is ignored.
+    """
+    text = _INLINE_CODE_PATTERN.sub(" ", _FENCED_CODE_PATTERN.sub(" ", text))
+    targets: list[str] = []
+    cursor = text.find("](")
+    while cursor != -1:
+        start = cursor + 2
+        end = start
+        if text.startswith("<" + _SANDBOX_SCHEME, start):
+            closing = text.find(">", start)
+            if (
+                closing != -1
+                and "\n" not in text[start:closing]
+                and _LINK_TAIL_PATTERN.match(text, closing + 1)
+            ):
+                targets.append(text[start + 1:closing])
+                end = closing
+        elif text.startswith(_SANDBOX_SCHEME, start):
+            depth = 0
+            while end < len(text) and not text[end].isspace():
+                if text[end] == "(":
+                    depth += 1
+                elif text[end] == ")":
+                    if depth == 0:
+                        break
+                    depth -= 1
+                end += 1
+            if _LINK_TAIL_PATTERN.match(text, end):
+                targets.append(text[start:end])
+        cursor = text.find("](", end)
+    return targets
+
+
+def _file_references(
+    messages: list[Mapping[str, Any]],
+) -> tuple[SandboxFileReference, ...]:
+    """Collect sandbox links from answer messages, first occurrence per path."""
+    references: dict[str, SandboxFileReference] = {}
+    for message in messages:
+        message_id = message.get("id")
+        for target in _sandbox_link_targets(_message_text(message)):
+            sandbox_path = unquote(target.removeprefix(_SANDBOX_SCHEME))
+            references.setdefault(
+                sandbox_path,
+                SandboxFileReference(
+                    message_id=message_id if isinstance(message_id, str) else None,
+                    sandbox_path=sandbox_path,
+                ),
+            )
+    return tuple(references.values())
+
+
 def _is_user_facing_text(message: Mapping[str, Any]) -> bool:
     """Return whether an assistant message is answer text shown to the user.
 
@@ -219,7 +308,11 @@ def extract_assistant_turn(
 
     texts = [text for text in map(_message_text, answer) if text]
     finished = answer[-1].get("end_turn") is True
-    return AssistantTurn(text="\n\n".join(texts), finished=finished)
+    return AssistantTurn(
+        text="\n\n".join(texts),
+        finished=finished,
+        file_references=_file_references(answer),
+    )
 
 
 def build_nonce_marker(nonce: str) -> str:

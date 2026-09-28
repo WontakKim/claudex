@@ -504,3 +504,190 @@ def test_unchannelled_answer_excludes_text_addressed_to_tools() -> None:
     assert conversation.extract_assistant_turn(
         fixture, NONCE_MARKER
     ) == conversation.AssistantTurn(text="Legacy answer.", finished=True)
+
+
+_FINAL_MESSAGE_ID = "11111111-2222-4333-8444-555555555555"
+_SECOND_MESSAGE_ID = "66666666-7777-4888-8999-aaaaaaaaaaaa"
+
+
+def _with_message_id(node: dict[str, Any], message_id: str) -> dict[str, Any]:
+    node["message"]["id"] = message_id
+    return node
+
+
+def _file_references(turn: object) -> list[tuple[object, object]]:
+    references = getattr(turn, "file_references", None)
+    assert references is not None, "AssistantTurn does not expose file references"
+    return [
+        (reference.message_id, reference.sandbox_path)
+        for reference in references
+    ]
+
+
+def test_turn_collects_sandbox_links_from_final_answer_messages() -> None:
+    answer = (
+        "Download [the archive](sandbox:/mnt/data/report-2026-01-01.zip) and "
+        "[notes](sandbox:/mnt/data/project/notes%20draft.md), plus "
+        "[copy](sandbox:/mnt/data/README(2).md). "
+        "Again: [archive](sandbox:/mnt/data/report-2026-01-01.zip). "
+        "External [site](https://example.com/file.zip) is only a link."
+    )
+    fixture = _conversation(
+        _node("user", None, "user", [NONCE_MARKER]),
+        _with_message_id(
+            _node(
+                "commentary",
+                "user",
+                "assistant",
+                ["Draft [tmp](sandbox:/mnt/data/commentary.md)"],
+                channel="commentary",
+            ),
+            "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+        ),
+        _with_message_id(
+            _node(
+                "tool-call",
+                "commentary",
+                "assistant",
+                ["[tool](sandbox:/mnt/data/tool.md)"],
+                recipient="python",
+            ),
+            "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+        ),
+        _with_message_id(
+            _node(
+                "final",
+                "tool-call",
+                "assistant",
+                [answer],
+                channel="final",
+                end_turn=True,
+            ),
+            _FINAL_MESSAGE_ID,
+        ),
+        current_node="final",
+    )
+
+    turn = conversation.extract_assistant_turn(fixture, NONCE_MARKER)
+
+    assert turn is not None
+    assert turn.text == answer
+    assert turn.finished is True
+    assert _file_references(turn) == [
+        (_FINAL_MESSAGE_ID, "/mnt/data/report-2026-01-01.zip"),
+        (_FINAL_MESSAGE_ID, "/mnt/data/project/notes draft.md"),
+        (_FINAL_MESSAGE_ID, "/mnt/data/README(2).md"),
+    ]
+
+
+def test_turn_keeps_message_association_across_answer_messages() -> None:
+    fixture = _conversation(
+        _node("user", None, "user", [NONCE_MARKER]),
+        _with_message_id(
+            _node("first", "user", "assistant", ["[a](sandbox:/mnt/data/a.md)"]),
+            _FINAL_MESSAGE_ID,
+        ),
+        _with_message_id(
+            _node(
+                "second",
+                "first",
+                "assistant",
+                ["[b](<sandbox:/mnt/data/b file.md>) [a](sandbox:/mnt/data/a.md)"],
+                end_turn=True,
+            ),
+            _SECOND_MESSAGE_ID,
+        ),
+        current_node="second",
+    )
+
+    turn = conversation.extract_assistant_turn(fixture, NONCE_MARKER)
+
+    assert _file_references(turn) == [
+        (_FINAL_MESSAGE_ID, "/mnt/data/a.md"),
+        (_SECOND_MESSAGE_ID, "/mnt/data/b file.md"),
+    ]
+
+
+def test_turn_without_sandbox_links_has_no_file_references() -> None:
+    fixture = _conversation(
+        _node("user", None, "user", [NONCE_MARKER]),
+        _node(
+            "answer",
+            "user",
+            "assistant",
+            ["Plain [link](https://chatgpt.com/x) and sandbox:/mnt/data/bare.md"],
+            end_turn=True,
+        ),
+        current_node="answer",
+    )
+
+    turn = conversation.extract_assistant_turn(fixture, NONCE_MARKER)
+
+    assert _file_references(turn) == []
+    assert turn == conversation.AssistantTurn(
+        text="Plain [link](https://chatgpt.com/x) and sandbox:/mnt/data/bare.md",
+        finished=True,
+    )
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        "Write `[x](sandbox:/mnt/data/inline.md)` for a link. "
+        "Result: [real](sandbox:/mnt/data/real.md)",
+        "Use ``[x](sandbox:/mnt/data/double.md)`` then "
+        "[real](sandbox:/mnt/data/real.md)",
+        "Example:\n\n```markdown\n[x](sandbox:/mnt/data/fenced.md)\n```\n\n"
+        "Result: [real](sandbox:/mnt/data/real.md)",
+        "~~~\n[x](sandbox:/mnt/data/tilde.md)\n~~~\n"
+        "[real](sandbox:/mnt/data/real.md)",
+        "[real](sandbox:/mnt/data/real.md)\n\n```\n"
+        "[x](sandbox:/mnt/data/unclosed-fence.md)\n",
+        "Broken [x](sandbox:/mnt/data/missing.md and more text. "
+        "Then [real](sandbox:/mnt/data/real.md)",
+        "Broken [x](sandbox:/mnt/data/missing.md\n"
+        "[real](sandbox:/mnt/data/real.md)",
+    ],
+)
+def test_turn_ignores_code_samples_and_unclosed_links(answer: str) -> None:
+    fixture = _conversation(
+        _node("user", None, "user", [NONCE_MARKER]),
+        _with_message_id(
+            _node("answer", "user", "assistant", [answer], end_turn=True),
+            _FINAL_MESSAGE_ID,
+        ),
+        current_node="answer",
+    )
+
+    turn = conversation.extract_assistant_turn(fixture, NONCE_MARKER)
+
+    assert turn is not None
+    assert turn.text == answer
+    assert _file_references(turn) == [(_FINAL_MESSAGE_ID, "/mnt/data/real.md")]
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        '[download](sandbox:/mnt/data/real.md "Report")',
+        "[download](sandbox:/mnt/data/real.md 'Report')",
+        "[download](sandbox:/mnt/data/real.md (Report))",
+        '[download](<sandbox:/mnt/data/real.md> "Report")',
+        "[download](sandbox:/mnt/data/real.md )",
+        "[download](<sandbox:/mnt/data/real.md> )",
+        '[download](sandbox:/mnt/data/real.md\n  "Report")',
+    ],
+)
+def test_turn_accepts_link_titles_and_trailing_whitespace(answer: str) -> None:
+    fixture = _conversation(
+        _node("user", None, "user", [NONCE_MARKER]),
+        _with_message_id(
+            _node("answer", "user", "assistant", [answer], end_turn=True),
+            _FINAL_MESSAGE_ID,
+        ),
+        current_node="answer",
+    )
+
+    turn = conversation.extract_assistant_turn(fixture, NONCE_MARKER)
+
+    assert _file_references(turn) == [(_FINAL_MESSAGE_ID, "/mnt/data/real.md")]

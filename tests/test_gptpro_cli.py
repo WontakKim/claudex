@@ -566,3 +566,51 @@ def test_gptpro_ask_keyboard_interrupt_closes_runtime_and_returns_130(
     assert context.page.closed
     assert context.closed
     assert profile_lock.released
+
+
+def test_gptpro_ask_reports_generated_files_on_stderr_only(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from types import SimpleNamespace
+
+    _install_cli_ask_runtime(monkeypatch)
+
+    async def execute_ask_outcome(
+        page: _FakeAskPage,
+        question: str,
+        *,
+        callbacks: gptpro_ask.AskCallbacks | None = None,
+        should_detach: object,
+        on_detach: object,
+    ) -> object:
+        del page, question, callbacks, should_detach, on_detach
+        return SimpleNamespace(
+            text="# Final answer",
+            marker="marker",
+            conversation_id=None,
+            files=(
+                SimpleNamespace(
+                    name="report.zip", sandbox_path="/mnt/data/report.zip",
+                    status="saved", path="/home/u/.claudex/out/report.zip",
+                    size_bytes=12, error=None,
+                ),
+                SimpleNamespace(
+                    name="notes.md", sandbox_path="/mnt/data/notes.md",
+                    status="failed", path=None, size_bytes=None,
+                    error="lookup failed with HTTP 404",
+                ),
+            ),
+            files_complete=False,
+        )
+
+    monkeypatch.setattr(gptpro_ask, "execute_ask_outcome", execute_ask_outcome)
+
+    assert gptpro_cli._gptpro_main(["ask", "explain the result"]) == 0
+    captured = capsys.readouterr()
+    assert captured.out == "# Final answer\n"
+    assert captured.err == (
+        "generated file saved: /home/u/.claudex/out/report.zip (12 bytes)\n"
+        "generated file failed: /mnt/data/notes.md: lookup failed with HTTP 404\n"
+        "warning: not every generated file was saved\n"
+    )

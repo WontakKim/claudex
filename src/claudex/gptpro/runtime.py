@@ -13,11 +13,12 @@ from dataclasses import dataclass, replace
 from typing import Any
 
 from claudex import locking, paths
-from claudex.gptpro import ask, browser, session
+from claudex.gptpro import ask, browser, generated_files, session
 from claudex.gptpro.ask import AskCallbacks, AskEvidence
 from claudex.gptpro.conversation import (
     CHATGPT_URL,
     TRUSTED_ORIGIN,
+    AssistantTurn,
     extract_assistant_turn,
 )
 from claudex.gptpro.selectors import PAGE_FETCH_PROBE_JS
@@ -136,6 +137,11 @@ class DetachPoller:
     def __init__(self, get_context: Callable[[], Awaitable[Any]]) -> None:
         self._get_context = get_context
         self._registrations: dict[int, _DetachedRegistration] = {}
+        # One task per finished turn, removed from polling, that resolves the
+        # turn's future after saving its generated files. They share the
+        # resident page, which stays open while any of them runs. A task
+        # removes itself when it ends; aclose settles the ones it cancels.
+        self._deliveries: dict[asyncio.Task[None], _DetachedRegistration] = {}
         self._task: asyncio.Task[None] | None = None
         self._page: Any | None = None
         self._poll_interval_seconds = DETACH_POLL_INTERVAL_SECONDS
@@ -175,6 +181,18 @@ class DetachPoller:
         if task is not None and not task.done():
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
+        deliveries = dict(self._deliveries)
+        self._deliveries.clear()
+        for delivery in deliveries:
+            delivery.cancel()
+        if deliveries:
+            await asyncio.gather(*deliveries, return_exceptions=True)
+        for registration in deliveries.values():
+            if not registration.future.done():
+                registration.future.set_exception(GptProAskError(
+                    "error",
+                    "the detached answer poller closed while saving generated files",
+                ))
         await self._close_page()
         self._fail_all(
             "error", "the detached answer poller closed before completion"
@@ -232,7 +250,8 @@ class DetachPoller:
             failure.__cause__ = exc
             self._complete_all_with_exception(failure)
         finally:
-            await self._close_page()
+            if not self._deliveries:
+                await self._close_page()
             if not self._registrations:
                 self._poll_interval_seconds = DETACH_POLL_INTERVAL_SECONDS
             if self._task is asyncio.current_task():
@@ -310,20 +329,78 @@ class DetachPoller:
         if turn is None or not turn.finished or not turn.text:
             return status
         self._registrations.pop(registration_id, None)
-        if not registration.future.done():
-            registration.future.set_result(
-                AskOutcome(
-                    text=turn.text,
-                    marker=registration.marker,
-                    conversation_id=registration.conversation_id,
-                )
-            )
-            logger.info(
-                "gptpro detached answer recovered (thread=%s chars=%d)",
-                registration.conversation_id,
-                len(turn.text),
-            )
+        if not turn.file_references:
+            self._resolve(registration, turn, (), True)
+            return status
+        # The conversation fetch above just used the resident page.
+        assert self._page is not None
+        delivery = asyncio.create_task(
+            self._deliver(registration, turn, self._page)
+        )
+        self._deliveries[delivery] = registration
         return status
+
+    async def _deliver(
+        self,
+        registration: _DetachedRegistration,
+        turn: AssistantTurn,
+        page: Any,
+    ) -> None:
+        """Save a finished turn's generated files, then resolve its future."""
+        try:
+            files, files_complete = await generated_files.collect_generated_files(
+                page.evaluate, registration.conversation_id, turn.file_references,
+            )
+        except asyncio.CancelledError:
+            if not registration.future.done():
+                registration.future.set_exception(GptProAskError(
+                    "error",
+                    "the detached answer poller closed while saving generated files",
+                ))
+            raise
+        except Exception as exc:
+            if not registration.future.done():
+                failure = GptProAskError(
+                    "error",
+                    "saving generated files failed unexpectedly "
+                    f"({type(exc).__name__})",
+                )
+                failure.__cause__ = exc
+                registration.future.set_exception(failure)
+            return
+        finally:
+            self._deliveries.pop(asyncio.current_task(), None)
+            if (
+                not self._registrations
+                and not self._deliveries
+                and self._task is None
+            ):
+                await self._close_page()
+        self._resolve(registration, turn, files, files_complete)
+
+    @staticmethod
+    def _resolve(
+        registration: _DetachedRegistration,
+        turn: AssistantTurn,
+        files: tuple[generated_files.GeneratedFile, ...],
+        files_complete: bool,
+    ) -> None:
+        if registration.future.done():
+            return
+        registration.future.set_result(
+            AskOutcome(
+                text=turn.text,
+                marker=registration.marker,
+                conversation_id=registration.conversation_id,
+                files=files,
+                files_complete=files_complete,
+            )
+        )
+        logger.info(
+            "gptpro detached answer recovered (thread=%s chars=%d)",
+            registration.conversation_id,
+            len(turn.text),
+        )
 
     async def _fetch_json(
         self,
@@ -630,8 +707,12 @@ class AskRuntime:
                             pass
                 release_admission()
                 # Retain job ownership until the nonce-correlated answer settles.
+                # As in recover(), the extra wait covers saving generated files.
                 try:
-                    outcome = await asyncio.wait_for(future, recovery_seconds)
+                    outcome = await asyncio.wait_for(
+                        future,
+                        recovery_seconds + generated_files.MAX_COLLECTION_SECONDS,
+                    )
                     if (
                         evidence is not None
                         and callbacks is not None
@@ -698,7 +779,11 @@ class AskRuntime:
             conversation_id, marker, _monotonic() + recovery_seconds,
         )
         try:
-            return await asyncio.wait_for(future, recovery_seconds)
+            # The poller expires the registration itself; the extra wait
+            # covers saving generated files of a turn found near the end.
+            return await asyncio.wait_for(
+                future, recovery_seconds + generated_files.MAX_COLLECTION_SECONDS
+            )
         except TimeoutError as exc:
             raise GptProAskError(
                 "timeout", "the bounded answer recovery window expired"

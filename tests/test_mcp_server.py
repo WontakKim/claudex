@@ -1518,3 +1518,80 @@ def test_recovery_validation_never_submits(
         assert result["isError"] is True
         assert error_fragment in result["content"][0]["text"]
         assert runtime.questions == []
+
+
+def test_succeeded_result_without_files_reports_complete_empty_files() -> None:
+    runtime = FakeAskRuntime()
+
+    with _mcp_client(runtime) as client:
+        _payload, headers = _initialize(client)
+        submitted = _json_tool_payload(
+            _call_tool(client, headers, "ask_gpt_pro", {"question": "Question"})
+        )
+        _finish_job(client, runtime, submitted["ask_id"])
+        result = _json_tool_payload(
+            _call_tool(
+                client, headers, "ask_gpt_pro_result",
+                {"ask_id": submitted["ask_id"]},
+            )
+        )
+
+    assert result.get("files") == []
+    assert result.get("files_complete") is True
+    assert result["answer"] == runtime.answer
+
+
+def test_succeeded_result_lists_generated_files_and_incompleteness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from dataclasses import dataclass
+    from types import SimpleNamespace
+
+    @dataclass(frozen=True)
+    class _File:
+        name: str
+        status: str
+        path: str | None
+        error: str | None
+
+    runtime = FakeAskRuntime()
+    snapshot = SimpleNamespace(
+        ask_id="result-files-id", state="succeeded", answer="answer",
+        failure=None, error_message=None, status_message=None,
+        nonce_marker="marker", thread_ref=_CONVERSATION_A,
+        created_at=1.0, finished_at=2.0, evidence=ask.AskEvidence(),
+        source_ask_id=None,
+        files=(
+            _File("report.zip", "saved", "/gateway/outputs/report.zip", None),
+            _File("notes.md", "failed", None, "HTTP 403"),
+        ),
+        files_complete=False,
+    )
+    monkeypatch.setattr(runtime, "job_result", lambda _ask_id: snapshot)
+
+    with _mcp_client(runtime) as client:
+        _payload, headers = _initialize(client)
+        result = _json_tool_payload(
+            _call_tool(
+                client, headers, "ask_gpt_pro_result", {"ask_id": snapshot.ask_id}
+            )
+        )
+
+    assert result.get("files") == [
+        {"name": "report.zip", "status": "saved",
+         "path": "/gateway/outputs/report.zip", "error": None},
+        {"name": "notes.md", "status": "failed", "path": None,
+         "error": "HTTP 403"},
+    ]
+    assert result.get("files_complete") is False
+    assert result["answer"] == "answer"
+
+
+def test_result_tool_description_explains_gateway_host_file_paths() -> None:
+    from claudex import mcp_tools
+
+    description = mcp_tools.ASK_GPT_PRO_RESULT_DESCRIPTION
+    assert "files" in description
+    assert "gateway host" in description
+    assert "files_complete" in description
+    assert "sandbox" in description

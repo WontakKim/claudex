@@ -1622,3 +1622,29 @@ def test_poller_waits_for_correct_finished_turn_across_other_requests(
         await poller.aclose()
 
     asyncio.run(scenario())
+
+
+def test_recover_waits_for_file_delivery_after_the_recovery_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GPTPRO_RAW_TURN_RECOVERY_SECONDS", "0.05")
+    marker = "[gptpro-transport-nonce:file-delivery]"
+
+    async def scenario() -> None:
+        ask_runtime = runtime.AskRuntime()
+        poller = _RuntimeDetachPollerFake(ask_runtime._get_context)
+        ask_runtime._poller = poller
+        task = asyncio.create_task(ask_runtime.recover(_CONVERSATION_ID, marker))
+        while poller.future is None:
+            await asyncio.sleep(0)
+        # The finished answer was found; its files are still downloading.
+        await asyncio.sleep(0.1)
+        assert not task.done(), "recovery gave up while files were downloading"
+        outcome = ask.AskOutcome(
+            text="recovered", marker=marker, conversation_id=_CONVERSATION_ID
+        )
+        poller.future.set_result(outcome)
+        assert await task == outcome
+        await ask_runtime.aclose()
+
+    asyncio.run(scenario())

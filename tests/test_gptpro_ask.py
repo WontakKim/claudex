@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 from collections.abc import Callable
@@ -1761,3 +1762,110 @@ def test_attachment_receipts_do_not_claim_composer_ready(
     assert raised.value.evidence.ready_attachments == 0
     assert raised.value.evidence.submission == "not_attempted"
     assert page.click_count == 0
+
+
+_GENERATED_MESSAGE_ID = "11111111-2222-4333-8444-555555555555"
+
+
+class _GeneratedFilePage(_FakePage):
+    """Fake page whose final answer links one generated sandbox file."""
+
+    def __init__(self, content: bytes, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.content = content
+        self.file_requests: list[str] = []
+
+    def _conversation(self, raw_text: str) -> dict[str, object]:
+        conversation = super()._conversation(raw_text)
+        mapping = conversation["mapping"]
+        assert isinstance(mapping, dict)
+        mapping["assistant"]["message"]["id"] = _GENERATED_MESSAGE_ID
+        return conversation
+
+    async def evaluate(self, expression: str, argument: Any = None) -> Any:
+        url = argument.get("url") if isinstance(argument, dict) else None
+        if (
+            url == "https://chatgpt.com/api/auth/session"
+            and expression != selectors.PAGE_FETCH_PROBE_JS
+        ):
+            result = await super().evaluate(selectors.PAGE_FETCH_PROBE_JS, argument)
+            body = json.dumps(result["json"]).encode()
+            return {
+                **result, "bodyBase64": base64.b64encode(body).decode(),
+                "byteLength": len(body), "tooLarge": False, "redirected": False,
+                "url": url,
+            }
+        if isinstance(url, str) and "/interpreter/download" in url:
+            self.file_requests.append(url)
+            body = json.dumps({
+                "status": "success",
+                "download_url": (
+                    "https://chatgpt.com/backend-api/estuary/content?id=f&sig=s"
+                ),
+                "mime_type": "text/markdown",
+            }).encode()
+            return {
+                "status": 200, "headers": {}, "text": body.decode(),
+                "json": json.loads(body), "fetchError": None, "timedOut": False,
+                "bodyBase64": base64.b64encode(body).decode(),
+                "byteLength": len(body), "tooLarge": False, "redirected": False,
+                "url": url,
+            }
+        if isinstance(url, str) and "/backend-api/estuary/content" in url:
+            self.file_requests.append(url)
+            return {
+                "status": 200, "headers": {}, "text": "", "json": None,
+                "fetchError": None, "timedOut": False,
+                "bodyBase64": base64.b64encode(self.content).decode(),
+                "byteLength": len(self.content), "tooLarge": False,
+                "redirected": False, "url": url,
+            }
+        return await super().evaluate(expression, argument)
+
+
+def test_direct_ask_delivers_generated_files_after_final_answer(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    _install_clock(monkeypatch)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    answer = "See [notes](sandbox:/mnt/data/notes.md)."
+    page = _GeneratedFilePage(b"# notes\n", raw_text=answer)
+    statuses: list[str] = []
+
+    outcome = asyncio.run(
+        ask.execute_ask_outcome(
+            page,
+            "Review this code",
+            callbacks=ask.AskCallbacks(on_status=statuses.append),
+        )
+    )
+
+    assert len(page.file_requests) == 2
+    assert outcome.text == answer
+    files = getattr(outcome, "files", None)
+    assert files is not None, "AskOutcome does not expose generated files"
+    (saved,) = files
+    assert saved.status == "saved"
+    assert saved.message_id == _GENERATED_MESSAGE_ID
+    with open(saved.path, "rb") as handle:
+        assert handle.read() == b"# notes\n"
+    assert outcome.files_complete is True
+    assert page.listeners == {"request": [], "requestfinished": [], "response": []}
+    assert "downloading 1 generated file" in statuses
+
+
+def test_direct_ask_without_file_links_makes_no_file_requests(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_clock(monkeypatch)
+    page = _GeneratedFilePage(b"unused", raw_text="plain answer")
+
+    outcome = asyncio.run(ask.execute_ask_outcome(page, "Review this code"))
+
+    assert page.file_requests == []
+    assert outcome == ask.AskOutcome(
+        text="plain answer",
+        marker=outcome.marker,
+        conversation_id=_CONVERSATION_ID,
+    )
+    assert getattr(outcome, "files", None) == ()

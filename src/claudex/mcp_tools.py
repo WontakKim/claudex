@@ -78,7 +78,16 @@ ASK_GPT_PRO_RESULT_DESCRIPTION = (
     "progress. Successful results include nonce_marker and evidence; failed "
     "results retain isError and include both human guidance and structured "
     "failure diagnostics. failure=expired is a pre-execution queue timeout; "
-    "an expired recovery job may still target an existing turn.\n"
+    "an expired recovery job may still target an existing turn. Successful "
+    "results also include files and files_complete. files lists every "
+    "sandbox: file link in the final answer, each with name, sandbox_path, "
+    "message_id, status (saved or failed), path, size_bytes, mime_type, "
+    "sha256, and error. A saved file's contents live at path on the gateway "
+    "host: read the file there. path is not a URL, and the sandbox: link in "
+    "the answer is not downloadable by the caller; a client on another "
+    "machine needs a shared filesystem or other out-of-band access to the "
+    "gateway host. files_complete is false when any linked file was not "
+    "saved; the answer text is still complete.\n"
     + _GPTPRO_FAILURE_ACTIONS_DESCRIPTION
 )
 _ATTACHMENTS_DESCRIPTION = (
@@ -334,6 +343,8 @@ def build_gptpro_server(app: Any) -> Any:
                     "nonce_marker": job.nonce_marker,
                     "evidence": asdict(job.evidence),
                     "source_ask_id": job.source_ask_id,
+                    "files": [asdict(item) for item in job.files],
+                    "files_complete": job.files_complete,
                 },
             )
 

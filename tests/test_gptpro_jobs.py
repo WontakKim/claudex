@@ -1984,3 +1984,64 @@ def test_recovery_rejects_pending_ask_and_contradictory_identifiers() -> None:
         await service.aclose()
 
     asyncio.run(scenario())
+
+
+def _outcome_with_files(
+    text: str, marker: str, conversation_id: str | None
+) -> object:
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        text=text,
+        marker=marker,
+        conversation_id=conversation_id,
+        files=("saved-descriptor", "failed-descriptor"),
+        files_complete=False,
+    )
+
+
+def test_successful_job_retains_generated_files_and_completeness() -> None:
+    thread = "123e4567-e89b-12d3-a456-426614174000"
+
+    async def provider(question: str, **_kwargs: object) -> ask.AskOutcome:
+        del question
+        return _outcome_with_files("answer", "[gptpro-transport-nonce:f]", thread)
+
+    async def scenario() -> None:
+        service = jobs.AskJobService(provider)
+        started = service.start("question")
+        assert getattr(started, "files", None) == ()
+        assert getattr(started, "files_complete", None) is True
+        succeeded = await _wait_for_state(service, started.ask_id, "succeeded")
+        assert succeeded.answer == "answer"
+        assert getattr(succeeded, "files", None) == (
+            "saved-descriptor", "failed-descriptor",
+        )
+        assert getattr(succeeded, "files_complete", None) is False
+        await service.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_explicit_recovery_retains_generated_files_and_completeness() -> None:
+    thread = "123e4567-e89b-12d3-a456-426614174000"
+    marker = "[gptpro-transport-nonce:saved-files]"
+
+    async def provider(question: str, **_kwargs: object) -> ask.AskOutcome:
+        raise AssertionError("recovery must not invoke provider ask")
+
+    async def recover(conversation_id: str, nonce: str) -> ask.AskOutcome:
+        return _outcome_with_files("recovered", nonce, conversation_id)
+
+    async def scenario() -> None:
+        service = jobs.AskJobService(provider, recover=recover)
+        started = service.start_recovery(conversation_id=thread, marker=marker)
+        succeeded = await _wait_for_state(service, started.ask_id, "succeeded")
+        assert succeeded.answer == "recovered"
+        assert getattr(succeeded, "files", None) == (
+            "saved-descriptor", "failed-descriptor",
+        )
+        assert getattr(succeeded, "files_complete", None) is False
+        await service.aclose()
+
+    asyncio.run(scenario())
