@@ -1558,6 +1558,36 @@ def test_runtime_never_polls_pre_submit_timeout_even_with_known_thread(
     asyncio.run(scenario())
 
 
+def test_poller_does_not_resolve_on_finished_commentary_before_final_answer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker = "[gptpro-transport-nonce:current]"
+    commentary = _detached_conversation(marker, "Checking sources.")
+    progress = commentary["mapping"]["assistant"]["message"]  # type: ignore[index]
+    progress["channel"] = "commentary"
+    progress["end_turn"] = False
+    final = _detached_conversation(marker, "actual final answer")
+    final["mapping"]["assistant"]["message"]["channel"] = "final"  # type: ignore[index]
+    page = _PollerFakePage(marker, [(200, commentary), (200, final)])
+    context = _PollerFakeContext(page)
+
+    async def no_delay(seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(runtime, "_sleep", no_delay)
+
+    async def scenario() -> None:
+        poller = runtime.DetachPoller(lambda: asyncio.sleep(0, result=context))
+        future = poller.register(
+            _CONVERSATION_ID, marker, deadline=runtime._monotonic() + 100,
+        )
+        answer = await future
+        assert answer.text == "actual final answer"
+        await poller.aclose()
+
+    asyncio.run(scenario())
+
+
 def test_poller_waits_for_correct_finished_turn_across_other_requests(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

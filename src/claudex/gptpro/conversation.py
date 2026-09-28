@@ -143,6 +143,22 @@ def _message_role(message: object) -> str | None:
     return role if isinstance(role, str) else None
 
 
+def _is_user_facing_text(message: Mapping[str, Any]) -> bool:
+    """Return whether an assistant message is answer text shown to the user.
+
+    Tool calls are addressed to a tool recipient, and reasoning-model progress
+    notes use the ``commentary`` channel; only unaddressed text on no channel
+    or the ``final`` channel is part of the answer.
+    """
+    content = message.get("content")
+    if not isinstance(content, Mapping) or content.get("content_type") != "text":
+        return False
+    return (
+        message.get("recipient") in (None, "all")
+        and message.get("channel") in (None, "final")
+    )
+
+
 def extract_assistant_turn(
     conversation: Mapping[str, Any], nonce_marker: str
 ) -> AssistantTurn | None:
@@ -179,8 +195,8 @@ def extract_assistant_turn(
     if anchor_index is None:
         return None
 
-    texts: list[str] = []
-    last_text_assistant: Mapping[str, Any] | None = None
+    final_channel: list[Mapping[str, Any]] = []
+    unchannelled: list[Mapping[str, Any]] = []
     for node in reversed(chain[:anchor_index]):
         message = node.get("message")
         role = _message_role(message)
@@ -188,21 +204,21 @@ def extract_assistant_turn(
             break
         if role != "assistant" or not isinstance(message, Mapping):
             continue
-        content = message.get("content")
-        if not isinstance(content, Mapping) or content.get("content_type") != "text":
+        if not _is_user_facing_text(message):
             continue
-        last_text_assistant = message
-        text = _message_text(message)
-        if text:
-            texts.append(text)
+        if message.get("channel") == "final":
+            final_channel.append(message)
+        else:
+            unchannelled.append(message)
 
-    if last_text_assistant is None:
+    # An explicit final-channel answer supersedes unchannelled text, which
+    # only forms the answer for models that do not tag channels.
+    answer = final_channel or unchannelled
+    if not answer:
         return AssistantTurn(text="", finished=False)
 
-    finished = (
-        last_text_assistant.get("status") == "finished_successfully"
-        or last_text_assistant.get("end_turn") is True
-    )
+    texts = [text for text in map(_message_text, answer) if text]
+    finished = answer[-1].get("end_turn") is True
     return AssistantTurn(text="\n\n".join(texts), finished=finished)
 
 
