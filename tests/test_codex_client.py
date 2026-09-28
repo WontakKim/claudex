@@ -30,6 +30,10 @@ class _FakeAuthManager:
 
 
 _CATALOG_MODELS: list[dict[str, Any]] = [
+    {"slug": "gpt-6-astra", "context_window": 272000},
+    {"slug": "gpt-6-sol", "context_window": 272000},
+    {"slug": "gpt-6-luna", "context_window": 272000},
+    {"slug": "gpt-6-hidden", "visibility": "hide", "context_window": 64000},
     {
         "slug": "gpt-5.6-sol",
         "context_window": 272000,
@@ -66,7 +70,10 @@ def _catalog_handler(calls: dict[str, int]) -> Any:
     async def handler(request: httpx.Request) -> httpx.Response:
         calls["n"] += 1
         assert str(request.url).startswith(CODEX_MODELS_URL)
-        assert request.url.params["client_version"]
+        expected_version = "0.157.1"
+        assert request.url.params["client_version"] == expected_version
+        assert request.headers["user-agent"].startswith(f"codex-tui/{expected_version} ")
+        assert request.headers["user-agent"].endswith(f"(codex-tui; {expected_version})")
         assert request.headers["accept"] == "application/json"
         return httpx.Response(200, json={"models": _CATALOG_MODELS})
 
@@ -232,6 +239,7 @@ def test_hidden_model_excluded_from_list_but_resolvable_via_context_window() -> 
     models, window = asyncio.run(scenario())
 
     assert "gpt-5.6-hidden" not in models
+    assert "gpt-6-hidden" not in models
     assert window == 64000
 
 
@@ -459,6 +467,8 @@ def test_list_models_fetches_fresh_after_context_window_populated_cache() -> Non
 
     assert window == 272000
     assert "gpt-5.6-sol" in models
+    assert {"gpt-6-astra", "gpt-6-sol", "gpt-6-luna"}.issubset(models)
+    assert "gpt-6-hidden" not in models
     assert "gpt-5.6-hidden" not in models
     assert calls["n"] == 2
 
@@ -486,6 +496,8 @@ def test_stream_responses_sends_fast_tier_routing_hint() -> None:
     assert events == [{"type": "response.created", "response": {"id": "r1"}}]
     (request,) = captured
     assert str(request.url) == CODEX_RESPONSES_URL
+    assert request.headers["user-agent"].startswith("codex-tui/0.157.1 ")
+    assert request.headers["user-agent"].endswith("(codex-tui; 0.157.1)")
     assert request.headers["x-codex-routing-hint"] == (
         "model=gpt-5.6-sol;tier=priority"
     )

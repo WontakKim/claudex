@@ -3956,15 +3956,17 @@ def _select_route_transport(
 
 def test_codex_client_list_models_filters_hidden_models() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
-        assert request.url.params["client_version"] == "0.146.0"
+        assert request.url.params["client_version"] == "0.157.1"
         assert request.headers["Chatgpt-Account-Id"] == "account"
         return httpx.Response(
             200,
             json={
                 "models": [
-                    {"slug": "gpt-5.6-sol", "visibility": "list"},
+                    {"slug": "gpt-6-astra", "visibility": "list"},
+                    {"slug": "gpt-6-sol"},
+                    {"slug": "gpt-6-luna"},
+                    {"slug": "gpt-6-hidden", "visibility": "hide"},
                     {"slug": "codex-auto-review", "visibility": "hide"},
-                    {"slug": "gpt-5.5"},
                 ]
             },
         )
@@ -3973,7 +3975,7 @@ def test_codex_client_list_models_filters_hidden_models() -> None:
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
             return await CodexClient(AvailableCodexAuthManager(), http_client).list_models()
 
-    assert asyncio.run(run()) == ["gpt-5.6-sol", "gpt-5.5"]
+    assert asyncio.run(run()) == ["gpt-6-astra", "gpt-6-sol", "gpt-6-luna"]
 
 
 class TestAdminDashboardApi:

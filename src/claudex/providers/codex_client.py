@@ -24,12 +24,15 @@ CODEX_MODELS_URL = "https://chatgpt.com/backend-api/codex/models"
 # The UI name is "Fast", but the wire keeps the legacy pre-rename value.
 CODEX_FAST_TIER_WIRE_VALUE = "priority"
 
+# The models endpoint 400s without an explicit client_version query parameter.
+_CODEX_CLIENT_VERSION = "0.157.1"
 # Mirrors the header set CLIProxyAPI sends; the backend rejects unknown clients
 # and silently downgrades gpt-5.6-luna requests from clients older than 0.144.0.
-_CODEX_USER_AGENT = "codex-tui/0.144.0 (Mac OS 26.5.1; arm64) iTerm.app/3.6.11 (codex-tui; 0.144.0)"
+_CODEX_USER_AGENT = (
+    f"codex-tui/{_CODEX_CLIENT_VERSION} (Mac OS 26.5.1; arm64) "
+    f"iTerm.app/3.6.11 (codex-tui; {_CODEX_CLIENT_VERSION})"
+)
 _CODEX_ORIGINATOR = "codex-tui"
-# The models endpoint 400s without an explicit client_version query parameter.
-_CODEX_CLIENT_VERSION = "0.146.0"
 
 
 class CodexUpstreamError(UpstreamError):
