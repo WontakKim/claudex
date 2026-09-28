@@ -17,11 +17,12 @@ from typing import Any, Literal
 from urllib.parse import urlsplit
 from uuid import uuid4
 
-from claudex.gptpro import attachments
+from claudex.gptpro import attachments, generated_files
 from claudex.gptpro.browser import COMPOSER_TIMEOUT_MS, NAVIGATION_TIMEOUT_MS
 from claudex.gptpro.conversation import (
     CHATGPT_URL,
     TRUSTED_ORIGIN,
+    AssistantTurn,
     build_conversation_url,
     build_nonce_marker,
     extract_assistant_turn,
@@ -105,9 +106,16 @@ FailureClassification = Literal[
 
 @dataclass(frozen=True)
 class AskOutcome:
+    """A settled answer and the files its final messages linked to.
+
+    ``files_complete`` is False when any linked file was not saved.
+    """
+
     text: str
     marker: str
     conversation_id: str | None
+    files: tuple[generated_files.GeneratedFile, ...] = ()
+    files_complete: bool = True
 
 
 @dataclass(frozen=True)
@@ -321,6 +329,7 @@ class _AskExecution:
         self.has_submitted = False
         self.has_locked_user_echo = False
         self._is_detach_requested = False
+        self.finished_turn: AssistantTurn | None = None
 
     def request_detach(self) -> None:
         self._is_detach_requested = True
@@ -1207,6 +1216,7 @@ class _AskExecution:
                     )
                     if turn.finished:
                         self._record_evidence(raw_extracted=True)
+                        self.finished_turn = turn
                         return turn.text
             if attempt + 1 < API_TURN_ATTEMPTS:
                 await self._pause_while_waiting(API_TURN_RETRY_SECONDS)
@@ -1398,10 +1408,33 @@ class _AskExecution:
                         "error", "the detached ask executor is unavailable"
                     )
                 return await self.on_detach(completion)
+            files: tuple[generated_files.GeneratedFile, ...] = ()
+            files_complete = True
+            references = (
+                self.finished_turn.file_references
+                if self.finished_turn is not None
+                else ()
+            )
+            if references:
+                self.stage = "files"
+                count = len(references)
+                self._status(
+                    f"downloading {count} generated file"
+                    f"{'' if count == 1 else 's'}"
+                )
+                files, files_complete = (
+                    await generated_files.collect_generated_files(
+                        self.page.evaluate,
+                        self.network.conversation_id,
+                        references,
+                    )
+                )
             return AskOutcome(
                 text=completion,
                 marker=self.marker,
                 conversation_id=self.network.conversation_id,
+                files=files,
+                files_complete=files_complete,
             )
         except _DeadlineExpired as exc:
             if self.network.saw_rate_limit and not self.has_locked_user_echo:

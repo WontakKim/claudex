@@ -98,7 +98,7 @@ listed below.
 | --- | --- | --- |
 | `ask_gpt_pro` | `question` (required string), `thread` (optional string), `attachments` (optional array of strings) | Starts a background ask and returns immediately with `{"ask_id": ..., "thread_ref": ...}`. A fresh ask can initially have a null `thread_ref`. |
 | `ask_gpt_pro_status` | `ask_id` (required string) | Returns `ask_id`, `state`, nullable `status_message`, `thread_ref`, `nonce_marker`, `failure`, and `error_message`, plus `evidence`, nullable `source_ask_id`, and `recovery_guidance`. Unknown or expired IDs are tool errors. |
-| `ask_gpt_pro_result` | `ask_id` (required string) | After `succeeded`, returns `ask_id`, the Markdown `answer`, `thread_ref`, `nonce_marker`, `evidence`, and nullable `source_ask_id`. After `failed`, returns an MCP tool error with a readable explanation and structured diagnostics. Calling it while `queued`, `running`, or `detached` is an error. |
+| `ask_gpt_pro_result` | `ask_id` (required string) | After `succeeded`, returns `ask_id`, the Markdown `answer`, `thread_ref`, `nonce_marker`, `evidence`, nullable `source_ask_id`, `files`, and `files_complete` (see [Generated files](#generated-files)). After `failed`, returns an MCP tool error with a readable explanation and structured diagnostics. Calling it while `queued`, `running`, or `detached` is an error. |
 | `recover_gpt_pro` | Either `ask_id` (a retained failed job) or `thread_ref` (conversation UUID) and `nonce_marker` | Starts a separate, bounded, read-only recovery job and returns its `ask_id`, nullable `source_ask_id`, and `thread_ref`. Poll its status and result as usual. It never sends a prompt or attaches files. |
 
 The normal caller flow is:
@@ -149,6 +149,54 @@ Questions larger than 35,000 UTF-8 bytes are automatically moved into a
 temporary text attachment, so callers should send the complete question rather
 than truncate it. The generated spill file consumes one attachment slot and
 counts toward the total byte limit.
+
+### Generated files
+
+When ChatGPT's final answer links files it generated as
+`sandbox:/mnt/data/...` Markdown links, the gateway downloads them after the
+answer is final and saves them on the gateway host. Links in commentary,
+tool calls, or an unfinished turn are never downloaded, and neither are
+Markdown examples inside code blocks or code spans. This applies to
+direct, detached, and recovered answers, and to the CLI.
+
+`files` has one entry per distinct linked sandbox path, in link order:
+
+| Field | Meaning |
+| --- | --- |
+| `name` | Local file name, derived from the link's last path segment. |
+| `sandbox_path` | The decoded `/mnt/data/...` path from the link. |
+| `message_id` | The ChatGPT message that linked the file. |
+| `status` | `saved` or `failed`. |
+| `path` | Absolute path of the saved file on the gateway host; null when failed. |
+| `size_bytes`, `mime_type`, `sha256` | Saved file size, type, and SHA-256 digest; null when failed. |
+| `error` | Why a failed file was not saved; null when saved. |
+
+`files_complete` is `true` when every linked file was saved, including when
+the answer links no files (`files` is then empty). It is `false` when any
+file failed; the `answer` text is still complete, so read the per-file
+`error` values.
+
+`path` is a filesystem path on the gateway host, not a URL, and the
+`sandbox:` link in the answer is not downloadable by the caller. Read saved
+files on the gateway host. A client on another machine needs a shared
+filesystem or other out-of-band access to that host; the gateway does not
+serve these files over HTTP. The CLI prints the answer to stdout unchanged
+and reports saved paths and failures on stderr.
+
+Each answer's files are saved in a new private directory (mode 0700) under
+`~/.claudex/gptpro/outputs/`. Files are written completely before they
+appear under their final name, never overwrite an existing file, and are
+not extracted or executed; archives stay as downloaded. The gateway never
+deletes saved files, so remove old output directories manually.
+
+Downloads use the authenticated ChatGPT browser page. The access token is
+sent only to the `chatgpt.com` download lookup; the returned download URL
+must be a `https://chatgpt.com/backend-api/estuary/content` URL and is
+fetched without the token, and redirects are refused. Errors never include
+tokens or signed download URLs. Fixed limits bound each answer: at most 20
+files, 20 MiB per file, 50 MiB in total, 60 seconds per request, and 300
+seconds for all of the answer's files. A file beyond a limit is reported as
+failed rather than silently omitted.
 
 ## Job lifecycle
 

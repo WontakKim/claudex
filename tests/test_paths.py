@@ -128,3 +128,9 @@ def test_consumers_use_shared_paths_module(module_name: str) -> None:
 def test_cli_daemon_imports_shared_paths_module() -> None:
     source = (_PACKAGE_DIR / "cli" / "daemon.py").read_text(encoding="utf-8")
     assert "from claudex import paths" in source
+
+
+def test_gptpro_output_dir_is_under_the_gptpro_runtime_dir(tmp_path: Path) -> None:
+    output_dir = getattr(paths, "gptpro_output_dir", None)
+    assert output_dir is not None, "paths does not define gptpro_output_dir"
+    assert output_dir() == tmp_path / ".claudex" / "gptpro" / "outputs"

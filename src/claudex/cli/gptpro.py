@@ -191,6 +191,19 @@ def _gptpro_ask(question: str) -> int:
         return 1
 
     print(outcome.text)
+    for item in outcome.files:
+        if item.status == "saved":
+            print(
+                f"generated file saved: {item.path} ({item.size_bytes} bytes)",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"generated file failed: {item.sandbox_path}: {item.error}",
+                file=sys.stderr,
+            )
+    if not outcome.files_complete:
+        print("warning: not every generated file was saved", file=sys.stderr)
     return 0
 
 
