@@ -848,10 +848,46 @@ async function main() {
     connected: document.getElementById(`card-${connectedName}`).innerHTML,
   };
 
+  context.jfetch = (url) => {
+    if (url === "/admin/providers/codex/models") {
+      return Promise.resolve({ok: false, status: 502, body: {error: {message: "<broken Codex version>"}}});
+    }
+    if (url === "/api/hello") {
+      return Promise.resolve({ok: true, body: {local_auth_required: false}});
+    }
+    if (url === "/health") {
+      return Promise.resolve({ok: true, body: {status: "ok", providers: {
+        codex: {status: "ok"}, kimi: {status: "ok"}, grok: {status: "ok"},
+      }}});
+    }
+    if (url === "/admin/settings/mapping") {
+      return Promise.resolve({ok: true, body: {model_map: {}, custom_providers: []}});
+    }
+    if (url === "/admin/settings/codex") {
+      return Promise.resolve({ok: true, body: {env_locked: false, service_tier: null}});
+    }
+    if (url === "/admin/settings/compaction") {
+      return Promise.resolve({ok: true, body: {env_locked: false, model: null}});
+    }
+    if (url === "/admin/providers/claude/pool/routing") {
+      return Promise.resolve({ok: true, body: {env_locked: false, mode: "disabled"}});
+    }
+    return Promise.resolve({ok: true, body: {models: [], choices: []}});
+  };
+  context.boot();
+  await new Promise((resolve) => setImmediate(resolve));
+  const toast = document.getElementById("toast");
+  const codexCatalogBoot = {
+    className: toast ? toast.className : "",
+    html: toast ? toast.innerHTML : "",
+    suggestions: Array.from(context.CATALOG.codex),
+  };
+
   const output = {credentialLeak};
   if (!credentialLeak) {
     Object.assign(output, {
       names: {configuredName, connectedName, unusedName, errorName},
+      codexCatalogBoot,
       jfetchRequests: requests.map((request) => ({
         url: String(request.url),
         options: request.options,

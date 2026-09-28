@@ -30,7 +30,7 @@ from claudex.providers.backends import (
     RouteBackend,
 )
 from claudex.providers.codex_auth import CodexAuthError
-from claudex.providers.codex_client import CodexUpstreamError
+from claudex.providers.codex_client import CodexDiscoveryError, CodexUpstreamError
 from claudex.config import ConfigError, GatewayConfig, parse_route_target
 from claudex.providers.grok_auth import GrokAuthError
 from claudex.providers.grok_client import GrokUpstreamError
@@ -217,6 +217,10 @@ async def _handle_admin_codex_models(request: Request) -> JSONResponse:
     except CodexAuthError as exc:
         return JSONResponse(
             server_support._openai_error_body("authentication_error", str(exc)), status_code=401
+        )
+    except CodexDiscoveryError as exc:
+        return JSONResponse(
+            server_support._openai_error_body("server_error", str(exc)), status_code=502
         )
     except CodexUpstreamError as exc:
         error_type = _STATUS_TO_OPENAI_ERROR_TYPE.get(exc.status_code, "server_error")

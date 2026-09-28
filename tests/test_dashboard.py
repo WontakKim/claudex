@@ -478,6 +478,17 @@ def test_quick_add_leaves_router_tab_closed_and_impossible_to_reopen_late() -> N
     assert "modelPicker.hidden" in refresh_section
 
 
+def test_boot_reports_codex_catalog_failure_without_inventing_suggestions(
+    dashboard_runtime_result: dict[str, Any],
+) -> None:
+    boot = dashboard_runtime_result["codexCatalogBoot"]
+    assert boot["className"] == "toast err"
+    assert "GET /admin/providers/codex/models" in boot["html"]
+    assert "&lt;broken Codex version>" in boot["html"]
+    assert "<broken Codex version>" not in boot["html"]
+    assert boot["suggestions"] == []
+
+
 def test_quick_add_keeps_credentials_and_catalogs_on_existing_channels() -> None:
     # The picker reuses the live CATALOG/jfetch closure: no new endpoints and
     # no hardcoded model snapshot may ride along with the new surface.
