@@ -2,6 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
+import os
+import re
+import shutil
+import signal
+import time
 from collections.abc import AsyncIterator
 from contextlib import aclosing
 from dataclasses import dataclass
@@ -24,15 +30,120 @@ CODEX_MODELS_URL = "https://chatgpt.com/backend-api/codex/models"
 # The UI name is "Fast", but the wire keeps the legacy pre-rename value.
 CODEX_FAST_TIER_WIRE_VALUE = "priority"
 
-# The models endpoint 400s without an explicit client_version query parameter.
+# The models endpoint requires an explicit client_version; this is the last
+# verified bundled stable identity, not a substitute for an absent CLI catalog.
 _CODEX_CLIENT_VERSION = "0.157.1"
-# Mirrors the header set CLIProxyAPI sends; the backend rejects unknown clients
-# and silently downgrades gpt-5.6-luna requests from clients older than 0.144.0.
-_CODEX_USER_AGENT = (
-    f"codex-tui/{_CODEX_CLIENT_VERSION} (Mac OS 26.5.1; arm64) "
-    f"iTerm.app/3.6.11 (codex-tui; {_CODEX_CLIENT_VERSION})"
-)
+_CODEX_VERSION_PROBE_TIMEOUT = 2.0
+_CODEX_VERSION_CLEANUP_TIMEOUT = 1.0
+_CODEX_VERSION_CACHE_SECONDS = 60.0
+_CODEX_VERSION_OUTPUT = re.compile(r"codex-cli (\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)\Z")
+_CODEX_PRESET_MODELS = [
+    "gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol",
+    "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5",
+]
 _CODEX_ORIGINATOR = "codex-tui"
+
+
+def _codex_user_agent(version: str) -> str:
+    # Mirrors the header set CLIProxyAPI sends; the backend rejects unknown
+    # clients and downgrades gpt-5.6-luna for versions older than 0.144.0.
+    return (
+        f"codex-tui/{version} (Mac OS 26.5.1; arm64) "
+        f"iTerm.app/3.6.11 (codex-tui; {version})"
+    )
+
+
+class CodexDiscoveryError(Exception):
+    """A present Codex CLI could not provide a usable version."""
+
+
+class CodexVersionDiscovery:
+    def __init__(self) -> None:
+        self._clock = time.monotonic
+        self._lock = asyncio.Lock()
+        self._version: str | None = None
+        self._checked_at: float | None = None
+
+    @property
+    def current_version(self) -> str:
+        return self._version or _CODEX_CLIENT_VERSION
+
+    async def get_version(self) -> str | None:
+        now = self._clock()
+        if self._checked_at is not None and now - self._checked_at < _CODEX_VERSION_CACHE_SECONDS:
+            return self._version
+        async with self._lock:
+            now = self._clock()
+            if self._checked_at is not None and now - self._checked_at < _CODEX_VERSION_CACHE_SECONDS:
+                return self._version
+            version = await self._probe_version()
+            self._version = version
+            self._checked_at = self._clock()
+            return version
+
+    async def _probe_version(self) -> str | None:
+        try:
+            process = await asyncio.create_subprocess_exec(
+                "codex", "--version",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                start_new_session=os.name == "posix",
+            )
+        except FileNotFoundError as exc:
+            if shutil.which("codex") is not None:
+                raise CodexDiscoveryError(f"could not run codex --version: {exc}") from exc
+            return None
+        except OSError as exc:
+            raise CodexDiscoveryError(f"could not run codex --version: {exc}") from exc
+
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(), timeout=_CODEX_VERSION_PROBE_TIMEOUT
+            )
+        except (TimeoutError, asyncio.CancelledError) as exc:
+            try:
+                if os.name == "posix":
+                    # The npm launcher can exit while a native child still owns
+                    # stdout/stderr, so killing only the launcher cannot close the pipes.
+                    os.killpg(process.pid, signal.SIGKILL)
+                else:
+                    process.kill()
+            except ProcessLookupError:
+                pass
+            try:
+                await asyncio.wait_for(
+                    process.communicate(), timeout=_CODEX_VERSION_CLEANUP_TIMEOUT
+                )
+            except TimeoutError:
+                try:
+                    await asyncio.wait_for(
+                        process.wait(), timeout=_CODEX_VERSION_CLEANUP_TIMEOUT
+                    )
+                except TimeoutError as cleanup_error:
+                    if isinstance(exc, asyncio.CancelledError):
+                        raise exc
+                    raise CodexDiscoveryError(
+                        "codex --version timed out and could not reap its process"
+                    ) from cleanup_error
+            if isinstance(exc, asyncio.CancelledError):
+                raise
+            raise CodexDiscoveryError("codex --version timed out") from exc
+
+        if process.returncode != 0:
+            raise CodexDiscoveryError(
+                f"codex --version exited with status {process.returncode}: "
+                f"{stderr.decode('utf-8', errors='replace').strip()}"
+            )
+        match = _CODEX_VERSION_OUTPUT.fullmatch(stdout.decode("utf-8", errors="replace").strip())
+        if match is None:
+            raise CodexDiscoveryError("codex --version returned an invalid version")
+        version = match.group(1)
+        try:
+            numbers = tuple(int(part) for part in version.split("-", 1)[0].split("."))
+        except ValueError as exc:
+            raise CodexDiscoveryError("codex --version returned an invalid version") from exc
+        floor = tuple(int(part) for part in _CODEX_CLIENT_VERSION.split("."))
+        return version if numbers > floor else _CODEX_CLIENT_VERSION
 
 
 class CodexUpstreamError(UpstreamError):
@@ -51,6 +162,7 @@ class CodexClient:
     def __init__(self, auth_manager: CodexAuthManager, http_client: httpx.AsyncClient) -> None:
         self._auth_manager = auth_manager
         self._http_client = http_client
+        self._version_discovery = CodexVersionDiscovery()
         self._catalog_entries: ModelCatalogCache[CodexModelEntry] = ModelCatalogCache(
             self._fetch_catalog_entries,
             expected_errors=(CodexAuthError, CodexUpstreamError, httpx.HTTPError),
@@ -74,8 +186,11 @@ class CodexClient:
             yield event
 
     async def list_models(self) -> list[str]:
-        """Return the visible Codex model slugs from the live catalog."""
-        models = await self._fetch_model_entries()
+        """Return live visible slugs when installed, otherwise preset suggestions."""
+        version = await self._version_discovery.get_version()
+        if version is None:
+            return list(_CODEX_PRESET_MODELS)
+        models = await self._fetch_model_entries(version)
         return [
             model["slug"]
             for model in models
@@ -129,15 +244,16 @@ class CodexClient:
             )
         return entries
 
-    async def _fetch_model_entries(self) -> list[Any]:
+    async def _fetch_model_entries(self, client_version: str | None = None) -> list[Any]:
         """GET the Codex model catalog and return its raw ``models`` list.
 
         Raises ``CodexUpstreamError`` on any structural failure: a non-200
         response, a non-JSON body, a non-object JSON root, or a missing/
         non-list ``models`` field.
         """
+        version = client_version or self._version_discovery.current_version
         credentials = await self._auth_manager.get_credentials()
-        headers = self._base_headers(credentials)
+        headers = self._base_headers(credentials, version)
         headers["Accept"] = "application/json"
         return await fetch_models_list(
             self._http_client,
@@ -145,16 +261,16 @@ class CodexClient:
             headers,
             label="codex",
             make_error=CodexUpstreamError,
-            params={"client_version": _CODEX_CLIENT_VERSION},
+            params={"client_version": version},
             items_key="models",
             require_object_root=True,
         )
 
     @staticmethod
-    def _base_headers(credentials: CodexCredentials) -> dict[str, str]:
+    def _base_headers(credentials: CodexCredentials, version: str) -> dict[str, str]:
         headers = {
             "Authorization": f"Bearer {credentials.access_token}",
-            "User-Agent": _CODEX_USER_AGENT,
+            "User-Agent": _codex_user_agent(version),
         }
         if not credentials.is_api_key:
             headers["Originator"] = _CODEX_ORIGINATOR
@@ -165,7 +281,7 @@ class CodexClient:
     async def _stream_once(
         self, payload: dict[str, Any], session_id: str, credentials: CodexCredentials
     ) -> AsyncIterator[dict[str, Any]]:
-        headers = self._base_headers(credentials)
+        headers = self._base_headers(credentials, self._version_discovery.current_version)
         headers.update(
             {
                 "Content-Type": "application/json",

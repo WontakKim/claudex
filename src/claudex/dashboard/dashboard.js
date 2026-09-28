@@ -2376,9 +2376,11 @@ function boot(){
       showToast('<span class="chip chip-err">ERROR</span><span class="lat">'+mapping.status+
         '</span><br>GET /admin/settings/mapping<br><span class="dim">'+esc(errDetail(mapping.body))+"</span>",true);
     }
-    // A catalog only feeds the add-node suggestions, and Kimi's routinely 401s
-    // when the gateway has no Kimi login, so failures stay silent here.
+    // Catalogs only feed add-node suggestions. Kimi/Grok failures are optional;
+    // a Codex failure means its local version probe or live catalog failed.
     if(codexCatalog.ok)CATALOG.codex=catalogIds(codexCatalog.body);
+    else showToast('<span class="chip chip-err">ERROR</span><span class="lat">'+codexCatalog.status+
+      '</span><br>GET /admin/providers/codex/models<br><span class="dim">'+esc(errDetail(codexCatalog.body))+"</span>",true);
     if(kimiCatalog.ok)CATALOG.kimi=catalogIds(kimiCatalog.body);
     if(grokCatalog.ok)CATALOG.grok=catalogIds(grokCatalog.body);
     DIR.mapping=Object.assign({},DIR.LIVE);

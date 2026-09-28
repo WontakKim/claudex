@@ -4,12 +4,19 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import shutil
+import signal
+import subprocess
+import sys
+from pathlib import Path
 from collections.abc import AsyncIterator
 from typing import Any
 
 import httpx
 import pytest
 
+import claudex.providers.codex_client as codex_module
 from claudex.providers.codex_auth import CodexAuthError, CodexCredentials
 from claudex.providers.codex_client import (
     CODEX_MODELS_URL,
@@ -20,6 +27,10 @@ from claudex.providers.codex_client import (
 from claudex.providers.model_catalog_cache import ModelCatalogCache
 
 
+_REAL_CREATE_SUBPROCESS_EXEC = asyncio.create_subprocess_exec
+_REAL_WHICH = shutil.which
+
+
 class _FakeAuthManager:
     def __init__(self) -> None:
         self.calls = 0
@@ -27,6 +38,57 @@ class _FakeAuthManager:
     async def get_credentials(self, force_refresh: bool = False) -> CodexCredentials:
         self.calls += 1
         return CodexCredentials(access_token="codex-token-1", account_id="account-1")
+
+
+@pytest.fixture(autouse=True)
+def no_host_codex_probe(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def missing_codex(*args: Any, **kwargs: Any) -> Any:
+        assert args == ("codex", "--version")
+        raise FileNotFoundError("codex")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", missing_codex)
+    monkeypatch.setattr(shutil, "which", lambda command: None)
+
+
+@pytest.fixture
+def installed_codex_probe(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def spawn(*args: Any, **kwargs: Any) -> _CodexVersionProcess:
+        assert args == ("codex", "--version")
+        return _CodexVersionProcess("codex-cli 0.157.1")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+
+
+class _CodexVersionProcess:
+    pid = 12345
+
+    def __init__(
+        self, output: str, *, returncode: int = 0, stderr: str = "", hang: bool = False
+    ) -> None:
+        self.output = output
+        self.returncode = returncode
+        self.stderr = stderr
+        self.hang = hang
+        self.killed = False
+        self.reaped = False
+        self.started = asyncio.Event()
+        self.wait = asyncio.Event()
+
+    async def communicate(self) -> tuple[bytes, bytes]:
+        self.started.set()
+        if self.hang:
+            await self.wait.wait()
+        self.reaped = True
+        return self.output.encode(), self.stderr.encode()
+
+    def kill(self) -> None:
+        self.killed = True
+        self.returncode = -9
+        self.wait.set()
+
+
+def _reject_unexpected_http(request: httpx.Request) -> httpx.Response:
+    raise AssertionError(f"unexpected HTTP request: {request.url}")
 
 
 _CATALOG_MODELS: list[dict[str, Any]] = [
@@ -226,7 +288,9 @@ def test_context_window_returns_window_for_exact_slug_match() -> None:
     assert calls["n"] == 1
 
 
-def test_hidden_model_excluded_from_list_but_resolvable_via_context_window() -> None:
+def test_hidden_model_excluded_from_list_but_resolvable_via_context_window(
+    installed_codex_probe: None,
+) -> None:
     calls = {"n": 0}
 
     async def scenario() -> tuple[list[str], int | None]:
@@ -453,7 +517,9 @@ def test_codex_cold_cache_malformed_catalog_returns_none(kind: str) -> None:
     assert calls["n"] == 1
 
 
-def test_list_models_fetches_fresh_after_context_window_populated_cache() -> None:
+def test_list_models_fetches_fresh_after_context_window_populated_cache(
+    installed_codex_probe: None,
+) -> None:
     calls = {"n": 0}
 
     async def scenario() -> tuple[int | None, list[str]]:
@@ -550,7 +616,9 @@ def test_stream_responses_omits_routing_hint_without_service_tier() -> None:
     assert "x-codex-routing-hint" not in request.headers
 
 
-def test_list_models_raises_upstream_error_on_non_200() -> None:
+def test_list_models_raises_upstream_error_on_non_200(
+    installed_codex_probe: None,
+) -> None:
     async def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(401, text="expired")
 
@@ -561,3 +629,438 @@ def test_list_models_raises_upstream_error_on_non_200() -> None:
     with pytest.raises(CodexUpstreamError) as exc_info:
         asyncio.run(scenario())
     assert exc_info.value.status_code == 401
+
+
+def test_missing_codex_returns_visible_presets_without_auth_or_http() -> None:
+    auth = _FakeAuthManager()
+    calls = {"http": 0}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls["http"] += 1
+        raise AssertionError("missing Codex must not fetch suggestion catalog")
+
+    async def scenario() -> list[str]:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+            return await CodexClient(auth, http_client).list_models()
+
+    assert asyncio.run(scenario()) == [
+        "gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol",
+        "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5",
+    ]
+    assert auth.calls == 0
+    assert calls["http"] == 0
+
+
+@pytest.mark.parametrize(
+    ("cli_version", "effective_version"),
+    [
+        ("0.99.0", "0.157.1"),
+        ("0.157.1", "0.157.1"),
+        ("0.160.0", "0.160.0"),
+        ("0.158.0-beta.1", "0.158.0-beta.1"),
+        ("0.157.1-rc.1", "0.157.1"),
+    ],
+)
+def test_installed_codex_uses_numeric_floor_for_catalog_and_user_agent(
+    cli_version: str, effective_version: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    commands: list[tuple[Any, ...]] = []
+    process = _CodexVersionProcess(f"codex-cli {cli_version}\n")
+
+    async def spawn(*args: Any, **kwargs: Any) -> _CodexVersionProcess:
+        commands.append(args)
+        assert kwargs["stdout"] == subprocess.PIPE
+        assert kwargs["stderr"] == subprocess.PIPE
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+    captured: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(200, json={"models": _CATALOG_MODELS})
+
+    async def scenario() -> list[str]:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+            return await CodexClient(_FakeAuthManager(), http_client).list_models()
+
+    models = asyncio.run(scenario())
+    assert commands == [("codex", "--version")]
+    assert process.reaped
+    assert "gpt-6-hidden" not in models
+    assert "gpt-6-astra" in models
+    (request,) = captured
+    assert request.url.params["client_version"] == effective_version
+    assert request.headers["user-agent"].startswith(f"codex-tui/{effective_version} ")
+    assert request.headers["user-agent"].endswith(f"(codex-tui; {effective_version})")
+
+
+@pytest.mark.parametrize(
+    ("output", "returncode", "message"),
+    [
+        ("broken", 0, "version"),
+        ("codex-cli 0.160.0", 7, "exit"),
+    ],
+)
+def test_broken_installed_codex_is_not_treated_as_missing(
+    output: str, returncode: int, message: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def spawn(*args: Any, **kwargs: Any) -> _CodexVersionProcess:
+        return _CodexVersionProcess(output, returncode=returncode, stderr="failed")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+    auth = _FakeAuthManager()
+
+    async def scenario() -> list[str]:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(_reject_unexpected_http)) as http_client:
+            return await CodexClient(auth, http_client).list_models()
+
+    with pytest.raises(codex_module.CodexDiscoveryError, match=message):
+        asyncio.run(scenario())
+    assert auth.calls == 0
+
+
+def test_codex_permission_failure_is_not_absence(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def denied(*args: Any, **kwargs: Any) -> Any:
+        raise PermissionError("codex is not executable")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", denied)
+
+    async def scenario() -> list[str]:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(_reject_unexpected_http)) as http_client:
+            return await CodexClient(_FakeAuthManager(), http_client).list_models()
+
+    with pytest.raises(codex_module.CodexDiscoveryError, match="codex"):
+        asyncio.run(scenario())
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX shebang behavior")
+def test_present_codex_with_missing_shebang_interpreter_is_not_absent(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    launcher = tmp_path / "codex"
+    launcher.write_text("#!/nonexistent/codex-interpreter\n", encoding="utf-8")
+    launcher.chmod(0o755)
+    monkeypatch.setenv("PATH", str(tmp_path))
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _REAL_CREATE_SUBPROCESS_EXEC)
+    monkeypatch.setattr(shutil, "which", _REAL_WHICH)
+    auth = _FakeAuthManager()
+
+    async def scenario() -> list[str]:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(_reject_unexpected_http)) as http_client:
+            return await CodexClient(auth, http_client).list_models()
+
+    with pytest.raises(codex_module.CodexDiscoveryError, match="codex"):
+        asyncio.run(scenario())
+    assert auth.calls == 0
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups")
+@pytest.mark.parametrize("cancel", [False, True])
+def test_probe_reaps_child_holding_inherited_pipe_after_parent_exits(
+    cancel: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class InheritedPipeProcess(_CodexVersionProcess):
+        pid = 12345
+
+        def kill(self) -> None:
+            self.killed = True
+            self.returncode = -9
+            # The child still owns the pipe after the launcher is killed.
+            asyncio.get_running_loop().call_later(0.1, self.wait.set)
+
+    process = InheritedPipeProcess("", hang=True)
+    commands: list[dict[str, Any]] = []
+    group_kills: list[int] = []
+
+    async def spawn(*args: Any, **kwargs: Any) -> InheritedPipeProcess:
+        commands.append(kwargs)
+        return process
+
+    def kill_group(process_group: int, signal_number: int) -> None:
+        assert signal_number == signal.SIGKILL
+        group_kills.append(process_group)
+        process.wait.set()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+    monkeypatch.setattr(os, "killpg", kill_group)
+    monkeypatch.setattr(codex_module, "_CODEX_VERSION_PROBE_TIMEOUT", 0.01, raising=False)
+
+    async def scenario() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(_reject_unexpected_http)) as http_client:
+            task = asyncio.create_task(CodexClient(_FakeAuthManager(), http_client).list_models())
+            await asyncio.wait_for(process.started.wait(), timeout=1)
+            if cancel:
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await asyncio.wait_for(task, timeout=1)
+            else:
+                with pytest.raises(codex_module.CodexDiscoveryError, match="timed out"):
+                    await asyncio.wait_for(task, timeout=1)
+
+    asyncio.run(scenario())
+    assert commands[0]["start_new_session"] is True
+    assert group_kills == [process.pid]
+    assert not process.killed
+    assert process.reaped
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups")
+def test_probe_cleanup_is_bounded_when_pipe_stays_open(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class OpenPipeProcess:
+        pid = 12345
+        returncode: int | None = None
+        reaped = False
+
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+            self.pipe_closed = asyncio.Event()
+            self.parent_exited = asyncio.Event()
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            self.started.set()
+            await self.pipe_closed.wait()
+            return b"", b""
+
+        async def wait(self) -> int:
+            await self.parent_exited.wait()
+            self.reaped = True
+            self.returncode = -9
+            return -9
+
+        def kill(self) -> None:
+            self.parent_exited.set()
+
+    process = OpenPipeProcess()
+
+    async def spawn(*args: Any, **kwargs: Any) -> OpenPipeProcess:
+        return process
+
+    def kill_group(process_group: int, signal_number: int) -> None:
+        assert process_group == process.pid
+        process.parent_exited.set()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+    monkeypatch.setattr(os, "killpg", kill_group)
+    monkeypatch.setattr(codex_module, "_CODEX_VERSION_PROBE_TIMEOUT", 0.01, raising=False)
+    monkeypatch.setattr(codex_module, "_CODEX_VERSION_CLEANUP_TIMEOUT", 0.01)
+
+    async def scenario() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(_reject_unexpected_http)) as http_client:
+            client = CodexClient(_FakeAuthManager(), http_client)
+            with pytest.raises(codex_module.CodexDiscoveryError, match="timed out"):
+                await asyncio.wait_for(client.list_models(), timeout=0.2)
+
+    asyncio.run(scenario())
+    assert process.reaped
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups")
+def test_probe_cancellation_survives_double_cleanup_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class StalledProcess:
+        pid = 12345
+
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+            self.never_finishes = asyncio.Event()
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            self.started.set()
+            await self.never_finishes.wait()
+            return b"", b""
+
+        async def wait(self) -> int:
+            await self.never_finishes.wait()
+            return -9
+
+    process = StalledProcess()
+    group_kills: list[int] = []
+
+    async def spawn(*args: Any, **kwargs: Any) -> StalledProcess:
+        return process
+
+    def kill_group(process_group: int, signal_number: int) -> None:
+        group_kills.append(process_group)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+    monkeypatch.setattr(os, "killpg", kill_group)
+    monkeypatch.setattr(codex_module, "_CODEX_VERSION_CLEANUP_TIMEOUT", 0.01)
+
+    async def scenario() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(_reject_unexpected_http)) as http_client:
+            task = asyncio.create_task(CodexClient(_FakeAuthManager(), http_client).list_models())
+            await asyncio.wait_for(process.started.wait(), timeout=1)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, timeout=0.2)
+
+    asyncio.run(scenario())
+    assert group_kills == [process.pid]
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+def test_codex_probe_timeout_and_cancellation_reap_process(
+    cancel: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    process = _CodexVersionProcess("", hang=True)
+
+    async def spawn(*args: Any, **kwargs: Any) -> _CodexVersionProcess:
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+    monkeypatch.setattr(os, "killpg", lambda process_group, signal_number: process.kill())
+    monkeypatch.setattr(codex_module, "_CODEX_VERSION_PROBE_TIMEOUT", 0.01, raising=False)
+
+    async def scenario() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(_reject_unexpected_http)) as http_client:
+            task = asyncio.create_task(CodexClient(_FakeAuthManager(), http_client).list_models())
+            await asyncio.wait_for(process.started.wait(), timeout=1)
+            if cancel:
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+            else:
+                with pytest.raises(codex_module.CodexDiscoveryError, match="timed out"):
+                    await task
+
+    asyncio.run(scenario())
+    assert process.killed
+    assert process.reaped
+
+
+def test_codex_version_cache_refreshes_after_install_and_upgrade(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = _FakeClock()
+    versions = [None, "codex-cli 0.161.0", "codex-cli 0.162.0"]
+    commands: list[tuple[Any, ...]] = []
+    requested_versions: list[str] = []
+
+    async def spawn(*args: Any, **kwargs: Any) -> _CodexVersionProcess:
+        commands.append(args)
+        version = versions.pop(0)
+        if version is None:
+            raise FileNotFoundError("codex")
+        return _CodexVersionProcess(version)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requested_versions.append(request.url.params["client_version"])
+        assert request.headers["user-agent"].startswith(
+            f"codex-tui/{requested_versions[-1]} "
+        )
+        return httpx.Response(200, json={"models": _CATALOG_MODELS})
+
+    async def scenario() -> list[list[str]]:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+            client = CodexClient(_FakeAuthManager(), http_client)
+            client._version_discovery._clock = clock
+            absent = await client.list_models()
+            cached_absent = await client.list_models()
+            clock.advance(61)
+            installed = await client.list_models()
+            cached_installed = await client.list_models()
+            clock.advance(61)
+            upgraded = await client.list_models()
+            return [absent, cached_absent, installed, cached_installed, upgraded]
+
+    results = asyncio.run(scenario())
+    assert results[0] == results[1]
+    assert results[0] == [
+        "gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol",
+        "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5",
+    ]
+    assert results[2] == results[3] == results[4]
+    assert requested_versions == ["0.161.0", "0.161.0", "0.162.0"]
+    assert commands == [("codex", "--version")] * 3
+
+
+def test_expired_version_probe_failure_does_not_serve_stale_suggestions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = _FakeClock()
+    commands = 0
+    http_calls = 0
+
+    async def spawn(*args: Any, **kwargs: Any) -> _CodexVersionProcess:
+        nonlocal commands
+        commands += 1
+        if commands == 2:
+            raise PermissionError("Codex update is broken")
+        return _CodexVersionProcess("codex-cli 0.161.0")
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal http_calls
+        http_calls += 1
+        return httpx.Response(200, json={"models": _CATALOG_MODELS})
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+
+    async def scenario() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+            client = CodexClient(_FakeAuthManager(), http_client)
+            client._version_discovery._clock = clock
+            await client.list_models()
+            clock.advance(61)
+            with pytest.raises(codex_module.CodexDiscoveryError, match="codex"):
+                await client.list_models()
+
+    asyncio.run(scenario())
+    assert commands == 2
+    assert http_calls == 1
+
+
+def test_stream_uses_selected_catalog_identity_after_local_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def spawn(*args: Any, **kwargs: Any) -> _CodexVersionProcess:
+        return _CodexVersionProcess("codex-cli 0.161.0")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if str(request.url).startswith(CODEX_MODELS_URL):
+            return httpx.Response(200, json={"models": _CATALOG_MODELS})
+        return httpx.Response(200, content=_sse([]))
+
+    async def scenario() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+            client = CodexClient(_FakeAuthManager(), http_client)
+            await client.list_models()
+            assert await client.context_window("gpt-5.6-sol") == 272000
+            await _collect(client, {"model": "gpt-5.6-sol"})
+
+    asyncio.run(scenario())
+    assert len(requests) == 3
+    assert all(request.url.params["client_version"] == "0.161.0" for request in requests[:2])
+    assert all(request.headers["user-agent"].startswith("codex-tui/0.161.0 ") for request in requests)
+
+
+def test_stream_and_metadata_without_cli_use_bundled_identity_and_live_catalog() -> None:
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if str(request.url).startswith(CODEX_MODELS_URL):
+            return httpx.Response(200, json={"models": _CATALOG_MODELS})
+        return httpx.Response(200, content=_sse([]))
+
+    async def scenario() -> tuple[int | None, bool]:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+            client = CodexClient(_FakeAuthManager(), http_client)
+            window = await client.context_window("gpt-5.6-sol")
+            fast = await client.supports_fast_tier("gpt-5.6-sol")
+            await _collect(client, {"model": "gpt-5.6-sol"})
+            return window, fast
+
+    assert asyncio.run(scenario()) == (272000, True)
+    assert len(requests) == 2
+    assert requests[0].url.params["client_version"] == "0.157.1"
+    assert all(request.headers["user-agent"].startswith("codex-tui/0.157.1 ") for request in requests)

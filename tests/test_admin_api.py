@@ -3954,7 +3954,18 @@ def _select_route_transport(
     )
 
 
-def test_codex_client_list_models_filters_hidden_models() -> None:
+def test_codex_client_list_models_filters_hidden_models(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def spawn(*args: Any, **kwargs: Any) -> Any:
+        assert args == ("codex", "--version")
+        return SimpleNamespace(
+            returncode=0,
+            communicate=lambda: asyncio.sleep(0, result=(b"codex-cli 0.157.1", b"")),
+        )
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.url.params["client_version"] == "0.157.1"
         assert request.headers["Chatgpt-Account-Id"] == "account"
@@ -4010,6 +4021,24 @@ class TestAdminDashboardApi:
 
         assert response.status_code == 400
         assert response.json()["error"]["message"] == "unsupported client"
+
+    def test_codex_models_reports_failed_local_version_probe(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        async def broken_codex(*args: Any, **kwargs: Any) -> Any:
+            raise PermissionError("codex is not executable")
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", broken_codex)
+        with self._client(monkeypatch, tmp_path) as client:
+            _select_route_transport(
+                client,
+                "codex",
+                CodexClient(client.app.state.codex_auth_manager, client.app.state.http_client),
+            )
+            response = client.get("/admin/providers/codex/models")
+
+        assert response.status_code == 502
+        assert "codex" in response.json()["error"]["message"]
 
     def test_codex_models_refuses_foreign_host(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path

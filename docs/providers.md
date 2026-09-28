@@ -43,6 +43,21 @@ results (with 64-char-safe names for long MCP tool namespaces), usage,
 stop reasons, and native web search; mid-conversation `system` messages
 keep operator authority as Responses `developer` messages.
 
+### Model suggestions
+
+The dashboard's Codex add-node suggestions come from the live catalog when
+`codex --version` is available. The gateway uses the newer of the installed
+CLI version and its verified bundled client version (0.157.1) for both the
+catalog request and its User-Agent. After a 60-second cache expires, the
+next suggestion request checks the installed version again, so updating Codex
+does not require restarting the gateway. If the CLI is not installed,
+suggestions use a short built-in list instead, without fetching the catalog
+or requiring Codex credentials. A CLI that cannot report its version or a
+failed live catalog request produces a visible dashboard error rather than
+falling back to that list. These presets only suggest model IDs; context
+windows and Fast availability still come from the live catalog, never from
+preset metadata.
+
 ### Fast mode
 
 Opt into Codex Fast mode with `"codex": { "service_tier": "fast" }` in
