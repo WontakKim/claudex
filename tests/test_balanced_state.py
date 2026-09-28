@@ -690,17 +690,18 @@ def test_same_row_coalescing_preserves_the_earliest_queue_position(store_factory
     """Step 4: coalescing may replace the payload, but the row keeps the
     earliest queue position — its debounce deadline is anchored to the
     first submission, not reset by later ones for the same row."""
-    store = store_factory(debounce_seconds=0.3)
+    store = store_factory(debounce_seconds=1.0)
     started = time.monotonic()
     store.upsert_cooldown(**_cooldown_kwargs(reason="first"))
-    time.sleep(0.15)
+    time.sleep(0.5)
     second = store.upsert_cooldown(**_cooldown_kwargs(reason="second"))
     second.wait(timeout=5)
     elapsed = time.monotonic() - started
 
     # If coalescing had reset the debounce timer, this would take roughly
-    # 0.15 + 0.3 = 0.45s. Preserving the earliest position keeps it near 0.3s.
-    assert elapsed < 0.4, f"coalescing appears to have reset the debounce deadline: {elapsed:.3f}s"
+    # 0.5 + 1.0 = 1.5s. Preserving the earliest position keeps it near 1.0s;
+    # the threshold sits midway so scheduler jitter on either side stays tolerated.
+    assert elapsed < 1.25, f"coalescing appears to have reset the debounce deadline: {elapsed:.3f}s"
     row = store.get_cooldown("acct-1", "account", "")
     assert row is not None and row.reason == "second"
 
