@@ -66,6 +66,9 @@ HEARTBEAT_INTERVAL_SECONDS = 30.0
 AUTH_PATH_FRAGMENT = "/auth/login"
 BACKEND_API_PATH_FRAGMENT = "/backend-api/"
 CHALLENGE_PROBE_TIMEOUT_SECONDS = 5.0
+# Non-interactive Cloudflare interstitials usually self-resolve; wait them out
+# before failing the ask.
+CHALLENGE_GRACE_SECONDS = 10.0
 
 # Browser navigation and composer budgets come from gptpro.browser.
 COMPOSER_SLICE_SECONDS = 2.0
@@ -679,6 +682,9 @@ class _AskExecution:
 
     async def _wait_for_composer(self) -> None:
         end = min(self.deadline, _monotonic() + COMPOSER_TIMEOUT_MS / 1_000)
+        # One bounded grace window per invocation: markers that vanish and
+        # later reappear do not restart the window.
+        challenge_grace_deadline: float | None = None
         while _monotonic() < end:
             await self._process_network_actions()
             self._check_authenticated()
@@ -701,9 +707,15 @@ class _AskExecution:
             self._check_authenticated()
             markers = await self._probe_challenge()
             if markers:
-                raise GptProChallengeError(
-                    "Cloudflare challenge markup was detected: " + ", ".join(markers)
-                )
+                if challenge_grace_deadline is None:
+                    challenge_grace_deadline = (
+                        _monotonic() + CHALLENGE_GRACE_SECONDS
+                    )
+                elif _monotonic() >= challenge_grace_deadline:
+                    raise GptProChallengeError(
+                        "Cloudflare challenge markup was detected: "
+                        + ", ".join(markers)
+                    )
             if _monotonic() < end:
                 await self._pause(min(POLL_INTERVAL_SECONDS, end - _monotonic()))
         self._ensure_deadline()

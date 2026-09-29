@@ -1004,6 +1004,88 @@ def test_cf_mitigation_is_typed_challenge(
     assert raised.value.failure == "challenge"
 
 
+def _challenge_interstitial_page(
+    page: _FakePage,
+    *,
+    marker_probes_remaining: int | None,
+) -> None:
+    """Route the composer wait through a Cloudflare interstitial.
+
+    ``marker_probes_remaining=None`` keeps the interstitial up forever;
+    otherwise the challenge markers vanish once that many probes saw them.
+    """
+    original_wait_for_selector = page.wait_for_selector
+    original_evaluate = page.evaluate
+    probes = {"remaining": marker_probes_remaining}
+
+    async def wait_while_challenged(
+        selector: str, *, state: str, timeout: int
+    ) -> object:
+        if probes["remaining"] is None or probes["remaining"] > 0:
+            raise RuntimeError("challenge interstitial is showing")
+        return await original_wait_for_selector(
+            selector, state=state, timeout=timeout
+        )
+
+    async def probe_while_challenged(
+        expression: str, argument: Any = None
+    ) -> Any:
+        if expression == selectors.CHALLENGE_DOM_PROBE_JS and (
+            probes["remaining"] is None or probes["remaining"] > 0
+        ):
+            if probes["remaining"] is not None:
+                probes["remaining"] -= 1
+            return ["cf-challenge", "challenge-platform"]
+        return await original_evaluate(expression, argument)
+
+    page.wait_for_selector = wait_while_challenged  # type: ignore[method-assign]
+    page.evaluate = probe_while_challenged  # type: ignore[method-assign]
+
+
+def test_transient_challenge_markup_self_resolves_within_grace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = _install_clock(monkeypatch)
+    page = _FakePage()
+    _challenge_interstitial_page(page, marker_probes_remaining=2)
+
+    assert _run(page) == "server **raw** markdown"
+    assert page.click_count == 1
+    assert clock.value < ask.CHALLENGE_GRACE_SECONDS
+
+
+def test_persistent_challenge_markup_fails_after_grace_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = _install_clock(monkeypatch)
+    page = _FakePage()
+    _challenge_interstitial_page(page, marker_probes_remaining=None)
+
+    with pytest.raises(ask.GptProChallengeError) as raised:
+        _run(page)
+
+    assert raised.value.failure == "challenge"
+    assert "Cloudflare challenge markup was detected" in str(raised.value)
+    assert "cf-challenge" in str(raised.value)
+    assert clock.value >= ask.CHALLENGE_GRACE_SECONDS
+    assert page.click_count == 0
+
+
+def test_challenge_grace_is_bounded_by_ask_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = _install_clock(monkeypatch)
+    monkeypatch.setattr(ask, "OVERALL_TIMEOUT_SECONDS", 4.0)
+    page = _FakePage()
+    _challenge_interstitial_page(page, marker_probes_remaining=None)
+
+    with pytest.raises(ask.GptProAskError) as raised:
+        _run(page)
+
+    assert raised.value.failure == "timeout"
+    assert clock.value <= 4.0
+
+
 def test_rate_limit_waits_and_does_not_resubmit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

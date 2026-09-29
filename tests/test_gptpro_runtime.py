@@ -42,6 +42,10 @@ class _FakeContext:
     def __init__(self) -> None:
         self.pages: list[_FakePage] = []
         self.close_calls = 0
+        self.clear_cookies_calls: list[Any] = []
+
+    async def clear_cookies(self, *, name: Any = None) -> None:
+        self.clear_cookies_calls.append(name)
 
     async def new_page(self) -> _FakePage:
         page = _FakePage()
@@ -57,9 +61,14 @@ class _RuntimeFakes:
         self,
         monkeypatch: pytest.MonkeyPatch,
         contexts: list[_FakeContext],
+        *,
+        default_user_agent: str | None = None,
     ) -> None:
         self._contexts = list(contexts)
+        self.default_user_agent = default_user_agent
         self.launch_calls: list[tuple[Path, bool]] = []
+        self.user_agent_overrides: list[str | None] = []
+        self.user_agent_probe_calls = 0
         self.close_calls: list[_FakeContext] = []
         self.lock_paths: list[Path] = []
         self.locks: list[_FakeLockHandle] = []
@@ -74,6 +83,9 @@ class _RuntimeFakes:
         monkeypatch.setattr(runtime.random, "uniform", lambda _low, _high: 1.5)
         monkeypatch.setattr(
             runtime.locking, "try_file_lock", self._try_file_lock
+        )
+        monkeypatch.setattr(
+            runtime.browser, "read_chromium_user_agent", self._read_user_agent
         )
         monkeypatch.setattr(
             runtime.browser, "launch_persistent_profile", self._launch
@@ -91,10 +103,19 @@ class _RuntimeFakes:
         self.locks.append(lock)
         return lock
 
+    async def _read_user_agent(self) -> str | None:
+        self.user_agent_probe_calls += 1
+        return self.default_user_agent
+
     async def _launch(
-        self, profile_dir: Path, *, headless: bool = False
+        self,
+        profile_dir: Path,
+        *,
+        headless: bool = False,
+        user_agent: str | None = None,
     ) -> _FakeContext:
         self.launch_calls.append((profile_dir, headless))
+        self.user_agent_overrides.append(user_agent)
         return self._contexts.pop(0)
 
     async def _close(self, context: _FakeContext) -> None:
@@ -396,6 +417,134 @@ def test_invalid_session_fails_before_browser_initialization(
         await ask_runtime.aclose()
 
     asyncio.run(scenario())
+
+
+def test_runtime_clears_stale_cloudflare_cookies_after_launch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = _FakeContext()
+    fakes = _RuntimeFakes(monkeypatch, [context])
+
+    async def scenario() -> None:
+        ask_runtime = runtime.AskRuntime()
+        returned = await ask_runtime._get_context()
+        assert returned is context
+        await ask_runtime.aclose()
+
+    asyncio.run(scenario())
+
+    assert len(fakes.launch_calls) == 1
+    assert context.clear_cookies_calls == [
+        runtime.session.CLOUDFLARE_COOKIE_NAME_PATTERN
+    ]
+    assert runtime.session.CLOUDFLARE_COOKIE_NAME_PATTERN.match("cf_clearance")
+
+
+def test_runtime_launches_with_the_normalized_probe_user_agent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = _FakeContext()
+    fakes = _RuntimeFakes(
+        monkeypatch,
+        [context],
+        default_user_agent="Mozilla/5.0 HeadlessChrome/140.0",
+    )
+
+    async def scenario() -> None:
+        ask_runtime = runtime.AskRuntime()
+        returned = await ask_runtime._get_context()
+        assert returned is context
+        await ask_runtime.aclose()
+
+    asyncio.run(scenario())
+
+    assert fakes.user_agent_probe_calls == 1
+    assert fakes.launch_calls[0][1] is True
+    assert fakes.user_agent_overrides == ["Mozilla/5.0 Chrome/140.0"]
+
+
+@pytest.mark.parametrize("probe_failure", ["raises", "returns_none"])
+def test_runtime_launches_without_user_agent_when_probe_falls_back(
+    monkeypatch: pytest.MonkeyPatch, probe_failure: str
+) -> None:
+    context = _FakeContext()
+    fakes = _RuntimeFakes(monkeypatch, [context])
+
+    if probe_failure == "raises":
+
+        async def fail_probe() -> str | None:
+            raise RuntimeError("probe failed")
+
+        monkeypatch.setattr(
+            runtime.browser, "read_chromium_user_agent", fail_probe
+        )
+
+    async def scenario() -> None:
+        ask_runtime = runtime.AskRuntime()
+        returned = await ask_runtime._get_context()
+        assert returned is context
+        await ask_runtime.aclose()
+
+    asyncio.run(scenario())
+
+    assert fakes.launch_calls[0][1] is True
+    assert fakes.user_agent_overrides == [None]
+
+
+def test_runtime_releases_profile_lock_when_cookie_clear_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = _FakeContext()
+    fakes = _RuntimeFakes(monkeypatch, [context])
+
+    async def fail_clear_cookies(*, name: Any = None) -> None:
+        raise RuntimeError("cookie clear failed")
+
+    context.clear_cookies = fail_clear_cookies
+
+    async def scenario() -> None:
+        ask_runtime = runtime.AskRuntime()
+        with pytest.raises(RuntimeError, match="cookie clear failed"):
+            await ask_runtime._get_context()
+        await ask_runtime.aclose()
+
+    asyncio.run(scenario())
+
+    assert len(fakes.launch_calls) == 1
+    assert fakes.locks[0].release_calls == 1
+    assert fakes.close_calls == [context]
+    assert context.close_calls == 1
+
+
+def test_runtime_releases_lock_and_reraises_when_context_close_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = _FakeContext()
+    fakes = _RuntimeFakes(monkeypatch, [context])
+
+    async def fail_clear_cookies(*, name: Any = None) -> None:
+        raise RuntimeError("cookie clear failed")
+
+    close_calls = 0
+
+    async def fail_close() -> None:
+        nonlocal close_calls
+        close_calls += 1
+        raise RuntimeError("close failed")
+
+    context.clear_cookies = fail_clear_cookies
+    context.close = fail_close
+
+    async def scenario() -> None:
+        ask_runtime = runtime.AskRuntime()
+        with pytest.raises(RuntimeError, match="cookie clear failed"):
+            await ask_runtime._get_context()
+        await ask_runtime.aclose()
+
+    asyncio.run(scenario())
+
+    assert close_calls == 1
+    assert fakes.locks[0].release_calls == 1
 
 
 def test_runtime_closes_page_when_execute_ask_fails(

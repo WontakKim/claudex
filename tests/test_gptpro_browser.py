@@ -262,6 +262,74 @@ def test_probe_context_removes_headless_user_agent_token(tmp_path: Path) -> None
     ]
 
 
+class _FakeUserAgentBrowser(_FakeResource):
+    def __init__(self) -> None:
+        super().__init__()
+        self.context = _FakeUserAgentContext()
+
+    async def new_context(self) -> _FakeUserAgentContext:
+        return self.context
+
+
+class _FakeUserAgentChromium(_FakeChromium):
+    def __init__(self) -> None:
+        super().__init__()
+        self.user_agent_browser = _FakeUserAgentBrowser()
+
+    async def launch(self, **options: object) -> _FakeUserAgentBrowser:
+        self.launch_calls.append(options)
+        return self.user_agent_browser
+
+
+def test_read_chromium_user_agent_returns_probe_ua_and_closes_resources(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    chromium = _FakeUserAgentChromium()
+    playwright = _FakePlaywright(chromium)
+
+    async def start_playwright() -> _FakePlaywright:
+        return playwright
+
+    monkeypatch.setattr(browser, "_start_playwright", start_playwright)
+
+    user_agent = asyncio.run(browser.read_chromium_user_agent())
+
+    assert user_agent == "Mozilla/5.0 HeadlessChrome/140.0"
+    assert chromium.launch_calls == [{"channel": "chrome", "headless": True}]
+    assert chromium.user_agent_browser.context.closed
+    assert chromium.user_agent_browser.closed
+    assert playwright.stopped
+
+
+def test_persistent_profile_passes_user_agent_only_when_provided(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    chromium = _FakeChromium()
+    playwright = _FakePlaywright(chromium)
+
+    async def start_playwright() -> _FakePlaywright:
+        return playwright
+
+    monkeypatch.setattr(browser, "_start_playwright", start_playwright)
+
+    user_agent = "Mozilla/5.0 Chrome/140.0"
+
+    async def scenario() -> None:
+        with_override = await browser.launch_persistent_profile(
+            tmp_path / "with-override", user_agent=user_agent
+        )
+        without_override = await browser.launch_persistent_profile(
+            tmp_path / "without-override"
+        )
+        await browser.close_playwright_resource(with_override)
+        await browser.close_playwright_resource(without_override)
+
+    asyncio.run(scenario())
+
+    assert chromium.persistent_calls[0][1]["user_agent"] == user_agent
+    assert "user_agent" not in chromium.persistent_calls[1][1]
+
+
 def test_persistent_profile_supports_headless_runtime_mode(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

@@ -284,10 +284,38 @@ async def _launch_persistent_context(
     return await chromium.launch_persistent_context(str(profile_dir), **options)
 
 
+async def read_chromium_user_agent() -> str | None:
+    """Read the default Chromium user agent to reuse its real version.
+
+    Launching an ephemeral headless browser is the cheapest way to learn
+    the exact version string of the installed binary; the value feeds
+    context-level user-agent overrides so headers, navigator.userAgent,
+    and the binary version all agree.
+    """
+    playwright = await _start_playwright()
+    try:
+        browser = await _launch_headless_browser(playwright.chromium)
+    except BaseException:
+        await playwright.stop()
+        raise
+    try:
+        context = await browser.new_context()
+        page = await context.new_page()
+        try:
+            user_agent = await page.evaluate("navigator.userAgent")
+        finally:
+            await context.close()
+    finally:
+        await browser.close()
+        await playwright.stop()
+    return user_agent if isinstance(user_agent, str) else None
+
+
 async def launch_persistent_profile(
     profile_dir: Path,
     *,
     headless: bool = False,
+    user_agent: str | None = None,
 ) -> BrowserContext:
     """Launch a persistent profile, preferring system Chrome."""
     options: dict[str, object] = {
@@ -295,6 +323,8 @@ async def launch_persistent_profile(
         "args": ["--disable-blink-features=AutomationControlled"],
         "ignore_default_args": ["--enable-automation"],
     }
+    if user_agent is not None:
+        options["user_agent"] = user_agent
     playwright = await _start_playwright()
     try:
         context = await _launch_persistent_context(

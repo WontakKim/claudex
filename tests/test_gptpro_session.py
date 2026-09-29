@@ -50,6 +50,19 @@ def test_auth_cookie_policy_selects_the_first_prefixed_cookie() -> None:
     assert session.AUTH_COOKIE_NAME_PATTERN.match("unrelated") is None
 
 
+def test_cloudflare_cookie_pattern_matches_exactly_the_clearance_names() -> None:
+    for name in ("cf_clearance", "__cf_bm", "_cfuvid", "__cflb"):
+        assert session.CLOUDFLARE_COOKIE_NAME_PATTERN.match(name)
+    for name in (
+        "cf_clearance_extra",
+        "xcf_clearance",
+        "__cf_bm2",
+        "cfuvid",
+        "unrelated",
+    ):
+        assert session.CLOUDFLARE_COOKIE_NAME_PATTERN.match(name) is None
+
+
 def test_auth_cookie_policy_rejects_valueless_cookie() -> None:
     cookies = [{"name": session.AUTH_COOKIE_PREFIX, "domain": ".chatgpt.com"}]
 
