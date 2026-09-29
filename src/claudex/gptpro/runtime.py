@@ -828,6 +828,24 @@ class AskRuntime:
                 profile_lock.release()
                 raise
 
+            try:
+                await context.clear_cookies(
+                    name=session.CLOUDFLARE_COOKIE_NAME_PATTERN
+                )
+            except BaseException as exc:
+                # The Chromium process owns the profile directory until the
+                # context is closed, so the lock must not be released first.
+                try:
+                    await browser.close_playwright_resource(context)
+                except BaseException as cleanup_failure:
+                    exc.add_note(
+                        "context cleanup failed with "
+                        f"{type(cleanup_failure).__name__}"
+                    )
+                finally:
+                    profile_lock.release()
+                raise
+
             self._context = context
             self._profile_lock = profile_lock
             return context

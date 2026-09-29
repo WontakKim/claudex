@@ -13,6 +13,11 @@ from claudex.providers.auth_support import write_private_json_atomic
 
 AUTH_COOKIE_PREFIX = "__Secure-next-auth.session-token"
 AUTH_COOKIE_NAME_PATTERN = re.compile("^" + AUTH_COOKIE_PREFIX.replace(".", r"\."))
+# Cloudflare clearance cookies are bound to the issuing client's
+# fingerprint, so a headless relaunch must clear them to mint its own.
+CLOUDFLARE_COOKIE_NAME_PATTERN = re.compile(
+    r"^(?:cf_clearance|__cf_bm|_cfuvid|__cflb)$"
+)
 _LOGIN_COMMAND = "run claudex-gateway gptpro login"
 
 

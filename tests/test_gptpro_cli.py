@@ -377,6 +377,9 @@ class _FakeAskContext:
         self.page = _FakeAskPage()
         self.closed = False
 
+    async def clear_cookies(self, *, name: object = None) -> None:
+        return None
+
     async def new_page(self) -> _FakeAskPage:
         return self.page
 

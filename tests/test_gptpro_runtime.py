@@ -42,6 +42,10 @@ class _FakeContext:
     def __init__(self) -> None:
         self.pages: list[_FakePage] = []
         self.close_calls = 0
+        self.clear_cookies_calls: list[Any] = []
+
+    async def clear_cookies(self, *, name: Any = None) -> None:
+        self.clear_cookies_calls.append(name)
 
     async def new_page(self) -> _FakePage:
         page = _FakePage()
@@ -396,6 +400,83 @@ def test_invalid_session_fails_before_browser_initialization(
         await ask_runtime.aclose()
 
     asyncio.run(scenario())
+
+
+def test_runtime_clears_stale_cloudflare_cookies_after_launch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = _FakeContext()
+    fakes = _RuntimeFakes(monkeypatch, [context])
+
+    async def scenario() -> None:
+        ask_runtime = runtime.AskRuntime()
+        returned = await ask_runtime._get_context()
+        assert returned is context
+        await ask_runtime.aclose()
+
+    asyncio.run(scenario())
+
+    assert len(fakes.launch_calls) == 1
+    assert context.clear_cookies_calls == [
+        runtime.session.CLOUDFLARE_COOKIE_NAME_PATTERN
+    ]
+    assert runtime.session.CLOUDFLARE_COOKIE_NAME_PATTERN.match("cf_clearance")
+
+
+def test_runtime_releases_profile_lock_when_cookie_clear_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = _FakeContext()
+    fakes = _RuntimeFakes(monkeypatch, [context])
+
+    async def fail_clear_cookies(*, name: Any = None) -> None:
+        raise RuntimeError("cookie clear failed")
+
+    context.clear_cookies = fail_clear_cookies
+
+    async def scenario() -> None:
+        ask_runtime = runtime.AskRuntime()
+        with pytest.raises(RuntimeError, match="cookie clear failed"):
+            await ask_runtime._get_context()
+        await ask_runtime.aclose()
+
+    asyncio.run(scenario())
+
+    assert len(fakes.launch_calls) == 1
+    assert fakes.locks[0].release_calls == 1
+    assert fakes.close_calls == [context]
+    assert context.close_calls == 1
+
+
+def test_runtime_releases_lock_and_reraises_when_context_close_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = _FakeContext()
+    fakes = _RuntimeFakes(monkeypatch, [context])
+
+    async def fail_clear_cookies(*, name: Any = None) -> None:
+        raise RuntimeError("cookie clear failed")
+
+    close_calls = 0
+
+    async def fail_close() -> None:
+        nonlocal close_calls
+        close_calls += 1
+        raise RuntimeError("close failed")
+
+    context.clear_cookies = fail_clear_cookies
+    context.close = fail_close
+
+    async def scenario() -> None:
+        ask_runtime = runtime.AskRuntime()
+        with pytest.raises(RuntimeError, match="cookie clear failed"):
+            await ask_runtime._get_context()
+        await ask_runtime.aclose()
+
+    asyncio.run(scenario())
+
+    assert close_calls == 1
+    assert fakes.locks[0].release_calls == 1
 
 
 def test_runtime_closes_page_when_execute_ask_fails(
