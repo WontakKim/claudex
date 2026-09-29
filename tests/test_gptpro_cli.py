@@ -404,8 +404,14 @@ def _install_cli_ask_runtime(
     async def sleep(_interval: float) -> None:
         return None
 
+    async def read_chromium_user_agent() -> str | None:
+        return None
+
     async def launch_persistent_profile(
-        profile_dir: Path, *, headless: bool = False
+        profile_dir: Path,
+        *,
+        headless: bool = False,
+        user_agent: str | None = None,
     ) -> _FakeAskContext:
         assert profile_dir.name == "chrome-profile"
         assert headless is True
@@ -427,6 +433,11 @@ def _install_cli_ask_runtime(
         gptpro_runtime.locking,
         "try_file_lock",
         lambda _path: profile_lock,
+    )
+    monkeypatch.setattr(
+        gptpro_runtime.browser,
+        "read_chromium_user_agent",
+        read_chromium_user_agent,
     )
     monkeypatch.setattr(
         gptpro_runtime.browser,

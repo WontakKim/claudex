@@ -821,8 +821,24 @@ class AskRuntime:
                 raise GptProAskError("error", browser.PROFILE_IN_USE_MESSAGE)
 
             try:
+                # Cloudflare scores the mismatch between the UA header and
+                # navigator.userAgent, so pin both to one version-consistent
+                # value at context level instead of patching headers per page.
+                launch_options: dict[str, object] = {"headless": True}
+                try:
+                    default_user_agent = await browser.read_chromium_user_agent()
+                except Exception:
+                    default_user_agent = None
+                if isinstance(default_user_agent, str) and (
+                    "Headless" in default_user_agent
+                ):
+                    launch_options["user_agent"] = (
+                        browser.remove_headless_user_agent_token(
+                            default_user_agent
+                        )
+                    )
                 context = await browser.launch_persistent_profile(
-                    paths.gptpro_chrome_profile_dir(), headless=True
+                    paths.gptpro_chrome_profile_dir(), **launch_options
                 )
             except BaseException:
                 profile_lock.release()
