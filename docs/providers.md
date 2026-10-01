@@ -15,7 +15,7 @@ OAuth, or refresh flows.
 Launch Claude Code through the gateway:
 
 ```sh
-ANTHROPIC_BASE_URL=http://127.0.0.1:8787 claude
+ENABLE_TOOL_SEARCH=true ANTHROPIC_BASE_URL=http://127.0.0.1:8787 claude
 ```
 
 A logged-in Claude Code needs no token setup: it attaches its own credentials,
@@ -25,7 +25,7 @@ untouched.
 A shell alias covers the launch part:
 
 ```sh
-alias claudex='ANTHROPIC_BASE_URL=http://127.0.0.1:8787 claude'
+alias claudex='ENABLE_TOOL_SEARCH=true ANTHROPIC_BASE_URL=http://127.0.0.1:8787 claude'
 ```
 
 To run only some Claude models on Codex and keep the rest on the real
@@ -42,6 +42,59 @@ than silently dropped), thinking/reasoning blocks, function calls and
 results (with 64-char-safe names for long MCP tool namespaces), usage,
 stop reasons, and native web search; mid-conversation `system` messages
 keep operator authority as Responses `developer` messages.
+
+### MCP tool search and context usage
+
+Claude Code disables tool search by default for a non-Anthropic base URL. With
+many MCP tools, that loads their full schemas into the first request even when
+the prompt is short. The bundled `claudex` launcher (see
+[From the macOS release](getting-started.md#from-the-macos-release)) enables
+tool search unless `ENABLE_TOOL_SEARCH` is already set. For a shell alias or a
+source installation, include the variable as shown above. Changing a gateway
+request cannot enable a tool that the running Claude Code client has disabled.
+
+Claude Code searches its catalog locally and sends the discovered definitions.
+Responses routes preserve the selected names in search results, use stable
+callable aliases for long names, and replay ordered tool additions, schema
+redefinitions, removals, and explicit re-additions. Only the final active
+functions are callable. Historical definitions and change records retain their
+original order; historical references do not reactivate functions withdrawn by
+explicit removal events. Classic clients can retain disconnected tools in their
+catalog without a removal event, so live availability and permissions still
+belong to the client's executor. Tool errors remain errors in the translated
+conversation.
+
+Responses routes validate tool schemas locally. If any tool callable in the
+request has an invalid schema, declares an unsupported `$schema` dialect, or
+uses a `$ref` that the schema does not embed, both `/v1/messages` and
+`/v1/messages/count_tokens` fail with HTTP 400 `invalid_request_error` before
+anything is sent upstream. The message names the function (a name that is not a
+valid Responses function name appears as its `mcp__gw_` alias). The gateway
+never retrieves remote schemas, so fix that MCP server's tool schema or
+disconnect the server. With tool search disabled, every connected MCP tool is
+callable and therefore checked.
+
+The gateway also validates completed function arguments against the current
+schema before emitting an executable call. Text and reasoning still stream,
+while function calls wait for validation. If the arguments fail validation,
+regex checks during argument validation exceed the 2-second budget for that
+call, or the backend stream cannot be matched to one complete call, including a
+stream that ends without a terminal event, no tool call is emitted. The gateway returns an API error
+instead: an `error` event on a streaming response, or HTTP 502 on a
+non-streaming one.
+
+This bridge uses ordinary Responses functions. It does not reproduce Anthropic's
+position-specific schema rendering or guarantee the same prompt-cache behavior.
+Mapped token counting estimates the prepared prompt, while response usage remains
+the backend's reported usage. A Claude-facing model name or `[1m]` suffix does not
+establish the actual mapped backend's context capacity.
+
+Unmapped Anthropic requests keep their original tool protocol. Native
+Anthropic-compatible providers remain responsible for accepting that protocol;
+use `ENABLE_TOOL_SEARCH=false` if a particular upstream does not support it.
+Anthropic's hosted `tool_search_tool_*` API tools are a different protocol from
+Claude Code's client `ToolSearch`; Responses routes reject them with HTTP 400
+instead of converting them into functions.
 
 ### Model suggestions
 

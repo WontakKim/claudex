@@ -708,3 +708,71 @@ def test_custom_provider_dashboard_does_not_handle_or_persist_api_keys() -> None
     assert "localStorage" not in DASHBOARD_JAVASCRIPT
     assert "sessionStorage" not in DASHBOARD_JAVASCRIPT
     assert re.search(r"\bconsole\.", DASHBOARD_JAVASCRIPT) is None
+
+
+def test_local_login_hero_describes_effective_balanced_participation(
+    dashboard_runtime_result: dict[str, Any],
+) -> None:
+    states = dashboard_runtime_result["localHeroStates"]
+    assert "밸런스 서빙 참여 설정" in states["balanced-true"]
+    assert "게이트웨이 서빙 설정 미확인" in states["unknown"]
+    assert "유효한 토큰 필요" in states["balanced-true"]
+    assert "중복 등록 제외" in states["balanced-true"]
+    assert "Local organization" in states["balanced-true"]
+    assert "게이트웨이 서빙과 무관" not in states["balanced-true"]
+    for mode in ["disabled", "fallback", "balanced"]:
+        for included in ["true", "false"]:
+            if mode == "balanced" and included == "true":
+                continue
+            assert "게이트웨이 서빙에 사용하지 않음" in states[f"{mode}-{included}"]
+    assert "밸런스 서빙 참여 설정" in states["unappliedDraft"]
+    assert "로컬 Claude Code 로그인이 없습니다" in states["noLoginIncluded"]
+    assert "밸런스 서빙 참여 설정" in states["noLoginIncluded"]
+    assert "로컬 로그인 필요" in states["noLoginIncluded"]
+    assert "게이트웨이 서빙에 사용하지 않음" in states["noLoginExcluded"]
+
+
+def test_routing_envelope_requires_read_only_local_login_flag(
+    dashboard_runtime_result: dict[str, Any],
+) -> None:
+    assert dashboard_runtime_result["routingEnvelopeValidation"] == {
+        "included": True,
+        "excluded": True,
+        "missing": False,
+        "invalid": False,
+    }
+
+
+def test_routing_first_preserves_local_hero_until_login_fetch_settles(
+    dashboard_runtime_result: dict[str, Any],
+) -> None:
+    states = dashboard_runtime_result["localHeroLoadOrder"]
+    assert "로컬 Claude Code 로그인이 없습니다" not in states["routingFirst"]
+    assert states["routingFirst"] == states["initial"]
+    assert states["pendingLocal"] == states["initial"]
+    assert "loaded@example.com" in states["loaded"]
+    assert "밸런스 서빙 참여 설정" in states["loaded"]
+    assert "로컬 Claude Code 로그인이 없습니다" not in states["loaded"]
+    assert "게이트웨이 서빙에 사용하지 않음" in states["repaintAfterSuccess"]
+    assert "밸런스 서빙 참여 설정" in states["repaintAfterLocalError"]
+
+
+def test_dashboard_health_boot_sends_token_and_renders_identities_after_admin_retry(
+    dashboard_runtime_result: dict[str, Any],
+) -> None:
+    scenarios = dashboard_runtime_result["healthAuthenticationBoot"]
+    assert len(scenarios) == 3
+    for scenario in scenarios:
+        assert scenario["helloHasToken"] is False
+        assert scenario["promptCount"] == (1 if scenario["firstTokenWasValid"] else 2)
+        admin_requests = scenario["adminRequests"]
+        assert len(admin_requests) == (8 if scenario["firstTokenWasValid"] else 16)
+        assert all(
+            request["hasValidToken"] is scenario["firstTokenWasValid"]
+            for request in admin_requests[:8]
+        )
+        assert all(request["hasValidToken"] for request in admin_requests[8:])
+        assert scenario["healthRequests"] == [{"url": "/health", "hasValidToken": True}]
+        assert "codex-identity@example.com" in scenario["identities"]["codex"]
+        assert "kimi-account-identity" in scenario["identities"]["kimi"]
+        assert "grok-identity@example.com" in scenario["identities"]["grok"]

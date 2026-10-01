@@ -1731,3 +1731,29 @@ def test_web_search_ids_are_unique_across_responses(item_fields: dict) -> None:
         assert blocks[1]["tool_use_id"] == blocks[0]["id"]
         call_ids.append(blocks[0]["id"])
     assert call_ids[0] != call_ids[1]
+
+
+def test_response_uses_exact_prepared_active_map_for_inline_names() -> None:
+    original = 'mcp__' + 'inline_service_' * 8 + '__lookup'
+    from claudex.translate.tool_protocol import stable_tool_name
+    alias = stable_tool_name(original)
+    translator = CodexToClaudeStreamTranslator(
+        {'messages': []}, tool_name_map={original: alias}
+    )
+    events = translator.translate_event({
+        'type': 'response.output_item.added', 'output_index': 0,
+        'item': {'type': 'function_call', 'call_id': 'call_inline', 'name': alias},
+    })
+    start = next(payload for name, payload in events if name == 'content_block_start')
+    assert start['content_block']['name'] == original
+
+
+@pytest.mark.parametrize('name', ['removed_tool', 'unknown_alias'])
+def test_response_does_not_emit_undeclared_or_removed_tool_calls(name: str) -> None:
+    from claudex.translate.claude_to_codex import TranslationError
+    translator = CodexToClaudeStreamTranslator({'messages': []}, tool_name_map={'active': 'active'})
+    with pytest.raises(TranslationError, match='undeclared or removed'):
+        translator.translate_event({
+            'type': 'response.output_item.added', 'output_index': 0,
+            'item': {'type': 'function_call', 'call_id': 'call_bad', 'name': name},
+        })

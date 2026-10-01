@@ -15,6 +15,7 @@ Claude's block-oriented SSE protocol:
 
 from __future__ import annotations
 
+import asyncio
 import itertools
 import json
 import re
@@ -23,8 +24,9 @@ from typing import Any
 from uuid import uuid4
 
 import claudex.translate.context_overflow as context_overflow
-from claudex.translate.claude_to_codex import build_tool_name_shortening_map, shorten_call_id
+from claudex.translate.claude_to_codex import TranslationError, build_tool_name_shortening_map, shorten_call_id
 from claudex.translate.thought_signature import encode_call_signature_carrier
+from claudex.translate.tool_validation import compile_function_validators, parse_function_arguments, validate_function_arguments
 from claudex.translate.server_tool_history import GATEWAY_SERVER_TOOL_ID_PREFIX
 
 # Claude tool_use ids only allow this alphabet.
@@ -40,6 +42,28 @@ _THINKING_SUMMARY_PART_SEPARATOR = "\n\n"
 estimate_overflow_prompt_tokens = context_overflow.estimate_overflow_prompt_tokens
 
 ClaudeEvent = tuple[str, dict[str, Any]]
+
+
+def _json_values_equal(left: Any, right: Any) -> bool:
+    pending_values = [(left, right)]
+    while pending_values:
+        left, right = pending_values.pop()
+        if isinstance(left, dict):
+            if not isinstance(right, dict) or left.keys() != right.keys():
+                return False
+            pending_values.extend((left[key], right[key]) for key in left)
+        elif isinstance(left, list):
+            if not isinstance(right, list) or len(left) != len(right):
+                return False
+            pending_values.extend(zip(left, right))
+        elif isinstance(right, (dict, list)):
+            return False
+        elif isinstance(left, bool) or isinstance(right, bool):
+            if type(left) is not type(right) or left != right:
+                return False
+        elif left != right:
+            return False
+    return True
 
 
 def sanitize_claude_tool_id(tool_id: str) -> str:
@@ -118,6 +142,8 @@ class _PendingFunctionCall:
     claude_tool_id: str = ""
     output_index: Any = None
     item_id: str = ""
+    name: str = ""
+    is_complete: bool = False
 
 
 @dataclass
@@ -136,8 +162,14 @@ class CodexToClaudeStreamTranslator:
     claude_request: dict[str, Any]
     context_window: int | None = None
     custom_provider: str | None = None
+    tool_name_map: dict[str, str] | None = None
+    countable_request: dict[str, Any] | None = None
+    function_schemas: dict[str, dict] | None = None
+    regex_dialect: str = "python"
 
     _short_to_original: dict[str, str] = field(init=False)
+    _function_validators: dict[str, Any] | None = field(init=False)
+    _buffered_function_calls: list[_PendingFunctionCall] = field(default_factory=list)
     _block_index: int = 0
     _text_block_open: bool = False
     _thinking_block_open: bool = False
@@ -153,6 +185,8 @@ class CodexToClaudeStreamTranslator:
     _has_received_arguments_delta: bool = False
     _has_text_delta: bool = False
     _has_emitted_tool_use: bool = False
+    _terminal_received: bool = False
+    _allocated_tool_ids: set[str] = field(default_factory=set)
     _pending_calls: dict[str, _PendingFunctionCall] = field(default_factory=dict)
     _last_pending_key: str = ""
     _closed_function_calls: list[_ClosedFunctionCall] = field(default_factory=list)
@@ -163,14 +197,58 @@ class CodexToClaudeStreamTranslator:
     _last_web_search_tool_use_id: str = ""
 
     def __post_init__(self) -> None:
-        self._short_to_original = _build_reverse_tool_name_map(self.claude_request)
+        self._function_validators = (
+            compile_function_validators(self.function_schemas, regex_dialect=self.regex_dialect)
+            if self.function_schemas is not None
+            else None
+        )
+        self._short_to_original = (
+            {alias: original for original, alias in self.tool_name_map.items()}
+            if self.tool_name_map is not None
+            else _build_reverse_tool_name_map(self.claude_request)
+        )
+
+    async def translate_event_async(self, event: dict[str, Any]) -> list[ClaudeEvent]:
+        event_type = event.get("type", "")
+        item = event.get("item") or {}
+        if self._function_validators is not None and (
+            (event_type in ("response.output_item.added", "response.output_item.done")
+             and item.get("type") == "function_call")
+            or event_type in ("response.function_call_arguments.done", "response.completed", "response.incomplete")
+        ):
+            return await asyncio.to_thread(self.translate_event, event)
+        return self.translate_event(event)
 
     def translate_event(self, event: dict[str, Any]) -> list[ClaudeEvent]:
         event_type = event.get("type", "")
+        if event_type in ("response.completed", "response.incomplete", "response.failed", "response.error", "error"):
+            self._terminal_received = True
+        if self._function_validators is not None:
+            item = event.get("item") or {}
+            if (
+                event_type in ("response.output_item.added", "response.output_item.done")
+                and item.get("type") == "function_call"
+            ) or event_type in (
+                "response.function_call_arguments.delta", "response.function_call_arguments.done"
+            ):
+                return self._buffer_function_call_event(event)
         handler = getattr(self, "_on_" + event_type.replace("response.", "").replace(".", "_"), None)
         if handler is None:
             return []
         return handler(event)
+
+    def finish(self) -> None:
+        if not self._terminal_received:
+            raise TranslationError("codex stream ended without a terminal response event")
+
+    def _allocate_claude_tool_id(self, call_id: str) -> str:
+        tool_id = sanitize_claude_tool_id(call_id)
+        # The request-side mapping cannot invert sanitation or disambiguating
+        # suffixes, so collisions must fail before another executable start.
+        if tool_id in self._allocated_tool_ids:
+            raise TranslationError("upstream returned a public tool id collision")
+        self._allocated_tool_ids.add(tool_id)
+        return tool_id
 
     # --- lifecycle events ---------------------------------------------------
 
@@ -239,7 +317,9 @@ class CodexToClaudeStreamTranslator:
             return None
         if self.context_window is None:
             return context_overflow.rewrite_context_overflow_message(code, text)
-        estimated_tokens = context_overflow.estimate_overflow_prompt_tokens(self.claude_request)
+        estimated_tokens = context_overflow.estimate_overflow_prompt_tokens(
+            self.countable_request if self.countable_request is not None else self.claude_request
+        )
         return context_overflow.rewrite_context_overflow_message(
             code, text, estimated_tokens=estimated_tokens, context_window=self.context_window
         )
@@ -247,6 +327,8 @@ class CodexToClaudeStreamTranslator:
     def _on_completed(self, event: dict[str, Any]) -> list[ClaudeEvent]:
         response = event.get("response") or {}
         events: list[ClaudeEvent] = []
+        if self._function_validators is not None:
+            events.extend(self._flush_buffered_calls_from_terminal(event))
         events.extend(self._hydrate_open_function_call_from_terminal(response))
         events.extend(self._finalize_open_blocks())
         events.extend(self._flush_pending_calls_from_terminal(response))
@@ -345,7 +427,7 @@ class CodexToClaudeStreamTranslator:
                 retained_signature = signature
             claude_tool_id = pending.claude_tool_id if pending is not None else ""
             if not claude_tool_id:
-                claude_tool_id = sanitize_claude_tool_id(call_id)
+                claude_tool_id = self._allocate_claude_tool_id(call_id)
             if pending is not None:
                 self._delete_pending_aliases(alias_keys)
 
@@ -391,7 +473,7 @@ class CodexToClaudeStreamTranslator:
                     return []
                 call_id = pending.call_id or item.get("call_id", "")
                 if not pending.claude_tool_id:
-                    pending.claude_tool_id = sanitize_claude_tool_id(call_id)
+                    pending.claude_tool_id = self._allocate_claude_tool_id(call_id)
                 block_index = self._block_index
                 events = self._function_call_start(pending.claude_tool_id, name, block_index)
                 self._has_emitted_tool_use = True
@@ -621,6 +703,171 @@ class CodexToClaudeStreamTranslator:
             self._last_web_search_tool_use_id = ""
         return events
 
+    # --- validated executable function calls ---------------------------------
+
+    def _buffered_call_for_event(
+        self, event: dict[str, Any], *, terminal_position: int | None = None,
+        matched_terminal_calls: set[int] | None = None,
+    ) -> _PendingFunctionCall:
+        item = event.get("item") or {}
+        call_id = item.get("call_id") or event.get("call_id") or ""
+        item_id = self._function_call_item_id(event, item)
+        output_index = event.get("output_index")
+        matches = [
+            call for call in self._buffered_function_calls
+            if (call_id and call.call_id == call_id)
+            or (item_id and call.item_id == item_id)
+            or (output_index is not None and call.output_index == output_index)
+        ]
+        if matches and matched_terminal_calls is not None and any(
+            id(call) in matched_terminal_calls for call in matches
+        ):
+            raise TranslationError("upstream returned ambiguous function call identity")
+        if not matches and event.get("type") != "response.output_item.added":
+            # Terminal list positions are not stable output indices. Reconcile
+            # partial identities before treating a terminal item as a new call.
+            matches = [
+                call for call in self._buffered_function_calls
+                if (matched_terminal_calls is None or id(call) not in matched_terminal_calls)
+                and all(not previous or not incoming or previous == incoming
+                       for previous, incoming in ((call.call_id, call_id), (call.item_id, item_id),
+                                                  (call.name, item.get("name"))))
+                and (output_index is None or call.output_index is None or call.output_index == output_index)
+                and (not call.start_emitted or terminal_position is not None or call_id or item_id
+                     or output_index is not None)
+            ]
+        if len(matches) > 1:
+            raise TranslationError("upstream returned ambiguous function call identity")
+        if matches:
+            call = matches[0]
+        else:
+            call = _PendingFunctionCall()
+            self._buffered_function_calls.append(call)
+            if output_index is None:
+                output_index = terminal_position
+        for attribute, value in (("call_id", call_id), ("item_id", item_id), ("name", item.get("name"))):
+            if not value:
+                continue
+            if not isinstance(value, str):
+                raise TranslationError("upstream returned invalid function call identity")
+            previous = getattr(call, attribute)
+            if previous and previous != value:
+                raise TranslationError("upstream changed function call identity")
+            setattr(call, attribute, value)
+        if output_index is not None:
+            if call.output_index is not None and call.output_index != output_index:
+                raise TranslationError("upstream changed function call output index")
+            call.output_index = output_index
+        return call
+
+    def _buffer_function_call_event(
+        self, event: dict[str, Any], *, flush: bool = True
+    ) -> list[ClaudeEvent]:
+        call = self._buffered_call_for_event(event)
+        event_type = event.get("type")
+        item = event.get("item") or {}
+        if event_type == "response.function_call_arguments.delta":
+            if call.is_complete:
+                raise TranslationError("upstream appended arguments to a completed function call")
+            delta = event.get("delta", "")
+            if not isinstance(delta, str):
+                raise TranslationError("upstream returned invalid function argument delta")
+            if not call.has_received_arguments_delta:
+                call.arguments = ""
+            call.has_received_arguments_delta = True
+            call.arguments += delta
+            return []
+
+        argument_source = event if event_type == "response.function_call_arguments.done" else item
+        if "arguments" in argument_source:
+            arguments = argument_source["arguments"]
+            if not isinstance(arguments, str):
+                raise TranslationError("upstream returned invalid JSON function arguments")
+            # An added snapshot may hydrate the name after argument events. Only
+            # completion snapshots are authoritative over an existing buffer.
+            if event_type != "response.output_item.added" or not (
+                call.has_received_arguments_delta or call.arguments
+            ):
+                if call.start_emitted:
+                    validate_function_arguments(self._function_validators, call.name, arguments)
+                    if not _json_values_equal(
+                        parse_function_arguments(call.arguments, call.name),
+                        parse_function_arguments(arguments, call.name),
+                    ):
+                        raise TranslationError("upstream changed emitted function call arguments")
+                else:
+                    call.arguments = arguments
+        signature = self._function_call_thought_signature(item)
+        if signature is not None and (
+            call.call_id or call.item_id or call.output_index is not None
+            or event_type == "response.output_item.added"
+        ):
+            call.signature = signature
+        if call.start_emitted:
+            for closed_call in self._closed_function_calls:
+                if closed_call.claude_tool_id == call.claude_tool_id:
+                    closed_call.call_id = call.call_id
+                    closed_call.item_id = call.item_id
+                    break
+        if event_type != "response.output_item.done":
+            return []
+        if item.get("status", "completed") != "completed":
+            raise TranslationError("upstream returned an incomplete function call")
+        call.is_complete = True
+        if call.name:
+            validate_function_arguments(self._function_validators, call.name, call.arguments)
+        return self._flush_validated_function_calls() if flush else []
+
+    def _flush_validated_function_calls(self) -> list[ClaudeEvent]:
+        events: list[ClaudeEvent] = []
+        for call in self._buffered_function_calls:
+            if call.start_emitted:
+                continue
+            if not call.is_complete or not call.name:
+                break
+            validate_function_arguments(self._function_validators, call.name, call.arguments)
+            events.extend(self._finalize_thinking_block())
+            events.extend(self._stop_text_block())
+            call.claude_tool_id = self._allocate_claude_tool_id(call.call_id)
+            block_index = self._block_index
+            events.extend(self._function_call_start(call.claude_tool_id, call.name, block_index))
+            events.extend(self._function_call_arguments_delta(call.arguments, block_index))
+            events.extend(self._function_call_stop(block_index))
+            self._block_index += 1
+            call.start_emitted = True
+            self._has_emitted_tool_use = True
+            events.extend(self._carrier_thinking_block_events(call.claude_tool_id, call.signature))
+            self._retain_closed_function_call(
+                call_id=call.call_id, claude_tool_id=call.claude_tool_id,
+                signature=call.signature, output_index=call.output_index, item_id=call.item_id,
+            )
+        return events
+
+    def _flush_buffered_calls_from_terminal(self, event: dict[str, Any]) -> list[ClaudeEvent]:
+        response = event.get("response") or {}
+        matched_calls: set[int] = set()
+        for output_index, item in enumerate(response.get("output") or []):
+            if not isinstance(item, dict) or item.get("type") != "function_call":
+                continue
+            done_event = {"type": "response.output_item.done", "item": item}
+            if "output_index" in item:
+                done_event["output_index"] = item["output_index"]
+            call = self._buffered_call_for_event(
+                done_event, terminal_position=output_index, matched_terminal_calls=matched_calls
+            )
+            matched_calls.add(id(call))
+            if call.output_index is not None:
+                done_event["output_index"] = call.output_index
+            if (
+                event.get("type") == "response.incomplete"
+                and not call.is_complete and item.get("status") != "completed"
+            ):
+                raise TranslationError("upstream returned an incomplete function call")
+            self._buffer_function_call_event(done_event, flush=False)
+        if any(not call.is_complete or not call.name for call in self._buffered_function_calls):
+            raise TranslationError("upstream returned an incomplete or nameless function call")
+        return self._flush_validated_function_calls()
+
     # --- function call argument events ---------------------------------------
 
     def _function_call_thought_signature(self, item: dict[str, Any]) -> str | None:
@@ -808,7 +1055,7 @@ class CodexToClaudeStreamTranslator:
                 continue
             call_id = pending.call_id or item.get("call_id", "")
             if not pending.claude_tool_id:
-                pending.claude_tool_id = sanitize_claude_tool_id(call_id)
+                pending.claude_tool_id = self._allocate_claude_tool_id(call_id)
 
             block_index = self._block_index
             events.extend(self._function_call_start(pending.claude_tool_id, name, block_index))
@@ -937,6 +1184,7 @@ class CodexToClaudeStreamTranslator:
         self._function_call_signature = ""
         self._closed_function_calls.clear()
         self._emitted_carrier_tool_ids.clear()
+        self._buffered_function_calls.clear()
         for pending in self._pending_calls.values():
             pending.signature = ""
             pending.claude_tool_id = ""
@@ -1074,6 +1322,8 @@ class CodexToClaudeStreamTranslator:
     def _function_call_start(
         self, claude_tool_id: str, name: str, block_index: int
     ) -> list[ClaudeEvent]:
+        if self.tool_name_map is not None and name not in self._short_to_original:
+            raise TranslationError(f"upstream returned an undeclared or removed function: {name}")
         return [
             (
                 "content_block_start",
@@ -1197,10 +1447,6 @@ def assemble_claude_message(claude_events: list[ClaudeEvent]) -> dict[str, Any] 
         block = blocks[index]
         if block.get("type") in ("tool_use", "server_tool_use"):
             raw_arguments = partial_json.get(index, "")
-            try:
-                tool_input = json.loads(raw_arguments) if raw_arguments else {}
-            except json.JSONDecodeError:
-                tool_input = {}
-            block["input"] = tool_input if isinstance(tool_input, dict) else {}
+            block["input"] = parse_function_arguments(raw_arguments or "{}", block.get("name", ""))
         message["content"].append(block)
     return message

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from dataclasses import replace
@@ -34,6 +35,7 @@ from claudex.config import (
     update_settings_file,
     validate_model_map,
 )
+from claudex.config.settings_io import read_settings_file
 from claudex.providers.backends import RouteBackend
 
 logger = logging.getLogger("claudex.server")
@@ -659,11 +661,12 @@ _CLAUDE_ROUTING_KEYS = ("mode",)
 
 
 def _claude_routing_payload(config: GatewayConfig) -> dict[str, Any]:
-    """Pinned {mode, env_locked} envelope for claude pool/routing."""
+    """Routing mode and lock state, plus read-only local-login inclusion."""
     env_name = SETTINGS_KEYS["claude_account.routing"]
     return {
         "mode": config.claude_account_routing_mode,
         "env_locked": os.environ.get(env_name) is not None,
+        "include_local_login": config.claude_account_include_local_login,
     }
 
 
@@ -675,17 +678,23 @@ async def _handle_admin_claude_routing_get(request: Request) -> JSONResponse:
 
 
 def _persist_claude_routing_mode(config: GatewayConfig, mode: str) -> None:
-    """Write `claude_account.routing` to `mode`'s on-disk representation.
-
-    "disabled" is represented by the settings key's absence; every other
-    mode ("fallback", "balanced") persists the policy document
-    ({"mode": mode}), whose object form leaves room for a mode to carry its
-    own config block without renaming the key.
-    """
-    if mode == "disabled":
+    """Change only the mode, retaining policy fields across disable/re-enable."""
+    stored_policy = read_settings_file(config.settings_file).get("claude_account.routing", {})
+    if isinstance(stored_policy, str):
+        try:
+            stored_policy = json.loads(stored_policy) if stored_policy else {}
+        except json.JSONDecodeError as exc:
+            raise ConfigError(f"claude account routing is not valid JSON: {exc}") from exc
+    if not isinstance(stored_policy, dict):
+        raise ConfigError("claude account routing must be a JSON object")
+    policy = {**stored_policy, "mode": mode}
+    if not config.claude_account_include_local_login:
+        policy.setdefault("include_local_login", False)
+    # Removing a policy with extra fields would reset them to defaults on restart.
+    if policy == {"mode": "disabled"}:
         update_settings_file(config.settings_file, {}, deletions=("claude_account.routing",))
     else:
-        update_settings_file(config.settings_file, {"claude_account.routing": {"mode": mode}})
+        update_settings_file(config.settings_file, {"claude_account.routing": policy})
 
 
 async def _handle_admin_claude_routing_put(request: Request) -> JSONResponse:
@@ -705,7 +714,12 @@ async def _handle_admin_claude_routing_put(request: Request) -> JSONResponse:
     handler returning 500 with the mode unchanged. After persistence succeeds,
     the runtime rotates the epoch and publishes the target mode in memory before
     waking requests that arrived mid-transition. Switching between "disabled"
-    and "fallback" uses the settings-file swap directly.
+    and "fallback" uses the settings-file swap directly. If startup restoration
+    left balanced routing inactive, exiting persists and publishes without
+    teardown, while selecting balanced retries preparation instead of merely
+    persisting the existing mode. A failed retry returns 400 for invalid account
+    profiles or 503 for unavailable runtime dependencies; settings persistence
+    failures still return 500 with the published mode unchanged.
     """
     denied = _admin_guard(request) or _require_json_content_type(request)
     if denied is not None:
@@ -749,7 +763,8 @@ async def _handle_admin_claude_routing_put(request: Request) -> JSONResponse:
         current_mode = config.claude_account_routing_mode
         runtime: ClaudeBalancedRuntime = request.app.state.claude_balanced_runtime
 
-        if mode == "balanced" and current_mode != "balanced":
+        if mode == "balanced" and (current_mode != "balanced" or not runtime.epoch_active):
+            is_recovery = current_mode == "balanced"
             lease = getattr(request.app.state, "claude_pool_lease", None)
             if lease is None:
                 return JSONResponse(
@@ -758,7 +773,7 @@ async def _handle_admin_claude_routing_put(request: Request) -> JSONResponse:
                         "the claude account pool lease is not held; balanced "
                         "routing cannot be enabled",
                     ),
-                    status_code=500,
+                    status_code=503 if is_recovery else 500,
                 )
             try:
                 accounts = list_accounts()
@@ -767,10 +782,14 @@ async def _handle_admin_claude_routing_put(request: Request) -> JSONResponse:
                     server_support._openai_error_body(
                         "server_error", f"cannot read the claude account registry: {exc}"
                     ),
-                    status_code=500,
+                    status_code=503 if is_recovery else 500,
                 )
 
+            is_persisting = False
+
             def _persist_balanced() -> None:
+                nonlocal is_persisting
+                is_persisting = True
                 _persist_claude_routing_mode(config, "balanced")
                 request.app.state.config = replace(config, claude_account_routing_mode="balanced")
 
@@ -792,7 +811,7 @@ async def _handle_admin_claude_routing_put(request: Request) -> JSONResponse:
                     server_support._openai_error_body(
                         "server_error", f"could not enable balanced routing: {exc}"
                     ),
-                    status_code=500,
+                    status_code=503 if is_recovery and not is_persisting else 500,
                 )
             return JSONResponse(_claude_routing_payload(request.app.state.config))
 

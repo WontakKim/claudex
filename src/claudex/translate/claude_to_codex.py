@@ -21,6 +21,7 @@ import uuid
 from typing import Any
 
 from .server_tool_history import normalize_server_tool_history
+from .tool_protocol import ToolProtocolError, ToolState, compile_tool_state, stable_tool_name
 from .thought_signature import (
     decode_call_signature_carrier,
     is_call_signature_carrier,
@@ -64,42 +65,16 @@ def is_gpt_reasoning_signature(signature: str) -> bool:
 
 
 def shorten_tool_name(name: str) -> str:
-    """Shorten a tool name to the Responses API limit, keeping MCP names readable."""
-    if len(name) <= _NAME_LIMIT:
-        return name
-    if name.startswith("mcp__"):
-        separator_index = name.rfind("__")
-        if separator_index > 0:
-            candidate = "mcp__" + name[separator_index + 2 :]
-            return candidate[:_NAME_LIMIT]
-    return name[:_NAME_LIMIT]
+    """Return the same callable name regardless of the loaded tool subset."""
+    return stable_tool_name(name)
 
 
 def build_tool_name_shortening_map(claude_request: dict[str, Any]) -> dict[str, str]:
-    """Map original tool names to unique shortened names for this request."""
-    names = [
-        tool["name"]
-        for tool in claude_request.get("tools") or []
-        if isinstance(tool, dict) and isinstance(tool.get("name"), str) and tool["name"]
-    ]
-
-    used: set[str] = set()
-    mapping: dict[str, str] = {}
-    for name in names:
-        candidate = shorten_tool_name(name)
-        if candidate in used:
-            suffix_counter = 1
-            while True:
-                suffix = f"_{suffix_counter}"
-                truncated = candidate[: max(_NAME_LIMIT - len(suffix), 0)]
-                unique = truncated + suffix
-                if unique not in used:
-                    candidate = unique
-                    break
-                suffix_counter += 1
-        used.add(candidate)
-        mapping[name] = candidate
-    return mapping
+    """Map declared and historical names without allocating order-dependent aliases."""
+    try:
+        return compile_tool_state(claude_request).name_map
+    except ToolProtocolError as exc:
+        raise TranslationError(str(exc)) from exc
 
 
 def shorten_call_id(call_id: str) -> str:
@@ -576,6 +551,24 @@ def _normalize_tool_parameters(
 
 
 
+def build_function_validation_schemas(tool_state: ToolState, payload: dict[str, Any]) -> dict[str, dict]:
+    """Retain local dialect declarations on the prepared upstream schemas."""
+    declarations = {
+        tool_state.name_map[tool["name"]]: tool.get("input_schema")
+        for tool in tool_state.tools
+    }
+    schemas = {}
+    for tool in payload.get("tools", []):
+        if tool.get("type") != "function":
+            continue
+        schema = dict(tool["parameters"])
+        declared = declarations.get(tool["name"])
+        if isinstance(declared, dict) and "$schema" in declared:
+            schema["$schema"] = declared["$schema"]
+        schemas[tool["name"]] = schema
+    return schemas
+
+
 def _image_data_url(source: dict[str, Any]) -> str | None:
     data = source.get("data") or source.get("base64")
     if not data:
@@ -607,13 +600,18 @@ def _translate_system_prompt(system: Any) -> dict[str, Any] | None:
     }
 
 
-def _translate_tool_result_output(content: Any) -> str | list[dict[str, Any]]:
+def _translate_tool_result_output(
+    content: Any, *, is_error: bool = False
+) -> str | list[dict[str, Any]]:
     if isinstance(content, str):
-        return content
+        return f"[tool error] {content}" if is_error else content
     if not isinstance(content, list):
-        return "" if content is None else str(content)
+        result = "" if content is None else str(content)
+        return f"[tool error] {result}" if is_error else result
 
     items: list[dict[str, Any]] = []
+    if is_error:
+        items.append({"type": "input_text", "text": "[tool error]"})
     for block in content:
         if not isinstance(block, dict):
             continue
@@ -668,6 +666,7 @@ def _translate_messages(
     name_map: dict[str, str],
     *,
     custom_provider: str | None,
+    tool_state: ToolState,
 ) -> list[dict[str, Any]]:
     input_items: list[dict[str, Any]] = []
 
@@ -675,24 +674,29 @@ def _translate_messages(
     if system_message is not None:
         input_items.append(system_message)
 
-    for message in claude_request.get("messages") or []:
+    for message_index, message in enumerate(claude_request.get("messages") or []):
         if not isinstance(message, dict):
             continue
         role = message.get("role", "")
         content = message.get("content")
 
         if role == "system":
-            # Mid-conversation system messages keep their position but carry
-            # operator authority, which Responses expresses as "developer".
-            text = content if isinstance(content, str) else _collect_text_blocks(content)
-            if text:
-                input_items.append(
-                    {
-                        "type": "message",
-                        "role": "developer",
-                        "content": [{"type": "input_text", "text": text}],
-                    }
-                )
+            # Control events remain chronological developer records; callable
+            # schemas come from the final active set, not historical references.
+            parts = []
+            if isinstance(content, str):
+                parts.append({"type": "input_text", "text": content})
+            elif isinstance(content, list):
+                for block_index, block in enumerate(content):
+                    if not isinstance(block, dict):
+                        continue
+                    marker = tool_state.markers.get((message_index, block_index))
+                    if marker is not None:
+                        parts.append({"type": "input_text", "text": marker})
+                    elif block.get("type") == "text":
+                        parts.append({"type": "input_text", "text": block.get("text", "")})
+            if parts:
+                input_items.append({"type": "message", "role": "developer", "content": parts})
             continue
 
         content_parts: list[dict[str, Any]] = []
@@ -747,7 +751,7 @@ def _translate_messages(
                 if carrier_counts[call_id] == 1 and tool_use_counts.get(call_id) == 1
             }
 
-        for block in content:
+        for block_index, block in enumerate(content):
             if not isinstance(block, dict):
                 continue
             block_type = block.get("type")
@@ -794,26 +798,26 @@ def _translate_messages(
                 input_items.append(function_call)
             elif block_type == "tool_result":
                 flush()
+                result_content = block.get("content")
+                if isinstance(result_content, list):
+                    result_content = [
+                        {"type": "text", "text": tool_state.references[(message_index, block_index, index)]}
+                        if (message_index, block_index, index) in tool_state.references else item
+                        for index, item in enumerate(result_content)
+                    ]
                 input_items.append(
                     {
                         "type": "function_call_output",
                         "call_id": shorten_call_id(block.get("tool_use_id", "")),
-                        "output": _translate_tool_result_output(block.get("content")),
+                        "output": _translate_tool_result_output(
+                            result_content, is_error=block.get("is_error") is True
+                        ),
                     }
                 )
         flush()
 
     return input_items
 
-
-def _collect_text_blocks(content: Any) -> str:
-    if not isinstance(content, list):
-        return ""
-    return "".join(
-        block.get("text", "")
-        for block in content
-        if isinstance(block, dict) and block.get("type") == "text"
-    )
 
 
 def web_search_tool_names(claude_request: dict[str, Any]) -> set[str]:
@@ -842,8 +846,9 @@ def _translate_tools(
     name_map: dict[str, str],
     *,
     codex_regex_compat: bool = False,
+    tool_state: ToolState,
 ) -> list[dict[str, Any]] | None:
-    tools = claude_request.get("tools")
+    tools = tool_state.tools
     if not isinstance(tools, list):
         return None
 
@@ -865,6 +870,13 @@ def _translate_tools(
         }
         if tool.get("description"):
             function_tool["description"] = tool["description"]
+        if name == "ToolSearch":
+            function_tool["description"] = (
+                "Search the client tool catalog. Use original tool names in select: queries. "
+                "Results identify original names and callable aliases. Call only currently "
+                "declared functions and follow their parameter schemas. "
+                + function_tool.get("description", "")
+            )
         translated.append(function_tool)
     return translated
 
@@ -933,6 +945,8 @@ def translate_claude_request_to_codex(
     service_tier: str | None = None,
     custom_provider: str | None = None,
     codex_regex_compat: bool = False,
+    tool_state: ToolState | None = None,
+    beta_header: str | None = None,
 ) -> dict[str, Any]:
     """Build a Codex Responses API payload, optionally with a service tier.
 
@@ -942,8 +956,15 @@ def translate_claude_request_to_codex(
     upstream validates schemas like Python's re module (the Codex backend),
     because the rewrite rejects patterns a JavaScript engine accepts.
     """
+    if tool_state is None:
+        try:
+            tool_state = compile_tool_state(claude_request, beta_header=beta_header)
+        except ToolProtocolError as exc:
+            raise TranslationError(str(exc)) from exc
+    name_map = tool_state.name_map
+    # Server-history normalization replaces blocks in place, preserving event
+    # coordinates. Compile controls first so legal native placement is retained.
     claude_request = normalize_server_tool_history(claude_request)
-    name_map = build_tool_name_shortening_map(claude_request)
 
     payload: dict[str, Any] = {
         "model": codex_model,
@@ -952,6 +973,7 @@ def translate_claude_request_to_codex(
             claude_request,
             name_map,
             custom_provider=custom_provider,
+            tool_state=tool_state,
         ),
         "reasoning": {
             "effort": reasoning_effort_override or _derive_reasoning_effort(claude_request),
@@ -966,7 +988,7 @@ def translate_claude_request_to_codex(
         payload["service_tier"] = service_tier
 
     tools = _translate_tools(
-        claude_request, name_map, codex_regex_compat=codex_regex_compat
+        claude_request, name_map, codex_regex_compat=codex_regex_compat, tool_state=tool_state
     )
     # An empty tools list means "no tools": neither field may go out, since
     # Grok 400s on tool_choice without tools and Codex rejects
@@ -974,7 +996,8 @@ def translate_claude_request_to_codex(
     if tools:
         payload["tools"] = tools
         payload["tool_choice"] = _translate_tool_choice(
-            claude_request.get("tool_choice"), name_map, web_search_tool_names(claude_request)
+            claude_request.get("tool_choice"), name_map,
+            {tool["name"] for tool in tool_state.tools if tool.get("type") in _CLAUDE_WEB_SEARCH_TOOL_TYPES}
         )
 
     # The Responses API rejects parallel_tool_calls when no tools are present.

@@ -232,7 +232,10 @@ def _local_claude_login_fields() -> dict[str, Any] | None:
     `$CLAUDE_CONFIG_DIR/.claude.json` when the override is set): the same
     `oauthAccount` block a capture snapshots — identity and plan metadata,
     never secrets. The dashboard presents this informational snapshot as the
-    local CLI login; it does not affect request serving.
+    local CLI login. When balanced routing includes the local login, its
+    valid credentials can serve traffic unless a registered account has the
+    same identity. Missing or expired tokens exclude it from the pool; the
+    gateway does not refresh the local CLI token.
     Missing or malformed files degrade to None (no local login).
     """
     override = os.environ.get("CLAUDE_CONFIG_DIR")

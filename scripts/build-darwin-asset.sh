@@ -139,7 +139,7 @@ if [ "$#" -eq 1 ] && [ "$1" = "settings" ]; then
   exec open "$BASE_URL/"
 fi
 command -v claude >/dev/null 2>&1 || { echo "claudex: claude (Claude Code) is not on PATH" >&2; exit 127; }
-exec env ANTHROPIC_BASE_URL="$BASE_URL" claude "$@"
+exec env ANTHROPIC_BASE_URL="$BASE_URL" ENABLE_TOOL_SEARCH="${ENABLE_TOOL_SEARCH-true}" claude "$@"
 EOF
 chmod +x "${STAGE}/bin/claudex"
 

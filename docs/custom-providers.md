@@ -36,13 +36,19 @@ Define either or both families in `~/.claudex/settings.json`:
 Provider names must match `^[a-z][a-z0-9-]{0,31}$`, must be unique across
 families, and cannot be `codex`, `kimi`, `grok`, `claude`, or `anthropic`.
 The model ID after the provider prefix is supplied by the operator and is sent
-upstream without a gateway model allowlist.
+upstream without a gateway model allowlist. Unknown families or entry keys
+abort startup. Startup also fails when an Anthropic-compatible provider's
+`api_key` appears inside any custom provider name or `base_url`, or when any
+custom provider's `api_key` appears inside an Anthropic-compatible provider's
+name or `base_url`.
 
 Custom providers are edited in `settings.json` only; the dashboard does not
 provide provider CRUD. Restart the daemon after changing a provider definition.
 `CLAUDEX_CUSTOM_PROVIDERS` accepts the same `custom_providers` object as
-JSON-encoded text, and `CLAUDEX_CUSTOM_PROVIDERS=''` disables all custom
-providers.
+JSON-encoded text and, when set, replaces the `settings.json` value.
+`CLAUDEX_CUSTOM_PROVIDERS=''` disables all custom providers; a `model_map` or
+`context_window_map` target that still names one of them then fails startup as
+an unknown provider prefix.
 
 ## OpenAI-compatible schema
 
@@ -68,6 +74,26 @@ insufficient.
 An upstream `401` is returned as an upstream error. The gateway does not refresh
 or retry a custom OpenAI-compatible credential.
 
+Tool input schemas reach this family exactly as the client sent them: the
+Codex-only regex rewriting does not apply, and `tool_schema_regex_compat` is
+not a valid key for this family. The gateway still checks tools locally, as on
+other [Responses routes](providers.md#mcp-tool-search-and-context-usage):
+
+- Before any upstream request, an active tool with an invalid parameter schema,
+  an unsupported root `$schema` dialect, or an external `$ref` is rejected with
+  `400 invalid_request_error` on both `/v1/messages` and
+  `/v1/messages/count_tokens`.
+- Each completed upstream function call is validated against the latest
+  definition of that tool before a `tool_use` block is emitted. Arguments that
+  fail validation end the response with an API error instead of a tool call: a
+  stream `error` event, or `502` for a non-streaming request.
+- `pattern` and `patternProperties` regexes use ECMAScript semantics, as a
+  JavaScript schema validator would apply them; for example, `^\p{Lu}+$`
+  matches uppercase letters in any script. The gateway evaluates them with the
+  Node.js runtime bundled in its `playwright` dependency. If that runtime is
+  missing, a request whose active tool schemas contain a regex is rejected with
+  `400`.
+
 ## Anthropic-compatible schema
 
 Each `custom_providers.anthropic_compatible` entry requires `base_url` and
@@ -75,7 +101,8 @@ Each `custom_providers.anthropic_compatible` entry requires `base_url` and
 
 - `base_url`: a versioned API prefix, such as an installation's documented
   `/v1` prefix. The gateway strips trailing slashes and appends exactly
-  `/messages` for inference. A query string or fragment is invalid.
+  `/messages` for inference. A query string or fragment is invalid. As for the
+  OpenAI-compatible family, HTTPS is required except for loopback HTTP hosts.
 - `api_key`: a non-empty static credential.
 - `tool_schema_regex_compat`: an optional JSON boolean, defaulting to `false`.
   Set it to `true` only when the configured upstream is known to reject
@@ -134,8 +161,10 @@ not billing or hard context-limit decisions.
 
 ## Catalog, health, and dashboard semantics
 
-`GET /admin/settings/mapping` exposes safe custom-provider metadata including
-`wire_kind` and `catalog_available`; it never includes `api_key`.
+`GET /admin/settings/mapping` lists each custom provider's `name`, `family`,
+`wire_kind`, `base_url`, and `catalog_available`, plus
+`tool_schema_regex_compat` for Anthropic-compatible entries. It never includes
+`api_key`.
 
 - Responses-family metadata uses `wire_kind: "responses"`, which the dashboard
   labels **Responses API**. Its current backend provides a catalog, so
@@ -171,8 +200,11 @@ provider's name, streaming events outside `message_start`, streaming and
 non-streaming model restoration, response ownership, header and credential
 policy, and the local token-count fallback. The relay's top-level model-only
 request rewrite is the basis for the tool, thinking, and signature preservation
-described above. This coverage is not a live external-provider end-to-end
-validation.
+described above. For the Responses family, deterministic tests also cover the
+verbatim tool schemas, the local schema checks, and ECMAScript pattern
+enforcement on streamed and non-streamed function calls. This coverage is not a
+live external-provider end-to-end validation, and whether Claude Code retries
+after an argument-validation error has not been verified.
 
 Z.AI is a possible use case for the generic Anthropic-compatible family only if
 the exact provider surface is tested against this contract. It is not a

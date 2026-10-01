@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from typing import Any
@@ -30,6 +31,10 @@ from claudex.relay.registered import (
     _passthrough_with_claude_pool,
 )
 from claudex.translate.server_tool_history import normalize_server_tool_history
+from claudex.translate import TranslationError, translate_claude_request_to_codex
+from claudex.translate.claude_to_codex import build_function_validation_schemas
+from claudex.translate.tool_protocol import ToolProtocolError, compile_tool_state
+from claudex.translate.tool_validation import compile_function_validators
 
 logger = logging.getLogger("claudex.server")
 
@@ -163,11 +168,37 @@ async def _handle_count_tokens(request: Request) -> JSONResponse | StreamingResp
         if counted is not None:
             return counted
 
+    if isinstance(backend, ResponsesBackend):
+        try:
+            tool_state = compile_tool_state(
+                body, beta_header=request.headers.get("anthropic-beta", "")
+            )
+            body = translate_claude_request_to_codex(
+                body,
+                route.model,
+                config.reasoning_effort_override,
+                custom_provider=backend.signature_namespace,
+                codex_regex_compat=backend.codex_regex_compat,
+                tool_state=tool_state,
+            )
+            body = backend.adapt_probe_payload(body, route.model)
+            await asyncio.to_thread(
+                compile_function_validators, build_function_validation_schemas(tool_state, body),
+                regex_dialect="python" if backend.codex_regex_compat else "ecmascript",
+            )
+        except (TranslationError, ToolProtocolError) as exc:
+            return JSONResponse(
+                server_support._claude_error_body("invalid_request_error", str(exc)),
+                status_code=400,
+            )
+        # Transport/cache identity fields are not model prompt content.
+        body = {key: body[key] for key in ("instructions", "input", "tools") if key in body}
+
     # Rough characters/4 estimate: mapped prompts must not be sent to
     # Anthropic just to be counted, and no Codex tokenizer or token-count
     # endpoint is available (Kimi's native counter is preferred above but
-    # may be down). Good enough for Claude Code's context-usage display;
-    # not exact for billing or hard context-limit decisions.
+    # may be down). Count the prepared prompt, including active tool schemas;
+    # this is not exact for billing or hard context-limit decisions.
     estimated = max(len(json.dumps(body, ensure_ascii=False)) // 4, 1)
     return JSONResponse({"input_tokens": estimated})
 

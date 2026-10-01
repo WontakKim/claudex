@@ -1370,6 +1370,38 @@ def test_mcp_requires_configured_local_token() -> None:
     assert response.json()["error"]["message"] == "Missing or invalid bearer token"
 
 
+@pytest.mark.parametrize("module_name", ["mcp", None])
+def test_mcp_missing_module_returns_installation_recovery_guidance(
+    monkeypatch: pytest.MonkeyPatch,
+    module_name: str | None,
+) -> None:
+    async def missing_manager(_endpoint: McpEndpoint, _app: Any) -> Any:
+        raise ModuleNotFoundError("Missing required module", name=module_name)
+
+    monkeypatch.setattr(McpEndpoint, "_get_manager", missing_manager)
+    with _mcp_client(FakeAskRuntime()) as client:
+        response = client.post(
+            "/mcp",
+            headers=_REQUEST_HEADERS,
+            json={"jsonrpc": "2.0", "id": 1, "method": "initialize"},
+        )
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "error": {
+            "message": (
+                "A required module is missing from the gateway installation; "
+                "run uv sync in a source checkout or reinstall the latest "
+                "release tarball."
+            ),
+            "type": "service_unavailable_error",
+            "param": None,
+            "code": None,
+        }
+    }
+    assert "gptpro extra" not in response.text
+
+
 def test_server_import_and_app_creation_do_not_import_optional_mcp(
     tmp_path: Path,
 ) -> None:

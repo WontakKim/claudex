@@ -59,9 +59,10 @@ def is_compaction_request(body: object) -> bool:
     """Return True when `body` is a Claude Code compaction request.
 
     A request is a compaction request when `body` is a dict, `messages` is a
-    non-empty list, the final message is a dict with `role == "user"`, and
+    non-empty list, the last non-system message is a dict with `role == "user"`, and
     its extracted text starts with `SIGNAL_A_PREFIX` and contains
-    `SIGNAL_A_MARKER`. Any other shape returns `False` without raising,
+    `SIGNAL_A_MARKER`, optionally after exact loaded-tool note text blocks.
+    Any other shape returns `False` without raising,
     since request bodies come from an untrusted client.
     """
     if not isinstance(body, dict):
@@ -69,13 +70,36 @@ def is_compaction_request(body: object) -> bool:
     messages = body.get("messages")
     if not isinstance(messages, list) or not messages:
         return False
-    last_message = messages[-1]
+    index = len(messages) - 1
+    # Current clients can append a system token-budget notice after the
+    # summary instruction; only that trailing operator section is skipped.
+    while index >= 0 and isinstance(messages[index], dict) and messages[index].get("role") == "system":
+        index -= 1
+    if index < 0:
+        return False
+    last_message = messages[index]
     if not isinstance(last_message, dict) or last_message.get("role") != "user":
         return False
-    text = _extract_message_text(last_message.get("content"))
-    if text is None:
+    content = last_message.get("content")
+    text = _extract_message_text(content)
+    if text is not None and text.startswith(SIGNAL_A_PREFIX) and SIGNAL_A_MARKER in text:
+        return True
+    if not isinstance(content, list):
         return False
-    return text.startswith(SIGNAL_A_PREFIX) and SIGNAL_A_MARKER in text
+    # Claude Code 2.1.286 captures use these exact loaded-tool note texts.
+    # A later instruction boundary is accepted only after such notes;
+    # non-text blocks, including tool_result/tool_reference, remain ignored.
+    parts = [block["text"] for block in content
+             if isinstance(block, dict) and block.get("type") == "text"
+             and isinstance(block.get("text"), str)]
+    for index, part in enumerate(parts):
+        if part in ("Tool loaded.", "Tool loaded.\n"):
+            continue
+        if not part:
+            return False
+        candidate = "".join(parts[index:])
+        return candidate.startswith(SIGNAL_A_PREFIX) and SIGNAL_A_MARKER in candidate
+    return False
 
 
 _THINKING_BLOCK_TYPES = frozenset({"thinking", "redacted_thinking"})
