@@ -163,6 +163,9 @@ async def _handle_hello(request: Request) -> JSONResponse:
 
 async def _handle_health(request: Request) -> JSONResponse:
     config: GatewayConfig = request.app.state.config
+    # Readiness stays public; free-form diagnostics can contain account identities
+    # or auth paths and belong in the authenticated view when local auth is set.
+    can_show_identity = server_support._require_local_token(request) is None
     codex_auth_manager: CodexAuthManager = request.app.state.codex_auth_manager
     kimi_auth_manager: KimiAuthManager = request.app.state.kimi_auth_manager
     grok_auth_manager: GrokAuthManager = request.app.state.grok_auth_manager
@@ -177,7 +180,10 @@ async def _handle_health(request: Request) -> JSONResponse:
             "email": credentials.email,
         }
     except CodexAuthError as exc:
-        providers["codex"] = {"status": "error", "detail": str(exc)}
+        providers["codex"] = {
+            "status": "error",
+            "detail": str(exc) if can_show_identity else "credentials unavailable",
+        }
 
     # A missing OAuth login only degrades readiness when the map routes to
     # that provider, so setups not using it keep reporting healthy. The flag
@@ -192,7 +198,11 @@ async def _handle_health(request: Request) -> JSONResponse:
             "account": kimi_credentials.account,
         }
     except KimiAuthError as exc:
-        providers["kimi"] = {"status": "error", "detail": str(exc), "required": kimi_required}
+        providers["kimi"] = {
+            "status": "error",
+            "detail": str(exc) if can_show_identity else "credentials unavailable",
+            "required": kimi_required,
+        }
 
     grok_required = config.maps_to_provider("grok")
     try:
@@ -204,7 +214,11 @@ async def _handle_health(request: Request) -> JSONResponse:
             "account": grok_credentials.email,
         }
     except GrokAuthError as exc:
-        providers["grok"] = {"status": "error", "detail": str(exc), "required": grok_required}
+        providers["grok"] = {
+            "status": "error",
+            "detail": str(exc) if can_show_identity else "credentials unavailable",
+            "required": grok_required,
+        }
 
     custom_providers_ready = True
     for index, (name, configured_provider) in enumerate(
@@ -241,10 +255,14 @@ async def _handle_health(request: Request) -> JSONResponse:
             await catalog_loader()
             providers[response_name] = {"status": "ok", "required": required}
         except UpstreamError as exc:
-            detail = _safe_custom_provider_upstream_detail(exc.body, provider.api_key)
+            detail = f"upstream returned HTTP {exc.status_code}"
+            if can_show_identity:
+                detail += ": " + _safe_custom_provider_upstream_detail(
+                    exc.body, provider.api_key
+                )
             providers[response_name] = {
                 "status": "error",
-                "detail": f"upstream returned HTTP {exc.status_code}: {detail}",
+                "detail": detail,
                 "required": required,
             }
             if required:
@@ -252,13 +270,22 @@ async def _handle_health(request: Request) -> JSONResponse:
         except httpx.HTTPError as exc:
             providers[response_name] = {
                 "status": "error",
-                "detail": _safe_custom_provider_exception_detail(
-                    exc, provider.api_key
+                "detail": (
+                    _safe_custom_provider_exception_detail(exc, provider.api_key)
+                    if can_show_identity
+                    else _redact_configured_credential(
+                        f"{type(exc).__name__}: provider request failed", provider.api_key
+                    )
                 ),
                 "required": required,
             }
             if required:
                 custom_providers_ready = False
+
+    if not can_show_identity:
+        for provider_status in providers.values():
+            provider_status.pop("account", None)
+            provider_status.pop("email", None)
 
     is_ready = (
         providers["codex"]["status"] == "ok"

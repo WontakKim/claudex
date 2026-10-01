@@ -1515,7 +1515,11 @@ class TestBalancedRoutingEnable:
             router_while_active = runtime.router
 
         assert response.status_code == 200
-        assert response.json() == {"mode": "balanced", "env_locked": False}
+        assert response.json() == {
+            "mode": "balanced",
+            "env_locked": False,
+            "include_local_login": True,
+        }
         assert config_after.claude_account_routing_mode == "balanced"
         assert status_while_active == "active"
         assert epoch_id_while_active is not None
@@ -1636,7 +1640,11 @@ class TestBalancedRoutingEnable:
 
         assert status_while_active == "active"
         assert epoch_id_while_active is not None
-        assert payload == {"mode": "balanced", "env_locked": False}
+        assert payload == {
+            "mode": "balanced",
+            "env_locked": False,
+            "include_local_login": True,
+        }
 
     def test_get_reports_balanced_mode(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -1653,7 +1661,11 @@ class TestBalancedRoutingEnable:
             payload = client.get("/admin/providers/claude/pool/routing").json()
 
         assert enable.status_code == 200
-        assert payload == {"mode": "balanced", "env_locked": False}
+        assert payload == {
+            "mode": "balanced",
+            "env_locked": False,
+            "include_local_login": True,
+        }
 
 
 
@@ -1702,7 +1714,11 @@ class TestBalancedRoutingExit:
             served_after_exit = client.post("/v1/messages", json=_account_body())
 
             assert exited.status_code == 200
-            assert exited.json() == {"mode": "disabled", "env_locked": False}
+            assert exited.json() == {
+                "mode": "disabled",
+                "env_locked": False,
+                "include_local_login": True,
+            }
             assert runtime.status == "disabled"
             # Draining resolved cleanly: the in-flight-created pin's request, and
             # a fresh one after exit (now served single-account, "disabled"), both
@@ -1846,7 +1862,11 @@ class TestBalancedRoutingExit:
                 )
 
             assert exited.status_code == 200
-            assert exited.json() == {"mode": "disabled", "env_locked": False}
+            assert exited.json() == {
+                "mode": "disabled",
+                "env_locked": False,
+                "include_local_login": True,
+            }
             assert runtime.status == "disabled"
             saved = json.loads(settings_file.read_text(encoding="utf-8"))
             assert "claude_account" not in saved
@@ -2061,7 +2081,11 @@ def test_balanced_graceful_shutdown_preserves_epoch_and_pin_for_restart(
         assert second_runtime.router.pin_count() == 1
         payload = client.get("/admin/providers/claude/pool/routing").json()
 
-    assert payload == {"mode": "balanced", "env_locked": False}
+    assert payload == {
+        "mode": "balanced",
+        "env_locked": False,
+        "include_local_login": True,
+    }
 
 
 # ---------------------------------------------------------------------------

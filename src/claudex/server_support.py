@@ -69,7 +69,9 @@ def _require_local_token(
     if (
         not separator
         or scheme.lower() != "bearer"
-        or not secrets.compare_digest(provided_token, expected_token)
+        or not secrets.compare_digest(
+            provided_token.encode("utf-8"), expected_token.encode("utf-8")
+        )
     ):
         body = (
             _claude_error_body("authentication_error", "Missing or invalid bearer token")

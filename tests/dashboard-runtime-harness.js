@@ -380,6 +380,7 @@ async function main() {
   source = source.replace(/boot\(\);\s*$/, "");
   vm.runInContext(source, context, {filename: javascriptPath});
 
+  const initialLocalHeroHtml = document.getElementById("local-body").innerHTML;
   const requests = [];
   const credentialMarker = "safe-synthetic-credential";
   const configuredName = "openai-by-name";
@@ -831,6 +832,66 @@ async function main() {
     hidden: document.getElementById("gptpro-doctor-output").hidden,
   };
 
+  const routingEnvelopeValidation = {
+    included: context.isRoutingEnvelope({mode: "balanced", env_locked: false, include_local_login: true}),
+    excluded: context.isRoutingEnvelope({mode: "balanced", env_locked: false, include_local_login: false}),
+    missing: context.isRoutingEnvelope({mode: "balanced", env_locked: false}),
+    invalid: context.isRoutingEnvelope({mode: "balanced", env_locked: false, include_local_login: "false"}),
+  };
+  const localHeroStates = {};
+  context.ACCT.local = {email: "local@example.com", organizationName: "Local organization"};
+  context.ACCT.localLoaded = true;
+  context.ACCT.localUsage = {status: "error"};
+  context.renderLocalHero();
+  localHeroStates.unknown = document.getElementById("local-body").innerHTML;
+  for (const mode of ["disabled", "fallback", "balanced"]) {
+    for (const includeLocalLogin of [true, false]) {
+      context.renderRoutingState({mode, env_locked: false, include_local_login: includeLocalLogin});
+      localHeroStates[`${mode}-${includeLocalLogin}`] = document.getElementById("local-body").innerHTML;
+    }
+  }
+  context.renderRoutingState({mode: "balanced", env_locked: false, include_local_login: true});
+  context.ROUTING.draft = "disabled";
+  context.renderRouting();
+  context.renderLocalHero();
+  localHeroStates.unappliedDraft = document.getElementById("local-body").innerHTML;
+  context.ACCT.local = null;
+  context.renderLocalHero();
+  localHeroStates.noLoginIncluded = document.getElementById("local-body").innerHTML;
+  context.renderRoutingState({mode: "fallback", env_locked: false, include_local_login: true});
+  localHeroStates.noLoginExcluded = document.getElementById("local-body").innerHTML;
+
+  const localHeroLoadOrder = {};
+  const previousJfetch = context.jfetch;
+  const pendingLocalLogin = createDeferred();
+  context.ACCT.local = null;
+  context.ACCT.localLoaded = false;
+  document.getElementById("local-body").innerHTML = initialLocalHeroHtml;
+  localHeroLoadOrder.initial = document.getElementById("local-body").innerHTML;
+  context.renderRoutingState({mode: "balanced", env_locked: false, include_local_login: true});
+  localHeroLoadOrder.routingFirst = document.getElementById("local-body").innerHTML;
+  context.jfetch = (url) => {
+    if (url === "/admin/providers/claude/local") return pendingLocalLogin.promise;
+    return Promise.resolve({ok: true, body: {accounts: [], members: []}});
+  };
+  context.fetchAccounts();
+  await new Promise((resolve) => setImmediate(resolve));
+  localHeroLoadOrder.pendingLocal = document.getElementById("local-body").innerHTML;
+  pendingLocalLogin.resolve({ok: true, body: {local: {email: "loaded@example.com"}}});
+  await new Promise((resolve) => setImmediate(resolve));
+  localHeroLoadOrder.loaded = document.getElementById("local-body").innerHTML;
+  context.renderRoutingState({mode: "disabled", env_locked: false, include_local_login: true});
+  localHeroLoadOrder.repaintAfterSuccess = document.getElementById("local-body").innerHTML;
+  context.ACCT.localLoaded = false;
+  context.jfetch = (url) => Promise.resolve(url === "/admin/providers/claude/local"
+    ?{ok: false, status: 503, body: {error: {message: "local login unavailable"}}}
+    :{ok: true, body: {accounts: [], members: []}});
+  context.fetchAccounts();
+  await new Promise((resolve) => setImmediate(resolve));
+  context.renderRoutingState({mode: "balanced", env_locked: false, include_local_login: true});
+  localHeroLoadOrder.repaintAfterLocalError = document.getElementById("local-body").innerHTML;
+  context.jfetch = previousJfetch;
+
   const requestSnapshot = JSON.stringify(requests);
   const domSnapshot = document.snapshot();
   const credentialLeak = [
@@ -870,7 +931,7 @@ async function main() {
       return Promise.resolve({ok: true, body: {env_locked: false, model: null}});
     }
     if (url === "/admin/providers/claude/pool/routing") {
-      return Promise.resolve({ok: true, body: {env_locked: false, mode: "disabled"}});
+      return Promise.resolve({ok: true, body: {env_locked: false, mode: "disabled", include_local_login: true}});
     }
     return Promise.resolve({ok: true, body: {models: [], choices: []}});
   };
@@ -883,11 +944,78 @@ async function main() {
     suggestions: Array.from(context.CATALOG.codex),
   };
 
+  const healthAuthenticationBoot = [];
+  for (const firstToken of ["dashboard-local-token", "wrong-token", null]) {
+    const authDocument = new FakeDocument(html);
+    const authRequests = [];
+    let promptCount = 0;
+    const authContext = Object.assign({}, context, {
+      document: authDocument,
+      window: Object.assign({}, context.window, {prompt: () => {
+        promptCount += 1;
+        if (promptCount === 1) return firstToken;
+        return promptCount === 2 ? "dashboard-local-token" : null;
+      }}),
+      fetch: async (url, options) => {
+        const hasValidToken = !!(options && options.headers &&
+          options.headers.Authorization === "Bearer dashboard-local-token");
+        authRequests.push({url, hasValidToken});
+        let status = 200;
+        let body = {};
+        if (url === "/api/hello") body = {local_auth_required: true};
+        else if (url.startsWith("/admin/") && !hasValidToken) {
+          status = 401;
+          body = {error: {message: "Missing or invalid bearer token"}};
+        } else if (url === "/health") {
+          body = {status: "ok", providers: {
+            codex: {status: "ok", auth_mode: "chatgpt"},
+            kimi: {status: "ok", required: false},
+            grok: {status: "ok", required: false, auth_mode: "oauth"},
+          }};
+          if (hasValidToken) {
+            body.providers.codex.email = "codex-identity@example.com";
+            body.providers.kimi.account = "kimi-account-identity";
+            body.providers.grok.account = "grok-identity@example.com";
+          }
+        } else if (url === "/admin/settings/mapping") {
+          body = {model_map: {}, custom_providers: []};
+        } else if (url === "/admin/settings/codex") {
+          body = {env_locked: false, service_tier: null};
+        } else if (url === "/admin/settings/compaction") {
+          body = {env_locked: false, model: null};
+        } else if (url === "/admin/providers/claude/pool/routing") {
+          body = {env_locked: false, mode: "disabled", include_local_login: true};
+        } else body = {models: [], choices: []};
+        return {ok: status === 200, status, json: async () => body};
+      },
+    });
+    vm.createContext(authContext);
+    vm.runInContext(source, authContext, {filename: javascriptPath});
+    authContext.boot();
+    await new Promise((resolve) => setImmediate(resolve));
+    healthAuthenticationBoot.push({
+      firstTokenWasValid: firstToken === "dashboard-local-token",
+      promptCount,
+      adminRequests: authRequests.filter((request) => request.url.startsWith("/admin/")),
+      healthRequests: authRequests.filter((request) => request.url === "/health"),
+      helloHasToken: authRequests.find((request) => request.url === "/api/hello").hasValidToken,
+      identities: {
+        codex: authDocument.getElementById("codex-statline").innerHTML,
+        kimi: authDocument.getElementById("kimi-statline").innerHTML,
+        grok: authDocument.getElementById("grok-statline").innerHTML,
+      },
+    });
+  }
+
   const output = {credentialLeak};
   if (!credentialLeak) {
     Object.assign(output, {
       names: {configuredName, connectedName, unusedName, errorName},
       codexCatalogBoot,
+      healthAuthenticationBoot,
+      localHeroStates,
+      localHeroLoadOrder,
+      routingEnvelopeValidation,
       jfetchRequests: requests.map((request) => ({
         url: String(request.url),
         options: request.options,

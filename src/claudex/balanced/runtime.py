@@ -338,6 +338,11 @@ class ClaudeBalancedRuntime:
         ALREADY-published target mode — then wake every transition waiter and
         close the store, discarding balanced-only state.
 
+        If startup preparation failed and status is already "disabled", there
+        is no live state to drain or invalidate: persist the target mode, then
+        publish it, without opening the store or rotating an epoch. A persistence
+        failure leaves this inactive runtime and the published mode untouched.
+
         Crash/cancellation contract: `persist()` is the commit point, and
         everything up to and including it is pre-commit. ANY `BaseException` —
         including `asyncio.CancelledError`, which is not an `Exception` — raised
@@ -359,6 +364,11 @@ class ClaudeBalancedRuntime:
         if target_mode == "balanced":
             raise ValueError('exit_mode target_mode must not be "balanced"')
         async with self._lifecycle_lock:
+            if self.status == "disabled":
+                if persist is not None:
+                    persist()
+                publish()
+                return
             if self.status != "active":
                 raise RuntimeError(
                     f"cannot exit balanced routing from status {self.status!r}"

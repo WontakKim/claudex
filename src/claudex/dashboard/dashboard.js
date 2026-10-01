@@ -695,7 +695,7 @@ function promptLocalToken(){
   return localToken!==null;
 }
 function rawFetch(url,opts){
-  if(url.indexOf("/admin/")===0&&localToken){
+  if((url.indexOf("/admin/")===0||url==="/health")&&localToken){
     opts=Object.assign({},opts||{});
     opts.headers=Object.assign({},opts.headers||{},{"Authorization":"Bearer "+localToken});
   }
@@ -704,8 +704,11 @@ function rawFetch(url,opts){
   });
 }
 function jfetch(url,opts){
+  var requestToken=localToken;
   return rawFetch(url,opts).then(function(r){
     if(r.status!==401||url.indexOf("/admin/")!==0||!authRequired)return r;
+    // A stale failure must not discard a token corrected by another request.
+    if(localToken!==requestToken)return rawFetch(url,opts);
     localToken=null;   // wrong or missing token: ask once, retry once, no loop
     if(!promptLocalToken())return r;
     return rawFetch(url,opts);
@@ -1325,10 +1328,10 @@ document.getElementById("codex-fast").addEventListener("change",function(){
 });
 document.getElementById("codex-apply").addEventListener("click",applyCodex);
 /* --- account-pool routing mode (claude_account.routing) -------------------
-   Same envelope discipline as the compaction card: adopt {mode, env_locked}
+   Same envelope discipline as the compaction card: adopt the live policy
    from every successful response, 409 flips the local lock and re-syncs from
    a fresh GET. Apply stays inert while the draft equals the live mode. */
-var ROUTING={envName:"CLAUDEX_CLAUDE_ACCOUNT_ROUTING",locked:false,mode:"disabled",draft:"disabled"};
+var ROUTING={envName:"CLAUDEX_CLAUDE_ACCOUNT_ROUTING",locked:false,mode:"disabled",draft:"disabled",includeLocalLogin:null};
 var ROUTING_LABELS={disabled:"Disabled",fallback:"Fallback",balanced:"Balanced"};
 var ROUTING_HINTS={
   disabled:"현재: Disabled — 단일 서빙 계정만 사용하고 429는 그대로 전달합니다.",
@@ -1336,7 +1339,7 @@ var ROUTING_HINTS={
   balanced:"현재: Balanced — ready 계정 풀 전체에 세션을 사용량 기반으로 고르게 분산합니다."
 };
 function isRoutingEnvelope(body){
-  return !!body&&typeof body.env_locked==="boolean"&&
+  return !!body&&typeof body.env_locked==="boolean"&&typeof body.include_local_login==="boolean"&&
     (body.mode==="disabled"||body.mode==="fallback"||body.mode==="balanced");
 }
 function renderRouting(){
@@ -1354,7 +1357,9 @@ function renderRoutingState(body){
   ROUTING.mode=body.mode;
   ROUTING.locked=!!body.env_locked;
   ROUTING.draft=body.mode;
+  ROUTING.includeLocalLogin=body.include_local_login;
   renderRouting();
+  if(ACCT.localLoaded)renderLocalHero();
 }
 function applyRouting(){
   var btn=document.getElementById("routing-apply");
@@ -1412,7 +1417,7 @@ document.querySelectorAll("#tab-settings .rail-item").forEach(function(a){
    the open set survives re-renders. No interval polling: fetch on entry,
    the hero's Refresh button, and after a login succeeds. */
 var ACCT_ENV="CLAUDEX_CLAUDE_ACCOUNT_ID";
-var ACCT={rows:[],serving:null,local:null,locked:false,usage:{},open:{},removeArmed:{},localUsage:null,routing:{},usageFreshness:null};
+var ACCT={rows:[],serving:null,local:null,localLoaded:false,locked:false,usage:{},open:{},removeArmed:{},localUsage:null,routing:{},usageFreshness:null};
 function attr(s){return esc(s).replace(/"/g,"&quot;")}
 function planLabel(planType){
   // claude_max -> MAX, claude_pro -> PRO; an absent plan renders as a dash.
@@ -1548,8 +1553,14 @@ function renderAcctList(){
 function renderLocalHero(){
   var box=document.getElementById("local-body");
   var local=ACCT.local;
+  // Identity metadata does not prove token eligibility; show the configured policy.
+  var serving=ROUTING.includeLocalLogin===null
+    ?"게이트웨이 서빙 설정 미확인"
+    :ROUTING.mode==="balanced"&&ROUTING.includeLocalLogin
+      ?"밸런스 서빙 참여 설정 · "+(local?"유효한 토큰 필요 · 중복 등록 제외":"로컬 로그인 필요")
+      :"게이트웨이 서빙에 사용하지 않음";
   if(!local){
-    box.innerHTML='<div class="org">로컬 Claude Code 로그인이 없습니다 · 게이트웨이 서빙과 무관</div>';
+    box.innerHTML='<div class="org">로컬 Claude Code 로그인이 없습니다 · '+serving+'</div>';
     return;
   }
   var u=ACCT.localUsage,usage;
@@ -1561,7 +1572,7 @@ function renderLocalHero(){
   box.innerHTML='<div class="who"><span class="em">'+esc(local.email)+'</span>'+
     '<span class="plan-lg">'+esc(planLabel(local.planType))+'</span></div>'+
     '<div class="org">'+(local.organizationName?esc(local.organizationName)+" · ":"")+
-    "게이트웨이 서빙과 무관"+(u&&u.status==="ok"?' · <b>'+esc(fmtAgo(u.updated_at))+'</b> 기준':"")+"</div>"+usage;
+    serving+(u&&u.status==="ok"?' · <b>'+esc(fmtAgo(u.updated_at))+'</b> 기준':"")+"</div>"+usage;
 }
 function fetchLocalHeroUsage(){
   return jfetch("/admin/usage?provider=claude").then(function(r){
@@ -1629,6 +1640,7 @@ function fetchAccounts(){
     }
     ACCT.rows=listResp.body.accounts||[];
     ACCT.local=localResp.ok?(localResp.body.local||null):null;
+    ACCT.localLoaded=true;
     if(servingResp.ok){
       ACCT.serving=servingResp.body.account_id||null;
       ACCT.locked=!!servingResp.body.env_locked;
@@ -2333,7 +2345,7 @@ function boot(){
     if(authRequired&&!localToken)promptLocalToken();
     return Promise.all([
       jfetch("/admin/settings/mapping"),
-      jfetch("/health"),
+      null,
       jfetch("/admin/providers/codex/models"),
       jfetch("/admin/providers/kimi/models"),
       jfetch("/admin/providers/grok/models"),
@@ -2341,7 +2353,13 @@ function boot(){
       jfetch("/admin/settings/compaction"),
       jfetch("/admin/settings/codex"),
       jfetch("/admin/providers/claude/pool/routing")
-    ]);
+    ]).then(function(results){
+      // Admin retries may replace the token; fetch identities only after they settle.
+      return jfetch("/health").then(function(health){
+        results[1]=health;
+        return results;
+      });
+    });
   }).then(function(results){
     var mapping=results[0],health=results[1];
     var codexCatalog=results[2],kimiCatalog=results[3],grokCatalog=results[4],loglevel=results[5];

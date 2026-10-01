@@ -526,6 +526,253 @@ def test_health_reports_ok_with_codex_credentials(
     }
 
 
+@pytest.mark.parametrize(
+    ("local_token", "authorization", "shows_identity"),
+    [
+        ("secret", None, False),
+        ("secret", "Bearer invalid", False),
+        ("secret", "Basic secret", False),
+        ("secret", b"Bearer invalid-\xff", False),
+        ("secret", "Bearer secret", True),
+        ("secret", "bEaReR secret", True),
+        (None, None, True),
+        (None, "Bearer invalid", True),
+    ],
+)
+@pytest.mark.parametrize("is_api_key", [False, True])
+def test_health_identity_visibility_preserves_readiness(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    local_token: str | None,
+    authorization: str | bytes | None,
+    shows_identity: bool,
+    is_api_key: bool,
+) -> None:
+    config = GatewayConfig(
+        local_token=local_token,
+        model_map={
+            "opus": "wrtn:gpt-5.5",
+            "sonnet": "kimi:k2.5",
+            "haiku": "grok:grok-4.5",
+        },
+        custom_providers={"wrtn": _custom_provider()},
+    )
+    headers = {"Authorization": authorization} if authorization is not None else {}
+    with _create_test_client(monkeypatch, tmp_path, config=config) as client:
+        if is_api_key:
+            for manager in (
+                client.app.state.codex_auth_manager,
+                client.app.state.grok_auth_manager,
+            ):
+                original = manager.get_credentials
+
+                async def api_key_credentials(
+                    force_refresh: bool = False, original: Any = original
+                ) -> Any:
+                    credentials = await original(force_refresh)
+                    if isinstance(credentials, SimpleNamespace):
+                        return SimpleNamespace(
+                            **{**vars(credentials), "is_api_key": True}
+                        )
+                    return replace(credentials, is_api_key=True)
+
+                monkeypatch.setattr(manager, "get_credentials", api_key_credentials)
+        full = client.get("/health", headers={"Authorization": "Bearer secret"})
+        health = client.get("/health", headers=headers)
+
+    expected = full.json()
+    assert expected["providers"]["codex"]["account"] == "account"
+    assert expected["providers"]["codex"]["email"] == "codex@example.com"
+    assert expected["providers"]["kimi"]["account"] == "kimi-user-1"
+    assert expected["providers"]["grok"]["account"] == "user@example.com"
+    assert expected["providers"]["codex"]["auth_mode"] == (
+        "api_key" if is_api_key else "chatgpt"
+    )
+    assert expected["providers"]["grok"]["auth_mode"] == (
+        "api_key" if is_api_key else "oauth"
+    )
+    assert expected["providers"]["kimi"]["required"] is True
+    assert expected["providers"]["grok"]["required"] is True
+    assert expected["providers"]["wrtn"] == {"status": "ok", "required": True}
+    if not shows_identity:
+        for provider in expected["providers"].values():
+            provider.pop("account", None)
+            provider.pop("email", None)
+    assert health.status_code == full.status_code == 200
+    assert health.json() == expected
+    assert "www-authenticate" not in health.headers
+
+
+@pytest.mark.parametrize(
+    "path", ["/admin/settings/mapping", "/v1/messages", "/v1/messages/count_tokens", "/mcp"]
+)
+def test_protected_routes_reject_non_ascii_bearer_without_raising(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    path: str,
+) -> None:
+    config = GatewayConfig(local_token="secret")
+    with _create_test_client(monkeypatch, tmp_path, config=config) as client:
+        response = client.request(
+            "GET" if path.startswith("/admin/") else "POST",
+            path,
+            headers={"Authorization": b"Bearer invalid-\xff"},
+            json={},
+        )
+
+    assert response.status_code == 401
+    assert response.headers["www-authenticate"] == "Bearer"
+    assert response.json()["error"]["type"] == "authentication_error"
+    assert response.json()["error"]["message"] == "Missing or invalid bearer token"
+
+
+@pytest.mark.parametrize("authorization", [None, "Bearer invalid", "Bearer secret"])
+@pytest.mark.parametrize("local_token", [None, "secret"])
+@pytest.mark.parametrize("required", [False, True])
+def test_health_identity_visibility_sanitizes_free_form_errors(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    authorization: str | None,
+    local_token: str | None,
+    required: bool,
+) -> None:
+    identity_detail = (
+        "credentials for private-account at person@example.com "
+        "in /Users/private-user/auth.json failed"
+    )
+
+    class IdentityCodexAuthManager(AvailableCodexAuthManager):
+        async def get_credentials(self, force_refresh: bool = False) -> Any:
+            raise server.CodexAuthError(identity_detail)
+
+    class IdentityKimiAuthManager(AvailableKimiAuthManager):
+        async def get_credentials(self, force_refresh: bool = False) -> Any:
+            raise server.KimiAuthError(identity_detail)
+
+    class IdentityGrokAuthManager(AvailableGrokAuthManager):
+        async def get_credentials(self, force_refresh: bool = False) -> Any:
+            raise server.GrokAuthError(identity_detail)
+
+    config = GatewayConfig(
+        local_token=local_token,
+        model_map={"opus": "kimi:k2.5", "sonnet": "grok:grok-4.5"} if required else {},
+    )
+    headers = {"Authorization": authorization} if authorization is not None else {}
+    with _create_test_client(
+        monkeypatch,
+        tmp_path,
+        config=config,
+        codex_auth=IdentityCodexAuthManager,
+        kimi_auth=IdentityKimiAuthManager,
+        grok_auth=IdentityGrokAuthManager,
+    ) as client:
+        full = client.get("/health", headers={"Authorization": "Bearer secret"})
+        health = client.get("/health", headers=headers)
+
+    expected = full.json()
+    assert all(
+        provider["detail"] == identity_detail
+        for provider in expected["providers"].values()
+    )
+    if local_token is not None and authorization != "Bearer secret":
+        for provider in expected["providers"].values():
+            provider["detail"] = "credentials unavailable"
+    assert health.status_code == full.status_code == 503
+    assert health.json() == expected
+    assert health.json()["providers"]["kimi"]["required"] is required
+    assert health.json()["providers"]["grok"]["required"] is required
+    assert "www-authenticate" not in health.headers
+
+
+@pytest.mark.parametrize("authorization", [None, "Bearer invalid", "Bearer secret"])
+@pytest.mark.parametrize("local_token", [None, "secret"])
+@pytest.mark.parametrize("required", [False, True])
+@pytest.mark.parametrize("failure", ["upstream", "transport", "binding"])
+def test_health_identity_visibility_preserves_custom_provider_status(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    authorization: str | None,
+    local_token: str | None,
+    required: bool,
+    failure: str,
+) -> None:
+    identity_detail = (
+        "account private-account (person@example.com) "
+        "at /Users/private-user/auth.json"
+    )
+    config = GatewayConfig(
+        local_token=local_token,
+        model_map={"opus": "wrtn:gpt-5.5"} if required else {},
+        custom_providers={"wrtn": _custom_provider()},
+    )
+
+    async def failed_catalog() -> list[str]:
+        if failure == "upstream":
+            raise OpenAICompatibleUpstreamError(
+                403, json.dumps({"error": {"message": identity_detail}}), "wrtn"
+            )
+        raise httpx.ConnectError(identity_detail)
+
+    headers = {"Authorization": authorization} if authorization is not None else {}
+    with _create_test_client(monkeypatch, tmp_path, config=config) as client:
+        if failure == "binding":
+            client.app.state.route_backends.pop("wrtn")
+        else:
+            backend = client.app.state.route_backends["wrtn"]
+            client.app.state.route_backends["wrtn"] = replace(
+                backend, catalog_loader=failed_catalog
+            )
+        full = client.get("/health", headers={"Authorization": "Bearer secret"})
+        health = client.get("/health", headers=headers)
+
+    expected = full.json()
+    if failure != "binding":
+        assert identity_detail in expected["providers"]["wrtn"]["detail"]
+    if local_token is not None and authorization != "Bearer secret":
+        for provider in expected["providers"].values():
+            provider.pop("account", None)
+            provider.pop("email", None)
+        if failure == "upstream":
+            expected["providers"]["wrtn"]["detail"] = "upstream returned HTTP 403"
+        elif failure == "transport":
+            expected["providers"]["wrtn"]["detail"] = (
+                "ConnectError: provider request failed"
+            )
+    assert health.status_code == full.status_code == (503 if required else 200)
+    assert health.json() == expected
+    assert health.json()["providers"]["wrtn"]["required"] is required
+    assert "www-authenticate" not in health.headers
+
+
+@pytest.mark.parametrize("api_key", ["ConnectError", "provider request failed"])
+def test_public_health_generic_diagnostic_still_redacts_custom_credential(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    api_key: str,
+) -> None:
+    config = GatewayConfig(
+        local_token="secret",
+        model_map={"opus": "wrtn:gpt-5.5"},
+        custom_providers={"wrtn": replace(_custom_provider(), api_key=api_key)},
+    )
+
+    async def failed_catalog() -> list[str]:
+        raise httpx.ConnectError("account person@example.com failed")
+
+    with _create_test_client(monkeypatch, tmp_path, config=config) as client:
+        backend = client.app.state.route_backends["wrtn"]
+        client.app.state.route_backends["wrtn"] = replace(
+            backend, catalog_loader=failed_catalog
+        )
+        health = client.get("/health")
+
+    assert health.status_code == 503
+    assert health.json()["providers"]["wrtn"]["required"] is True
+    assert health.json()["providers"]["wrtn"]["status"] == "error"
+    _assert_secret_absent(api_key, health.text)
+    assert "person@example.com" not in health.text
+
+
 def test_health_reports_error_without_codex_credentials(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -1982,7 +2229,50 @@ class TestAdminClaudeRoutingApi:
         with self._admin_client(monkeypatch, tmp_path) as client:
             payload = client.get("/admin/providers/claude/pool/routing").json()
 
-        assert payload == {"mode": "disabled", "env_locked": False}
+        assert payload == {
+            "mode": "disabled",
+            "env_locked": False,
+            "include_local_login": True,
+        }
+
+    @pytest.mark.parametrize("include_local_login", [True, False])
+    def test_routing_exposes_effective_local_login_inclusion_read_only(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, include_local_login: bool
+    ) -> None:
+        with self._admin_client(
+            monkeypatch,
+            tmp_path,
+            claude_account_include_local_login=include_local_login,
+        ) as client:
+            response = client.get("/admin/providers/claude/pool/routing")
+            assert response.status_code == 200
+            assert response.json() == {
+                "mode": "disabled",
+                "env_locked": False,
+                "include_local_login": include_local_login,
+            }
+            updated = client.put(
+                "/admin/providers/claude/pool/routing", json={"mode": "fallback"}
+            )
+            assert updated.status_code == 200
+            assert updated.json() == {
+                "mode": "fallback",
+                "env_locked": False,
+                "include_local_login": include_local_login,
+            }
+            rejected = client.put(
+                "/admin/providers/claude/pool/routing",
+                json={"mode": "fallback", "include_local_login": not include_local_login},
+            )
+            assert rejected.status_code == 400
+            assert (
+                "unknown keys: include_local_login"
+                in rejected.json()["error"]["message"]
+            )
+            assert (
+                client.app.state.config.claude_account_include_local_login
+                is include_local_login
+            )
 
     def test_put_fallback_persists_the_policy_document_and_hot_swaps(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -1995,7 +2285,11 @@ class TestAdminClaudeRoutingApi:
             config_after = client.app.state.config
 
         assert response.status_code == 200
-        assert response.json() == {"mode": "fallback", "env_locked": False}
+        assert response.json() == {
+            "mode": "fallback",
+            "env_locked": False,
+            "include_local_login": True,
+        }
         assert config_after.claude_account_routing_mode == "fallback"
         saved = json.loads(settings_file.read_text(encoding="utf-8"))
         assert saved == {"claude_account": {"routing": {"mode": "fallback"}}}
@@ -2017,9 +2311,94 @@ class TestAdminClaudeRoutingApi:
             config_after = client.app.state.config
 
         assert response.status_code == 200
-        assert response.json() == {"mode": "disabled", "env_locked": False}
+        assert response.json() == {
+            "mode": "disabled",
+            "env_locked": False,
+            "include_local_login": True,
+        }
         assert config_after.claude_account_routing_mode == "disabled"
         assert "claude_account" not in json.loads(settings_file.read_text())
+
+    @pytest.mark.parametrize("mode", ["fallback", "disabled"])
+    def test_put_mode_preserves_explicit_local_login_policy(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, mode: str
+    ) -> None:
+        settings_file = tmp_path / "settings.json"
+        settings_file.write_text(
+            json.dumps(
+                {
+                    "claude_account": {"routing": {"mode": "fallback", "include_local_login": True}},
+                    "log_level": "debug",
+                }
+            ),
+            encoding="utf-8",
+        )
+        with self._admin_client(
+            monkeypatch, tmp_path, claude_account_routing_mode="fallback"
+        ) as client:
+            response = client.put("/admin/providers/claude/pool/routing", json={"mode": mode})
+            assert response.status_code == 200
+            assert response.json()["include_local_login"] is True
+            assert json.loads(settings_file.read_text(encoding="utf-8")) == {
+                "claude_account": {"routing": {"mode": mode, "include_local_login": True}},
+                "log_level": "debug",
+            }
+
+    @pytest.mark.parametrize("is_json_encoded", [False, True])
+    def test_put_mode_preserves_local_login_policy_edited_for_next_restart(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, is_json_encoded: bool
+    ) -> None:
+        settings_file = tmp_path / "settings.json"
+        settings_file.write_text(
+            json.dumps(
+                {"claude_account": {"routing": {"mode": "fallback", "include_local_login": False}}}
+            ),
+            encoding="utf-8",
+        )
+        with self._admin_client(
+            monkeypatch,
+            tmp_path,
+            claude_account_routing_mode="fallback",
+            claude_account_include_local_login=False,
+        ) as client:
+            policy = {"mode": "fallback", "include_local_login": True}
+            settings_file.write_text(
+                json.dumps(
+                    {"claude_account": {"routing": json.dumps(policy) if is_json_encoded else policy}}
+                ),
+                encoding="utf-8",
+            )
+            response = client.put(
+                "/admin/providers/claude/pool/routing", json={"mode": "disabled"}
+            )
+            assert response.status_code == 200
+            assert response.json() == {
+                "mode": "disabled",
+                "env_locked": False,
+                "include_local_login": False,
+            }
+            assert client.app.state.config.claude_account_routing_mode == "disabled"
+            assert client.app.state.config.claude_account_include_local_login is False
+            assert json.loads(settings_file.read_text(encoding="utf-8")) == {
+                "claude_account": {"routing": {"mode": "disabled", "include_local_login": True}}
+            }
+            reloaded = GatewayConfig.load(settings_file)
+            assert reloaded.claude_account_routing_mode == "disabled"
+            assert reloaded.claude_account_include_local_login is True
+
+    @pytest.mark.parametrize("mode", ["fallback", "disabled"])
+    def test_put_mode_persists_effective_opt_out_when_settings_are_missing(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, mode: str
+    ) -> None:
+        with self._admin_client(
+            monkeypatch, tmp_path, claude_account_include_local_login=False
+        ) as client:
+            response = client.put("/admin/providers/claude/pool/routing", json={"mode": mode})
+            assert response.status_code == 200
+            assert response.json()["include_local_login"] is False
+            reloaded = GatewayConfig.load(tmp_path / "settings.json")
+            assert reloaded.claude_account_routing_mode == mode
+            assert reloaded.claude_account_include_local_login is False
 
     def test_put_balanced_with_unknown_keys_is_rejected(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -3481,7 +3860,10 @@ def test_dashboard_accounts_card_mirrors_the_final_probe(
 
     assert 'class="lhero"' in page
     assert "로컬 CLI 로그인" in page
-    assert "게이트웨이 서빙과 무관" in javascript
+    assert "게이트웨이 서빙과 무관" not in javascript
+    assert 'ROUTING.mode==="balanced"&&ROUTING.includeLocalLogin' in javascript
+    assert "밸런스 서빙 참여 설정" in javascript
+    assert "게이트웨이 서빙에 사용하지 않음" in javascript
     assert 'id="btn-local-refresh"' in page
     assert 'id="btn-add-account"' in page
     assert (

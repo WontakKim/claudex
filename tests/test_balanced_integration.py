@@ -27,6 +27,7 @@ import json
 import sqlite3
 import time
 import uuid
+from collections.abc import Iterator
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -466,6 +467,219 @@ def test_graceful_restart_preserves_the_same_session_pin_across_two_app_instance
         assert runtime2.router.pin_count() == 1
 
 
+@pytest.mark.parametrize("intermediate_mode", ["fallback", "disabled"])
+@pytest.mark.parametrize("is_json_encoded", [False, True])
+def test_admin_mode_changes_preserve_local_login_opt_out_after_reload(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    intermediate_mode: str,
+    is_json_encoded: bool,
+) -> None:
+    _balanced_env(monkeypatch, tmp_path)
+    _register_balanced_ready_account()
+    settings_file = tmp_path / "settings.json"
+    policy = {"mode": "balanced", "include_local_login": False}
+    settings_file.write_text(
+        json.dumps(
+            {"claude_account": {"routing": json.dumps(policy) if is_json_encoded else policy}}
+        ),
+        encoding="utf-8",
+    )
+    with _create_test_client(
+        monkeypatch,
+        config=GatewayConfig.load(settings_file),
+        base_url="http://127.0.0.1:8787",
+    ) as client:
+        for mode in (intermediate_mode, "balanced"):
+            response = client.put("/admin/providers/claude/pool/routing", json={"mode": mode})
+            assert response.status_code == 200
+            assert response.json() == {
+                "mode": mode,
+                "env_locked": False,
+                "include_local_login": False,
+            }
+            assert client.app.state.config.claude_account_routing_mode == mode
+            assert client.app.state.config.claude_account_include_local_login is False
+            assert json.loads(settings_file.read_text(encoding="utf-8")) == {
+                "claude_account": {"routing": {"mode": mode, "include_local_login": False}}
+            }
+            reloaded = GatewayConfig.load(settings_file)
+            assert reloaded.claude_account_routing_mode == mode
+            assert reloaded.claude_account_include_local_login is False
+
+
+@pytest.fixture
+def failed_balanced_restore(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> Iterator[tuple[TestClient, Path, str]]:
+    _balanced_env(monkeypatch, tmp_path)
+    account_id = _register_balanced_ready_account(account_uuid=None)
+    settings_file = tmp_path / "settings.json"
+    settings_file.write_text(
+        json.dumps(
+            {"claude_account": {
+                "id": account_id,
+                "routing": {"mode": "balanced", "include_local_login": False},
+            }}
+        ),
+        encoding="utf-8",
+    )
+    with _create_test_client(
+        monkeypatch,
+        config=GatewayConfig.load(settings_file),
+        base_url="http://127.0.0.1:8787",
+    ) as client:
+        runtime = client.app.state.claude_balanced_runtime
+        assert client.app.state.claude_pool_lease is not None
+        assert client.app.state.config.claude_account_routing_mode == "balanced"
+        assert runtime.status == "disabled"
+        assert runtime.router is None
+        response = client.post("/v1/messages", json=_message_body("claude-sonnet-5"))
+        assert response.status_code == 503
+        assert response.json()["error"]["message"] == "balanced routing is not active"
+        yield client, settings_file, account_id
+
+
+@pytest.mark.parametrize("mode", ["disabled", "fallback"])
+def test_failed_balanced_restore_can_exit_and_dispatch_under_target_mode(
+    failed_balanced_restore: tuple[TestClient, Path, str], mode: str
+) -> None:
+    client, settings_file, _account_id = failed_balanced_restore
+    _register_balanced_ready_account(email="second@example.com")
+    message_calls: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/oauth/usage":
+            return httpx.Response(200, json={})
+        message_calls.append(request)
+        if len(message_calls) == 1:
+            return httpx.Response(
+                429,
+                json={"type": "error", "error": {"type": "rate_limit_error", "message": "Error"}},
+                headers={"x-should-retry": "true"},
+            )
+        return httpx.Response(200, json={"id": "msg_recovered"})
+
+    client.app.state.http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    response = client.put("/admin/providers/claude/pool/routing", json={"mode": mode})
+    assert response.status_code == 200, response.text
+    assert response.json() == {"mode": mode, "env_locked": False, "include_local_login": False}
+    assert client.app.state.config.claude_account_routing_mode == mode
+    assert client.app.state.claude_balanced_runtime.status == "disabled"
+    saved = GatewayConfig.load(settings_file)
+    assert saved.claude_account_routing_mode == mode
+    assert saved.claude_account_include_local_login is False
+    dispatched = client.post("/v1/messages", json=_message_body("claude-sonnet-5"))
+    assert dispatched.status_code == (429 if mode == "disabled" else 200)
+    assert len(message_calls) == (1 if mode == "disabled" else 2)
+
+
+def _repair_balanced_profile(account_id: str) -> None:
+    profile = paths.accounts_dir("claude") / account_id / "oauth-account.json"
+    captured = json.loads(profile.read_text(encoding="utf-8"))
+    captured["accountUuid"] = _BALANCED_ACCOUNT_UUID
+    profile.write_text(json.dumps(captured), encoding="utf-8")
+
+
+def test_failed_balanced_restore_can_retry_balanced_after_profile_repair(
+    failed_balanced_restore: tuple[TestClient, Path, str]
+) -> None:
+    client, settings_file, account_id = failed_balanced_restore
+    _repair_balanced_profile(account_id)
+    client.app.state.http_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(200, json={"id": "msg_recovered"})
+        )
+    )
+    response = client.put("/admin/providers/claude/pool/routing", json={"mode": "balanced"})
+    assert response.status_code == 200, response.text
+    runtime = client.app.state.claude_balanced_runtime
+    assert runtime.status == "active"
+    assert runtime.router is not None
+    assert response.json()["include_local_login"] is False
+    assert GatewayConfig.load(settings_file).claude_account_routing_mode == "balanced"
+    assert GatewayConfig.load(settings_file).claude_account_include_local_login is False
+    dispatched = client.post("/v1/messages", json=_balanced_body(str(uuid.uuid4())))
+    assert dispatched.status_code == 200
+    assert runtime.router.pin_count() == 1
+
+
+@pytest.mark.parametrize("failure", ["profile", "store", "store_oserror"])
+def test_failed_balanced_restore_retry_rejects_unresolved_cause_without_false_success(
+    failed_balanced_restore: tuple[TestClient, Path, str],
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    client, settings_file, account_id = failed_balanced_restore
+    before = settings_file.read_bytes()
+    if failure != "profile":
+        _repair_balanced_profile(account_id)
+
+        def fail_store_open(*_args: Any, **_kwargs: Any) -> Any:
+            error_type = OSError if failure == "store_oserror" else RuntimeError
+            raise error_type("simulated unavailable runtime store")
+
+        monkeypatch.setattr(ClaudePoolRuntimeStateStore, "open_", classmethod(fail_store_open))
+    response = client.put("/admin/providers/claude/pool/routing", json={"mode": "balanced"})
+    assert response.status_code == (400 if failure == "profile" else 503), response.text
+    expected_error = "profile_fingerprint" if failure == "profile" else "unavailable runtime store"
+    assert expected_error in response.json()["error"]["message"]
+    assert settings_file.read_bytes() == before
+    assert client.app.state.config.claude_account_routing_mode == "balanced"
+    assert client.app.state.claude_balanced_runtime.status == "disabled"
+    assert client.app.state.claude_balanced_runtime.router is None
+    dispatched = client.post("/v1/messages", json=_message_body("claude-sonnet-5"))
+    assert dispatched.status_code == 503
+    assert dispatched.json()["error"]["message"] == "balanced routing is not active"
+
+
+@pytest.mark.parametrize("mode", ["disabled", "fallback", "balanced"])
+def test_failed_balanced_restore_recovery_preserves_mode_when_settings_write_fails(
+    failed_balanced_restore: tuple[TestClient, Path, str],
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+) -> None:
+    client, settings_file, account_id = failed_balanced_restore
+    _repair_balanced_profile(account_id)
+    before = settings_file.read_bytes()
+
+    def fail_settings_write(*_args: Any, **_kwargs: Any) -> None:
+        raise OSError("simulated disk-full settings write")
+
+    with monkeypatch.context() as fault:
+        fault.setattr(admin_settings, "update_settings_file", fail_settings_write)
+        response = client.put("/admin/providers/claude/pool/routing", json={"mode": mode})
+    assert response.status_code == 500
+    assert "disk-full settings write" in response.json()["error"]["message"]
+    assert settings_file.read_bytes() == before
+    assert client.app.state.config.claude_account_routing_mode == "balanced"
+    assert client.app.state.claude_balanced_runtime.status == "disabled"
+    dispatched = client.post("/v1/messages", json=_message_body("claude-sonnet-5"))
+    assert dispatched.status_code == 503
+    assert dispatched.json()["error"]["message"] == "balanced routing is not active"
+    retried = client.put("/admin/providers/claude/pool/routing", json={"mode": mode})
+    assert retried.status_code == 200
+    expected_status = "active" if mode == "balanced" else "disabled"
+    assert client.app.state.claude_balanced_runtime.status == expected_status
+
+
+@pytest.mark.parametrize("mode", ["disabled", "fallback", "balanced"])
+def test_failed_balanced_restore_recovery_respects_environment_lock(
+    failed_balanced_restore: tuple[TestClient, Path, str],
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+) -> None:
+    client, settings_file, account_id = failed_balanced_restore
+    _repair_balanced_profile(account_id)
+    before = settings_file.read_bytes()
+    monkeypatch.setenv("CLAUDEX_CLAUDE_ACCOUNT_ROUTING", "balanced")
+    response = client.put("/admin/providers/claude/pool/routing", json={"mode": mode})
+    assert response.status_code == 409
+    assert settings_file.read_bytes() == before
+    assert client.app.state.config.claude_account_routing_mode == "balanced"
+    assert client.app.state.claude_balanced_runtime.status == "disabled"
+
+
 def test_mode_exit_rotates_the_epoch_so_a_later_reentry_never_restores_the_old_pin(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -533,7 +747,11 @@ def test_newer_schema_runtime_db_is_refused_at_enable_time_and_left_byte_identic
         assert "could not enable balanced routing" in response.json()["error"]["message"]
         assert client.app.state.claude_balanced_runtime.status == "disabled"
         mode_after = client.get("/admin/providers/claude/pool/routing").json()
-        assert mode_after == {"mode": "disabled", "env_locked": False}
+        assert mode_after == {
+            "mode": "disabled",
+            "env_locked": False,
+            "include_local_login": True,
+        }
 
     after = runtime_db_path.read_bytes()
     assert before == after
