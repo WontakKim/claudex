@@ -161,7 +161,9 @@ class McpEndpoint:
                 {
                     "error": {
                         "message": (
-                            "MCP support is not installed; install the gptpro extra"
+                            "A required module is missing from the gateway installation; "
+                            "run uv sync in a source checkout or reinstall the latest "
+                            "release tarball."
                         ),
                         "type": "service_unavailable_error",
                         "param": None,
