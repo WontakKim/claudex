@@ -2057,6 +2057,7 @@ def test_responses_backend_translates_then_awaits_adapter_and_uses_bound_transpo
         service_tier: str | None = None,
         custom_provider: str | None = None,
         codex_regex_compat: bool = False,
+        tool_state: Any = None,
     ) -> dict[str, Any]:
         call_order.append(("translate", custom_provider, codex_regex_compat))
         assert model == upstream_model
@@ -2474,6 +2475,7 @@ def test_custom_provider_stream_emits_carrier_thinking_block() -> None:
     )
     client = _custom_provider_gateway(custom_stub)
     body = _message_body("claude-opus-4-6")
+    body["tools"] = [{"name": "lookup", "input_schema": {"type": "object", "properties": {}}}]
     body["stream"] = True
 
     response = client.post("/v1/messages", json=body)
@@ -2520,6 +2522,7 @@ def test_custom_provider_nonstream_emits_carrier_thinking_block() -> None:
     )
     client = _custom_provider_gateway(custom_stub)
     body = _message_body("claude-opus-4-6")
+    body["tools"] = [{"name": "lookup", "input_schema": {"type": "object", "properties": {}}}]
     body["stream"] = False
 
     response = client.post("/v1/messages", json=body)
@@ -3082,6 +3085,7 @@ def test_compaction_reroute_fallback_translates_untouched_original_body_once(
         service_tier: str | None = None,
         custom_provider: str | None = None,
         codex_regex_compat: bool = False,
+        tool_state: Any = None,
     ) -> dict[str, Any]:
         # A deep, JSON-round-tripped copy: proves equality without ever
         # aliasing the mutable dict the caller still holds.
@@ -3557,6 +3561,7 @@ def test_compaction_stream_reroute_fallback_translates_untouched_original_body_w
         service_tier: str | None = None,
         custom_provider: str | None = None,
         codex_regex_compat: bool = False,
+        tool_state: Any = None,
     ) -> dict[str, Any]:
         # A deep, JSON-round-tripped copy: proves equality without ever
         # aliasing the mutable dict the caller still holds.
@@ -7997,3 +8002,599 @@ def test_provider_image_analysis_history_survives_backend_switch(target: str, st
         assert "analyze_image" in assistant_text
         assert "The image shows a blue triangle." in assistant_text
     assert followup["messages"][1]["content"] == source_content
+
+
+def _toolsearch_inline_request() -> dict[str, Any]:
+    return {
+        'model': 'claude-opus-4-6', 'max_tokens': 64,
+        'tools': [{'name': 'ToolSearch', 'input_schema': {'type': 'object'}}],
+        'messages': [
+            {'role': 'user', 'content': 'Load the lookup function.'},
+            {'role': 'system', 'content': [
+                {'type': 'tool_addition', 'tool': {'type': 'tool_definition', 'definition': {
+                    'name': 'lookup', 'description': 'Read-only synthetic lookup.',
+                    'input_schema': {'type': 'object', 'properties': {'query': {'type': 'string'}}, 'required': ['query']},
+                }}},
+            ]},
+        ],
+    }
+
+
+def test_toolsearch_counting_and_inference_use_the_same_prepared_prompt() -> None:
+    client, stub = _gateway(GatewayConfig(model_map={'opus': 'codex:gpt-5.5'}), _failing_anthropic_handler)
+    body = _toolsearch_inline_request()
+    headers = {'anthropic-beta': 'inline-tools-2026-09-15'}
+    counted = client.post('/v1/messages/count_tokens', json=body, headers=headers)
+    response = client.post('/v1/messages', json=body, headers=headers)
+    assert counted.status_code == 200
+    assert response.status_code == 503
+    (payload,) = stub.payloads
+    countable = {key: payload[key] for key in ('instructions', 'input', 'tools') if key in payload}
+    assert counted.json()['input_tokens'] == max(len(json.dumps(countable, ensure_ascii=False)) // 4, 1)
+    assert [tool['name'] for tool in payload['tools']] == ['ToolSearch', 'lookup']
+
+
+@pytest.mark.parametrize('path', ['/v1/messages', '/v1/messages/count_tokens'])
+def test_toolsearch_malformed_current_reference_is_rejected_before_transport(path: str) -> None:
+    client, stub = _gateway(GatewayConfig(model_map={'opus': 'codex:gpt-5.5'}), _failing_anthropic_handler)
+    body = _message_body('claude-opus-4-6')
+    body['tools'] = [{'name': 'ToolSearch', 'input_schema': {'type': 'object'}}]
+    body['messages'] += [
+        {'role': 'assistant', 'content': [{'type': 'tool_use', 'id': 'search', 'name': 'ToolSearch', 'input': {}}]},
+        {'role': 'user', 'content': [{'type': 'tool_result', 'tool_use_id': 'search', 'content': [
+            {'type': 'tool_reference', 'tool_name': 'missing_lookup'},
+        ]}]},
+    ]
+    response = client.post(path, json=body)
+    assert response.status_code == 400
+    assert response.json()['error']['type'] == 'invalid_request_error'
+    assert 'no known definition' in response.json()['error']['message']
+    assert stub.payloads == []
+
+
+@pytest.mark.parametrize('stream', [False, True])
+def test_removed_function_is_not_emitted_as_executable_tool_use(stream: bool) -> None:
+    custom_stub = StubOpenAICompatibleClient(_custom_function_call_events('call_removed', 'signature'))
+    client = _custom_provider_gateway(custom_stub)
+    body = _toolsearch_inline_request()
+    body['stream'] = stream
+    body['messages'][1]['content'].append({'type': 'tool_removal', 'tool': {'type': 'tool_reference', 'name': 'lookup'}})
+    response = client.post('/v1/messages', json=body, headers={'anthropic-beta': 'inline-tools-2026-09-15'})
+    assert [tool['name'] for tool in custom_stub.payloads[0]['tools']] == ['ToolSearch']
+    if stream:
+        assert response.status_code == 200
+        frames = [json.loads(frame.split('data: ', 1)[1]) for frame in response.text.split('\n\n') if frame]
+        assert any(frame.get('type') == 'error' for frame in frames)
+        assert not any(frame.get('content_block', {}).get('type') == 'tool_use' for frame in frames)
+    else:
+        assert response.status_code == 502
+        assert response.json()['error']['type'] == 'api_error'
+
+
+@pytest.mark.parametrize('path', ['/v1/messages', '/v1/messages/count_tokens'])
+def test_native_passthrough_keeps_inline_tool_protocol_bytes_and_headers(path: str) -> None:
+    captured: list[httpx.Request] = []
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(200, json={'input_tokens': 123} if path.endswith('count_tokens') else {'id': 'msg_native'})
+    client, stub = _gateway(GatewayConfig(model_map={}), handler)
+    body = _toolsearch_inline_request()
+    raw = json.dumps(body, separators=(',', ':')).encode()
+    beta = 'inline-tools-2026-09-15'
+    response = client.post(path, content=raw, headers={'content-type': 'application/json', 'anthropic-beta': beta})
+    assert response.status_code == 200
+    assert captured[0].content == raw
+    assert captured[0].headers['anthropic-beta'] == beta
+    assert stub.payloads == []
+
+
+def test_toolsearch_compaction_trigger_does_not_count_removed_root_schema() -> None:
+    body = _compaction_body('claude-opus-4-6')
+    body['tools'] = [{'name': 'departed', 'description': 'long description ' * 2000,
+                      'input_schema': {'type': 'object'}}]
+    body['messages'] = [
+        {'role': 'user', 'content': 'Remove the old function.'},
+        {'role': 'system', 'content': [{'type': 'tool_removal', 'tool': {'type': 'tool_reference', 'name': 'departed'}}]},
+        {'role': 'assistant', 'content': 'The function was removed.'},
+        *body['messages'],
+    ]
+    preview = translate_claude_request_to_codex(body, 'gpt-5.5')
+    counted = {key: preview[key] for key in ('instructions', 'input', 'tools') if key in preview}
+    estimate = context_overflow.estimate_overflow_prompt_tokens(counted)
+    assert context_overflow.estimate_overflow_prompt_tokens(body) > estimate * 2
+    client, stub = _gateway(_compaction_config({'opus': 'codex:gpt-5.5'}),
+                            _failing_anthropic_handler, codex_context_window=estimate + 1)
+    response = client.post('/v1/messages', json=body,
+                           headers={'anthropic-beta': 'mid-conversation-tool-changes-2026-07-01'})
+    assert response.status_code == 503
+    assert len(stub.payloads) == 1
+    assert 'tools' not in stub.payloads[0]
+    assert client.app.state.compaction_last_reroute is None
+
+
+def test_hosted_web_search_cannot_be_emitted_as_a_client_function_call() -> None:
+    events = _custom_function_call_events('call_hosted', 'signature')
+    for event in events:
+        item = event.get('item')
+        if isinstance(item, dict) and item.get('type') == 'function_call':
+            item['name'] = 'web_search'
+    custom_stub = StubOpenAICompatibleClient(events)
+    client = _custom_provider_gateway(custom_stub)
+    body = _message_body('claude-opus-4-6')
+    body['tools'] = [{'type': 'web_search_20260209', 'name': 'web_search'}]
+    response = client.post('/v1/messages', json=body)
+    assert custom_stub.payloads[0]['tools'] == [{'type': 'web_search'}]
+    assert response.status_code == 502
+    assert 'undeclared or removed function' in response.json()['error']['message']
+
+
+@pytest.mark.parametrize('path', ['/v1/messages', '/v1/messages/count_tokens'])
+def test_malformed_toolsearch_root_description_is_http400(path: str) -> None:
+    client, stub = _gateway(GatewayConfig(model_map={'opus': 'codex:gpt-5.5'}), _failing_anthropic_handler)
+    body = _message_body('claude-opus-4-6')
+    body['tools'] = [{'name': 'ToolSearch', 'description': 1, 'input_schema': {'type': 'object'}}]
+    response = client.post(path, json=body)
+    assert response.status_code == 400
+    assert stub.payloads == []
+
+
+@pytest.mark.parametrize('stream', [False, True])
+def test_active_function_with_stale_arguments_never_emits_executable_tool_use(stream: bool) -> None:
+    events = _custom_function_call_events('call_stale', 'signature')
+    for event in events:
+        if event.get('type') == 'response.function_call_arguments.delta':
+            event['delta'] = '{"revision":"OLD_ONLY"}'
+        if event.get('type') == 'response.function_call_arguments.done':
+            event['arguments'] = '{"revision":"OLD_ONLY"}'
+        item = event.get('item')
+        if isinstance(item, dict) and item.get('type') == 'function_call':
+            item['arguments'] = '{"revision":"OLD_ONLY"}'
+    stub = StubOpenAICompatibleClient(events)
+    client = _custom_provider_gateway(stub)
+    body = _message_body('claude-opus-4-6')
+    body['stream'] = stream
+    body['tools'] = [{'name': 'lookup', 'input_schema': {
+        'type': 'object', 'properties': {'revision': {'type': 'string', 'enum': ['NEW_ONLY']}},
+        'required': ['revision'], 'additionalProperties': False,
+    }}]
+    response = client.post('/v1/messages', json=body)
+    if stream:
+        assert response.status_code == 200
+        frames = [json.loads(frame.split('data: ', 1)[1]) for frame in response.text.split('\n\n') if frame]
+        assert any(frame.get('type') == 'error' for frame in frames)
+        assert not any(frame.get('content_block', {}).get('type') == 'tool_use' for frame in frames)
+    else:
+        assert response.status_code == 502
+        assert response.json()['error']['type'] == 'api_error'
+
+
+@pytest.mark.parametrize('path', ['/v1/messages', '/v1/messages/count_tokens'])
+def test_invalid_current_function_schema_fails_before_transport(path: str) -> None:
+    client, stub = _gateway(GatewayConfig(model_map={'opus': 'codex:gpt-5.5'}), _failing_anthropic_handler)
+    body = _message_body('claude-opus-4-6')
+    body['tools'] = [{'name': 'lookup', 'input_schema': {'type': 'object', 'required': 'not-an-array'}}]
+    response = client.post(path, json=body)
+    assert response.status_code == 400
+    assert stub.payloads == []
+
+
+@pytest.mark.parametrize('stream', [False, True])
+@pytest.mark.parametrize('value,valid', [('É', True), ('lower', False)])
+def test_custom_ecmascript_pattern_is_enforced_without_losing_valid_calls(
+    stream: bool, value: str, valid: bool
+) -> None:
+    events = _custom_function_call_events('call_unicode', 'signature')
+    arguments = json.dumps({'upper': value})
+    for event in events:
+        if event.get('type') == 'response.function_call_arguments.delta':
+            event['delta'] = arguments
+        if event.get('type') == 'response.function_call_arguments.done':
+            event['arguments'] = arguments
+        item = event.get('item')
+        if isinstance(item, dict) and item.get('type') == 'function_call':
+            item['arguments'] = arguments
+    stub = StubOpenAICompatibleClient(events)
+    client = _custom_provider_gateway(stub)
+    body = _message_body('claude-opus-4-6')
+    body['stream'] = stream
+    schema = {'type': 'object', 'properties': {'upper': {'type': 'string', 'pattern': r'^\p{Lu}+$'}},
+              'required': ['upper'], 'additionalProperties': False}
+    body['tools'] = [{'name': 'lookup', 'input_schema': schema}]
+    response = client.post('/v1/messages', json=body)
+    assert stub.payloads[0]['tools'][0]['parameters'] == schema
+    if stream:
+        assert response.status_code == 200
+        frames = [json.loads(frame.split('data: ', 1)[1]) for frame in response.text.split('\n\n') if frame]
+        assert any(frame.get('content_block', {}).get('type') == 'tool_use' for frame in frames) is valid
+        assert any(frame.get('type') == 'error' for frame in frames) is not valid
+    else:
+        assert response.status_code == (200 if valid else 502)
+
+
+def _validation_call_events(arguments: str) -> list[dict[str, Any]]:
+    events = _custom_function_call_events('call_validation', 'signature')
+    for event in events:
+        if event.get('type') == 'response.function_call_arguments.delta':
+            event['delta'] = arguments
+        if event.get('type') == 'response.function_call_arguments.done':
+            event['arguments'] = arguments
+        item = event.get('item')
+        if isinstance(item, dict) and item.get('type') == 'function_call':
+            item['arguments'] = arguments
+    return events
+
+
+@pytest.mark.parametrize('path', ['/v1/messages', '/v1/messages/count_tokens'])
+@pytest.mark.parametrize('regex_dialect', ['python', 'ecmascript'])
+def test_declared_draft_is_preserved_from_latest_active_tool(path, regex_dialect, monkeypatch):
+    from claudex.translate.claude_to_codex import TranslationError
+    from claudex.translate.tool_validation import compile_function_validators, validate_function_arguments
+    import claudex.relay.endpoints as relay_endpoints
+
+    schema = {'$schema': 'http://json-schema.org/draft-07/schema#', 'type': 'object',
+              'properties': {'amount': {'type': 'number'}, 'approved': {'const': True}},
+              'dependencies': {'amount': ['approved']}}
+    compiled = []
+
+    def capture(schemas, **kwargs):
+        validators = compile_function_validators(schemas, **kwargs)
+        compiled.append(validators)
+        return validators
+
+    monkeypatch.setattr(relay_openai_backend, 'compile_function_validators', capture)
+    monkeypatch.setattr(relay_endpoints, 'compile_function_validators', capture)
+    stub = StubOpenAICompatibleClient(_validation_call_events('{"amount":100}'))
+    if regex_dialect == 'python':
+        client, codex = _gateway(GatewayConfig(model_map={'opus': 'codex:gpt-5.5'}), _failing_anthropic_handler)
+        codex.stream_responses = stub.stream_responses
+    else:
+        client = _custom_provider_gateway(stub)
+    body = _toolsearch_inline_request()
+    body['tools'].append({'name': 'lookup', 'input_schema': {'type': 'object'}})
+    body['messages'][1]['content'][0]['tool']['definition']['input_schema'] = schema
+    response = client.post(path, json=body, headers={'anthropic-beta': 'inline-tools-2026-09-15'})
+    assert compiled
+    with pytest.raises(TranslationError, match='dependencies'):
+        validate_function_arguments(compiled[0], 'lookup', '{"amount":100}')
+    assert response.status_code == (200 if path.endswith('count_tokens') else 502)
+    if stub.payloads:
+        assert '$schema' not in stub.payloads[0]['tools'][-1]['parameters']
+
+
+@pytest.mark.parametrize('path', ['/v1/messages', '/v1/messages/count_tokens'])
+@pytest.mark.parametrize('regex_dialect', ['python', 'ecmascript'])
+def test_unsupported_root_schema_dialect_fails_before_transport(path, regex_dialect):
+    stub = StubOpenAICompatibleClient(_validation_call_events('{}'))
+    if regex_dialect == 'python':
+        client, codex = _gateway(GatewayConfig(model_map={'opus': 'codex:gpt-5.5'}), _failing_anthropic_handler)
+        codex.stream_responses = stub.stream_responses
+    else:
+        client = _custom_provider_gateway(stub)
+    body = _message_body('claude-opus-4-6')
+    body['tools'] = [{'name': 'lookup', 'input_schema': {
+        '$schema': 'https://local.example/unsupported-dialect', 'type': 'object'}}]
+    response = client.post(path, json=body)
+    assert response.status_code == 400
+    assert 'unsupported JSON Schema dialect' in response.json()['error']['message']
+    assert stub.payloads == []
+
+
+@pytest.mark.parametrize('stream', [False, True])
+@pytest.mark.parametrize('arguments', ['{"amount":1e999}', '{"amount":-1e999}', '{"nested":[{"values":[1e999]}]}'])
+def test_nonfinite_arguments_never_emit_executable_tool_use(stream, arguments):
+    stub = StubOpenAICompatibleClient(_validation_call_events(arguments))
+    client = _custom_provider_gateway(stub)
+    body = _message_body('claude-opus-4-6')
+    body['stream'] = stream
+    body['tools'] = [{'name': 'lookup', 'input_schema': {'type': 'object'}}]
+    response = client.post('/v1/messages', json=body)
+    if stream:
+        assert response.status_code == 200
+        frames = [json.loads(frame.split('data: ', 1)[1]) for frame in response.text.split('\n\n') if frame]
+        assert any(frame.get('type') == 'error' for frame in frames)
+        assert not any(frame.get('content_block', {}).get('type') == 'tool_use' for frame in frames)
+    else:
+        assert response.status_code == 502
+        assert response.json()['error']['type'] == 'api_error'
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_argument_validation_does_not_block_relay_event_loop(stream, monkeypatch):
+    import claudex.translate.codex_to_claude as translator_module
+    from claudex.translate.claude_to_codex import TranslationError
+
+    validating = threading.Event()
+    progress = []
+
+    def slow_validation(*args, **kwargs):
+        validating.set()
+        time.sleep(0.15)
+        validating.clear()
+        raise TranslationError("bounded validation timed out")
+
+    monkeypatch.setattr(translator_module, "validate_function_arguments", slow_validation)
+
+    async def run():
+        async def heartbeat():
+            while True:
+                if validating.is_set():
+                    progress.append(True)
+                await asyncio.sleep(0.01)
+
+        async def events():
+            for event in _validation_call_events('{}'):
+                yield event
+
+        task = asyncio.create_task(heartbeat())
+        await asyncio.sleep(0)
+        try:
+            kwargs = {"function_schemas": {"lookup": {"type": "object"}},
+                      "tool_name_map": {"lookup": "lookup"}}
+            if stream:
+                result = ''.join([chunk async for chunk in _translate_claude_sse({}, events(), **kwargs)])
+                assert 'event: error' in result
+                assert '"type": "tool_use"' not in result
+            else:
+                result = await _aggregate_claude_response({}, events(), **kwargs)
+                assert result.status_code == 502
+        finally:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+    asyncio.run(run())
+    assert len(progress) >= 3, "other coroutines stalled during argument validation"
+
+
+@pytest.mark.parametrize("path", ["/v1/messages", "/v1/messages/count_tokens"])
+def test_schema_compilation_does_not_block_relay_event_loop(path, monkeypatch):
+    import claudex.relay.endpoints as relay_endpoints
+    from claudex.translate.tool_validation import compile_function_validators
+
+    compiling = threading.Event()
+    progress = []
+
+    def slow_compile(*args, **kwargs):
+        compiling.set()
+        time.sleep(0.15)
+        compiling.clear()
+        return compile_function_validators(*args, **kwargs)
+
+    monkeypatch.setattr(relay_openai_backend, "compile_function_validators", slow_compile)
+    monkeypatch.setattr(relay_endpoints, "compile_function_validators", slow_compile)
+    stub = StubOpenAICompatibleClient(_validation_call_events('{}'))
+    client = _custom_provider_gateway(stub)
+    body = _message_body('claude-opus-4-6')
+    body['tools'] = [{"name": "lookup", "input_schema": {"type": "object"}}]
+
+    async def run():
+        async def heartbeat():
+            while True:
+                if compiling.is_set():
+                    progress.append(True)
+                await asyncio.sleep(0.01)
+
+        task = asyncio.create_task(heartbeat())
+        await asyncio.sleep(0)
+        try:
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=client.app),
+                                         base_url='http://testserver') as async_client:
+                response = await async_client.post(path, json=body)
+                assert response.status_code == 200
+        finally:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+    asyncio.run(run())
+    assert len(progress) >= 3, "other coroutines stalled during schema compilation"
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_translator_schema_timeout_is_nonblocking_and_mapped_to_api_error(stream, monkeypatch):
+    import claudex.translate.codex_to_claude as translator_module
+    from claudex.translate.claude_to_codex import TranslationError
+
+    compiling = threading.Event()
+    progress = []
+    closed = []
+
+    def slow_compile(*args, **kwargs):
+        compiling.set()
+        time.sleep(0.15)
+        compiling.clear()
+        raise TranslationError("schema pattern validation timed out")
+
+    monkeypatch.setattr(translator_module, "compile_function_validators", slow_compile)
+
+    async def run():
+        async def heartbeat():
+            while True:
+                if compiling.is_set():
+                    progress.append(True)
+                await asyncio.sleep(0.01)
+
+        async def events():
+            try:
+                yield {"type": "response.created"}
+            finally:
+                closed.append(True)
+
+        upstream = events()
+        await anext(upstream)
+        task = asyncio.create_task(heartbeat())
+        await asyncio.sleep(0)
+        try:
+            if stream:
+                response = ''.join([chunk async for chunk in _translate_claude_sse({}, upstream, function_schemas={})])
+                assert 'event: error' in response
+                assert '"type": "tool_use"' not in response
+            else:
+                response = await _aggregate_claude_response({}, upstream, function_schemas={})
+                assert response.status_code == 502
+        finally:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+    asyncio.run(run())
+    assert len(progress) >= 3
+    assert closed == [True]
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("validated", [False, True])
+@pytest.mark.parametrize("delivered", [False, True])
+def test_terminal_less_function_stream_is_api_error(stream, validated, delivered):
+    flags = {"closed": False}
+    item = {"type": "function_call", "id": "item_1", "call_id": "call_1", "name": "lookup"}
+    events = [_CREATED_EVENT, {"type": "response.output_item.added", "output_index": 0, "item": item},
+              {"type": "response.function_call_arguments.delta", "output_index": 0,
+               "delta": '{"mode":"B"}' if delivered else '{"mode":'}]
+    if delivered:
+        events.append({"type": "response.output_item.done", "output_index": 0,
+                       "item": {**item, "arguments": '{"mode":"B"}'}})
+    kwargs = {"function_schemas": {"lookup": {"type": "object"}}} if validated else {}
+
+    async def run():
+        upstream = _finalizing_upstream(flags, events)
+        if stream:
+            result = ''.join([chunk async for chunk in _translate_claude_sse({}, upstream, **kwargs)])
+            assert result.count('event: error') == 1
+            assert 'without a terminal response event' in result
+            assert 'event: message_stop' not in result
+            assert 'event: message_delta' not in result
+            assert result.count('"type": "tool_use"') == (int(delivered) if validated else 1)
+        else:
+            result = await _aggregate_claude_response({}, upstream, **kwargs)
+            assert result.status_code == 502
+            assert json.loads(result.body)["error"]["type"] == "api_error"
+            assert 'without a terminal response event' in json.loads(result.body)["error"]["message"]
+
+    asyncio.run(run())
+    assert flags["closed"] is True
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("event_type", ["response.completed", "response.incomplete", "response.failed", "error"])
+def test_legitimate_terminal_does_not_add_eof_error(stream, event_type):
+    flags = {"closed": False}
+    terminal = {"type": event_type, "response": {"output": [], "error": {"message": "upstream failure"}},
+                "error": {"message": "upstream failure"}}
+
+    async def run():
+        upstream = _finalizing_upstream(flags, [_CREATED_EVENT, terminal])
+        if stream:
+            result = ''.join([chunk async for chunk in _translate_claude_sse({}, upstream)])
+            assert 'without a terminal response event' not in result
+            assert result.count('event: error') == int(event_type in ("response.failed", "error"))
+        else:
+            result = await _aggregate_claude_response({}, upstream)
+            assert result.status_code == (502 if event_type in ("response.failed", "error") else 200)
+
+    asyncio.run(run())
+    assert flags["closed"] is True
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("events", [[], [_CREATED_EVENT],
+    [_CREATED_EVENT, {"type": "response.output_text.delta", "delta": "partial text"}]])
+def test_terminal_less_empty_or_text_stream_is_api_error(stream, events):
+    flags = {"closed": False}
+
+    async def run():
+        upstream = _finalizing_upstream(flags, events)
+        if stream:
+            result = ''.join([chunk async for chunk in _translate_claude_sse({}, upstream)])
+            assert result.count('event: error') == 1
+            assert 'without a terminal response event' in result
+            assert 'event: message_stop' not in result
+            assert 'event: message_delta' not in result
+        else:
+            result = await _aggregate_claude_response({}, upstream)
+            assert result.status_code == 502
+            assert 'without a terminal response event' in json.loads(result.body)["error"]["message"]
+
+    asyncio.run(run())
+    assert flags["closed"] is True
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("failure", ["collision", "changed_arguments"])
+def test_call_identity_errors_are_relay_api_errors_without_duplicate_execution(stream, failure):
+    flags = {"closed": False}
+    item = {"type": "function_call", "id": "item_1", "call_id": "call.real/id", "name": "lookup",
+            "arguments": '{"mode":"A"}'}
+    events = [_CREATED_EVENT, {"type": "response.output_item.done", "output_index": 0, "item": item}]
+    terminal_item = ({**item, "id": "item_2", "call_id": "call_real_id", "output_index": 1}
+                     if failure == "collision" else {**item, "arguments": '{"mode":"B"}',
+                         "extra_content": {"google": {"thought_signature": "mismatched_arguments"}}})
+    events.append({"type": "response.completed", "response": {"output": [terminal_item]}})
+    kwargs = {"function_schemas": {"lookup": {"type": "object"}}, "custom_provider": "gemprov"}
+
+    async def run():
+        upstream = _finalizing_upstream(flags, events)
+        if stream:
+            result = ''.join([chunk async for chunk in _translate_claude_sse({}, upstream, **kwargs)])
+            assert result.count('event: error') == 1
+            assert result.count('"type": "tool_use"') == 1
+            assert 'event: message_stop' not in result
+            assert 'signature_delta' not in result
+        else:
+            result = await _aggregate_claude_response({}, upstream, **kwargs)
+            assert result.status_code == 502
+            assert json.loads(result.body)["error"]["type"] == "api_error"
+
+    asyncio.run(run())
+    assert flags["closed"] is True
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("changed", [False, True])
+def test_deep_emitted_argument_snapshot_comparison_is_depth_safe(stream, changed):
+    flags = {"closed": False}
+    depth = 600
+    arguments = '{"x":' * depth + '0' + '}' * depth
+    json.loads(arguments)
+    terminal_arguments = ' ' + '{"x":' * depth + ('1' if changed else '0') + '}' * depth + ' '
+    json.loads(terminal_arguments)
+    item = {"type": "function_call", "call_id": "call_1", "name": "f", "status": "completed",
+            "arguments": arguments}
+    terminal_item = {**item, "arguments": terminal_arguments,
+                     "extra_content": {"google": {"thought_signature": "terminal_signature"}}}
+    events = [_CREATED_EVENT, {"type": "response.output_item.done", "output_index": 0, "item": item},
+              {"type": "response.completed", "response": {"output": [terminal_item]}}]
+    kwargs = {"function_schemas": {"f": {"type": "object"}}, "custom_provider": "gemprov"}
+
+    async def run():
+        upstream = _finalizing_upstream(flags, events)
+        if stream:
+            result = ''.join([chunk async for chunk in _translate_claude_sse({}, upstream, **kwargs)])
+            assert result.count('"type": "tool_use"') == 1
+            assert result.count('event: error') == int(changed)
+            assert result.count('event: message_delta') == int(not changed)
+            assert result.count('event: message_stop') == int(not changed)
+            assert result.count('signature_delta') == int(not changed)
+            if changed:
+                assert 'changed emitted function call arguments' in result
+                assert 'terminal_signature' not in result
+        else:
+            result = await _aggregate_claude_response({}, upstream, **kwargs)
+            assert result.status_code == (502 if changed else 200)
+            body = json.loads(result.body)
+            if changed:
+                assert body["error"]["type"] == "api_error"
+                assert 'changed emitted function call arguments' in body["error"]["message"]
+                assert 'terminal_signature' not in result.body.decode()
+            else:
+                tools = [block for block in body["content"] if block["type"] == "tool_use"]
+                assert len(tools) == 1
+                assert tools[0]["id"] == "call_1"
+                leaf = tools[0]["input"]
+                for _ in range(depth):
+                    leaf = leaf["x"]
+                assert leaf == 0
+                assert body["stop_reason"] == "tool_use"
+
+    asyncio.run(run())
+    assert flags["closed"] is True

@@ -13,6 +13,8 @@ literal text here means a drift in either file breaks the tests.
 
 import copy
 
+import pytest
+
 from claudex import compaction
 
 FULL_COMPACT_PROMPT = (
@@ -507,3 +509,99 @@ def test_build_reroute_headers_never_forwards_transport_or_arbitrary_headers() -
     }
     result = compaction.build_reroute_headers(headers, None)
     assert set(result) == {"content-type", "anthropic-version", "x-api-key"}
+
+
+def test_detects_actual_client_compact_instruction_before_system_budget_notice() -> None:
+    body = {'messages': [
+        _user_message(FULL_COMPACT_PROMPT),
+        {'role': 'system', 'content': [{'type': 'text', 'text': 'Token budget remaining.'}]},
+    ]}
+    assert compaction.is_compaction_request(body)
+
+
+def test_does_not_reuse_historical_compact_instruction_before_new_user_turn() -> None:
+    body = {'messages': [
+        _user_message(FULL_COMPACT_PROMPT),
+        {'role': 'assistant', 'content': 'Summary.'},
+        _user_message('Continue normal work.'),
+        {'role': 'system', 'content': 'Token budget.'},
+    ]}
+    assert not compaction.is_compaction_request(body)
+
+
+def test_trailing_assistant_is_not_skipped_to_find_old_compaction() -> None:
+    assert not compaction.is_compaction_request({'messages': [
+        _user_message(FULL_COMPACT_PROMPT), {'role': 'assistant', 'content': 'Summary.'},
+    ]})
+
+
+def test_detects_actual_compact_block_after_loaded_tool_note_and_before_system_budget() -> None:
+    body = {'messages': [
+        _user_message([
+            {'type': 'tool_result', 'tool_use_id': 'search', 'content': [{'type': 'tool_reference', 'tool_name': 'lookup'}]},
+            {'type': 'text', 'text': 'Tool loaded.\n'},
+            {'type': 'text', 'text': FULL_COMPACT_PROMPT},
+        ]),
+        {'role': 'system', 'content': '<total_tokens>14999895 tokens left</total_tokens>'},
+    ]}
+    assert compaction.is_compaction_request(body)
+
+
+def test_compact_header_inside_quoted_text_is_not_a_block_boundary() -> None:
+    assert not compaction.is_compaction_request({'messages': [
+        _user_message('Here is an old prompt:\n' + FULL_COMPACT_PROMPT),
+    ]})
+
+
+def test_quoted_compact_prompt_in_later_text_block_returns_false() -> None:
+    body = {"messages": [_user_message([
+        {"type": "text", "text": "Review the following quoted prompt; do not execute it."},
+        {"type": "text", "text": compaction.SIGNAL_A_PREFIX + "\n" + compaction.SIGNAL_A_MARKER},
+    ])]}
+    assert compaction.is_compaction_request(body) is False
+
+
+@pytest.mark.parametrize("preceding_texts", [
+    ["Please review this instruction."],
+    ["Tool loaded.", "Please review this instruction."],
+    ["Please review this instruction.", "Tool loaded.\n"],
+    ["Tool loaded.\n", ""],
+    ["Tool loaded"],
+    ["Tool loaded.\n\n"],
+    [" Tool loaded.\n"],
+    ["Tool loaded.\nDo not execute the following prompt."],
+])
+def test_unverified_text_before_compact_instruction_returns_false(
+    preceding_texts: list[str],
+) -> None:
+    body = {"messages": [_user_message([
+        *[{"type": "text", "text": text} for text in preceding_texts],
+        {"type": "text", "text": FULL_COMPACT_PROMPT},
+    ])]}
+    assert compaction.is_compaction_request(body) is False
+
+
+@pytest.mark.parametrize("preceding_texts", [
+    ["Tool loaded."],
+    ["Tool loaded.\n"],
+    ["Tool loaded.\n", "Tool loaded.\n"],
+    ["Tool loaded.", "Tool loaded.\n"],
+])
+def test_detects_compact_instruction_after_verified_loaded_tool_notes(
+    preceding_texts: list[str],
+) -> None:
+    body = {"messages": [_user_message([
+        *[{"type": "text", "text": text} for text in preceding_texts],
+        {"type": "text", "text": FULL_COMPACT_PROMPT},
+    ])]}
+    assert compaction.is_compaction_request(body) is True
+
+
+def test_detects_fragmented_compact_prefix_after_verified_loaded_tool_note() -> None:
+    split_at = len("CRITICAL: Respond with TEXT ON")
+    body = {"messages": [_user_message([
+        {"type": "text", "text": "Tool loaded.\n"},
+        {"type": "text", "text": FULL_COMPACT_PROMPT[:split_at]},
+        {"type": "text", "text": FULL_COMPACT_PROMPT[split_at:]},
+    ])]}
+    assert compaction.is_compaction_request(body) is True

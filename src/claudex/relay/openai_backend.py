@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 import logging
@@ -34,6 +35,9 @@ from claudex.translate import (
     translate_claude_request_to_codex,
 )
 from claudex.upstream_errors import UpstreamAuthError, UpstreamError
+from claudex.translate.tool_protocol import ToolProtocolError, compile_tool_state
+from claudex.translate.claude_to_codex import build_function_validation_schemas
+from claudex.translate.tool_validation import compile_function_validators
 
 logger = logging.getLogger("claudex.server")
 
@@ -115,7 +119,32 @@ async def _relay_via_responses_backend(
         # never be treated as a real window, so the bool case is excluded
         # explicitly rather than trusting `isinstance(x, int)` alone.
         if isinstance(context_window, int) and not isinstance(context_window, bool):
-            estimated_prompt_tokens = context_overflow.estimate_overflow_prompt_tokens(claude_request)
+            overflow_request = claude_request
+            has_tool_protocol = bool(claude_request.get("tools")) or any(
+                isinstance(block, dict) and block.get("type") in {"tool_addition", "tool_removal"}
+                for message in claude_request.get("messages", [])
+                if isinstance(message, dict) and isinstance(message.get("content"), list)
+                for block in message["content"]
+            )
+            if has_tool_protocol:
+                try:
+                    preview = translate_claude_request_to_codex(
+                        claude_request,
+                        upstream_model,
+                        config.reasoning_effort_override,
+                        custom_provider=backend.signature_namespace,
+                        codex_regex_compat=backend.codex_regex_compat,
+                        beta_header=request.headers.get("anthropic-beta", ""),
+                    )
+                except TranslationError as exc:
+                    return JSONResponse(
+                        server_support._claude_error_body("invalid_request_error", str(exc)),
+                        status_code=400,
+                    )
+                overflow_request = {
+                    key: preview[key] for key in ("instructions", "input", "tools") if key in preview
+                }
+            estimated_prompt_tokens = context_overflow.estimate_overflow_prompt_tokens(overflow_request)
             if estimated_prompt_tokens > context_window:
                 target_model = parse_compaction_model(config.compaction_model)
                 reroute_response = await _reroute_compaction(
@@ -130,18 +159,37 @@ async def _relay_via_responses_backend(
                     return reroute_response
 
     try:
+        tool_state = compile_tool_state(
+            claude_request, beta_header=request.headers.get("anthropic-beta", "")
+        )
         payload = translate_claude_request_to_codex(
             claude_request,
             upstream_model,
             config.reasoning_effort_override,
             custom_provider=backend.signature_namespace,
             codex_regex_compat=backend.codex_regex_compat,
+            tool_state=tool_state,
+        )
+    except (TranslationError, ToolProtocolError) as exc:
+        return JSONResponse(
+            server_support._claude_error_body("invalid_request_error", str(exc)), status_code=400
+        )
+    payload = await backend.adapt_payload(payload, upstream_model)
+    countable_request = {key: payload[key] for key in ("instructions", "input", "tools") if key in payload}
+    callable_names = {tool["name"] for tool in payload.get("tools", []) if tool.get("type") == "function"}
+    active_function_map = {
+        name: alias for name, alias in tool_state.active_name_map.items() if alias in callable_names
+    }
+    function_schemas = build_function_validation_schemas(tool_state, payload)
+    try:
+        await asyncio.to_thread(
+            compile_function_validators, function_schemas,
+            regex_dialect="python" if backend.codex_regex_compat else "ecmascript",
         )
     except TranslationError as exc:
         return JSONResponse(
             server_support._claude_error_body("invalid_request_error", str(exc)), status_code=400
         )
-    payload = await backend.adapt_payload(payload, upstream_model)
     session_id = payload["prompt_cache_key"]
     logger.info(
         "%s -> %s:%s (stream=%s, effort=%s, tier=%s, messages=%d, tools=%d)",
@@ -176,7 +224,7 @@ async def _relay_via_responses_backend(
             )
     except UpstreamError as exc:
         status_code, body = _upstream_error_to_claude(
-            exc, claude_request=claude_request, context_window=context_window
+            exc, claude_request=countable_request, context_window=context_window
         )
         logger.warning(
             "%s upstream error %s: %s", provider, exc.status_code, body["error"]["message"]
@@ -210,6 +258,10 @@ async def _relay_via_responses_backend(
                 upstream_events(),
                 context_window,
                 custom_provider=backend.signature_namespace,
+                tool_name_map=active_function_map,
+                function_schemas=function_schemas,
+                regex_dialect="python" if backend.codex_regex_compat else "ecmascript",
+                countable_request=countable_request,
             ),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache"},
@@ -219,6 +271,10 @@ async def _relay_via_responses_backend(
         upstream_events(),
         context_window,
         custom_provider=backend.signature_namespace,
+        tool_name_map=active_function_map,
+        function_schemas=function_schemas,
+        regex_dialect="python" if backend.codex_regex_compat else "ecmascript",
+        countable_request=countable_request,
     )
 
 
@@ -505,19 +561,31 @@ async def _translate_claude_sse(
     context_window: int | None = None,
     *,
     custom_provider: str | None = None,
+    tool_name_map: dict[str, str] | None = None,
+    function_schemas: dict[str, dict[str, Any]] | None = None,
+    regex_dialect: str = "python",
+    countable_request: dict[str, Any] | None = None,
 ) -> AsyncIterator[str]:
-    translator = CodexToClaudeStreamTranslator(
-        claude_request,
-        context_window=context_window,
-        custom_provider=custom_provider,
-    )
     try:
+        translator = await asyncio.to_thread(
+            CodexToClaudeStreamTranslator, claude_request,
+            context_window=context_window,
+            custom_provider=custom_provider,
+            tool_name_map=tool_name_map,
+            function_schemas=function_schemas,
+            regex_dialect=regex_dialect,
+            countable_request=countable_request,
+        )
         async for event in upstream_events:
-            for event_name, payload in translator.translate_event(event):
+            for event_name, payload in await translator.translate_event_async(event):
                 yield _format_sse(event_name, payload)
+        translator.finish()
+    except TranslationError as exc:
+        yield _format_sse("error", server_support._claude_error_body("api_error", str(exc)))
     except UpstreamError as exc:
         _, body = _upstream_error_to_claude(
-            exc, claude_request=claude_request, context_window=context_window
+            exc, claude_request=countable_request if countable_request is not None else claude_request,
+            context_window=context_window
         )
         yield _format_sse("error", body)
     except (UpstreamAuthError, httpx.HTTPError) as exc:
@@ -538,25 +606,37 @@ async def _aggregate_claude_response(
     context_window: int | None = None,
     *,
     custom_provider: str | None = None,
+    tool_name_map: dict[str, str] | None = None,
+    function_schemas: dict[str, dict[str, Any]] | None = None,
+    regex_dialect: str = "python",
+    countable_request: dict[str, Any] | None = None,
 ) -> JSONResponse:
-    translator = CodexToClaudeStreamTranslator(
-        claude_request,
-        context_window=context_window,
-        custom_provider=custom_provider,
-    )
     claude_events: list[tuple[str, dict[str, Any]]] = []
     try:
+        translator = await asyncio.to_thread(
+            CodexToClaudeStreamTranslator, claude_request,
+            context_window=context_window,
+            custom_provider=custom_provider,
+            tool_name_map=tool_name_map,
+            function_schemas=function_schemas,
+            regex_dialect=regex_dialect,
+            countable_request=countable_request,
+        )
         async for event in upstream_events:
-            for translated in translator.translate_event(event):
+            for translated in await translator.translate_event_async(event):
                 event_name, payload = translated
                 if event_name == "error":
                     error_type = payload["error"]["type"]
                     status_code = 400 if error_type == "invalid_request_error" else 502
                     return JSONResponse(payload, status_code=status_code)
                 claude_events.append(translated)
+        translator.finish()
+    except TranslationError as exc:
+        return JSONResponse(server_support._claude_error_body("api_error", str(exc)), status_code=502)
     except UpstreamError as exc:
         status_code, body = _upstream_error_to_claude(
-            exc, claude_request=claude_request, context_window=context_window
+            exc, claude_request=countable_request if countable_request is not None else claude_request,
+            context_window=context_window
         )
         return JSONResponse(body, status_code=status_code)
     except UpstreamAuthError as exc:
@@ -571,7 +651,10 @@ async def _aggregate_claude_response(
         # Early error returns above must not leave the upstream stream open.
         await upstream_events.aclose()
 
-    message = assemble_claude_message(claude_events)
+    try:
+        message = assemble_claude_message(claude_events)
+    except TranslationError as exc:
+        return JSONResponse(server_support._claude_error_body("api_error", str(exc)), status_code=502)
     if message is None:
         return JSONResponse(
             server_support._claude_error_body("api_error", "codex stream ended without a terminal response event"),

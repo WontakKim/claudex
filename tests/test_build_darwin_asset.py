@@ -595,3 +595,22 @@ def test_linux_build_requires_host_python_before_assembly(tmp_path: Path) -> Non
     assert result.returncode != 0
     assert "could not obtain host CPython 3.12" in result.stderr
     assert not (root / "build").exists()
+
+
+@pytest.mark.parametrize('override', [None, 'false', 'auto:10', 'true', ''])
+def test_claudex_launcher_enables_search_and_preserves_explicit_overrides(
+    tmp_path: Path, override: str | None
+) -> None:
+    script = (_REPOSITORY_ROOT / 'scripts/build-darwin-asset.sh').read_text()
+    launcher = script.split('cat > "${STAGE}/bin/claudex" <<\'EOF\'\n', 1)[1].split('\nEOF', 1)[0]
+    (tmp_path / 'claudex').write_text(launcher)
+    (tmp_path / 'claudex-gateway').write_text('#!/bin/sh\nexit 0\n')
+    (tmp_path / 'claudex-gateway').chmod(0o755)
+    (tmp_path / 'claude').write_text('#!/bin/sh\nprintf "%s" "$ENABLE_TOOL_SEARCH"\n')
+    (tmp_path / 'claude').chmod(0o755)
+    env = {**os.environ, 'PATH': str(tmp_path) + os.pathsep + os.environ['PATH']}
+    env.pop('ENABLE_TOOL_SEARCH', None)
+    if override is not None:
+        env['ENABLE_TOOL_SEARCH'] = override
+    result = subprocess.run(['sh', str(tmp_path / 'claudex')], env=env, text=True, capture_output=True, check=True)
+    assert result.stdout == ('true' if override is None else override)

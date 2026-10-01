@@ -1647,3 +1647,91 @@ def test_image_analysis_repair_does_not_make_native_search_a_client_function_cal
     }]
     assert {"type": "web_search"} in payload["tools"]
     assert "An internal image analysis." in str(_find_items(payload, "message"))
+
+
+def test_toolsearch_preserves_mixed_result_identity_and_error() -> None:
+    long_name = 'mcp__' + 'long_service_' * 8 + '__lookup'
+    body = {
+        'tools': [
+            {'name': 'ToolSearch', 'input_schema': {'type': 'object'}},
+            {'name': long_name, 'defer_loading': True, 'input_schema': {'type': 'object'}},
+        ],
+        'messages': [
+            {'role': 'user', 'content': 'Find a tool.'},
+            {'role': 'assistant', 'content': [{'type': 'tool_use', 'id': 'search', 'name': 'ToolSearch', 'input': {}}]},
+            {'role': 'user', 'content': [{'type': 'tool_result', 'tool_use_id': 'search', 'is_error': True, 'content': [
+                {'type': 'text', 'text': 'before'},
+                {'type': 'tool_reference', 'tool_name': long_name},
+                {'type': 'text', 'text': 'after'},
+            ]}]},
+        ],
+    }
+    snapshot = deepcopy(body)
+    payload = translate_claude_request_to_codex(body, 'gpt-5.5')
+    output = _find_items(payload, 'function_call_output')[0]['output']
+    assert [item['text'] for item in (output[0], output[1], output[-1])] == ['[tool error]', 'before', 'after']
+    marker = json.loads(output[2]['text'])
+    assert marker['tool_name'] == long_name
+    assert build_tool_name_shortening_map(body)[long_name] in marker.values()
+    assert marker.get('discovery', False) is False
+    assert body == snapshot
+
+
+def test_inline_redefinition_removal_and_readd_are_translated_in_order() -> None:
+    def definition(version: str) -> dict:
+        return {'name': 'lookup', 'description': version, 'input_schema': {
+            'type': 'object', 'properties': {'version': {'type': 'string', 'enum': [version]}},
+            'required': ['version'],
+        }}
+
+    first, latest = definition('old'), definition('latest')
+    body = {'messages': [
+        {'role': 'user', 'content': 'start'},
+        {'role': 'system', 'content': [
+            {'type': 'tool_addition', 'tool': {'type': 'tool_definition', 'definition': first}},
+            {'type': 'text', 'text': 'between definitions'},
+            {'type': 'tool_addition', 'tool': {'type': 'tool_definition', 'definition': latest}},
+            {'type': 'tool_removal', 'tool': {'type': 'tool_reference', 'name': 'lookup'}},
+            {'type': 'tool_addition', 'tool': {'type': 'tool_reference', 'name': 'lookup'}},
+        ]},
+    ]}
+    payload = translate_claude_request_to_codex(body, 'gpt-5.5', beta_header='inline-tools-2026-09-15')
+    assert [tool['name'] for tool in payload['tools']] == ['lookup']
+    assert payload['tools'][0]['parameters']['properties']['version']['enum'] == ['latest']
+    records = payload['input'][1]['content']
+    assert records[1]['text'] == 'between definitions'
+    assert json.loads(records[0]['text'])['tool']['definition']['description'] == 'old'
+    assert json.loads(records[2]['text'])['tool']['definition']['description'] == 'latest'
+    assert json.loads(records[3]['text'])['type'] == 'tool_removal'
+
+
+def test_tool_alias_is_stable_across_loaded_subset_and_order() -> None:
+    names = ['mcp__' + server * 20 + '__lookup' for server in ('alpha', 'zeta')]
+    alone = build_tool_name_shortening_map({'tools': [{'name': names[1]}]})
+    together = build_tool_name_shortening_map({'tools': [{'name': name} for name in names]})
+    reverse = build_tool_name_shortening_map({'tools': [{'name': name} for name in reversed(names)]})
+    assert alone[names[1]] == together[names[1]] == reverse[names[1]]
+    assert together[names[0]] == reverse[names[0]] != together[names[1]]
+
+
+def test_toolsearch_omission_survives_translation_and_placeholder_is_not_callable() -> None:
+    body = {'tools': [
+        {'name': 'ToolSearch', 'input_schema': {'type': 'object'}},
+        {'name': 'DeferredToolPlaceholder',
+         'description': 'Reserved placeholder that keeps deferred tool loading active; never call this tool.',
+         'input_schema': {'type': 'object', 'properties': {}}, 'defer_loading': True},
+    ], 'messages': [{'role': 'user', 'content': 'hello'}]}
+    payload = translate_claude_request_to_codex(body, 'gpt-5.5')
+    assert [tool['name'] for tool in payload['tools']] == ['ToolSearch']
+
+
+def test_forced_inline_web_search_uses_native_choice_type() -> None:
+    body = {'tool_choice': {'type': 'tool', 'name': 'web_search'}, 'messages': [
+        {'role': 'user', 'content': 'Search.'},
+        {'role': 'system', 'content': [{'type': 'tool_addition', 'tool': {
+            'type': 'tool_definition', 'definition': {'type': 'web_search_20260209', 'name': 'web_search'},
+        }}]},
+    ]}
+    payload = translate_claude_request_to_codex(body, 'gpt-5.5')
+    assert payload['tools'] == [{'type': 'web_search'}]
+    assert payload['tool_choice'] == {'type': 'web_search'}
