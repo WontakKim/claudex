@@ -11,6 +11,12 @@ Interactive capture supports Claude Code builds that use scoped Keychain
 credential storage (2.1+) and fails cleanly otherwise. It is POSIX-only in
 this version — on Windows, always use `--from <dir>` instead.
 
+The [dashboard](dashboard.md#claude-accounts) offers the same add, re-login,
+serve, and remove actions. Its add flow runs the same
+`claude auth login --claudeai` capture on the gateway host and takes the
+pasted login code in the browser. Only one Claude login, from the CLI or the
+dashboard, can run on a machine at a time.
+
 Adding an account whose `(email, organization)` identity is already
 registered replaces that account's stored credentials in place after a
 confirmation prompt — the account keeps its id, so an `account use`
@@ -41,7 +47,10 @@ collides only with another account that also has none, never with one
 that has an `organizationUuid` set. `account remove <id>` deletes that
 account's local copy only — it does not revoke the OAuth grant at
 Anthropic, which stays valid until revoked from Anthropic's own account
-settings.
+settings. The CLI removes even the account selected by `account use`;
+passthrough then fails until you select another account. The dashboard
+refuses to remove the selected account (`409`) until the selection is
+cleared.
 
 ## Serving with a registered account (`account use`)
 
@@ -65,8 +74,10 @@ channel decision table as `compact`: a confirmed running daemon is updated
 live through the `/admin/providers/claude/pool/serving` endpoint (no
 restart needed), a settings-file write is used only when no live daemon can
 be confirmed, and an ambiguous probe refuses to apply changes.
-`account use off` clears the pin via `DELETE` and returns to today's
-default: client credentials forwarded untouched.
+`account use off` clears the pin via `DELETE` and returns to the default:
+client credentials forwarded untouched. Balanced routing is the exception: it
+serves from the account pool whether or not an account is selected (see
+[Balanced routing](#balanced-routing-across-the-pool)).
 
 ```sh
 curl http://127.0.0.1:8787/admin/providers/claude/pool/serving
@@ -89,9 +100,11 @@ Caveats to accept consciously:
   usage display) reflect the serving account.
 - If the selected account is removed or its refresh token becomes invalid,
   passthrough fails with a clear gateway 503 — there is never a silent
-  fallback to client credentials. Re-add the account or run
-  `account use off`. (With the `fallback` routing mode enabled — see the
-  next section — the remaining ready accounts serve instead.)
+  fallback to client credentials. If Anthropic still rejects a freshly
+  refreshed token, that request fails with `401` and later requests get the
+  503. Re-add the account or run `account use off`. (With the `fallback`
+  routing mode enabled — see the next section — the remaining ready accounts
+  serve instead.)
 - The [compaction reroute](compaction.md#compaction-reroute) still uses the credentials
   the client itself sent: with a credential-less client it records
   `skipped_no_credentials` and falls back to the mapped model as usual.
@@ -105,6 +118,8 @@ routing mode `disabled`, only the pinned serving account is used and a
 `429` relays to the client verbatim. Selecting the `fallback` mode turns
 the pin into the head of a fallback chain: every **ready** account is a
 pool member, ordered serving-account-first and then by registration time.
+Fallback needs a serving account from `account use`; without one,
+passthrough keeps forwarding client credentials.
 When the account being served with answers `429`, the gateway puts it on
 an in-memory cooldown, transparently retries the same request with the
 next account in the chain, and fails back automatically once the cooldown
@@ -112,17 +127,10 @@ expires — the client never has to handle the rate limit itself as long as
 any account has quota left.
 
 The mode is the `claude_account.routing` settings key — a policy document
-like `{"mode": "fallback"}` or `{"mode": "balanced"}` — managed at runtime
-through `/admin/providers/claude/pool/routing`. Its optional
-`include_local_login` key defaults to `true` and applies only to balanced
-routing.
-
-In balanced mode, the machine's own Claude Code login automatically joins
-the pool. The gateway reads its current credential without modifying or
-refreshing it, leaving the CLI as the sole token refresher and avoiding the
-single-use refresh-token race that could log one process out. A matching
-registered identity takes precedence; set `"include_local_login": false` in
-the policy document to opt out.
+such as `{"mode": "fallback"}` with `mode` set to `disabled`, `fallback`, or
+`balanced` — managed at runtime through
+`/admin/providers/claude/pool/routing` or the dashboard's routing selector.
+The endpoint accepts only the `mode` key.
 
 ```sh
 curl http://127.0.0.1:8787/admin/providers/claude/pool/routing
@@ -149,20 +157,98 @@ probe.
 
 Boundaries to know:
 
-- Only `429` triggers failover, and only in `fallback` mode. Auth failures
-  durably mark the account `needs-reauth` (excluded from the chain until a
-  re-login); other upstream errors and network failures are relayed as
-  before — retrying a different account would not help them.
+- Failover happens only in `fallback` mode, on a `429` or an account-specific
+  auth failure. A refresh that needs a new login, or a `401` that persists
+  after a forced refresh, also durably marks the account `needs-reauth`,
+  which excludes it until a re-login. Other upstream errors and network
+  failures are relayed as before — retrying a different account would not
+  help them.
 - When every account is rate-limited, the client sees a real `429`: the last
   upstream rejection while probing, or a synthesized one with `Retry-After`
   once everything is already cooling (upstream is then not contacted at all).
 - Failover only happens before any response byte is relayed; a stream that
   dies midway is reported in-band, as before.
-- Rate limits are per account **per model tier** upstream, but the pool's
-  cooldown is per account: a Fable-scoped weekly limit cools the whole
-  account even for requests other models could still serve. Per-model
-  eligibility is a known follow-up.
+- Rate limits are per account **per model tier** upstream, but the fallback
+  pool's cooldown is per account: a Fable-scoped weekly limit cools the whole
+  account even for requests other models could still serve. Balanced routing
+  can limit such a cooldown to Fable models.
 - The CLI's own usage display remains unreliable under pooling: its usage
   query authenticates with the placeholder token and fails, and response
   rate-limit headers reflect whichever account served. Use the dashboard's
   per-account usage view instead.
+
+## Balanced routing across the pool
+
+The `balanced` mode spreads Claude Code sessions across every ready
+registered account instead of waiting for a `429`. It does not need a
+serving account and never forwards client credentials, even after
+`account use off`. If an account is selected, it gets the first session
+while no usage readings or session assignments exist yet, and it wins ties.
+
+Each session stays on one account. The session is identified by Claude
+Code's session id, or by a hash of the first user message when the request
+has none. A new session goes to an account picked at random, weighted
+toward accounts with more remaining quota in their latest usage readings.
+Usage is polled in the background, with at most one upstream usage call
+every five minutes across the pool.
+
+When the session's account answers `429`, is already cooling down, was
+removed or needs a new login, or fails authentication, the gateway moves
+the session to another eligible account. As in fallback mode, this happens
+only before any response byte reaches the client. A Fable-model `429` cools
+only the account's Fable models when fresh usage readings show the Fable
+weekly window exhausted while the five-hour and seven-day windows still have
+room; otherwise the whole account cools. When no account
+is eligible, the client gets the upstream `429` or a synthesized `429` with
+`Retry-After`. If no account is ready at all, the client gets `503`.
+Token counting follows the session's account when one is already assigned,
+but never moves a session or retries another account.
+
+Enable balanced routing like the other modes:
+
+```sh
+curl -X PUT http://127.0.0.1:8787/admin/providers/claude/pool/routing \
+  -H 'Content-Type: application/json' \
+  -d '{"mode": "balanced"}'
+```
+
+The gateway prepares the pool before switching, and the previous mode keeps
+serving until then. Enabling fails with `400` when a ready account's
+captured profile has no valid account UUID; re-add that account with
+`account add`.
+
+Session assignments, cooldowns, and usage readings are stored in
+`~/.claudex/claude-account-pool/claude-account-pool-runtime.sqlite3` and
+survive a daemon restart. Switching to `disabled` or `fallback` discards the
+session assignments. If a persisted `balanced` mode cannot be restored at
+startup, the daemon still starts and logs the error, and passthrough returns
+`503` (`balanced routing is not active`). Fix the cause and retry the
+`PUT` above to activate the pool without restarting. If preparation still
+fails, the endpoint returns `400` for an invalid account profile or `503`
+for an unavailable runtime dependency, and balanced passthrough keeps
+returning `503`. You can instead switch to `disabled` or `fallback` through
+the same endpoint even while the balanced runtime is inactive.
+
+While balanced routing is active, `GET /admin/providers/claude/pool/usage`
+answers from cached readings only. Add `?refresh` to queue a rate-limited
+poll. `GET /admin/providers/claude/pool/status` adds a pool-wide
+`usage_freshness` value: `fresh`, `partial`, or `degraded`.
+
+### Local Claude Code login
+
+In balanced mode, the machine's own Claude Code login also joins the pool.
+The gateway reads its current credential without modifying or refreshing it,
+leaving the CLI as the sole token refresher and avoiding the single-use
+refresh-token race that could log one process out. The login drops out while
+its access token is expired, and a registered account with the same identity
+takes precedence. It does not appear in `account list` or the routing
+status.
+
+To opt out, set `"include_local_login": false` in the policy document, for
+example `{"mode": "balanced", "include_local_login": false}`, in
+`settings.json` or `CLAUDEX_CLAUDE_ACCOUNT_ROUTING`, then restart the daemon.
+The key defaults to `true` and affects only balanced routing. The routing
+endpoint and dashboard selector accept only `mode` and preserve this key
+when changing modes, including across disable/re-enable. Disabling routing
+keeps a policy document with `"mode": "disabled"` when it carries this key,
+so the opt-out also survives a restart while routing is disabled.

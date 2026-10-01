@@ -14,7 +14,7 @@ Claude Code ── unmapped model ────▶ claudex-gateway ── verbati
 
 - Mapped models run on Codex, Kimi, Grok, or a named custom provider, while everything else is relayed to Anthropic untouched.
 - Custom providers support the OpenAI Responses and Anthropic Messages wire families; static Messages providers require manual model IDs and explicit remote verification.
-- The gateway reuses each built-in provider's CLI login and can serve traffic through registered Claude accounts with fallback routing.
+- The gateway reuses each built-in provider's CLI login and can serve Anthropic passthrough traffic through registered Claude accounts with fallback or balanced routing.
 - Configuration, model mapping, compaction, the dashboard, and detailed behavior are documented in docs/.
 
 Built-in provider prerequisites and logins are covered in
@@ -31,18 +31,25 @@ uv run claudex-gateway --foreground  # attached to the terminal
 uv run claudex-gateway stop
 ```
 
-Run a mapped Claude model on another backend (details in [Model mapping](docs/model-mapping.md)):
+Run a mapped Claude model on another backend (details in [Model mapping](docs/model-mapping.md)).
+Environment variables apply when the gateway starts, so stop a running gateway
+first:
 
 ```sh
 CLAUDEX_MODEL_MAP='{"opus":"codex:gpt-5.6-sol","haiku":"codex:gpt-5.6-luna"}' \
 uv run claudex-gateway
 ```
 
-Point Claude Code at the gateway:
+Point Claude Code at the gateway. `ENABLE_TOOL_SEARCH=true` keeps Claude Code's
+MCP tool search on, which it otherwise disables for a non-Anthropic base URL
+(see [MCP tool search and context usage](docs/providers.md#mcp-tool-search-and-context-usage)):
 
 ```sh
-ANTHROPIC_BASE_URL=http://127.0.0.1:8787 claude
+ENABLE_TOOL_SEARCH=true ANTHROPIC_BASE_URL=http://127.0.0.1:8787 claude
 ```
+
+The macOS release asset also ships a `claudex` launcher that starts the gateway
+and Claude Code together; see [Getting started](docs/getting-started.md#from-the-macos-release).
 
 ## Docs
 

@@ -3,14 +3,14 @@
 ## Behavior
 
 - Serves `POST /v1/messages` in Anthropic Messages format: models with a
-  `CLAUDEX_MODEL_MAP` entry are routed to the provider-prefixed target
-  backend, while everything else is forwarded byte-for-byte to the real
-  Anthropic API with the client's own credentials, except for incompatible
-  server-tool history described below.
-- Answers as the Claude model the client requested. The mapped upstream model
-  is restored in Responses-family output and in both streaming and non-streaming
-  native Messages output, so Claude Code heuristics keyed on model names keep
-  working for built-in and custom routes.
+  `model_map` entry (`settings.json` or `CLAUDEX_MODEL_MAP`) are routed to the
+  provider-prefixed target backend, while everything else is forwarded
+  byte-for-byte to the real Anthropic API with the client's own credentials,
+  except for incompatible server-tool history described below.
+- Answers as the Claude model the client requested. The requested model name
+  replaces the mapped upstream model in Responses-family output and in both
+  streaming and non-streaming native Messages output, so Claude Code
+  heuristics keyed on model names keep working for built-in and custom routes.
 
 ## Runtime mapping API
 
@@ -24,12 +24,21 @@ curl -X PUT http://127.0.0.1:8787/admin/settings/mapping \
   -d '{"model_map": {"opus": "codex:gpt-5.6-sol"}}'
 ```
 
-A `PUT` accepts `model_map`, replaces it for all subsequent requests, and
-persists it to `settings.json` (other keys in the file are preserved). When
-`CLAUDEX_MODEL_MAP` is set the request is refused with `409` — the
-environment would silently win again on restart. The endpoint honors
-`CLAUDEX_LOCAL_TOKEN` and only answers requests whose `Host` is the gateway
-itself, so foreign web pages cannot drive it from a browser.
+A `PUT` accepts only `model_map`, replaces the whole map for all subsequent
+requests, and persists it to `settings.json` (other keys in the file are
+preserved). It requires `Content-Type: application/json` (otherwise `415`);
+an unknown key, an empty body, or an invalid target returns `400`. When
+`CLAUDEX_MODEL_MAP` is set a valid request is refused with `409` — the
+environment would silently win again on restart. Custom provider definitions
+and `context_window_map` cannot be changed through this endpoint.
+
+`GET` and a successful `PUT` return the current `model_map`, an `env_locked`
+object (`{"model_map": "CLAUDEX_MODEL_MAP"}` while the variable is set, else
+`null`), the `codex_home`, `grok_home`, and `kimi_code_home` paths, and, when
+custom providers are configured, their safe
+[metadata](custom-providers.md#catalog-health-and-dashboard-semantics). The
+endpoint honors `CLAUDEX_LOCAL_TOKEN` and only answers requests whose `Host` is
+the gateway itself, so foreign web pages cannot drive it from a browser.
 
 ## Model mapping examples
 
@@ -41,15 +50,18 @@ CLAUDEX_MODEL_MAP='{"fable":"grok:grok-4.5","opus":"kimi:k3","sonnet":"codex:gpt
   uv run claudex-gateway
 ```
 
-Keys match exactly first, then as substrings, where the longest matching key
-wins (`claude-haiku` beats a catch-all `claude`). A request with no match is
-relayed to Anthropic, preserving native request content. Values with an unknown
-provider prefix (or an empty model after the prefix) are rejected at startup and
-by the mapping API, so a typo like `"kim:k2.5"` fails loudly instead of surfacing as a baffling
-upstream error.
+Keys match the requested model name exactly first, then as case-sensitive
+substrings, where the longest matching key wins (`claude-haiku` beats a
+catch-all `claude`). A request with no match is relayed to Anthropic,
+preserving native request content. Values with an unknown
+provider prefix, no prefix, or an empty model after the prefix are rejected at
+startup and by the mapping API, so a typo like `"kim:k2.5"` fails loudly instead
+of surfacing as a baffling upstream error.
 
 `GET /health` returns `200` with `status: "ok"` when required provider
 readiness checks pass; otherwise it returns `503` with `status: "error"`.
+Codex credentials are always required. Kimi, Grok, and custom providers are
+required only while a `model_map` value targets them.
 Catalog-capable custom providers use their remote catalog for that readiness
 check. Catalog-less Anthropic-compatible providers perform no remote health I/O:
 an `ok` state confirms configuration and binding only, not remote entitlement or
@@ -82,10 +94,10 @@ name, selects the wire behavior. For example, a provider named
 wire when configured in that family.
 
 OpenAI-compatible entries retain the required `wire_api: "responses"` schema and
-live catalog behavior. Anthropic-compatible entries have only `base_url` and
-`api_key`; their versioned prefix receives exactly `/messages`, they require
-manual model IDs, and token counting uses the local approximate characters/4
-fallback. See [Custom providers](custom-providers.md#custom-providers).
+live catalog behavior. Anthropic-compatible entries require `base_url` and
+`api_key` and accept an optional `tool_schema_regex_compat` boolean; their
+versioned prefix receives exactly `/messages`, they require manual model IDs,
+and token counting uses the local approximate characters/4 fallback. See [Custom providers](custom-providers.md#custom-providers).
 
 ## Mixing Claude and Codex models
 
@@ -156,6 +168,7 @@ matching calls.
 
 The same repair applies to Anthropic passthrough, registered-account routing,
 Kimi, custom Messages providers, native token counting, Anthropic compaction
-reroutes, and built-in or custom Responses providers. Existing client transcripts are not modified. Native Anthropic search
+reroutes, and built-in or custom Responses providers. Existing client
+transcripts are not modified. Native Anthropic search
 calls and signed results remain untouched, including their citations. Requests
 that need no repair keep the usual passthrough behavior.

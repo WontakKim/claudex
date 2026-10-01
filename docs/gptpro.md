@@ -28,10 +28,23 @@ uv run claudex-gateway gptpro login
 uv run claudex-gateway gptpro status
 ```
 
+`login` opens a visible browser on the gateway host; complete ChatGPT sign-in
+there within five minutes. It then saves the session and verifies it with a
+headless ChatGPT check. `status` and `doctor` inspect only local state and do
+not contact ChatGPT, so a valid `status` does not prove that ChatGPT still
+accepts the session. `claudex-gateway gptpro ask "<question>"` runs one
+foreground ask in a new conversation, without attachments or MCP job handles.
+
 The dashboard MCP tab leads with gateway-wide Claude Code connection setup,
 including the MCP endpoint and a copyable command. Its GPT Pro backend card
 shows the saved session status, starts and monitors interactive ChatGPT sign-in,
 and runs the same doctor diagnostic.
+
+When `CLAUDEX_LOCAL_TOKEN` is set, `/mcp` requires it as an
+`Authorization: Bearer` header, and like the admin routes it answers only
+requests whose `Host` names the gateway. The dashboard's one-click registration
+adds that header; its copyable command contains a `<CLAUDEX_LOCAL_TOKEN>`
+placeholder to replace.
 
 Run `uv run claudex-gateway gptpro doctor` to diagnose the
 saved session, Chrome profile and lock, and Playwright dependency.
@@ -55,8 +68,21 @@ checkout, rerun `uv sync`.
 The ask runtime lazily starts one warm, headless persistent browser context and
 reuses it. Login uses the same profile in a visible browser. A profile lock
 prevents login and an ask runtime, or two ask runtimes, from using that profile
-at the same time. If login reports that another gptpro ask is using the browser
+at the same time, and a CLI ask fails while the gateway's runtime holds the
+profile. If login reports that another gptpro ask is using the browser
 profile, stop the gateway process that owns the runtime before logging in again.
+Starting sign-in from the dashboard instead releases the gateway's idle ask
+runtime itself; the dashboard refuses to start sign-in while any GPT Pro ask is
+queued, running, or detached.
+
+Cloudflare clearance cookies are bound to the browser that obtained them, so
+clearance from the visible login browser does not carry over to the headless
+runtime. Each time the ask runtime launches the profile, it clears the
+profile's Cloudflare cookies and presents a user agent without the headless
+marker, so the headless browser can obtain its own clearance. While waiting for
+the ChatGPT composer, an ask tolerates Cloudflare challenge markup for up to 10
+seconds, within its deadline, before failing with `challenge`. A challenge or
+block reported by a ChatGPT backend response fails the ask immediately.
 
 ## Release build hosts
 
@@ -157,7 +183,7 @@ When ChatGPT's final answer links files it generated as
 answer is final and saves them on the gateway host. Links in commentary,
 tool calls, or an unfinished turn are never downloaded, and neither are
 Markdown examples inside code blocks or code spans. This applies to
-direct, detached, and recovered answers, and to the CLI.
+direct, detached, and recovered answers, and to `claudex-gateway gptpro ask`.
 
 `files` has one entry per distinct linked sandbox path, in link order:
 
@@ -202,7 +228,7 @@ failed rather than silently omitted.
 
 | State | Meaning | Next states and recovery |
 | --- | --- | --- |
-| `queued` | The job is waiting for admission, normally behind an in-flight ask on the same conversation. | Becomes `running`, or `failed` with `expired` if same-conversation admission exceeds the 900-second queue TTL. |
+| `queued` | The job is waiting for admission, normally behind an in-flight ask on the same conversation. | Becomes `running` (a recovery job becomes `detached`), or `failed` with `expired` if same-conversation admission exceeds the 900-second queue TTL. |
 | `running` | The job is admitted; navigation, submission, or answer observation may be in progress. This state alone does not prove submission. | Becomes `detached` during read-only polling, or `succeeded` or `failed`. |
 | `detached` | The gateway polls the server for an existing answer; ChatGPT may still be generating, or extraction may have failed. | Remains observable through normal status polling, then becomes `succeeded` or `failed`. |
 | `succeeded` | The answer is settled and available from `ask_gpt_pro_result`. | Terminal. The successful `thread_ref` becomes this MCP session's binding. |
@@ -212,12 +238,13 @@ failed rather than silently omitted.
 in-flight answer` identifies same-conversation queueing, while `detached; polling
 for the answer` identifies server-side recovery. State remains authoritative.
 
-An eligible post-click `no_raw_turn`, `echo_timeout`, `timeout`, or other
-executor failure can move a job to `detached` for up to
+A post-click `no_raw_turn`, `echo_timeout`, `timeout`, `navigation_failed`,
+`submit_failed`, or `error` failure can move a job to `detached` for up to
 `GPTPRO_RAW_TURN_RECOVERY_SECONDS` (300 seconds by default), provided its
-conversation ID and nonce are known. Pre-click failures do not trigger this
-polling. A non-positive window disables it. Only a finished, nonempty,
-nonce-correlated raw assistant turn counts as a recovered answer. The job
+conversation ID and nonce are known. Pre-click failures and `session_expired`,
+`challenge`, and `rate_limited_timeout` failures do not trigger this polling.
+A non-positive window disables it. Only a finished, nonempty, nonce-correlated
+raw assistant turn counts as a recovered answer. The job
 retains conversation ownership while polling, so follow-up asks for the same
 conversation remain queued until it settles. `recover_gpt_pro` uses the same
 window and ownership rule to inspect an existing turn after a failure.
@@ -253,9 +280,10 @@ If a failed ask retains a `thread_ref` and `nonce_marker`, call
 to recover means no matching finished answer was obtained within the window,
 not proof that none exists. If either identifier is missing, this read-only
 lookup cannot identify the turn: inspect the ChatGPT conversation before
-considering any new submission. Re-run login for an expired session or browser
-challenge; wait as appropriate for rate limits. Do not blindly resubmit a
-prompt whose submission outcome is uncertain.
+considering any new submission. Re-run login for `session_expired` or
+`challenge`; for `rate_limited_timeout`, wait, then recover if the ask may have
+submitted. Do not blindly resubmit a prompt whose submission outcome is
+uncertain.
 
 Poll status every 30-60 seconds or longer rather than in a tight loop. Detached
 answer recovery uses a separate server-side polling interval and does not
@@ -278,8 +306,8 @@ answer recovery to one resident polling tab.
 The detached poller checks every 45 seconds. An HTTP 429 doubles the interval,
 up to 300 seconds. A successful fetch restores the 45-second interval, and an
 idle poller also resets it. While a longer backoff is active, the same delay is
-applied to new ask admission so new submissions do not worsen provider
-contention.
+added before each newly admitted ask submits so new submissions do not worsen
+provider contention.
 
 Queue and execution limits are separate. Waiting for the current owner of the
 same conversation is bounded by the fixed 900-second queue TTL and does not

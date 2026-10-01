@@ -27,18 +27,27 @@ a transport failure — exits non-zero without touching the settings file.
 
 The compaction reroute is opt-in and disabled by default (unset
 `compaction.model`); once configured to a `claude:<model-id>` target, it
-triggers only for a detected Claude Code compaction request whose estimated
-size exceeds the mapped backend's context window, and makes a single
-Anthropic attempt using the client's own credentials, billed by Anthropic
-separately from the mapped backend. Its failure semantics: missing eligible
+triggers only for a detected Claude Code compaction request mapped to a
+Responses backend (Codex, Grok, or a Responses custom provider) whose
+estimated prompt size exceeds that backend's known context window, and
+makes a single Anthropic attempt using the client's own credentials, billed
+by Anthropic separately from the mapped backend. Its failure semantics: missing eligible
 Anthropic credentials skip the reroute entirely; connection failures and
 non-2xx responses before a streaming HTTP 2xx commit fall back silently to
 the mapped backend; failures after that commit surface as in-band SSE
 errors without fallback; non-streaming requests fall back on any failure
-before a complete, valid JSON response is obtained. The literals used to
-detect a compaction request are a versioned contract with Claude Code
-`2.1.223` — re-verified against the client binary before ever being
-changed, never guessed.
+before a complete, valid JSON response is obtained.
+
+The context window is the provider-prefixed `context_window_map` override or,
+without one, the backend's catalog value; when neither is known, the reroute
+never triggers. For a request that carries tools, the size estimate covers the
+prompt as translated for that backend, including active tool schemas.
+
+The literals used to detect a compaction request are a versioned contract
+with Claude Code `2.1.223` — re-verified against the client binary before
+ever being changed, never guessed. Detection also accepts the compaction
+instruction when it follows exact `Tool loaded.` note blocks, as observed
+in Claude Code `2.1.286` requests.
 
 ```sh
 curl http://127.0.0.1:8787/admin/settings/compaction
