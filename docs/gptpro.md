@@ -291,30 +291,39 @@ require frequent client polling.
 
 ### Composer and send locator recovery
 
-The gateway locates the composer and send button by structure because labels
-follow the UI language. A locator fault persisting for about four seconds while
-a contract-satisfying control is present triggers one rediscovery per control
+The gateway locates the composer, send button, and stop button by structure
+because labels follow the UI language. Only the composer and send button can
+be rediscovered. A locator fault persisting for about four seconds while a
+contract-satisfying control is present triggers one rediscovery per control
 per ask. Candidates are collected by structure only: no conversation text or
 composer contents are included.
 
 The gateway asks `claude-sonnet-5-5` through its own `/v1/messages` endpoint.
 This follows `model_map` like any client request: a `sonnet` mapping routes the
 request to the mapped provider; otherwise it passes through to Anthropic.
-The gateway must be running and reachable at its configured host and port.
+The structure-only candidate description, including tags, roles, UI labels,
+data attributes, and positions, is sent to whichever provider handles that
+request. The gateway must be running and reachable at its configured host and
+port. If it is unreachable, for example during a CLI `claudex-gateway gptpro ask`
+while the gateway is stopped, rediscovery is unavailable and a locator fault
+ends the ask with `locator_unresolved`.
 
 The selected candidate's structural selector is compiled locally and checked
 again against the control contract. It is used first and saved in
 `~/.claudex/gptpro/locators.json`, keyed by UI language, only after that use
 succeeds: retained prompt text proves the composer; a nonce-matched user echo
-proves the send button. `locator_unresolved` means nothing was sent, so retrying
-is safe.
+proves the send button. `locator_unresolved` means nothing was sent: retrying
+cannot duplicate that prompt, but may fail again.
 
-After a failed rediscovery, the next attempt waits at least 60 seconds. Three
-consecutive failures suspend rediscovery for one hour. After that cooldown,
-one ask may retry; a failure suspends rediscovery for another hour. An
-unreachable gateway or rejected Messages request does not count as a failed
-rediscovery. Deleting `locators.json` returns to the built-in locators and
-clears the suspension.
+After a failed rediscovery, a 60-second backoff prevents another rediscovery.
+Three consecutive failures suspend rediscovery for one hour. Asks do not wait
+for either window to expire: if the recorded and built-in locators still fail
+the contract, the ask ends immediately with `locator_unresolved` without
+calling the LLM; if either locator matches again, the ask proceeds normally.
+After the hour, one ask may rediscover again; a failure restarts the one-hour
+suspension. An unreachable gateway or rejected Messages request does not count
+as a failed rediscovery. Deleting `locators.json` returns to the built-in
+locators and clears the suspension.
 
 ## Scheduling behavior
 
