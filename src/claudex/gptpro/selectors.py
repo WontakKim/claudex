@@ -427,3 +427,56 @@ LOCATOR_CHECK_PROBE_JS = r"""
   };
 }
 """.replace("__LOCATOR_CONTRACT__", "(" + LOCATOR_CONTRACT_JS + ")")
+
+# Candidates expose structure only, never conversation text, input values, or IDs.
+LOCATOR_CANDIDATES_PROBE_JS = r"""
+(args) => {
+  const contract = __LOCATOR_CONTRACT__(args.target, args.composerSelector);
+  const dataNames = (element) => Array.from(element.attributes)
+    .map(attribute => attribute.name)
+    .filter(name => name.startsWith('data-') && name !== 'data-state');
+  const presence = (element) => dataNames(element).map(name => `[${CSS.escape(name)}]`).join('');
+  const compile = (element) => {
+    const form = element.closest('form') || element.form;
+    const scope = form ? 'form' + presence(form) + ' ' : '';
+    let base = element.tagName.toLowerCase();
+    for (const name of ['role', 'type', 'contenteditable']) {
+      if (element.hasAttribute(name)) base += `[${name}="${CSS.escape(element.getAttribute(name))}"]`;
+    }
+    const stableClasses = Array.from(element.classList)
+      .filter(name => !name.includes(':') && !/focus|active|hover|open|closed|selected|disabled|checked/i.test(name))
+      .slice(0, 3).map(name => '.' + CSS.escape(name)).join('');
+    for (const selector of [scope + base, scope + base + presence(element),
+                           scope + base + presence(element) + stableClasses]) {
+      const matches = document.querySelectorAll(selector);
+      if (matches.length === 1 && matches[0] === element) return selector;
+    }
+    return null;
+  };
+  const pool = args.target === 'composer' ? '[contenteditable="true"], textarea' : 'button';
+  const fraction = (value, size) => Math.round(value / Math.max(1, size) * 100) / 100;
+  const candidates = Array.from(document.querySelectorAll(pool)).filter(contract).map((element, index) => {
+    const form = element.closest('form') || element.form;
+    const ancestors = [];
+    let ancestor = element.parentElement;
+    while (ancestor && ancestors.length < 6) {
+      const role = ancestor.getAttribute('role');
+      ancestors.push(ancestor.tagName.toLowerCase() + (role ? `[role=${role}]` : ''));
+      ancestor = ancestor.parentElement;
+    }
+    const rect = element.getBoundingClientRect();
+    return {
+      index, selector: compile(element), tag: element.tagName.toLowerCase(),
+      type: element.getAttribute('type') || '', role: element.getAttribute('role') || '',
+      ariaLabel: (element.getAttribute('aria-label') || '').slice(0, 80),
+      dataAttributes: dataNames(element).map(name => name + '=' + element.getAttribute(name).slice(0, 30)),
+      classes: Array.from(element.classList).slice(0, 6),
+      formDataAttributes: form ? dataNames(form) : [], ancestry: ancestors.join(' < '),
+      box: {x: fraction(rect.x, innerWidth), y: fraction(rect.y, innerHeight),
+            width: fraction(rect.width, innerWidth), height: fraction(rect.height, innerHeight)},
+      disabled: element.disabled === true || element.getAttribute('aria-disabled') === 'true',
+    };
+  });
+  return {lang: document.documentElement.lang || '', candidates};
+}
+""".replace("__LOCATOR_CONTRACT__", "(" + LOCATOR_CONTRACT_JS + ")")

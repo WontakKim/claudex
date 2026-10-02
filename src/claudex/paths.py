@@ -41,6 +41,10 @@ def gptpro_session_file() -> Path:
     return gptpro_dir() / "session.json"
 
 
+def gptpro_locators_file() -> Path:
+    return gptpro_dir() / "locators.json"
+
+
 def gptpro_profile_lock() -> Path:
     return gptpro_dir() / "chrome-profile.lock"
 

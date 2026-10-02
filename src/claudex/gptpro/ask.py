@@ -17,7 +17,7 @@ from typing import Any, Literal
 from urllib.parse import urlsplit
 from uuid import uuid4
 
-from claudex.gptpro import attachments, generated_files
+from claudex.gptpro import attachments, generated_files, locators
 from claudex.gptpro.browser import COMPOSER_TIMEOUT_MS, NAVIGATION_TIMEOUT_MS
 from claudex.gptpro.conversation import (
     CHATGPT_URL,
@@ -42,7 +42,6 @@ from claudex.gptpro.selectors import (
     ASSISTANT_MESSAGE_SELECTOR,
     CHALLENGE_DOM_PROBE_JS,
     COMPOSER_READBACK_PROBE_JS,
-    COMPOSER_SELECTOR,
     DISMISS_MODAL_PROBE_JS,
     MESSAGE_ID_ATTRIBUTE,
     MODAL_BUTTON_TEXTS,
@@ -50,7 +49,6 @@ from claudex.gptpro.selectors import (
     PAGE_FETCH_PROBE_JS,
     RELOCK_USER_ECHO_PROBE_JS,
     SEND_BUTTON_READY_PROBE_JS,
-    SEND_BUTTON_SELECTOR,
     STOP_BUTTON_SELECTOR,
     TOP_LEVEL_USER_IDS_PROBE_JS,
     TURN_STATE_PROBE_JS,
@@ -296,6 +294,7 @@ class _AskExecution:
         attachment_paths: Sequence[str] | None = None,
         should_detach: Callable[[], bool] | None = None,
         on_detach: Callable[[AskSubmission], Awaitable[AskOutcome]] | None = None,
+        locator_book: locators.LocatorBook | None = None,
     ) -> None:
         if conversation_id is not None and not is_conversation_id(conversation_id):
             raise GptProAskError(
@@ -303,6 +302,13 @@ class _AskExecution:
                 "conversation_id must be a canonical ChatGPT conversation UUID",
             )
         self.page = page
+        self.locator_book = (
+            locator_book if locator_book is not None else locators.default_book()
+        )
+        self.locator_environment: str | None = None
+        self.locator_selectors: dict[str, str] = {}
+        self.unproven_locators: dict[str, str] = {}
+        self.rediscovered_targets: set[str] = set()
         self.callbacks = callbacks if callbacks is not None else AskCallbacks()
         timeout_budget = (
             overall_timeout_seconds()
@@ -684,6 +690,73 @@ class _AskExecution:
             return []
         return [marker for marker in result if isinstance(marker, str) and marker]
 
+    def _selector(self, target: locators.LocatorTarget) -> str:
+        if target in self.locator_selectors:
+            return self.locator_selectors[target]
+        if self.locator_environment is None:
+            return locators.SEED_SELECTORS[target]
+        selector = self.locator_book.selector_for(self.locator_environment, target)
+        self.locator_selectors[target] = selector
+        return selector
+
+    async def _check_locator(self, target: locators.LocatorTarget) -> LocatorCheck:
+        check = await self._await_page_operation(
+            check_locator(
+                self.page.evaluate, target, self._selector(target),
+                composer_selector=self._selector("composer"),
+            )
+        )
+        if self.locator_environment is None and check.lang:
+            self.locator_environment = locators.environment_key(check.lang)
+        return check
+
+    async def _rediscover(
+        self, target: locators.LocatorTarget, check: LocatorCheck,
+    ) -> None:
+        if target in self.rediscovered_targets:
+            self._settle_rediscovered(
+                target, "the rediscovered locator failed the contract again",
+            )
+            raise GptProAskError(
+                "locator_unresolved",
+                f"the ChatGPT {target} locator still fails after rediscovery ({check.describe()})",
+            )
+        self.rediscovered_targets.add(target)
+        self._status(f"the ChatGPT {target} locator stopped matching; rediscovering it")
+
+        async def evaluate(expression: str, args: Any) -> Any:
+            return await self._await_page_operation(self.page.evaluate(expression, args))
+
+        try:
+            selector = await self.locator_book.rediscover(
+                evaluate, target, self.locator_environment or "unknown",
+                failed_selector=self._selector(target),
+                composer_selector=self._selector("composer"),
+                timeout_seconds=self._remaining(),
+            )
+        except locators.LocatorHealingError as exc:
+            raise GptProAskError(
+                "locator_unresolved", f"the ChatGPT {target} locator failed ({check.describe()}) "
+                f"and rediscovery did not recover it: {exc}",
+            ) from exc
+        self.locator_selectors[target] = selector
+        self.unproven_locators[target] = selector
+
+    def _settle_rediscovered(
+        self, target: locators.LocatorTarget, failure: str | None = None,
+    ) -> None:
+        selector = self.unproven_locators.pop(target, None)
+        if selector is None:
+            return
+        env = self.locator_environment or "unknown"
+        try:
+            if failure is None:
+                self.locator_book.record_success(env, target, selector)
+            else:
+                self.locator_book.record_failure(env, target, failure)
+        except OSError as exc:
+            logger.warning("Could not record optional %s locator result: %s", target, exc)
+
     async def _wait_for_composer(self) -> None:
         end = min(self.deadline, _monotonic() + COMPOSER_TIMEOUT_MS / 1_000)
         # One bounded grace window per invocation: markers that vanish and
@@ -691,6 +764,7 @@ class _AskExecution:
         challenge_grace_deadline: float | None = None
         check: LocatorCheck | None = None
         last_error: Exception | None = None
+        fault_since: float | None = None
         while _monotonic() < end:
             await self._process_network_actions()
             self._check_authenticated()
@@ -698,7 +772,7 @@ class _AskExecution:
             try:
                 await self._await_page_operation(
                     self.page.wait_for_selector(
-                        COMPOSER_SELECTOR,
+                        self._selector("composer"),
                         state="visible",
                         timeout=self._timeout_ms(slice_seconds),
                     )
@@ -708,20 +782,25 @@ class _AskExecution:
             except Exception as exc:
                 last_error = exc
             try:
-                check = await self._await_page_operation(
-                    check_locator(
-                        self.page.evaluate, "composer", COMPOSER_SELECTOR,
-                        composer_selector=COMPOSER_SELECTOR,
-                    )
-                )
+                check = await self._check_locator("composer")
             except _DeadlineExpired:
                 raise
             except Exception as exc:
                 last_error = exc
+                check = None
             await self._process_network_actions()
             self._check_authenticated()
             if check is not None and check.verdict == "valid":
                 return
+            if check is not None and check.verdict == "fault":
+                if fault_since is None:
+                    fault_since = _monotonic()
+                if _monotonic() - fault_since >= LOCATOR_SETTLE_SECONDS:
+                    await self._rediscover("composer", check)
+                    fault_since = None
+                    continue
+            else:
+                fault_since = None
             markers = await self._probe_challenge()
             if markers:
                 if challenge_grace_deadline is None:
@@ -821,17 +900,18 @@ class _AskExecution:
     async def _fill_and_verify(self) -> None:
         try:
             await self._await_page_operation(
-                self.page.fill(COMPOSER_SELECTOR, self.prompt)
+                self.page.fill(self._selector("composer"), self.prompt)
             )
             readback = await self._await_page_operation(
                 self.page.evaluate(
                     COMPOSER_READBACK_PROBE_JS,
-                    {"selector": COMPOSER_SELECTOR},
+                    {"selector": self._selector("composer")},
                 )
             )
         except _DeadlineExpired:
             raise
         except Exception as exc:
+            self._settle_rediscovered("composer", "could not fill the ChatGPT composer")
             raise GptProAskError(
                 "submit_failed", "could not fill the ChatGPT composer"
             ) from exc
@@ -844,9 +924,13 @@ class _AskExecution:
         if not isinstance(readback, str) or normalize(readback) != normalize(
             self.prompt
         ):
+            self._settle_rediscovered(
+                "composer", "the ChatGPT composer did not retain the prompt",
+            )
             raise GptProAskError(
                 "submit_failed", "the ChatGPT composer did not retain the prompt"
             )
+        self._settle_rediscovered("composer")
 
     async def _dismiss_modal(self) -> None:
         try:
@@ -928,7 +1012,7 @@ class _AskExecution:
                 ready = await self._await_page_operation(
                     self.page.evaluate(
                         SEND_BUTTON_READY_PROBE_JS,
-                        {"selector": SEND_BUTTON_SELECTOR},
+                        {"selector": self._selector("send")},
                     )
                 )
             except _DeadlineExpired:
@@ -947,12 +1031,7 @@ class _AskExecution:
                     not_ready_since = _monotonic()
                 if _monotonic() - not_ready_since >= LOCATOR_SETTLE_SECONDS:
                     try:
-                        check = await self._await_page_operation(
-                            check_locator(
-                                self.page.evaluate, "send", SEND_BUTTON_SELECTOR,
-                                composer_selector=COMPOSER_SELECTOR,
-                            )
-                        )
+                        check = await self._check_locator("send")
                     except _DeadlineExpired:
                         raise
                     except Exception as exc:
@@ -960,13 +1039,12 @@ class _AskExecution:
                             "submit_failed",
                             "could not inspect the ChatGPT send button locator"
                         ) from exc
+                    not_ready_since = _monotonic()
                     if check.verdict == "fault" and not missing_attachments:
-                        raise GptProAskError(
-                            "locator_unresolved", "the ChatGPT send button locator matches no "
-                            f"usable send button ({check.describe()})"
-                        )
+                        await self._rediscover("send", check)
             await self._pause(min(POLL_INTERVAL_SECONDS, end - _monotonic()))
         self._ensure_deadline()
+        self._settle_rediscovered("send", "the send button did not become ready")
         if missing_attachments:
             raise GptProAskError(
                 "submit_failed", "attachments no longer ready in the active "
@@ -992,7 +1070,7 @@ class _AskExecution:
             self._record_evidence(submission="uncertain")
             await self._await_page_operation(
                 self.page.click(
-                    SEND_BUTTON_SELECTOR,
+                    self._selector("send"),
                     timeout=self._timeout_ms(SEND_READY_TIMEOUT_SECONDS),
                 )
             )
@@ -1460,6 +1538,7 @@ class _AskExecution:
                 await self._click_send()
                 self.stage = "echo"
                 locked_user_id = await self._lock_user_echo(pre_submit_ids)
+                self._settle_rediscovered("send")
                 self.has_locked_user_echo = True
                 self._record_evidence(submission="confirmed")
                 self._capture_trusted_page_conversation()
