@@ -8,7 +8,13 @@ COMPOSER_SELECTOR = (
     '[role="textbox"]'
 )
 SEND_BUTTON_SELECTOR = 'form[data-chatgpt-composer] button[type="submit"]'
-STOP_BUTTON_SELECTOR = 'form[data-chatgpt-composer] button[aria-label="Stop"]'
+# The composer's trailing slot is voice (type=button with a data-state tooltip
+# trigger) when empty, submit when text is present, and stop (type=button without
+# data-state) while streaming. Accessible names are localized; match structure.
+STOP_BUTTON_SELECTOR = (
+    'form[data-chatgpt-composer] '
+    'button.size-token-button-composer[type="button"]:not([data-state])'
+)
 # Message units carry a search-unit key whose prefix ("fallback-turn-N") is
 # index-based and changes between renders; only the ":user"/":assistant"
 # suffix is stable, so units are addressed by suffix match. The message-ids
