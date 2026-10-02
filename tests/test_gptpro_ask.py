@@ -2309,3 +2309,197 @@ def test_send_probe_failure_without_locator_fault_stays_submit_failed(
     assert raised.value.failure == "submit_failed"
     assert raised.value.evidence.submission == "not_attempted"
     assert page.click_actions == []
+
+
+def _install_timed_locator_probes(
+    page: _FakePage,
+    clock: _FakeClock,
+    book: locators.LocatorBook,
+    *,
+    target: locators.LocatorTarget,
+    result_at: Callable[[float], dict[str, object]],
+    markers_until: float = 0,
+    ready_at: float | None = None,
+    readiness_raises: bool = False,
+) -> tuple[list[float], list[float]]:
+    original = page.evaluate
+    selector = locators.SEED_SELECTORS[target]
+    check_times: list[float] = []
+    healer_times: list[float] = []
+
+    class Healer:
+        async def complete(self, system, prompt, timeout_seconds):
+            healer_times.append(clock.value)
+            return json.dumps({"status": "absent"})
+
+    book.healer = Healer()
+
+    async def evaluate(expression: str, argument: Any = None) -> Any:
+        if (expression == selectors.LOCATOR_CHECK_PROBE_JS
+                and argument["target"] == target and argument["selector"] == selector):
+            check_times.append(clock.value)
+            return result_at(clock.value)
+        if expression == selectors.LOCATOR_CANDIDATES_PROBE_JS:
+            return {"lang": "en-US", "candidates": [{"index": 0, "selector": ".candidate"}]}
+        if expression == selectors.CHALLENGE_DOM_PROBE_JS:
+            return ["cf-challenge"] if clock.value < markers_until else []
+        if expression == selectors.SEND_BUTTON_READY_PROBE_JS:
+            if readiness_raises:
+                raise RuntimeError("SyntaxError: invalid selector")
+            return ready_at is not None and clock.value >= ready_at
+        return await original(expression, argument)
+
+    page.evaluate = evaluate  # type: ignore[method-assign]
+    return check_times, healer_times
+
+
+def test_composer_invalid_selector_without_candidates_respects_challenge_grace(
+    monkeypatch: pytest.MonkeyPatch, isolated_locator_book: locators.LocatorBook,
+) -> None:
+    clock = _install_clock(monkeypatch)
+    page = _FakePage()
+    _, healer_times = _install_timed_locator_probes(
+        page, clock, isolated_locator_book, target="composer", markers_until=12,
+        result_at=lambda _: {"invalidSelector": True, "candidates": 0},
+    )
+    with pytest.raises(ask.GptProChallengeError):
+        _run(page)
+    assert ask.CHALLENGE_GRACE_SECONDS <= clock.value < 12
+    assert healer_times == []
+    assert not isolated_locator_book.path.exists()
+
+
+def test_composer_fault_timer_starts_after_challenge_disappears(
+    monkeypatch: pytest.MonkeyPatch, isolated_locator_book: locators.LocatorBook,
+) -> None:
+    clock = _install_clock(monkeypatch)
+    page = _FakePage()
+    _, healer_times = _install_timed_locator_probes(
+        page, clock, isolated_locator_book, target="composer", markers_until=6,
+        result_at=lambda _: {"matched": 0, "eligible": 0, "candidates": 1},
+    )
+    with pytest.raises(ask.GptProAskError) as raised:
+        _run(page)
+    assert raised.value.failure == "locator_unresolved"
+    assert healer_times == [6 + ask.LOCATOR_SETTLE_SECONDS]
+
+
+@pytest.mark.parametrize("reset", ["valid", "wait", "invalid_without_candidates", "probe_error"])
+def test_composer_unsustained_fault_does_not_rediscover(
+    monkeypatch: pytest.MonkeyPatch, isolated_locator_book: locators.LocatorBook,
+    reset: str,
+) -> None:
+    clock = _install_clock(monkeypatch)
+    page = _FakePage()
+
+    def result_at(now: float) -> dict[str, object]:
+        if int(now) % 4 != 3:
+            return {"matched": 0, "eligible": 0, "candidates": 1}
+        if reset == "probe_error":
+            raise RuntimeError("check unavailable")
+        return {
+            "matched": int(reset == "valid"), "eligible": int(reset == "valid"),
+            "candidates": int(reset == "valid"),
+            "invalidSelector": reset == "invalid_without_candidates",
+        }
+
+    _, healer_times = _install_timed_locator_probes(
+        page, clock, isolated_locator_book, target="composer", result_at=result_at,
+    )
+    execution = ask._AskExecution(page, "question", None, timeout_seconds=12)
+    if reset == "valid":
+        asyncio.run(execution._wait_for_composer())
+        assert clock.value == 3
+    else:
+        with pytest.raises(ask._DeadlineExpired):
+            asyncio.run(execution._wait_for_composer())
+    assert healer_times == []
+    assert not isolated_locator_book.path.exists()
+
+
+def test_send_disabled_valid_button_waits_with_bounded_contract_checks(
+    monkeypatch: pytest.MonkeyPatch, isolated_locator_book: locators.LocatorBook,
+) -> None:
+    clock = _install_clock(monkeypatch)
+    monkeypatch.setattr(ask, "POLL_INTERVAL_SECONDS", 0.12)
+    page = _FakePage()
+    check_times, healer_times = _install_timed_locator_probes(
+        page, clock, isolated_locator_book, target="send", ready_at=10,
+        result_at=lambda _: {"matched": 1, "eligible": 1, "candidates": 1},
+    )
+    execution = ask._AskExecution(page, "question", None)
+    asyncio.run(execution._wait_for_send_ready())
+    assert clock.value >= 10
+    assert 9 <= len(check_times) <= 12
+    assert healer_times == []
+    assert not isolated_locator_book.path.exists()
+
+
+@pytest.mark.parametrize("scenario", ["candidate_appears", "ready_fault", "invalid_css", "invalid_css_without_candidates"])
+def test_send_rediscovery_requires_sustained_fault_with_candidates(
+    monkeypatch: pytest.MonkeyPatch, isolated_locator_book: locators.LocatorBook,
+    scenario: str,
+) -> None:
+    clock = _install_clock(monkeypatch)
+    monkeypatch.setattr(ask, "POLL_INTERVAL_SECONDS", 0.12)
+    page = _FakePage()
+    invalid_css = scenario.startswith("invalid_css")
+
+    def result_at(now: float) -> dict[str, object]:
+        candidates = int(now >= 4) if scenario == "candidate_appears" else 1
+        if scenario == "invalid_css_without_candidates":
+            candidates = 0
+        return {"matched": 0, "eligible": 0, "candidates": candidates,
+                "invalidSelector": invalid_css}
+
+    check_times, healer_times = _install_timed_locator_probes(
+        page, clock, isolated_locator_book, target="send", result_at=result_at,
+        ready_at=0 if scenario == "ready_fault" else None, readiness_raises=invalid_css,
+    )
+    execution = ask._AskExecution(page, "question", None)
+    with pytest.raises(ask.GptProAskError) as raised:
+        asyncio.run(execution._wait_for_send_ready())
+    if scenario == "invalid_css_without_candidates":
+        assert raised.value.failure == "submit_failed"
+        assert clock.value >= ask.SEND_READY_TIMEOUT_SECONDS
+        assert healer_times == []
+        assert not isolated_locator_book.path.exists()
+    else:
+        assert raised.value.failure == "locator_unresolved"
+        first_fault = next(now for now in check_times if scenario != "candidate_appears" or now >= 4)
+        assert len(healer_times) == 1
+        assert first_fault + ask.LOCATOR_SETTLE_SECONDS <= healer_times[0] <= first_fault + 5.2
+
+
+@pytest.mark.parametrize("reset", ["valid", "wait", "invalid_without_candidates", "probe_error"])
+def test_send_fault_timer_resets_on_nonrediscoverable_observation(
+    monkeypatch: pytest.MonkeyPatch, isolated_locator_book: locators.LocatorBook,
+    reset: str,
+) -> None:
+    clock = _install_clock(monkeypatch)
+    page = _FakePage()
+
+    def result_at(now: float) -> dict[str, object]:
+        if not 3 <= now < 6:
+            return {"matched": 0, "eligible": 0, "candidates": 1}
+        if reset == "probe_error":
+            raise RuntimeError("contract probe unavailable")
+        return {
+            "matched": int(reset == "valid"), "eligible": int(reset == "valid"),
+            "candidates": int(reset == "valid"),
+            "invalidSelector": reset == "invalid_without_candidates",
+        }
+
+    _, healer_times = _install_timed_locator_probes(
+        page, clock, isolated_locator_book, target="send", result_at=result_at,
+    )
+    execution = ask._AskExecution(page, "question", None)
+    with pytest.raises(ask.GptProAskError) as raised:
+        asyncio.run(execution._wait_for_send_ready())
+    if reset == "probe_error":
+        assert raised.value.failure == "submit_failed"
+        assert healer_times == []
+        assert not isolated_locator_book.path.exists()
+    else:
+        assert raised.value.failure == "locator_unresolved"
+        assert healer_times == [6 + ask.LOCATOR_SETTLE_SECONDS]

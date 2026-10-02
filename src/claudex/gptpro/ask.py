@@ -795,22 +795,15 @@ class _AskExecution:
             await self._process_network_actions()
             self._check_authenticated()
             if check is not None and check.verdict == "valid":
+                fault_since = None
                 # Learning the language can select a different recorded locator.
                 if selector != self._selector("composer"):
                     continue
                 self.locator_selectors["composer"] = selector
                 return
-            if check is not None and check.verdict == "fault":
-                if fault_since is None:
-                    fault_since = _monotonic()
-                if _monotonic() - fault_since >= LOCATOR_SETTLE_SECONDS:
-                    await self._rediscover("composer", check)
-                    fault_since = None
-                    continue
-            else:
-                fault_since = None
             markers = await self._probe_challenge()
             if markers:
+                fault_since = None
                 if challenge_grace_deadline is None:
                     challenge_grace_deadline = (
                         _monotonic() + CHALLENGE_GRACE_SECONDS
@@ -820,6 +813,15 @@ class _AskExecution:
                         "Cloudflare challenge markup was detected: "
                         + ", ".join(markers)
                     )
+            elif check is not None and check.verdict == "fault" and check.candidates > 0:
+                if fault_since is None:
+                    fault_since = _monotonic()
+                if _monotonic() - fault_since >= LOCATOR_SETTLE_SECONDS:
+                    await self._rediscover("composer", check)
+                    fault_since = None
+                    continue
+            else:
+                fault_since = None
             if _monotonic() < end:
                 await self._pause(min(POLL_INTERVAL_SECONDS, end - _monotonic()))
         self._ensure_deadline()
@@ -1023,11 +1025,13 @@ class _AskExecution:
     async def _wait_for_send_ready(self) -> None:
         end = min(self.deadline, _monotonic() + SEND_READY_TIMEOUT_SECONDS)
         missing_attachments: list[str] = []
-        not_ready_since: float | None = None
+        fault_since: float | None = None
+        next_check_at = _monotonic()
         check: LocatorCheck | None = None
         while _monotonic() < end:
             await self._process_network_actions()
             selector = self._selector("send")
+            readiness_error: Exception | None = None
             try:
                 ready = await self._await_page_operation(
                     self.page.evaluate(
@@ -1038,46 +1042,41 @@ class _AskExecution:
             except _DeadlineExpired:
                 raise
             except Exception as exc:
+                ready = False
+                readiness_error = exc
+            missing_attachments = await self._missing_ready_attachments()
+            # Readiness alone cannot establish the contract. While waiting,
+            # sample it once per second rather than on every readiness poll.
+            if ready is True or _monotonic() >= next_check_at:
                 try:
                     check = await self._check_locator("send", selector)
                 except _DeadlineExpired:
                     raise
-                except Exception as check_error:
+                except Exception as exc:
+                    fault_since = None
                     raise GptProAskError(
                         "submit_failed", "could not inspect the ChatGPT send button locator"
-                    ) from check_error
-                if check.verdict == "fault":
-                    await self._rediscover("send", check)
-                    continue
-                raise GptProAskError(
-                    "submit_failed", "could not inspect the ChatGPT send button"
-                ) from exc
-            missing_attachments = await self._missing_ready_attachments()
-            if ready is True:
-                check = await self._check_locator("send", selector)
-                if check.verdict == "valid" and not missing_attachments:
+                    ) from exc
+                next_check_at = _monotonic() + 1.0
+                if check.verdict == "fault" and check.candidates > 0:
+                    if fault_since is None:
+                        fault_since = _monotonic()
+                    if (_monotonic() - fault_since >= LOCATOR_SETTLE_SECONDS
+                            and not missing_attachments):
+                        await self._rediscover("send", check)
+                        fault_since = None
+                        check = None
+                        next_check_at = _monotonic()
+                        continue
+                else:
+                    fault_since = None
+                if ready is True and check.verdict == "valid" and not missing_attachments:
                     self.locator_selectors["send"] = selector
                     return
-                if check.verdict == "fault" and not missing_attachments:
-                    await self._rediscover("send", check)
-                    continue
-                not_ready_since = None
-            else:
-                if not_ready_since is None:
-                    not_ready_since = _monotonic()
-                if _monotonic() - not_ready_since >= LOCATOR_SETTLE_SECONDS:
-                    try:
-                        check = await self._check_locator("send")
-                    except _DeadlineExpired:
-                        raise
-                    except Exception as exc:
-                        raise GptProAskError(
-                            "submit_failed",
-                            "could not inspect the ChatGPT send button locator"
-                        ) from exc
-                    not_ready_since = _monotonic()
-                    if check.verdict == "fault" and not missing_attachments:
-                        await self._rediscover("send", check)
+            if readiness_error is not None and (check is None or check.verdict != "fault"):
+                raise GptProAskError(
+                    "submit_failed", "could not inspect the ChatGPT send button"
+                ) from readiness_error
             await self._pause(min(POLL_INTERVAL_SECONDS, end - _monotonic()))
         self._ensure_deadline()
         self._settle_rediscovered("send", "the send button did not become ready")
