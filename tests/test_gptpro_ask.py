@@ -2795,6 +2795,55 @@ def test_repeated_fault_probe_crosses_phase_end(monkeypatch, isolated_locator_bo
 
 
 @pytest.mark.parametrize("target", ["composer", "send"])
+@pytest.mark.parametrize("prior_failures", [2, 3])
+def test_success_language_transition_closes_source_circuit(
+    isolated_locator_book, target, prior_failures,
+):
+    book = isolated_locator_book
+    now = [100.0]
+    book.clock = lambda: now[0]
+    for _ in range(prior_failures):
+        book._record_failure("unknown", target, "healer failed")
+        now[0] += (locators.BREAKER_COOLDOWN_SECONDS if book._record(
+            "unknown", target)["open_until"] else locators.RETRY_BACKOFF_SECONDS)
+    class Healer:
+        async def complete(self, *args, **kwargs):
+            return '{"status":"selected","candidate":0}'
+    book.healer = Healer()
+    async def evaluate(expression, argument):
+        if expression == selectors.LOCATOR_CANDIDATES_PROBE_JS:
+            return {"lang": "", "candidates": [{"selector": ".recovered"}]}
+        return {"matched": 1, "eligible": 1, "candidates": 1, "lang": ""}
+    async def run():
+        page = _FakePage()
+        execution = ask._AskExecution(page, "question", None, locator_book=book)
+        result = await book.rediscover(evaluate, target, "",
+            failed_selector=locators.SEED_SELECTORS[target],
+            composer_selector=selectors.COMPOSER_SELECTOR, deadline=ask._monotonic() + 20)
+        execution.unproven_locators[target] = result
+        async def known_language(*args):
+            return {"matched": 1, "eligible": 1, "candidates": 1, "lang": "ko"}
+        page.evaluate = known_language
+        await execution._check_locator(target, result.selector)
+        assert execution.locator_environment == "ko"
+        execution._settle_rediscovered(target, "success")
+        execution._settle_rediscovered(target, "success")
+    asyncio.run(run())
+    assert not book.pending
+    assert book.selector_for("ko", target) == ".recovered"
+    source = book._record("unknown", target)
+    assert source["consecutive_failures"] == 0
+    assert source["open_until"] is None
+    assert source["next_attempt_at"] is None
+    assert source["last_failure"] is None
+    book._record_failure("unknown", target, "next healer failed")
+    source = book._record("unknown", target)
+    assert source["consecutive_failures"] == 1
+    assert source["open_until"] is None
+    assert source["next_attempt_at"] == now[0] + 60
+
+
+@pytest.mark.parametrize("target", ["composer", "send"])
 @pytest.mark.parametrize("outcome", ["success", "failure", "abandon", "cancel"])
 def test_attempt_language_transition(isolated_locator_book, target, outcome):
     book = isolated_locator_book

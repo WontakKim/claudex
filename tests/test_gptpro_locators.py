@@ -805,6 +805,63 @@ def test_deterministic_reuse_failure_and_abandon_do_not_count(tmp_path):
     assert book.selector_for("ko", "composer") == ".restored"
 
 
+@pytest.mark.parametrize("prior_failures", [2, 3])
+@pytest.mark.parametrize("has_source_selector", [False, True])
+@pytest.mark.parametrize("destination_already_stored", [False, True])
+def test_transferred_success_closes_source_circuit(
+    tmp_path, prior_failures, has_source_selector, destination_already_stored,
+):
+    now = [100.0]
+    book = locators.LocatorBook(tmp_path / "locators.json", healer=_Healer(),
+                               clock=lambda: now[0])
+    if has_source_selector:
+        book.record_success("unknown", "composer", ".old")
+        book.record_success("unknown", "composer", ".source")
+    if destination_already_stored:
+        book.record_success("ko", "composer", ".recovered")
+    for _ in range(prior_failures):
+        book._record_failure("unknown", "composer", "healer failed")
+        now[0] += (locators.BREAKER_COOLDOWN_SECONDS if book._record(
+            "unknown", "composer")["open_until"] else locators.RETRY_BACKOFF_SECONDS)
+    source = book._record("unknown", "composer")
+    assert book.refusal("unknown", "composer") is None
+
+    async def run():
+        result = await book.rediscover(_evaluate(), "composer", "unknown",
+            failed_selector=selectors.COMPOSER_SELECTOR,
+            composer_selector=selectors.COMPOSER_SELECTOR,
+            deadline=book.monotonic() + 20)
+        book.record_success("ko", "composer", result.selector, result.attempt_id,
+                            attempt_env=result.environment)
+    asyncio.run(run())
+
+    assert not book.pending
+    assert book.selector_for("ko", "composer") == ".recovered"
+    assert book._record("unknown", "composer") == {
+        **source, "consecutive_failures": 0, "open_until": None,
+        "next_attempt_at": None, "last_failure": None,
+    }
+    book._record_failure("unknown", "composer", "next healer failed")
+    record = book._record("unknown", "composer")
+    assert record["consecutive_failures"] == 1
+    assert record["open_until"] is None
+    assert record["next_attempt_at"] == now[0] + 60
+
+
+@pytest.mark.parametrize("attempt_id", ["stale", "unknown-attempt"])
+def test_stale_transferred_success_preserves_both_records(tmp_path, attempt_id):
+    book = locators.LocatorBook(tmp_path / "locators.json")
+    book.record_success("ko", "composer", ".destination")
+    book._record_failure("unknown", "composer", "healer failed")
+    attempt = locators.RediscoveredLocator(".recovered", "owned", "unknown")
+    book.pending[("unknown", "composer")] = attempt
+    before = book.path.read_bytes()
+    book.record_success("ko", "composer", attempt.selector, attempt_id,
+                        attempt_env=attempt.environment)
+    assert book.path.read_bytes() == before
+    assert book.pending[("unknown", "composer")] == attempt
+
+
 @pytest.mark.parametrize("owned", [False, True])
 @pytest.mark.parametrize("destination", ["ko", "unknown"])
 def test_success_transfer_checks_attempt_ownership(tmp_path, owned, destination):

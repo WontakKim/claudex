@@ -210,10 +210,17 @@ class LocatorBook:
         self, env: str, target: str, selector: str, attempt_id: str | None = None,
         *, attempt_env: str | None = None,
     ) -> None:
-        if attempt_id is not None and not self.abandon(
-            env if attempt_env is None else attempt_env, target, attempt_id,
-        ):
-            return
+        source_env = env if attempt_env is None else attempt_env
+        if attempt_id is not None:
+            if not self.abandon(source_env, target, attempt_id):
+                return
+            if environment_key(source_env) != environment_key(env):
+                source = self._record(source_env, target)
+                if source:
+                    self._store(source_env, target, {
+                        **source, "consecutive_failures": 0, "open_until": None,
+                        "next_attempt_at": None, "last_failure": None,
+                    })
         prior = self._record(env, target)
         if prior.get("selector") == selector and prior.get("consecutive_failures", 0) == 0:
             return
