@@ -699,10 +699,13 @@ class _AskExecution:
         self.locator_selectors[target] = selector
         return selector
 
-    async def _check_locator(self, target: locators.LocatorTarget) -> LocatorCheck:
+    async def _check_locator(
+        self, target: locators.LocatorTarget, selector: str | None = None,
+    ) -> LocatorCheck:
+        selector = self._selector(target) if selector is None else selector
         check = await self._await_page_operation(
             check_locator(
-                self.page.evaluate, target, self._selector(target),
+                self.page.evaluate, target, selector,
                 composer_selector=self._selector("composer"),
             )
         )
@@ -782,7 +785,8 @@ class _AskExecution:
             except Exception as exc:
                 last_error = exc
             try:
-                check = await self._check_locator("composer")
+                selector = self._selector("composer")
+                check = await self._check_locator("composer", selector)
             except _DeadlineExpired:
                 raise
             except Exception as exc:
@@ -791,6 +795,10 @@ class _AskExecution:
             await self._process_network_actions()
             self._check_authenticated()
             if check is not None and check.verdict == "valid":
+                # Learning the language can select a different recorded locator.
+                if selector != self._selector("composer"):
+                    continue
+                self.locator_selectors["composer"] = selector
                 return
             if check is not None and check.verdict == "fault":
                 if fault_since is None:
@@ -898,14 +906,25 @@ class _AskExecution:
         return latest
 
     async def _fill_and_verify(self) -> None:
+        selector = self._selector("composer")
+        check = await self._check_locator("composer", selector)
+        if check.verdict != "valid":
+            self._settle_rediscovered(
+                "composer", "the rediscovered locator failed the contract again",
+            )
+            raise GptProAskError(
+                "locator_unresolved",
+                f"the ChatGPT composer locator failed before fill ({check.describe()})",
+            )
+        self.locator_selectors["composer"] = selector
         try:
             await self._await_page_operation(
-                self.page.fill(self._selector("composer"), self.prompt)
+                self.page.fill(selector, self.prompt, strict=True)
             )
             readback = await self._await_page_operation(
                 self.page.evaluate(
                     COMPOSER_READBACK_PROBE_JS,
-                    {"selector": self._selector("composer")},
+                    {"selector": selector},
                 )
             )
         except _DeadlineExpired:
@@ -1008,23 +1027,40 @@ class _AskExecution:
         check: LocatorCheck | None = None
         while _monotonic() < end:
             await self._process_network_actions()
+            selector = self._selector("send")
             try:
                 ready = await self._await_page_operation(
                     self.page.evaluate(
                         SEND_BUTTON_READY_PROBE_JS,
-                        {"selector": self._selector("send")},
+                        {"selector": selector},
                     )
                 )
             except _DeadlineExpired:
                 raise
             except Exception as exc:
+                try:
+                    check = await self._check_locator("send", selector)
+                except _DeadlineExpired:
+                    raise
+                except Exception as check_error:
+                    raise GptProAskError(
+                        "submit_failed", "could not inspect the ChatGPT send button locator"
+                    ) from check_error
+                if check.verdict == "fault":
+                    await self._rediscover("send", check)
+                    continue
                 raise GptProAskError(
                     "submit_failed", "could not inspect the ChatGPT send button"
                 ) from exc
             missing_attachments = await self._missing_ready_attachments()
-            if ready is True and not missing_attachments:
-                return
             if ready is True:
+                check = await self._check_locator("send", selector)
+                if check.verdict == "valid" and not missing_attachments:
+                    self.locator_selectors["send"] = selector
+                    return
+                if check.verdict == "fault" and not missing_attachments:
+                    await self._rediscover("send", check)
+                    continue
                 not_ready_since = None
             else:
                 if not_ready_since is None:
@@ -1065,12 +1101,24 @@ class _AskExecution:
                 "submit_failed", "attachments no longer ready in the active "
                 "composer: " + ", ".join(repr(name) for name in missing_attachments)
             )
+        selector = self._selector("send")
+        check = await self._check_locator("send", selector)
+        if check.verdict != "valid":
+            self._settle_rediscovered(
+                "send", "the rediscovered locator failed the contract again",
+            )
+            raise GptProAskError(
+                "locator_unresolved",
+                f"the ChatGPT send locator failed before click ({check.describe()})",
+            )
+        self.locator_selectors["send"] = selector
         try:
             self.has_submitted = True
             self._record_evidence(submission="uncertain")
             await self._await_page_operation(
                 self.page.click(
-                    self._selector("send"),
+                    selector,
+                    strict=True,
                     timeout=self._timeout_ms(SEND_READY_TIMEOUT_SECONDS),
                 )
             )

@@ -123,6 +123,8 @@ class _FakePage:
         }
         self.composer_value = ""
         self.filled_prompt = ""
+        self.fill_actions: list[tuple[str, bool]] = []
+        self.click_actions: list[tuple[str, bool]] = []
         self.click_count = 0
         self.fetch_count = 0
         self.session_fetch_count = 0
@@ -163,7 +165,9 @@ class _FakePage:
         self.call_order.append("composer")
         return object()
 
-    async def fill(self, selector: str, value: str) -> None:
+    async def fill(self, selector: str, value: str, *, strict: bool = False) -> None:
+        self.fill_actions.append((selector, strict))
+        assert strict is True
         assert selector == selectors.COMPOSER_SELECTOR
         if self.hang_operation == "fill":
             await asyncio.Event().wait()
@@ -171,7 +175,9 @@ class _FakePage:
         self.composer_value = value
         self.filled_prompt = value
 
-    async def click(self, selector: str, *, timeout: int) -> None:
+    async def click(self, selector: str, *, timeout: int, strict: bool = False) -> None:
+        self.click_actions.append((selector, strict))
+        assert strict is True
         assert selector == selectors.SEND_BUTTON_SELECTOR
         assert timeout > 0
         self.click_count += 1
@@ -1701,7 +1707,7 @@ def test_correlated_outgoing_request_captures_id_before_requestfinished(
     observed: list[str] = []
     original_click = page.click
 
-    async def click_then_lose_confirmation(selector: str, *, timeout: int) -> None:
+    async def click_then_lose_confirmation(selector: str, *, timeout: int, strict: bool = False) -> None:
         page._emit(
             "request",
             _FakeRequest(
@@ -1713,7 +1719,7 @@ def test_correlated_outgoing_request_captures_id_before_requestfinished(
                 }),
             ),
         )
-        await original_click(selector, timeout=timeout)
+        await original_click(selector, timeout=timeout, strict=strict)
         raise RuntimeError("navigation destroyed click confirmation")
 
     page.click = click_then_lose_confirmation  # type: ignore[method-assign]
@@ -2039,7 +2045,7 @@ def test_send_locator_fault_or_disabled_button(
 
 
 @pytest.mark.parametrize("target", ["composer", "send"])
-@pytest.mark.parametrize("result", ["success", "absent", "second_fault", "click_failure", "echo_timeout"])
+@pytest.mark.parametrize("result", ["success", "absent", "second_fault", "action_refault", "invalid_css", "click_failure", "echo_timeout"])
 def test_locator_recovery_first_use(
     monkeypatch: pytest.MonkeyPatch, isolated_locator_book: locators.LocatorBook,
     target: locators.LocatorTarget, result: str,
@@ -2060,13 +2066,17 @@ def test_locator_recovery_first_use(
             return {"lang": "ko", "candidates": [{"index": 0, "selector": recovered}]}
         if expression == selectors.LOCATOR_CHECK_PROBE_JS and argument["target"] == target:
             valid = argument["selector"] == recovered
-            if result == "second_fault" and valid:
-                valid = not getattr(page, "candidate_checked", False)
-                page.candidate_checked = True
-            return {"matched": int(valid), "eligible": int(valid), "candidates": 1, "lang": "ko"}
+            if result in ("second_fault", "action_refault") and valid:
+                checks = getattr(page, "candidate_checks", 0) + 1
+                page.candidate_checks = checks
+                valid = checks < (2 if result == "second_fault" else 3)
+            return {"matched": int(valid), "eligible": int(valid), "candidates": 1, "lang": "ko",
+                    "invalidSelector": result == "invalid_css" and not valid}
         if expression == selectors.LOCATOR_CHECK_PROBE_JS:
             return {"matched": 1, "eligible": 1, "candidates": 1, "lang": "ko"}
         if expression == selectors.SEND_BUTTON_READY_PROBE_JS and target == "send":
+            if result == "invalid_css" and argument["selector"] != recovered:
+                raise RuntimeError("SyntaxError: invalid selector")
             return argument["selector"] == recovered and result != "second_fault"
         if expression == selectors.USER_ECHO_PROBE_JS and target == "send":
             assert not book.path.exists()
@@ -2079,21 +2089,21 @@ def test_locator_recovery_first_use(
     page.evaluate = evaluate
     if target == "composer":
         original_fill = page.fill
-        async def fill(selector, value):
+        async def fill(selector, value, *, strict=False):
             assert selector == recovered and not book.path.exists()
-            await original_fill(selectors.COMPOSER_SELECTOR, value)
+            await original_fill(selectors.COMPOSER_SELECTOR, value, strict=strict)
         page.fill = fill
     else:
         original_click = page.click
-        async def click(selector, *, timeout):
+        async def click(selector, *, timeout, strict=False):
             assert selector == recovered and not book.path.exists()
-            await original_click(selectors.SEND_BUTTON_SELECTOR, timeout=timeout)
+            await original_click(selectors.SEND_BUTTON_SELECTOR, timeout=timeout, strict=strict)
         page.click = click
     if result == "click_failure":
-        async def failed_click(selector, *, timeout):
+        async def failed_click(selector, *, timeout, strict=False):
             raise RuntimeError("click failed")
         page.click = failed_click
-    if result == "success":
+    if result in ("success", "invalid_css"):
         _run(page)
         assert book.selector_for("ko", target) == recovered
         assert book.path.exists()
@@ -2111,7 +2121,7 @@ def test_locator_recovery_first_use(
             assert raised.value.evidence.submission == "not_attempted"
             assert page.click_count == 0
     assert len(calls) == 1
-    if result == "second_fault":
+    if result in ("second_fault", "action_refault"):
         record = json.loads(book.path.read_text())["environments"]["ko"][target]
         assert record["consecutive_failures"] == 1
         assert record["selector"] is None
@@ -2159,7 +2169,7 @@ def test_unproven_composer_failure_is_recorded(
     execution.locator_environment = "ko"
     execution.unproven_locators["composer"] = selectors.COMPOSER_SELECTOR
     if failure == "fill":
-        async def fill(selector, value):
+        async def fill(selector, value, *, strict=False):
             raise RuntimeError("cannot fill")
         page.fill = fill
     else:
@@ -2209,3 +2219,93 @@ def test_unproven_composer_timeout_leaves_book_unchanged(
     assert after == before
     assert book.refusal("ko", "composer") is None
     assert "composer" in execution.unproven_locators
+
+
+@pytest.mark.parametrize("scenario", [
+    "stale_composer", "composer_refault", "send_button_type", "send_duplicate",
+    "send_other_form", "send_invalid_css", "send_refault", "healthy", "book_changes",
+])
+def test_actions_require_verified_locators(
+    monkeypatch: pytest.MonkeyPatch, isolated_locator_book: locators.LocatorBook,
+    scenario: str,
+) -> None:
+    _install_clock(monkeypatch)
+    page = _FakePage()
+    book = isolated_locator_book
+    stale = ".stale-composer"
+    if scenario == "stale_composer":
+        book.record_success("en-US", "composer", stale)
+    original = page.evaluate
+    checked: list[tuple[str, str, bool]] = []
+    send_checks = 0
+    composer_checks = 0
+
+    async def evaluate(expression: str, argument: Any = None) -> Any:
+        nonlocal send_checks, composer_checks
+        if expression == selectors.TOP_LEVEL_USER_IDS_PROBE_JS and scenario == "book_changes":
+            book.record_success("en-US", "composer", stale)
+        if expression == selectors.SEND_BUTTON_READY_PROBE_JS and scenario == "send_invalid_css":
+            raise RuntimeError("SyntaxError: invalid selector")
+        if expression == selectors.LOCATOR_CHECK_PROBE_JS:
+            target, selector = argument["target"], argument["selector"]
+            if target == "composer":
+                composer_checks += 1
+                valid = selector != stale and not (
+                    scenario == "composer_refault" and composer_checks > 1
+                )
+            else:
+                send_checks += 1
+                valid = not scenario.startswith("send_") or (
+                    scenario == "send_refault" and send_checks == 1
+                )
+            checked.append((target, selector, valid))
+            return {
+                "matched": 2 if scenario == "send_duplicate" and target == "send" else 1,
+                "eligible": int(valid), "candidates": 1, "lang": "en-US",
+                "invalidSelector": scenario == "send_invalid_css" and target == "send",
+            }
+        return await original(expression, argument)
+
+    page.evaluate = evaluate  # type: ignore[method-assign]
+    if scenario in ("healthy", "stale_composer", "book_changes"):
+        _run(page)
+        assert page.fill_actions == [(selectors.COMPOSER_SELECTOR, True)]
+        assert ("composer", page.fill_actions[0][0], True) in checked
+        assert page.click_actions == [(selectors.SEND_BUTTON_SELECTOR, True)]
+        assert ("send", page.click_actions[0][0], True) in checked
+        if scenario == "stale_composer":
+            assert ("composer", stale, False) in checked
+    else:
+        with pytest.raises(ask.GptProAskError) as raised:
+            _run(page)
+        assert raised.value.failure == "locator_unresolved"
+        assert raised.value.evidence.submission == "not_attempted"
+        assert page.click_count == 0
+        if scenario == "composer_refault":
+            assert page.fill_actions == []
+        if scenario not in ("composer_refault", "send_refault"):
+            assert isinstance(raised.value.__cause__, locators.HealerUnavailable)
+
+
+@pytest.mark.parametrize("contract_raises", [False, True])
+def test_send_probe_failure_without_locator_fault_stays_submit_failed(
+    monkeypatch: pytest.MonkeyPatch, contract_raises: bool,
+) -> None:
+    _install_clock(monkeypatch)
+    page = _FakePage()
+    original = page.evaluate
+
+    async def evaluate(expression: str, argument: Any = None) -> Any:
+        if expression == selectors.SEND_BUTTON_READY_PROBE_JS:
+            raise RuntimeError("readiness probe unavailable")
+        if (expression == selectors.LOCATOR_CHECK_PROBE_JS
+                and argument["target"] == "send" and contract_raises):
+            raise RuntimeError("contract probe unavailable")
+        return await original(expression, argument)
+
+    page.evaluate = evaluate  # type: ignore[method-assign]
+    with pytest.raises(ask.GptProAskError) as raised:
+        _run(page)
+    assert raised.value.failure == "submit_failed"
+    assert raised.value.evidence.submission == "not_attempted"
+    assert page.click_actions == []
