@@ -44,7 +44,9 @@ class _Element:
             child.parent = self
 
 
-_CHUNK_RE = re.compile(r"#[^\[\]\s]+|\.[^\[\]\s]+|\[[^\]]*\]")
+_CHUNK_RE = re.compile(
+    r":not\(\[[^\]~|^$*=\s]+\]\)|#[^\[\]\s:()]+|\.[^\[\]\s:()]+|\[[^\]]*\]"
+)
 _ATTR_RE = re.compile(
     r'^\[\s*(?P<name>[^\]~|^$*=\s]+)'
     r'(?:\s*(?P<operator>\$?=)\s*"(?P<value>[^"]*)")?'
@@ -80,7 +82,10 @@ def _matches_compound(node: _Element, compound: str) -> bool:
     if "".join(chunks) != remainder:
         return False
     for chunk in chunks:
-        if chunk.startswith("#"):
+        if chunk.startswith(":not("):
+            if _matches_compound(node, chunk[5:-1]):
+                return False
+        elif chunk.startswith("#"):
             if node.attributes.get("id") != chunk[1:]:
                 return False
         elif chunk.startswith("."):
@@ -154,15 +159,37 @@ def _composer_form(*buttons: _Element) -> _Element:
 
 
 def _send_button() -> _Element:
-    return _Element("button", {"type": "submit", "aria-label": "Send"})
+    return _Element(
+        "button",
+        {
+            "type": "submit",
+            "class": "cursor-interaction size-token-button-composer",
+            "aria-label": "Send",
+        },
+    )
 
 
 def _stop_button() -> _Element:
-    return _Element("button", {"aria-label": "Stop"})
+    return _Element(
+        "button",
+        {
+            "type": "button",
+            "class": "cursor-interaction size-token-button-composer",
+            "aria-label": "Stop",
+        },
+    )
 
 
 def _start_voice_button() -> _Element:
-    return _Element("button", {"aria-label": "Start Voice"})
+    return _Element(
+        "button",
+        {
+            "type": "button",
+            "class": "cursor-interaction size-token-button-composer",
+            "data-state": "closed",
+            "aria-label": "Start Voice",
+        },
+    )
 
 
 def _turn(user_id: str, assistant_ids: str, *, turn_index: int) -> _Element:
@@ -296,16 +323,54 @@ def test_send_readiness_scrolls_only_enabled_active_button_before_hit_test(
         assert after == before
 
 
-def test_stop_button_selector_targets_the_generating_stop_button() -> None:
+@pytest.mark.parametrize("label", ["중지", "Stop"])
+def test_stop_button_selector_targets_the_generating_stop_button(label: str) -> None:
     stop = _stop_button()
+    stop.attributes["aria-label"] = label
     generating = _conversation_dom(stop)
 
     assert _select(generating, selectors.STOP_BUTTON_SELECTOR) == [stop]
 
-    # After completion the stop button is replaced by "Start Voice".
-    completed = _conversation_dom(_start_voice_button())
 
-    assert _select(completed, selectors.STOP_BUTTON_SELECTOR) == []
+@pytest.mark.parametrize("label", ["음성 대화 시작", "Start Voice"])
+def test_stop_button_selector_excludes_the_voice_slot(label: str) -> None:
+    voice = _start_voice_button()
+    voice.attributes["aria-label"] = label
+
+    assert _select(_conversation_dom(voice), selectors.STOP_BUTTON_SELECTOR) == []
+
+
+def test_stop_button_selector_excludes_the_submit_slot() -> None:
+    assert _select(_conversation_dom(_send_button()), selectors.STOP_BUTTON_SELECTOR) == []
+
+
+def test_stop_button_selector_excludes_the_dictate_button() -> None:
+    dictate = _Element(
+        "button",
+        {
+            "type": "button",
+            "class": "no-drag cursor-interaction",
+            "aria-label": "음성 입력",
+        },
+    )
+
+    assert _select(_conversation_dom(dictate), selectors.STOP_BUTTON_SELECTOR) == []
+
+
+def test_stop_button_selector_excludes_slots_outside_the_composer_form() -> None:
+    dom = _Element("div", None, _composer_form(), _stop_button())
+
+    assert _select(dom, selectors.STOP_BUTTON_SELECTOR) == []
+
+
+@pytest.mark.parametrize("attributes", [{}, {"data-state": ""}, {"data-state": "closed"}])
+def test_mini_matcher_negates_attribute_presence(attributes: dict[str, str]) -> None:
+    button = _Element("button", attributes)
+    dom = _Element("div", None, button)
+
+    assert _select(dom, "button:not([data-state])") == (
+        [] if "data-state" in attributes else [button]
+    )
 
 
 def test_message_unit_selectors_target_units_by_key_suffix() -> None:
@@ -389,3 +454,22 @@ def test_legacy_dom_markup_is_not_selected() -> None:
     assert _select(legacy, selectors.STOP_BUTTON_SELECTOR) == []
     assert _select(legacy, selectors.USER_MESSAGE_SELECTOR) == []
     assert _select(legacy, selectors.ASSISTANT_MESSAGE_SELECTOR) == []
+
+
+@pytest.mark.parametrize(
+    "labels", [("Ask ChatGPT", "Send"), ("ChatGPT에게 물어보세요", "보내기"), (None, None)],
+)
+def test_composer_and_send_selectors_ignore_localized_labels(
+    labels: tuple[str | None, str | None],
+) -> None:
+    submit = _send_button()
+    form = _composer_form(submit)
+    composer = form.children[1]
+    for element, label in zip((composer, submit), labels):
+        if label is None:
+            element.attributes.pop("aria-label")
+        else:
+            element.attributes["aria-label"] = label
+    dom = _Element("div", None, form)
+    assert _select(dom, selectors.COMPOSER_SELECTOR) == [composer]
+    assert _select(dom, selectors.SEND_BUTTON_SELECTOR) == [submit]

@@ -2,14 +2,19 @@
 
 from __future__ import annotations
 
+# Accessible names are localized; composer and send locators match structure only.
 COMPOSER_SELECTOR = (
     'form[data-chatgpt-composer] div.ProseMirror[contenteditable="true"]'
-    '[role="textbox"][aria-label="Ask ChatGPT"]'
+    '[role="textbox"]'
 )
-SEND_BUTTON_SELECTOR = (
-    'form[data-chatgpt-composer] button[type="submit"][aria-label="Send"]'
+SEND_BUTTON_SELECTOR = 'form[data-chatgpt-composer] button[type="submit"]'
+# The composer's trailing slot is voice (type=button with a data-state tooltip
+# trigger) when empty, submit when text is present, and stop (type=button without
+# data-state) while streaming. Accessible names are localized; match structure.
+STOP_BUTTON_SELECTOR = (
+    'form[data-chatgpt-composer] '
+    'button.size-token-button-composer[type="button"]:not([data-state])'
 )
-STOP_BUTTON_SELECTOR = 'form[data-chatgpt-composer] button[aria-label="Stop"]'
 # Message units carry a search-unit key whose prefix ("fallback-turn-N") is
 # index-based and changes between renders; only the ":user"/":assistant"
 # suffix is stable, so units are addressed by suffix match. The message-ids
@@ -376,3 +381,128 @@ async (args) => {
   }
 }
 """
+
+
+# Composers are visible editable roots in forms outside dialogs, navigation,
+# message units, and search areas; known composer forms constrain eligibility when
+# present, otherwise generic forms qualify. Send buttons qualify only in the form
+# of exactly one selector-matched composer that satisfies this same predicate.
+LOCATOR_CONTRACT_JS = r"""
+(target, composerSelector) => {
+  const isVisibleCandidate = (element) => {
+    const style = getComputedStyle(element);
+    const rect = element.getBoundingClientRect();
+    return !(
+      style.display === 'none' || style.visibility === 'hidden' ||
+      Number(style.opacity) === 0 || rect.width <= 0 || rect.height <= 0 ||
+      element.closest('[role="dialog"], dialog, nav, aside')
+    );
+  };
+  const isEligibleComposer = (element) => {
+    if (!isVisibleCandidate(element)) return false;
+    if (
+      element.closest('__MESSAGE_UNIT_SELECTOR__, [role="search"], search') ||
+      element.getAttribute('type') === 'search'
+    ) return false;
+    const form = element.closest('form');
+    if (form === null) return false;
+    if (
+      document.querySelector('form[data-chatgpt-composer]') !== null &&
+      !form.matches('form[data-chatgpt-composer]')
+    ) return false;
+    return element.getAttribute('contenteditable') === 'true' ||
+      element.tagName === 'TEXTAREA';
+  };
+  if (target === 'composer') return isEligibleComposer;
+  let composerForm = null;
+  if (target === 'send') {
+    try {
+      const composers = document.querySelectorAll(composerSelector);
+      if (composers.length === 1 && isEligibleComposer(composers[0])) {
+        composerForm = composers[0].closest('form');
+      }
+    } catch (_) {
+      // An invalid composer selector cannot establish form ownership.
+    }
+  }
+  return (element) => target === 'send' && isVisibleCandidate(element) &&
+    element.tagName === 'BUTTON' && element.type === 'submit' &&
+    composerForm !== null && element.form === composerForm;
+}
+""".replace("__MESSAGE_UNIT_SELECTOR__", USER_MESSAGE_SELECTOR.split("$=", 1)[0] + "]")
+
+LOCATOR_CHECK_PROBE_JS = r"""
+(args) => {
+  const contract = __LOCATOR_CONTRACT__(args.target, args.composerSelector);
+  let invalidSelector = false;
+  let matches = [];
+  try {
+    matches = Array.from(document.querySelectorAll(args.selector));
+  } catch (_) {
+    invalidSelector = true;
+  }
+  const pool = args.target === 'composer' ? '[contenteditable="true"], textarea' : 'button';
+  return {
+    invalidSelector,
+    matched: matches.length,
+    eligible: matches.filter(contract).length,
+    candidates: Array.from(document.querySelectorAll(pool)).filter(contract).length,
+    lang: document.documentElement.lang || '',
+  };
+}
+""".replace("__LOCATOR_CONTRACT__", "(" + LOCATOR_CONTRACT_JS + ")")
+
+# Candidates expose structural metadata and aria-label UI labels, never conversation text,
+# input values, or element IDs. Element and form data attributes expose names only
+# (excluding data-state), never data-* values.
+LOCATOR_CANDIDATES_PROBE_JS = r"""
+(args) => {
+  const contract = __LOCATOR_CONTRACT__(args.target, args.composerSelector);
+  const dataNames = (element) => Array.from(element.attributes)
+    .map(attribute => attribute.name)
+    .filter(name => name.startsWith('data-') && name !== 'data-state');
+  const presence = (element) => dataNames(element).map(name => `[${CSS.escape(name)}]`).join('');
+  const compile = (element) => {
+    const form = element.closest('form') || element.form;
+    const scope = form ? 'form' + presence(form) + ' ' : '';
+    let base = element.tagName.toLowerCase();
+    for (const name of ['role', 'type', 'contenteditable']) {
+      if (element.hasAttribute(name)) base += `[${name}="${CSS.escape(element.getAttribute(name))}"]`;
+    }
+    const stableClasses = Array.from(element.classList)
+      .filter(name => !name.includes(':') && !/focus|active|hover|open|closed|selected|disabled|checked/i.test(name))
+      .slice(0, 3).map(name => '.' + CSS.escape(name)).join('');
+    for (const selector of [scope + base, scope + base + presence(element),
+                           scope + base + presence(element) + stableClasses]) {
+      const matches = document.querySelectorAll(selector);
+      if (matches.length === 1 && matches[0] === element) return selector;
+    }
+    return null;
+  };
+  const pool = args.target === 'composer' ? '[contenteditable="true"], textarea' : 'button';
+  const fraction = (value, size) => Math.round(value / Math.max(1, size) * 100) / 100;
+  const candidates = Array.from(document.querySelectorAll(pool)).filter(contract).map((element, index) => {
+    const form = element.closest('form') || element.form;
+    const ancestors = [];
+    let ancestor = element.parentElement;
+    while (ancestor && ancestors.length < 6) {
+      const role = ancestor.getAttribute('role');
+      ancestors.push(ancestor.tagName.toLowerCase() + (role ? `[role=${role}]` : ''));
+      ancestor = ancestor.parentElement;
+    }
+    const rect = element.getBoundingClientRect();
+    return {
+      index, selector: compile(element), tag: element.tagName.toLowerCase(),
+      type: element.getAttribute('type') || '', role: element.getAttribute('role') || '',
+      ariaLabel: (element.getAttribute('aria-label') || '').slice(0, 80),
+      dataAttributes: dataNames(element),
+      classes: Array.from(element.classList).slice(0, 6),
+      formDataAttributes: form ? dataNames(form) : [], ancestry: ancestors.join(' < '),
+      box: {x: fraction(rect.x, innerWidth), y: fraction(rect.y, innerHeight),
+            width: fraction(rect.width, innerWidth), height: fraction(rect.height, innerHeight)},
+      disabled: element.disabled === true || element.getAttribute('aria-disabled') === 'true',
+    };
+  });
+  return {lang: document.documentElement.lang || '', candidates};
+}
+""".replace("__LOCATOR_CONTRACT__", "(" + LOCATOR_CONTRACT_JS + ")")

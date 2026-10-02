@@ -402,6 +402,7 @@ def test_tool_descriptions_enumerate_failure_recovery_actions() -> None:
         "- timeout / echo_timeout:",
         "- rate_limited_timeout:",
         "- session_expired / challenge:",
+        "- locator_unresolved:",
         "- submit_failed / navigation_failed / error:",
     )
     for description in (status_description, result_description):
