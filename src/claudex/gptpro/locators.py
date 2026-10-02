@@ -255,11 +255,16 @@ class LocatorBook:
                     timeout_seconds=min(timeout_seconds, 30),
                 )
                 try:
-                    start = reply.index("{")
-                    selection, _ = json.JSONDecoder().raw_decode(reply[start:])
+                    text = reply.strip()
+                    lines = text.splitlines()
+                    if len(lines) >= 3 and lines[0] in ("```", "```json") and lines[-1] == "```":
+                        text = "\n".join(lines[1:-1]).strip()
+                    selection = json.loads(text)
                 except (ValueError, TypeError, AttributeError) as exc:
-                    raise HealFailed("the healer returned malformed JSON") from exc
-                if not isinstance(selection, dict) or selection.get("status") != "selected":
+                    raise HealFailed("the healer reply was not a single JSON object") from exc
+                if not isinstance(selection, dict):
+                    raise HealFailed("the healer reply was not a single JSON object")
+                if selection.get("status") != "selected":
                     raise HealFailed("the healer found the control absent or uncertain")
                 index = selection.get("candidate")
                 if type(index) is not int or not 0 <= index < len(candidates):
@@ -288,7 +293,7 @@ class GatewayMessagesHealer:
             config = GatewayConfig.load()
         except ConfigError as exc:
             raise HealerUnavailable(f"gateway configuration is unavailable: {exc}") from exc
-        host = "127.0.0.1" if config.host in ("0.0.0.0", "::") else config.host
+        host = {"0.0.0.0": "127.0.0.1", "::": "::1"}.get(config.host, config.host)
         if ":" in host and not host.startswith("["):
             host = f"[{host}]"
         headers = {"anthropic-version": "2023-06-01"}
@@ -299,7 +304,7 @@ class GatewayMessagesHealer:
         payload = {"model": HEALER_MODEL, "max_tokens": 200, "system": system,
                    "messages": [{"role": "user", "content": prompt}]}
         try:
-            async with httpx.AsyncClient(timeout=timeout_seconds) as client:
+            async with httpx.AsyncClient(timeout=timeout_seconds, trust_env=False) as client:
                 response = await client.post(
                     f"http://{host}:{config.port}/v1/messages", headers=headers, json=payload,
                 )

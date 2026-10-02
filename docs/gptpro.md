@@ -302,7 +302,7 @@ The gateway asks `claude-sonnet-5-5` through its own `/v1/messages` endpoint.
 This follows `model_map` like any client request: a `sonnet` mapping routes the
 request to the mapped provider; otherwise it passes through to Anthropic.
 The structure-only candidate description, including tags, roles, UI labels,
-data attributes, and positions, is sent to whichever provider handles that
+data attribute names (not values), and positions, is sent to whichever provider handles that
 request. The gateway must be running and reachable at its configured host and
 port. If it is unreachable, for example during a CLI `claudex-gateway gptpro ask`
 while the gateway is stopped, rediscovery is unavailable and a locator fault

@@ -447,7 +447,9 @@ LOCATOR_CHECK_PROBE_JS = r"""
 }
 """.replace("__LOCATOR_CONTRACT__", "(" + LOCATOR_CONTRACT_JS + ")")
 
-# Candidates expose structure only, never conversation text, input values, or IDs.
+# Candidates expose structural metadata and aria-label UI labels, never conversation text,
+# input values, or element IDs. Element and form data attributes expose names only
+# (excluding data-state), never data-* values.
 LOCATOR_CANDIDATES_PROBE_JS = r"""
 (args) => {
   const contract = __LOCATOR_CONTRACT__(args.target, args.composerSelector);
@@ -488,7 +490,7 @@ LOCATOR_CANDIDATES_PROBE_JS = r"""
       index, selector: compile(element), tag: element.tagName.toLowerCase(),
       type: element.getAttribute('type') || '', role: element.getAttribute('role') || '',
       ariaLabel: (element.getAttribute('aria-label') || '').slice(0, 80),
-      dataAttributes: dataNames(element).map(name => name + '=' + element.getAttribute(name).slice(0, 30)),
+      dataAttributes: dataNames(element),
       classes: Array.from(element.classList).slice(0, 6),
       formDataAttributes: form ? dataNames(form) : [], ancestry: ancestors.join(' < '),
       box: {x: fraction(rect.x, innerWidth), y: fraction(rect.y, innerHeight),

@@ -372,7 +372,8 @@ def test_candidates_privacy_and_form_ownership() -> None:
     asyncio.run(run())
 
 
-@pytest.mark.parametrize("host,expected", [("0.0.0.0", "127.0.0.1"), ("::", "127.0.0.1"), ("::1", "[::1]")])
+@pytest.mark.parametrize("host,expected", [("0.0.0.0", "127.0.0.1"), ("::", "[::1]"),
+                                          ("::1", "[::1]"), ("gateway.test", "gateway.test")])
 def test_gateway_healer_request(
     monkeypatch: pytest.MonkeyPatch, host: str, expected: str,
 ) -> None:
@@ -454,6 +455,121 @@ def test_invalid_book_is_optional(tmp_path: Path, content: str) -> None:
     book = locators.LocatorBook(path)
     assert book.selector_for("ko", "composer") == selectors.COMPOSER_SELECTOR
     assert book.refusal("ko", "composer") is None
+
+
+def test_candidate_data_attribute_values_are_private() -> None:
+    names = ["data-conversation-id", "data-draft", "data-message-id", "data-value"]
+    sentinels = [f"PRIVATE_{index}_SENTINEL_VALUE" for index in range(8)]
+    composer_attributes = " ".join(
+        f'{name}="{value}"' for name, value in zip(names, sentinels[:4])
+    )
+    form_attributes = " ".join(
+        f'{name}="{value}"' for name, value in zip(names, sentinels[4:])
+    )
+    payload = _candidates(
+        f'<form {form_attributes} data-state="PRIVATE_STATE">'
+        f'<textarea {composer_attributes} data-state="PRIVATE_STATE"></textarea></form>'
+    )
+    assert len(payload) == 1
+    serialized = json.dumps(payload)
+    for sentinel in sentinels:
+        assert sentinel not in serialized and sentinel[:10] not in serialized
+    assert "PRIVATE_STATE" not in serialized and "data-state" not in serialized
+    assert payload[0]["dataAttributes"] == names
+    assert payload[0]["formDataAttributes"] == names
+
+
+@pytest.mark.parametrize("reply", [
+    '{"status":"selected","candidate":0}',
+    ' \n {"status":"selected","candidate":0}\t ',
+    '```json\n{"status":"selected","candidate":0}\n```',
+    ' \n```\n{"status":"selected","candidate":0}\n```\n ',
+])
+def test_single_object_reply_accepted(tmp_path: Path, reply: str) -> None:
+    book = locators.LocatorBook(tmp_path / "locators.json", healer=_Healer(reply))
+    assert asyncio.run(_rediscover(book)) == ".recovered"
+    assert not book.path.exists()
+
+
+@pytest.mark.parametrize("reply", [
+    '{"status":"selected","candidate":0}\n{"status":"uncertain"}',
+    '{"status":"selected","candidate":0} trailing prose',
+    'prose {"status":"selected","candidate":0}',
+    '[{"status":"selected","candidate":0}]',
+    '```json\n{"status":"selected","candidate":0}\n{"status":"uncertain"}\n```',
+    '```python\n{"status":"selected","candidate":0}\n```',
+    '```json\n```json\n{"status":"selected","candidate":0}\n```\n```',
+])
+def test_non_single_object_reply_counts(tmp_path: Path, reply: str) -> None:
+    book = locators.LocatorBook(tmp_path / "locators.json", healer=_Healer(reply))
+    with pytest.raises(locators.HealFailed, match="the healer reply was not a single JSON object"):
+        asyncio.run(_rediscover(book))
+    record = json.loads(book.path.read_text())["environments"]["ko"]["composer"]
+    assert record["consecutive_failures"] == 1
+    assert book.refusal("ko", "composer")
+    assert not book.pending
+
+
+@pytest.mark.parametrize("host,bind_host", [("127.0.0.1", "127.0.0.1"), ("::", "::1")])
+def test_gateway_healer_bypasses_environment_proxy(
+    monkeypatch: pytest.MonkeyPatch, host: str, bind_host: str,
+) -> None:
+    from claudex.config import GatewayConfig
+
+    async def run() -> None:
+        gateway_requests = []
+        proxy_requests = []
+
+        async def respond(reader, writer, requests):
+            try:
+                headers = await reader.readuntil(b"\r\n\r\n")
+                requests.append(headers)
+                content_length = next(
+                    int(line.split(b":", 1)[1]) for line in headers.split(b"\r\n")
+                    if line.lower().startswith(b"content-length:")
+                )
+                await reader.readexactly(content_length)
+                body = b'{"content":[{"type":"text","text":"selected"}]}'
+                writer.write(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                    + f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode()
+                    + body
+                )
+                await writer.drain()
+            finally:
+                writer.close()
+                await writer.wait_closed()
+
+        try:
+            gateway = await asyncio.start_server(
+                lambda reader, writer: respond(reader, writer, gateway_requests), bind_host, 0,
+            )
+        except OSError as exc:
+            if bind_host == "::1":
+                pytest.skip(f"IPv6 loopback is unavailable: {exc}")
+            raise
+        async with gateway:
+            proxy = await asyncio.start_server(
+                lambda reader, writer: respond(reader, writer, proxy_requests), "127.0.0.1", 0,
+            )
+            async with proxy:
+                proxy_url = f"http://127.0.0.1:{proxy.sockets[0].getsockname()[1]}"
+                for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+                             "http_proxy", "https_proxy", "all_proxy"):
+                    monkeypatch.setenv(name, proxy_url)
+                for name in ("NO_PROXY", "no_proxy"):
+                    monkeypatch.setenv(name, "")
+                config = GatewayConfig(
+                    host=host, port=gateway.sockets[0].getsockname()[1], local_token="test-local-token",
+                )
+                monkeypatch.setattr(GatewayConfig, "load", lambda: config)
+                assert await locators.GatewayMessagesHealer().complete("system", "prompt", 5) == "selected"
+                assert proxy_requests == []
+                assert len(gateway_requests) == 1
+                assert b"authorization: Bearer test-local-token\r\n" in gateway_requests[0]
+                assert gateway_requests[0].startswith(b"POST /v1/messages HTTP/1.1\r\n")
+
+    asyncio.run(run())
 
 
 def test_environment_key() -> None:
