@@ -383,6 +383,9 @@ async (args) => {
 """
 
 
+# Composers are visible editables in forms outside dialogs, navigation, message
+# units, and search areas. Known composer forms constrain candidates when present;
+# otherwise generic forms qualify. Send buttons belong to the validated composer.
 LOCATOR_CONTRACT_JS = r"""
 (target, composerSelector) => {
   let composerForm = null;
@@ -403,15 +406,25 @@ LOCATOR_CONTRACT_JS = r"""
       element.closest('[role="dialog"], dialog, nav, aside')
     ) return false;
     if (target === 'composer') {
-      return (element.getAttribute('contenteditable') === 'true' ||
-        element.tagName === 'TEXTAREA') && element.closest('form') !== null;
+      if (
+        element.closest('__MESSAGE_UNIT_SELECTOR__, [role="search"], search') ||
+        element.getAttribute('type') === 'search'
+      ) return false;
+      const form = element.closest('form');
+      if (form === null) return false;
+      if (
+        document.querySelector('form[data-chatgpt-composer]') !== null &&
+        !form.matches('form[data-chatgpt-composer]')
+      ) return false;
+      return element.getAttribute('contenteditable') === 'true' ||
+        element.tagName === 'TEXTAREA';
     }
     return target === 'send' && element.tagName === 'BUTTON' &&
       element.type === 'submit' && composerForm !== null &&
       element.form === composerForm;
   };
 }
-"""
+""".replace("__MESSAGE_UNIT_SELECTOR__", USER_MESSAGE_SELECTOR.split("$=", 1)[0] + "]")
 
 LOCATOR_CHECK_PROBE_JS = r"""
 (args) => {

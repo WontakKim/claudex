@@ -132,6 +132,78 @@ def _check(
     return asyncio.run(run())
 
 
+@pytest.mark.parametrize(
+    "html",
+    [
+        '<div data-chatgpt-search-unit-key="t1:user"><form data-edit-message>'
+        '<textarea>old</textarea><button type="submit">Save edit</button>'
+        '</form></div>',
+        '<form role="search"><textarea></textarea></form>',
+        '<div role="search"><form><div contenteditable="true">Search</div>'
+        '</form></div>',
+        '<search><form><textarea></textarea></form></search>',
+        '<form><textarea type="search"></textarea></form>',
+    ],
+    ids=["inline-editor", "search-form", "search-area", "search-element", "search-type"],
+)
+def test_composer_contract_excludes_message_editors_and_search(html: str) -> None:
+    check = _check(html, selector='textarea, [contenteditable="true"]')
+    assert (check.verdict, check.eligible, check.candidates) == ("wait", 0, 0)
+    assert _candidates(html) == []
+    check = _check(html, target="send", selector='button[type="submit"]')
+    assert (check.verdict, check.eligible, check.candidates) == ("wait", 0, 0)
+    assert _candidates(html, target="send") == []
+
+
+def test_composer_contract_prefers_known_composer_form() -> None:
+    html = _EMPTY_FORM + '<form data-other><textarea>Other editor</textarea></form>'
+    check = _check(html)
+    assert (check.verdict, check.eligible, check.candidates) == ("valid", 1, 1)
+    candidates = _candidates(html)
+    assert len(candidates) == 1
+    assert candidates[0]["formDataAttributes"] == ["data-chatgpt-composer"]
+    assert _check(html, selector=candidates[0]["selector"]).verdict == "valid"
+    assert _check(html, selector="form[data-other] textarea").eligible == 0
+
+
+def test_composer_contract_allows_generic_form_after_markup_drift() -> None:
+    html = '<form><div contenteditable="true" role="textbox">Text</div></form>'
+    check = _check(html, selector='form > div[contenteditable="true"][role="textbox"]')
+    assert (check.verdict, check.eligible, check.candidates) == ("valid", 1, 1)
+    candidates = _candidates(html)
+    assert len(candidates) == 1
+    assert _check(html, selector=candidates[0]["selector"]).verdict == "valid"
+
+
+def _candidates(
+    html: str, *, target: locators.LocatorTarget = "composer",
+) -> list[dict[str, Any]]:
+    async def run() -> list[dict[str, Any]]:
+        async with async_playwright() as playwright:
+            executable = Path(playwright.chromium.executable_path)
+            if not executable.is_file():
+                options = sorted((Path.home() / "Library/Caches/ms-playwright").glob(
+                    "chromium-*/chrome-mac*/Google Chrome for Testing.app/"
+                    "Contents/MacOS/Google Chrome for Testing"
+                ))
+                if not options:
+                    pytest.skip("No local Chromium executable available")
+                executable = options[-1]
+            browser = await playwright.chromium.launch(
+                executable_path=str(executable), headless=True,
+            )
+            try:
+                page = await browser.new_page()
+                await page.set_content(html)
+                result = await page.evaluate(selectors.LOCATOR_CANDIDATES_PROBE_JS, {
+                    "target": target, "composerSelector": selectors.COMPOSER_SELECTOR,
+                })
+                return result["candidates"]
+            finally:
+                await browser.close()
+    return asyncio.run(run())
+
+
 class _Healer:
     def __init__(self, reply: str | Exception = '{"status":"selected","candidate":0}') -> None:
         self.reply = reply
