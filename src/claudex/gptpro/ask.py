@@ -32,6 +32,7 @@ from claudex.gptpro.conversation import (
     is_conversation_stream_url,
     is_trusted_origin_url,
 )
+from claudex.gptpro.locators import LocatorCheck, check_locator
 from claudex.gptpro.retry import (
     RetryAction,
     classify_backend_response,
@@ -73,6 +74,8 @@ CHALLENGE_GRACE_SECONDS = 10.0
 # Browser navigation and composer budgets come from gptpro.browser.
 COMPOSER_SLICE_SECONDS = 2.0
 SEND_READY_TIMEOUT_SECONDS = 30.0
+# Allow hydration and re-renders to settle before treating a locator fault as drift.
+LOCATOR_SETTLE_SECONDS = 4.0
 PRE_SUBMIT_STABILITY_TIMEOUT_SECONDS = 10.0
 PRE_SUBMIT_POLL_INTERVAL_SECONDS = 0.2
 PRE_SUBMIT_STABLE_TICKS = 3
@@ -99,6 +102,7 @@ FailureClassification = Literal[
     "challenge",
     "rate_limited_timeout",
     "navigation_failed",
+    "locator_unresolved",
     "submit_failed",
     "echo_timeout",
     "no_raw_turn",
@@ -685,6 +689,8 @@ class _AskExecution:
         # One bounded grace window per invocation: markers that vanish and
         # later reappear do not restart the window.
         challenge_grace_deadline: float | None = None
+        check: LocatorCheck | None = None
+        last_error: Exception | None = None
         while _monotonic() < end:
             await self._process_network_actions()
             self._check_authenticated()
@@ -697,14 +703,25 @@ class _AskExecution:
                         timeout=self._timeout_ms(slice_seconds),
                     )
                 )
-                await self._process_network_actions()
-                return
             except _DeadlineExpired:
                 raise
-            except Exception:
-                pass
+            except Exception as exc:
+                last_error = exc
+            try:
+                check = await self._await_page_operation(
+                    check_locator(
+                        self.page.evaluate, "composer", COMPOSER_SELECTOR,
+                        composer_selector=COMPOSER_SELECTOR,
+                    )
+                )
+            except _DeadlineExpired:
+                raise
+            except Exception as exc:
+                last_error = exc
             await self._process_network_actions()
             self._check_authenticated()
+            if check is not None and check.verdict == "valid":
+                return
             markers = await self._probe_challenge()
             if markers:
                 if challenge_grace_deadline is None:
@@ -719,9 +736,18 @@ class _AskExecution:
             if _monotonic() < end:
                 await self._pause(min(POLL_INTERVAL_SECONDS, end - _monotonic()))
         self._ensure_deadline()
-        raise GptProAskError(
-            "navigation_failed", "the ChatGPT composer did not become visible"
+        if check is not None and check.verdict == "fault":
+            raise GptProAskError(
+                "locator_unresolved", "the ChatGPT composer locator matches no "
+                f"usable composer ({check.describe()})"
+            ) from last_error
+        detail = (
+            check.describe() if check is not None
+            else "the locator check did not complete"
         )
+        raise GptProAskError(
+            "navigation_failed", f"the ChatGPT composer did not become visible ({detail})"
+        ) from last_error
 
     async def _attach_files(self) -> None:
         self._ensure_deadline()
@@ -894,6 +920,8 @@ class _AskExecution:
     async def _wait_for_send_ready(self) -> None:
         end = min(self.deadline, _monotonic() + SEND_READY_TIMEOUT_SECONDS)
         missing_attachments: list[str] = []
+        not_ready_since: float | None = None
+        check: LocatorCheck | None = None
         while _monotonic() < end:
             await self._process_network_actions()
             try:
@@ -912,6 +940,31 @@ class _AskExecution:
             missing_attachments = await self._missing_ready_attachments()
             if ready is True and not missing_attachments:
                 return
+            if ready is True:
+                not_ready_since = None
+            else:
+                if not_ready_since is None:
+                    not_ready_since = _monotonic()
+                if _monotonic() - not_ready_since >= LOCATOR_SETTLE_SECONDS:
+                    try:
+                        check = await self._await_page_operation(
+                            check_locator(
+                                self.page.evaluate, "send", SEND_BUTTON_SELECTOR,
+                                composer_selector=COMPOSER_SELECTOR,
+                            )
+                        )
+                    except _DeadlineExpired:
+                        raise
+                    except Exception as exc:
+                        raise GptProAskError(
+                            "submit_failed",
+                            "could not inspect the ChatGPT send button locator"
+                        ) from exc
+                    if check.verdict == "fault" and not missing_attachments:
+                        raise GptProAskError(
+                            "locator_unresolved", "the ChatGPT send button locator matches no "
+                            f"usable send button ({check.describe()})"
+                        )
             await self._pause(min(POLL_INTERVAL_SECONDS, end - _monotonic()))
         self._ensure_deadline()
         if missing_attachments:
@@ -921,6 +974,7 @@ class _AskExecution:
             )
         raise GptProAskError(
             "submit_failed", "the ChatGPT send button did not become ready"
+            + (f" ({check.describe()})" if check is not None else "")
         )
 
     async def _click_send(self) -> None:

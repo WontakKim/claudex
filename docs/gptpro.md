@@ -274,6 +274,11 @@ erasing the original failure. `recovery` is `not_attempted`, `polling`,
 observation was not made, not that
 ChatGPT definitely did nothing.
 
+`locator_unresolved` occurs before submission when the composer or send button
+cannot be located: nothing was sent, so retrying is safe. Repeated failures need
+a gateway update. The gateway locates these controls by structure, not label
+text, because accessible labels follow the UI language.
+
 If a failed ask retains a `thread_ref` and `nonce_marker`, call
 `recover_gpt_pro` with its `ask_id`. After a gateway restart, use the saved
 `thread_ref` and `nonce_marker` instead. Poll the new recovery job; a failure

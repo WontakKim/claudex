@@ -48,6 +48,8 @@ _GPTPRO_FAILURE_ACTIONS_DESCRIPTION = (
     "- rate_limited_timeout: wait, then use read-only recovery if submitted.\n"
     "- session_expired / challenge: run claudex-gateway gptpro login; "
     "recover a known turn rather than resubmitting blindly.\n"
+    "- locator_unresolved: composer or send button was not found before submission; "
+    "nothing was sent, retrying is safe, and repeated failures need a gateway update.\n"
     "- submit_failed / navigation_failed / error: inspect evidence; recover if "
     "submission may have happened.\n"
     "Use recover_gpt_pro with a failed ask_id, or saved thread_ref and nonce_marker "

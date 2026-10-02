@@ -389,3 +389,22 @@ def test_legacy_dom_markup_is_not_selected() -> None:
     assert _select(legacy, selectors.STOP_BUTTON_SELECTOR) == []
     assert _select(legacy, selectors.USER_MESSAGE_SELECTOR) == []
     assert _select(legacy, selectors.ASSISTANT_MESSAGE_SELECTOR) == []
+
+
+@pytest.mark.parametrize(
+    "labels", [("Ask ChatGPT", "Send"), ("ChatGPT에게 물어보세요", "보내기"), (None, None)],
+)
+def test_composer_and_send_selectors_ignore_localized_labels(
+    labels: tuple[str | None, str | None],
+) -> None:
+    submit = _send_button()
+    form = _composer_form(submit)
+    composer = form.children[1]
+    for element, label in zip((composer, submit), labels):
+        if label is None:
+            element.attributes.pop("aria-label")
+        else:
+            element.attributes["aria-label"] = label
+    dom = _Element("div", None, form)
+    assert _select(dom, selectors.COMPOSER_SELECTOR) == [composer]
+    assert _select(dom, selectors.SEND_BUTTON_SELECTOR) == [submit]

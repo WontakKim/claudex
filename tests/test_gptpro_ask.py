@@ -266,6 +266,11 @@ class _FakePage:
             and expression == selectors.TOP_LEVEL_USER_IDS_PROBE_JS
         ):
             await asyncio.Event().wait()
+        if expression == selectors.LOCATOR_CHECK_PROBE_JS:
+            return {
+                "invalidSelector": False, "matched": 1, "eligible": 1,
+                "candidates": 1, "lang": "en-US",
+            }
         if expression == selectors.CHALLENGE_DOM_PROBE_JS:
             return []
         if expression == selectors.TOP_LEVEL_USER_IDS_PROBE_JS:
@@ -1030,6 +1035,10 @@ def _challenge_interstitial_page(
     async def probe_while_challenged(
         expression: str, argument: Any = None
     ) -> Any:
+        if expression == selectors.LOCATOR_CHECK_PROBE_JS and (
+            probes["remaining"] is None or probes["remaining"] > 0
+        ):
+            return {"matched": 0, "eligible": 0, "candidates": 0}
         if expression == selectors.CHALLENGE_DOM_PROBE_JS and (
             probes["remaining"] is None or probes["remaining"] > 0
         ):
@@ -1951,3 +1960,65 @@ def test_direct_ask_without_file_links_makes_no_file_requests(
         conversation_id=_CONVERSATION_ID,
     )
     assert getattr(outcome, "files", None) == ()
+
+
+@pytest.mark.parametrize(
+    ("candidates", "expected"), [(1, "locator_unresolved"), (0, "navigation_failed")],
+)
+def test_composer_locator_failure_diagnostic(
+    monkeypatch: pytest.MonkeyPatch, candidates: int, expected: str,
+) -> None:
+    _install_clock(monkeypatch)
+    page = _FakePage()
+    last_error = RuntimeError("composer wait timed out")
+    original = page.evaluate
+
+    async def wait(selector: str, *, state: str, timeout: int) -> object:
+        raise last_error
+
+    async def evaluate(expression: str, argument: Any = None) -> Any:
+        if expression == selectors.LOCATOR_CHECK_PROBE_JS:
+            return {
+                "matched": 0, "eligible": 0, "candidates": candidates, "lang": "ko-KR",
+            }
+        return await original(expression, argument)
+
+    page.wait_for_selector = wait  # type: ignore[method-assign]
+    page.evaluate = evaluate  # type: ignore[method-assign]
+    with pytest.raises(ask.GptProAskError) as raised:
+        _run(page)
+    assert raised.value.failure == expected
+    assert raised.value.evidence.failure_stage == "composer"
+    assert raised.value.evidence.submission == "not_attempted"
+    assert f"page candidates={candidates}, lang=ko-KR" in str(raised.value)
+    assert raised.value.__cause__ is last_error
+
+
+@pytest.mark.parametrize("fault", [True, False])
+def test_send_locator_fault_or_disabled_button(
+    monkeypatch: pytest.MonkeyPatch, fault: bool,
+) -> None:
+    _install_clock(monkeypatch)
+    page = _FakePage()
+    original = page.evaluate
+
+    async def evaluate(expression: str, argument: Any = None) -> Any:
+        if expression == selectors.SEND_BUTTON_READY_PROBE_JS:
+            return False
+        if (
+            expression == selectors.LOCATOR_CHECK_PROBE_JS
+            and argument["target"] == "send"
+        ):
+            return {
+                "matched": 0 if fault else 1, "eligible": 0 if fault else 1,
+                "candidates": 1, "lang": "ko-KR",
+            }
+        return await original(expression, argument)
+
+    page.evaluate = evaluate  # type: ignore[method-assign]
+    with pytest.raises(ask.GptProAskError) as raised:
+        _run(page)
+    assert raised.value.failure == ("locator_unresolved" if fault else "submit_failed")
+    assert "page candidates=1, lang=ko-KR" in str(raised.value)
+    assert raised.value.evidence.submission == "not_attempted"
+    assert page.click_count == 0

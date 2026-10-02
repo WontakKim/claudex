@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
+# Accessible names are localized; composer and send locators match structure only.
 COMPOSER_SELECTOR = (
     'form[data-chatgpt-composer] div.ProseMirror[contenteditable="true"]'
-    '[role="textbox"][aria-label="Ask ChatGPT"]'
+    '[role="textbox"]'
 )
-SEND_BUTTON_SELECTOR = (
-    'form[data-chatgpt-composer] button[type="submit"][aria-label="Send"]'
-)
+SEND_BUTTON_SELECTOR = 'form[data-chatgpt-composer] button[type="submit"]'
 STOP_BUTTON_SELECTOR = 'form[data-chatgpt-composer] button[aria-label="Stop"]'
 # Message units carry a search-unit key whose prefix ("fallback-turn-N") is
 # index-based and changes between renders; only the ":user"/":assistant"
@@ -376,3 +375,55 @@ async (args) => {
   }
 }
 """
+
+
+LOCATOR_CONTRACT_JS = r"""
+(target, composerSelector) => {
+  let composerForm = null;
+  if (target === 'send') {
+    try {
+      const composers = document.querySelectorAll(composerSelector);
+      if (composers.length === 1) composerForm = composers[0].closest('form');
+    } catch (_) {
+      // An invalid composer selector cannot establish form ownership.
+    }
+  }
+  return (element) => {
+    const style = getComputedStyle(element);
+    const rect = element.getBoundingClientRect();
+    if (
+      style.display === 'none' || style.visibility === 'hidden' ||
+      Number(style.opacity) === 0 || rect.width <= 0 || rect.height <= 0 ||
+      element.closest('[role="dialog"], dialog, nav, aside')
+    ) return false;
+    if (target === 'composer') {
+      return (element.getAttribute('contenteditable') === 'true' ||
+        element.tagName === 'TEXTAREA') && element.closest('form') !== null;
+    }
+    return target === 'send' && element.tagName === 'BUTTON' &&
+      element.type === 'submit' && composerForm !== null &&
+      element.form === composerForm;
+  };
+}
+"""
+
+LOCATOR_CHECK_PROBE_JS = r"""
+(args) => {
+  const contract = __LOCATOR_CONTRACT__(args.target, args.composerSelector);
+  let invalidSelector = false;
+  let matches = [];
+  try {
+    matches = Array.from(document.querySelectorAll(args.selector));
+  } catch (_) {
+    invalidSelector = true;
+  }
+  const pool = args.target === 'composer' ? '[contenteditable="true"], textarea' : 'button';
+  return {
+    invalidSelector,
+    matched: matches.length,
+    eligible: matches.filter(contract).length,
+    candidates: Array.from(document.querySelectorAll(pool)).filter(contract).length,
+    lang: document.documentElement.lang || '',
+  };
+}
+""".replace("__LOCATOR_CONTRACT__", "(" + LOCATOR_CONTRACT_JS + ")")
