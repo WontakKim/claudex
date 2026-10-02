@@ -803,3 +803,27 @@ def test_deterministic_reuse_failure_and_abandon_do_not_count(tmp_path):
     assert not book.path.exists()
     book.record_success("ko", "composer", ".restored", None)
     assert book.selector_for("ko", "composer") == ".restored"
+
+
+@pytest.mark.parametrize("owned", [False, True])
+@pytest.mark.parametrize("destination", ["ko", "unknown"])
+def test_success_transfer_checks_attempt_ownership(tmp_path, owned, destination):
+    book = locators.LocatorBook(tmp_path / "locators.json", healer=_Healer())
+    async def run():
+        result = await book.rediscover(_evaluate(), "composer", "",
+            failed_selector=selectors.COMPOSER_SELECTOR,
+            composer_selector=selectors.COMPOSER_SELECTOR,
+            deadline=book.monotonic() + 20)
+        assert result.environment == "unknown"
+        book.record_success(destination, "composer", result.selector,
+                            result.attempt_id if owned else "stale",
+                            attempt_env=result.environment)
+        if owned:
+            assert not book.pending
+            assert book.selector_for(destination, "composer") == result.selector
+            if destination != "unknown":
+                assert book._record("unknown", "composer") == {}
+        else:
+            assert book.pending[("unknown", "composer")] == result
+            assert not book.path.exists()
+    asyncio.run(run())

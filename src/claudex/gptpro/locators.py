@@ -132,6 +132,7 @@ def environment_key(lang: str) -> str:
 class RediscoveredLocator:
     selector: str
     attempt_id: str | None = None
+    environment: str = "unknown"
 
 
 @dataclass
@@ -207,8 +208,11 @@ class LocatorBook:
 
     def record_success(
         self, env: str, target: str, selector: str, attempt_id: str | None = None,
+        *, attempt_env: str | None = None,
     ) -> None:
-        if attempt_id is not None and not self.abandon(env, target, attempt_id):
+        if attempt_id is not None and not self.abandon(
+            env if attempt_env is None else attempt_env, target, attempt_id,
+        ):
             return
         prior = self._record(env, target)
         if prior.get("selector") == selector and prior.get("consecutive_failures", 0) == 0:
@@ -287,7 +291,7 @@ class LocatorBook:
                 )
                 remaining()
                 if check.verdict == "valid":
-                    return RediscoveredLocator(selector)
+                    return RediscoveredLocator(selector, environment=key[0])
             refusal = self.refusal(env, target)
             if refusal:
                 raise HealingRefused(refusal)
@@ -341,7 +345,7 @@ class LocatorBook:
                 except OSError as recording_error:
                     logger.warning("Could not record optional locator failure: %s", recording_error)
                 raise
-            result = RediscoveredLocator(selector, uuid4().hex)
+            result = RediscoveredLocator(selector, uuid4().hex, key[0])
             self.pending[key] = result
             return result
 

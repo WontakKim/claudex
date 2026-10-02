@@ -717,6 +717,13 @@ class _AskExecution:
         self, target: locators.LocatorTarget, check: LocatorCheck, end: float,
     ) -> None:
         end = min(self.deadline, end)
+        self._ensure_deadline()
+        if _monotonic() >= end:
+            self._settle_rediscovered(target, "abandon")
+            raise GptProAskError(
+                "locator_unresolved",
+                f"rediscovery did not finish within the {target} wait budget",
+            )
         if target in self.rediscovered_targets:
             self._settle_rediscovered(
                 target, "failure", "the rediscovered locator failed the contract again",
@@ -761,10 +768,13 @@ class _AskExecution:
         result = self.unproven_locators.pop(target, None)
         if result is None:
             return
-        env = self.locator_environment or "unknown"
+        env = result.environment
         try:
             if outcome == "success":
-                self.locator_book.record_success(env, target, result.selector, result.attempt_id)
+                self.locator_book.record_success(
+                    self.locator_environment or env, target, result.selector,
+                    result.attempt_id, attempt_env=env,
+                )
             elif outcome == "failure":
                 self.locator_book.record_failure(env, target, reason, result.attempt_id)
             else:
@@ -923,6 +933,7 @@ class _AskExecution:
         selector = self._selector("composer")
         check = await self._check_locator("composer", selector)
         if check.verdict != "valid":
+            self._ensure_deadline()
             self._settle_rediscovered(
                 "composer", "failure" if check.verdict == "fault" else "abandon",
                 "the rediscovered locator failed the contract again",
@@ -939,6 +950,7 @@ class _AskExecution:
         except _DeadlineExpired:
             raise
         except Exception as exc:
+            self._ensure_deadline()
             self._settle_rediscovered("composer", "failure", "could not fill the ChatGPT composer")
             raise GptProAskError(
                 "submit_failed", "could not fill the ChatGPT composer"
@@ -966,6 +978,7 @@ class _AskExecution:
         if not isinstance(readback, str) or normalize(readback) != normalize(
             self.prompt
         ):
+            self._ensure_deadline()
             self._settle_rediscovered(
                 "composer", "failure", "the ChatGPT composer did not retain the prompt",
             )
@@ -1126,6 +1139,7 @@ class _AskExecution:
         selector = self._selector("send")
         check = await self._check_locator("send", selector)
         if check.verdict != "valid":
+            self._ensure_deadline()
             self._settle_rediscovered(
                 "send", "failure" if check.verdict == "fault" else "abandon",
                 "the rediscovered locator failed the contract again",
@@ -1148,6 +1162,7 @@ class _AskExecution:
         except _DeadlineExpired:
             raise
         except Exception as exc:
+            self._ensure_deadline()
             self._settle_rediscovered(
                 "send", "abandon" if isinstance(exc, (TimeoutError, PlaywrightTimeoutError)) else "failure",
                 "could not click the ChatGPT send button",
