@@ -11,6 +11,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
+from uuid import uuid4
 
 import httpx
 
@@ -127,12 +128,19 @@ def environment_key(lang: str) -> str:
     return lang or "unknown"
 
 
+@dataclass(frozen=True)
+class RediscoveredLocator:
+    selector: str
+    attempt_id: str | None = None
+
+
 @dataclass
 class LocatorBook:
     path: Path
     healer: Any = None
     clock: Callable[[], float] = time.time
-    pending: dict[tuple[str, str], str] = field(default_factory=dict, init=False)
+    monotonic: Callable[[], float] = time.monotonic
+    pending: dict[tuple[str, str], RediscoveredLocator] = field(default_factory=dict, init=False)
     _locks: dict[tuple[str, str], asyncio.Lock] = field(default_factory=dict, init=False)
 
     def _load(self) -> dict[str, dict[str, dict[str, Any]]]:
@@ -189,8 +197,19 @@ class LocatorBook:
             return "locator rediscovery is waiting for its 60-second retry backoff"
         return None
 
-    def record_success(self, env: str, target: str, selector: str) -> None:
-        self.pending.pop((environment_key(env), target), None)
+    def abandon(self, env: str, target: str, attempt_id: str | None) -> bool:
+        key = (environment_key(env), target)
+        pending = self.pending.get(key)
+        if attempt_id is None or pending is None or pending.attempt_id != attempt_id:
+            return False
+        del self.pending[key]
+        return True
+
+    def record_success(
+        self, env: str, target: str, selector: str, attempt_id: str | None = None,
+    ) -> None:
+        if attempt_id is not None and not self.abandon(env, target, attempt_id):
+            return
         prior = self._record(env, target)
         if prior.get("selector") == selector and prior.get("consecutive_failures", 0) == 0:
             return
@@ -201,8 +220,13 @@ class LocatorBook:
             "last_failure": None,
         })
 
-    def record_failure(self, env: str, target: str, reason: str) -> None:
-        self.pending.pop((environment_key(env), target), None)
+    def record_failure(
+        self, env: str, target: str, reason: str, attempt_id: str | None,
+    ) -> None:
+        if self.abandon(env, target, attempt_id):
+            self._record_failure(env, target, reason)
+
+    def _record_failure(self, env: str, target: str, reason: str) -> None:
         prior = self._record(env, target)
         failures = prior.get("consecutive_failures", 0) + 1
         now = self.clock()
@@ -219,13 +243,40 @@ class LocatorBook:
 
     async def rediscover(
         self, evaluate: Callable[..., Awaitable[Any]], target: LocatorTarget, env: str,
-        *, failed_selector: str, composer_selector: str, timeout_seconds: float,
-    ) -> str:
+        *, failed_selector: str, composer_selector: str, deadline: float,
+    ) -> RediscoveredLocator:
+        def ensure_budget() -> float:
+            remaining = deadline - self.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("locator rediscovery deadline expired")
+            task = asyncio.current_task()
+            if task is not None and task.cancelling():
+                raise asyncio.CancelledError
+            return remaining
+
+        async with asyncio.timeout(ensure_budget()):
+            return await self._rediscover(
+                evaluate, target, env, failed_selector=failed_selector,
+                composer_selector=composer_selector, remaining=ensure_budget,
+            )
+
+    async def _rediscover(
+        self, evaluate: Callable[..., Awaitable[Any]], target: LocatorTarget, env: str,
+        *, failed_selector: str, composer_selector: str, remaining: Callable[[], float],
+    ) -> RediscoveredLocator:
         key = (environment_key(env), target)
         async with self._locks.setdefault(key, asyncio.Lock()):
-            alternatives = [
-                self.pending.get(key), self.selector_for(env, target), SEED_SELECTORS[target],
-            ]
+            remaining()
+            pending = self.pending.get(key)
+            if pending is not None:
+                check = await check_locator(
+                    evaluate, target, pending.selector, composer_selector=composer_selector,
+                )
+                remaining()
+                if check.verdict == "valid":
+                    return pending
+                raise HealingRefused("a rediscovered locator is awaiting first-use proof")
+            alternatives = [self.selector_for(env, target), SEED_SELECTORS[target]]
             seen = {failed_selector, None}
             for selector in alternatives:
                 if selector in seen:
@@ -234,12 +285,13 @@ class LocatorBook:
                 check = await check_locator(
                     evaluate, target, selector, composer_selector=composer_selector,
                 )
+                remaining()
                 if check.verdict == "valid":
-                    return selector
+                    return RediscoveredLocator(selector)
             refusal = self.refusal(env, target)
             if refusal:
                 raise HealingRefused(refusal)
-            if timeout_seconds < MINIMUM_REDISCOVERY_SECONDS:
+            if remaining() < MINIMUM_REDISCOVERY_SECONDS:
                 raise HealingRefused("less than 10 seconds remain for locator rediscovery")
             if self.healer is None:
                 raise HealerUnavailable("the locator healer is not configured")
@@ -247,13 +299,15 @@ class LocatorBook:
                 probe = await evaluate(LOCATOR_CANDIDATES_PROBE_JS, {
                     "target": target, "composerSelector": composer_selector,
                 })
+                remaining()
                 candidates = probe.get("candidates") if isinstance(probe, Mapping) else None
                 if not isinstance(candidates, list) or not candidates:
                     raise HealFailed("no contract-satisfying candidates were found")
                 reply = await self.healer.complete(
                     _SYSTEM_PROMPT, _TARGET_DESCRIPTIONS[target] + "\n" + json.dumps(candidates),
-                    timeout_seconds=min(timeout_seconds, 30),
+                    timeout_seconds=min(remaining(), 30),
                 )
+                remaining()
                 try:
                     text = reply.strip()
                     lines = text.splitlines()
@@ -275,16 +329,21 @@ class LocatorBook:
                 check = await check_locator(
                     evaluate, target, selector, composer_selector=composer_selector,
                 )
+                remaining()
+                if check.verdict == "wait":
+                    raise HealingRefused("the selected candidate could not be verified")
                 if check.verdict != "valid":
                     raise HealFailed("the selected candidate failed the fresh locator contract check")
             except HealFailed as exc:
+                remaining()
                 try:
-                    self.record_failure(env, target, str(exc))
+                    self._record_failure(env, target, str(exc))
                 except OSError as recording_error:
                     logger.warning("Could not record optional locator failure: %s", recording_error)
                 raise
-            self.pending[key] = selector
-            return selector
+            result = RediscoveredLocator(selector, uuid4().hex)
+            self.pending[key] = result
+            return result
 
 
 class GatewayMessagesHealer:

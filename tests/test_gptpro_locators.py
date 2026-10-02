@@ -230,7 +230,13 @@ def _rediscover(book, **kwargs):
     return book.rediscover(kwargs.pop("evaluate", _evaluate()), "composer", "ko",
                           failed_selector=selectors.COMPOSER_SELECTOR,
                           composer_selector=selectors.COMPOSER_SELECTOR,
-                          timeout_seconds=kwargs.pop("timeout_seconds", 20), **kwargs)
+                          deadline=book.monotonic() + kwargs.pop("timeout_seconds", 20), **kwargs)
+
+
+def _record_test_failure(book, reason):
+    attempt = locators.RediscoveredLocator(".candidate", "test-attempt")
+    book.pending[("ko", "composer")] = attempt
+    book.record_failure("ko", "composer", reason, attempt.attempt_id)
 
 
 def test_book_persistence_breaker_and_success(tmp_path: Path) -> None:
@@ -238,21 +244,21 @@ def test_book_persistence_breaker_and_success(tmp_path: Path) -> None:
     path = tmp_path / "locators.json"
     book = locators.LocatorBook(path, clock=lambda: now[0])
     assert book.selector_for("ko", "composer") == selectors.COMPOSER_SELECTOR
-    book.record_failure("ko", "composer", "absent")
+    _record_test_failure(book, "absent")
     assert book.refusal("ko", "composer")
     now[0] += 59
     assert book.refusal("ko", "composer")
     now[0] += 1
     assert book.refusal("ko", "composer") is None
-    book.record_failure("ko", "composer", "absent")
+    _record_test_failure(book, "absent")
     now[0] += 60
-    book.record_failure("ko", "composer", "absent")
+    _record_test_failure(book, "absent")
     assert book.refusal("ko", "composer")
     now[0] += 3599
     assert book.refusal("ko", "composer")
     now[0] += 1
     assert book.refusal("ko", "composer") is None
-    book.record_failure("ko", "composer", "half-open failed")
+    _record_test_failure(book, "half-open failed")
     assert book.refusal("ko", "composer")
     book.record_success("ko", "composer", ".recovered")
     restored = locators.LocatorBook(path, clock=lambda: now[0])
@@ -283,9 +289,11 @@ def test_rediscovery_pending_and_concurrency(tmp_path: Path) -> None:
     book = locators.LocatorBook(tmp_path / "locators.json", healer=healer)
     async def run():
         return await asyncio.gather(_rediscover(book), _rediscover(book))
-    assert asyncio.run(run()) == [".recovered", ".recovered"]
+    results = asyncio.run(run())
+    assert [result.selector for result in results] == [".recovered", ".recovered"]
+    assert results[0].attempt_id == results[1].attempt_id
     assert healer.calls == 1
-    assert book.pending[("ko", "composer")] == ".recovered"
+    assert book.pending[("ko", "composer")] == results[0]
     assert not book.path.exists()
 
 
@@ -319,7 +327,7 @@ def test_unavailable_and_short_budget_do_not_count(tmp_path: Path) -> None:
     with pytest.raises(locators.HealerUnavailable):
         asyncio.run(_rediscover(book))
     assert not book.path.exists()
-    book.record_failure("ko", "composer", "bad")
+    _record_test_failure(book, "bad")
     with pytest.raises(locators.HealingRefused):
         asyncio.run(_rediscover(book))
     assert healer.calls == 1
@@ -333,8 +341,8 @@ def test_seed_reuse(tmp_path: Path) -> None:
         assert expression == selectors.LOCATOR_CHECK_PROBE_JS
         return {"matched": 1, "eligible": 1}
     result = asyncio.run(book.rediscover(evaluate, "composer", "ko", failed_selector=".broken",
-                                        composer_selector=".broken", timeout_seconds=20))
-    assert result == selectors.COMPOSER_SELECTOR and healer.calls == 0
+                                        composer_selector=".broken", deadline=book.monotonic() + 20))
+    assert result.selector == selectors.COMPOSER_SELECTOR and result.attempt_id is None and healer.calls == 0
 
 
 @pytest.mark.parametrize("result", [{"matched": "1", "eligible": None, "candidates": -1, "lang": 5},
@@ -435,8 +443,8 @@ def test_success_same_selector_is_no_write(
     def unexpected_write(*args):
         pytest.fail("identical proven selectors must not be written again")
     monkeypatch.setattr(locators, "write_private_json_atomic", unexpected_write)
-    book.pending[("ko", "composer")] = ".saved"
-    book.record_success("ko", "composer", ".saved")
+    book.pending[("ko", "composer")] = locators.RediscoveredLocator(".saved", "attempt")
+    book.record_success("ko", "composer", ".saved", "attempt")
     assert not book.pending
 
 
@@ -487,7 +495,7 @@ def test_candidate_data_attribute_values_are_private() -> None:
 ])
 def test_single_object_reply_accepted(tmp_path: Path, reply: str) -> None:
     book = locators.LocatorBook(tmp_path / "locators.json", healer=_Healer(reply))
-    assert asyncio.run(_rediscover(book)) == ".recovered"
+    assert asyncio.run(_rediscover(book)).selector == ".recovered"
     assert not book.path.exists()
 
 
@@ -581,7 +589,7 @@ def test_deleting_book_clears_breaker_and_selector_without_restart(tmp_path: Pat
     book = locators.LocatorBook(tmp_path / "locators.json", clock=lambda: 100.0)
     book.record_success("ko", "composer", ".saved")
     for _ in range(locators.FAILURE_THRESHOLD):
-        book.record_failure("ko", "composer", "not found")
+        _record_test_failure(book, "not found")
     assert book.refusal("ko", "composer")
     book.path.unlink()
     assert book.refusal("ko", "composer") is None
@@ -604,8 +612,159 @@ def test_store_rereads_before_merging(tmp_path: Path) -> None:
 def test_corrupt_file_replaces_prior_state_on_access(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
     book = locators.LocatorBook(tmp_path / "locators.json")
     book.record_success("ko", "composer", ".saved")
-    book.record_failure("ko", "composer", "not found")
+    _record_test_failure(book, "not found")
     book.path.write_text("invalid JSON")
     assert book.refusal("ko", "composer") is None
     assert book.selector_for("ko", "composer") == selectors.COMPOSER_SELECTOR
     assert "Could not read optional locator book" in caplog.text
+
+
+@pytest.mark.parametrize("blocked", ["lock", "probe", "healer", "fresh_check", "late_reply"])
+def test_rediscovery_absolute_deadline(tmp_path, monkeypatch, blocked):
+    monkeypatch.setattr(locators, "MINIMUM_REDISCOVERY_SECONDS", 0)
+    cancelled = []
+    class SlowHealer:
+        async def complete(self, *args, **kwargs):
+            if blocked in ("probe", "fresh_check"):
+                return '{"status":"selected","candidate":0}'
+            try:
+                await asyncio.sleep(1)
+            except asyncio.CancelledError:
+                cancelled.append(True)
+                if blocked == "late_reply":
+                    return "malformed late reply"
+                raise
+    book = locators.LocatorBook(tmp_path / "locators.json", healer=SlowHealer())
+    original = _evaluate()
+    async def evaluate(expression, args):
+        if ((blocked == "probe" and expression == selectors.LOCATOR_CANDIDATES_PROBE_JS)
+                or (blocked == "fresh_check" and expression == selectors.LOCATOR_CHECK_PROBE_JS)):
+            await asyncio.sleep(1)
+        return await original(expression, args)
+    async def run():
+        lock = book._locks.setdefault(("ko", "composer"), asyncio.Lock())
+        if blocked == "lock":
+            await lock.acquire()
+        start = asyncio.get_running_loop().time()
+        try:
+            with pytest.raises(TimeoutError):
+                await book.rediscover(evaluate, "composer", "ko",
+                    failed_selector=selectors.COMPOSER_SELECTOR,
+                    composer_selector=selectors.COMPOSER_SELECTOR, deadline=start + .05)
+            assert asyncio.get_running_loop().time() - start < .15
+        finally:
+            if blocked == "lock":
+                lock.release()
+    asyncio.run(run())
+    assert not book.pending and not book.path.exists()
+    assert bool(cancelled) == (blocked in ("healer", "late_reply"))
+
+
+def test_pending_attempt_ownership(tmp_path):
+    healer = _Healer()
+    book = locators.LocatorBook(tmp_path / "locators.json", healer=healer)
+    async def run():
+        first = await _rediscover(book)
+        with pytest.raises(locators.HealingRefused, match="awaiting first-use proof"):
+            await _rediscover(book, evaluate=_evaluate(valid=False))
+        joined = await _rediscover(book)
+        assert first.attempt_id == joined.attempt_id
+        book.record_failure("ko", "composer", "bad", first.attempt_id)
+        book.record_failure("ko", "composer", "bad twice", joined.attempt_id)
+        assert book._record("ko", "composer")["consecutive_failures"] == 1
+        book.record_success("ko", "composer", ".recovered", first.attempt_id)
+        assert book.refusal("ko", "composer")
+        newer = locators.RediscoveredLocator(".new", "new-attempt")
+        book.pending[("ko", "composer")] = newer
+        book.abandon("ko", "composer", first.attempt_id)
+        book.record_failure("ko", "composer", "late failure", first.attempt_id)
+        assert book.pending[("ko", "composer")] == newer
+        book.abandon("ko", "composer", newer.attempt_id)
+        assert not book.pending
+    asyncio.run(run())
+    assert healer.calls == 1
+
+
+def test_deadline_remaining_recomputed_after_lock(tmp_path, monkeypatch):
+    monkeypatch.setattr(locators, "MINIMUM_REDISCOVERY_SECONDS", 0)
+    timeouts = []
+    class Healer:
+        async def complete(self, *args, timeout_seconds):
+            timeouts.append(timeout_seconds)
+            return '{"status":"selected","candidate":0}'
+    book = locators.LocatorBook(tmp_path / "locators.json", healer=Healer())
+    async def run():
+        lock = book._locks.setdefault(("ko", "composer"), asyncio.Lock())
+        await lock.acquire()
+        asyncio.get_running_loop().call_later(.05, lock.release)
+        await book.rediscover(_evaluate(), "composer", "ko",
+            failed_selector=selectors.COMPOSER_SELECTOR,
+            composer_selector=selectors.COMPOSER_SELECTOR,
+            deadline=asyncio.get_running_loop().time() + .15)
+    asyncio.run(run())
+    assert 0 < timeouts[0] <= .11
+
+
+def test_half_open_only_one_attempt_awaits_proof(tmp_path):
+    now = [100.0]
+    healer = _Healer()
+    book = locators.LocatorBook(tmp_path / "locators.json", healer=healer, clock=lambda: now[0])
+    for _ in range(locators.FAILURE_THRESHOLD):
+        _record_test_failure(book, "failed")
+    now[0] += locators.BREAKER_COOLDOWN_SECONDS
+    async def run():
+        results = await asyncio.gather(
+            _rediscover(book), _rediscover(book, evaluate=_evaluate(valid=False)),
+            return_exceptions=True,
+        )
+        assert isinstance(results[0], locators.RediscoveredLocator)
+        assert isinstance(results[1], locators.HealingRefused)
+        assert len(book.pending) == 1
+        book.record_failure("ko", "composer", "half-open failed", results[0].attempt_id)
+    asyncio.run(run())
+    assert healer.calls == 1
+    assert book._record("ko", "composer")["open_until"] == now[0] + locators.BREAKER_COOLDOWN_SECONDS
+
+
+def test_fresh_check_wait_does_not_count(tmp_path):
+    book = locators.LocatorBook(tmp_path / "locators.json", healer=_Healer())
+    original = _evaluate()
+    async def evaluate(expression, args):
+        if expression == selectors.LOCATOR_CHECK_PROBE_JS:
+            return {"matched": 0, "eligible": 0, "candidates": 0}
+        return await original(expression, args)
+    with pytest.raises(locators.HealingRefused, match="could not be verified"):
+        asyncio.run(_rediscover(book, evaluate=evaluate))
+    assert not book.pending and not book.path.exists()
+
+
+@pytest.mark.parametrize("suppresses_cancellation", [False, True])
+def test_cancelled_healer_does_not_count(tmp_path, suppresses_cancellation):
+    started = asyncio.Event()
+    class Healer:
+        async def complete(self, *args, **kwargs):
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                if suppresses_cancellation:
+                    return "malformed cancelled reply"
+                raise
+    book = locators.LocatorBook(tmp_path / "locators.json", healer=Healer())
+    async def run():
+        task = asyncio.create_task(_rediscover(book))
+        await started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    asyncio.run(run())
+    assert not book.pending and not book.path.exists()
+
+
+def test_deterministic_reuse_failure_and_abandon_do_not_count(tmp_path):
+    book = locators.LocatorBook(tmp_path / "locators.json", healer=_Healer())
+    book.record_failure("ko", "composer", "seed failed", None)
+    book.abandon("ko", "composer", None)
+    assert not book.path.exists()
+    book.record_success("ko", "composer", ".restored", None)
+    assert book.selector_for("ko", "composer") == ".restored"

@@ -307,7 +307,7 @@ class _AskExecution:
         )
         self.locator_environment: str | None = None
         self.locator_selectors: dict[str, str] = {}
-        self.unproven_locators: dict[str, str] = {}
+        self.unproven_locators: dict[str, locators.RediscoveredLocator] = {}
         self.rediscovered_targets: set[str] = set()
         self.callbacks = callbacks if callbacks is not None else AskCallbacks()
         timeout_budget = (
@@ -714,11 +714,12 @@ class _AskExecution:
         return check
 
     async def _rediscover(
-        self, target: locators.LocatorTarget, check: LocatorCheck,
+        self, target: locators.LocatorTarget, check: LocatorCheck, end: float,
     ) -> None:
+        end = min(self.deadline, end)
         if target in self.rediscovered_targets:
             self._settle_rediscovered(
-                target, "the rediscovered locator failed the contract again",
+                target, "failure", "the rediscovered locator failed the contract again",
             )
             raise GptProAskError(
                 "locator_unresolved",
@@ -731,32 +732,43 @@ class _AskExecution:
             return await self._await_page_operation(self.page.evaluate(expression, args))
 
         try:
-            selector = await self.locator_book.rediscover(
-                evaluate, target, self.locator_environment or "unknown",
-                failed_selector=self._selector(target),
-                composer_selector=self._selector("composer"),
-                timeout_seconds=self._remaining(),
+            result = await self._await_page_operation(
+                self.locator_book.rediscover(
+                    evaluate, target, self.locator_environment or "unknown",
+                    failed_selector=self._selector(target),
+                    composer_selector=self._selector("composer"), deadline=end,
+                ),
+                maximum_seconds=end - _monotonic(),
             )
+        except TimeoutError as exc:
+            self._ensure_deadline()
+            raise GptProAskError(
+                "locator_unresolved",
+                f"rediscovery did not finish within the {target} wait budget",
+            ) from exc
         except locators.LocatorHealingError as exc:
             raise GptProAskError(
                 "locator_unresolved", f"the ChatGPT {target} locator failed ({check.describe()}) "
                 f"and rediscovery did not recover it: {exc}",
             ) from exc
-        self.locator_selectors[target] = selector
-        self.unproven_locators[target] = selector
+        self.locator_selectors[target] = result.selector
+        self.unproven_locators[target] = result
 
     def _settle_rediscovered(
-        self, target: locators.LocatorTarget, failure: str | None = None,
+        self, target: locators.LocatorTarget,
+        outcome: Literal["success", "failure", "abandon"], reason: str = "",
     ) -> None:
-        selector = self.unproven_locators.pop(target, None)
-        if selector is None:
+        result = self.unproven_locators.pop(target, None)
+        if result is None:
             return
         env = self.locator_environment or "unknown"
         try:
-            if failure is None:
-                self.locator_book.record_success(env, target, selector)
+            if outcome == "success":
+                self.locator_book.record_success(env, target, result.selector, result.attempt_id)
+            elif outcome == "failure":
+                self.locator_book.record_failure(env, target, reason, result.attempt_id)
             else:
-                self.locator_book.record_failure(env, target, failure)
+                self.locator_book.abandon(env, target, result.attempt_id)
         except OSError as exc:
             logger.warning("Could not record optional %s locator result: %s", target, exc)
 
@@ -817,7 +829,7 @@ class _AskExecution:
                 if fault_since is None:
                     fault_since = _monotonic()
                 if _monotonic() - fault_since >= LOCATOR_SETTLE_SECONDS:
-                    await self._rediscover("composer", check)
+                    await self._rediscover("composer", check, end)
                     fault_since = None
                     continue
             else:
@@ -912,7 +924,8 @@ class _AskExecution:
         check = await self._check_locator("composer", selector)
         if check.verdict != "valid":
             self._settle_rediscovered(
-                "composer", "the rediscovered locator failed the contract again",
+                "composer", "failure" if check.verdict == "fault" else "abandon",
+                "the rediscovered locator failed the contract again",
             )
             raise GptProAskError(
                 "locator_unresolved",
@@ -923,6 +936,14 @@ class _AskExecution:
             await self._await_page_operation(
                 self.page.fill(selector, self.prompt, strict=True)
             )
+        except _DeadlineExpired:
+            raise
+        except Exception as exc:
+            self._settle_rediscovered("composer", "failure", "could not fill the ChatGPT composer")
+            raise GptProAskError(
+                "submit_failed", "could not fill the ChatGPT composer"
+            ) from exc
+        try:
             readback = await self._await_page_operation(
                 self.page.evaluate(
                     COMPOSER_READBACK_PROBE_JS,
@@ -932,9 +953,9 @@ class _AskExecution:
         except _DeadlineExpired:
             raise
         except Exception as exc:
-            self._settle_rediscovered("composer", "could not fill the ChatGPT composer")
+            self._settle_rediscovered("composer", "abandon")
             raise GptProAskError(
-                "submit_failed", "could not fill the ChatGPT composer"
+                "submit_failed", "could not verify the ChatGPT composer contents"
             ) from exc
         # Contenteditable can collapse blank lines and normalize line endings;
         # those changes are safe, but dropping prompt text is not.
@@ -946,12 +967,12 @@ class _AskExecution:
             self.prompt
         ):
             self._settle_rediscovered(
-                "composer", "the ChatGPT composer did not retain the prompt",
+                "composer", "failure", "the ChatGPT composer did not retain the prompt",
             )
             raise GptProAskError(
                 "submit_failed", "the ChatGPT composer did not retain the prompt"
             )
-        self._settle_rediscovered("composer")
+        self._settle_rediscovered("composer", "success")
 
     async def _dismiss_modal(self) -> None:
         try:
@@ -1063,7 +1084,7 @@ class _AskExecution:
                         fault_since = _monotonic()
                     if (_monotonic() - fault_since >= LOCATOR_SETTLE_SECONDS
                             and not missing_attachments):
-                        await self._rediscover("send", check)
+                        await self._rediscover("send", check, end)
                         fault_since = None
                         check = None
                         next_check_at = _monotonic()
@@ -1079,7 +1100,7 @@ class _AskExecution:
                 ) from readiness_error
             await self._pause(min(POLL_INTERVAL_SECONDS, end - _monotonic()))
         self._ensure_deadline()
-        self._settle_rediscovered("send", "the send button did not become ready")
+        self._settle_rediscovered("send", "abandon")
         if missing_attachments:
             raise GptProAskError(
                 "submit_failed", "attachments no longer ready in the active "
@@ -1091,6 +1112,8 @@ class _AskExecution:
         )
 
     async def _click_send(self) -> None:
+        from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+
         await self._dismiss_modal()
         await self._wait_for_send_ready()
         await self._process_network_actions()
@@ -1104,7 +1127,8 @@ class _AskExecution:
         check = await self._check_locator("send", selector)
         if check.verdict != "valid":
             self._settle_rediscovered(
-                "send", "the rediscovered locator failed the contract again",
+                "send", "failure" if check.verdict == "fault" else "abandon",
+                "the rediscovered locator failed the contract again",
             )
             raise GptProAskError(
                 "locator_unresolved",
@@ -1124,6 +1148,10 @@ class _AskExecution:
         except _DeadlineExpired:
             raise
         except Exception as exc:
+            self._settle_rediscovered(
+                "send", "abandon" if isinstance(exc, (TimeoutError, PlaywrightTimeoutError)) else "failure",
+                "could not click the ChatGPT send button",
+            )
             raise GptProAskError(
                 "submit_failed", "could not click the ChatGPT send button"
             ) from exc
@@ -1585,13 +1613,15 @@ class _AskExecution:
                 await self._click_send()
                 self.stage = "echo"
                 locked_user_id = await self._lock_user_echo(pre_submit_ids)
-                self._settle_rediscovered("send")
+                self._settle_rediscovered("send", "success")
                 self.has_locked_user_echo = True
                 self._record_evidence(submission="confirmed")
                 self._capture_trusted_page_conversation()
                 self.stage = "answer"
                 completion = await self._monitor_completion(locked_user_id)
             finally:
+                for target in tuple(self.unproven_locators):
+                    self._settle_rediscovered(target, "abandon")
                 await self._remove_listeners()
 
             if isinstance(completion, AskSubmission):

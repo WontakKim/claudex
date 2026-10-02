@@ -399,6 +399,7 @@ class _FakePage:
 def _install_clock(monkeypatch: pytest.MonkeyPatch) -> _FakeClock:
     clock = _FakeClock()
     monkeypatch.setattr(ask, "_monotonic", clock.monotonic)
+    monkeypatch.setattr(locators._default_book, "monotonic", clock.monotonic)
     monkeypatch.setattr(ask, "_sleep", clock.sleep)
     monkeypatch.setattr(ask, "POLL_INTERVAL_SECONDS", 1.0)
     monkeypatch.setattr(ask, "rate_limit_delay_ms", lambda retry_after_ms: 1_000)
@@ -2114,7 +2115,12 @@ def test_locator_recovery_first_use(
             assert raised.value.failure == ("submit_failed" if result == "click_failure" else "echo_timeout")
             assert raised.value.evidence.submission == "uncertain"
             if target == "send":
-                assert not book.path.exists()
+                assert not book.pending
+                if result == "click_failure":
+                    assert book._record("ko", target)["consecutive_failures"] == 1
+                    assert book.refusal("ko", target)
+                else:
+                    assert not book.path.exists()
         else:
             assert raised.value.failure == "locator_unresolved"
             assert raised.value.evidence.failure_stage == ("composer" if target == "composer" else "submission")
@@ -2167,7 +2173,9 @@ def test_unproven_composer_failure_is_recorded(
     page = _FakePage()
     execution = ask._AskExecution(page, "question", None, locator_book=isolated_locator_book)
     execution.locator_environment = "ko"
-    execution.unproven_locators["composer"] = selectors.COMPOSER_SELECTOR
+    attempt = locators.RediscoveredLocator(selectors.COMPOSER_SELECTOR, "test-attempt")
+    execution.unproven_locators["composer"] = attempt
+    isolated_locator_book.pending[("ko", "composer")] = attempt
     if failure == "fill":
         async def fill(selector, value, *, strict=False):
             raise RuntimeError("cannot fill")
@@ -2190,11 +2198,11 @@ def test_optional_recording_error_does_not_fail_ask(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     execution = ask._AskExecution(_FakePage(), "question", None, locator_book=isolated_locator_book)
-    execution.unproven_locators["composer"] = ".candidate"
+    execution.unproven_locators["composer"] = locators.RediscoveredLocator(".candidate")
     def fail(*args):
         raise OSError("read-only directory")
     monkeypatch.setattr(isolated_locator_book, "record_success", fail)
-    execution._settle_rediscovered("composer")
+    execution._settle_rediscovered("composer", "success")
     assert "read-only directory" in caplog.text
 
 
@@ -2212,7 +2220,9 @@ def test_unproven_composer_timeout_leaves_book_unchanged(
     )
     execution.locator_environment = "ko"
     execution.locator_selectors["composer"] = selectors.COMPOSER_SELECTOR
-    execution.unproven_locators["composer"] = selectors.COMPOSER_SELECTOR
+    attempt = locators.RediscoveredLocator(selectors.COMPOSER_SELECTOR, "test-attempt")
+    execution.unproven_locators["composer"] = attempt
+    isolated_locator_book.pending[("ko", "composer")] = attempt
     with pytest.raises(ask._DeadlineExpired):
         asyncio.run(execution._fill_and_verify())
     after = book.path.read_bytes() if book.path.exists() else None
@@ -2503,3 +2513,181 @@ def test_send_fault_timer_resets_on_nonrediscoverable_observation(
     else:
         assert raised.value.failure == "locator_unresolved"
         assert healer_times == [6 + ask.LOCATOR_SETTLE_SECONDS]
+
+
+@pytest.mark.parametrize("exit_path", ["late_not_ready", "click_error", "click_timeout", "echo_timeout", "cancel_echo"])
+def test_rediscovered_send_exit_settlement(monkeypatch, isolated_locator_book, exit_path):
+    clock = _install_clock(monkeypatch)
+    book = isolated_locator_book
+    page = _FakePage()
+    calls = []
+    class Healer:
+        async def complete(self, *args, **kwargs):
+            calls.append(clock.value)
+            if exit_path == "late_not_ready":
+                clock.value = 27
+            return '{"status":"selected","candidate":0}'
+    book.healer = Healer()
+    original = page.evaluate
+    echo_started = asyncio.Event()
+    async def evaluate(expression, argument=None):
+        if expression == selectors.LOCATOR_CANDIDATES_PROBE_JS:
+            return {"candidates": [{"selector": ".send"}]}
+        if expression == selectors.LOCATOR_CHECK_PROBE_JS and argument["target"] == "send":
+            valid = argument["selector"] == ".send"
+            return {"matched": int(valid), "eligible": int(valid), "candidates": 1, "lang": "ko"}
+        if expression == selectors.LOCATOR_CHECK_PROBE_JS:
+            return {"matched": 1, "eligible": 1, "candidates": 1, "lang": "ko"}
+        if expression == selectors.SEND_BUTTON_READY_PROBE_JS:
+            return argument["selector"] == ".send" and exit_path != "late_not_ready"
+        if expression == selectors.USER_ECHO_PROBE_JS:
+            if exit_path == "cancel_echo":
+                echo_started.set()
+                await asyncio.Event().wait()
+            return None
+        return await original(expression, argument)
+    page.evaluate = evaluate
+    async def click(*args, **kwargs):
+        page.click_count += 1
+        if exit_path == "click_error":
+            raise RuntimeError("click failed")
+        if exit_path == "click_timeout":
+            raise TimeoutError("click timed out")
+    page.click = click
+    async def run():
+        execution = ask._AskExecution(page, "question", None, locator_book=book)
+        if exit_path == "cancel_echo":
+            task = asyncio.create_task(execution.run())
+            await echo_started.wait()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        else:
+            with pytest.raises(ask.GptProAskError) as raised:
+                await execution.run()
+            assert raised.value.failure == ("echo_timeout" if exit_path == "echo_timeout" else "timeout" if exit_path == "click_timeout" else "submit_failed")
+            assert execution.evidence.submission == ("not_attempted" if exit_path == "late_not_ready" else "uncertain")
+    asyncio.run(run())
+    assert not book.pending
+    assert page.click_count == (0 if exit_path == "late_not_ready" else 1)
+    assert book._record("ko", "send").get("consecutive_failures", 0) == int(exit_path == "click_error")
+    if exit_path == "click_error":
+        assert book.refusal("ko", "send")
+        with pytest.raises(ask.GptProAskError) as raised:
+            _run(page)
+        assert raised.value.failure == "locator_unresolved"
+        assert len(calls) == 1
+
+
+@pytest.mark.parametrize("target", ["composer", "send"])
+@pytest.mark.parametrize("verdict", ["wait", "fault"])
+def test_action_recheck_settlement(isolated_locator_book, verdict, target):
+    page = _FakePage()
+    book = isolated_locator_book
+    class Healer:
+        async def complete(self, *args, **kwargs):
+            return '{"status":"selected","candidate":0}'
+    book.healer = Healer()
+    async def run():
+        result = await book.rediscover(evaluate_candidate, target, "ko",
+            failed_selector=locators.SEED_SELECTORS[target], composer_selector=selectors.COMPOSER_SELECTOR,
+            deadline=ask._monotonic() + 20)
+        execution = ask._AskExecution(page, "question", None, locator_book=book)
+        execution.locator_environment = "ko"
+        execution.locator_selectors[target] = result.selector
+        execution.unproven_locators[target] = result
+        async def evaluate(*args):
+            return {"matched": 0, "eligible": 0, "candidates": int(verdict == "fault")}
+        page.evaluate = evaluate
+        with pytest.raises(ask.GptProAskError):
+            if target == "composer":
+                await execution._fill_and_verify()
+            else:
+                async def ready():
+                    pass
+                execution._dismiss_modal = ready
+                execution._wait_for_send_ready = ready
+                await execution._click_send()
+    async def evaluate_candidate(expression, argument):
+        if expression == selectors.LOCATOR_CANDIDATES_PROBE_JS:
+            return {"candidates": [{"selector": ".composer"}]}
+        return {"matched": 1, "eligible": 1}
+    asyncio.run(run())
+    assert not book.pending
+    assert book._record("ko", target).get("consecutive_failures", 0) == int(verdict == "fault")
+
+
+@pytest.mark.parametrize("overall", [False, True])
+@pytest.mark.parametrize("blocked", ["lock", "healer"])
+def test_runner_rediscovery_deadline(monkeypatch, isolated_locator_book, overall, blocked):
+    monkeypatch.setattr(locators, "MINIMUM_REDISCOVERY_SECONDS", 0)
+    book = isolated_locator_book
+    class Healer:
+        async def complete(self, *args, **kwargs):
+            await asyncio.sleep(1)
+            return "late malformed reply"
+    book.healer = Healer()
+    async def run():
+        execution = ask._AskExecution(_FakePage(), "question", None,
+            timeout_seconds=.05 if overall else 1, locator_book=book)
+        execution.locator_environment = "ko"
+        async def evaluate(expression, args):
+            return {"candidates": [{"selector": ".send"}]}
+        execution.page.evaluate = evaluate
+        lock = book._locks.setdefault(("ko", "send"), asyncio.Lock())
+        if blocked == "lock":
+            await lock.acquire()
+        check = locators.classify_check({"candidates": 1, "lang": "ko"})
+        start = ask._monotonic()
+        try:
+            with pytest.raises(ask._DeadlineExpired if overall else ask.GptProAskError) as raised:
+                await execution._rediscover("send", check, start + .05)
+            if not overall:
+                assert raised.value.failure == "locator_unresolved"
+                assert "rediscovery did not finish within the send wait budget" in str(raised.value)
+            assert ask._monotonic() - start < .15
+        finally:
+            if blocked == "lock":
+                lock.release()
+    asyncio.run(run())
+    assert not book.pending and not book.path.exists()
+
+
+def test_unverifiable_composer_readback_abandons(isolated_locator_book):
+    book = isolated_locator_book
+    page = _FakePage()
+    execution = ask._AskExecution(page, "question", None, locator_book=book)
+    execution.locator_environment = "ko"
+    attempt = locators.RediscoveredLocator(selectors.COMPOSER_SELECTOR, "attempt")
+    execution.unproven_locators["composer"] = attempt
+    book.pending[("ko", "composer")] = attempt
+    original = page.evaluate
+    async def evaluate(expression, args=None):
+        if expression == selectors.COMPOSER_READBACK_PROBE_JS:
+            raise RuntimeError("probe unavailable")
+        return await original(expression, args)
+    page.evaluate = evaluate
+    with pytest.raises(ask.GptProAskError, match="could not verify"):
+        asyncio.run(execution._fill_and_verify())
+    assert not book.pending and not book.path.exists()
+
+
+def test_playwright_click_timeout_abandons(isolated_locator_book):
+    from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+    book = isolated_locator_book
+    page = _FakePage()
+    execution = ask._AskExecution(page, "question", None, locator_book=book)
+    execution.locator_environment = "ko"
+    attempt = locators.RediscoveredLocator(selectors.SEND_BUTTON_SELECTOR, "attempt")
+    execution.unproven_locators["send"] = attempt
+    book.pending[("ko", "send")] = attempt
+    async def click(*args, **kwargs):
+        page.click_count += 1
+        raise PlaywrightTimeoutError("click timed out")
+    page.click = click
+    with pytest.raises(ask.GptProAskError) as raised:
+        asyncio.run(execution._click_send())
+    assert raised.value.failure == "submit_failed"
+    assert execution.evidence.submission == "uncertain"
+    assert page.click_count == 1
+    assert not book.pending and not book.path.exists()

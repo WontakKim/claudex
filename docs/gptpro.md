@@ -312,8 +312,12 @@ The selected candidate's structural selector is compiled locally and checked
 again against the control contract. It is used first and saved in
 `~/.claudex/gptpro/locators.json`, keyed by UI language, only after that use
 succeeds: retained prompt text proves the composer; a nonce-matched user echo
-proves the send button. `locator_unresolved` means nothing was sent: retrying
-cannot duplicate that prompt, but may fail again.
+proves the send button. While a rediscovered locator awaits its first successful
+use, other asks reuse it when it matches their page; otherwise they end with
+`locator_unresolved` without another rediscovery. A rediscovery that cannot
+finish within the control's wait budget ends the ask with `locator_unresolved`
+and does not count as a failed rediscovery. `locator_unresolved` means nothing
+was sent: retrying cannot duplicate that prompt, but may fail again.
 
 After a failed rediscovery, a 60-second backoff prevents another rediscovery.
 Three consecutive failures suspend rediscovery for one hour. Asks do not wait
