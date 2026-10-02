@@ -383,46 +383,51 @@ async (args) => {
 """
 
 
-# Composers are visible editables in forms outside dialogs, navigation, message
-# units, and search areas. Known composer forms constrain candidates when present;
-# otherwise generic forms qualify. Send buttons belong to the validated composer.
+# Composers are visible editable roots in forms outside dialogs, navigation,
+# message units, and search areas; known composer forms constrain eligibility when
+# present, otherwise generic forms qualify. Send buttons qualify only in the form
+# of exactly one selector-matched composer that satisfies this same predicate.
 LOCATOR_CONTRACT_JS = r"""
 (target, composerSelector) => {
+  const isVisibleCandidate = (element) => {
+    const style = getComputedStyle(element);
+    const rect = element.getBoundingClientRect();
+    return !(
+      style.display === 'none' || style.visibility === 'hidden' ||
+      Number(style.opacity) === 0 || rect.width <= 0 || rect.height <= 0 ||
+      element.closest('[role="dialog"], dialog, nav, aside')
+    );
+  };
+  const isEligibleComposer = (element) => {
+    if (!isVisibleCandidate(element)) return false;
+    if (
+      element.closest('__MESSAGE_UNIT_SELECTOR__, [role="search"], search') ||
+      element.getAttribute('type') === 'search'
+    ) return false;
+    const form = element.closest('form');
+    if (form === null) return false;
+    if (
+      document.querySelector('form[data-chatgpt-composer]') !== null &&
+      !form.matches('form[data-chatgpt-composer]')
+    ) return false;
+    return element.getAttribute('contenteditable') === 'true' ||
+      element.tagName === 'TEXTAREA';
+  };
+  if (target === 'composer') return isEligibleComposer;
   let composerForm = null;
   if (target === 'send') {
     try {
       const composers = document.querySelectorAll(composerSelector);
-      if (composers.length === 1) composerForm = composers[0].closest('form');
+      if (composers.length === 1 && isEligibleComposer(composers[0])) {
+        composerForm = composers[0].closest('form');
+      }
     } catch (_) {
       // An invalid composer selector cannot establish form ownership.
     }
   }
-  return (element) => {
-    const style = getComputedStyle(element);
-    const rect = element.getBoundingClientRect();
-    if (
-      style.display === 'none' || style.visibility === 'hidden' ||
-      Number(style.opacity) === 0 || rect.width <= 0 || rect.height <= 0 ||
-      element.closest('[role="dialog"], dialog, nav, aside')
-    ) return false;
-    if (target === 'composer') {
-      if (
-        element.closest('__MESSAGE_UNIT_SELECTOR__, [role="search"], search') ||
-        element.getAttribute('type') === 'search'
-      ) return false;
-      const form = element.closest('form');
-      if (form === null) return false;
-      if (
-        document.querySelector('form[data-chatgpt-composer]') !== null &&
-        !form.matches('form[data-chatgpt-composer]')
-      ) return false;
-      return element.getAttribute('contenteditable') === 'true' ||
-        element.tagName === 'TEXTAREA';
-    }
-    return target === 'send' && element.tagName === 'BUTTON' &&
-      element.type === 'submit' && composerForm !== null &&
-      element.form === composerForm;
-  };
+  return (element) => target === 'send' && isVisibleCandidate(element) &&
+    element.tagName === 'BUTTON' && element.type === 'submit' &&
+    composerForm !== null && element.form === composerForm;
 }
 """.replace("__MESSAGE_UNIT_SELECTOR__", USER_MESSAGE_SELECTOR.split("$=", 1)[0] + "]")
 

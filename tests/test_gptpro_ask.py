@@ -2297,6 +2297,48 @@ def test_actions_require_verified_locators(
             assert isinstance(raised.value.__cause__, locators.HealerUnavailable)
 
 
+@pytest.mark.parametrize("invalidates_before_click", [False, True])
+def test_send_stops_when_filled_composer_becomes_ineligible(
+    monkeypatch: pytest.MonkeyPatch, invalidates_before_click: bool,
+) -> None:
+    _install_clock(monkeypatch)
+    page = _FakePage()
+    original = page.evaluate
+    is_composer_valid = True
+    send_checks = 0
+
+    async def evaluate(expression: str, argument: Any = None) -> Any:
+        nonlocal is_composer_valid, send_checks
+        if expression == selectors.COMPOSER_READBACK_PROBE_JS:
+            result = await original(expression, argument)
+            if not invalidates_before_click:
+                is_composer_valid = False
+            return result
+        if expression == selectors.LOCATOR_CHECK_PROBE_JS:
+            if argument["target"] == "send":
+                assert argument["composerSelector"] == page.fill_actions[0][0]
+                send_checks += 1
+                if invalidates_before_click and send_checks > 1:
+                    is_composer_valid = False
+                return {
+                    "matched": 1, "eligible": int(is_composer_valid),
+                    "candidates": int(is_composer_valid), "lang": "en-US",
+                }
+        return await original(expression, argument)
+
+    page.evaluate = evaluate  # type: ignore[method-assign]
+    with pytest.raises(ask.GptProAskError) as raised:
+        _run(page)
+    assert raised.value.failure == (
+        "locator_unresolved" if invalidates_before_click else "submit_failed"
+    )
+    assert page.fill_actions == [(selectors.COMPOSER_SELECTOR, True)]
+    assert send_checks > 0
+    assert raised.value.evidence.submission == "not_attempted"
+    assert page.click_count == 0
+    assert page.click_actions == []
+
+
 @pytest.mark.parametrize("contract_raises", [False, True])
 def test_send_probe_failure_without_locator_fault_stays_submit_failed(
     monkeypatch: pytest.MonkeyPatch, contract_raises: bool,

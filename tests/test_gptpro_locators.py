@@ -103,6 +103,7 @@ def test_locator_contract(
 def _check(
     html: str, *, target: locators.LocatorTarget = "composer",
     selector: str | None = None, lang: str = "ko-KR",
+    composer_selector: str = selectors.COMPOSER_SELECTOR,
 ) -> locators.LocatorCheck:
     async def run() -> locators.LocatorCheck:
         async with async_playwright() as playwright:
@@ -125,7 +126,7 @@ def _check(
                         else selectors.SEND_BUTTON_SELECTOR)
                 return await locators.check_locator(
                     page.evaluate, target, selector if selector is not None else seed,
-                    composer_selector=selectors.COMPOSER_SELECTOR,
+                    composer_selector=composer_selector,
                 )
             finally:
                 await browser.close()
@@ -155,6 +156,39 @@ def test_composer_contract_excludes_message_editors_and_search(html: str) -> Non
     assert _candidates(html, target="send") == []
 
 
+@pytest.mark.parametrize(
+    "container_attributes",
+    ['data-chatgpt-search-unit-key="t1:user"', 'role="search"', ''],
+    ids=["inline-editor", "search-area", "other-form"],
+)
+def test_send_contract_requires_eligible_composer(container_attributes: str) -> None:
+    html = _EMPTY_FORM + (
+        f'<div {container_attributes}><form data-edit-message>'
+        '<textarea role="textbox">Old message</textarea>'
+        '<button type="submit">Save</button></form></div>'
+    )
+    composer_selector = 'form textarea[role="textbox"]'
+    composer_check = _check(html, selector=composer_selector)
+    assert (composer_check.verdict, composer_check.eligible) == ("fault", 0)
+    check = _check(
+        html, target="send", selector='form[data-edit-message] button[type="submit"]',
+        composer_selector=composer_selector,
+    )
+    assert (check.verdict, check.eligible, check.candidates) == ("wait", 0, 0)
+    assert _candidates(html, target="send", composer_selector=composer_selector) == []
+
+
+def test_send_contract_allows_generic_composer_form() -> None:
+    html = '<form><textarea role="textbox">Text</textarea><button type="submit">Send</button></form>'
+    composer_selector = 'form textarea[role="textbox"]'
+    check = _check(
+        html, target="send", selector='button[type="submit"]',
+        composer_selector=composer_selector,
+    )
+    assert (check.verdict, check.eligible, check.candidates) == ("valid", 1, 1)
+    assert len(_candidates(html, target="send", composer_selector=composer_selector)) == 1
+
+
 def test_composer_contract_prefers_known_composer_form() -> None:
     html = _EMPTY_FORM + '<form data-other><textarea>Other editor</textarea></form>'
     check = _check(html)
@@ -177,6 +211,7 @@ def test_composer_contract_allows_generic_form_after_markup_drift() -> None:
 
 def _candidates(
     html: str, *, target: locators.LocatorTarget = "composer",
+    composer_selector: str = selectors.COMPOSER_SELECTOR,
 ) -> list[dict[str, Any]]:
     async def run() -> list[dict[str, Any]]:
         async with async_playwright() as playwright:
@@ -196,7 +231,7 @@ def _candidates(
                 page = await browser.new_page()
                 await page.set_content(html)
                 result = await page.evaluate(selectors.LOCATOR_CANDIDATES_PROBE_JS, {
-                    "target": target, "composerSelector": selectors.COMPOSER_SELECTOR,
+                    "target": target, "composerSelector": composer_selector,
                 })
                 return result["candidates"]
             finally:
