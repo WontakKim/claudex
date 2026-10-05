@@ -1147,13 +1147,16 @@ class _RuntimeDetachPollerFake:
     def __init__(self, _get_context: Callable[[], Awaitable[Any]]) -> None:
         self.future: asyncio.Future[ask.AskOutcome] | None = None
         self.registrations: list[tuple[str, str, float]] = []
+        self.delivery_deadlines: list[float | None] = []
         self.close_calls = 0
         self.backoff_seconds = 0.0
 
     def register(
-        self, conversation_id: str, marker: str, deadline: float
+        self, conversation_id: str, marker: str, deadline: float,
+        *, delivery_deadline: float | None = None,
     ) -> asyncio.Future[ask.AskOutcome]:
         self.registrations.append((conversation_id, marker, deadline))
+        self.delivery_deadlines.append(delivery_deadline)
         self.future = asyncio.get_running_loop().create_future()
         return self.future
 
@@ -1231,6 +1234,7 @@ def test_runtime_detaches_waiting_answer_when_submitter_contends(
         second_task = asyncio.create_task(ask_runtime.ask("second"))
         await second_started.wait()
 
+        await second_task
         assert second_task.done()
         assert not first_task.done()
         assert len(context.pages) == 2
@@ -1794,6 +1798,385 @@ def test_recover_waits_for_file_delivery_after_the_recovery_window(
         )
         poller.future.set_result(outcome)
         assert await task == outcome
+        await ask_runtime.aclose()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("configured", [None, "inf", "nan", "999999"])
+def test_recovery_configuration_has_finite_ninety_minute_cap(
+    monkeypatch: pytest.MonkeyPatch, configured: str | None,
+) -> None:
+    if configured is None:
+        monkeypatch.delenv("GPTPRO_RAW_TURN_RECOVERY_SECONDS", raising=False)
+    else:
+        monkeypatch.setenv("GPTPRO_RAW_TURN_RECOVERY_SECONDS", configured)
+    assert runtime.raw_turn_recovery_seconds() == 5400.0
+
+
+@pytest.mark.parametrize("answer_at", [1.0, 3600.0, 5340.0, 5400.0, 5401.0])
+def test_shared_deadline_survives_short_initial_watchdog(
+    monkeypatch: pytest.MonkeyPatch, answer_at: float,
+) -> None:
+    context = _FakeContext()
+    _RuntimeFakes(monkeypatch, [context])
+    monkeypatch.delenv("GPTPRO_RAW_TURN_RECOVERY_SECONDS", raising=False)
+    now = 100.0
+    monkeypatch.setattr(runtime, "_monotonic", lambda: now)
+    submissions: list[str] = []
+
+    async def execute(
+        page: _FakePage, question: str, **options: Any,
+    ) -> ask.AskOutcome:
+        nonlocal now
+        submissions.append(question)
+        callbacks = options["callbacks"]
+        callbacks.on_conversation_id(_CONVERSATION_ID)
+        callbacks.on_marker("exact-marker")
+        assert options["timeout_seconds"] == 30.0
+        now += min(30.0, answer_at / 2)
+        raise ask.GptProAskError("no_raw_turn", "answer not available")
+
+    monkeypatch.setattr(runtime.ask, "execute_ask_outcome", execute)
+
+    async def scenario() -> None:
+        nonlocal now
+        ask_runtime = runtime.AskRuntime()
+        poller = _RuntimeDetachPollerFake(ask_runtime._get_context)
+        ask_runtime._poller = poller
+        task = asyncio.create_task(ask_runtime.ask(
+            "review", timeout_seconds=30.0, callbacks=ask.AskCallbacks(),
+        ))
+        while poller.future is None:
+            await asyncio.sleep(0)
+        assert poller.registrations == [(_CONVERSATION_ID, "exact-marker", 5500.0)]
+        assert ask_runtime._ask_semaphore._value == 2
+        now = 100.0 + answer_at
+        poller.future.set_result(_outcome("finished answer"))
+        if answer_at >= 5400:
+            with pytest.raises(ask.GptProAskError):
+                await task
+        else:
+            assert (await task).text == "finished answer"
+        assert submissions == ["review"]
+        await ask_runtime.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_capacity_queue_does_not_consume_shared_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = _FakeContext()
+    _RuntimeFakes(monkeypatch, [context])
+    now = 0.0
+    monkeypatch.setattr(runtime, "_monotonic", lambda: now)
+    monkeypatch.setenv("GPTPRO_MAX_CONCURRENT_ASKS", "1")
+    monkeypatch.delenv("GPTPRO_RAW_TURN_RECOVERY_SECONDS", raising=False)
+
+    async def execute(
+        page: _FakePage, question: str, **options: Any,
+    ) -> ask.AskOutcome:
+        callbacks = options["callbacks"]
+        callbacks.on_conversation_id(_CONVERSATION_ID)
+        callbacks.on_marker("queued-marker")
+        raise ask.GptProAskError("no_raw_turn", "answer not available")
+
+    monkeypatch.setattr(runtime.ask, "execute_ask_outcome", execute)
+
+    async def scenario() -> None:
+        nonlocal now
+        ask_runtime = runtime.AskRuntime()
+        poller = _RuntimeDetachPollerFake(ask_runtime._get_context)
+        ask_runtime._poller = poller
+        await ask_runtime._ask_semaphore.acquire()
+        task = asyncio.create_task(ask_runtime.ask("queued", callbacks=ask.AskCallbacks()))
+        while ask_runtime._waiting_submitters != 1:
+            await asyncio.sleep(0)
+        now = 7200.0
+        ask_runtime._ask_semaphore.release()
+        while poller.future is None:
+            await asyncio.sleep(0)
+        assert poller.registrations[0][2] == 12600.0
+        poller.future.set_result(_outcome("ready"))
+        assert (await task).text == "ready"
+        await ask_runtime.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_initial_result_and_file_delivery_cannot_overrun_total(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = _FakeContext()
+    _RuntimeFakes(monkeypatch, [context])
+    now = 0.0
+    monkeypatch.setattr(runtime, "_monotonic", lambda: now)
+
+    async def execute(
+        page: _FakePage, question: str, **options: Any,
+    ) -> ask.AskOutcome:
+        nonlocal now
+        now = 5400.0
+        return _outcome("files finished too late")
+
+    monkeypatch.setattr(runtime.ask, "execute_ask_outcome", execute)
+
+    async def scenario() -> None:
+        ask_runtime = runtime.AskRuntime()
+        with pytest.raises(ask.GptProAskError) as raised:
+            await ask_runtime.ask("review")
+        assert raised.value.failure == "timeout"
+        await ask_runtime.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_manual_recovery_starts_new_window_and_rejects_late_delivery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = 7200.0
+    monkeypatch.setattr(runtime, "_monotonic", lambda: now)
+    monkeypatch.delenv("GPTPRO_RAW_TURN_RECOVERY_SECONDS", raising=False)
+
+    async def scenario() -> None:
+        nonlocal now
+        ask_runtime = runtime.AskRuntime()
+        poller = _RuntimeDetachPollerFake(ask_runtime._get_context)
+        ask_runtime._poller = poller
+        task = asyncio.create_task(ask_runtime.recover(_CONVERSATION_ID, "source-marker"))
+        while poller.future is None:
+            await asyncio.sleep(0)
+        assert poller.registrations == [(_CONVERSATION_ID, "source-marker", 12600.0)]
+        now = 12600.0
+        poller.future.set_result(_outcome("late files"))
+        with pytest.raises(ask.GptProAskError) as raised:
+            await task
+        assert raised.value.failure == "timeout"
+        await ask_runtime.aclose()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("delivery_at", [5399.0, 5400.0, 5401.0])
+def test_detached_generated_files_share_total_deadline(
+    monkeypatch: pytest.MonkeyPatch, delivery_at: float,
+) -> None:
+    now = 0.0
+    marker = "[gptpro-transport-nonce:files-deadline]"
+    monkeypatch.setattr(runtime, "_monotonic", lambda: now)
+    monkeypatch.delenv("GPTPRO_RAW_TURN_RECOVERY_SECONDS", raising=False)
+
+    def answer_ready() -> None:
+        nonlocal now
+        now = 5390.0
+
+    page = _PollerFakePage(marker, [(200, _detached_conversation(
+        marker, "Finished [file](sandbox:/mnt/data/answer.txt)",
+    ))], on_conversation_fetch=answer_ready)
+    context = _PollerFakeContext(page)
+    collections: list[Any] = []
+
+    async def collect(
+        evaluate: Any, conversation_id: str, references: Any,
+    ) -> tuple[tuple[Any, ...], bool]:
+        nonlocal now
+        assert conversation_id == _CONVERSATION_ID
+        assert len(references) == 1
+        collections.append(references)
+        now = delivery_at
+        # A failed optional download still permits a timely finished answer.
+        return (), False
+
+    monkeypatch.setattr(runtime.generated_files, "collect_generated_files", collect)
+
+    async def scenario() -> None:
+        ask_runtime = runtime.AskRuntime()
+        poller = runtime.DetachPoller(lambda: asyncio.sleep(0, result=context))
+        ask_runtime._poller = poller
+        if delivery_at < 5400:
+            outcome = await ask_runtime.recover(_CONVERSATION_ID, marker)
+            assert outcome.text.startswith("Finished")
+            assert outcome.files_complete is False
+        else:
+            with pytest.raises(ask.GptProAskError) as raised:
+                await ask_runtime.recover(_CONVERSATION_ID, marker)
+            assert raised.value.failure == "timeout"
+        await _wait_for_poller_idle(poller)
+        assert not poller._registrations
+        assert not poller._deliveries
+        assert len(collections) == 1
+        assert page.close_calls == 1
+        await ask_runtime.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_shared_deadline_without_answer_cleans_poller(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = 0.0
+    marker = "[gptpro-transport-nonce:no-answer-deadline]"
+    monkeypatch.setattr(runtime, "_monotonic", lambda: now)
+    monkeypatch.delenv("GPTPRO_RAW_TURN_RECOVERY_SECONDS", raising=False)
+
+    def exhaust_execution() -> None:
+        nonlocal now
+        now = 5400.0
+
+    page = _PollerFakePage(marker, [(200, _detached_conversation(
+        "another-marker", "unrelated answer",
+    ))], on_conversation_fetch=exhaust_execution)
+    context = _PollerFakeContext(page)
+
+    async def scenario() -> None:
+        ask_runtime = runtime.AskRuntime()
+        poller = runtime.DetachPoller(lambda: asyncio.sleep(0, result=context))
+        ask_runtime._poller = poller
+        with pytest.raises(ask.GptProAskError) as raised:
+            await ask_runtime.recover(_CONVERSATION_ID, marker)
+        assert raised.value.failure == "timeout"
+        await _wait_for_poller_idle(poller)
+        assert not poller._registrations
+        assert not poller._deliveries
+        assert page.close_calls == 1
+        await ask_runtime.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_total_deadline_does_not_wait_for_resistant_browser_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = _FakeContext()
+    _RuntimeFakes(monkeypatch, [context])
+    now = 0.0
+    monkeypatch.setattr(runtime, "_monotonic", lambda: now)
+    original_wait = asyncio.wait
+    cleanup_started = asyncio.Event()
+    release_cleanup = asyncio.Event()
+
+    async def execute(
+        page: _FakePage, question: str, **options: Any,
+    ) -> ask.AskOutcome:
+        try:
+            await asyncio.Future()
+        finally:
+            cleanup_started.set()
+            await release_cleanup.wait()
+
+    async def simulated_wait(
+        futures: set[asyncio.Future[Any]], *, timeout: float,
+    ) -> tuple[set[asyncio.Future[Any]], set[asyncio.Future[Any]]]:
+        nonlocal now
+        # Let jitter/context finish normally, but expire the browser execution.
+        future = next(iter(futures))
+        await asyncio.sleep(0)
+        if not future.done():
+            assert timeout == 5400.0
+            now = 5400.0
+            return set(), set(futures)
+        return await original_wait(futures, timeout=timeout)
+
+    monkeypatch.setattr(runtime.ask, "execute_ask_outcome", execute)
+    monkeypatch.setattr(runtime.asyncio, "wait", simulated_wait)
+
+    async def scenario() -> None:
+        ask_runtime = runtime.AskRuntime()
+        with pytest.raises(ask.GptProAskError) as raised:
+            await ask_runtime.ask("review")
+        assert raised.value.failure == "timeout"
+        assert ask_runtime._ask_semaphore._value == 2
+        await cleanup_started.wait()
+        assert not release_cleanup.is_set()
+        release_cleanup.set()
+        while not context.pages[0].close_calls:
+            await asyncio.sleep(0)
+        await ask_runtime.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_initial_detach_uses_total_not_browser_stage_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = _FakeContext()
+    _RuntimeFakes(monkeypatch, [context])
+    now = 100.0
+    monkeypatch.setattr(runtime, "_monotonic", lambda: now)
+
+    async def execute(
+        page: _FakePage, question: str, **options: Any,
+    ) -> ask.AskOutcome:
+        assert options["timeout_seconds"] == 30.0
+        return await options["on_detach"](ask.AskSubmission(
+            marker="detached-marker", conversation_id=_CONVERSATION_ID,
+        ))
+
+    monkeypatch.setattr(runtime.ask, "execute_ask_outcome", execute)
+
+    async def scenario() -> None:
+        nonlocal now
+        ask_runtime = runtime.AskRuntime()
+        poller = _RuntimeDetachPollerFake(ask_runtime._get_context)
+        ask_runtime._poller = poller
+        task = asyncio.create_task(ask_runtime.ask("review", timeout_seconds=30.0))
+        while poller.future is None:
+            await asyncio.sleep(0)
+        assert poller.registrations == [(_CONVERSATION_ID, "detached-marker", 5500.0)]
+        assert context.pages[0].close_calls == 1
+        assert ask_runtime._ask_semaphore._value == 2
+        now = 5440.0
+        poller.future.set_result(_outcome("89-minute answer"))
+        assert (await task).text == "89-minute answer"
+        await ask_runtime.aclose()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("initial_seconds", [60.0, 5390.0])
+def test_short_auto_recovery_file_allowance_cannot_extend_total(
+    monkeypatch: pytest.MonkeyPatch, initial_seconds: float,
+) -> None:
+    context = _FakeContext()
+    _RuntimeFakes(monkeypatch, [context])
+    now = 0.0
+    monkeypatch.setattr(runtime, "_monotonic", lambda: now)
+    monkeypatch.setenv("GPTPRO_RAW_TURN_RECOVERY_SECONDS", "120")
+
+    async def execute(
+        page: _FakePage, question: str, **options: Any,
+    ) -> ask.AskOutcome:
+        nonlocal now
+        callbacks = options["callbacks"]
+        callbacks.on_conversation_id(_CONVERSATION_ID)
+        callbacks.on_marker("short-window-marker")
+        now = initial_seconds
+        raise ask.GptProAskError("no_raw_turn", "answer not available")
+
+    monkeypatch.setattr(runtime.ask, "execute_ask_outcome", execute)
+
+    async def scenario() -> None:
+        nonlocal now
+        ask_runtime = runtime.AskRuntime()
+        poller = _RuntimeDetachPollerFake(ask_runtime._get_context)
+        ask_runtime._poller = poller
+        task = asyncio.create_task(ask_runtime.ask("review", callbacks=ask.AskCallbacks()))
+        while poller.future is None:
+            await asyncio.sleep(0)
+        polling_deadline = min(5400.0, initial_seconds + 120.0)
+        delivery_deadline = min(
+            5400.0, polling_deadline + runtime.generated_files.MAX_COLLECTION_SECONDS,
+        )
+        assert poller.registrations[0][2] == polling_deadline
+        assert poller.delivery_deadlines == [delivery_deadline]
+        # A finished answer was found in the polling window, but delivery is late.
+        now = delivery_deadline
+        poller.future.set_result(_outcome("late files"))
+        with pytest.raises(ask.GptProAskError) as raised:
+            await task
+        assert raised.value.failure == "no_raw_turn"
+        assert raised.value.evidence.recovery_failure == "timeout"
         await ask_runtime.aclose()
 
     asyncio.run(scenario())
