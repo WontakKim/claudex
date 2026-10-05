@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import random
 import time
@@ -26,7 +27,8 @@ from claudex.gptpro.selectors import PAGE_FETCH_PROBE_JS
 logger = logging.getLogger(__name__)
 
 DEFAULT_MAX_CONCURRENT_ASKS = 2
-DEFAULT_RAW_TURN_RECOVERY_SECONDS = 300.0
+MAX_EXECUTION_SECONDS = 5400.0
+DEFAULT_RAW_TURN_RECOVERY_SECONDS = MAX_EXECUTION_SECONDS
 MIN_SUBMISSION_JITTER_SECONDS = 1.0
 MAX_SUBMISSION_JITTER_SECONDS = 2.0
 DETACH_POLL_INTERVAL_SECONDS = 45.0
@@ -71,7 +73,6 @@ def _max_concurrent_asks() -> int:
 
 
 def raw_turn_recovery_seconds() -> float:
-    # This window lets generations outlasting the p95 x 1.5 budget finish.
     raw_value = os.environ.get("GPTPRO_RAW_TURN_RECOVERY_SECONDS")
     if raw_value is None:
         return DEFAULT_RAW_TURN_RECOVERY_SECONDS
@@ -79,7 +80,32 @@ def raw_turn_recovery_seconds() -> float:
         configured_value = float(raw_value)
     except ValueError:
         return DEFAULT_RAW_TURN_RECOVERY_SECONDS
-    return max(0.0, configured_value)
+    if not math.isfinite(configured_value):
+        return DEFAULT_RAW_TURN_RECOVERY_SECONDS
+    return min(MAX_EXECUTION_SECONDS, max(0.0, configured_value))
+
+
+def _consume_completion(future: asyncio.Future[Any]) -> None:
+    if not future.cancelled():
+        future.exception()
+
+
+async def _wait_until(operation: Awaitable[Any], deadline: float) -> Any:
+    """Bound execution without waiting for cancellation-resistant cleanup."""
+    future = asyncio.ensure_future(operation)
+    try:
+        remaining = deadline - _monotonic()
+        if remaining > 0:
+            done, _ = await asyncio.wait({future}, timeout=remaining)
+            if done and _monotonic() < deadline:
+                return future.result()
+        raise GptProAskError(
+            "timeout", "the bounded ChatGPT execution deadline expired"
+        )
+    finally:
+        if not future.done():
+            future.cancel()
+        future.add_done_callback(_consume_completion)
 
 
 def _is_transient_detach_fetch_error(exc: BaseException) -> bool:
@@ -129,6 +155,7 @@ class _DetachedRegistration:
     marker: str
     deadline: float
     future: asyncio.Future[AskOutcome]
+    delivery_deadline: float | None = None
 
 
 class DetachPoller:
@@ -152,6 +179,8 @@ class DetachPoller:
         conversation_id: str,
         marker: str,
         deadline: float,
+        *,
+        delivery_deadline: float | None = None,
     ) -> asyncio.Future[AskOutcome]:
         """Register one detached turn and start polling lazily."""
         if self._is_closing:
@@ -162,10 +191,26 @@ class DetachPoller:
             marker=marker,
             deadline=deadline,
             future=future,
+            delivery_deadline=delivery_deadline,
         )
+        future.add_done_callback(self._on_registration_done)
         if self._task is None or self._task.done():
             self._task = asyncio.create_task(self._run())
         return future
+
+    def _on_registration_done(self, future: asyncio.Future[AskOutcome]) -> None:
+        self._registrations.pop(id(future), None)
+        if not future.cancelled():
+            return
+        for delivery, registration in tuple(self._deliveries.items()):
+            if registration.future is future:
+                delivery.cancel()
+        if (
+            not self._registrations
+            and not self._deliveries
+            and self._task is not None
+        ):
+            self._task.cancel()
 
     def current_backoff_seconds(self) -> float:
         """Return the admission delay imposed by active polling backoff."""
@@ -348,8 +393,13 @@ class DetachPoller:
     ) -> None:
         """Save a finished turn's generated files, then resolve its future."""
         try:
-            files, files_complete = await generated_files.collect_generated_files(
-                page.evaluate, registration.conversation_id, turn.file_references,
+            files, files_complete = await _wait_until(
+                generated_files.collect_generated_files(
+                    page.evaluate, registration.conversation_id, turn.file_references,
+                ),
+                registration.delivery_deadline
+                if registration.delivery_deadline is not None
+                else registration.deadline,
             )
         except asyncio.CancelledError:
             if not registration.future.done():
@@ -358,6 +408,10 @@ class DetachPoller:
                     "the detached answer poller closed while saving generated files",
                 ))
             raise
+        except GptProAskError as exc:
+            if not registration.future.done():
+                registration.future.set_exception(exc)
+            return
         except Exception as exc:
             if not registration.future.done():
                 failure = GptProAskError(
@@ -368,6 +422,8 @@ class DetachPoller:
                 failure.__cause__ = exc
                 registration.future.set_exception(failure)
             return
+        else:
+            self._resolve(registration, turn, files, files_complete)
         finally:
             self._deliveries.pop(asyncio.current_task(), None)
             if (
@@ -376,7 +432,6 @@ class DetachPoller:
                 and self._task is None
             ):
                 await self._close_page()
-        self._resolve(registration, turn, files, files_complete)
 
     @staticmethod
     def _resolve(
@@ -576,6 +631,7 @@ class AskRuntime:
         finally:
             self._waiting_submitters -= 1
 
+        execution_deadline = _monotonic() + MAX_EXECUTION_SECONDS
         has_admission = True
 
         def release_admission() -> None:
@@ -625,26 +681,23 @@ class AskRuntime:
                 MIN_SUBMISSION_JITTER_SECONDS,
                 MAX_SUBMISSION_JITTER_SECONDS,
             ) + self._poller.current_backoff_seconds()
-            await _sleep(submission_delay)
+            await _wait_until(_sleep(submission_delay), execution_deadline)
             # A concurrent page may have observed a browser crash while this
             # ask waited for admission, so re-read the shared context here.
-            context = await self._get_context()
-            timeout_budget = (
-                ask.overall_timeout_seconds()
-                if timeout_seconds is None
-                else timeout_seconds
-            )
-            detached_deadline = _monotonic() + timeout_budget
+            context = await _wait_until(self._get_context(), execution_deadline)
             try:
-                return await self._execute_in_page(
-                    context,
-                    question,
-                    execution_callbacks,
-                    conversation_id,
-                    timeout_seconds,
-                    attachment_paths,
-                    detached_deadline,
-                    release_admission,
+                return await _wait_until(
+                    self._execute_in_page(
+                        context,
+                        question,
+                        execution_callbacks,
+                        conversation_id,
+                        timeout_seconds,
+                        attachment_paths,
+                        execution_deadline,
+                        release_admission,
+                    ),
+                    execution_deadline,
                 )
             except ask.GptProAskError as exc:
                 recovery_seconds = raw_turn_recovery_seconds()
@@ -675,11 +728,21 @@ class AskRuntime:
                         if callbacks is not None and callbacks.on_evidence is not None:
                             callbacks.on_evidence(exc.evidence)
                     raise
+                recovery_deadline = min(
+                    execution_deadline, _monotonic() + recovery_seconds,
+                )
+                if recovery_deadline <= _monotonic():
+                    raise
+                delivery_deadline = min(
+                    execution_deadline,
+                    recovery_deadline + generated_files.MAX_COLLECTION_SECONDS,
+                )
                 try:
                     future = self._poller.register(
                         captured_conversation_id,
                         captured_marker,
-                        _monotonic() + recovery_seconds,
+                        recovery_deadline,
+                        delivery_deadline=delivery_deadline,
                     )
                 except Exception as recovery_exc:
                     detail = str(recovery_exc) or type(recovery_exc).__name__
@@ -707,12 +770,8 @@ class AskRuntime:
                             pass
                 release_admission()
                 # Retain job ownership until the nonce-correlated answer settles.
-                # As in recover(), the extra wait covers saving generated files.
                 try:
-                    outcome = await asyncio.wait_for(
-                        future,
-                        recovery_seconds + generated_files.MAX_COLLECTION_SECONDS,
-                    )
+                    outcome = await _wait_until(future, delivery_deadline)
                     if (
                         evidence is not None
                         and callbacks is not None
@@ -775,15 +834,20 @@ class AskRuntime:
                 recovery_failure="disabled", recovery_detail=detail,
             )
             raise failure
+        execution_deadline = _monotonic() + MAX_EXECUTION_SECONDS
+        recovery_deadline = min(
+            execution_deadline, _monotonic() + recovery_seconds,
+        )
+        delivery_deadline = min(
+            execution_deadline,
+            recovery_deadline + generated_files.MAX_COLLECTION_SECONDS,
+        )
         future = self._poller.register(
-            conversation_id, marker, _monotonic() + recovery_seconds,
+            conversation_id, marker, recovery_deadline,
+            delivery_deadline=delivery_deadline,
         )
         try:
-            # The poller expires the registration itself; the extra wait
-            # covers saving generated files of a turn found near the end.
-            return await asyncio.wait_for(
-                future, recovery_seconds + generated_files.MAX_COLLECTION_SECONDS
-            )
+            return await _wait_until(future, delivery_deadline)
         except TimeoutError as exc:
             raise GptProAskError(
                 "timeout", "the bounded answer recovery window expired"

@@ -222,7 +222,9 @@ fetched without the token, and redirects are refused. Errors never include
 tokens or signed download URLs. Fixed limits bound each answer: at most 20
 files, 20 MiB per file, 50 MiB in total, 60 seconds per request, and 300
 seconds for all of the answer's files. A file beyond a limit is reported as
-failed rather than silently omitted.
+failed rather than silently omitted. File saving must also finish within the
+job's execution deadline; it does not add time to that deadline. Expiry of the
+execution deadline fails the job even if the answer text was already observed.
 
 ## Job lifecycle
 
@@ -240,14 +242,20 @@ for the answer` identifies server-side recovery. State remains authoritative.
 
 A post-click `no_raw_turn`, `echo_timeout`, `timeout`, `navigation_failed`,
 `submit_failed`, or `error` failure can move a job to `detached` for up to
-`GPTPRO_RAW_TURN_RECOVERY_SECONDS` (300 seconds by default), provided its
+`GPTPRO_RAW_TURN_RECOVERY_SECONDS` (5400 seconds by default), but only within
+the original ask's remaining 90-minute execution window, provided its
 conversation ID and nonce are known. Pre-click failures and `session_expired`,
 `challenge`, and `rate_limited_timeout` failures do not trigger this polling.
 A non-positive window disables it. Only a finished, nonempty, nonce-correlated
 raw assistant turn counts as a recovered answer. The job
 retains conversation ownership while polling, so follow-up asks for the same
 conversation remain queued until it settles. `recover_gpt_pro` uses the same
-window and ownership rule to inspect an existing turn after a failure.
+ownership rule to inspect an existing turn after a failure, with a new execution
+window of at most 90 minutes starting after its own admission. It creates a new
+recovery job and does not change the source failed job. A shorter configured
+polling window retains the bounded file-saving allowance for an answer found
+in time, but neither automatic nor manual recovery can save files beyond its
+90-minute execution deadline.
 
 `expired` specifically means the 900-second same-conversation queue wait ended
 before this job ran. A queued ordinary ask did not submit; a queued recovery
@@ -351,12 +359,17 @@ provider contention.
 
 Queue and execution limits are separate. Waiting for the current owner of the
 same conversation is bounded by the fixed 900-second queue TTL and does not
-consume the ask's execution budget. On admission, the job receives the current
-execution budget.
+consume the ask's execution window. Browser-capacity queueing is also excluded.
+After browser admission, one monotonic 90-minute maximum covers submission
+jitter, page setup, the initial browser interaction, detached polling,
+automatic recovery, and generated-file saving. Polling and recovery do not
+restart this deadline. A ready result returns immediately; the maximum is not
+a mandatory wait.
 
-Before five successful duration samples exist, the execution budget is the
-configured ceiling. After that, the gateway uses the p95 of up to 64 recent
-successful durations plus 50 percent. The measured budget is clamped to the
+The watchdog controls a separate initial browser-stage budget, not the total
+90-minute window. Before five successful duration samples exist, that initial
+budget is the configured ceiling. After that, the gateway uses the p95 of up to
+64 recent successful durations plus 50 percent. The measured budget is clamped to the
 configured minimum and ceiling; if the minimum exceeds the ceiling, the ceiling
 wins. Only successful ask durations update these measurements; failed asks do
 not.
@@ -367,9 +380,9 @@ The gptpro scheduler reads these environment variables directly:
 
 | Variable | Default | Behavior |
 | --- | --- | --- |
-| `GPTPRO_OVERALL_TIMEOUT_SECONDS` | `900` | Positive floating-point execution-budget ceiling in seconds. Missing, non-numeric, zero, and negative values use the default. This is only a ceiling: increasing it does not raise a lower measured budget (`p95 × 1.5`); use `GPTPRO_MIN_EXECUTION_BUDGET_SECONDS` to raise that floor. Only successful ask durations affect the measurement; failures do not. |
+| `GPTPRO_OVERALL_TIMEOUT_SECONDS` | `900` | Positive floating-point initial browser-stage budget ceiling in seconds. It cannot extend the fixed 90-minute total execution limit. Missing, non-numeric, zero, and negative values use the default. This is only a ceiling: increasing it does not raise a lower measured budget (`p95 × 1.5`); use `GPTPRO_MIN_EXECUTION_BUDGET_SECONDS` to raise that floor. Only successful ask durations affect the measurement; failures do not. |
 | `GPTPRO_MIN_EXECUTION_BUDGET_SECONDS` | `60` | Positive floating-point floor for the execution budget reduced by watchdog measurements. Missing, non-numeric, zero, and negative values use the default. Values above `GPTPRO_OVERALL_TIMEOUT_SECONDS` are clamped to that ceiling. |
-| `GPTPRO_RAW_TURN_RECOVERY_SECONDS` | `300` | Floating-point recovery window for eligible uncertain or incomplete turns and explicit read-only recovery. Positive values enable polling; zero or negative values disable it. |
+| `GPTPRO_RAW_TURN_RECOVERY_SECONDS` | `5400` | Polling window in seconds, for eligible uncertain or incomplete turns and explicit read-only recovery. Automatic recovery and file saving are capped by the original execution deadline. A shorter polling window retains the existing bounded file-saving allowance within the total limit. Positive values are capped at 5400; zero or negative values disable recovery. Missing, non-numeric, and nonfinite values use the default. |
 | `GPTPRO_MAX_CONCURRENT_ASKS` | `2` | Integer ask-tab concurrency. Non-integer values use the default; values below 1 are clamped to 1. |
 
 Set overrides in the environment that starts the gateway. A background daemon
