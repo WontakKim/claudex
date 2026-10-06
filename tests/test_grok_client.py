@@ -10,6 +10,7 @@ from typing import Any
 import httpx
 import pytest
 
+import claudex.providers.grok_client as grok_module
 from claudex.providers.model_catalog_cache import ModelCatalogCache
 from claudex.providers.grok_auth import GrokAuthError, GrokCredentials
 from claudex.providers.grok_client import (
@@ -19,6 +20,41 @@ from claudex.providers.grok_client import (
     GrokUpstreamError,
     sanitize_grok_payload,
 )
+
+
+@pytest.fixture(autouse=True)
+def no_host_grok_probe(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def missing_grok(*args: Any, **kwargs: Any) -> Any:
+        assert args == ("grok", "--version")
+        raise FileNotFoundError("grok")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", missing_grok)
+
+
+class _GrokVersionProcess:
+    def __init__(
+        self, output: str, *, returncode: int = 0, stderr: str = "", hang: bool = False
+    ) -> None:
+        self.output = output
+        self.returncode = returncode
+        self.stderr = stderr
+        self.hang = hang
+        self.killed = False
+        self.reaped = False
+        self.started = asyncio.Event()
+        self.finished = asyncio.Event()
+
+    async def communicate(self) -> tuple[bytes, bytes]:
+        self.started.set()
+        if self.hang:
+            await self.finished.wait()
+        self.reaped = True
+        return self.output.encode(), self.stderr.encode()
+
+    def kill(self) -> None:
+        self.killed = True
+        self.returncode = -9
+        self.finished.set()
 
 
 def _payload(**overrides: Any) -> dict[str, Any]:
@@ -184,8 +220,8 @@ def test_stream_responses_sends_grok_headers_and_parses_events() -> None:
     assert str(request.url) == GROK_RESPONSES_URL
     assert request.headers["authorization"] == "Bearer grok-token-1"
     assert request.headers["x-xai-token-auth"] == "xai-grok-cli"
-    assert request.headers["x-grok-client-version"]
-    assert request.headers["user-agent"].startswith("xai-grok-workspace/")
+    assert request.headers["x-grok-client-version"] == "0.2.93"
+    assert request.headers["user-agent"] == "xai-grok-workspace/0.2.93"
     assert request.headers["x-grok-conv-id"] == "session-1"
     assert request.headers["accept"] == "text/event-stream"
 
@@ -523,3 +559,218 @@ class TestContextWindow:
         with pytest.raises(GrokUpstreamError) as exc_info:
             asyncio.run(scenario())
         assert exc_info.value.status_code == 500
+
+
+@pytest.mark.parametrize(
+    ("cli_version", "effective_version"),
+    [("1.0.46", "1.0.46"), ("0.2.9", "0.2.93"), ("0.2.93", "0.2.93")],
+)
+def test_installed_grok_version_is_used_for_stream_and_catalog_headers(
+    cli_version: str, effective_version: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    commands: list[tuple[Any, ...]] = []
+    process = _GrokVersionProcess(f"grok {cli_version} (2765805b9442) [stable]\nignored")
+
+    async def spawn(*args: Any, **kwargs: Any) -> _GrokVersionProcess:
+        commands.append(args)
+        assert kwargs == {"stdout": asyncio.subprocess.PIPE, "stderr": asyncio.subprocess.PIPE}
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+    captured: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        if str(request.url) == GROK_MODELS_URL:
+            return httpx.Response(200, json={"data": [{"id": "grok-4.5"}]})
+        return httpx.Response(200, content=_sse([]))
+
+    async def scenario() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+            client = GrokClient(_FakeAuthManager(), http_client)
+            await _collect(client, _payload())
+            assert await client.list_models() == ["grok-4.5"]
+
+    asyncio.run(scenario())
+    assert commands == [("grok", "--version")]
+    assert process.reaped
+    assert [str(request.url) for request in captured] == [GROK_RESPONSES_URL, GROK_MODELS_URL]
+    for request in captured:
+        assert request.headers["x-grok-client-version"] == effective_version
+        assert request.headers["user-agent"] == f"xai-grok-workspace/{effective_version}"
+
+
+def test_missing_grok_uses_bundled_version_without_warning(caplog: pytest.LogCaptureFixture) -> None:
+    async def scenario() -> None:
+        discovery = grok_module.GrokVersionDiscovery()
+        assert discovery.current_version == "0.2.93"
+        assert await discovery.get_version() == "0.2.93"
+        assert discovery.current_version == "0.2.93"
+
+    asyncio.run(scenario())
+    assert not caplog.records
+
+
+@pytest.mark.parametrize(("output", "returncode"), [("garbage", 0), ("", 0), ("grok 1.0.46", 7)])
+def test_broken_grok_probe_falls_back_and_warns_once(
+    output: str,
+    returncode: int,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    async def spawn(*args: Any, **kwargs: Any) -> _GrokVersionProcess:
+        return _GrokVersionProcess(output, returncode=returncode, stderr="failed")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+
+    async def scenario() -> None:
+        discovery = grok_module.GrokVersionDiscovery()
+        assert await discovery.get_version() == "0.2.93"
+        assert await discovery.get_version() == "0.2.93"
+
+    asyncio.run(scenario())
+    assert len(caplog.records) == 1
+    assert caplog.records[0].name == grok_module.__name__
+    assert caplog.records[0].levelname == "WARNING"
+
+
+def test_grok_os_error_falls_back_with_warning(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    async def denied(*args: Any, **kwargs: Any) -> Any:
+        raise PermissionError("grok is not executable")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", denied)
+    assert asyncio.run(grok_module.GrokVersionDiscovery().get_version()) == "0.2.93"
+    assert len(caplog.records) == 1
+    assert "grok is not executable" in caplog.text
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+def test_grok_probe_timeout_and_cancellation_kill_and_reap_process(
+    cancel: bool, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    process = _GrokVersionProcess("", hang=True)
+
+    async def spawn(*args: Any, **kwargs: Any) -> _GrokVersionProcess:
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+    monkeypatch.setattr(grok_module, "_GROK_VERSION_PROBE_TIMEOUT", 0.01, raising=False)
+
+    async def scenario() -> None:
+        discovery = grok_module.GrokVersionDiscovery()
+        task = asyncio.create_task(discovery.get_version())
+        await asyncio.wait_for(process.started.wait(), timeout=1)
+        if cancel:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, timeout=1)
+            assert discovery._checked_at is None
+        else:
+            assert await asyncio.wait_for(task, timeout=1) == "0.2.93"
+
+    asyncio.run(scenario())
+    assert process.killed
+    assert process.reaped
+    assert len(caplog.records) == (0 if cancel else 1)
+
+
+def test_grok_version_cache_expiry_updates_both_request_paths(monkeypatch: pytest.MonkeyPatch) -> None:
+    versions = iter(["1.0.46", "1.0.47", "1.0.48"])
+    commands: list[tuple[Any, ...]] = []
+
+    async def spawn(*args: Any, **kwargs: Any) -> _GrokVersionProcess:
+        commands.append(args)
+        return _GrokVersionProcess(f"grok {next(versions)} (hash) [stable]")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+    captured: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        if str(request.url) == GROK_MODELS_URL:
+            return httpx.Response(200, json={"data": []})
+        return httpx.Response(200, content=_sse([]))
+
+    async def scenario() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+            client = GrokClient(_FakeAuthManager(), http_client)
+            clock = _FakeClock()
+            client._version_discovery._clock = clock
+            await _collect(client, _payload())
+            clock.advance(59)
+            await client.list_models()
+            assert len(commands) == 1
+            clock.advance(1)
+            await client.list_models()
+            assert len(commands) == 2
+            clock.advance(60)
+            await _collect(client, _payload())
+            assert client._version_discovery.current_version == "1.0.48"
+
+    asyncio.run(scenario())
+    assert len(commands) == 3
+    for request, version in zip(captured, ["1.0.46", "1.0.46", "1.0.47", "1.0.48"], strict=True):
+        assert request.headers["x-grok-client-version"] == version
+        assert request.headers["user-agent"] == f"xai-grok-workspace/{version}"
+
+
+def test_concurrent_grok_version_requests_share_one_probe(monkeypatch: pytest.MonkeyPatch) -> None:
+    process = _GrokVersionProcess("grok 1.0.46", hang=True)
+    commands: list[tuple[Any, ...]] = []
+
+    async def spawn(*args: Any, **kwargs: Any) -> _GrokVersionProcess:
+        commands.append(args)
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+
+    async def scenario() -> None:
+        discovery = grok_module.GrokVersionDiscovery()
+        tasks = [asyncio.create_task(discovery.get_version()) for _ in range(3)]
+        await asyncio.wait_for(process.started.wait(), timeout=1)
+        process.finished.set()
+        assert await asyncio.gather(*tasks) == ["1.0.46"] * 3
+
+    asyncio.run(scenario())
+    assert commands == [("grok", "--version")]
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+def test_grok_probe_cleanup_is_bounded_when_pipes_stay_open(
+    cancel: bool, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    class OpenPipeProcess(_GrokVersionProcess):
+        def kill(self) -> None:
+            self.killed = True
+            self.returncode = -9
+
+    process = OpenPipeProcess("", hang=True)
+
+    async def spawn(*args: Any, **kwargs: Any) -> OpenPipeProcess:
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+    monkeypatch.setattr(grok_module, "_GROK_VERSION_PROBE_TIMEOUT", 0.01)
+    monkeypatch.setattr(grok_module, "_GROK_VERSION_CLEANUP_TIMEOUT", 0.01, raising=False)
+
+    async def scenario() -> None:
+        discovery = grok_module.GrokVersionDiscovery()
+        task = asyncio.create_task(discovery.get_version())
+        await asyncio.wait_for(process.started.wait(), timeout=1)
+        if cancel:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, timeout=0.2)
+            assert discovery._checked_at is None
+        else:
+            assert await asyncio.wait_for(task, timeout=0.2) == "0.2.93"
+            assert discovery._checked_at is not None
+
+    asyncio.run(scenario())
+    assert process.killed
+    assert len(caplog.records) == (0 if cancel else 1)
+    if not cancel:
+        assert caplog.records[0].levelname == "WARNING"
+        assert "could not reap its process" in caplog.text

@@ -194,6 +194,13 @@ reasoning config — sending one to a non-thinking model fails upstream.
 A newly released thinking model simply runs at its default effort until the
 gateway's list catches up.
 
+The gateway uses the newer of the installed `grok --version` and its verified
+bundled client version (0.2.93) for both `x-grok-client-version` and User-Agent
+on Responses and model catalog requests. After a 60-second cache expires, the
+next request checks the installed version again, so updating Grok does not
+require restarting the gateway. If the CLI is absent or cannot report its
+version, the gateway falls back to the bundled version.
+
 ## Custom providers
 
 Named custom routes can use either the OpenAI Responses wire family or the
