@@ -379,6 +379,9 @@ not.
 Ask-tab concurrency is the `gptpro.max_concurrent_asks` setting (integer 1–10,
 default 2), read from `settings.json` or `GPTPRO_MAX_CONCURRENT_ASKS`. See
 [Configuration](configuration.md) for source precedence and startup validation.
+The admin API (`PUT /admin/settings/gptpro`) applies changes to the running daemon
+without a restart: raising the limit admits waiting asks immediately, while
+lowering it lets in-flight asks finish.
 
 The gptpro scheduler reads these environment variables directly:
 

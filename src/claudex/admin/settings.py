@@ -22,6 +22,9 @@ from claudex.admin.common import (
 from claudex.balanced.runtime import BalancedPrepareError, ClaudeBalancedRuntime
 from claudex.claude.accounts import AccountRegistryError, list_accounts, load_registry
 from claudex.config import (
+    DEFAULT_GPTPRO_MAX_CONCURRENT_ASKS,
+    MAX_GPTPRO_MAX_CONCURRENT_ASKS,
+    MIN_GPTPRO_MAX_CONCURRENT_ASKS,
     SETTINGS_KEYS,
     VALID_CLAUDE_ACCOUNT_ROUTING_MODES,
     VALID_CODEX_SERVICE_TIERS,
@@ -487,6 +490,104 @@ async def _handle_admin_codex_put(request: Request) -> JSONResponse:
         new_config = replace(config, codex_service_tier=value)
         request.app.state.config = new_config
     return JSONResponse(_codex_payload(new_config))
+
+
+_GPTPRO_KEYS = ("max_concurrent_asks",)
+
+
+def _gptpro_payload(config: GatewayConfig) -> dict[str, Any]:
+    env_name = SETTINGS_KEYS["gptpro.max_concurrent_asks"]
+    return {
+        "max_concurrent_asks": config.gptpro_max_concurrent_asks,
+        "env_locked": os.environ.get(env_name) is not None,
+    }
+
+
+async def _handle_admin_gptpro_get(request: Request) -> JSONResponse:
+    denied = _admin_guard(request)
+    if denied is not None:
+        return denied
+    return JSONResponse(_gptpro_payload(request.app.state.config))
+
+
+async def _handle_admin_gptpro_put(request: Request) -> JSONResponse:
+    denied = _admin_guard(request) or _require_json_content_type(request)
+    if denied is not None:
+        return denied
+
+    body, error = await _read_json_object(request, server_support._openai_error_body)
+    if error is not None or body is None:
+        return error
+    unknown = sorted(set(body) - set(_GPTPRO_KEYS))
+    if unknown:
+        return JSONResponse(
+            server_support._openai_error_body(
+                "invalid_request_error",
+                f"unknown keys: {', '.join(unknown)}; "
+                f"supported: {', '.join(_GPTPRO_KEYS)}",
+            ),
+            status_code=400,
+        )
+    if "max_concurrent_asks" not in body:
+        return JSONResponse(
+            server_support._openai_error_body(
+                "invalid_request_error",
+                "provide 'max_concurrent_asks' "
+                f"(integer {MIN_GPTPRO_MAX_CONCURRENT_ASKS}–"
+                f"{MAX_GPTPRO_MAX_CONCURRENT_ASKS} or null)",
+            ),
+            status_code=400,
+        )
+
+    value = body["max_concurrent_asks"]
+    if value is not None and (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or not MIN_GPTPRO_MAX_CONCURRENT_ASKS <= value <= MAX_GPTPRO_MAX_CONCURRENT_ASKS
+    ):
+        return JSONResponse(
+            server_support._openai_error_body(
+                "invalid_request_error",
+                "max_concurrent_asks must be null or an integer between "
+                f"{MIN_GPTPRO_MAX_CONCURRENT_ASKS} and {MAX_GPTPRO_MAX_CONCURRENT_ASKS}",
+            ),
+            status_code=400,
+        )
+
+    env_name = SETTINGS_KEYS["gptpro.max_concurrent_asks"]
+    if os.environ.get(env_name) is not None:
+        return JSONResponse(
+            server_support._openai_error_body(
+                "invalid_request_error",
+                f"{env_name} is set in the gateway's environment and overrides "
+                "gptpro.max_concurrent_asks; unset it to manage the setting at runtime",
+            ),
+            status_code=409,
+        )
+
+    async with request.app.state.admin_lock:
+        config: GatewayConfig = request.app.state.config
+        try:
+            if value is None:
+                update_settings_file(
+                    config.settings_file, {}, deletions=("gptpro.max_concurrent_asks",)
+                )
+            else:
+                update_settings_file(
+                    config.settings_file, {"gptpro.max_concurrent_asks": value}
+                )
+        except (ConfigError, OSError) as exc:
+            return JSONResponse(
+                server_support._openai_error_body(
+                    "server_error", f"could not persist settings: {exc}"
+                ),
+                status_code=500,
+            )
+        effective = DEFAULT_GPTPRO_MAX_CONCURRENT_ASKS if value is None else value
+        new_config = replace(config, gptpro_max_concurrent_asks=effective)
+        request.app.state.config = new_config
+        request.app.state.gptpro_ask_runtime.set_max_concurrent_asks(effective)
+    return JSONResponse(_gptpro_payload(new_config))
 
 
 _CLAUDE_ACCOUNT_KEYS = ("account_id",)

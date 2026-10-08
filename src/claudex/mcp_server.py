@@ -28,6 +28,10 @@ class LazyAskRuntime:
 
     def set_max_concurrent_asks(self, limit: int) -> None:
         self._max_concurrent_asks = limit
+        # A runtime created concurrently by _get_runtime reads the stored limit,
+        # so no update is lost without taking the asynchronous lock here.
+        if self._runtime is not None:
+            self._runtime.set_max_concurrent_asks(limit)
 
     @property
     def max_concurrent_asks(self) -> int:

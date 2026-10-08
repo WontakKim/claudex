@@ -584,6 +584,51 @@ class DetachPoller:
             return
 
 
+class _AdmissionGate:
+    """Semaphore whose limit can change while asks are in flight.
+
+    Raising the limit releases permits immediately so waiting submitters
+    wake; lowering it never interrupts admitted asks — the next releases are
+    swallowed instead of returning permits, so the pool shrinks as they finish.
+    """
+
+    def __init__(self, limit: int) -> None:
+        self._limit = limit
+        self._semaphore = asyncio.Semaphore(limit)
+        self._pending_shrink = 0
+
+    @property
+    def limit(self) -> int:
+        return self._limit
+
+    @property
+    def _value(self) -> int:
+        return self._semaphore._value
+
+    def locked(self) -> bool:
+        return self._semaphore.locked()
+
+    async def acquire(self) -> None:
+        await self._semaphore.acquire()
+
+    def release(self) -> None:
+        if self._pending_shrink > 0:
+            self._pending_shrink -= 1
+            return
+        self._semaphore.release()
+
+    def set_limit(self, new_limit: int) -> None:
+        delta = new_limit - self._limit
+        self._limit = new_limit
+        if delta < 0:
+            self._pending_shrink += -delta
+            return
+        paid = min(delta, self._pending_shrink)
+        self._pending_shrink -= paid
+        for _ in range(delta - paid):
+            self._semaphore.release()
+
+
 class AskRuntime:
     """Own one lazy persistent context and its bounded pool of ask tabs."""
 
@@ -595,9 +640,14 @@ class AskRuntime:
         self._context: Any | None = None
         self._profile_lock: locking.FileLockHandle | None = None
         self._initialization_lock = asyncio.Lock()
-        self._ask_semaphore = asyncio.Semaphore(max_concurrent_asks)
+        self._ask_semaphore = _AdmissionGate(max_concurrent_asks)
         self._waiting_submitters = 0
         self._poller = DetachPoller(self._get_context)
+
+    def set_max_concurrent_asks(self, limit: int) -> None:
+        if limit < 1:
+            raise ValueError("max_concurrent_asks must be at least 1")
+        self._ask_semaphore.set_limit(limit)
 
     async def ask(
         self,

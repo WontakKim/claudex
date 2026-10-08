@@ -2239,3 +2239,67 @@ def test_short_auto_recovery_file_allowance_cannot_extend_total(
 def test_runtime_rejects_nonpositive_concurrency(limit: int) -> None:
     with pytest.raises(ValueError, match="max_concurrent_asks"):
         runtime.AskRuntime(max_concurrent_asks=limit)
+
+
+@pytest.mark.parametrize("change", ["grow", "shrink", "shrink_then_grow"])
+def test_runtime_resizes_admission_live(
+    monkeypatch: pytest.MonkeyPatch, change: str
+) -> None:
+    context = _FakeContext()
+    _RuntimeFakes(monkeypatch, [context])
+
+    async def scenario() -> None:
+        started = {question: asyncio.Event() for question in ("one", "two", "three")}
+        finish = {question: asyncio.Event() for question in started}
+
+        async def execute_ask_outcome(
+            page: _FakePage, question: str, **options: Any
+        ) -> ask.AskOutcome:
+            started[question].set()
+            await finish[question].wait()
+            return _outcome(question)
+
+        monkeypatch.setattr(runtime.ask, "execute_ask_outcome", execute_ask_outcome)
+        ask_runtime = runtime.AskRuntime(
+            max_concurrent_asks=1 if change == "grow" else 2
+        )
+        tasks = [asyncio.create_task(ask_runtime.ask(question)) for question in started]
+        try:
+            await asyncio.wait_for(started["one"].wait(), timeout=1)
+            if change == "grow":
+                await asyncio.sleep(0)
+                assert not started["two"].is_set()
+                ask_runtime.set_max_concurrent_asks(2)
+                await asyncio.wait_for(started["two"].wait(), timeout=1)
+                assert not tasks[0].done()
+                assert not started["three"].is_set()
+            else:
+                await asyncio.wait_for(started["two"].wait(), timeout=1)
+                ask_runtime.set_max_concurrent_asks(1)
+                assert not tasks[0].done()
+                assert not tasks[1].done()
+                if change == "shrink_then_grow":
+                    ask_runtime.set_max_concurrent_asks(2)
+                    await asyncio.sleep(0)
+                    assert not started["three"].is_set()
+                finish["one"].set()
+                await asyncio.wait_for(tasks[0], timeout=1)
+                if change == "shrink":
+                    await asyncio.sleep(0)
+                    assert not started["three"].is_set()
+                    finish["two"].set()
+                    await asyncio.wait_for(tasks[1], timeout=1)
+                await asyncio.wait_for(started["three"].wait(), timeout=1)
+        finally:
+            for event in finish.values():
+                event.set()
+            await asyncio.gather(*tasks)
+            await ask_runtime.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_runtime_resize_rejects_nonpositive_concurrency() -> None:
+    ask_runtime = runtime.AskRuntime()
+    with pytest.raises(ValueError, match="max_concurrent_asks"):
+        ask_runtime.set_max_concurrent_asks(0)

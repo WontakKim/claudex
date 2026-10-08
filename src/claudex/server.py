@@ -54,6 +54,8 @@ from claudex.admin.settings import (
     _handle_admin_codex_put,
     _handle_admin_compaction_get,
     _handle_admin_compaction_put,
+    _handle_admin_gptpro_get,
+    _handle_admin_gptpro_put,
     _handle_admin_log_level_get,
     _handle_admin_log_level_put,
     _handle_admin_mapping_get,
@@ -467,6 +469,8 @@ def create_app(config: GatewayConfig, daemon_nonce: str | None = None) -> Starle
             ),
             Route("/admin/settings/codex", _handle_admin_codex_get, methods=["GET"]),
             Route("/admin/settings/codex", _handle_admin_codex_put, methods=["PUT"]),
+            Route("/admin/settings/gptpro", _handle_admin_gptpro_get, methods=["GET"]),
+            Route("/admin/settings/gptpro", _handle_admin_gptpro_put, methods=["PUT"]),
             Route(
                 "/admin/providers/codex/models",
                 _handle_admin_codex_models,

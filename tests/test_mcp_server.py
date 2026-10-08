@@ -1652,3 +1652,25 @@ def test_lazy_runtime_passes_configured_concurrency(
     created = asyncio.run(lazy_runtime._get_runtime())
     assert isinstance(created, RuntimeSpy)
     assert captured == [{"max_concurrent_asks": 3}]
+
+
+def test_lazy_runtime_forwards_live_concurrency(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from claudex.gptpro import runtime
+
+    forwarded: list[int] = []
+
+    class RuntimeSpy:
+        def __init__(self, **options: Any) -> None:
+            pass
+
+        def set_max_concurrent_asks(self, limit: int) -> None:
+            forwarded.append(limit)
+
+    monkeypatch.setattr(runtime, "AskRuntime", RuntimeSpy)
+    lazy_runtime = LazyAskRuntime()
+    asyncio.run(lazy_runtime._get_runtime())
+    lazy_runtime.set_max_concurrent_asks(5)
+    assert forwarded == [5]
+    assert lazy_runtime.max_concurrent_asks == 5
