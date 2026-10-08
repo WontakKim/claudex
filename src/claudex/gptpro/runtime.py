@@ -279,6 +279,16 @@ class DetachPoller:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            threads = ", ".join(sorted({
+                registration.conversation_id
+                for registration in self._registrations.values()
+            }))
+            logger.exception(
+                "gptpro detached answer poller failed unexpectedly; failing %d "
+                "registration(s) (thread=%s)",
+                len(self._registrations),
+                threads or "none",
+            )
             failure = GptProAskError(
                 "error", "the detached answer poller failed unexpectedly"
             )
