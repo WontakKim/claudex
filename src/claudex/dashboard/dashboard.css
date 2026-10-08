@@ -299,6 +299,16 @@ input[type="checkbox"]{width:15px;height:15px;accent-color:var(--info)}
 .complock code,.acctlock code{color:var(--cyan)}
 #compaction-card.locked .complock,#codex-card.locked .complock,#routing-card.locked .complock{display:block}
 #gptpro-concurrency-card.locked .complock{display:block}
+#gptpro-concurrency-card{border-top:1px solid var(--line);margin-top:14px;padding-top:12px}
+.gptpro-concurrency-row{display:flex;align-items:center;gap:18px}
+.gptpro-concurrency-copy{flex:1;min-width:0}
+.gptpro-concurrency-copy label{display:block;font:700 12px var(--mono);letter-spacing:.06em;text-transform:uppercase}
+.gptpro-concurrency-copy .sub{margin:4px 0 0}
+#gptpro-concurrency{flex:none;width:64px;font-weight:600;color-scheme:dark}
+#gptpro-concurrency-status{font:11.5px/1.5 var(--mono);font-variant-numeric:tabular-nums}
+#gptpro-concurrency-status[data-state="error"]{color:var(--err)}
+#gptpro-concurrency-status[data-state="success"]{color:var(--ok)}
+@media(prefers-color-scheme:light){#gptpro-concurrency{color-scheme:light}}
 #scard-accounts.locked .acctlock{display:block}
 #compaction-card.locked,
 #codex-card.locked,

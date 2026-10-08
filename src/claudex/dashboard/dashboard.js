@@ -1327,68 +1327,122 @@ document.getElementById("codex-fast").addEventListener("change",function(){
   renderCodex();
 });
 document.getElementById("codex-apply").addEventListener("click",applyCodex);
-var GPTPRO_CONCURRENCY={envName:"GPTPRO_MAX_CONCURRENT_ASKS",locked:false,live:null,draft:null};
+var GPTPRO_CONCURRENCY={
+  envName:"GPTPRO_MAX_CONCURRENT_ASKS",locked:false,live:null,draft:null,
+  hasLoaded:false,isSaving:false,requestGeneration:0,message:"",messageKind:""
+};
 function isGptProConcurrencyEnvelope(body){
   return !!body&&typeof body.env_locked==="boolean"&&typeof body.max_concurrent_asks==="number"&&
     body.max_concurrent_asks%1===0&&body.max_concurrent_asks>=1&&body.max_concurrent_asks<=10;
 }
 function renderGptProConcurrency(){
-  document.getElementById("gptpro-concurrency-card").classList.toggle("locked",GPTPRO_CONCURRENCY.locked);
+  var card=document.getElementById("gptpro-concurrency-card");
+  card.classList.toggle("locked",GPTPRO_CONCURRENCY.locked);
+  card.setAttribute("aria-busy",String(GPTPRO_CONCURRENCY.isSaving));
   document.getElementById("gptpro-concurrency-lock-env").textContent=GPTPRO_CONCURRENCY.envName;
   var select=document.getElementById("gptpro-concurrency");
   select.value=GPTPRO_CONCURRENCY.draft===null?"":String(GPTPRO_CONCURRENCY.draft);
-  select.disabled=GPTPRO_CONCURRENCY.locked;
-  var btn=document.getElementById("gptpro-concurrency-apply");
-  btn.disabled=GPTPRO_CONCURRENCY.locked||GPTPRO_CONCURRENCY.draft===GPTPRO_CONCURRENCY.live;
-  btn.textContent="Apply";
+  select.disabled=GPTPRO_CONCURRENCY.locked||GPTPRO_CONCURRENCY.isSaving||!GPTPRO_CONCURRENCY.hasLoaded;
+  var status=document.getElementById("gptpro-concurrency-status");
+  status.textContent=GPTPRO_CONCURRENCY.message;
+  status.dataset.state=GPTPRO_CONCURRENCY.messageKind;
+  status.hidden=!GPTPRO_CONCURRENCY.message;
 }
 function renderGptProConcurrencyState(body){
   GPTPRO_CONCURRENCY.live=body.max_concurrent_asks;
   GPTPRO_CONCURRENCY.locked=body.env_locked;
   GPTPRO_CONCURRENCY.draft=body.max_concurrent_asks;
+  GPTPRO_CONCURRENCY.hasLoaded=true;
+  GPTPRO_CONCURRENCY.message="";
+  GPTPRO_CONCURRENCY.messageKind="";
   renderGptProConcurrency();
 }
+function showGptProConcurrencyError(operation,message,detail,status){
+  GPTPRO_CONCURRENCY.message=message;
+  GPTPRO_CONCURRENCY.messageKind="error";
+  renderGptProConcurrency();
+  showToast('<span class="chip chip-err">ERROR</span>'+(status?'<span class="lat">'+status+"</span>":"")+
+    "<br>"+esc(operation)+'<br><span class="dim">'+esc(detail)+"</span>",true);
+}
 function fetchGptProConcurrency(){
-  jfetch("/admin/settings/gptpro").then(function(r){
+  if(GPTPRO_CONCURRENCY.isSaving)return Promise.resolve();
+  var generation=++GPTPRO_CONCURRENCY.requestGeneration;
+  return jfetch("/admin/settings/gptpro").then(function(r){
+    if(generation!==GPTPRO_CONCURRENCY.requestGeneration)return;
     if(r.ok&&isGptProConcurrencyEnvelope(r.body)){
       renderGptProConcurrencyState(r.body);
-    }else{
-      renderGptProConcurrency();
-      showToast('<span class="chip chip-err">ERROR</span><span class="lat">'+r.status+
-        '</span><br>GET /admin/settings/gptpro<br><span class="dim">'+esc(errDetail(r.body))+"</span>",true);
+      return;
     }
+    GPTPRO_CONCURRENCY.hasLoaded=false;
+    GPTPRO_CONCURRENCY.draft=null;
+    showGptProConcurrencyError("GET /admin/settings/gptpro","Could not load settings. Editing unavailable.",
+      r.ok?"invalid settings response":errDetail(r.body),r.status);
   }).catch(function(){
-    renderGptProConcurrency();
-    showToast('<span class="chip chip-err">ERROR</span><br>GET /admin/settings/gptpro'+
-      '<br><span class="dim">gateway unreachable</span>',true);
+    if(generation!==GPTPRO_CONCURRENCY.requestGeneration)return;
+    GPTPRO_CONCURRENCY.hasLoaded=false;
+    GPTPRO_CONCURRENCY.draft=null;
+    showGptProConcurrencyError("GET /admin/settings/gptpro","Could not load settings. Editing unavailable.","gateway unreachable");
   });
 }
-function applyGptProConcurrency(){
-  var btn=document.getElementById("gptpro-concurrency-apply");
-  if(GPTPRO_CONCURRENCY.locked||btn.disabled)return;
-  applyLockableSetting({
-    button:btn,
-    request:function(){return jfetch("/admin/settings/gptpro",{
-      method:"PUT",
-      headers:JSON_HEADERS,
-      body:JSON.stringify({max_concurrent_asks:Number(GPTPRO_CONCURRENCY.draft)})
-    })},
-    refresh:function(){return jfetch("/admin/settings/gptpro")},
-    lock:function(){GPTPRO_CONCURRENCY.locked=true},
-    render:renderGptProConcurrency,
-    isFresh:function(g){return g.ok&&isGptProConcurrencyEnvelope(g.body)},
-    adopt:function(g){renderGptProConcurrencyState(g.body)},
-    envName:GPTPRO_CONCURRENCY.envName,
-    name:"GPT Pro concurrency",
-    refreshName:"GPT Pro concurrency refresh",
-    successText:function(body){return "GPT Pro concurrency → "+body.max_concurrent_asks}
+function saveGptProConcurrency(nextLimit){
+  if(GPTPRO_CONCURRENCY.locked||GPTPRO_CONCURRENCY.isSaving||!GPTPRO_CONCURRENCY.hasLoaded||
+    typeof nextLimit!=="number"||nextLimit%1!==0||nextLimit<1||nextLimit>10||nextLimit===GPTPRO_CONCURRENCY.live){
+    renderGptProConcurrency();
+    return Promise.resolve();
+  }
+  // A pending GET must not overwrite a save or its conflict lock.
+  ++GPTPRO_CONCURRENCY.requestGeneration;
+  GPTPRO_CONCURRENCY.isSaving=true;
+  GPTPRO_CONCURRENCY.draft=nextLimit;
+  GPTPRO_CONCURRENCY.message="Saving…";
+  GPTPRO_CONCURRENCY.messageKind="";
+  renderGptProConcurrency();
+  var isConflict=false;
+  return jfetch("/admin/settings/gptpro",{
+    method:"PUT",
+    headers:JSON_HEADERS,
+    body:JSON.stringify({max_concurrent_asks:nextLimit})
+  }).then(function(r){
+    if(r.status===409){
+      isConflict=true;
+      GPTPRO_CONCURRENCY.locked=true;
+      GPTPRO_CONCURRENCY.message="Concurrency is locked by the gateway environment.";
+      GPTPRO_CONCURRENCY.messageKind="error";
+      renderGptProConcurrency();
+      showToast('<span class="chip chip-err">LOCKED</span><span class="lat">409</span><br>'+esc(GPTPRO_CONCURRENCY.envName)+
+        '<br><span class="dim">'+esc(errDetail(r.body))+"</span>",true);
+      return jfetch("/admin/settings/gptpro").then(function(g){
+        if(g.ok&&isGptProConcurrencyEnvelope(g.body)){
+          renderGptProConcurrencyState(g.body);
+          return;
+        }
+        showGptProConcurrencyError("GPT Pro concurrency refresh","Could not load current settings. Editing remains locked.",
+          g.ok?"invalid settings response":errDetail(g.body),g.status);
+      });
+    }
+    if(!r.ok||!isGptProConcurrencyEnvelope(r.body)){
+      showGptProConcurrencyError("GPT Pro concurrency","Could not save settings. Previous value restored.",
+        r.ok?"invalid settings response":errDetail(r.body),r.status);
+      return;
+    }
+    renderGptProConcurrencyState(r.body);
+    GPTPRO_CONCURRENCY.message="Applied · "+r.body.max_concurrent_asks+" tabs";
+    GPTPRO_CONCURRENCY.messageKind="success";
+    showToast('<span class="chip chip-ok">APPLIED</span><br>GPT Pro concurrency → '+r.body.max_concurrent_asks,false);
+  }).catch(function(){
+    showGptProConcurrencyError(isConflict?"GPT Pro concurrency refresh":"GPT Pro concurrency",
+      isConflict?"Could not load current settings. Editing remains locked.":"Could not save settings. Previous value restored.",
+      "gateway unreachable");
+  }).finally(function(){
+    GPTPRO_CONCURRENCY.isSaving=false;
+    GPTPRO_CONCURRENCY.draft=GPTPRO_CONCURRENCY.live;
+    renderGptProConcurrency();
   });
 }
 document.getElementById("gptpro-concurrency").addEventListener("change",function(){
-  GPTPRO_CONCURRENCY.draft=Number(this.value);
-  renderGptProConcurrency();
+  saveGptProConcurrency(Number(this.value));
 });
-document.getElementById("gptpro-concurrency-apply").addEventListener("click",applyGptProConcurrency);
+renderGptProConcurrency();
 /* --- account-pool routing mode (claude_account.routing) -------------------
    Same envelope discipline as the compaction card: adopt the live policy
    from every successful response, 409 flips the local lock and re-syncs from

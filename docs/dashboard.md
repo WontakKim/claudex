@@ -73,10 +73,13 @@ MCP backend. GPT Pro is the first backend section:
   doctor and displays the output. Sign-in opens a visible browser window on
   the gateway host, as `claudex-gateway gptpro login` does from a terminal,
   so either path needs a graphical session on that host.
-- **Ask concurrency** selects 1–10 parallel ask tabs (default: 2) and applies
-  changes to the running daemon immediately. The control is read-only with a
-  LOCKED band while `GPTPRO_MAX_CONCURRENT_ASKS` is set in the gateway
-  environment. Raising concurrency does not lift ChatGPT-side rate limits.
+- **Ask concurrency** limits how many GPT Pro ask tabs can run at once (1–10,
+  default: 2). Selecting a value saves and applies it to the running daemon
+  immediately; there is no Apply button. Editing pauses while saving or while
+  settings are unavailable. A failed save restores the last confirmed value.
+  The control is read-only with a LOCKED band while
+  `GPTPRO_MAX_CONCURRENT_ASKS` is set in the gateway environment. Raising
+  concurrency does not lift ChatGPT-side rate limits.
 
 The tab uses these guarded admin API operations:
 

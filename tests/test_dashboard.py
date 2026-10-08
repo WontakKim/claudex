@@ -111,6 +111,7 @@ def dashboard_runtime_result() -> dict[str, Any]:
     completed = subprocess.run(
         [
             node,
+            "--unhandled-rejections=strict",
             str(DASHBOARD_RUNTIME_HARNESS),
             str(DASHBOARD_JAVASCRIPT_PATH),
             str(DASHBOARD_HTML_PATH),
@@ -517,84 +518,247 @@ def test_mcp_tab_leads_with_connection_and_combines_gptpro_tools() -> None:
     assert 'id="gptpro-doctor-output"' in gptpro_markup
 
 
-def test_gptpro_concurrency_card_wires_apply_flow_and_env_lock() -> None:
-    start = DASHBOARD_HTML.index('id="gptpro-session-card"')
-    section = DASHBOARD_HTML[start:DASHBOARD_HTML.index('</section>', start)]
+def test_gptpro_concurrency_card_wires_native_autosave_and_env_lock() -> None:
+    start = DASHBOARD_HTML.index("id=\"gptpro-session-card\"")
+    section = DASHBOARD_HTML[start:DASHBOARD_HTML.index("</section>", start)]
     assert (
-        section.index('id="gptpro-login-detail"')
-        < section.index('id="gptpro-concurrency-card"')
-        < section.index('Diagnostics')
+        section.index("id=\"gptpro-login-detail\"")
+        < section.index("id=\"gptpro-concurrency-card\"")
+        < section.index("Diagnostics")
     )
     select = re.search(
-        r'<select id="gptpro-concurrency"[^>]*>(.*?)</select>',
+        r"<select id=\"gptpro-concurrency\"([^>]*)>(.*?)</select>",
         section,
         re.DOTALL,
     )
     assert select is not None
+    assert re.search(r"\bdisabled\b", select.group(1))
     assert re.findall(
-        r'<option value="(\d+)">\d+</option>', select.group(1)
+        r"<option value=\"(\d+)\">\d+</option>", select.group(2)
     ) == [str(value) for value in range(1, 11)]
-    assert 'id="gptpro-concurrency-apply"' in section
-    assert 'class="complock"' in section
-    assert (
-        '<code id="gptpro-concurrency-lock-env"></code> takes precedence.'
-        in section
+    placeholder = re.search(r"<option value=\"\"([^>]*)>", select.group(2))
+    assert placeholder is not None
+    assert re.search(r"\bdisabled\b", placeholder.group(1))
+    assert "gptpro-concurrency-apply" not in DASHBOARD_HTML
+    assert "gptpro-concurrency-apply" not in DASHBOARD_JAVASCRIPT
+    assert "Limits how many GPT Pro ask tabs can run at once." in section
+    assert "id=\"gptpro-concurrency-description\"" in section
+    assert "id=\"gptpro-concurrency-status\" role=\"status\" aria-live=\"polite\"" in section
+    assert "id=\"gptpro-concurrency-rules\"" in section
+    assert "aria-describedby=\"gptpro-concurrency-description gptpro-concurrency-status gptpro-concurrency-rules\"" in select.group(1)
+    assert section.index("<label for=\"gptpro-concurrency\">") < section.index("<select id=\"gptpro-concurrency\"")
+    assert ".gptpro-concurrency-row{display:flex;" in DASHBOARD_CSS
+    assert ".gptpro-concurrency-copy{flex:1;min-width:0}" in DASHBOARD_CSS
+    assert "#gptpro-concurrency{flex:none;width:64px;" in DASHBOARD_CSS
+    assert "class=\"complock\"" in section
+    assert "<code id=\"gptpro-concurrency-lock-env\"></code> takes precedence." in section
+    assert "GPTPRO_MAX_CONCURRENT_ASKS" in DASHBOARD_JAVASCRIPT
+    save_fn = javascript_section(
+        "function saveGptProConcurrency(nextLimit){",
+        "document.getElementById(\"gptpro-concurrency\").addEventListener",
     )
-    assert 'GPTPRO_MAX_CONCURRENT_ASKS' in DASHBOARD_JAVASCRIPT
-    assert 'jfetch("/admin/settings/gptpro")' in DASHBOARD_JAVASCRIPT
-    apply_fn = javascript_section(
-        'function applyGptProConcurrency(){',
-        'document.getElementById("gptpro-concurrency").addEventListener',
-    )
+    assert "applyLockableSetting" not in save_fn
     for source in (
-        'applyLockableSetting({',
-        'jfetch("/admin/settings/gptpro",{',
-        'method:"PUT"',
-        'headers:JSON_HEADERS',
-        'JSON.stringify({max_concurrent_asks:Number(GPTPRO_CONCURRENCY.draft)})',
+        "jfetch(\"/admin/settings/gptpro\",{", "method:\"PUT\"",
+        "headers:JSON_HEADERS", "JSON.stringify({max_concurrent_asks:nextLimit})",
     ):
-        assert source in apply_fn
+        assert source in save_fn
     assert (
-        'if(t==="mcp"){fetchGptProSession();fetchMcpInfo();fetchGptProLogin();'
-        'fetchGptProConcurrency()}' in DASHBOARD_JAVASCRIPT
+        "if(t===\"mcp\"){fetchGptProSession();fetchMcpInfo();fetchGptProLogin();"
+        "fetchGptProConcurrency()}" in DASHBOARD_JAVASCRIPT
     )
-    boot = javascript_section('function boot(){', '\nboot();')
-    assert '/admin/settings/gptpro' not in boot
-    assert '#gptpro-concurrency-card.locked .complock' in DASHBOARD_CSS
-    assert '#gptpro-concurrency-card.locked' in DASHBOARD_CSS
+    boot = javascript_section("function boot(){", "\nboot();")
+    assert "/admin/settings/gptpro" not in boot
+    assert "#gptpro-concurrency-card.locked .complock" in DASHBOARD_CSS
+    assert "#gptpro-concurrency-card.locked" in DASHBOARD_CSS
 
 
-def test_gptpro_concurrency_runtime_render_lock_and_apply(
+def assert_concurrency_ready(state: dict[str, Any], limit: int) -> None:
+    assert state["value"] == str(limit)
+    assert state["live"] == state["draft"] == limit
+    assert state["hasLoaded"] is True
+    assert state["isSaving"] is False
+    assert state["selectDisabled"] is False
+    assert state["locked"] is False
+    assert state["env"] == "GPTPRO_MAX_CONCURRENT_ASKS"
+
+
+def assert_concurrency_ignored(guard: dict[str, Any]) -> None:
+    assert guard["requestsAdded"] == 0
+    assert all(state == guard["before"] for state in guard["states"])
+
+
+def test_gptpro_concurrency_runtime_starts_disabled_and_loads_on_mcp(
     dashboard_runtime_result: dict[str, Any],
 ) -> None:
     states = dashboard_runtime_result["gptProConcurrencyStates"]
-    assert states["loaded"] == {
-        "value": "3",
-        "selectDisabled": False,
-        "applyDisabled": True,
-        "locked": False,
-        "env": "GPTPRO_MAX_CONCURRENT_ASKS",
+    assert states["noApply"] is True
+    for state in (states["initial"], states["loading"]):
+        assert state["value"] == ""
+        assert state["live"] is None
+        assert state["draft"] is None
+        assert state["hasLoaded"] is False
+        assert state["isSaving"] is False
+        assert state["selectDisabled"] is True
+        assert state["locked"] is False
+        assert state["env"] == "GPTPRO_MAX_CONCURRENT_ASKS"
+    unavailable = states["startupUnavailable"]
+    assert unavailable["hasLoaded"] is False
+    assert unavailable["selectDisabled"] is True
+    assert unavailable["value"] == ""
+    assert unavailable["status"] == "Could not load settings. Editing unavailable."
+    assert_concurrency_ignored(states["startupUnavailableGuard"])
+    assert_concurrency_ready(states["loaded"], 3)
+    assert_concurrency_ignored(states["unloadedGuard"])
+
+
+def test_gptpro_concurrency_runtime_saves_immediately_and_adopts_server_envelope(
+    dashboard_runtime_result: dict[str, Any],
+) -> None:
+    states = dashboard_runtime_result["gptProConcurrencyStates"]
+    assert states["immediateRequests"] == [{
+        "url": "/admin/settings/gptpro",
+        "options": {
+            "method": "PUT",
+            "headers": {"Content-Type": "application/json"},
+            "body": "{\"max_concurrent_asks\":5}",
+        },
+    }]
+    pending = states["pending"]
+    assert pending["value"] == "5"
+    assert pending["draft"] == 5
+    assert pending["live"] == 3
+    assert pending["isSaving"] is True
+    assert pending["selectDisabled"] is True
+    assert pending["status"] == "Saving…"
+    assert_concurrency_ready(states["saved"], 4)
+    assert states["saved"]["status"] == "Applied · 4 tabs"
+    assert states["saved"]["messageKind"] == "success"
+    locked = states["savedLocked"]
+    assert locked["value"] == "2"
+    assert locked["draft"] == locked["live"] == 2
+    assert locked["isSaving"] is False
+    assert locked["locked"] is True
+    assert locked["selectDisabled"] is True
+    assert_concurrency_ignored(states["busyGuard"])
+    assert states["suppressedGetRequests"] == 0
+
+
+def test_gptpro_concurrency_runtime_validates_and_blocks_locked_or_invalid_events(
+    dashboard_runtime_result: dict[str, Any],
+) -> None:
+    states = dashboard_runtime_result["gptProConcurrencyStates"]
+    assert states["validation"] == [True, True, *([False] * 8)]
+    assert_concurrency_ignored(states["invalidGuard"])
+    assert_concurrency_ignored(states["lockedGuard"])
+    locked = states["envLocked"]
+    assert locked["value"] == "3"
+    assert locked["draft"] == locked["live"] == 3
+    assert locked["locked"] is True
+    assert locked["selectDisabled"] is True
+    assert locked["isSaving"] is False
+
+
+def test_gptpro_concurrency_runtime_rolls_back_failed_put_and_allows_retry(
+    dashboard_runtime_result: dict[str, Any],
+) -> None:
+    scenarios = dashboard_runtime_result["gptProConcurrencyStates"]["saveErrors"]
+    assert len(scenarios) == 10
+    for scenario in scenarios:
+        failed = scenario["failed"]
+        assert_concurrency_ready(failed, 3)
+        assert failed["status"] == "Could not save settings. Previous value restored."
+        assert failed["messageKind"] == "error"
+        assert_concurrency_ready(scenario["retried"], 5)
+        assert scenario["retried"]["messageKind"] == "success"
+
+
+def test_gptpro_concurrency_runtime_get_failure_disables_until_valid_recovery(
+    dashboard_runtime_result: dict[str, Any],
+) -> None:
+    scenarios = dashboard_runtime_result["gptProConcurrencyStates"]["getErrors"]
+    assert len(scenarios) == 10
+    for scenario in scenarios:
+        unavailable = scenario["unavailable"]
+        assert unavailable["hasLoaded"] is False
+        assert unavailable["selectDisabled"] is True
+        assert unavailable["isSaving"] is False
+        assert unavailable["value"] == ""
+        assert unavailable["draft"] is None
+        assert unavailable["status"] == "Could not load settings. Editing unavailable."
+        assert unavailable["messageKind"] == "error"
+        assert "ERROR" in scenario["toast"]
+        assert "GET /admin/settings/gptpro" in scenario["toast"]
+        assert_concurrency_ignored(scenario["guard"])
+        assert_concurrency_ready(scenario["recovered"], 2)
+        assert scenario["recovered"]["status"] == ""
+
+
+def test_gptpro_concurrency_runtime_ignores_stale_get_success_and_errors(
+    dashboard_runtime_result: dict[str, Any],
+) -> None:
+    scenarios = dashboard_runtime_result["gptProConcurrencyStates"]["staleGets"]
+    assert len(scenarios) == 6
+    assert {(scenario["outcome"], scenario["settleDuringSave"]) for scenario in scenarios} == {
+        (outcome, during) for outcome in ("success", "error", "network")
+        for during in (True, False)
     }
-    assert states["draft"] == {
-        **states["loaded"], "value": "5", "applyDisabled": False,
-    }
-    assert states["applied"] == {**states["draft"], "applyDisabled": True}
-    assert states["put"] == {
-        "method": "PUT",
-        "headers": {"Content-Type": "application/json"},
-        "body": '{"max_concurrent_asks":5}',
-    }
-    assert states["envLocked"] == {
-        **states["loaded"], "selectDisabled": True, "locked": True,
-    }
-    assert states["conflict"] == {
-        **states["draft"], "selectDisabled": True,
-        "applyDisabled": True, "locked": True,
-    }
-    assert states["failedRefresh"] == states["conflict"]
-    assert states["validation"] == [True, False, False, False, False, False]
-    assert "ERROR" in states["getError"]
-    assert "GET /admin/settings/gptpro" in states["getError"]
+    for scenario in scenarios:
+        assert scenario["generationAfterSave"] > scenario["generationBeforeSave"]
+        assert scenario["before"] == scenario["after"]
+        assert scenario["toastBefore"] == scenario["toastAfter"]
+        assert_concurrency_ready(scenario["saved"], 4)
+
+
+def test_gptpro_concurrency_runtime_conflict_waits_for_refresh_and_fails_closed(
+    dashboard_runtime_result: dict[str, Any],
+) -> None:
+    scenarios = dashboard_runtime_result["gptProConcurrencyStates"]["conflicts"]
+    assert len(scenarios) == 5
+    for scenario in scenarios:
+        pending = scenario["pendingRefresh"]
+        assert pending["locked"] is True
+        assert pending["selectDisabled"] is True
+        assert pending["isSaving"] is True
+        assert pending["live"] == 3  # Never adopt the 409 error body's value 9.
+        assert scenario["settledBeforeRefresh"] is False
+        assert_concurrency_ignored(scenario["guard"])
+        assert [request["options"] and request["options"]["method"] for request in scenario["requestsBeforeRefresh"]] == ["PUT", None]
+        assert all(request["url"] == "/admin/settings/gptpro" for request in scenario["requestsBeforeRefresh"])
+        refreshed = scenario["refreshed"]
+        assert refreshed["isSaving"] is False
+        assert scenario["saveSettled"] is True
+        if scenario["outcome"] == "unlocked":
+            assert_concurrency_ready(refreshed, 2)
+        elif scenario["outcome"] == "locked":
+            assert refreshed["locked"] is True
+            assert refreshed["selectDisabled"] is True
+            assert refreshed["live"] == refreshed["draft"] == 2
+            assert refreshed["value"] == "2"
+        else:
+            assert refreshed["locked"] is True
+            assert refreshed["selectDisabled"] is True
+            assert refreshed["live"] == refreshed["draft"] == 3
+            assert refreshed["value"] == "3"
+            assert refreshed["status"] == "Could not load current settings. Editing remains locked."
+            assert refreshed["messageKind"] == "error"
+        assert_concurrency_ready(scenario["recovered"], 7)
+
+
+def test_gptpro_concurrency_runtime_uses_authenticated_json_channel(
+    dashboard_runtime_result: dict[str, Any],
+) -> None:
+    assert dashboard_runtime_result["gptProConcurrencyStates"]["authRequests"] == [{
+        "url": "/admin/settings/gptpro",
+        "options": {
+            "method": "PUT",
+            "headers": {
+                "Content-Type": "application/json",
+                "Authorization": "Bearer concurrency-test-token",
+            },
+            "body": "{\"max_concurrent_asks\":6}",
+        },
+    }]
 
 
 def test_gptpro_session_card_renders_states_and_polls_only_on_mcp(

@@ -266,14 +266,15 @@
         </div>
         <div class="cthint" id="gptpro-login-detail"></div>
         <div class="cthint">Sign-in checks system Chrome, then Playwright Chromium, and downloads matching Chromium if needed. No graphical browser available? Run <code>claudex-gateway gptpro login</code> from a terminal.</div>
-        <div class="tbl-cap">
-          <span class="t">Ask concurrency</span>
-        </div>
-        <div class="sub">Parallel ask tabs the GPT Pro runtime admits at once.</div>
         <div id="gptpro-concurrency-card">
           <div class="complock"><b>LOCKED</b> — <code id="gptpro-concurrency-lock-env"></code> takes precedence. GPT Pro concurrency is read-only.</div>
-          <div class="ctrow">
-            <select id="gptpro-concurrency" aria-label="GPT Pro ask concurrency">
+          <div class="gptpro-concurrency-row">
+            <div class="gptpro-concurrency-copy">
+              <label for="gptpro-concurrency">Ask concurrency</label>
+              <div class="sub" id="gptpro-concurrency-description">Limits how many GPT Pro ask tabs can run at once.</div>
+            </div>
+            <select id="gptpro-concurrency" aria-describedby="gptpro-concurrency-description gptpro-concurrency-status gptpro-concurrency-rules" title="Parallel ask tabs · 1–10 · Default: 2" disabled>
+              <option value="" hidden disabled>—</option>
               <option value="1">1</option>
               <option value="2">2</option>
               <option value="3">3</option>
@@ -285,9 +286,9 @@
               <option value="9">9</option>
               <option value="10">10</option>
             </select>
-            <button id="gptpro-concurrency-apply">Apply</button>
           </div>
-          <div class="cthint">Default: 2. Raising concurrency does not lift ChatGPT-side rate limits.</div>
+          <div class="cthint" id="gptpro-concurrency-status" role="status" aria-live="polite" aria-atomic="true" hidden></div>
+          <div class="sr-only" id="gptpro-concurrency-rules">Parallel ask tabs, 1–10. Default: 2. ChatGPT rate limits still apply.</div>
         </div>
         <div class="tbl-cap">
           <span class="t">Diagnostics</span>
