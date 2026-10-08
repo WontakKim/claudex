@@ -892,6 +892,67 @@ async function main() {
   localHeroLoadOrder.repaintAfterLocalError = document.getElementById("local-body").innerHTML;
   context.jfetch = previousJfetch;
 
+  const gptProConcurrencyStates = {};
+  const concurrencyJfetch = context.jfetch;
+  let concurrencyBody = {max_concurrent_asks: 3, env_locked: false};
+  let concurrencyConflict = false;
+  const concurrencyRefresh = createDeferred();
+  context.jfetch = (url, options) => {
+    if (url !== "/admin/settings/gptpro") return Promise.resolve({ok: false, status: 500, body: {}});
+    if (options) {
+      gptProConcurrencyStates.put = options;
+      if (concurrencyConflict) return Promise.resolve({ok: false, status: 409, body: {}});
+      concurrencyBody = {max_concurrent_asks: JSON.parse(options.body).max_concurrent_asks, env_locked: false};
+    } else if (concurrencyConflict) return concurrencyRefresh.promise;
+    return Promise.resolve({ok: true, status: 200, body: concurrencyBody});
+  };
+  const concurrencySelect = document.getElementById("gptpro-concurrency");
+  const concurrencyApply = document.getElementById("gptpro-concurrency-apply");
+  const captureConcurrency = () => ({
+    value: concurrencySelect.value,
+    selectDisabled: concurrencySelect.disabled,
+    applyDisabled: concurrencyApply.disabled,
+    locked: document.getElementById("gptpro-concurrency-card").classList.contains("locked"),
+    env: document.getElementById("gptpro-concurrency-lock-env").textContent,
+  });
+  context.setTab("mcp");
+  await new Promise((resolve) => setImmediate(resolve));
+  gptProConcurrencyStates.loaded = captureConcurrency();
+  concurrencySelect.value = "5";
+  concurrencySelect.dispatchEvent({type: "change"});
+  gptProConcurrencyStates.draft = captureConcurrency();
+  concurrencyApply.click();
+  await new Promise((resolve) => setImmediate(resolve));
+  gptProConcurrencyStates.applied = captureConcurrency();
+  concurrencyBody = {max_concurrent_asks: 3, env_locked: true};
+  context.setTab("mcp");
+  await new Promise((resolve) => setImmediate(resolve));
+  gptProConcurrencyStates.envLocked = captureConcurrency();
+  concurrencyBody.env_locked = false;
+  context.setTab("mcp");
+  await new Promise((resolve) => setImmediate(resolve));
+  concurrencySelect.value = "5";
+  concurrencySelect.dispatchEvent({type: "change"});
+  concurrencyConflict = true;
+  concurrencyApply.click();
+  await new Promise((resolve) => setImmediate(resolve));
+  gptProConcurrencyStates.conflict = captureConcurrency();
+  concurrencyRefresh.resolve({ok: false, status: 500, body: {}});
+  await new Promise((resolve) => setImmediate(resolve));
+  gptProConcurrencyStates.failedRefresh = captureConcurrency();
+  gptProConcurrencyStates.validation = [
+    {max_concurrent_asks: 3, env_locked: false},
+    {max_concurrent_asks: 0, env_locked: false},
+    {max_concurrent_asks: 11, env_locked: false},
+    {max_concurrent_asks: 3.5, env_locked: false},
+    {max_concurrent_asks: "3", env_locked: false},
+    {max_concurrent_asks: 3},
+  ].map((body) => context.isGptProConcurrencyEnvelope(body));
+  context.fetchGptProConcurrency();
+  await new Promise((resolve) => setImmediate(resolve));
+  gptProConcurrencyStates.getError = document.getElementById("toast").innerHTML;
+  context.jfetch = concurrencyJfetch;
+
   const requestSnapshot = JSON.stringify(requests);
   const domSnapshot = document.snapshot();
   const credentialLeak = [
@@ -1028,6 +1089,7 @@ async function main() {
         error: statusText(document, errorName),
       },
       cards,
+      gptProConcurrencyStates,
       gptProSessionStates,
       mcpInfoStates,
       mcpConnectStates,

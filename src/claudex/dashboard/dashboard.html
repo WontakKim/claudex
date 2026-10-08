@@ -267,6 +267,29 @@
         <div class="cthint" id="gptpro-login-detail"></div>
         <div class="cthint">Sign-in checks system Chrome, then Playwright Chromium, and downloads matching Chromium if needed. No graphical browser available? Run <code>claudex-gateway gptpro login</code> from a terminal.</div>
         <div class="tbl-cap">
+          <span class="t">Ask concurrency</span>
+        </div>
+        <div class="sub">Parallel ask tabs the GPT Pro runtime admits at once.</div>
+        <div id="gptpro-concurrency-card">
+          <div class="complock"><b>LOCKED</b> — <code id="gptpro-concurrency-lock-env"></code> takes precedence. GPT Pro concurrency is read-only.</div>
+          <div class="ctrow">
+            <select id="gptpro-concurrency" aria-label="GPT Pro ask concurrency">
+              <option value="1">1</option>
+              <option value="2">2</option>
+              <option value="3">3</option>
+              <option value="4">4</option>
+              <option value="5">5</option>
+              <option value="6">6</option>
+              <option value="7">7</option>
+              <option value="8">8</option>
+              <option value="9">9</option>
+              <option value="10">10</option>
+            </select>
+            <button id="gptpro-concurrency-apply">Apply</button>
+          </div>
+          <div class="cthint">Default: 2. Raising concurrency does not lift ChatGPT-side rate limits.</div>
+        </div>
+        <div class="tbl-cap">
           <span class="t">Diagnostics</span>
         </div>
         <div class="sub">Check the saved session, browser profile, and browser dependencies.</div>

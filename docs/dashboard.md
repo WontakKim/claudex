@@ -18,8 +18,8 @@ Opening `http://127.0.0.1:8787/` uses the same guarded admin API as the CLI:
   is irreversible, so the button only opens a confirmation dialog, and
   confirming there is the only action that sends the request.
 - **MCP** keeps gateway-wide Claude Code connection setup above per-backend
-  sections, with GPT Pro as the first backend. See [GPT Pro MCP](#gpt-pro-mcp)
-  below.
+  sections, with GPT Pro session, ask concurrency, and diagnostics controls
+  in the first backend card. See [GPT Pro MCP](#gpt-pro-mcp) below.
 - **Log** reads `GET /admin/logs` and changes the persisted runtime log level
   through `PUT /admin/settings/log-level`.
 - **Router** edits the provider-prefixed model map on a canvas. Targets are
@@ -73,9 +73,15 @@ MCP backend. GPT Pro is the first backend section:
   doctor and displays the output. Sign-in opens a visible browser window on
   the gateway host, as `claudex-gateway gptpro login` does from a terminal,
   so either path needs a graphical session on that host.
+- **Ask concurrency** selects 1–10 parallel ask tabs (default: 2) and applies
+  changes to the running daemon immediately. The control is read-only with a
+  LOCKED band while `GPTPRO_MAX_CONCURRENT_ASKS` is set in the gateway
+  environment. Raising concurrency does not lift ChatGPT-side rate limits.
 
 The tab uses these guarded admin API operations:
 
+- `GET /admin/settings/gptpro` reads the concurrency limit and environment lock.
+- `PUT /admin/settings/gptpro` persists and applies the concurrency limit live.
 - `GET /admin/gptpro/session` reads the saved session state.
 - `GET /admin/gptpro/login` reads the current login state.
 - `POST /admin/gptpro/login` starts a login.

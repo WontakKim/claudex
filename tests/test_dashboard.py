@@ -517,6 +517,86 @@ def test_mcp_tab_leads_with_connection_and_combines_gptpro_tools() -> None:
     assert 'id="gptpro-doctor-output"' in gptpro_markup
 
 
+def test_gptpro_concurrency_card_wires_apply_flow_and_env_lock() -> None:
+    start = DASHBOARD_HTML.index('id="gptpro-session-card"')
+    section = DASHBOARD_HTML[start:DASHBOARD_HTML.index('</section>', start)]
+    assert (
+        section.index('id="gptpro-login-detail"')
+        < section.index('id="gptpro-concurrency-card"')
+        < section.index('Diagnostics')
+    )
+    select = re.search(
+        r'<select id="gptpro-concurrency"[^>]*>(.*?)</select>',
+        section,
+        re.DOTALL,
+    )
+    assert select is not None
+    assert re.findall(
+        r'<option value="(\d+)">\d+</option>', select.group(1)
+    ) == [str(value) for value in range(1, 11)]
+    assert 'id="gptpro-concurrency-apply"' in section
+    assert 'class="complock"' in section
+    assert (
+        '<code id="gptpro-concurrency-lock-env"></code> takes precedence.'
+        in section
+    )
+    assert 'GPTPRO_MAX_CONCURRENT_ASKS' in DASHBOARD_JAVASCRIPT
+    assert 'jfetch("/admin/settings/gptpro")' in DASHBOARD_JAVASCRIPT
+    apply_fn = javascript_section(
+        'function applyGptProConcurrency(){',
+        'document.getElementById("gptpro-concurrency").addEventListener',
+    )
+    for source in (
+        'applyLockableSetting({',
+        'jfetch("/admin/settings/gptpro",{',
+        'method:"PUT"',
+        'headers:JSON_HEADERS',
+        'JSON.stringify({max_concurrent_asks:Number(GPTPRO_CONCURRENCY.draft)})',
+    ):
+        assert source in apply_fn
+    assert (
+        'if(t==="mcp"){fetchGptProSession();fetchMcpInfo();fetchGptProLogin();'
+        'fetchGptProConcurrency()}' in DASHBOARD_JAVASCRIPT
+    )
+    boot = javascript_section('function boot(){', '\nboot();')
+    assert '/admin/settings/gptpro' not in boot
+    assert '#gptpro-concurrency-card.locked .complock' in DASHBOARD_CSS
+    assert '#gptpro-concurrency-card.locked' in DASHBOARD_CSS
+
+
+def test_gptpro_concurrency_runtime_render_lock_and_apply(
+    dashboard_runtime_result: dict[str, Any],
+) -> None:
+    states = dashboard_runtime_result["gptProConcurrencyStates"]
+    assert states["loaded"] == {
+        "value": "3",
+        "selectDisabled": False,
+        "applyDisabled": True,
+        "locked": False,
+        "env": "GPTPRO_MAX_CONCURRENT_ASKS",
+    }
+    assert states["draft"] == {
+        **states["loaded"], "value": "5", "applyDisabled": False,
+    }
+    assert states["applied"] == {**states["draft"], "applyDisabled": True}
+    assert states["put"] == {
+        "method": "PUT",
+        "headers": {"Content-Type": "application/json"},
+        "body": '{"max_concurrent_asks":5}',
+    }
+    assert states["envLocked"] == {
+        **states["loaded"], "selectDisabled": True, "locked": True,
+    }
+    assert states["conflict"] == {
+        **states["draft"], "selectDisabled": True,
+        "applyDisabled": True, "locked": True,
+    }
+    assert states["failedRefresh"] == states["conflict"]
+    assert states["validation"] == [True, False, False, False, False, False]
+    assert "ERROR" in states["getError"]
+    assert "GET /admin/settings/gptpro" in states["getError"]
+
+
 def test_gptpro_session_card_renders_states_and_polls_only_on_mcp(
     dashboard_runtime_result: dict[str, Any],
 ) -> None:
