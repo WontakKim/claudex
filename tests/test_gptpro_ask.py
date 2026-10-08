@@ -995,6 +995,121 @@ def test_readback_mismatch_is_submit_failed(
     assert page.click_count == 0
 
 
+def test_readback_mid_text_divergence_reports_normalized_details(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    _install_clock(monkeypatch)
+    caplog.set_level(logging.WARNING, logger="claudex.gptpro.ask")
+    page = _FakePage()
+    original_evaluate = page.evaluate
+
+    async def changed_readback(expression: str, argument: Any = None) -> Any:
+        if expression == selectors.COMPOSER_READBACK_PROBE_JS:
+            return page.composer_value.replace("this", "changed", 1)
+        return await original_evaluate(expression, argument)
+
+    page.evaluate = changed_readback  # type: ignore[method-assign]
+    with pytest.raises(ask.GptProAskError) as raised:
+        _run(page)
+
+    normalized_prompt = page.filled_prompt.replace("\n\n", "\n")
+    normalized_readback = normalized_prompt.replace("this", "changed", 1)
+    first_difference = normalized_prompt.index("this")
+    expected_window = normalized_prompt[
+        max(0, first_difference - 40):first_difference + 40
+    ]
+    actual_window = normalized_readback[
+        max(0, first_difference - 40):first_difference + 40
+    ]
+    assert raised.value.failure == "submit_failed"
+    assert str(raised.value) == (
+        "the ChatGPT composer did not retain the prompt "
+        f"(prompt {len(normalized_prompt)} chars, "
+        f"readback {len(normalized_readback)} chars, "
+        f"first difference at char {first_difference})"
+    )
+    records = [
+        record for record in caplog.records if record.name == "claudex.gptpro.ask"
+    ]
+    assert len(records) == 1
+    assert records[0].levelno == logging.WARNING
+    assert records[0].msg == (
+        "gptpro composer readback diverged at char %d "
+        "(prompt %d chars, readback %d chars): expected %r, got %r"
+    )
+    assert records[0].args == (
+        first_difference,
+        len(normalized_prompt),
+        len(normalized_readback),
+        expected_window,
+        actual_window,
+    )
+    assert records[0].getMessage() == (
+        f"gptpro composer readback diverged at char {first_difference} "
+        f"(prompt {len(normalized_prompt)} chars, "
+        f"readback {len(normalized_readback)} chars): "
+        f"expected {expected_window!r}, got {actual_window!r}"
+    )
+    assert page.click_count == 0
+
+
+def test_readback_strict_prefix_reports_readback_length_as_first_difference(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_clock(monkeypatch)
+    page = _FakePage()
+    original_evaluate = page.evaluate
+
+    async def truncated_readback(expression: str, argument: Any = None) -> Any:
+        if expression == selectors.COMPOSER_READBACK_PROBE_JS:
+            return page.composer_value[:-5]
+        return await original_evaluate(expression, argument)
+
+    page.evaluate = truncated_readback  # type: ignore[method-assign]
+    with pytest.raises(ask.GptProAskError) as raised:
+        _run(page)
+
+    normalized_prompt = page.filled_prompt.replace("\n\n", "\n")
+    readback_length = len(normalized_prompt) - 5
+    assert raised.value.failure == "submit_failed"
+    assert str(raised.value) == (
+        "the ChatGPT composer did not retain the prompt "
+        f"(prompt {len(normalized_prompt)} chars, readback {readback_length} chars, "
+        f"first difference at char {readback_length})"
+    )
+    assert page.click_count == 0
+
+
+def test_non_string_readback_reports_unavailable_without_divergence_log(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    _install_clock(monkeypatch)
+    caplog.set_level(logging.WARNING, logger="claudex.gptpro.ask")
+    page = _FakePage()
+    original_evaluate = page.evaluate
+
+    async def unavailable_readback(expression: str, argument: Any = None) -> Any:
+        if expression == selectors.COMPOSER_READBACK_PROBE_JS:
+            return None
+        return await original_evaluate(expression, argument)
+
+    page.evaluate = unavailable_readback  # type: ignore[method-assign]
+    with pytest.raises(ask.GptProAskError) as raised:
+        _run(page)
+
+    assert raised.value.failure == "submit_failed"
+    assert str(raised.value) == (
+        "the ChatGPT composer did not retain the prompt "
+        "(readback unavailable: NoneType)"
+    )
+    assert not any(
+        record.name == "claudex.gptpro.ask"
+        and record.getMessage().startswith("gptpro composer readback diverged")
+        for record in caplog.records
+    )
+    assert page.click_count == 0
+
+
 def test_backend_401_is_session_expired(monkeypatch: pytest.MonkeyPatch) -> None:
     _install_clock(monkeypatch)
     page = _FakePage(

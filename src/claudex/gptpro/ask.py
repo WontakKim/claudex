@@ -975,15 +975,46 @@ class _AskExecution:
             lines = value.replace("\r\n", "\n").replace("\r", "\n")
             return re.sub(r"\n+", "\n", lines)
 
-        if not isinstance(readback, str) or normalize(readback) != normalize(
-            self.prompt
-        ):
+        normalized_prompt = normalize(self.prompt)
+        normalized_readback = (
+            normalize(readback) if isinstance(readback, str) else None
+        )
+        if normalized_readback is None or normalized_readback != normalized_prompt:
             self._ensure_deadline()
             self._settle_rediscovered(
-                "composer", "failure", "the ChatGPT composer did not retain the prompt",
+                "composer", "failure",
+                "the ChatGPT composer did not retain the prompt",
             )
+            if normalized_readback is None:
+                detail = f"readback unavailable: {type(readback).__name__}"
+            else:
+                prompt_length = len(normalized_prompt)
+                readback_length = len(normalized_readback)
+                first_difference = min(prompt_length, readback_length)
+                for index, (expected, actual) in enumerate(
+                    zip(normalized_prompt, normalized_readback)
+                ):
+                    if expected != actual:
+                        first_difference = index
+                        break
+                window_start = max(0, first_difference - 40)
+                window_end = first_difference + 40
+                logger.warning(
+                    "gptpro composer readback diverged at char %d "
+                    "(prompt %d chars, readback %d chars): expected %r, got %r",
+                    first_difference,
+                    prompt_length,
+                    readback_length,
+                    normalized_prompt[window_start:window_end],
+                    normalized_readback[window_start:window_end],
+                )
+                detail = (
+                    f"prompt {prompt_length} chars, readback {readback_length} chars, "
+                    f"first difference at char {first_difference}"
+                )
             raise GptProAskError(
-                "submit_failed", "the ChatGPT composer did not retain the prompt"
+                "submit_failed",
+                f"the ChatGPT composer did not retain the prompt ({detail})",
             )
         self._settle_rediscovered("composer", "success")
 
