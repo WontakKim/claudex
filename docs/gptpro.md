@@ -176,6 +176,11 @@ temporary text attachment, so callers should send the complete question rather
 than truncate it. The generated spill file consumes one attachment slot and
 counts toward the total byte limit.
 
+When the ChatGPT composer does not retain an inline question, nothing has been
+sent. Within the remaining execution budget, the gateway resubmits the same ask
+once with the question moved into a temporary text attachment before reporting a
+failure. The status message reports the resubmission while it runs.
+
 ### Generated files
 
 When ChatGPT's final answer links files it generated as

@@ -30,6 +30,30 @@ ACTIVE_JOB_STATES = frozenset({"queued", "running", "detached"})
 _NONCE_PATTERN = re.compile(r"^\[gptpro-transport-nonce:[^\]\r\n]{1,128}\]$")
 
 
+def _spill_question(
+    question: str, attachment_paths: Sequence[str] | None,
+) -> tuple[str, list[str], Path]:
+    spill_file = tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        prefix="gptpro-spill-",
+        suffix=".txt",
+        delete=False,
+    )
+    spill_path = Path(spill_file.name)
+    try:
+        with spill_file:
+            spill_file.write(question)
+    except OSError:
+        spill_path.unlink(missing_ok=True)
+        raise
+    provider_question = (
+        "The full question text is attached as "
+        f"{spill_path.name}; read the attachment and answer it."
+    )
+    return provider_question, [str(spill_path), *(attachment_paths or ())], spill_path
+
+
 def _ownership_key(conversation_id: str) -> str:
     if is_conversation_id(conversation_id):
         return conversation_id.lower()
@@ -435,23 +459,9 @@ class AskJobService:
             provider_question = question
             provider_attachment_paths = attachment_paths
             if len(question.encode("utf-8")) > QUESTION_SPILL_THRESHOLD_BYTES:
-                with tempfile.NamedTemporaryFile(
-                    mode="w",
-                    encoding="utf-8",
-                    prefix="gptpro-spill-",
-                    suffix=".txt",
-                    delete=False,
-                ) as spill_file:
-                    spill_path = Path(spill_file.name)
-                    spill_file.write(question)
-                provider_question = (
-                    "The full question text is attached as "
-                    f"{spill_path.name}; read the attachment and answer it."
+                provider_question, provider_attachment_paths, spill_path = (
+                    _spill_question(question, attachment_paths)
                 )
-                provider_attachment_paths = [
-                    str(spill_path),
-                    *(attachment_paths or ()),
-                ]
 
             ask_options: dict[str, Any] = {
                 "callbacks": AskCallbacks(
@@ -466,7 +476,42 @@ class AskJobService:
             }
             if provider_attachment_paths is not None:
                 ask_options["attachment_paths"] = provider_attachment_paths
-            outcome = await self._ask(provider_question, **ask_options)
+            try:
+                outcome = await self._ask(provider_question, **ask_options)
+            except GptProAskError as exc:
+                if (
+                    exc.failure != "submit_failed"
+                    or exc.evidence is None
+                    or exc.evidence.failure_stage != "composer"
+                    or exc.evidence.submission != "not_attempted"
+                    or spill_path is not None
+                ):
+                    raise
+                retry_budget = remaining - (self._clock() - admitted_at)
+                if retry_budget <= 0:
+                    raise
+                logger.warning(
+                    "gptpro ask %.8s composer did not retain the inline question "
+                    "(%s); resubmitting it as an attachment",
+                    ask_id,
+                    str(exc),
+                )
+                capture_status(
+                    "composer did not retain the inline question; "
+                    "resubmitting it as an attachment"
+                )
+                job = self._jobs[ask_id]
+                # Recovery must use the nonce of the attempt that submits.
+                self._jobs[ask_id] = replace(
+                    job, nonce_marker=None,
+                    evidence=replace(job.evidence, failure_stage=None),
+                )
+                provider_question, provider_attachment_paths, spill_path = (
+                    _spill_question(question, attachment_paths)
+                )
+                ask_options["attachment_paths"] = provider_attachment_paths
+                ask_options["timeout_seconds"] = retry_budget
+                outcome = await self._ask(provider_question, **ask_options)
             job = self._jobs[ask_id]
             if job.thread_ref is None and outcome.conversation_id is not None:
                 self._on_conversation_id(ask_id, outcome.conversation_id)
