@@ -117,8 +117,9 @@ Opt into Codex Fast mode with `"codex": { "service_tier": "fast" }` in
 `settings.json` or `CLAUDEX_CODEX_SERVICE_TIER=fast`; the gateway sends
 Responses `service_tier: "priority"` only when the live model catalog
 advertises Fast, while unknown or unsupported models silently stay standard.
-Fast mode burns ChatGPT-plan usage about 2–2.5x faster and speeds responses
-about 1.5x.
+Actual speed and ChatGPT-plan usage consumption depend on the provider's
+policy and workload; selecting the priority tier does not guarantee a fixed
+speedup or usage multiplier.
 
 ## Kimi
 
@@ -139,8 +140,10 @@ Every value names its provider (`codex:`, `kimi:`, `grok:`, or a configured
 custom prefix); a bare model name is rejected at boot and on `PUT`, so an entry
 always says which backend serves it. Kimi's coding endpoint speaks the
 Anthropic Messages API natively, so requests and responses — streaming and
-non-streaming, thinking, tool use — are relayed as-is; only the model name
-and credentials are swapped.
+non-streaming, thinking, tool use — use a near-verbatim relay. The gateway
+swaps the upstream model name and credentials, restores the requested model
+name in responses, and replays incompatible server-tool history as text; see
+[Server-tool history across backends](model-mapping.md#server-tool-history-across-backends).
 
 The model ID after `kimi:` bypasses the gateway untouched: it is sent to Kimi
 exactly as written and never validated against a model list, so a newly

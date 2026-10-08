@@ -38,6 +38,13 @@ the mapped backend; failures after that commit surface as in-band SSE
 errors without fallback; non-streaming requests fall back on any failure
 before a complete, valid JSON response is obtained.
 
+Registered-account OAuth credentials are not substituted for the client's
+headers. The reroute keeps a nonblank `x-api-key` or a nonempty Bearer token,
+except a Bearer matching the configured `CLAUDEX_LOCAL_TOKEN`. It records
+`skipped_no_credentials` only when no credential header remains. The filter
+does not validate upstream credentials: a dummy Bearer can still trigger an
+Anthropic attempt, with a non-2xx response recorded as `fallback_mapped`.
+
 The context window is the provider-prefixed `context_window_map` override or,
 without one, the backend's catalog value; when neither is known, the reroute
 never triggers. For a request that carries tools, the size estimate covers the

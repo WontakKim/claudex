@@ -668,6 +668,7 @@ body[data-tab="map"] .applybar.dirty{display:block}
   .rail-item{flex:none}
   .srow{grid-template-columns:1fr;gap:10px}
   .ad-grid{grid-template-columns:1fr}
+  #scard-accounts .tbl-cap{flex-wrap:wrap}
   .kv{grid-template-columns:minmax(96px,35%) 1fr}
   #node-add{min-height:40px;padding:6px 14px}
   .addpick{width:calc(100vw - 16px)}

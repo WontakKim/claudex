@@ -163,7 +163,7 @@ function render(){
       '<span class="st">'+(s.id in DIR.mapping?"WIRED":"UNWIRED")+
         (isDraft?' <span class="dr">(draft)</span> <span class="undo" data-k="'+esc(s.id)+'">undo</span>':"")+'</span>'+
       '<span class="port" data-k="'+esc(s.id)+'"></span>'+
-      (s.id in DIR.mapping?'<button class="x" data-k="'+esc(s.id)+'" title="연결 끊기">'+X_ICON+"</button>":"");
+      (s.id in DIR.mapping?'<button class="x" data-k="'+esc(s.id)+'" title="Disconnect route">'+X_ICON+"</button>":"");
     layer.appendChild(el);
   });
   DIR.targets.forEach(function(t){
@@ -182,7 +182,7 @@ function render(){
         (wired!==liveWired?' <span class="dr">(draft)</span>':"")+'</span>'+
       // A ghost node (live wire already cut in this draft) has nothing left
       // to delete; every other target node gets the remove button.
-      (wired||!liveWired?'<button class="x" data-t="'+esc(t.id)+'" title="노드 제거">'+X_ICON+"</button>":"");
+      (wired||!liveWired?'<button class="x" data-t="'+esc(t.id)+'" title="Remove node and disconnect its routes">'+X_ICON+"</button>":"");
     layer.appendChild(el);
   });
   drawWires();
@@ -489,7 +489,7 @@ function renderPicker(){
     var value=routeValue(addProvider,o.id);
     if(o.kind==="manual"||onBoard[value]){
       var note=document.createElement("small");
-      note.textContent=o.kind==="manual"?"직접 입력 · 카탈로그에 없어도 추가":"이미 추가됨";
+      note.textContent=o.kind==="manual"?"Manual entry · add even if not in the catalog":"Already added";
       el.appendChild(note);
     }
     modelOptions.appendChild(el);
@@ -498,7 +498,7 @@ function renderPicker(){
      space; only a capability boundary carries information. */
   if(CATALOGLESS[addProvider]){
     pickerState.hidden=false;
-    pickerState.textContent="카탈로그 없음 · 모델 ID를 직접 입력하세요";
+    pickerState.textContent="No catalog · enter a model ID manually";
   }else pickerState.hidden=true;
   syncPickerActive();
   placePicker();
@@ -678,8 +678,11 @@ function showToast(html,isErr){
   if(!t){
     t=document.createElement("div");t.id="toast";
     t.addEventListener("click",function(){t.remove()});
-    document.body.appendChild(t);
-  }else if(!t.isConnected){document.body.appendChild(t)}
+  }
+  t.setAttribute("role",isErr?"alert":"status");
+  t.setAttribute("aria-live",isErr?"assertive":"polite");
+  t.setAttribute("aria-atomic","true");
+  if(!t.parentNode||!t.isConnected)document.body.appendChild(t);
   t.className="toast"+(isErr?" err":"");
   t.innerHTML=html;
   clearTimeout(toastTimer);
@@ -690,7 +693,7 @@ function showToast(html,isErr){
    lifetime: never in HTML, URLs, storage, or logs. */
 var authRequired=false,localToken=null;
 function promptLocalToken(){
-  var entered=window.prompt("이 게이트웨이는 CLAUDEX_LOCAL_TOKEN 인증이 필요합니다.\n토큰을 입력하세요:");
+  var entered=window.prompt("This gateway requires CLAUDEX_LOCAL_TOKEN authentication.\nEnter the configured local token:");
   localToken=entered?entered:null;
   return localToken!==null;
 }
@@ -715,7 +718,7 @@ function jfetch(url,opts){
   });
 }
 function errDetail(body){
-  return body&&body.error&&body.error.message?body.error.message:"request failed";
+  return body&&body.error&&body.error.message?body.error.message:"Request failed. Check the gateway logs and retry.";
 }
 function renderHealth(h){
   var box=document.getElementById("health");
@@ -826,27 +829,27 @@ function renderProviderHealth(provider,info,successDetail,account,unusedDetail,e
   var isUnused=info.required===false&&unusedDetail;
   var copyId=provider+"-login-copy";
   renderStatLine(provider,isUnused?"":"err",info.detail||"",
-    '● '+(isUnused?"미사용":"ERROR")+' <span class="detail">'+(isUnused?unusedDetail:errorDetail)+"</span>"+
+    '● '+(isUnused?"UNUSED":"ERROR")+' <span class="detail">'+(isUnused?unusedDetail:errorDetail)+"</span>"+
     '<div class="codeblock"><span class="tx">$ '+command+'</span>'+
-    '<button class="cp" id="'+copyId+'" title="복사"></button></div>');
+    '<button class="cp" id="'+copyId+'" title="Copy"></button></div>');
   wireCopy(document.getElementById(copyId),command);
 }
 function renderProviderCards(h){
   var codex=(h.providers||{}).codex||{};
   renderProviderHealth("codex",codex,
-    codex.auth_mode==="api_key"?"API 키로 인증됨":"ChatGPT 계정으로 로그인됨",
+    codex.auth_mode==="api_key"?"Authenticated with an API key":"Signed in with a ChatGPT account",
     codex.auth_mode!=="api_key"?(codex.email||codex.account):null,
-    null,"Codex 로그인이 필요합니다","codex login");
+    null,"Codex sign-in is required","codex login");
   var kimi=(h.providers||{}).kimi||{};
-  renderProviderHealth("kimi",kimi,"Kimi 계정으로 로그인됨",kimi.account,
-    "모델 맵에 kimi: 타겟이 없어 로그인하지 않아도 됩니다",
-    "Kimi 로그인이 필요합니다","kimi login");
+  renderProviderHealth("kimi",kimi,"Signed in with a Kimi account",kimi.account,
+    "No kimi: target is mapped; sign-in is not required",
+    "Kimi sign-in is required","kimi login");
   var grok=(h.providers||{}).grok||{};
   renderProviderHealth("grok",grok,
-    grok.auth_mode==="api_key"?"API 키로 인증됨":"Grok 계정으로 로그인됨",
+    grok.auth_mode==="api_key"?"Authenticated with an API key":"Signed in with a Grok account",
     grok.auth_mode!=="api_key"?grok.account:null,
-    "모델 맵에 grok: 타겟이 없어 로그인하지 않아도 됩니다",
-    "Grok 로그인이 필요합니다","grok login");
+    "No grok: target is mapped; sign-in is not required",
+    "Grok sign-in is required","grok login");
   CUSTOM_PROVIDERS.forEach(function(provider){
     var name=provider.name,info=(h.providers||{})[name]||{};
     var status=customProviderStatus(provider,info);
@@ -860,7 +863,7 @@ function renderFacts(p){
   document.getElementById("kv-grok-home").textContent=p.grok_home||"—";
 }
 var GPTPRO_EXPIRY_WARNING_SECONDS=7*24*60*60;
-var GPTPRO_LOGIN_COMMAND="run claudex-gateway gptpro login";
+var GPTPRO_LOGIN_COMMAND="claudex-gateway gptpro login";
 function fmtGptProRemaining(value){
   var seconds=Math.max(0,Math.floor(value));
   var days=Math.floor(seconds/86400);
@@ -887,13 +890,13 @@ function renderGptProSession(data){
   var remaining=typeof data.expires_in_seconds==="number"?data.expires_in_seconds:null;
   if(data.valid===true){
     if(remaining===null){
-      setGptProSessionState("okv","VALID","No fixed expiry reported",false);
+      setGptProSessionState("okv","VALID","Authentication cookie has no fixed expiry",false);
       return;
     }
     var isExpiringSoon=remaining<=GPTPRO_EXPIRY_WARNING_SECONDS;
     setGptProSessionState(isExpiringSoon?"warn":"okv",
       isExpiringSoon?"EXPIRING SOON":"VALID",
-      "Expires in "+fmtGptProRemaining(remaining),false);
+      "Authentication cookie expires in "+fmtGptProRemaining(remaining),false);
     return;
   }
   if(data.expired===true){
@@ -942,7 +945,7 @@ function fetchMcpInfo(){
   }).catch(function(){
     document.getElementById("mcp-endpoint").textContent="Unavailable";
     showToast('<span class="chip chip-err">ERROR</span><br>GPT Pro MCP connection'+
-      '<br><span class="dim">gateway unreachable</span>',true);
+      '<br><span class="dim">Gateway unreachable. Check that the gateway is running and reachable, then retry.</span>',true);
   });
 }
 function renderMcpConnect(data){
@@ -950,7 +953,7 @@ function renderMcpConnect(data){
   result.hidden=false;
   result.className="codeblock "+(data.ok?"okv":"err");
   result.textContent=data.ok
-    ?"Claude Code MCP registered successfully. Please restart Claude Code sessions to load it."
+    ?"MCP registered for the gateway user on the gateway machine. Restart Claude Code sessions there to load it."
     :String(data.output||"Claude Code MCP registration failed with no output.");
 }
 function connectClaudeCode(){
@@ -968,7 +971,7 @@ function connectClaudeCode(){
   }).catch(function(){
     renderMcpConnect({ok:false,output:"Gateway unreachable"});
     showToast('<span class="chip chip-err">ERROR</span><br>Claude Code MCP registration'+
-      '<br><span class="dim">gateway unreachable</span>',true);
+      '<br><span class="dim">Gateway unreachable. Check that the gateway is running and reachable, then retry.</span>',true);
   }).finally(function(){
     button.disabled=false;button.textContent="Add to Claude Code";
   });
@@ -1089,7 +1092,7 @@ function runGptProDoctor(){
   }).catch(function(){
     renderGptProDoctor({ok:false,output:"Gateway unreachable"});
     showToast('<span class="chip chip-err">ERROR</span><br>GPT Pro doctor'+
-      '<br><span class="dim">gateway unreachable</span>',true);
+      '<br><span class="dim">Gateway unreachable. Check that the gateway is running and reachable, then retry.</span>',true);
   }).finally(function(){
     button.disabled=false;button.textContent="Run doctor";
   });
@@ -1099,7 +1102,7 @@ function renderLogLevel(p){
   var locked=!!p.env_locked;
   box.innerHTML=(p.choices||[]).map(function(l){
     return '<button data-l="'+esc(l)+'"'+(l===p.log_level?' class="on"':"")+(locked?" disabled":"")+
-      (locked?' title="'+esc(p.env_locked)+' 환경변수가 우선합니다"':"")+'>'+esc(l.toUpperCase())+"</button>";
+      (locked?' title="'+esc(p.env_locked)+' takes precedence"':"")+'>'+esc(l.toUpperCase())+"</button>";
   }).join("");
   box.querySelectorAll("button").forEach(function(b){
     b.addEventListener("click",function(){setLogLevel(this.dataset.l)});
@@ -1118,7 +1121,7 @@ function fmtLogTs(ts){
 }
 function renderLogs(entries){
   var box=document.getElementById("logbox");
-  if(!entries.length){box.innerHTML='<div class="logempty">로그가 아직 없습니다.</div>';return}
+  if(!entries.length){box.innerHTML='<div class="logempty">No logs to display.</div>';return}
   var pinned=box.scrollTop+box.clientHeight>=box.scrollHeight-8;
   box.innerHTML=entries.map(function(e){
     return '<div class="logline"><span class="lts">'+fmtLogTs(e.ts)+'</span><span class="llv '+esc(e.level)+'">'+
@@ -1146,7 +1149,7 @@ function setLogLevel(level){
     renderLogLevel(r.body);
     showToast('<span class="chip chip-ok">APPLIED</span><br>log level → '+esc(r.body.log_level),false);
   }).catch(function(){
-    showToast('<span class="chip chip-err">ERROR</span><br>log level<br><span class="dim">gateway unreachable</span>',true);
+    showToast('<span class="chip chip-err">ERROR</span><br>log level<br><span class="dim">Gateway unreachable. Check that the gateway is running and reachable, then retry.</span>',true);
   });
 }
 /* === Lockable settings =================================================== */
@@ -1167,7 +1170,7 @@ function applyLockableSetting(config){
           config.lock();
           config.render();
           showToast('<span class="chip chip-err">ERROR</span><br>'+config.refreshName+
-            '<br><span class="dim">could not load current state</span>',true);
+            '<br><span class="dim">Could not load current state. Reload the dashboard to retry.</span>',true);
         }
       });
       return;
@@ -1183,7 +1186,7 @@ function applyLockableSetting(config){
   }).catch(function(){
     config.render();
     showToast('<span class="chip chip-err">ERROR</span><br>'+config.name+
-      '<br><span class="dim">gateway unreachable</span>',true);
+      '<br><span class="dim">Gateway unreachable. Check that the gateway is running and reachable, then retry.</span>',true);
   });
 }
 
@@ -1225,7 +1228,7 @@ function renderCompaction(){
   input.disabled=COMP.locked;
   var btn=document.getElementById("comp-apply");
   btn.disabled=COMP.locked;
-  btn.textContent="적용";
+  btn.textContent="Apply";
 }
 /* Adopts a fresh /admin/settings/compaction GET/PUT envelope as the new live state
    and re-derives the draft selection from it. */
@@ -1375,13 +1378,13 @@ function fetchGptProConcurrency(){
     }
     GPTPRO_CONCURRENCY.hasLoaded=false;
     GPTPRO_CONCURRENCY.draft=null;
-    showGptProConcurrencyError("GET /admin/settings/gptpro","Could not load settings. Editing unavailable.",
+    showGptProConcurrencyError("GET /admin/settings/gptpro","Could not load settings. Editing unavailable. Reopen MCP to retry.",
       r.ok?"invalid settings response":errDetail(r.body),r.status);
   }).catch(function(){
     if(generation!==GPTPRO_CONCURRENCY.requestGeneration)return;
     GPTPRO_CONCURRENCY.hasLoaded=false;
     GPTPRO_CONCURRENCY.draft=null;
-    showGptProConcurrencyError("GET /admin/settings/gptpro","Could not load settings. Editing unavailable.","gateway unreachable");
+    showGptProConcurrencyError("GET /admin/settings/gptpro","Could not load settings. Editing unavailable. Reopen MCP to retry.","Gateway unreachable. Check that the gateway is running and reachable, then retry.");
   });
 }
 function saveGptProConcurrency(nextLimit){
@@ -1416,12 +1419,12 @@ function saveGptProConcurrency(nextLimit){
           renderGptProConcurrencyState(g.body);
           return;
         }
-        showGptProConcurrencyError("GPT Pro concurrency refresh","Could not load current settings. Editing remains locked.",
+        showGptProConcurrencyError("GPT Pro concurrency refresh","Could not load current settings. Editing remains locked. Reopen MCP to retry.",
           g.ok?"invalid settings response":errDetail(g.body),g.status);
       });
     }
     if(!r.ok||!isGptProConcurrencyEnvelope(r.body)){
-      showGptProConcurrencyError("GPT Pro concurrency","Could not save settings. Previous value restored.",
+      showGptProConcurrencyError("GPT Pro concurrency","Could not confirm the save. Showing the last confirmed value. Reopen MCP to check the current setting.",
         r.ok?"invalid settings response":errDetail(r.body),r.status);
       return;
     }
@@ -1431,8 +1434,8 @@ function saveGptProConcurrency(nextLimit){
     showToast('<span class="chip chip-ok">APPLIED</span><br>GPT Pro concurrency → '+r.body.max_concurrent_asks,false);
   }).catch(function(){
     showGptProConcurrencyError(isConflict?"GPT Pro concurrency refresh":"GPT Pro concurrency",
-      isConflict?"Could not load current settings. Editing remains locked.":"Could not save settings. Previous value restored.",
-      "gateway unreachable");
+      isConflict?"Could not load current settings. Editing remains locked. Reopen MCP to retry.":"Could not confirm the save. Showing the last confirmed value. Reopen MCP to check the current setting.",
+      "Gateway unreachable. Check that the gateway is running and reachable, then retry.");
   }).finally(function(){
     GPTPRO_CONCURRENCY.isSaving=false;
     GPTPRO_CONCURRENCY.draft=GPTPRO_CONCURRENCY.live;
@@ -1450,9 +1453,9 @@ renderGptProConcurrency();
 var ROUTING={envName:"CLAUDEX_CLAUDE_ACCOUNT_ROUTING",locked:false,mode:"disabled",draft:"disabled",includeLocalLogin:null};
 var ROUTING_LABELS={disabled:"Disabled",fallback:"Fallback",balanced:"Balanced"};
 var ROUTING_HINTS={
-  disabled:"현재: Disabled — 단일 서빙 계정만 사용하고 429는 그대로 전달합니다.",
-  fallback:"현재: Fallback — ready 계정으로 순차 폴백하고 쿨다운 후 자동 복귀합니다.",
-  balanced:"현재: Balanced — ready 계정 풀 전체에 세션을 사용량 기반으로 고르게 분산합니다."
+  disabled:"Current: Disabled — use the serving pin, or client credentials when no pin is set; forward 429 responses without pool fallback.",
+  fallback:"Current: Fallback — with a serving pin set, try ready accounts in order after a 429; cooled-down accounts can rejoin after cooldown.",
+  balanced:"Current: Balanced — distribute sessions across the ready account pool using usage-based weights."
 };
 function isRoutingEnvelope(body){
   return !!body&&typeof body.env_locked==="boolean"&&typeof body.include_local_login==="boolean"&&
@@ -1466,7 +1469,7 @@ function renderRouting(){
   select.disabled=ROUTING.locked;
   var btn=document.getElementById("routing-apply");
   btn.disabled=ROUTING.locked||ROUTING.draft===ROUTING.mode;
-  btn.textContent="적용";
+  btn.textContent="Apply";
   document.getElementById("routing-current").textContent=ROUTING_HINTS[ROUTING.mode];
 }
 function renderRoutingState(body){
@@ -1493,9 +1496,9 @@ function applyRouting(){
     isFresh:function(g){return g.ok&&isRoutingEnvelope(g.body)},
     adopt:function(g){renderRoutingState(g.body)},
     envName:ROUTING.envName,
-    name:"계정 라우팅",
-    refreshName:"라우팅 새로고침",
-    successText:function(body){return "라우팅 → "+(ROUTING_LABELS[body.mode]||"Disabled")}
+    name:"Account routing",
+    refreshName:"Account routing refresh",
+    successText:function(body){return "Account routing → "+(ROUTING_LABELS[body.mode]||"Disabled")}
   });
 }
 document.getElementById("routing-select").addEventListener("change",function(){
@@ -1547,7 +1550,7 @@ function fmtAcctDate(epochMs){
 function fmtAgo(epochSec){
   if(!epochSec)return"—";
   var m=Math.max(0,Math.round((Date.now()/1000-epochSec)/60));
-  return m<1?"방금":m<60?m+"분 전":Math.floor(m/60)+"시간 "+(m%60)+"분 전";
+  return m<1?"just now":m<60?m+"m ago":Math.floor(m/60)+"h "+(m%60)+"m ago";
 }
 /* Uses the same relative-time phrasing as fmtAgo, but for a pool/usage
    window's own age_seconds duration rather than an epoch timestamp — this is
@@ -1555,7 +1558,7 @@ function fmtAgo(epochSec){
 function fmtAge(ageSeconds){
   if(typeof ageSeconds!=="number")return"—";
   var m=Math.max(0,Math.round(ageSeconds/60));
-  return m<1?"방금":m<60?m+"분 전":Math.floor(m/60)+"시간 "+(m%60)+"분 전";
+  return m<1?"just now":m<60?m+"m ago":Math.floor(m/60)+"h "+(m%60)+"m ago";
 }
 function fmtCooldownUntil(epochMs){
   if(typeof epochMs!=="number")return"—";
@@ -1566,71 +1569,71 @@ function routingBadgeHtml(accountId){
   var m=ACCT.routing[accountId];
   if(!m)return"";
   if(m.routing_state==="cooldown")
-    return'<span class="pill cool">쿨다운 · '+esc(fmtCooldownUntil(m.cooldown_until))+'</span>';
-  if(m.routing_state==="ready")return'<span class="pill ready">라우팅 준비</span>';
+    return'<span class="pill cool">Cooldown until '+esc(fmtCooldownUntil(m.cooldown_until))+'</span>';
+  if(m.routing_state==="ready")return'<span class="pill ready">Ready for routing</span>';
   if(m.routing_state==="unavailable")
-    return'<span class="pill unavailable">라우팅 불가'+(m.reason==="needs-reauth"?" · 토큰 만료":"")+'</span>';
+    return'<span class="pill unavailable">Unavailable for routing'+(m.reason==="needs-reauth"?" · sign-in required":"")+'</span>';
   return"";
 }
-var ACCT_USAGE_SKELETON='<div class="uwin" aria-hidden="true"><div class="uwin-h"><span class="sk">세션 윈도우</span></div>'+
-  '<div class="ubar"></div><div class="ureset"><span class="sk">0요일 00:00 리셋 (0시간 0분 후)</span></div></div>';
+var ACCT_USAGE_SKELETON='<div class="uwin" aria-hidden="true"><div class="uwin-h"><span class="sk">Session window</span></div>'+
+  '<div class="ubar"></div><div class="ureset"><span class="sk">Resets Sun 00:00 (in 0h 0m)</span></div></div>';
 function usageWindowsHtml(u){
   // Outside active balanced mode, pool/usage carries no windows map. Each
   // metadata lookup therefore falls back to "no metadata".
   var w=u.windows||{};
-  return(u.session?usageWindowHtml("세션 윈도우",u.session,true,w.session):"")+
-    (u.weekly?usageWindowHtml("주간 윈도우",u.weekly,true,w.weekly):"")+
-    (u.fable_weekly?usageWindowHtml("Fable 주간",u.fable_weekly,true,w.fable_weekly):"")+
-    (u.monthly?usageWindowHtml("월간 윈도우",u.monthly,true,w.monthly):"");
+  return(u.session?usageWindowHtml("Session window",u.session,true,w.session):"")+
+    (u.weekly?usageWindowHtml("Weekly window",u.weekly,true,w.weekly):"")+
+    (u.fable_weekly?usageWindowHtml("Fable weekly",u.fable_weekly,true,w.fable_weekly):"")+
+    (u.monthly?usageWindowHtml("Monthly window",u.monthly,true,w.monthly):"");
 }
 function acctUsageHtml(row){
   if(row.state!=="ready")
-    return'<div class="unavail">사용량을 불러올 수 없습니다.'+
-      '<span class="hint">토큰이 만료됐습니다. 다시 로그인하면 이 자리에서 갱신됩니다.</span></div>';
+    return'<div class="unavail">Could not load usage.'+
+      '<span class="hint">Authentication needs renewal. Choose Sign in again to update this account.</span></div>';
   var u=ACCT.usage[row.id];
   if(!u)return ACCT_USAGE_SKELETON+ACCT_USAGE_SKELETON;
   if(u.status!=="ok")
-    return'<div class="unavail">사용량을 불러올 수 없습니다.'+
+    return'<div class="unavail">Could not load usage.'+
       (u.error?'<span class="hint">'+esc(u.error)+"</span>":"")+"</div>";
   var rows=usageWindowsHtml(u);
   // A queued manual refresh never fetches inline. It renders as "queued"
   // until the coordinator's next poll completes the refresh.
-  var queuedHtml=u.queued?'<div class="ureset queued">사용량 새로고침 대기 중 — 다음 폴링에 반영됩니다</div>':"";
-  return(rows||'<div class="ureset">표시되는 윈도우가 없습니다</div>')+queuedHtml+
-    '<div class="age">사용량 <b>'+esc(fmtAgo(u.updated_at))+'</b> 기준</div>';
+  var queuedHtml=u.queued?'<div class="ureset queued">Usage refresh queued — results become available after the next poll. Reopen Claude accounts to check.</div>':"";
+  return(rows||'<div class="ureset">No usage windows reported</div>')+queuedHtml+
+    '<div class="age">Usage checked <b>'+esc(fmtAgo(u.updated_at))+'</b></div>';
 }
 function acctDetailHtml(row,serving){
   var isLocalSame=!!(ACCT.local&&ACCT.local.accountUuid&&ACCT.local.accountUuid===row.id);
   var kv='<div class="kv">'+
-    (row.planType?'<span class="k">플랜</span><span class="v">'+esc(planLabel(row.planType))+'</span>':"")+
-    '<span class="k">조직</span>'+(row.organizationName
+    (row.planType?'<span class="k">Plan</span><span class="v">'+esc(planLabel(row.planType))+'</span>':"")+
+    '<span class="k">Organization</span>'+(row.organizationName
       ?'<span class="v">'+esc(row.organizationName)+'</span>'
-      :'<span class="v" style="color:var(--muted);font-style:italic">없음</span>')+
-    '<span class="k">추가</span><span class="v">'+fmtAcctDate(row.createdAt)+'</span>'+
-    '<span class="k">마지막 인증</span><span class="v">'+fmtAcctDate(row.lastAuthenticatedAt)+'</span>'+
-    (isLocalSame?'<span class="k">로컬 CLI</span><span class="v"><span class="pill same">동일 계정</span></span>':"")+
+      :'<span class="v" style="color:var(--muted);font-style:italic">None</span>')+
+    '<span class="k">Added</span><span class="v">'+fmtAcctDate(row.createdAt)+'</span>'+
+    '<span class="k">Last authenticated</span><span class="v">'+fmtAcctDate(row.lastAuthenticatedAt)+'</span>'+
+    (isLocalSame?'<span class="k">Local CLI</span><span class="v"><span class="pill same">Same account</span></span>':"")+
     "</div>";
   var primary=row.state!=="ready"
-    ?'<button type="button" class="primary" data-act="relogin">다시 로그인</button>'
+    ?'<button type="button" class="primary" data-act="relogin">Sign in again</button>'
     :serving
-      ?'<button type="button" class="ghost" data-act="unserve"'+(ACCT.locked?" disabled":"")+'>서빙 해제</button>'
-      :'<button type="button" class="primary" data-act="serve"'+(ACCT.locked?" disabled":"")+'>이 계정으로 서빙</button>';
+      ?'<button type="button" class="ghost" data-act="unserve"'+(ACCT.locked?" disabled":"")+'>Clear serving pin</button>'
+      :'<button type="button" class="primary" data-act="serve"'+(ACCT.locked?" disabled":"")+'>Set serving pin</button>';
   // Account removal is available unless the account is the active serving pin.
   var member=ACCT.routing[row.id];
   var coolnote=member&&member.routing_state==="cooldown"
-    ?'<div class="coolnote">사용량 한도(429)로 쿨다운 중입니다.'+
-      '<span class="hint">'+esc(fmtCooldownUntil(member.cooldown_until))+' 이후 자동으로 다시 참여합니다.</span></div>'
+    ?'<div class="coolnote">Cooling down after a usage-limit response (429).'+
+      '<span class="hint">'+esc(fmtCooldownUntil(member.cooldown_until))+' onward, this account can rejoin routing.</span></div>'
     :"";
   return coolnote+'<div class="ad-grid"><div>'+acctUsageHtml(row)+'</div><div>'+kv+'</div>'+
     '<div class="actions">'+primary+'<span class="spacer"></span>'+
     '<button type="button" class="ghost danger" data-act="remove"'+
-      (serving?' disabled title="서빙 핀을 먼저 해제해야 제거할 수 있습니다"':"")+'>제거</button></div></div>';
+      (serving?' disabled title="Clear the serving pin before removing this account"':"")+'>Remove</button></div></div>';
 }
 function acctRowHtml(row){
   var serving=row.id===ACCT.serving;
   var open=!!ACCT.open[row.id];
-  var st=serving?'<span class="st serve">서빙 중</span>'
-    :row.state!=="ready"?'<span class="st reauth">⚠ 재로그인 필요</span>':"";
+  var st=serving?'<span class="st serve">Serving pin set</span>'
+    :row.state!=="ready"?'<span class="st reauth">Sign-in required</span>':"";
   return'<div class="arow'+(open?" open":"")+'" data-id="'+attr(row.id)+'" tabindex="0" role="button" aria-expanded="'+(open?"true":"false")+'">'+
     '<span class="chev" aria-hidden="true">▶</span>'+
     '<span class="em">'+esc(row.email)+'</span>'+st+routingBadgeHtml(row.id)+
@@ -1644,7 +1647,7 @@ function acctRowHtml(row){
    30 minutes, partial is everything between. The manual-refresh button only
    does anything useful while balanced routing is actually polling, so it
    shares this chip's visibility. */
-var POOL_FRESHNESS_LABEL={fresh:"사용량 최신",partial:"사용량 일부 지연",degraded:"사용량 지연됨"};
+var POOL_FRESHNESS_LABEL={fresh:"Usage up to date",partial:"Some usage data delayed",degraded:"Usage data delayed"};
 function renderPoolFreshness(){
   var pill=document.getElementById("pool-fresh-pill");
   var refreshBtn=document.getElementById("btn-usage-refresh");
@@ -1661,7 +1664,7 @@ function renderAcctList(){
   renderPoolFreshness();
   var list=document.getElementById("acct-list");
   if(!ACCT.rows.length){
-    list.innerHTML='<div class="ureset" style="padding:12px 0">등록된 계정이 없습니다. 계정 추가로 브라우저 로그인을 시작하세요.</div>';
+    list.innerHTML='<div class="ureset" style="padding:12px 0">No registered accounts. Choose Add account to start browser sign-in.</div>';
     return;
   }
   list.innerHTML=ACCT.rows.map(acctRowHtml).join("");
@@ -1671,24 +1674,24 @@ function renderLocalHero(){
   var local=ACCT.local;
   // Identity metadata does not prove token eligibility; show the configured policy.
   var serving=ROUTING.includeLocalLogin===null
-    ?"게이트웨이 서빙 설정 미확인"
+    ?"Gateway serving policy not yet loaded"
     :ROUTING.mode==="balanced"&&ROUTING.includeLocalLogin
-      ?"밸런스 서빙 참여 설정 · "+(local?"유효한 토큰 필요 · 중복 등록 제외":"로컬 로그인 필요")
-      :"게이트웨이 서빙에 사용하지 않음";
+      ?"Configured for Balanced routing · "+(local?"valid token required · duplicate registered identities excluded":"local sign-in required")
+      :"Not included as a local-login member of the gateway pool";
   if(!local){
-    box.innerHTML='<div class="org">로컬 Claude Code 로그인이 없습니다 · '+serving+'</div>';
+    box.innerHTML='<div class="org">No local Claude Code login found · '+serving+'</div>';
     return;
   }
   var u=ACCT.localUsage,usage;
   if(!u)usage=ACCT_USAGE_SKELETON+ACCT_USAGE_SKELETON;
   else if(u.status!=="ok")
-    usage='<div class="unavail">사용량을 불러올 수 없습니다.'+
+    usage='<div class="unavail">Could not load usage.'+
       (u.error?'<span class="hint">'+esc(u.error)+"</span>":"")+"</div>";
   else usage=usageWindowsHtml(u);
   box.innerHTML='<div class="who"><span class="em">'+esc(local.email)+'</span>'+
     '<span class="plan-lg">'+esc(planLabel(local.planType))+'</span></div>'+
     '<div class="org">'+(local.organizationName?esc(local.organizationName)+" · ":"")+
-    serving+(u&&u.status==="ok"?' · <b>'+esc(fmtAgo(u.updated_at))+'</b> 기준':"")+"</div>"+usage;
+    serving+(u&&u.status==="ok"?' · <b>'+esc(fmtAgo(u.updated_at))+'</b>':"")+"</div>"+usage;
 }
 function fetchLocalHeroUsage(){
   return jfetch("/admin/usage?provider=claude").then(function(r){
@@ -1696,7 +1699,7 @@ function fetchLocalHeroUsage(){
       :{status:"error",error:errDetail(r.body),updated_at:Date.now()/1000};
     renderLocalHero();
   }).catch(function(){
-    ACCT.localUsage={status:"error",error:"gateway unreachable",updated_at:Date.now()/1000};
+    ACCT.localUsage={status:"error",error:"Gateway unreachable. Check that the gateway is running and reachable, then retry.",updated_at:Date.now()/1000};
     renderLocalHero();
   });
 }
@@ -1713,7 +1716,7 @@ function fetchAccountUsage(){
     if(!r.ok){settle(errDetail(r.body));return}
     ACCT.usage=r.body.accounts||{};
     renderAcctList();
-  }).catch(function(){settle("gateway unreachable")});
+  }).catch(function(){settle("Gateway unreachable. Check that the gateway is running and reachable, then retry.")});
 }
 /* In balanced mode, `?refresh` enqueues a coalesced, rate-limited poll on
    the balanced coordinator and returns
@@ -1725,17 +1728,17 @@ function refreshAccountUsage(){
   return jfetch("/admin/providers/claude/pool/usage?refresh").then(function(r){
     if(!r.ok){
       showToast('<span class="chip chip-err">ERROR</span><span class="lat">'+r.status+
-        '</span><br>사용량 새로고침<br><span class="dim">'+esc(errDetail(r.body))+"</span>",true);
+        '</span><br>Refresh usage<br><span class="dim">'+esc(errDetail(r.body))+"</span>",true);
       return;
     }
     ACCT.usage=r.body.accounts||{};
     renderAcctList();
     if(r.body.queued){
-      showToast('<span class="chip chip-ok">QUEUED</span><br>사용량 새로고침이 대기열에 들어갔습니다'+
-        '<br><span class="dim">다음 폴링에 반영됩니다</span>',false);
+      showToast('<span class="chip chip-ok">QUEUED</span><br>Usage refresh queued'+
+        '<br><span class="dim">Results become available after the next poll. Reopen Claude accounts to check.</span>',false);
     }
   }).catch(function(){
-    showToast('<span class="chip chip-err">ERROR</span><br>사용량 새로고침<br><span class="dim">gateway unreachable</span>',true);
+    showToast('<span class="chip chip-err">ERROR</span><br>Refresh usage<br><span class="dim">Gateway unreachable. Check that the gateway is running and reachable, then retry.</span>',true);
   });
 }
 function fetchAccounts(){
@@ -1785,7 +1788,7 @@ function fetchAccounts(){
     fetchLocalHeroUsage();
   }).catch(function(){
     showToast('<span class="chip chip-err">ERROR</span><br>GET /admin/providers/claude/accounts'+
-      '<br><span class="dim">gateway unreachable</span>',true);
+      '<br><span class="dim">Gateway unreachable. Check that the gateway is running and reachable, then retry.</span>',true);
   });
 }
 function setServingAccount(accountId){
@@ -1807,17 +1810,17 @@ function setServingAccount(accountId){
       return;
     }
     if(!r.ok){
-      showToast('<span class="chip chip-err">ERROR</span><span class="lat">'+r.status+"</span><br>서빙 계정 변경"+
+      showToast('<span class="chip chip-err">ERROR</span><span class="lat">'+r.status+"</span><br>Serving pin update"+
         '<br><span class="dim">'+esc(errDetail(r.body))+"</span>",true);
       return;
     }
     ACCT.serving=r.body.account_id||null;
     renderAcctList();
     var servingRow=ACCT.rows.find(function(row){return row.id===ACCT.serving});
-    showToast('<span class="chip chip-ok">APPLIED</span><br>서빙 계정 → '+
-      (servingRow?esc(servingRow.email):"해제"),false);
+    showToast('<span class="chip chip-ok">APPLIED</span><br>Serving pin → '+
+      (servingRow?esc(servingRow.email):"cleared"),false);
   }).catch(function(){
-    showToast('<span class="chip chip-err">ERROR</span><br>서빙 계정 변경<br><span class="dim">gateway unreachable</span>',true);
+    showToast('<span class="chip chip-err">ERROR</span><br>Serving pin update<br><span class="dim">Gateway unreachable. Check that the gateway is running and reachable, then retry.</span>',true);
   });
 }
 function removeAccount(accountId){
@@ -1825,16 +1828,16 @@ function removeAccount(accountId){
   jfetch("/admin/providers/claude/accounts/"+encodeURIComponent(accountId),{method:"DELETE"}).then(function(r){
     if(!r.ok){
       showToast('<span class="chip chip-err">ERROR</span><span class="lat">'+r.status+
-        '</span><br>계정 제거<br><span class="dim">'+esc(errDetail(r.body))+"</span>",true);
+        '</span><br>Remove account<br><span class="dim">'+esc(errDetail(r.body))+"</span>",true);
       if(r.status===404)fetchAccounts();
       else renderAcctList();
       return;
     }
-    showToast('<span class="chip chip-ok">REMOVED</span><br>'+esc(account?account.email:accountId)+" 제거됨",false);
+    showToast('<span class="chip chip-ok">REMOVED</span><br>'+esc(account?account.email:accountId)+" removed from the gateway registry",false);
     fetchAccounts();
   }).catch(function(){
     renderAcctList();
-    showToast('<span class="chip chip-err">ERROR</span><br>계정 제거<br><span class="dim">gateway unreachable</span>',true);
+    showToast('<span class="chip chip-err">ERROR</span><br>Remove account<br><span class="dim">Gateway unreachable. Check that the gateway is running and reachable, then retry.</span>',true);
   });
 }
 document.getElementById("acct-list").addEventListener("click",function(e){
@@ -1849,7 +1852,7 @@ document.getElementById("acct-list").addEventListener("click",function(e){
     else if(btn.dataset.act==="remove"){
       if(!ACCT.removeArmed[id]){
         ACCT.removeArmed[id]=true;
-        btn.classList.add("armed");btn.textContent="정말 제거";
+        btn.classList.add("armed");btn.textContent="Confirm removal";
       }else{
         delete ACCT.removeArmed[id];
         setButtonBusy(btn);
@@ -1880,13 +1883,13 @@ document.getElementById("btn-local-refresh").addEventListener("click",function()
   if(btn.disabled)return;
   setButtonBusy(btn);
   ACCT.localUsage=null;renderLocalHero();
-  fetchLocalHeroUsage().finally(function(){btn.disabled=false;btn.textContent="갱신"});
+  fetchLocalHeroUsage().finally(function(){btn.disabled=false;btn.textContent="Refresh"});
 });
 document.getElementById("btn-usage-refresh").addEventListener("click",function(){
   var btn=this;
   if(btn.disabled)return;
   setButtonBusy(btn);
-  refreshAccountUsage().finally(function(){btn.disabled=false;btn.textContent="사용량 새로고침"});
+  refreshAccountUsage().finally(function(){btn.disabled=false;btn.textContent="Refresh usage"});
 });
 /* === Dashboard login (browser OAuth through the gateway's Claude CLI) =====
    POST starts the session (or attaches to a running one on 409 login-active);
@@ -1926,8 +1929,8 @@ function adoptLoginAttempt(attemptId){
   /* Adopt only a well-formed attempt id — a malformed envelope must not
      leave the tab polling as bare unattached GETs. */
   if(typeof attemptId!=="string"||!attemptId){
-    showToast('<span class="chip chip-err">ERROR</span><br>계정 추가'+
-      '<br><span class="dim">로그인 세션 응답에 attempt_id가 없습니다.</span>',true);
+    showToast('<span class="chip chip-err">ERROR</span><br>Add account'+
+      '<br><span class="dim">The sign-in response has no attempt_id. Reopen Add account to reconnect.</span>',true);
     return;
   }
   LOGIN.attemptId=attemptId;
@@ -1963,19 +1966,19 @@ function openLoginModal(){
           adoptLoginAttempt(g.body.attempt_id);
           return;
         }
-        showToast('<span class="chip chip-err">ERROR</span><br>계정 추가'+
-          '<br><span class="dim">활성 로그인 세션에 연결할 수 없습니다.</span>',true);
+        showToast('<span class="chip chip-err">ERROR</span><br>Add account'+
+          '<br><span class="dim">Could not connect to the active sign-in session. Reopen Add account to retry.</span>',true);
       }).catch(function(){
         if(generation!==LOGIN.openGeneration)return;
-        showToast('<span class="chip chip-err">ERROR</span><br>계정 추가<br><span class="dim">gateway unreachable</span>',true);
+        showToast('<span class="chip chip-err">ERROR</span><br>Add account<br><span class="dim">Gateway unreachable. Check that the gateway is running and reachable, then retry.</span>',true);
       });
       return;
     }
     showToast('<span class="chip chip-err">'+(r.status===409?"LOCKED":"ERROR")+'</span><span class="lat">'+r.status+
-      '</span><br>계정 추가<br><span class="dim">'+esc(errDetail(r.body))+"</span>",true);
+      '</span><br>Add account<br><span class="dim">'+esc(errDetail(r.body))+"</span>",true);
   }).catch(function(){
     if(generation!==LOGIN.openGeneration)return;
-    showToast('<span class="chip chip-err">ERROR</span><br>계정 추가<br><span class="dim">gateway unreachable</span>',true);
+    showToast('<span class="chip chip-err">ERROR</span><br>Add account<br><span class="dim">Gateway unreachable. Check that the gateway is running and reachable, then retry.</span>',true);
   });
 }
 function pollLogin(){
@@ -1995,7 +1998,7 @@ function pollLogin(){
     if(st.status==="succeeded"){
       closeLoginModal();
       showToast('<span class="chip chip-ok">ADDED</span><br>'+
-        esc((st.account&&st.account.email)||"계정")+" 등록됨",false);
+        esc((st.account&&st.account.email)||"Account")+" registered",false);
       fetchAccounts();
       return;
     }
@@ -2010,7 +2013,7 @@ function pollLogin(){
 function loginPollFailed(){
   LOGIN.failures++;
   if(LOGIN.failures>=5)
-    document.getElementById("login-reconnect").textContent="게이트웨이 연결을 다시 시도하는 중…";
+    document.getElementById("login-reconnect").textContent="Reconnecting to the gateway…";
 }
 function renderLoginModal(st){
   var key=loginStateKey(st);
@@ -2020,39 +2023,40 @@ function renderLoginModal(st){
   var actions=document.getElementById("login-modal-actions");
   var codeInput=document.getElementById("login-code-input");
   var codeValue=codeInput?codeInput.value:"";
-  var cancelBtn='<button class="cancel" data-lact="cancel">취소</button>';
+  var cancelBtn='<button class="cancel" data-lact="cancel">Cancel</button>';
   if(st.status==="awaiting-browser"){
     var safeUrl=/^https:\/\//.test(st.url||"")?st.url:null;
-    body.innerHTML='<p>브라우저에서 Anthropic 로그인을 완료하세요. 로그인이 끝나면 이 창이 자동으로 진행됩니다.</p>'+
+    body.innerHTML='<p>Complete Anthropic sign-in in the browser. This dialog continues when the gateway receives the result.</p>'+
       (safeUrl
-        ?'<div class="lgurl"><span class="tx">'+esc(safeUrl)+'</span><button class="cp" id="login-url-copy" title="복사"></button></div>'+
-          '<a class="lgopen" href="'+attr(safeUrl)+'" target="_blank" rel="noopener">브라우저에서 열기 ↗</a>'
-        :'<p><span class="sk">로그인 URL을 기다리는 중…</span></p>')+
-      '<div class="lgrow"><input id="login-code-input" spellcheck="false" placeholder="브라우저가 표시한 코드 붙여넣기">'+
-      '<button type="button" class="primary" data-lact="code">제출</button></div>'+
-      '<div class="lghint">브라우저가 자동으로 돌아오지 않으면 표시된 코드를 붙여넣으세요. <span id="login-countdown"></span></div>';
+        ?'<div class="lgurl"><span class="tx">'+esc(safeUrl)+'</span><button class="cp" id="login-url-copy" title="Copy"></button></div>'+
+          '<a class="lgopen" href="'+attr(safeUrl)+'" target="_blank" rel="noopener">Open in browser ↗</a>'
+        :'<p><span class="sk">Waiting for the sign-in URL…</span></p>')+
+      '<div class="lgrow"><input id="login-code-input" spellcheck="false" aria-label="Sign-in code" aria-describedby="login-code-error" placeholder="Paste the code shown in the browser">'+
+      '<button type="button" class="primary" data-lact="code">Submit</button></div>'+
+      '<div class="lghint">If the browser does not return automatically, paste the code it shows. <span id="login-countdown"></span></div>'+
+      '<div class="unavail" id="login-code-error" role="alert" aria-live="assertive" aria-atomic="true" hidden></div>';
     if(safeUrl)wireCopy(document.getElementById("login-url-copy"),safeUrl);
     document.getElementById("login-code-input").value=codeValue;
     actions.innerHTML=cancelBtn;
   }else if(st.status==="completing"){
-    body.innerHTML='<p><span class="sk">로그인을 완료하는 중…</span></p>';
+    body.innerHTML='<p><span class="sk">Completing sign-in…</span></p>';
     actions.innerHTML=cancelBtn;
   }else if(st.status==="awaiting-replace"){
     // Exactly two buttons, mirroring the CLI's [y/N] replace prompt. The
     // confirmation names the record being replaced; declining cancels.
     LOGIN.existingAccountId=st.existing_account_id||null;
-    body.innerHTML='<p><b>'+esc(st.email||"")+'</b> 계정이 이미 등록되어 있습니다.</p>'+
-      '<p class="warn">교체하면 기존 자격증명을 이번 로그인으로 덮어씁니다.</p>';
-    actions.innerHTML='<button class="cancel" data-lact="decline">교체 안 함</button>'+
-      '<button class="go" data-lact="replace">교체</button>';
+    body.innerHTML='<p><b>'+esc(st.email||"")+'</b> is already registered.</p>'+
+      '<p class="warn">Replace overwrites the saved credentials for this account with the new sign-in.</p>';
+    actions.innerHTML='<button class="cancel" data-lact="decline">Do not replace</button>'+
+      '<button class="go" data-lact="replace">Replace</button>';
   }else if(st.status==="failed"){
-    body.innerHTML='<div class="unavail">로그인에 실패했습니다.'+
+    body.innerHTML='<div class="unavail">Sign-in failed. Close this dialog and choose Add account to retry.'+
       (st.error?'<span class="hint">'+esc(st.error)+"</span>":"")+"</div>";
-    actions.innerHTML='<button class="cancel" data-lact="close">닫기</button>';
+    actions.innerHTML='<button class="cancel" data-lact="close">Close</button>';
   }else{
     // starting (server) or the optimistic local cancelling state.
     body.innerHTML='<p><span class="sk">'+
-      (st.status==="cancelling"?"취소하는 중…":"로그인 세션을 시작하는 중…")+"</span></p>";
+      (st.status==="cancelling"?"Cancelling…":"Starting the sign-in session…")+"</span></p>";
     actions.innerHTML=st.status==="cancelling"?"":cancelBtn;
   }
 }
@@ -2061,7 +2065,16 @@ function updateLoginCountdown(st){
   if(!el)return;
   if(!st.expires_at){el.textContent="";return}
   var s=Math.max(0,Math.round(st.expires_at-Date.now()/1000));
-  el.textContent="남은 시간 "+Math.floor(s/60)+"분 "+(s%60)+"초";
+  el.textContent="Time remaining: "+Math.floor(s/60)+"m "+(s%60)+"s";
+}
+function showLoginCodeError(detail,status){
+  var error=document.getElementById("login-code-error");
+  if(error){
+    error.hidden=false;
+    error.textContent="Could not confirm code submission. "+detail+" Check the code and sign-in status before retrying.";
+  }
+  showToast('<span class="chip chip-err">ERROR</span>'+(status?'<span class="lat">'+status+"</span>":"")+
+    '<br>Sign-in code submission<br><span class="dim">'+esc(detail)+"</span>",true);
 }
 function submitLoginCode(){
   var input=document.getElementById("login-code-input");
@@ -2076,12 +2089,12 @@ function submitLoginCode(){
   }).then(function(r){
     if(!isCurrentAttempt(attempt))return;
     if(isStaleLogin(r)){closeLoginModal();fetchAccounts();return}
-    if(!r.ok)
-      showToast('<span class="chip chip-err">ERROR</span><span class="lat">'+r.status+
-        '</span><br>코드 제출<br><span class="dim">'+esc(errDetail(r.body))+"</span>",true);
+    if(!r.ok){showLoginCodeError(errDetail(r.body),r.status);return}
+    var error=document.getElementById("login-code-error");
+    if(error){error.hidden=true;error.textContent=""}
   }).catch(function(){
     if(!isCurrentAttempt(attempt))return;
-    showToast('<span class="chip chip-err">ERROR</span><br>코드 제출<br><span class="dim">gateway unreachable</span>',true);
+    showLoginCodeError("Gateway unreachable. Check that the gateway is running and reachable.");
   });
 }
 function cancelLoginSession(){
@@ -2118,7 +2131,7 @@ document.getElementById("login-modal").addEventListener("click",function(e){
       if(isStaleLogin(r)){closeLoginModal();fetchAccounts();return}
       if(!r.ok)
         showToast('<span class="chip chip-err">ERROR</span><span class="lat">'+r.status+
-          '</span><br>교체 확인<br><span class="dim">'+esc(errDetail(r.body))+"</span>",true);
+          '</span><br>Credential replacement<br><span class="dim">'+esc(errDetail(r.body))+"</span>",true);
     }).catch(function(){});
   }
 });
@@ -2141,7 +2154,7 @@ function apply(){
       return;
     }
     if(!r.ok){
-      showToast('<span class="chip chip-err">ERROR</span><span class="lat">'+r.status+"</span><br>Apply Claude → Codex"+
+      showToast('<span class="chip chip-err">ERROR</span><span class="lat">'+r.status+"</span><br>Apply Router mapping"+
         '<br><span class="dim">'+esc(errDetail(r.body))+"</span>",true);
       return;
     }
@@ -2149,10 +2162,10 @@ function apply(){
     DIR.mapping=Object.assign({},DIR.LIVE);
     DIR.sel=null;
     render();
-    showToast('<span class="chip chip-ok">APPLIED</span><br>Claude → Codex map · '+count+" changes",false);
+    showToast('<span class="chip chip-ok">APPLIED</span><br>Router mapping · '+count+" changes",false);
   }).catch(function(){
-    showToast('<span class="chip chip-err">ERROR</span><br>Apply Claude → Codex'+
-      '<br><span class="dim">gateway unreachable</span>',true);
+    showToast('<span class="chip chip-err">ERROR</span><br>Apply Router mapping'+
+      '<br><span class="dim">Gateway unreachable. Check that the gateway is running and reachable, then retry.</span>',true);
   });
 }
 document.getElementById("applybtn").addEventListener("click",apply);
@@ -2179,7 +2192,7 @@ function runConnTest(){
     var b=r.body||{};
     if(r.ok&&b.ok){
       showToast('<span class="chip chip-ok">OK</span><span class="lat">'+(b.latency_ms!=null?b.latency_ms+"ms":"")+
-        "</span><br>"+label+' 응답 확인<br><span class="dim">response.model: '+esc(b.response_model||n)+"</span>",false);
+        "</span><br>"+label+' responded<br><span class="dim">response.model: '+esc(b.response_model||n)+"</span>",false);
     }else{
       var code=b.status!=null?b.status:r.status;
       showToast('<span class="chip chip-err">ERROR</span><span class="lat">'+esc(code)+"</span><br>"+label+
@@ -2188,7 +2201,7 @@ function runConnTest(){
   }).catch(function(){
     btn.disabled=false;btn.textContent="Test";
     showToast('<span class="chip chip-err">ERROR</span><br>'+label+
-      '<br><span class="dim">gateway unreachable</span>',true);
+      '<br><span class="dim">Gateway unreachable. Check that the gateway is running and reachable, then retry.</span>',true);
   });
 }
 document.getElementById("ct-btn").addEventListener("click",runConnTest);
@@ -2241,17 +2254,17 @@ const TAB_NAMES=["settings","status","mcp","map","log"];
 /* === Subscription usage in Status provider cards ========================= */
 function fmtPct(v){return (Math.round(v*10)/10)+"%"}
 function fmtReset(epochSec){
-  if(!epochSec)return"리셋 시각 정보 없음";
+  if(!epochSec)return"Reset time not reported";
   var ms=epochSec*1000,diffMin=Math.max(0,Math.round((ms-Date.now())/60000));
   var d=new Date(ms);
-  var days=["일","월","화","수","목","금","토"];
+  var days=["Sun","Mon","Tue","Wed","Thu","Fri","Sat"];
   var abs=(d.toDateString()===new Date().toDateString())
     ?pad(d.getHours())+":"+pad(d.getMinutes())
-    :days[d.getDay()]+"요일 "+pad(d.getHours())+":"+pad(d.getMinutes());
-  var rel=diffMin>=1440?Math.floor(diffMin/1440)+"일 "+Math.floor(diffMin%1440/60)+"시간 후"
-    :diffMin>=60?Math.floor(diffMin/60)+"시간 "+(diffMin%60)+"분 후"
-    :diffMin+"분 후";
-  return abs+" 리셋 ("+rel+")";
+    :days[d.getDay()]+" "+pad(d.getHours())+":"+pad(d.getMinutes());
+  var rel=diffMin>=1440?Math.floor(diffMin/1440)+"d "+Math.floor(diffMin%1440/60)+"h"
+    :diffMin>=60?Math.floor(diffMin/60)+"h "+(diffMin%60)+"m"
+    :diffMin+"m";
+  return "Resets "+abs+" (in "+rel+")";
 }
 /* colorPct (accounts screens only) mirrors the bar's state color onto the
    % readout; the Status cards keep their original neutral readout. meta is
@@ -2273,11 +2286,11 @@ function usageWindowHtml(label,win,colorPct,meta){
 function resetCreditHtml(provider,data){
   var count=data.reset_credits_available;
   if(provider!=="codex"||typeof count!=="number")return"";
-  return'<div class="uact"><span class="lbl">리셋 크레딧</span><span class="num">'+count+"개</span>"+
+  return'<div class="uact"><span class="lbl">Reset credits</span><span class="num">'+count+"</span>"+
     (count>0
-      ?'<button id="codex-reset-go" data-n="'+count+'">1개 사용</button>'+
-        '<span class="hint">한도 창을 즉시 리셋합니다</span>'
-      :'<span class="hint">쓸 수 있는 크레딧이 없습니다</span>')+"</div>";
+      ?'<button id="codex-reset-go" data-n="'+count+'">Use 1 credit</button>'+
+        '<span class="hint">Resets rate-limit windows immediately</span>'
+      :'<span class="hint">No reset credits available</span>')+"</div>";
 }
 /* One bar per line, not one per value: the loading card reads as a few calm
    rows instead of a mosaic. Each bar still carries the widest text of the
@@ -2291,37 +2304,37 @@ function resetCreditHtml(provider,data){
    makes the placeholder a pixel taller than the plan it stands in for. */
 var PLAN_SKELETON='<b class="sk">STANDARD</b>';
 function usageSkeletonHtml(provider){
-  var row='<div class="uwin"><div class="uwin-h"><span class="sk">5시간 윈도우</span></div>'+
+  var row='<div class="uwin"><div class="uwin-h"><span class="sk">Session window</span></div>'+
     '<div class="ubar"></div>'+
-    '<div class="ureset"><span class="sk">0요일 00:00 리셋 (0시간 0분 후)</span></div></div>';
+    '<div class="ureset"><span class="sk">Resets Sun 00:00 (in 0h 0m)</span></div></div>';
   return'<div aria-hidden="true">'+row+row+
-    '<div class="umeta"><span class="sk">마지막 갱신 00:00:00</span></div>'+
+    '<div class="umeta"><span class="sk">Last checked 00:00:00</span></div>'+
     (provider==="codex"
-      ?'<div class="uact"><button class="sk" disabled>리셋 크레딧 0개 · 1개 사용</button></div>':"")+
+      ?'<div class="uact"><button class="sk" disabled>Reset credits: 0 · Use 1 credit</button></div>':"")+
     "</div>";
 }
 function renderUsageProvider(provider,data){
   // The plan sits above, in the card's status box, so it is written to its
   // own hook rather than into the body this function rebuilds.
   document.getElementById("usage-plan-"+provider).innerHTML=
-    data?(data.plan_type?"<b>"+esc(data.plan_type)+"</b> 플랜":""):PLAN_SKELETON;
+    data?(data.plan_type?"<b>"+esc(data.plan_type)+"</b> plan":""):PLAN_SKELETON;
   var body=document.getElementById("usage-body-"+provider);
   if(!data){
     body.innerHTML=usageSkeletonHtml(provider);
     return;
   }
-  var meta='<div class="umeta">마지막 갱신 '+fmtLogTs(data.updated_at||Date.now()/1000)+"</div>";
+  var meta='<div class="umeta">Last checked '+fmtLogTs(data.updated_at||Date.now()/1000)+"</div>";
   if(data.status==="ok"){
     // Do not render rows for windows absent from the response, such as Codex's five-hour window.
-    var rows=(data.session?usageWindowHtml("5시간 윈도우",data.session):"")+
-      (data.weekly?usageWindowHtml("주간 윈도우",data.weekly):"")+
-      (data.fable_weekly?usageWindowHtml("Fable 주간",data.fable_weekly):"")+
-      (data.monthly?usageWindowHtml("월간 윈도우",data.monthly):"");
-    body.innerHTML=(rows||'<div class="ureset">표시되는 윈도우가 없습니다</div>')+meta+
+    var rows=(data.session?usageWindowHtml("Session window",data.session):"")+
+      (data.weekly?usageWindowHtml("Weekly window",data.weekly):"")+
+      (data.fable_weekly?usageWindowHtml("Fable weekly",data.fable_weekly):"")+
+      (data.monthly?usageWindowHtml("Monthly window",data.monthly):"");
+    body.innerHTML=(rows||'<div class="ureset">No usage windows reported</div>')+meta+
       resetCreditHtml(provider,data);
     return;
   }
-  var detail=data.status==="unavailable"?"사용량을 조회할 수 없습니다":"조회에 실패했습니다";
+  var detail=data.status==="unavailable"?"Usage unavailable":"Usage check failed";
   body.innerHTML='<div class="stat'+(data.status==="unavailable"?"":" err")+'">● <span class="detail">'+
     detail+"</span>"+(data.error?'<div class="codeblock">'+esc(data.error)+"</div>":"")+"</div>"+meta;
 }
@@ -2330,7 +2343,7 @@ function renderUsageProvider(provider,data){
 function restoreUsageButtons(providers){
   providers.forEach(function(p){
     var btn=document.querySelector('.urefresh[data-provider="'+p+'"]');
-    if(btn){btn.disabled=false;btn.textContent="갱신"}
+    if(btn){btn.disabled=false;btn.textContent="Refresh"}
   });
 }
 /* Without a provider, refresh all visible cards on tab entry; with one,
@@ -2362,8 +2375,8 @@ function fetchUsage(provider){
     });
   }).catch(function(){
     showToast('<span class="chip chip-err">ERROR</span><br>GET /admin/usage'+
-      '<br><span class="dim">gateway unreachable</span>',true);
-    failAll("gateway unreachable");
+      '<br><span class="dim">Gateway unreachable. Check that the gateway is running and reachable, then retry.</span>',true);
+    failAll("Gateway unreachable. Check that the gateway is running and reachable, then retry.");
   }).finally(function(){restoreUsageButtons(targets)});
 }
 document.getElementById("tab-status").addEventListener("click",function(ev){
@@ -2377,21 +2390,20 @@ document.getElementById("tab-status").addEventListener("click",function(ev){
    button only arms the dialog: confirming there is the single path that
    reaches /admin/providers/codex/reset-credit. */
 var RESET_OUTCOMES={
-  reset:{spent:true,text:"한도 창을 리셋했습니다"},
+  reset:{spent:true,text:"Rate-limit windows reset"},
   // The backend reports these so the card can say why nothing changed.
-  nothing_to_reset:{spent:false,text:"리셋할 한도가 없어 크레딧을 쓰지 않았습니다"},
-  no_credit:{spent:false,text:"사용 가능한 리셋 크레딧이 없습니다"},
-  already_redeemed:{spent:false,text:"이미 처리된 요청입니다"}
+  nothing_to_reset:{spent:false,text:"No rate limit needed resetting; no credit was spent"},
+  no_credit:{spent:false,text:"No reset credits available"},
+  already_redeemed:{spent:false,text:"This request was already processed"}
 };
 function closeResetModal(){document.getElementById("reset-modal").classList.remove("open")}
 document.getElementById("tab-status").addEventListener("click",function(ev){
   var btn=ev.target.closest?ev.target.closest("#codex-reset-go"):null;
   if(!btn)return;
   document.getElementById("reset-modal-body").innerHTML=
-    "보유한 리셋 크레딧 <b>"+esc(btn.dataset.n)+"개</b> 중 <b>1개</b>를 사용해 "+
-    "Codex 한도 창을 즉시 리셋합니다.";
+    "Use <b>1</b> of your <b>"+esc(btn.dataset.n)+"</b> reset credits to reset the Codex rate-limit windows immediately.";
   var go=document.getElementById("reset-confirm");
-  go.disabled=false;go.textContent="사용";
+  go.disabled=false;go.textContent="Use";
   document.getElementById("reset-modal").classList.add("open");
   // Focus the safe choice so Enter or a stray space cannot spend the credit.
   document.getElementById("reset-cancel").focus();
@@ -2417,13 +2429,13 @@ document.getElementById("reset-confirm").addEventListener("click",function(){
         (outcome.spent?"RESET":"NO-OP")+"</span><br>"+esc(outcome.text),!outcome.spent);
     }else{
       showToast('<span class="chip chip-err">ERROR</span><span class="lat">'+r.status+
-        '</span><br>리셋 크레딧 사용<br><span class="dim">'+esc(b.error||errDetail(b))+"</span>",true);
+        '</span><br>Reset credit redemption<br><span class="dim">'+esc(b.error||errDetail(b))+"</span>",true);
     }
     fetchUsage("codex");   // windows and the remaining count both moved
   }).catch(function(){
     closeResetModal();
-    showToast('<span class="chip chip-err">ERROR</span><br>리셋 크레딧 사용'+
-      '<br><span class="dim">gateway unreachable</span>',true);
+    showToast('<span class="chip chip-err">ERROR</span><br>Reset credit redemption'+
+      '<br><span class="dim">Gateway unreachable. Check that the gateway is running and reachable, then retry.</span>',true);
   });
 });
 document.getElementById("log-refresh").addEventListener("click",fetchLogs);

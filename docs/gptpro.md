@@ -127,6 +127,10 @@ listed below.
 | `ask_gpt_pro_result` | `ask_id` (required string) | After `succeeded`, returns `ask_id`, the Markdown `answer`, `thread_ref`, `nonce_marker`, `evidence`, nullable `source_ask_id`, `files`, and `files_complete` (see [Generated files](#generated-files)). After `failed`, returns an MCP tool error with a readable explanation and structured diagnostics. Calling it while `queued`, `running`, or `detached` is an error. |
 | `recover_gpt_pro` | Either `ask_id` (a retained failed job) or `thread_ref` (conversation UUID) and `nonce_marker` | Starts a separate, bounded, read-only recovery job and returns its `ask_id`, nullable `source_ask_id`, and `thread_ref`. Poll its status and result as usual. It never sends a prompt or attaches files. |
 
+Use `ask_gpt_pro` when the user explicitly requests ChatGPT Pro or when a
+consequential judgment would materially benefit from a second opinion, not for
+routine delegation.
+
 The normal caller flow is:
 
 1. Call `ask_gpt_pro` once and retain its `ask_id` and any `thread_ref`.
@@ -137,27 +141,34 @@ The normal caller flow is:
    `nonce_marker`. Use `recover_gpt_pro` to look for that turn without sending a
    second prompt. A recovery job has its own `ask_id` and does not rewrite the
    failed source job.
+5. After manual recovery succeeds, pass its `thread_ref` explicitly as `thread`
+   in the next `ask_gpt_pro` call to continue the recovered conversation.
 
 Send a self-contained `question` with the code, logs, and context needed for the
 answer. If an answer begins with `GPTPRO_CONTEXT_REQUEST_V1`, gather the
-requested material and call `ask_gpt_pro` again; omitting `thread` continues the
-conversation that just succeeded.
+requested material and call `ask_gpt_pro` again. Omitting `thread` continues the
+conversation from the last successful ordinary ask; if the answer came from
+manual recovery, pass the recovered `thread_ref` explicitly as `thread`.
 
 ### Thread selection
 
 `thread` has three modes:
 
 - Omit it to continue the conversation from this MCP session's most recent
-  successful completion. If the session has no binding, the ask starts a new
-  conversation.
+  successful `ask_gpt_pro` job. If the session has no binding, the ask starts a
+  new conversation.
 - Pass `"new"` to force a fresh conversation.
 - Pass a conversation UUID from an earlier `thread_ref` to revisit that
   conversation explicitly.
 
 A `thread_ref` can become visible while a job is in progress, but the MCP
-session binding changes only when that job succeeds. Failed jobs do not replace
-the session's last successful binding. Separate MCP sessions share a
-conversation only when callers explicitly pass the same UUID.
+session binding changes only when an ordinary `ask_gpt_pro` job succeeds,
+including after automatic detached polling or recovery. Failed asks and manual
+`recover_gpt_pro` jobs leave the binding unchanged. To follow up on a manually
+recovered answer, pass its `thread_ref` explicitly as `thread`; omitting it uses
+the previous binding or starts a new conversation if there is none. Separate
+MCP sessions share a conversation only when callers explicitly pass the same
+UUID.
 
 ### Attachments and large questions
 
@@ -238,7 +249,7 @@ execution deadline fails the job even if the answer text was already observed.
 | `queued` | The job is waiting for admission, normally behind an in-flight ask on the same conversation. | Becomes `running` (a recovery job becomes `detached`), or `failed` with `expired` if same-conversation admission exceeds the 900-second queue TTL. |
 | `running` | The job is admitted; navigation, submission, or answer observation may be in progress. This state alone does not prove submission. | Becomes `detached` during read-only polling, or `succeeded` or `failed`. |
 | `detached` | The gateway polls the server for an existing answer; ChatGPT may still be generating, or extraction may have failed. | Remains observable through normal status polling, then becomes `succeeded` or `failed`. |
-| `succeeded` | The answer is settled and available from `ask_gpt_pro_result`. | Terminal. The successful `thread_ref` becomes this MCP session's binding. |
+| `succeeded` | The answer is settled and available from `ask_gpt_pro_result`. | Terminal. An ordinary `ask_gpt_pro` job binds its `thread_ref` to this MCP session; a manual `recover_gpt_pro` job leaves the binding unchanged. |
 | `failed` | The queue or provider execution ended with a classified failure. | Terminal. Fetch the result for the operational error and use any preserved conversation metadata for recovery. |
 
 `status_message` is supplemental progress. In particular, `waiting for the
@@ -289,11 +300,13 @@ ChatGPT definitely did nothing.
 
 If a failed ask retains a `thread_ref` and `nonce_marker`, call
 `recover_gpt_pro` with its `ask_id`. After a gateway restart, use the saved
-`thread_ref` and `nonce_marker` instead. Poll the new recovery job; a failure
-to recover means no matching finished answer was obtained within the window,
-not proof that none exists. If either identifier is missing, this read-only
-lookup cannot identify the turn: inspect the ChatGPT conversation before
-considering any new submission. Re-run login for `session_expired` or
+`thread_ref` and `nonce_marker` instead. Poll the new recovery job. On success,
+pass its `thread_ref` explicitly as `thread` in any follow-up `ask_gpt_pro` call:
+manual recovery does not update the implicit session binding, even after a
+restart. A failure to recover means no matching finished answer was obtained
+within the window, not proof that none exists. If either identifier is missing,
+this read-only lookup cannot identify the turn: inspect the ChatGPT conversation
+before considering any new submission. Re-run login for `session_expired` or
 `challenge`; for `rate_limited_timeout`, wait, then recover if the ask may have
 submitted. Do not blindly resubmit a prompt whose submission outcome is
 uncertain.

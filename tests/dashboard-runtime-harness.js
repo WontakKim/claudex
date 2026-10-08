@@ -1117,6 +1117,79 @@ async function main() {
   context.fetch = concurrencyFetch;
   context.jfetch = concurrencyJfetch;
 
+  const feedbackDocument = new FakeDocument(html);
+  const feedbackRequests = [];
+  const feedbackContext = Object.assign({}, context, {document: feedbackDocument});
+  vm.createContext(feedbackContext);
+  vm.runInContext(source, feedbackContext, {filename: javascriptPath});
+  const captureToast = () => {
+    const element = feedbackDocument.getElementById("toast");
+    return {role: element.getAttribute("role"), live: element.getAttribute("aria-live"),
+      atomic: element.getAttribute("aria-atomic"), html: element.innerHTML};
+  };
+  feedbackContext.showToast("<b>First failure</b>", true);
+  const alertToast = captureToast();
+  feedbackContext.showToast("Saved", false);
+  const statusToast = captureToast();
+
+  feedbackContext.LOGIN.attemptId = "feedback-attempt";
+  feedbackContext.renderLoginModal({status: "awaiting-browser", url: "https://example.com/sign-in"});
+  feedbackDocument.getElementById("login-code-input").value = "synthetic-sign-in-code";
+  feedbackContext.jfetch = (url, options) => {
+    feedbackRequests.push({url, options});
+    return Promise.resolve({ok: false, status: 400, body: {error: {message: "<invalid code>"}}});
+  };
+  feedbackContext.submitLoginCode();
+  await new Promise((resolve) => setImmediate(resolve));
+  const codeError = feedbackDocument.getElementById("login-code-error");
+  const rejectedCode = {text: codeError.textContent, hidden: codeError.hidden, toast: captureToast()};
+  feedbackDocument.getElementById("toast").remove();
+  const retainedCodeError = codeError.textContent;
+  feedbackContext.jfetch = (url, options) => {
+    feedbackRequests.push({url, options});
+    return Promise.reject(new Error("code response lost"));
+  };
+  feedbackContext.submitLoginCode();
+  await new Promise((resolve) => setImmediate(resolve));
+  const disconnectedCode = {text: codeError.textContent, hidden: codeError.hidden};
+  feedbackContext.jfetch = (url, options) => {
+    feedbackRequests.push({url, options});
+    return Promise.resolve({ok: true, status: 200, body: {}});
+  };
+  feedbackContext.submitLoginCode();
+  await new Promise((resolve) => setImmediate(resolve));
+  const acceptedCode = {text: codeError.textContent, hidden: codeError.hidden};
+  feedbackContext.LOGIN.attemptId = "new-feedback-attempt";
+  const staleCodeResponse = createDeferred();
+  feedbackContext.jfetch = () => staleCodeResponse.promise;
+  feedbackContext.submitLoginCode();
+  feedbackContext.LOGIN.attemptId = "newer-feedback-attempt";
+  staleCodeResponse.resolve({ok: false, status: 400, body: {error: {message: "stale code error"}}});
+  await new Promise((resolve) => setImmediate(resolve));
+  const staleCodeIgnored = codeError.hidden && codeError.textContent === "";
+
+  feedbackContext.renderGptProConcurrencyState(concurrencyEnvelope(3).body);
+  let persistedLimit = 3;
+  const lostResponseRequests = [];
+  feedbackContext.jfetch = (url, options) => {
+    lostResponseRequests.push({url, options});
+    persistedLimit = JSON.parse(options.body).max_concurrent_asks;
+    return Promise.reject(new Error("response lost after persistence"));
+  };
+  await feedbackContext.saveGptProConcurrency(5);
+  const responseLoss = {persistedLimit, displayedLimit: feedbackDocument.getElementById("gptpro-concurrency").value,
+    message: feedbackDocument.getElementById("gptpro-concurrency-status").textContent, requests: lostResponseRequests};
+  const account = {id: "copy-account", email: "copy@example.com", state: "ready"};
+  const servingCopy = {};
+  feedbackContext.ACCT.serving = account.id;
+  servingCopy.pinned = feedbackContext.acctRowHtml(account);
+  feedbackContext.ACCT.serving = null;
+  servingCopy.unpinned = feedbackContext.acctRowHtml(account);
+  feedbackContext.renderUsageProvider("codex", {status: "ok", session: {used_percent: 5, window_minutes: 60}});
+  const unknownDurationUsage = feedbackDocument.getElementById("usage-body-codex").innerHTML;
+  const operatorFeedback = {alertToast, statusToast, rejectedCode, retainedCodeError, disconnectedCode,
+    acceptedCode, staleCodeIgnored, codeRequests: feedbackRequests, responseLoss, servingCopy, unknownDurationUsage};
+
   const requestSnapshot = JSON.stringify(requests);
   const domSnapshot = document.snapshot();
   const credentialLeak = [
@@ -1253,6 +1326,7 @@ async function main() {
         error: statusText(document, errorName),
       },
       cards,
+      operatorFeedback,
       gptProConcurrencyStates,
       gptProSessionStates,
       mcpInfoStates,
