@@ -96,6 +96,9 @@ _ADMIN_FUNCTION_MANIFEST = {
         "_codex_payload",
         "_handle_admin_codex_get",
         "_handle_admin_codex_put",
+        "_gptpro_payload",
+        "_handle_admin_gptpro_get",
+        "_handle_admin_gptpro_put",
         "_claude_account_payload",
         "_handle_admin_claude_serving_get",
         "_claude_account_env_locked",
@@ -5736,3 +5739,151 @@ class TestAdminClaudeLoginLifecycle:
 
         [record] = claude_accounts.load_registry()
         assert record == original
+
+
+def test_lifespan_configures_gptpro_concurrency(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config = GatewayConfig(gptpro_max_concurrent_asks=4)
+    with _create_test_client(monkeypatch, tmp_path, config=config) as client:
+        assert client.app.state.gptpro_ask_runtime.max_concurrent_asks == 4
+
+
+class TestAdminGptproSettingsApi:
+    @staticmethod
+    def _admin_client(
+        monkeypatch: pytest.MonkeyPatch, tmp_path: Path, **config_kwargs: Any
+    ) -> TestClient:
+        monkeypatch.delenv("GPTPRO_MAX_CONCURRENT_ASKS", raising=False)
+        config = GatewayConfig(settings_file=tmp_path / "settings.json", **config_kwargs)
+        return _create_test_client(
+            monkeypatch, tmp_path, config=config, base_url="http://127.0.0.1:8787"
+        )
+
+    def test_get_returns_default_state(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        with self._admin_client(monkeypatch, tmp_path) as client:
+            response = client.get("/admin/settings/gptpro")
+        assert response.status_code == 200
+        assert response.json() == {"max_concurrent_asks": 2, "env_locked": False}
+
+    @pytest.mark.parametrize("value", [1, 4, 10, None])
+    def test_put_persists_and_applies_live(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, value: int | None
+    ) -> None:
+        settings_file = tmp_path / "settings.json"
+        settings_file.write_text('{"gptpro": {"max_concurrent_asks": 3}}', encoding="utf-8")
+        effective = 2 if value is None else value
+        with self._admin_client(
+            monkeypatch, tmp_path, gptpro_max_concurrent_asks=3
+        ) as client:
+            response = client.put(
+                "/admin/settings/gptpro", json={"max_concurrent_asks": value}
+            )
+            assert response.status_code == 200
+            assert response.json() == {
+                "max_concurrent_asks": effective, "env_locked": False
+            }
+            assert client.get("/admin/settings/gptpro").json() == response.json()
+            assert client.app.state.config.gptpro_max_concurrent_asks == effective
+            assert client.app.state.gptpro_ask_runtime.max_concurrent_asks == effective
+        assert json.loads(settings_file.read_text(encoding="utf-8")) == (
+            {} if value is None else {"gptpro": {"max_concurrent_asks": value}}
+        )
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            {"max_concurrent_asks": 0},
+            {"max_concurrent_asks": 11},
+            {"max_concurrent_asks": "4"},
+            {"max_concurrent_asks": True},
+            {"max_concurrent_asks": 4.0},
+            {"unknown": 4},
+            {},
+        ],
+    )
+    def test_put_rejects_invalid_body(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, body: dict[str, Any]
+    ) -> None:
+        with self._admin_client(monkeypatch, tmp_path) as client:
+            response = client.put("/admin/settings/gptpro", json=body)
+            assert response.status_code == 400
+            assert client.app.state.config.gptpro_max_concurrent_asks == 2
+            assert client.app.state.gptpro_ask_runtime.max_concurrent_asks == 2
+        assert not (tmp_path / "settings.json").exists()
+        message = response.json()["error"]["message"]
+        if "unknown" in body:
+            assert message == "unknown keys: unknown; supported: max_concurrent_asks"
+        elif not body:
+            assert message == "provide 'max_concurrent_asks' (integer 1–10 or null)"
+        else:
+            assert message == (
+                "max_concurrent_asks must be null or an integer between 1 and 10"
+            )
+
+    @pytest.mark.parametrize("env_value", ["3", ""])
+    def test_env_override_locks_get_and_put(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, env_value: str
+    ) -> None:
+        settings_file = tmp_path / "settings.json"
+        original = '{"gptpro": {"max_concurrent_asks": 4}}'
+        settings_file.write_text(original, encoding="utf-8")
+        monkeypatch.setenv("GPTPRO_MAX_CONCURRENT_ASKS", env_value)
+        config = GatewayConfig(settings_file=settings_file, gptpro_max_concurrent_asks=3)
+        with _create_test_client(
+            monkeypatch, tmp_path, config=config, base_url="http://127.0.0.1:8787"
+        ) as client:
+            response = client.get("/admin/settings/gptpro")
+            assert response.status_code == 200
+            assert response.json() == {"max_concurrent_asks": 3, "env_locked": True}
+            response = client.put(
+                "/admin/settings/gptpro", json={"max_concurrent_asks": 4}
+            )
+            assert response.status_code == 409
+            assert "GPTPRO_MAX_CONCURRENT_ASKS" in response.json()["error"]["message"]
+            assert client.app.state.config.gptpro_max_concurrent_asks == 3
+            assert client.app.state.gptpro_ask_runtime.max_concurrent_asks == 3
+        assert settings_file.read_text(encoding="utf-8") == original
+
+    def test_put_requires_json_content_type(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        with self._admin_client(monkeypatch, tmp_path) as client:
+            response = client.put(
+                "/admin/settings/gptpro",
+                content='{"max_concurrent_asks": 4}',
+                headers={"Content-Type": "text/plain"},
+            )
+        assert response.status_code == 415
+        assert not (tmp_path / "settings.json").exists()
+
+    def test_get_and_put_require_token(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        with self._admin_client(monkeypatch, tmp_path, local_token="secret") as client:
+            assert client.get("/admin/settings/gptpro").status_code == 401
+            response = client.put(
+                "/admin/settings/gptpro", json={"max_concurrent_asks": 4}
+            )
+            assert response.status_code == 401
+
+    @pytest.mark.parametrize("error_type", [ConfigError, OSError])
+    def test_persistence_failure_preserves_live_state(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, error_type: type[Exception]
+    ) -> None:
+        def fail_update(*args: Any, **kwargs: Any) -> None:
+            raise error_type("write failed")
+
+        monkeypatch.setattr(admin_settings, "update_settings_file", fail_update)
+        with self._admin_client(monkeypatch, tmp_path) as client:
+            response = client.put(
+                "/admin/settings/gptpro", json={"max_concurrent_asks": 4}
+            )
+            assert response.status_code == 500
+            assert response.json()["error"]["message"] == (
+                "could not persist settings: write failed"
+            )
+            assert client.app.state.config.gptpro_max_concurrent_asks == 2
+            assert client.app.state.gptpro_ask_runtime.max_concurrent_asks == 2

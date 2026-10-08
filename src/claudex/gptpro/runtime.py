@@ -14,6 +14,7 @@ from dataclasses import dataclass, replace
 from typing import Any
 
 from claudex import locking, paths
+from claudex.config.schema import DEFAULT_GPTPRO_MAX_CONCURRENT_ASKS
 from claudex.gptpro import ask, browser, generated_files, session
 from claudex.gptpro.ask import AskCallbacks, AskEvidence
 from claudex.gptpro.conversation import (
@@ -26,7 +27,7 @@ from claudex.gptpro.selectors import PAGE_FETCH_PROBE_JS
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_MAX_CONCURRENT_ASKS = 2
+DEFAULT_MAX_CONCURRENT_ASKS = DEFAULT_GPTPRO_MAX_CONCURRENT_ASKS
 MAX_EXECUTION_SECONDS = 5400.0
 DEFAULT_RAW_TURN_RECOVERY_SECONDS = MAX_EXECUTION_SECONDS
 MIN_SUBMISSION_JITTER_SECONDS = 1.0
@@ -59,17 +60,6 @@ async def _harden_page_user_agent(page: Any) -> None:
         await page.set_extra_http_headers({"User-Agent": hardened})
     except Exception:
         return
-
-
-def _max_concurrent_asks() -> int:
-    raw_value = os.environ.get("GPTPRO_MAX_CONCURRENT_ASKS")
-    if raw_value is None:
-        return DEFAULT_MAX_CONCURRENT_ASKS
-    try:
-        configured_value = int(raw_value)
-    except ValueError:
-        return DEFAULT_MAX_CONCURRENT_ASKS
-    return max(1, configured_value)
 
 
 def raw_turn_recovery_seconds() -> float:
@@ -594,16 +584,70 @@ class DetachPoller:
             return
 
 
+class _AdmissionGate:
+    """Semaphore whose limit can change while asks are in flight.
+
+    Raising the limit releases permits immediately so waiting submitters
+    wake; lowering it never interrupts admitted asks — the next releases are
+    swallowed instead of returning permits, so the pool shrinks as they finish.
+    """
+
+    def __init__(self, limit: int) -> None:
+        self._limit = limit
+        self._semaphore = asyncio.Semaphore(limit)
+        self._pending_shrink = 0
+
+    @property
+    def limit(self) -> int:
+        return self._limit
+
+    @property
+    def _value(self) -> int:
+        return self._semaphore._value
+
+    def locked(self) -> bool:
+        return self._semaphore.locked()
+
+    async def acquire(self) -> None:
+        await self._semaphore.acquire()
+
+    def release(self) -> None:
+        if self._pending_shrink > 0:
+            self._pending_shrink -= 1
+            return
+        self._semaphore.release()
+
+    def set_limit(self, new_limit: int) -> None:
+        delta = new_limit - self._limit
+        self._limit = new_limit
+        if delta < 0:
+            self._pending_shrink += -delta
+            return
+        paid = min(delta, self._pending_shrink)
+        self._pending_shrink -= paid
+        for _ in range(delta - paid):
+            self._semaphore.release()
+
+
 class AskRuntime:
     """Own one lazy persistent context and its bounded pool of ask tabs."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self, *, max_concurrent_asks: int = DEFAULT_MAX_CONCURRENT_ASKS
+    ) -> None:
+        if max_concurrent_asks < 1:
+            raise ValueError("max_concurrent_asks must be at least 1")
         self._context: Any | None = None
         self._profile_lock: locking.FileLockHandle | None = None
         self._initialization_lock = asyncio.Lock()
-        self._ask_semaphore = asyncio.Semaphore(_max_concurrent_asks())
+        self._ask_semaphore = _AdmissionGate(max_concurrent_asks)
         self._waiting_submitters = 0
         self._poller = DetachPoller(self._get_context)
+
+    def set_max_concurrent_asks(self, limit: int) -> None:
+        if limit < 1:
+            raise ValueError("max_concurrent_asks must be at least 1")
+        self._ask_semaphore.set_limit(limit)
 
     async def ask(
         self,

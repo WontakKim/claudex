@@ -376,6 +376,13 @@ not.
 
 ## Operations
 
+Ask-tab concurrency is the `gptpro.max_concurrent_asks` setting (integer 1–10,
+default 2), read from `settings.json` or `GPTPRO_MAX_CONCURRENT_ASKS`. See
+[Configuration](configuration.md) for source precedence and startup validation.
+The admin API (`PUT /admin/settings/gptpro`) applies changes to the running daemon
+without a restart: raising the limit admits waiting asks immediately, while
+lowering it lets in-flight asks finish.
+
 The gptpro scheduler reads these environment variables directly:
 
 | Variable | Default | Behavior |
@@ -383,7 +390,6 @@ The gptpro scheduler reads these environment variables directly:
 | `GPTPRO_OVERALL_TIMEOUT_SECONDS` | `900` | Positive floating-point initial browser-stage budget ceiling in seconds. It cannot extend the fixed 90-minute total execution limit. Missing, non-numeric, zero, and negative values use the default. This is only a ceiling: increasing it does not raise a lower measured budget (`p95 × 1.5`); use `GPTPRO_MIN_EXECUTION_BUDGET_SECONDS` to raise that floor. Only successful ask durations affect the measurement; failures do not. |
 | `GPTPRO_MIN_EXECUTION_BUDGET_SECONDS` | `60` | Positive floating-point floor for the execution budget reduced by watchdog measurements. Missing, non-numeric, zero, and negative values use the default. Values above `GPTPRO_OVERALL_TIMEOUT_SECONDS` are clamped to that ceiling. |
 | `GPTPRO_RAW_TURN_RECOVERY_SECONDS` | `5400` | Polling window in seconds, for eligible uncertain or incomplete turns and explicit read-only recovery. Automatic recovery and file saving are capped by the original execution deadline. A shorter polling window retains the existing bounded file-saving allowance within the total limit. Positive values are capped at 5400; zero or negative values disable recovery. Missing, non-numeric, and nonfinite values use the default. |
-| `GPTPRO_MAX_CONCURRENT_ASKS` | `2` | Integer ask-tab concurrency. Non-integer values use the default; values below 1 are clamped to 1. |
 
 Set overrides in the environment that starts the gateway. A background daemon
 inherits that launch environment, so stop and start it to apply changes. If the

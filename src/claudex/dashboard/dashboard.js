@@ -1327,6 +1327,68 @@ document.getElementById("codex-fast").addEventListener("change",function(){
   renderCodex();
 });
 document.getElementById("codex-apply").addEventListener("click",applyCodex);
+var GPTPRO_CONCURRENCY={envName:"GPTPRO_MAX_CONCURRENT_ASKS",locked:false,live:null,draft:null};
+function isGptProConcurrencyEnvelope(body){
+  return !!body&&typeof body.env_locked==="boolean"&&typeof body.max_concurrent_asks==="number"&&
+    body.max_concurrent_asks%1===0&&body.max_concurrent_asks>=1&&body.max_concurrent_asks<=10;
+}
+function renderGptProConcurrency(){
+  document.getElementById("gptpro-concurrency-card").classList.toggle("locked",GPTPRO_CONCURRENCY.locked);
+  document.getElementById("gptpro-concurrency-lock-env").textContent=GPTPRO_CONCURRENCY.envName;
+  var select=document.getElementById("gptpro-concurrency");
+  select.value=GPTPRO_CONCURRENCY.draft===null?"":String(GPTPRO_CONCURRENCY.draft);
+  select.disabled=GPTPRO_CONCURRENCY.locked;
+  var btn=document.getElementById("gptpro-concurrency-apply");
+  btn.disabled=GPTPRO_CONCURRENCY.locked||GPTPRO_CONCURRENCY.draft===GPTPRO_CONCURRENCY.live;
+  btn.textContent="Apply";
+}
+function renderGptProConcurrencyState(body){
+  GPTPRO_CONCURRENCY.live=body.max_concurrent_asks;
+  GPTPRO_CONCURRENCY.locked=body.env_locked;
+  GPTPRO_CONCURRENCY.draft=body.max_concurrent_asks;
+  renderGptProConcurrency();
+}
+function fetchGptProConcurrency(){
+  jfetch("/admin/settings/gptpro").then(function(r){
+    if(r.ok&&isGptProConcurrencyEnvelope(r.body)){
+      renderGptProConcurrencyState(r.body);
+    }else{
+      renderGptProConcurrency();
+      showToast('<span class="chip chip-err">ERROR</span><span class="lat">'+r.status+
+        '</span><br>GET /admin/settings/gptpro<br><span class="dim">'+esc(errDetail(r.body))+"</span>",true);
+    }
+  }).catch(function(){
+    renderGptProConcurrency();
+    showToast('<span class="chip chip-err">ERROR</span><br>GET /admin/settings/gptpro'+
+      '<br><span class="dim">gateway unreachable</span>',true);
+  });
+}
+function applyGptProConcurrency(){
+  var btn=document.getElementById("gptpro-concurrency-apply");
+  if(GPTPRO_CONCURRENCY.locked||btn.disabled)return;
+  applyLockableSetting({
+    button:btn,
+    request:function(){return jfetch("/admin/settings/gptpro",{
+      method:"PUT",
+      headers:JSON_HEADERS,
+      body:JSON.stringify({max_concurrent_asks:Number(GPTPRO_CONCURRENCY.draft)})
+    })},
+    refresh:function(){return jfetch("/admin/settings/gptpro")},
+    lock:function(){GPTPRO_CONCURRENCY.locked=true},
+    render:renderGptProConcurrency,
+    isFresh:function(g){return g.ok&&isGptProConcurrencyEnvelope(g.body)},
+    adopt:function(g){renderGptProConcurrencyState(g.body)},
+    envName:GPTPRO_CONCURRENCY.envName,
+    name:"GPT Pro concurrency",
+    refreshName:"GPT Pro concurrency refresh",
+    successText:function(body){return "GPT Pro concurrency → "+body.max_concurrent_asks}
+  });
+}
+document.getElementById("gptpro-concurrency").addEventListener("change",function(){
+  GPTPRO_CONCURRENCY.draft=Number(this.value);
+  renderGptProConcurrency();
+});
+document.getElementById("gptpro-concurrency-apply").addEventListener("click",applyGptProConcurrency);
 /* --- account-pool routing mode (claude_account.routing) -------------------
    Same envelope discipline as the compaction card: adopt the live policy
    from every successful response, 409 flips the local lock and re-syncs from
@@ -2115,7 +2177,7 @@ function setTab(t){
   }else if(location.hash!=="#"+t){history.replaceState(null,"","#"+t)}
   if(t==="map"){drawWires();if(mapNeedsFit){mapNeedsFit=false;fitView()}}
   if(t==="status")fetchUsage();
-  if(t==="mcp"){fetchGptProSession();fetchMcpInfo();fetchGptProLogin()}
+  if(t==="mcp"){fetchGptProSession();fetchMcpInfo();fetchGptProLogin();fetchGptProConcurrency()}
   if(t==="log")fetchLogs();
   syncLogTimer();
   syncGptProSessionTimer();

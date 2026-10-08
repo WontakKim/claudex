@@ -298,10 +298,12 @@ input[type="checkbox"]{width:15px;height:15px;accent-color:var(--info)}
 .complock b,.acctlock b{color:var(--fg)}
 .complock code,.acctlock code{color:var(--cyan)}
 #compaction-card.locked .complock,#codex-card.locked .complock,#routing-card.locked .complock{display:block}
+#gptpro-concurrency-card.locked .complock{display:block}
 #scard-accounts.locked .acctlock{display:block}
 #compaction-card.locked,
 #codex-card.locked,
-#routing-card.locked{border-left:3px solid var(--err);padding-left:14px;margin-left:-17px}
+#routing-card.locked,
+#gptpro-concurrency-card.locked{border-left:3px solid var(--err);padding-left:14px;margin-left:-17px}
 .ctrow{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
 .cthint{margin-top:8px;color:var(--muted);font-size:12.5px}
 .cthint a,.route-link{color:var(--cyan)}

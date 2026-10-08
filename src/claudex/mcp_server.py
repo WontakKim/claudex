@@ -11,6 +11,7 @@ from starlette.responses import JSONResponse
 from starlette.types import Receive, Scope, Send
 
 from claudex import mcp_tools
+from claudex.config.schema import DEFAULT_GPTPRO_MAX_CONCURRENT_ASKS
 from claudex.gptpro import jobs
 from claudex.gptpro.ask import AskCallbacks
 
@@ -19,10 +20,22 @@ class LazyAskRuntime:
     """Create the optional ChatGPT Pro runtime on its first background ask."""
 
     def __init__(self) -> None:
+        self._max_concurrent_asks: int = DEFAULT_GPTPRO_MAX_CONCURRENT_ASKS
         self._runtime: Any | None = None
         self._job_service: jobs.AskJobService | None = None
         self._thread_registry = jobs.ThreadRegistry()
         self._lock = asyncio.Lock()
+
+    def set_max_concurrent_asks(self, limit: int) -> None:
+        self._max_concurrent_asks = limit
+        # A runtime created concurrently by _get_runtime reads the stored limit,
+        # so no update is lost without taking the asynchronous lock here.
+        if self._runtime is not None:
+            self._runtime.set_max_concurrent_asks(limit)
+
+    @property
+    def max_concurrent_asks(self) -> int:
+        return self._max_concurrent_asks
 
     async def ask(
         self,
@@ -130,7 +143,7 @@ class LazyAskRuntime:
             if self._runtime is None:
                 from claudex.gptpro.runtime import AskRuntime
 
-                self._runtime = AskRuntime()
+                self._runtime = AskRuntime(max_concurrent_asks=self._max_concurrent_asks)
             return self._runtime
 
 

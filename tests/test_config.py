@@ -221,6 +221,47 @@ class TestSettingsFile:
         monkeypatch.setenv("CLAUDEX_REASONING_EFFORT", "high")
         assert GatewayConfig.load(settings_file).reasoning_effort_override == "high"
 
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            {"gptpro": {"max_concurrent_asks": 4}},
+            {"gptpro.max_concurrent_asks": 4},
+        ],
+    )
+    def test_gptpro_concurrency_applies_from_settings_file(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        payload: dict[str, object],
+    ) -> None:
+        monkeypatch.delenv("GPTPRO_MAX_CONCURRENT_ASKS", raising=False)
+        settings_file = self._write(tmp_path, payload)
+        assert GatewayConfig.load(settings_file).gptpro_max_concurrent_asks == 4
+
+    @pytest.mark.parametrize("value", [True, False, "4", 4.0, None, 0, 11])
+    def test_invalid_gptpro_concurrency_in_settings_file(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, value: object
+    ) -> None:
+        monkeypatch.delenv("GPTPRO_MAX_CONCURRENT_ASKS", raising=False)
+        settings_file = self._write(tmp_path, {"gptpro": {"max_concurrent_asks": value}})
+        message = (
+            "must be between 1 and 10" if type(value) is int else "must be an integer"
+        )
+        with pytest.raises(ConfigError, match=message):
+            GatewayConfig.load(settings_file)
+
+    @pytest.mark.parametrize(("value", "expected"), [("1", 1), ("10", 10), ("", 2)])
+    def test_gptpro_concurrency_env_overrides_settings_file(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        value: str,
+        expected: int,
+    ) -> None:
+        settings_file = self._write(tmp_path, {"gptpro": {"max_concurrent_asks": 4}})
+        monkeypatch.setenv("GPTPRO_MAX_CONCURRENT_ASKS", value)
+        assert GatewayConfig.load(settings_file).gptpro_max_concurrent_asks == expected
+
     def test_codex_fast_service_tier_applies_from_settings_file(
         self, tmp_path: Path
     ) -> None:
@@ -1505,3 +1546,24 @@ class TestClaudeAccountRoutingSetting:
         update_settings_file(settings_file, {}, deletions=("compaction.model",))
         written = json.loads(settings_file.read_text(encoding="utf-8"))
         assert written == {"port": 9090}
+
+
+@pytest.mark.parametrize(("value", "expected"), [(None, 2), ("", 2), ("4", 4)])
+def test_gptpro_concurrency_from_env(
+    monkeypatch: pytest.MonkeyPatch, value: str | None, expected: int
+) -> None:
+    if value is None:
+        monkeypatch.delenv("GPTPRO_MAX_CONCURRENT_ASKS", raising=False)
+    else:
+        monkeypatch.setenv("GPTPRO_MAX_CONCURRENT_ASKS", value)
+    assert GatewayConfig.from_env().gptpro_max_concurrent_asks == expected
+
+
+@pytest.mark.parametrize("value", ["0", "11", "invalid", "1.5"])
+def test_invalid_gptpro_concurrency_from_env(
+    monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    monkeypatch.setenv("GPTPRO_MAX_CONCURRENT_ASKS", value)
+    message = "must be between 1 and 10" if value in ("0", "11") else "must be an integer"
+    with pytest.raises(ConfigError, match=message):
+        GatewayConfig.from_env()

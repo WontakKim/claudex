@@ -12,7 +12,7 @@ the new values, so stop and start the gateway after editing the file or
 changing the environment by hand. Changes made through the dashboard or admin
 API apply to the running gateway without a restart.
 
-The GPT Pro scheduler reads its own environment-only variables; see
+The other GPT Pro scheduler variables are environment-only; see
 [GPT Pro operations](gptpro.md#operations).
 
 | Variable | Default | Description |
@@ -24,6 +24,7 @@ The GPT Pro scheduler reads its own environment-only variables; see
 | `CLAUDEX_CUSTOM_PROVIDERS` | empty | JSON-encoded document containing `openai_compatible` and/or `anthropic_compatible` named providers; an empty string means no custom providers. See [Custom providers](custom-providers.md#custom-providers) |
 | `CLAUDEX_REASONING_EFFORT` | derived | Force `minimal`, `low`, `medium`, `high`, `xhigh`, or `max` instead of deriving the effort from each Claude request. Applies to Responses routes: Codex, Grok, and OpenAI-compatible custom providers; Grok narrows it to `low`/`medium`/`high` |
 | `CLAUDEX_CODEX_SERVICE_TIER` | unset | `codex.service_tier` setting: `fast` opts Codex requests into Fast mode where the live catalog advertises it; unset or empty keeps the standard tier. See [Fast mode](providers.md#fast-mode) |
+| `GPTPRO_MAX_CONCURRENT_ASKS` | `2` | `gptpro.max_concurrent_asks` setting: integer 1–10 ask-tab concurrency for the GPT Pro MCP runtime; out-of-range or non-integer values abort the boot; editable at runtime through the dashboard and `PUT /admin/settings/gptpro` |
 | `CODEX_HOME` | `~/.codex` | Directory containing Codex `auth.json` |
 | `GROK_HOME` | `~/.grok` | Directory containing the Grok CLI's `auth.json` |
 | `KIMI_CODE_HOME` | `~/.kimi-code` | Directory containing the Kimi Code CLI's credential store |
@@ -48,14 +49,15 @@ so maps are plain objects instead of JSON-in-a-string:
 }
 ```
 
-Four settings are grouped instead: `codex.service_tier`, `compaction.model`,
-`claude_account.id`, and `claude_account.routing` are nested objects in the
-file, so `compaction_model` or `claude_account_routing` is rejected as an
-unknown key:
+Five settings are grouped instead: `codex.service_tier`,
+`gptpro.max_concurrent_asks`, `compaction.model`, `claude_account.id`, and
+`claude_account.routing` are nested objects in the file, so `compaction_model`
+or `claude_account_routing` is rejected as an unknown key:
 
 ```json
 {
   "codex": {"service_tier": "fast"},
+  "gptpro": {"max_concurrent_asks": 4},
   "compaction": {"model": "claude:claude-opus-5"},
   "claude_account": {"routing": {"mode": "fallback"}}
 }
