@@ -12,8 +12,11 @@ from claudex import paths
 
 from .schema import (
     BUILTIN_ROUTE_PROVIDERS,
+    DEFAULT_GPTPRO_MAX_CONCURRENT_ASKS,
     DEFAULT_HOST,
     DEFAULT_PORT,
+    MAX_GPTPRO_MAX_CONCURRENT_ASKS,
+    MIN_GPTPRO_MAX_CONCURRENT_ASKS,
     SETTINGS_KEYS,
     VALID_CODEX_SERVICE_TIERS,
     VALID_LOG_LEVELS,
@@ -53,6 +56,8 @@ class GatewayConfig:
     reasoning_effort_override: str | None = None
     # When set to "fast", opts supported Codex models into the Fast tier.
     codex_service_tier: str | None = None
+    # Maximum number of concurrent ask tabs in the GPT Pro MCP runtime.
+    gptpro_max_concurrent_asks: int = DEFAULT_GPTPRO_MAX_CONCURRENT_ASKS
     codex_home: Path = field(default_factory=lambda: Path.home() / ".codex")
     # Where the Grok CLI login (`grok login`) lives; mirrors the CLI's own
     # GROK_HOME. auth.json sits directly inside.
@@ -117,6 +122,29 @@ class GatewayConfig:
             raise ConfigError(f"{label} must be an integer, got {value!r}")
         if not 1 <= port <= 65535:
             raise ConfigError(f"{label} must be between 1 and 65535, got {port}")
+
+        value, label = _resolve("gptpro.max_concurrent_asks", settings)
+        env_name = SETTINGS_KEYS["gptpro.max_concurrent_asks"]
+        if label == env_name and (value is None or value == ""):
+            gptpro_max_concurrent_asks = DEFAULT_GPTPRO_MAX_CONCURRENT_ASKS
+        elif label == env_name and isinstance(value, str):
+            try:
+                gptpro_max_concurrent_asks = int(value)
+            except ValueError as exc:
+                raise ConfigError(f"{label} must be an integer, got {value!r}") from exc
+        elif isinstance(value, int) and not isinstance(value, bool):
+            gptpro_max_concurrent_asks = value
+        else:
+            raise ConfigError(f"{label} must be an integer, got {value!r}")
+        if not (
+            MIN_GPTPRO_MAX_CONCURRENT_ASKS
+            <= gptpro_max_concurrent_asks
+            <= MAX_GPTPRO_MAX_CONCURRENT_ASKS
+        ):
+            raise ConfigError(
+                f"{label} must be between {MIN_GPTPRO_MAX_CONCURRENT_ASKS} "
+                f"and {MAX_GPTPRO_MAX_CONCURRENT_ASKS}, got {gptpro_max_concurrent_asks}"
+            )
 
         value, label = _resolve("custom_providers", settings)
         if value is None:
@@ -256,6 +284,7 @@ class GatewayConfig:
             custom_providers=custom_providers,
             reasoning_effort_override=effort,
             codex_service_tier=codex_service_tier,
+            gptpro_max_concurrent_asks=gptpro_max_concurrent_asks,
             codex_home=codex_home,
             grok_home=grok_home,
             kimi_code_home=kimi_code_home,

@@ -13,6 +13,9 @@ from urllib.parse import urlsplit
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8787
+DEFAULT_GPTPRO_MAX_CONCURRENT_ASKS = 2
+MIN_GPTPRO_MAX_CONCURRENT_ASKS = 1
+MAX_GPTPRO_MAX_CONCURRENT_ASKS = 10
 
 # Built-in providers a model_map value may target. Custom providers extend this
 # namespace at config load time.
@@ -41,6 +44,8 @@ SETTINGS_KEYS: dict[str, str] = {
     # (or a resolved empty string) means the feature is disabled — there is no
     # separate "enabled" flag.
     "codex.service_tier": "CLAUDEX_CODEX_SERVICE_TIER",
+    # The GPT Pro variable keeps its pre-existing unprefixed name.
+    "gptpro.max_concurrent_asks": "GPTPRO_MAX_CONCURRENT_ASKS",
     "codex_home": "CODEX_HOME",
     "grok_home": "GROK_HOME",
     "kimi_code_home": "KIMI_CODE_HOME",

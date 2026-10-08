@@ -332,7 +332,63 @@ def test_runtime_limits_concurrent_asks_to_two(
         return _outcome(question)
 
     monkeypatch.setattr(runtime.ask, "execute_ask_outcome", execute_ask_outcome)
-    monkeypatch.setenv("GPTPRO_MAX_CONCURRENT_ASKS", "2")
+
+    async def scenario() -> None:
+        ask_runtime = runtime.AskRuntime(max_concurrent_asks=2)
+        tasks = [
+            asyncio.create_task(ask_runtime.ask(question))
+            for question in ("one", "two", "three")
+        ]
+        await two_started.wait()
+        await asyncio.sleep(0)
+        assert len(started) == 2
+        assert maximum_active == 2
+        release.set()
+        outcomes = await asyncio.gather(*tasks)
+        assert [outcome.text for outcome in outcomes] == ["one", "two", "three"]
+        assert maximum_active == 2
+        await ask_runtime.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_runtime_default_ignores_concurrency_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = _FakeContext()
+    _RuntimeFakes(monkeypatch, [context])
+    active = 0
+    maximum_active = 0
+    started: list[str] = []
+    two_started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def execute_ask_outcome(
+        page: _FakePage,
+        question: str,
+        *,
+        callbacks: ask.AskCallbacks | None = None,
+        should_detach: Callable[[], bool] | None = None,
+        on_detach: Callable[
+            [ask.AskSubmission], Awaitable[ask.AskOutcome]
+        ]
+        | None = None,
+    ) -> ask.AskOutcome:
+        nonlocal active, maximum_active
+        del page, callbacks
+        active += 1
+        maximum_active = max(maximum_active, active)
+        started.append(question)
+        if len(started) == 2:
+            two_started.set()
+        try:
+            await release.wait()
+        finally:
+            active -= 1
+        return _outcome(question)
+
+    monkeypatch.setattr(runtime.ask, "execute_ask_outcome", execute_ask_outcome)
+    monkeypatch.setenv("GPTPRO_MAX_CONCURRENT_ASKS", "1")
 
     async def scenario() -> None:
         ask_runtime = runtime.AskRuntime()
@@ -340,7 +396,7 @@ def test_runtime_limits_concurrent_asks_to_two(
             asyncio.create_task(ask_runtime.ask(question))
             for question in ("one", "two", "three")
         ]
-        await two_started.wait()
+        await asyncio.wait_for(two_started.wait(), timeout=1)
         await asyncio.sleep(0)
         assert len(started) == 2
         assert maximum_active == 2
@@ -1182,7 +1238,6 @@ def test_runtime_detaches_waiting_answer_when_submitter_contends(
         return poller
 
     monkeypatch.setattr(runtime, "DetachPoller", create_poller)
-    monkeypatch.setenv("GPTPRO_MAX_CONCURRENT_ASKS", "1")
     first_started = asyncio.Event()
     second_started = asyncio.Event()
     detached_callback_calls = 0
@@ -1223,7 +1278,7 @@ def test_runtime_detaches_waiting_answer_when_submitter_contends(
     monkeypatch.setattr(runtime.ask, "execute_ask_outcome", execute_ask_outcome)
 
     async def scenario() -> None:
-        ask_runtime = runtime.AskRuntime()
+        ask_runtime = runtime.AskRuntime(max_concurrent_asks=1)
         first_task = asyncio.create_task(
             ask_runtime.ask(
                 "first",
@@ -1266,7 +1321,6 @@ def test_runtime_recovers_no_raw_turn_through_detach_poller(
 ) -> None:
     context = _FakeContext()
     _RuntimeFakes(monkeypatch, [context])
-    monkeypatch.setenv("GPTPRO_MAX_CONCURRENT_ASKS", "1")
     monkeypatch.setenv("GPTPRO_RAW_TURN_RECOVERY_SECONDS", "120")
     now = 100.0
     monkeypatch.setattr(runtime, "_monotonic", lambda: now)
@@ -1299,7 +1353,7 @@ def test_runtime_recovers_no_raw_turn_through_detach_poller(
     monkeypatch.setattr(runtime.ask, "execute_ask_outcome", execute_ask_outcome)
 
     async def scenario() -> None:
-        ask_runtime = runtime.AskRuntime()
+        ask_runtime = runtime.AskRuntime(max_concurrent_asks=1)
         poller = _RuntimeDetachPollerFake(ask_runtime._get_context)
         ask_runtime._poller = poller
         outcome_task = asyncio.create_task(
@@ -1871,7 +1925,6 @@ def test_capacity_queue_does_not_consume_shared_deadline(
     _RuntimeFakes(monkeypatch, [context])
     now = 0.0
     monkeypatch.setattr(runtime, "_monotonic", lambda: now)
-    monkeypatch.setenv("GPTPRO_MAX_CONCURRENT_ASKS", "1")
     monkeypatch.delenv("GPTPRO_RAW_TURN_RECOVERY_SECONDS", raising=False)
 
     async def execute(
@@ -1886,7 +1939,7 @@ def test_capacity_queue_does_not_consume_shared_deadline(
 
     async def scenario() -> None:
         nonlocal now
-        ask_runtime = runtime.AskRuntime()
+        ask_runtime = runtime.AskRuntime(max_concurrent_asks=1)
         poller = _RuntimeDetachPollerFake(ask_runtime._get_context)
         ask_runtime._poller = poller
         await ask_runtime._ask_semaphore.acquire()
@@ -2180,3 +2233,9 @@ def test_short_auto_recovery_file_allowance_cannot_extend_total(
         await ask_runtime.aclose()
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("limit", [0, -1])
+def test_runtime_rejects_nonpositive_concurrency(limit: int) -> None:
+    with pytest.raises(ValueError, match="max_concurrent_asks"):
+        runtime.AskRuntime(max_concurrent_asks=limit)

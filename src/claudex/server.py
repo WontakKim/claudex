@@ -276,6 +276,9 @@ def create_app(config: GatewayConfig, daemon_nonce: str | None = None) -> Starle
                     kimi_auth_manager = KimiAuthManager(config.kimi_code_home, http_client)
                     grok_auth_manager = GrokAuthManager(config.grok_home / "auth.json", http_client)
                     app.state.config = config
+                    app.state.gptpro_ask_runtime.set_max_concurrent_asks(
+                        config.gptpro_max_concurrent_asks
+                    )
                     app.state.admin_lock = asyncio.Lock()
                     # Redeem key of a reset attempt whose outcome never came back.
                     app.state.codex_reset_key = None

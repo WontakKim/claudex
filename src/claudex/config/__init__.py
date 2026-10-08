@@ -4,8 +4,11 @@ from . import gateway, schema, settings_io
 from .gateway import GatewayConfig
 from .schema import (
     BUILTIN_ROUTE_PROVIDERS,
+    DEFAULT_GPTPRO_MAX_CONCURRENT_ASKS,
     DEFAULT_HOST,
     DEFAULT_PORT,
+    MAX_GPTPRO_MAX_CONCURRENT_ASKS,
+    MIN_GPTPRO_MAX_CONCURRENT_ASKS,
     RESERVED_PROVIDER_NAMES,
     SETTINGS_KEYS,
     VALID_CLAUDE_ACCOUNT_ROUTING_MODES,

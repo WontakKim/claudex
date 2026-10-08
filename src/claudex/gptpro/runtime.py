@@ -14,6 +14,7 @@ from dataclasses import dataclass, replace
 from typing import Any
 
 from claudex import locking, paths
+from claudex.config.schema import DEFAULT_GPTPRO_MAX_CONCURRENT_ASKS
 from claudex.gptpro import ask, browser, generated_files, session
 from claudex.gptpro.ask import AskCallbacks, AskEvidence
 from claudex.gptpro.conversation import (
@@ -26,7 +27,7 @@ from claudex.gptpro.selectors import PAGE_FETCH_PROBE_JS
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_MAX_CONCURRENT_ASKS = 2
+DEFAULT_MAX_CONCURRENT_ASKS = DEFAULT_GPTPRO_MAX_CONCURRENT_ASKS
 MAX_EXECUTION_SECONDS = 5400.0
 DEFAULT_RAW_TURN_RECOVERY_SECONDS = MAX_EXECUTION_SECONDS
 MIN_SUBMISSION_JITTER_SECONDS = 1.0
@@ -59,17 +60,6 @@ async def _harden_page_user_agent(page: Any) -> None:
         await page.set_extra_http_headers({"User-Agent": hardened})
     except Exception:
         return
-
-
-def _max_concurrent_asks() -> int:
-    raw_value = os.environ.get("GPTPRO_MAX_CONCURRENT_ASKS")
-    if raw_value is None:
-        return DEFAULT_MAX_CONCURRENT_ASKS
-    try:
-        configured_value = int(raw_value)
-    except ValueError:
-        return DEFAULT_MAX_CONCURRENT_ASKS
-    return max(1, configured_value)
 
 
 def raw_turn_recovery_seconds() -> float:
@@ -597,11 +587,15 @@ class DetachPoller:
 class AskRuntime:
     """Own one lazy persistent context and its bounded pool of ask tabs."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self, *, max_concurrent_asks: int = DEFAULT_MAX_CONCURRENT_ASKS
+    ) -> None:
+        if max_concurrent_asks < 1:
+            raise ValueError("max_concurrent_asks must be at least 1")
         self._context: Any | None = None
         self._profile_lock: locking.FileLockHandle | None = None
         self._initialization_lock = asyncio.Lock()
-        self._ask_semaphore = asyncio.Semaphore(_max_concurrent_asks())
+        self._ask_semaphore = asyncio.Semaphore(max_concurrent_asks)
         self._waiting_submitters = 0
         self._poller = DetachPoller(self._get_context)
 

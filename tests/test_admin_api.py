@@ -5736,3 +5736,11 @@ class TestAdminClaudeLoginLifecycle:
 
         [record] = claude_accounts.load_registry()
         assert record == original
+
+
+def test_lifespan_configures_gptpro_concurrency(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config = GatewayConfig(gptpro_max_concurrent_asks=4)
+    with _create_test_client(monkeypatch, tmp_path, config=config) as client:
+        assert client.app.state.gptpro_ask_runtime.max_concurrent_asks == 4

@@ -1628,3 +1628,27 @@ def test_result_tool_description_explains_gateway_host_file_paths() -> None:
     assert "gateway host" in description
     assert "files_complete" in description
     assert "sandbox" in description
+
+
+def test_lazy_runtime_default_concurrency() -> None:
+    assert LazyAskRuntime().max_concurrent_asks == 2
+
+
+def test_lazy_runtime_passes_configured_concurrency(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from claudex.gptpro import runtime
+
+    captured: list[dict[str, Any]] = []
+
+    class RuntimeSpy:
+        def __init__(self, **options: Any) -> None:
+            captured.append(options)
+
+    monkeypatch.setattr(runtime, "AskRuntime", RuntimeSpy)
+    lazy_runtime = LazyAskRuntime()
+    lazy_runtime.set_max_concurrent_asks(3)
+    assert lazy_runtime.max_concurrent_asks == 3
+    created = asyncio.run(lazy_runtime._get_runtime())
+    assert isinstance(created, RuntimeSpy)
+    assert captured == [{"max_concurrent_asks": 3}]
