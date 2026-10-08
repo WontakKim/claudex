@@ -1400,6 +1400,325 @@ def test_explicit_attachment_paths_are_passed_unchanged() -> None:
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize(
+    "original_attachment_paths",
+    [None, ["notes.txt", "context.txt"]],
+    ids=["question-only", "user-attachments"],
+)
+def test_composer_rejection_resubmits_as_attachment(
+    caplog: pytest.LogCaptureFixture,
+    original_attachment_paths: list[str] | None,
+) -> None:
+    now = 100.0
+    release_fallback = asyncio.Event()
+    captured_questions: list[str] = []
+    captured_callbacks: list[ask.AskCallbacks | None] = []
+    captured_attachment_paths: list[Sequence[str] | None] = []
+    captured_timeouts: list[float | None] = []
+    original_question = "Review https://example.test/private-question; price: €"
+    thread_ref = "123e4567-e89b-12d3-a456-426614174000"
+    status_message = (
+        "composer did not retain the inline question; "
+        "resubmitting it as an attachment"
+    )
+
+    async def provider(
+        question: str,
+        *,
+        callbacks: ask.AskCallbacks | None = None,
+        conversation_id: str | None = None,
+        timeout_seconds: float | None = None,
+        attachment_paths: Sequence[str] | None = None,
+    ) -> ask.AskOutcome:
+        nonlocal now
+        captured_questions.append(question)
+        captured_callbacks.append(callbacks)
+        captured_attachment_paths.append(attachment_paths)
+        captured_timeouts.append(timeout_seconds)
+        assert conversation_id == thread_ref
+        assert callbacks is not None
+        assert callbacks.on_marker is not None
+        assert callbacks.on_evidence is not None
+        if len(captured_questions) == 1:
+            callbacks.on_marker("marker-1")
+            exc = ask.GptProAskError(
+                "submit_failed", "the ChatGPT composer did not retain the prompt"
+            )
+            exc.evidence = ask.AskEvidence(
+                failure_stage="composer", submission="not_attempted"
+            )
+            callbacks.on_evidence(exc.evidence)
+            now += 7.5
+            raise exc
+        callbacks.on_marker("marker-2")
+        callbacks.on_evidence(ask.AskEvidence(submission="confirmed"))
+        await release_fallback.wait()
+        return ask.AskOutcome("answer", "marker-2", conversation_id)
+
+    async def scenario() -> None:
+        nonlocal now
+        service = jobs.AskJobService(
+            provider, overall_timeout_seconds=120.0, clock=lambda: now
+        )
+        started = service.start(
+            original_question,
+            conversation_id=thread_ref,
+            attachment_paths=original_attachment_paths,
+        )
+        caplog.clear()
+        now = 102.5
+        try:
+            pending = await _wait_for_status_message(
+                service, started.ask_id, status_message
+            )
+            assert pending.state == "running"
+            assert pending.nonce_marker == "marker-2"
+            assert pending.evidence.failure_stage is None
+            assert pending.evidence.submission == "confirmed"
+            assert service._conversation_owners[thread_ref].owner_ask_id == (
+                started.ask_id
+            )
+            assert len(captured_questions) == 2
+            assert captured_questions[0] == original_question
+            assert captured_attachment_paths[0] is original_attachment_paths
+            fallback_paths = captured_attachment_paths[1]
+            assert fallback_paths is not None
+            spill_path = Path(fallback_paths[0])
+            assert fallback_paths == [
+                str(spill_path), *(original_attachment_paths or ())
+            ]
+            assert spill_path.name.startswith("gptpro-spill-")
+            assert spill_path.suffix == ".txt"
+            assert spill_path.read_text(encoding="utf-8") == original_question
+            assert captured_questions[1] == (
+                "The full question text is attached as "
+                f"{spill_path.name}; read the attachment and answer it."
+            )
+            assert captured_callbacks[1] is captured_callbacks[0]
+            assert captured_timeouts == [120.0, 112.5]
+
+            release_fallback.set()
+            succeeded = await _wait_for_state(service, started.ask_id, "succeeded")
+            assert succeeded.answer == "answer"
+            assert succeeded.nonce_marker == "marker-2"
+            assert succeeded.evidence.failure_stage is None
+            assert succeeded.evidence.submission == "confirmed"
+            assert not spill_path.exists()
+            warnings = [
+                record for record in caplog.records
+                if record.levelno == logging.WARNING
+            ]
+            assert len(warnings) == 1
+            assert warnings[0].msg == (
+                "gptpro ask %.8s composer did not retain the inline question "
+                "(%s); resubmitting it as an attachment"
+            )
+            assert warnings[0].args == (
+                started.ask_id, "the ChatGPT composer did not retain the prompt"
+            )
+            assert original_question not in caplog.text
+            assert "https://example.test/private-question" not in caplog.text
+        finally:
+            await service.aclose()
+
+    caplog.set_level(logging.INFO, logger="claudex.gptpro.jobs")
+    asyncio.run(scenario())
+
+
+def test_composer_rejection_fallback_is_attempted_only_once() -> None:
+    captured_attachment_paths: list[Sequence[str] | None] = []
+    original_question = "Review https://example.test/question"
+    second_evidence = ask.AskEvidence(
+        failure_stage="composer", submission="not_attempted",
+        upload_receipts=1, ready_attachments=1,
+    )
+
+    async def provider(
+        question: str,
+        *,
+        callbacks: ask.AskCallbacks | None = None,
+        conversation_id: str | None = None,
+        timeout_seconds: float | None = None,
+        attachment_paths: Sequence[str] | None = None,
+    ) -> ask.AskOutcome:
+        del question, conversation_id, timeout_seconds
+        captured_attachment_paths.append(attachment_paths)
+        attempt = len(captured_attachment_paths)
+        assert callbacks is not None
+        assert callbacks.on_marker is not None
+        assert callbacks.on_evidence is not None
+        callbacks.on_marker(f"marker-{attempt}")
+        exc = ask.GptProAskError(
+            "submit_failed",
+            "the ChatGPT composer did not retain the prompt"
+            if attempt == 1 else "the ChatGPT composer rejected the stub too",
+        )
+        exc.evidence = (
+            ask.AskEvidence(failure_stage="composer", submission="not_attempted")
+            if attempt == 1 else second_evidence
+        )
+        callbacks.on_evidence(exc.evidence)
+        if attachment_paths is not None:
+            assert Path(attachment_paths[0]).read_text() == original_question
+        raise exc
+
+    async def scenario() -> None:
+        service = jobs.AskJobService(provider)
+        started = service.start(original_question)
+        try:
+            failed = await _wait_for_state(service, started.ask_id, "failed")
+            assert len(captured_attachment_paths) == 2
+            assert failed.failure == "submit_failed"
+            assert failed.error_message == "the ChatGPT composer rejected the stub too"
+            assert failed.nonce_marker == "marker-2"
+            assert failed.evidence == second_evidence
+            fallback_paths = captured_attachment_paths[1]
+            assert fallback_paths is not None
+            assert len(fallback_paths) == 1
+            assert not Path(fallback_paths[0]).exists()
+        finally:
+            await service.aclose()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("failure", "evidence"),
+    [
+        ("submit_failed", ask.AskEvidence(failure_stage="submission")),
+        ("submit_failed", ask.AskEvidence(
+            failure_stage="composer", submission="uncertain"
+        )),
+        ("submit_failed", ask.AskEvidence(
+            failure_stage="composer", submission="confirmed"
+        )),
+        ("submit_failed", None),
+        ("navigation_failed", ask.AskEvidence(failure_stage="composer")),
+    ],
+    ids=["other-stage", "uncertain", "confirmed", "no-evidence", "other-failure"],
+)
+def test_composer_rejection_fallback_requires_unsubmitted_composer_evidence(
+    failure: ask.FailureClassification,
+    evidence: ask.AskEvidence | None,
+) -> None:
+    provider_calls = 0
+
+    async def provider(
+        question: str,
+        *,
+        callbacks: ask.AskCallbacks | None = None,
+        conversation_id: str | None = None,
+        timeout_seconds: float | None = None,
+        attachment_paths: Sequence[str] | None = None,
+    ) -> ask.AskOutcome:
+        nonlocal provider_calls
+        del question, callbacks, conversation_id, timeout_seconds, attachment_paths
+        provider_calls += 1
+        exc = ask.GptProAskError(failure, "the composer did not retain the prompt")
+        exc.evidence = evidence
+        raise exc
+
+    async def scenario() -> None:
+        service = jobs.AskJobService(provider)
+        started = service.start("Review https://example.test/question")
+        try:
+            failed = await _wait_for_state(service, started.ask_id, "failed")
+            assert provider_calls == 1
+            assert failed.failure == failure
+            assert failed.error_message == "the composer did not retain the prompt"
+            if evidence is not None:
+                assert failed.evidence == evidence
+        finally:
+            await service.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_composer_rejection_does_not_resubmit_an_already_spilled_question(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(jobs_service, "QUESTION_SPILL_THRESHOLD_BYTES", 8)
+    captured_attachment_paths: list[Sequence[str] | None] = []
+    original_question = "price: €"
+
+    async def provider(
+        question: str,
+        *,
+        callbacks: ask.AskCallbacks | None = None,
+        conversation_id: str | None = None,
+        timeout_seconds: float | None = None,
+        attachment_paths: Sequence[str] | None = None,
+    ) -> ask.AskOutcome:
+        del question, callbacks, conversation_id, timeout_seconds
+        captured_attachment_paths.append(attachment_paths)
+        exc = ask.GptProAskError(
+            "submit_failed", "the ChatGPT composer did not retain the prompt"
+        )
+        exc.evidence = ask.AskEvidence(
+            failure_stage="composer", submission="not_attempted"
+        )
+        raise exc
+
+    async def scenario() -> None:
+        service = jobs.AskJobService(provider)
+        started = service.start(original_question)
+        try:
+            failed = await _wait_for_state(service, started.ask_id, "failed")
+            assert len(captured_attachment_paths) == 1
+            assert failed.failure == "submit_failed"
+            paths = captured_attachment_paths[0]
+            assert paths is not None
+            assert len(paths) == 1
+            assert not Path(paths[0]).exists()
+        finally:
+            await service.aclose()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("elapsed_seconds", [120.0, 120.5])
+def test_composer_rejection_does_not_resubmit_after_budget_exhaustion(
+    elapsed_seconds: float,
+) -> None:
+    now = 100.0
+    captured_timeouts: list[float | None] = []
+
+    async def provider(
+        question: str,
+        *,
+        callbacks: ask.AskCallbacks | None = None,
+        conversation_id: str | None = None,
+        timeout_seconds: float | None = None,
+        attachment_paths: Sequence[str] | None = None,
+    ) -> ask.AskOutcome:
+        nonlocal now
+        del question, callbacks, conversation_id, attachment_paths
+        captured_timeouts.append(timeout_seconds)
+        now += elapsed_seconds
+        exc = ask.GptProAskError(
+            "submit_failed", "the ChatGPT composer did not retain the prompt"
+        )
+        exc.evidence = ask.AskEvidence(
+            failure_stage="composer", submission="not_attempted"
+        )
+        raise exc
+
+    async def scenario() -> None:
+        service = jobs.AskJobService(
+            provider, overall_timeout_seconds=120.0, clock=lambda: now
+        )
+        started = service.start("Review https://example.test/question")
+        try:
+            failed = await _wait_for_state(service, started.ask_id, "failed")
+            assert captured_timeouts == [120.0]
+            assert failed.failure == "submit_failed"
+            assert failed.evidence.failure_stage == "composer"
+        finally:
+            await service.aclose()
+
+    asyncio.run(scenario())
+
+
 def test_thread_registry_returns_bound_thread_and_none_for_unknown_session() -> None:
     registry = jobs.ThreadRegistry()
 
