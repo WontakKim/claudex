@@ -54,6 +54,18 @@ def _spill_question(
     return provider_question, [str(spill_path), *(attachment_paths or ())], spill_path
 
 
+def _root_cause(exc: BaseException) -> BaseException | None:
+    """Return the innermost explicitly chained cause of `exc`, if any."""
+    root: BaseException | None = None
+    seen: set[int] = {id(exc)}
+    current = exc.__cause__
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        root = current
+        current = current.__cause__
+    return root
+
+
 def _ownership_key(conversation_id: str) -> str:
     if is_conversation_id(conversation_id):
         return conversation_id.lower()
@@ -593,12 +605,14 @@ class AskJobService:
                     conversation_id=job.thread_ref,
                 ),
             )
+            cause = _root_cause(exc)
             logger.warning(
-                "gptpro ask %.8s failed (failure=%s thread=%s): %s",
+                "gptpro ask %.8s failed (failure=%s thread=%s): %s%s",
                 ask_id,
                 exc.failure,
                 self._jobs[ask_id].thread_ref or "new",
                 exc,
+                "" if cause is None else f" (cause: {type(cause).__name__}: {cause})",
             )
         except Exception as exc:
             self._jobs[ask_id] = replace(

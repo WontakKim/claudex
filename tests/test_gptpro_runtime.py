@@ -1032,6 +1032,49 @@ def test_detach_poller_retries_navigation_destroyed_fetch_on_next_cycle(
     asyncio.run(scenario())
 
 
+def test_detach_poller_logs_unexpected_failure_with_traceback(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    marker = "[gptpro-transport-nonce:poller-unexpected-failure]"
+    cause = RuntimeError("Target page, context or browser has been closed")
+    page = _PollerFakePage(marker, [cause])
+    context = _PollerFakeContext(page)
+    caplog.set_level(logging.ERROR, logger="claudex.gptpro.runtime")
+
+    async def scenario() -> None:
+        poller = runtime.DetachPoller(lambda: asyncio.sleep(0, result=context))
+        future = poller.register(
+            _CONVERSATION_ID,
+            marker,
+            deadline=runtime._monotonic() + 100.0,
+        )
+        with pytest.raises(ask.GptProAskError) as raised:
+            await future
+        await _wait_for_poller_idle(poller)
+
+        assert raised.value.failure == "error"
+        assert str(raised.value) == (
+            "the detached answer poller failed unexpectedly"
+        )
+        assert raised.value.__cause__ is cause
+        await poller.aclose()
+
+    asyncio.run(scenario())
+
+    records = [
+        record for record in caplog.records
+        if record.name == "claudex.gptpro.runtime"
+    ]
+    assert len(records) == 1
+    assert records[0].levelno == logging.ERROR
+    assert records[0].getMessage() == (
+        "gptpro detached answer poller failed unexpectedly; failing 1 "
+        f"registration(s) (thread={_CONVERSATION_ID})"
+    )
+    assert records[0].exc_info is not None
+    assert records[0].exc_info[1] is cause
+
+
 def test_detach_poller_resets_backoff_when_registrations_become_idle(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

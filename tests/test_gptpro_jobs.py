@@ -199,6 +199,39 @@ def test_classified_failure_log_includes_failure_and_thread(
     ]
 
 
+def test_classified_failure_log_includes_root_cause(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    async def provider(question: str, **_options: object) -> ask.AskOutcome:
+        root = RuntimeError("Target page, context or browser has been closed")
+        poller_failure = ask.GptProAskError(
+            "error", "the detached answer poller failed unexpectedly"
+        )
+        poller_failure.__cause__ = root
+        raise ask.GptProAskError(
+            "timeout",
+            "the overall ChatGPT ask deadline expired; recovery error: "
+            "the detached answer poller failed unexpectedly",
+        ) from poller_failure
+
+    async def scenario() -> jobs.AskJob:
+        service = jobs.AskJobService(provider)
+        started_job = service.start("question")
+        await _wait_for_state(service, started_job.ask_id, "failed")
+        await service.aclose()
+        return started_job
+
+    caplog.set_level(logging.WARNING, logger="claudex.gptpro.jobs")
+    started_job = asyncio.run(scenario())
+
+    assert caplog.messages == [
+        f"gptpro ask {started_job.ask_id[:8]} failed (failure=timeout thread=new): "
+        "the overall ChatGPT ask deadline expired; recovery error: "
+        "the detached answer poller failed unexpectedly "
+        "(cause: RuntimeError: Target page, context or browser has been closed)"
+    ]
+
+
 def test_unexpected_failure_log_includes_exception_info(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
