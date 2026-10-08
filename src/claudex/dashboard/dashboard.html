@@ -1,6 +1,6 @@
 <!doctype html>
 <!-- Runtime dashboard for routing Claude Code models across multiple providers. -->
-<html lang="ko">
+<html lang="en">
 <!-- Head -->
 <head>
 <meta charset="utf-8">
@@ -28,34 +28,34 @@
     <!-- Settings tab -->
     <section id="tab-settings" data-cat="general">
       <div class="layout">
-        <nav class="rail" aria-label="설정 종류">
+        <nav class="rail" aria-label="Settings categories">
           <a class="rail-item on" href="#settings/general">General</a>
-          <a class="rail-item" href="#settings/accounts">Claude 계정</a>
+          <a class="rail-item" href="#settings/accounts">Claude accounts</a>
         </nav>
         <div class="card scard" id="scard-general">
           <!-- compaction-section:start -->
           <div class="srow" id="compaction-card">
             <div>
               <div class="name">Compact Reroute</div>
-              <div class="desc">Claude Code가 보내는 긴 컨텍스트 정리 요청을 지정한 모델로 진행합니다.</div>
+              <div class="desc">Reroute oversized compaction requests to the selected Claude model.</div>
             </div>
             <div>
-              <div class="complock" id="comp-lockband"><b>LOCKED</b> — <code id="comp-lock-env"></code> 환경변수가 우선합니다. 재라우팅 대상은 열람 전용입니다.</div>
+              <div class="complock" id="comp-lockband"><b>LOCKED</b> — <code id="comp-lock-env"></code> takes precedence. The compaction target is read-only.</div>
               <div class="ctrow">
-                <select id="comp-select">
+                <select id="comp-select" aria-label="Compaction model">
                   <option value="disabled">Disabled</option>
                   <option value="claude-sonnet-5">claude-sonnet-5 (recommended)</option>
                   <option value="claude-opus-5">claude-opus-5</option>
                   <option value="claude-fable-5">claude-fable-5</option>
                   <option value="custom">Custom</option>
                 </select>
-                <button id="comp-apply">적용</button>
+                <button id="comp-apply">Apply</button>
               </div>
               <div class="comp-custom" id="comp-custom-wrap">
-                <div class="ctnode grow"><input id="comp-custom-input" spellcheck="false" placeholder="claude-…"></div>
+                <div class="ctnode grow"><input id="comp-custom-input" spellcheck="false" aria-label="Custom compaction model ID" placeholder="claude-…"></div>
                 <div class="cthint">unverified until first use</div>
               </div>
-              <div class="cthint">Compact 요청은 장치에 저장된 Claude 기본 자격증명으로 수행됩니다.</div>
+              <div class="cthint">Uses eligible Claude credentials sent by the client; registered-account credentials are not substituted.</div>
             </div>
           </div>
           <!-- compaction-section:end -->
@@ -70,27 +70,27 @@
                 <label class="fast-option" for="codex-fast"><input type="checkbox" id="codex-fast"> Enable Codex Fast mode</label>
                 <button id="codex-apply">Apply</button>
               </div>
-              <div class="cthint">Fast runs supported Codex models with priority processing (~1.5x speed) at ~2–2.5x usage burn; models whose catalog does not advertise Fast silently stay standard.</div>
+              <div class="cthint">Fast requests priority processing for supported Codex models. Speed and usage costs depend on the provider and workload; models whose catalog does not advertise Fast stay standard.</div>
             </div>
           </div>
           <!-- codex-section:end -->
           <!-- routing-section:start -->
           <div class="srow" id="routing-card">
             <div>
-              <div class="name">Claude 계정 라우팅</div>
-              <div class="desc">서빙 계정이 429를 받았을 때 등록 계정 풀을 어떻게 쓸지 정합니다.</div>
+              <div class="name">Claude account routing</div>
+              <div class="desc">Choose how the gateway routes requests across the registered Claude account pool.</div>
             </div>
             <div>
-              <div class="complock" id="routing-lockband"><b>LOCKED</b> — <code id="routing-lock-env"></code> 환경변수가 우선합니다. 계정 라우팅은 열람 전용입니다.</div>
+              <div class="complock" id="routing-lockband"><b>LOCKED</b> — <code id="routing-lock-env"></code> takes precedence. Account routing is read-only.</div>
               <div class="ctrow">
-                <select id="routing-select">
+                <select id="routing-select" aria-label="Claude account routing">
                   <option value="disabled">Disabled</option>
                   <option value="fallback">Fallback</option>
                   <option value="balanced">Balanced</option>
                 </select>
-                <button id="routing-apply">적용</button>
+                <button id="routing-apply">Apply</button>
               </div>
-              <div class="cthint" aria-live="polite"><span id="routing-current"></span> · <a class="route-link" href="#settings/accounts">계정별 라우팅 상태 보기</a></div>
+              <div class="cthint" aria-live="polite"><span id="routing-current"></span> · <a class="route-link" href="#settings/accounts">View account routing status</a></div>
             </div>
           </div>
           <!-- routing-section:end -->
@@ -98,22 +98,22 @@
         <div class="card scard" id="scard-accounts">
           <div class="acct-head">
             <div>
-              <h2>Claude 계정</h2>
-              <div class="sub">게이트웨이가 서빙에 쓰는 등록 계정과 이 머신의 로컬 Claude Code 로그인입니다. 라우팅 정책은 <a class="route-link" href="#settings/general">General</a>에서 설정합니다.</div>
+              <h2>Claude accounts</h2>
+              <div class="sub">Registered accounts and the local Claude Code login on the gateway machine. Set the routing policy in <a class="route-link" href="#settings/general">General</a>. Clearing a serving pin does not remove an account from the Balanced pool.</div>
             </div>
           </div>
-          <div class="acctlock" id="acct-lockband"><b>LOCKED</b> — <code id="acct-lock-env"></code> 환경변수가 우선합니다. 서빙 계정 선택은 열람 전용입니다.</div>
+          <div class="acctlock" id="acct-lockband"><b>LOCKED</b> — <code id="acct-lock-env"></code> takes precedence. The serving pin is read-only.</div>
           <div class="lhero" id="local-sec">
-            <div class="ribbon">로컬 CLI 로그인
-              <button type="button" class="urefresh" id="btn-local-refresh">갱신</button>
+            <div class="ribbon">Local CLI login
+              <button type="button" class="urefresh" id="btn-local-refresh">Refresh</button>
             </div>
             <div id="local-body"></div>
           </div>
           <div class="tbl-cap">
-            <span class="t">등록 계정</span><span class="n" id="acct-count"></span>
+            <span class="t">Registered accounts</span><span class="n" id="acct-count"></span>
             <span class="pill" id="pool-fresh-pill" hidden></span>
-            <button type="button" class="urefresh" id="btn-usage-refresh" hidden>사용량 새로고침</button>
-            <button type="button" class="add" id="btn-add-account">계정 추가</button>
+            <button type="button" class="urefresh" id="btn-usage-refresh" hidden>Refresh usage</button>
+            <button type="button" class="add" id="btn-add-account">Add account</button>
           </div>
           <div id="acct-list"></div>
         </div>
@@ -122,45 +122,45 @@
 
     <!-- Router tab -->
     <section id="tab-map">
-      <div class="lockband"><b>LOCKED</b> — <code id="lock-env"></code> 환경변수가 우선합니다. 보드는 열람 전용입니다.</div>
-      <div class="board" id="board" tabindex="0" role="group" aria-label="라우팅 보드 · 빈 곳을 두 번 클릭하거나 우클릭하면 그 자리에 타겟 노드를 추가할 수 있습니다">
+      <div class="lockband"><b>LOCKED</b> — <code id="lock-env"></code> takes precedence. The board is read-only.</div>
+      <div class="board" id="board" tabindex="0" role="group" aria-label="Router board. Double-click or right-click empty space to add a target node there.">
         <div class="wstatus"><span>ROUTER · VECTOR MODE</span></div>
         <svg id="wires"></svg>
         <div id="layer"></div>
         <button class="wdel" id="wdel">remove</button>
         <div class="ztools">
-          <button id="z-out" title="축소">−</button>
-          <span class="pct" id="z-pct" title="클릭 = 100%">100%</span>
-          <button id="z-in" title="확대">+</button>
-          <button id="z-reset" title="뷰 리셋">⟲</button>
+          <button id="z-out" title="Zoom out">−</button>
+          <span class="pct" id="z-pct" title="Click to reset zoom to 100%">100%</span>
+          <button id="z-in" title="Zoom in">+</button>
+          <button id="z-reset" title="Fit nodes to view">⟲</button>
         </div>
         <!-- Persistent fallback: a sibling of the transformed node layer, so
              pan and zoom never move it. -->
-        <button id="node-add" type="button" aria-haspopup="dialog" aria-expanded="false">+ 노드 추가</button>
+        <button id="node-add" type="button" aria-haspopup="dialog" aria-expanded="false">+ Add node</button>
       </div>
       <!-- Transient quick-add chooser: hidden by default, position:fixed
            above the add button; consumes no idle layout space. -->
-      <div id="model-picker" class="addpick" hidden role="dialog" aria-modal="false" aria-label="노드 추가 · 프로바이더와 모델 선택">
+      <div id="model-picker" class="addpick" hidden role="dialog" aria-modal="false" aria-label="Add node. Choose a provider and model.">
         <div class="addpick-head">
-          <select id="provider-select" aria-label="프로바이더"></select>
-          <button id="picker-close" type="button">닫기</button>
+          <select id="provider-select" aria-label="Provider"></select>
+          <button id="picker-close" type="button">Close</button>
         </div>
         <div class="addpick-search">
-          <label class="sr-only" for="model-query">모델 검색 또는 ID 직접 입력</label>
-          <input id="model-query" type="text" role="combobox" aria-controls="model-options" aria-expanded="false" aria-autocomplete="list" autocomplete="off" spellcheck="false" placeholder="모델 검색 또는 ID 직젉 입력">
+          <label class="sr-only" for="model-query">Search models or enter a model ID</label>
+          <input id="model-query" type="text" role="combobox" aria-controls="model-options" aria-expanded="false" aria-autocomplete="list" autocomplete="off" spellcheck="false" placeholder="Search models or enter a model ID">
         </div>
         <div id="picker-state" role="status" aria-live="polite" hidden></div>
-        <div id="model-options" class="addpick-options" role="listbox" aria-label="모델 제안 및 직접 입력"></div>
-        <p class="addpick-foot">목록에 없는 모델 ID도 그대로 입력해 <kbd>Enter</kbd>로 추가할 수 있습니다. <kbd>Esc</kbd> 취소</p>
+        <div id="model-options" class="addpick-options" role="listbox" aria-label="Suggested and manually entered models"></div>
+        <p class="addpick-foot">Enter any model ID, even one not listed, and press <kbd>Enter</kbd> to add it. <kbd>Esc</kbd> to cancel.</p>
       </div>
       <div class="ctest">
         <div class="l">
-          <label>모델 연결 테스트</label>
+          <label for="ct-in">Model connection test</label>
           <div class="ctrow">
-            <span class="ctnode grow"><span class="nicon" id="ct-in-icon"></span><input id="ct-in" spellcheck="false" placeholder="모델 ID…"></span>
+            <span class="ctnode grow"><span class="nicon" id="ct-in-icon"></span><input id="ct-in" spellcheck="false" placeholder="provider:model, e.g. codex:your-model"></span>
             <button id="ct-btn">Test</button>
           </div>
-          <div class="cthint">연결 전에 테스트 요청 한 건으로 모델 ID가 실제로 응답하는지 확인합니다</div>
+          <div class="cthint">Enter a provider-prefixed target (provider:model). Test sends one real model request to check its response; provider usage limits apply.</div>
         </div>
       </div>
     </section>
@@ -171,9 +171,9 @@
         <div class="ucard-h">
           <span class="deco" aria-hidden="true">┌─ </span>
           <h2>Claude Status</h2>
-          <button class="urefresh" data-provider="claude">갱신</button>
+          <button class="urefresh" data-provider="claude">Refresh</button>
         </div>
-        <div class="sub">로컬 Claude Code 자격증명으로 확인하는 로그인 상태와 구독 사용량입니다. 게이트웨이 트래픽과 무관합니다.</div>
+        <div class="sub">Login status and subscription usage from the local Claude Code credentials on the gateway machine, not a count of gateway traffic.</div>
         <div class="cardplan" id="usage-plan-claude"><b class="sk">STANDARD</b></div>
         <div class="ubody" id="usage-body-claude"></div>
       </div>
@@ -181,12 +181,12 @@
         <div class="ucard-h">
           <span class="deco" aria-hidden="true">┌─ </span>
           <h2>Codex Status</h2>
-          <button class="urefresh" data-provider="codex">갱신</button>
+          <button class="urefresh" data-provider="codex">Refresh</button>
         </div>
-        <div class="sub">게이트웨이가 사용하는 Codex 로그인 상태와 자격증명 위치입니다. 사용량은 로컬 자격증명으로 직접 조회하며 게이트웨이 트래픽과 무관합니다.</div>
+        <div class="sub">Codex authentication status and credential location used by the gateway. Usage is queried with local credentials, not counted from gateway traffic.</div>
         <div class="stat" id="codex-stat">
           <div class="cardplan" id="usage-plan-codex"><b class="sk">STANDARD</b></div>
-          <div class="statline" id="codex-statline"><span class="sk">OK · 계정으로 로그인됨</span><div class="codeblock"><span class="sk">account-placeholder</span></div></div>
+          <div class="statline" id="codex-statline"><span class="sk">OK · Signed in with an account</span><div class="codeblock"><span class="sk">account-placeholder</span></div></div>
         </div>
         <div class="kv">
           <span class="kvh">ENV</span><span class="kvh">VALUE</span>
@@ -198,12 +198,12 @@
         <div class="ucard-h">
           <span class="deco" aria-hidden="true">┌─ </span>
           <h2>Kimi Status</h2>
-          <button class="urefresh" data-provider="kimi">갱신</button>
+          <button class="urefresh" data-provider="kimi">Refresh</button>
         </div>
-        <div class="sub">게이트웨이가 사용하는 Kimi 로그인 상태와 자격증명 위치입니다. 사용량은 로컬 자격증명으로 직접 조회하며 게이트웨이 트래픽과 무관합니다.</div>
+        <div class="sub">Kimi authentication status and credential location used by the gateway. Usage is queried with local credentials, not counted from gateway traffic.</div>
         <div class="stat" id="kimi-stat">
           <div class="cardplan" id="usage-plan-kimi"><b class="sk">STANDARD</b></div>
-          <div class="statline" id="kimi-statline"><span class="sk">OK · 계정으로 로그인됨</span><div class="codeblock"><span class="sk">account-placeholder</span></div></div>
+          <div class="statline" id="kimi-statline"><span class="sk">OK · Signed in with an account</span><div class="codeblock"><span class="sk">account-placeholder</span></div></div>
         </div>
         <div class="kv">
           <span class="kvh">ENV</span><span class="kvh">VALUE</span>
@@ -215,12 +215,12 @@
         <div class="ucard-h">
           <span class="deco" aria-hidden="true">┌─ </span>
           <h2>Grok Status</h2>
-          <button class="urefresh" data-provider="grok">갱신</button>
+          <button class="urefresh" data-provider="grok">Refresh</button>
         </div>
-        <div class="sub">게이트웨이가 사용하는 Grok 로그인 상태와 자격증명 위치입니다. 사용량은 로컬 자격증명으로 직접 조회하며 게이트웨이 트래픽과 무관합니다.</div>
+        <div class="sub">Grok authentication status and credential location used by the gateway. Usage is queried with local credentials, not counted from gateway traffic.</div>
         <div class="stat" id="grok-stat">
           <div class="cardplan" id="usage-plan-grok"><b class="sk">STANDARD</b></div>
-          <div class="statline" id="grok-statline"><span class="sk">OK · 계정으로 로그인됨</span><div class="codeblock"><span class="sk">account-placeholder</span></div></div>
+          <div class="statline" id="grok-statline"><span class="sk">OK · Signed in with an account</span><div class="codeblock"><span class="sk">account-placeholder</span></div></div>
         </div>
         <div class="kv">
           <span class="kvh">ENV</span><span class="kvh">VALUE</span>
@@ -234,7 +234,7 @@
     <section id="tab-mcp">
       <div class="card" id="mcp-connect-card">
         <h2><span class="deco" aria-hidden="true">┌─ </span>Connect Claude Code</h2>
-        <div class="sub">Register the gateway's GPT Pro tools with Claude Code.</div>
+        <div class="sub">The button registers GPT Pro tools for the gateway user on the gateway machine, across all projects. When authentication is enabled, the registration stores the configured local token. To connect Claude Code elsewhere, run the command on that machine with an endpoint reachable from it.</div>
         <div class="stat">
           <div class="codeblock">
             <span class="ps1" aria-hidden="true">$</span>
@@ -257,7 +257,7 @@
           <h2>GPT Pro</h2>
           <div class="umeta" id="gptpro-session-updated">Last checked —</div>
         </div>
-        <div class="sub">Saved ChatGPT Pro web session used by gptpro asks.</div>
+        <div class="sub">Saved ChatGPT authentication cookie used by GPT Pro asks. This is a local cookie check, not a live check of ChatGPT access or Pro subscription status.</div>
         <div class="stat" id="gptpro-session-stat">
           <div class="statline" id="gptpro-session-statline"><span class="sk">VALID · Expires in 00d 00h</span></div>
         </div>
@@ -265,15 +265,16 @@
           <button id="gptpro-login-btn">Sign in to ChatGPT</button>
         </div>
         <div class="cthint" id="gptpro-login-detail"></div>
-        <div class="cthint">Sign-in checks system Chrome, then Playwright Chromium, and downloads matching Chromium if needed. No graphical browser available? Run <code>claudex-gateway gptpro login</code> from a terminal.</div>
-        <div class="tbl-cap">
-          <span class="t">Ask concurrency</span>
-        </div>
-        <div class="sub">Parallel ask tabs the GPT Pro runtime admits at once.</div>
+        <div class="cthint">Sign-in opens a graphical browser on the gateway machine. It checks system Chrome, then Playwright Chromium, and downloads matching Chromium if needed. If dashboard sign-in fails, run <code>claudex-gateway gptpro login</code> in a terminal on that machine with a graphical desktop available.</div>
         <div id="gptpro-concurrency-card">
           <div class="complock"><b>LOCKED</b> — <code id="gptpro-concurrency-lock-env"></code> takes precedence. GPT Pro concurrency is read-only.</div>
-          <div class="ctrow">
-            <select id="gptpro-concurrency" aria-label="GPT Pro ask concurrency">
+          <div class="gptpro-concurrency-row">
+            <div class="gptpro-concurrency-copy">
+              <label for="gptpro-concurrency">Ask concurrency</label>
+              <div class="sub" id="gptpro-concurrency-description">Limits how many GPT Pro ask tabs can run at once.</div>
+            </div>
+            <select id="gptpro-concurrency" aria-describedby="gptpro-concurrency-description gptpro-concurrency-status gptpro-concurrency-rules" title="Parallel ask tabs · 1–10 · Default: 2" disabled>
+              <option value="" hidden disabled>—</option>
               <option value="1">1</option>
               <option value="2">2</option>
               <option value="3">3</option>
@@ -285,9 +286,9 @@
               <option value="9">9</option>
               <option value="10">10</option>
             </select>
-            <button id="gptpro-concurrency-apply">Apply</button>
           </div>
-          <div class="cthint">Default: 2. Raising concurrency does not lift ChatGPT-side rate limits.</div>
+          <div class="cthint" id="gptpro-concurrency-status" role="status" aria-live="polite" aria-atomic="true" hidden></div>
+          <div class="sr-only" id="gptpro-concurrency-rules">Parallel ask tabs, 1–10. Default: 2. ChatGPT rate limits still apply.</div>
         </div>
         <div class="tbl-cap">
           <span class="t">Diagnostics</span>
@@ -304,17 +305,17 @@
     <section id="tab-log">
       <div class="card">
         <h2><span class="deco" aria-hidden="true">┌─ </span>Log Level</h2>
-        <div class="sub">게이트웨이 프로세스의 로그 출력 레벨입니다.</div>
+        <div class="sub">Choose the logging level for the gateway process.</div>
         <div class="seg" id="loglevel"></div>
       </div>
       <div class="card">
         <h2><span class="deco" aria-hidden="true">┌─ </span>Logs</h2>
-        <div class="sub">게이트웨이 프로세스의 최근 로그입니다.</div>
+        <div class="sub">Recent logs from the gateway process. Live refreshes every two seconds while this tab is open.</div>
         <div class="seg">
-          <button id="log-refresh">갱신</button>
-          <button id="log-live">라이브</button>
+          <button id="log-refresh">Refresh</button>
+          <button id="log-live">Live</button>
         </div>
-        <div class="logbox" id="logbox"><div class="logempty">로그가 아직 없습니다.</div></div>
+        <div class="logbox" id="logbox"><div class="logempty">No logs to display.</div></div>
       </div>
     </section>
   </main>
@@ -322,19 +323,19 @@
 
 <div class="modalwrap" id="reset-modal">
   <div class="modal" role="alertdialog" aria-modal="true" aria-labelledby="reset-modal-title">
-    <h3 id="reset-modal-title">리셋 크레딧을 사용할까요?</h3>
+    <h3 id="reset-modal-title">Use a reset credit?</h3>
     <p id="reset-modal-body"></p>
-    <p class="warn">되돌릴 수 없습니다.</p>
+    <p class="warn">Spending a credit cannot be undone.</p>
     <div class="modal-actions">
-      <button class="cancel" id="reset-cancel">취소</button>
-      <button class="go" id="reset-confirm">사용</button>
+      <button class="cancel" id="reset-cancel">Cancel</button>
+      <button class="go" id="reset-confirm">Use</button>
     </div>
   </div>
 </div>
 
 <div class="modalwrap" id="login-modal">
   <div class="modal wide" role="dialog" aria-modal="true" aria-labelledby="login-modal-title">
-    <h3 id="login-modal-title">Claude 계정 추가</h3>
+    <h3 id="login-modal-title">Add Claude account</h3>
     <div id="login-modal-body"></div>
     <div class="lghint" id="login-reconnect"></div>
     <div class="modal-actions" id="login-modal-actions"></div>

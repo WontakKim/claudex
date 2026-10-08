@@ -97,6 +97,9 @@ see [Model mapping](model-mapping.md).
 
 ## Development
 
+Running the test suite also requires Node.js (`node`) on `PATH` for the
+dashboard behavior tests.
+
 ```sh
 uv run pytest
 ```

@@ -22,11 +22,11 @@ Opening `http://127.0.0.1:8787/` uses the same guarded admin API as the CLI:
   in the first backend card. See [GPT Pro MCP](#gpt-pro-mcp) below.
 - **Log** reads `GET /admin/logs` and changes the persisted runtime log level
   through `PUT /admin/settings/log-level`.
-- **Router** edits the provider-prefixed model map on a canvas. Targets are
-  added through an in-canvas quick-add chooser, and `POST /admin/test` checks
-  connections before wiring.
+- **Router** contains the **Router mapping** canvas for editing the
+  provider-prefixed model map. Targets are added through an in-canvas quick-add
+  chooser, and `POST /admin/test` checks connections before wiring.
 
-Open the chooser with the **+ 노드 추가** button pinned at the board's
+Open the chooser with the **Add node** button pinned at the board's
 bottom-right corner, by double-clicking or right-clicking empty canvas, or by
 focusing the board (click empty canvas, then Tab) and pressing Shift+A. The
 last two place the new node at the clicked lane; the button and shortcut use
@@ -40,7 +40,7 @@ providers clears the search and refocuses it. Catalog suggestions appear as
 you type; a model ID no catalog suggests — including differently-cased IDs
 with extra colons — can still be entered verbatim and committed with Enter,
 in every catalog state (loading, failed, or not configured). The chooser
-closes on Escape, the 닫기 button, an outside click, or leaving the Router
+closes on Escape, the **Close** button, an outside click, or leaving the Router
 tab. The chooser opens right-aligned above the add button with an 8px gap
 between its bottom edge and the button's top edge, clamped inside the visible
 canvas and viewport; the footer hint's own bottom padding is a separate 8px.
@@ -62,21 +62,32 @@ while this lock is active, and an open chooser closes when the lock engages.
 The MCP tab leads with gateway-wide connection setup, followed by one card per
 MCP backend. GPT Pro is the first backend section:
 
-- **Connect Claude Code** registers the local MCP endpoint in the user scope
-  with one click by running `claude mcp add` on the gateway host. When local
-  authentication is enabled, registration stores the configured local token as
-  a bearer header in Claude Code's MCP settings. A copyable user-scope command
-  remains available as a manual fallback.
+- **Connect Claude Code** runs `claude mcp add` on the gateway host through
+  **Add to Claude Code**, so the `claude` CLI must be on that process's `PATH`.
+  Registration changes the user-scope MCP settings of the operating-system
+  user running the gateway, not those of a user viewing the dashboard from
+  another machine. When local authentication is enabled, registration stores
+  the configured local token as a bearer header in that user's Claude Code MCP
+  settings. A copyable user-scope command remains available as a manual
+  fallback; replace its `<CLAUDEX_LOCAL_TOKEN>` placeholder when present and
+  run it on the machine and as the user whose Claude Code should connect.
+  The endpoint must be reachable from that machine. Restart Claude Code
+  sessions after registration to load the tools.
 - **GPT Pro** shows the saved ChatGPT Pro session and refreshes it once per
   minute while the tab is visible. It can start, monitor, and cancel an
   interactive ChatGPT sign-in. Its Diagnostics subsection runs the server-side
   doctor and displays the output. Sign-in opens a visible browser window on
   the gateway host, as `claudex-gateway gptpro login` does from a terminal,
   so either path needs a graphical session on that host.
-- **Ask concurrency** selects 1–10 parallel ask tabs (default: 2) and applies
-  changes to the running daemon immediately. The control is read-only with a
-  LOCKED band while `GPTPRO_MAX_CONCURRENT_ASKS` is set in the gateway
-  environment. Raising concurrency does not lift ChatGPT-side rate limits.
+- **Ask concurrency** limits how many GPT Pro ask tabs can run at once (1–10,
+  default: 2). Selecting a value saves and applies it to the running daemon
+  immediately; there is no Apply button. Editing pauses while saving or while
+  settings are unavailable. A failed save restores the displayed last confirmed
+  value; this does not roll back a change already accepted by the server. If
+  the response is lost or invalid, leave and reopen the MCP tab to read the
+  actual setting before retrying. The control is read-only with a LOCKED band
+  while `GPTPRO_MAX_CONCURRENT_ASKS` is set in the gateway environment. Raising
+  concurrency does not lift ChatGPT-side rate limits.
 
 The tab uses these guarded admin API operations:
 
@@ -95,7 +106,7 @@ unavailable while sign-in is starting, running, or being cancelled.
 
 ## Claude accounts
 
-The Settings tab's **Claude 계정** category manages the accounts described in
+The Settings tab's **Claude accounts** category manages the accounts described in
 [Claude accounts](claude-accounts.md). The routing mode selector lives in the
 **General** category and is read-only while `CLAUDEX_CLAUDE_ACCOUNT_ROUTING` is
 set.
@@ -107,18 +118,19 @@ set.
 - Each registered account shows its plan, usage windows, and routing state:
   ready, cooling down until a time, or unavailable because it needs a new
   login.
-- **계정 추가** and an account's **다시 로그인** run
+- **Add account** and an account's **Sign in again** run
   `claude auth login --claudeai` on the gateway host, so the `claude` CLI must
   be installed there. The dialog shows the authorization URL to open in a
   browser and accepts the pasted code. If the login matches an already
   registered identity, the dialog asks before it replaces the stored
   credentials.
-- **이 계정으로 서빙** and **서빙 해제** set and clear the serving account.
-  They are read-only while `CLAUDEX_CLAUDE_ACCOUNT_ID` is set.
-- **제거** needs a second click to confirm and is disabled for the serving
+- **Set serving pin** and **Clear serving pin** set and clear the serving
+  account. **Serving pin set** identifies the selected account. These controls
+  are read-only while `CLAUDEX_CLAUDE_ACCOUNT_ID` is set.
+- **Remove** needs a second click to confirm and is disabled for the serving
   account. Clear the serving account first.
 - While balanced routing is active, a pool usage freshness badge and a
-  **사용량 새로고침** button appear. The button queues a rate-limited usage poll
+  **Refresh usage** button appear. The button queues a rate-limited usage poll
   instead of fetching inline.
 
 The panel uses these guarded admin API operations:
@@ -202,4 +214,6 @@ load and retains it in an in-memory closure for that page only. It is attached
 as a bearer header to admin requests and is never written to the DOM, a URL,
 `localStorage`, `sessionStorage`, console output, or gateway logs. When an
 admin request returns `401`, the dashboard prompts once more and retries that
-request once.
+request once. This page-only token handling is separate from MCP registration,
+which persists the gateway's configured token in Claude Code's MCP settings as
+described above.

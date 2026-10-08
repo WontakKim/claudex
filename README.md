@@ -2,17 +2,17 @@
 
 A lightweight local gateway that runs mapped Claude Code models on Codex,
 Kimi, Grok, or configured custom Responses/Messages backends and relays
-everything else to Anthropic untouched.
+unmapped requests to Anthropic with their original credentials by default.
 
 ```text
 Claude Code ── "codex:" mapped ───▶ claudex-gateway ── Codex Responses API ─▶ Codex
 Claude Code ── "kimi:" mapped ────▶ claudex-gateway ── near-verbatim relay ─▶ Kimi coding API
 Claude Code ── "grok:" mapped ────▶ claudex-gateway ── Grok Responses API ──▶ Grok
 Claude Code ── custom mapped ──────▶ claudex-gateway ── Responses or Messages ▶ configured upstream
-Claude Code ── unmapped model ────▶ claudex-gateway ── verbatim relay ──────▶ Anthropic API
+Claude Code ── unmapped model ────▶ claudex-gateway ── native relay ────────▶ Anthropic API
 ```
 
-- Mapped models run on Codex, Kimi, Grok, or a named custom provider, while everything else is relayed to Anthropic untouched.
+- Mapped models run on Codex, Kimi, Grok, or a named custom provider, while unmapped models are relayed to Anthropic. The default Anthropic relay keeps request bodies unchanged except for [incompatible server-tool history](docs/model-mapping.md#server-tool-history-across-backends), which is replayed as text.
 - Custom providers support the OpenAI Responses and Anthropic Messages wire families; static Messages providers require manual model IDs and explicit remote verification.
 - The gateway reuses each built-in provider's CLI login and can serve Anthropic passthrough traffic through registered Claude accounts with fallback or balanced routing.
 - Configuration, model mapping, compaction, the dashboard, and detailed behavior are documented in docs/.

@@ -11,8 +11,16 @@ Interactive capture supports Claude Code builds that use scoped Keychain
 credential storage (2.1+) and fails cleanly otherwise. It is POSIX-only in
 this version — on Windows, always use `--from <dir>` instead.
 
-The [dashboard](dashboard.md#claude-accounts) offers the same add, re-login,
-serve, and remove actions. Its add flow runs the same
+`account add --from` copies the source login credentials; future refreshes of
+that copy are not coordinated with the source CLI. Avoid independently using
+both credential copies. Prefer interactive `account add` for isolated
+gateway-owned credentials. To retain an active local Claude Code login, use
+balanced routing's [local-login participation](#local-claude-code-login), which
+leaves token refresh to the CLI.
+
+The [dashboard](dashboard.md#claude-accounts) offers **Add account**,
+**Sign in again**, **Set serving pin**, **Clear serving pin**, and **Remove**.
+Its add flow runs the same
 `claude auth login --claudeai` capture on the gateway host and takes the
 pasted login code in the browser. Only one Claude login, from the CLI or the
 dashboard, can run on a machine at a time.
@@ -54,11 +62,13 @@ cleared.
 
 ## Serving with a registered account (`account use`)
 
-`claudex-gateway account use <id|email>` selects one registered account to
-serve all Anthropic passthrough traffic (`/v1/messages` for unmapped models
-and `count_tokens`). With a selection active, the gateway consumes the
-client's `Authorization`/`x-api-key` headers and serves upstream with the
-selected account's OAuth token instead — Claude Code no longer needs a real
+`claudex-gateway account use <id|email>` sets the serving pin for Anthropic
+passthrough traffic (`/v1/messages` for unmapped models and `count_tokens`).
+With routing disabled, this registered account serves all passthrough traffic;
+`fallback` and `balanced` use the pool policies described below. For a request
+served by a registered account, the gateway consumes the
+client's `Authorization`/`x-api-key` headers and serves upstream with that
+account's OAuth token instead — Claude Code no longer needs a real
 Anthropic login of its own (`ANTHROPIC_AUTH_TOKEN` set to the gateway local
 token, or any placeholder when no local token is configured, is enough).
 The gateway owns the token lifecycle: access tokens are refreshed ~5
@@ -77,7 +87,9 @@ be confirmed, and an ambiguous probe refuses to apply changes.
 `account use off` clears the pin via `DELETE` and returns to the default:
 client credentials forwarded untouched. Balanced routing is the exception: it
 serves from the account pool whether or not an account is selected (see
-[Balanced routing](#balanced-routing-across-the-pool)).
+[Balanced routing](#balanced-routing-across-the-pool)). Clearing the pin does
+not unregister the account or exclude it from balanced routing; registered
+ready accounts can continue to serve requests.
 
 ```sh
 curl http://127.0.0.1:8787/admin/providers/claude/pool/serving
@@ -105,9 +117,14 @@ Caveats to accept consciously:
   503. Re-add the account or run `account use off`. (With the `fallback`
   routing mode enabled — see the next section — the remaining ready accounts
   serve instead.)
-- The [compaction reroute](compaction.md#compaction-reroute) still uses the credentials
-  the client itself sent: with a credential-less client it records
-  `skipped_no_credentials` and falls back to the mapped model as usual.
+- The [compaction reroute](compaction.md#compaction-reroute) uses only eligible
+  credential headers sent by the client; registered-account OAuth credentials
+  are not substituted. It records `skipped_no_credentials` only when its header
+  filter leaves no credential—for example, a Bearer matching the configured
+  gateway-local token with no nonblank `x-api-key`. A dummy Bearer when no local
+  token is configured can instead trigger one direct Anthropic attempt; an
+  upstream non-2xx response records `fallback_mapped`, not
+  `skipped_no_credentials`.
 - Subscription OAuth tokens are licensed for the holder's own Claude Code
   use; serving other clients with them is a gray zone.
 

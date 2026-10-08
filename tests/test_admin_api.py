@@ -3270,7 +3270,7 @@ def test_dashboard_plan_and_credits_read_inside_the_card(
     # The credit count is stated by the reset line, which owns the spend
     # button too, so there is one place credits are reported.
     assert 'class="uact"' in javascript
-    assert "리셋 크레딧" in javascript
+    assert "Reset credits" in javascript
 
 
 def test_dashboard_status_cards_load_as_skeletons(
@@ -3285,7 +3285,7 @@ def test_dashboard_status_cards_load_as_skeletons(
     # The cards used to render a one-line "Checking…" status that loaded content
     # then pushed apart. They now ship a skeleton of the same shape instead,
     # so nothing moves when the probes answer.
-    assert all("확인 중" not in source for source in sources.values())
+    assert all("Checking…" not in source for source in sources.values())
     assert 'class="sk"' in page
     # A skeleton carries the text it stands in for, painted transparent, so
     # its line box matches the line that replaces it.
@@ -3337,7 +3337,7 @@ def test_dashboard_serves_canvas_quick_add_with_stable_hooks(
     # transformed node layer, so pan and zoom never move it.
     assert board.index('id="layer"') < board.index('id="node-add"')
     assert 'aria-haspopup="dialog"' in board
-    assert ">+ 노드 추가</button>" in board
+    assert ">+ Add node</button>" in board
     for element_id in (
         "node-add",
         "model-picker",
@@ -3608,14 +3608,16 @@ def test_dashboard_compaction_custom_input_labeled_unverified(
 def test_dashboard_compaction_credentials_disclosure_present(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    # The card must state which credentials rerouted requests run on, so the
-    # user knows their own Claude account is being used.
+    # Reroute credentials come from eligible client headers, not from the
+    # gateway machine or the registered-account pool.
     with _create_test_client(monkeypatch, tmp_path) as client:
         sources = _dashboard_sources(client)
         page = sources["html"]
 
     section = _compaction_section(page)
-    assert "장치에 저장된 Claude 기본 자격증명" in section
+    assert "Uses eligible Claude credentials sent by the client" in section
+    assert "registered-account credentials are not substituted" in section
+    assert "default Claude credentials saved on the gateway machine" not in section
 
 
 def test_dashboard_compaction_fetched_in_parallel_boot_sequence(
@@ -3658,7 +3660,7 @@ def test_dashboard_compaction_diagnostics_ui_removed_by_design(
 
     assert 'id="comp-diagnostics"' not in page
     assert "renderCompactionDiagnostics" not in javascript
-    assert "아직 재라우팅이 시도되지 않았습니다" not in javascript
+    assert "No compaction reroute has been attempted yet" not in javascript
 
 
 def test_dashboard_compaction_apply_body_matches_pinned_shape(
@@ -3784,9 +3786,9 @@ def test_dashboard_codex_fast_card_wires_apply_flow_and_env_lock(
     assert page.index('id="compaction-card"') < page.index('id="codex-card"')
     assert 'type="checkbox" id="codex-fast"' in section
     assert 'id="codex-apply"' in section
-    assert "~1.5x speed" in section
-    assert "~2–2.5x usage burn" in section
-    assert "silently stay standard" in section
+    assert "priority processing for supported Codex models" in section
+    assert "Speed and usage costs depend on the provider and workload" in section
+    assert "models whose catalog does not advertise Fast stay standard" in section
     assert "CLAUDEX_CODEX_SERVICE_TIER" in javascript
     assert 'jfetch("/admin/settings/codex")' in javascript
     apply_fn = _codex_apply_fn(javascript)
@@ -3862,11 +3864,11 @@ def test_dashboard_accounts_card_mirrors_the_final_probe(
         javascript = sources["javascript"]
 
     assert 'class="lhero"' in page
-    assert "로컬 CLI 로그인" in page
-    assert "게이트웨이 서빙과 무관" not in javascript
+    assert "Local CLI login" in page
+    assert "Unrelated to gateway serving" not in javascript
     assert 'ROUTING.mode==="balanced"&&ROUTING.includeLocalLogin' in javascript
-    assert "밸런스 서빙 참여 설정" in javascript
-    assert "게이트웨이 서빙에 사용하지 않음" in javascript
+    assert "Configured for Balanced routing" in javascript
+    assert "Not included as a local-login member of the gateway pool" in javascript
     assert 'id="btn-local-refresh"' in page
     assert 'id="btn-add-account"' in page
     assert (
@@ -3876,8 +3878,8 @@ def test_dashboard_accounts_card_mirrors_the_final_probe(
     )
     # Collapsed rows carry status text only (no chips, no mini bars); the
     # right edge is the plan text.
-    assert "서빙 중" in javascript
-    assert "재로그인 필요" in javascript
+    assert "Serving pin set" in javascript
+    assert "Sign-in required" in javascript
     assert 'class="plan-txt"' in javascript
     # Expansion is independent per-row state, never an accordion.
     assert "ACCT.open[id]=!ACCT.open[id]" in javascript
@@ -3904,7 +3906,7 @@ def test_dashboard_accounts_fetch_paints_registry_before_usage(
     assert fetch_fn.index("renderAcctList()") < fetch_fn.index("fetchAccountUsage()")
     # Data age renders from each result's updated_at.
     assert "function fmtAgo(" in page
-    assert "기준" in page
+    assert "Usage checked" in page
 
 
 def test_dashboard_serving_selection_reuses_the_singular_admin_endpoint(
@@ -3923,8 +3925,8 @@ def test_dashboard_serving_selection_reuses_the_singular_admin_endpoint(
     assert "CLAUDEX_CLAUDE_ACCOUNT_ID" in page
     assert 'id="acct-lockband"' in html
     assert "#scard-accounts.locked .acctlock{display:block}" in stylesheet
-    assert "이 계정으로 서빙" in page
-    assert "서빙 해제" in page
+    assert "Set serving pin" in page
+    assert "Clear serving pin" in page
     # Removal uses the account endpoint; the serving pin guard stays visible in the UI.
     assert 'jfetch("/admin/providers/claude/accounts/"+encodeURIComponent(accountId),{method:"DELETE"})' in page
 
@@ -3956,7 +3958,7 @@ def test_dashboard_routing_section_wires_endpoint(
     # VALID_CLAUDE_ACCOUNT_ROUTING_MODES) and is offered here too.
     assert 'value="balanced"' in section
     assert ">Balanced<" in section
-    assert "계정별 라우팅 상태 보기" in section
+    assert "View account routing status" in section
     # The mode-envelope validator adopts a balanced boot GET/apply response
     # instead of rejecting it as malformed.
     assert 'body.mode==="balanced"' in javascript
@@ -3981,7 +3983,7 @@ def test_dashboard_accounts_surface_pool_usage_freshness(
     assert "meta.age_seconds" in page
     assert "meta.source" in page
     assert "u.queued" in page
-    assert "대기 중" in page
+    assert "Usage refresh queued" in page
 
 
 def test_dashboard_routing_locked_renders_readonly(
@@ -4028,14 +4030,14 @@ def test_dashboard_accounts_surface_routing_status(
         html = sources["html"]
 
     assert 'jfetch("/admin/providers/claude/pool/status")' in page
-    assert "라우팅 준비" in page
-    assert "라우팅 불가" in page
-    assert "쿨다운 · " in page
+    assert "Ready for routing" in page
+    assert "Unavailable for routing" in page
+    assert "Cooldown until " in page
     assert "coolnote" in page
     assert "function fmtCooldownUntil(" in page
     # The accounts card links back to the policy row in General.
     assert (
-        '라우팅 정책은 <a class="route-link" href="#settings/general">General</a>에서 설정합니다.'
+        'Set the routing policy in <a class="route-link" href="#settings/general">General</a>.'
         in html
     )
 
@@ -4062,7 +4064,7 @@ def test_dashboard_login_modal_drives_the_login_endpoints(
     # 409 login-active attaches to the running session instead of erroring.
     assert 'code==="login-active"' in page
     # The replace confirmation shows exactly the CLI's two choices.
-    assert "교체 안 함" in page
+    assert "Do not replace" in page
     assert 'data-lact="replace"' in page
     assert 'data-lact="decline"' in page
     # The URL opens in a new tab with rel=noopener and an https-only guard.

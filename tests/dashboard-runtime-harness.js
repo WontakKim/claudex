@@ -298,8 +298,12 @@ function createStorageRecorder() {
 
 function createDeferred() {
   let resolve;
-  const promise = new Promise((resolvePromise) => { resolve = resolvePromise; });
-  return {promise, resolve};
+  let reject;
+  const promise = new Promise((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return {promise, resolve, reject};
 }
 
 function requireQuickAddElements(document) {
@@ -388,6 +392,7 @@ async function main() {
   const unusedName = "unused-provider";
   const errorName = "error-provider";
   const connectedCatalog = createDeferred();
+  const dashboardJfetch = context.jfetch;
   context.jfetch = (url, options) => {
     requests.push({url, options: options || null});
     if (url === `/admin/providers/custom/${connectedName}/models`) {
@@ -894,64 +899,296 @@ async function main() {
 
   const gptProConcurrencyStates = {};
   const concurrencyJfetch = context.jfetch;
-  let concurrencyBody = {max_concurrent_asks: 3, env_locked: false};
-  let concurrencyConflict = false;
-  const concurrencyRefresh = createDeferred();
-  context.jfetch = (url, options) => {
-    if (url !== "/admin/settings/gptpro") return Promise.resolve({ok: false, status: 500, body: {}});
-    if (options) {
-      gptProConcurrencyStates.put = options;
-      if (concurrencyConflict) return Promise.resolve({ok: false, status: 409, body: {}});
-      concurrencyBody = {max_concurrent_asks: JSON.parse(options.body).max_concurrent_asks, env_locked: false};
-    } else if (concurrencyConflict) return concurrencyRefresh.promise;
-    return Promise.resolve({ok: true, status: 200, body: concurrencyBody});
-  };
   const concurrencySelect = document.getElementById("gptpro-concurrency");
-  const concurrencyApply = document.getElementById("gptpro-concurrency-apply");
+  const concurrencyRequests = [];
+  const concurrencyResponses = [];
+  const flushConcurrency = () => new Promise((resolve) => setImmediate(resolve));
+  const concurrencyEnvelope = (limit = 3, locked = false) => ({
+    ok: true, status: 200, body: {max_concurrent_asks: limit, env_locked: locked},
+  });
+  context.jfetch = (url, options) => {
+    if (url !== "/admin/settings/gptpro") {
+      return Promise.resolve({ok: false, status: 500, body: {}});
+    }
+    concurrencyRequests.push({url, options: options || null});
+    if (!concurrencyResponses.length) throw new Error("unexpected concurrency request");
+    return Promise.resolve(concurrencyResponses.shift());
+  };
   const captureConcurrency = () => ({
     value: concurrencySelect.value,
     selectDisabled: concurrencySelect.disabled,
-    applyDisabled: concurrencyApply.disabled,
     locked: document.getElementById("gptpro-concurrency-card").classList.contains("locked"),
     env: document.getElementById("gptpro-concurrency-lock-env").textContent,
+    status: document.getElementById("gptpro-concurrency-status").textContent,
+    live: context.GPTPRO_CONCURRENCY.live,
+    draft: context.GPTPRO_CONCURRENCY.draft,
+    hasLoaded: context.GPTPRO_CONCURRENCY.hasLoaded,
+    isSaving: context.GPTPRO_CONCURRENCY.isSaving,
+    message: context.GPTPRO_CONCURRENCY.message,
+    messageKind: context.GPTPRO_CONCURRENCY.messageKind,
   });
+  const changeConcurrency = (value) => {
+    concurrencySelect.value = String(value);
+    concurrencySelect.dispatchEvent({type: "change"});
+  };
+  const loadConcurrency = async (limit = 3, locked = false) => {
+    concurrencyResponses.push(concurrencyEnvelope(limit, locked));
+    await context.fetchGptProConcurrency();
+  };
+  const captureIgnoredChanges = (values) => {
+    const before = captureConcurrency();
+    const requestCount = concurrencyRequests.length;
+    const states = values.map((value) => {
+      changeConcurrency(value);
+      return captureConcurrency();
+    });
+    return {before, states, requestsAdded: concurrencyRequests.length - requestCount};
+  };
+
+  gptProConcurrencyStates.noApply = !document.getElementById("gptpro-concurrency-apply");
+  gptProConcurrencyStates.initial = captureConcurrency();
+  gptProConcurrencyStates.unloadedGuard = captureIgnoredChanges(["5", ""]);
+  const initialGet = createDeferred();
+  concurrencyResponses.push(initialGet.promise);
   context.setTab("mcp");
-  await new Promise((resolve) => setImmediate(resolve));
+  gptProConcurrencyStates.loading = captureConcurrency();
+  initialGet.resolve({ok: false, status: 503, body: {}});
+  await flushConcurrency();
+  gptProConcurrencyStates.startupUnavailable = captureConcurrency();
+  gptProConcurrencyStates.startupUnavailableGuard = captureIgnoredChanges(["5"]);
+  await loadConcurrency();
   gptProConcurrencyStates.loaded = captureConcurrency();
-  concurrencySelect.value = "5";
-  concurrencySelect.dispatchEvent({type: "change"});
-  gptProConcurrencyStates.draft = captureConcurrency();
-  concurrencyApply.click();
-  await new Promise((resolve) => setImmediate(resolve));
-  gptProConcurrencyStates.applied = captureConcurrency();
-  concurrencyBody = {max_concurrent_asks: 3, env_locked: true};
-  context.setTab("mcp");
-  await new Promise((resolve) => setImmediate(resolve));
+  gptProConcurrencyStates.invalidGuard = captureIgnoredChanges(["", "0", "11", "3.5", "bad", "3"]);
+
+  const firstSave = createDeferred();
+  concurrencyResponses.push(firstSave.promise);
+  const beforeSave = concurrencyRequests.length;
+  changeConcurrency("5");
+  gptProConcurrencyStates.pending = captureConcurrency();
+  gptProConcurrencyStates.immediateRequests = concurrencyRequests.slice(beforeSave);
+  gptProConcurrencyStates.busyGuard = captureIgnoredChanges(["6", "7"]);
+  const beforeSuppressedGet = concurrencyRequests.length;
+  await context.fetchGptProConcurrency();
+  gptProConcurrencyStates.suppressedGetRequests = concurrencyRequests.length - beforeSuppressedGet;
+  firstSave.resolve(concurrencyEnvelope(4));
+  await flushConcurrency();
+  gptProConcurrencyStates.saved = captureConcurrency();
+  concurrencyResponses.push(concurrencyEnvelope(2, true));
+  await context.saveGptProConcurrency(6);
+  gptProConcurrencyStates.savedLocked = captureConcurrency();
+  await loadConcurrency(3, true);
   gptProConcurrencyStates.envLocked = captureConcurrency();
-  concurrencyBody.env_locked = false;
-  context.setTab("mcp");
-  await new Promise((resolve) => setImmediate(resolve));
-  concurrencySelect.value = "5";
-  concurrencySelect.dispatchEvent({type: "change"});
-  concurrencyConflict = true;
-  concurrencyApply.click();
-  await new Promise((resolve) => setImmediate(resolve));
-  gptProConcurrencyStates.conflict = captureConcurrency();
-  concurrencyRefresh.resolve({ok: false, status: 500, body: {}});
-  await new Promise((resolve) => setImmediate(resolve));
-  gptProConcurrencyStates.failedRefresh = captureConcurrency();
-  gptProConcurrencyStates.validation = [
-    {max_concurrent_asks: 3, env_locked: false},
-    {max_concurrent_asks: 0, env_locked: false},
+  gptProConcurrencyStates.lockedGuard = captureIgnoredChanges(["5"]);
+  await loadConcurrency();
+
+  const malformedBodies = [
+    null, {}, {max_concurrent_asks: 0, env_locked: false},
     {max_concurrent_asks: 11, env_locked: false},
     {max_concurrent_asks: 3.5, env_locked: false},
     {max_concurrent_asks: "3", env_locked: false},
-    {max_concurrent_asks: 3},
+    {max_concurrent_asks: 3}, {max_concurrent_asks: 3, env_locked: "false"},
+  ];
+  gptProConcurrencyStates.validation = [
+    concurrencyEnvelope(1).body, concurrencyEnvelope(10, true).body,
+    ...malformedBodies,
   ].map((body) => context.isGptProConcurrencyEnvelope(body));
-  context.fetchGptProConcurrency();
-  await new Promise((resolve) => setImmediate(resolve));
-  gptProConcurrencyStates.getError = document.getElementById("toast").innerHTML;
+  gptProConcurrencyStates.saveErrors = [];
+  for (const failure of [
+    {ok: false, status: 500, body: {error: {message: "save unavailable"}}},
+    ...malformedBodies.map((body) => ({ok: true, status: 200, body})),
+    "network",
+  ]) {
+    await loadConcurrency();
+    const failedPut = createDeferred();
+    concurrencyResponses.push(failedPut.promise);
+    const savePromise = context.saveGptProConcurrency(5);
+    if (!savePromise || typeof savePromise.then !== "function") {
+      throw new Error("saveGptProConcurrency must return its full promise");
+    }
+    if (failure === "network") failedPut.reject(new Error("PUT disconnected"));
+    else failedPut.resolve(failure);
+    await savePromise;
+    const failed = captureConcurrency();
+    concurrencyResponses.push(concurrencyEnvelope(5));
+    changeConcurrency("5");
+    await flushConcurrency();
+    gptProConcurrencyStates.saveErrors.push({failed, retried: captureConcurrency()});
+  }
+
+  gptProConcurrencyStates.getErrors = [];
+  for (const failure of [
+    {ok: false, status: 503, body: {}},
+    ...malformedBodies.map((body) => ({ok: true, status: 200, body})), "network",
+  ]) {
+    await loadConcurrency();
+    const failedGet = createDeferred();
+    concurrencyResponses.push(failedGet.promise);
+    const getPromise = context.fetchGptProConcurrency();
+    if (!getPromise || typeof getPromise.then !== "function") {
+      throw new Error("fetchGptProConcurrency must return a promise");
+    }
+    if (failure === "network") failedGet.reject(new Error("GET disconnected"));
+    else failedGet.resolve(failure);
+    await getPromise;
+    const unavailable = captureConcurrency();
+    const toast = document.getElementById("toast").innerHTML;
+    const guard = captureIgnoredChanges(["5"]);
+    await loadConcurrency(2);
+    gptProConcurrencyStates.getErrors.push({unavailable, toast, guard, recovered: captureConcurrency()});
+  }
+
+  gptProConcurrencyStates.staleGets = [];
+  for (const outcome of ["success", "error", "network"]) {
+    for (const settleDuringSave of [true, false]) {
+      await loadConcurrency();
+      const staleGet = createDeferred();
+      concurrencyResponses.push(staleGet.promise);
+      const getPromise = context.fetchGptProConcurrency();
+      const pendingPut = createDeferred();
+      concurrencyResponses.push(pendingPut.promise);
+      const generationBeforeSave = context.GPTPRO_CONCURRENCY.requestGeneration;
+      const savePromise = context.saveGptProConcurrency(5);
+      const generationAfterSave = context.GPTPRO_CONCURRENCY.requestGeneration;
+      if (!settleDuringSave) {
+        pendingPut.resolve(concurrencyEnvelope(4));
+        await savePromise;
+      }
+      const before = captureConcurrency();
+      const toastBefore = document.getElementById("toast").innerHTML;
+      if (outcome === "network") staleGet.reject(new Error("stale GET disconnected"));
+      else staleGet.resolve(outcome === "success"
+        ? concurrencyEnvelope(9, true) : {ok: false, status: 500, body: {}});
+      await getPromise;
+      const after = captureConcurrency();
+      const toastAfter = document.getElementById("toast").innerHTML;
+      if (settleDuringSave) {
+        pendingPut.resolve(concurrencyEnvelope(4));
+        await savePromise;
+      }
+      gptProConcurrencyStates.staleGets.push({
+        outcome, settleDuringSave, before, after, toastBefore, toastAfter,
+        generationBeforeSave, generationAfterSave, saved: captureConcurrency(),
+      });
+    }
+  }
+
+  gptProConcurrencyStates.conflicts = [];
+  for (const outcome of ["unlocked", "locked", "error", "malformed", "network"]) {
+    await loadConcurrency();
+    const conflictingPut = createDeferred();
+    const refresh = createDeferred();
+    concurrencyResponses.push(conflictingPut.promise, refresh.promise);
+    const requestStart = concurrencyRequests.length;
+    let saveSettled = false;
+    const savePromise = context.saveGptProConcurrency(5);
+    const observedSave = savePromise.then(() => { saveSettled = true; });
+    conflictingPut.resolve({ok: false, status: 409, body: concurrencyEnvelope(9).body});
+    await flushConcurrency();
+    const pendingRefresh = captureConcurrency();
+    const settledBeforeRefresh = saveSettled;
+    const guard = captureIgnoredChanges(["6"]);
+    await context.fetchGptProConcurrency();
+    const requestsBeforeRefresh = concurrencyRequests.slice(requestStart);
+    if (outcome === "network") refresh.reject(new Error("refresh disconnected"));
+    else if (outcome === "error") refresh.resolve({ok: false, status: 500, body: {}});
+    else if (outcome === "malformed") refresh.resolve({ok: true, status: 200, body: {}});
+    else refresh.resolve(concurrencyEnvelope(2, outcome === "locked"));
+    await observedSave;
+    const refreshed = captureConcurrency();
+    await loadConcurrency(7);
+    gptProConcurrencyStates.conflicts.push({
+      outcome, pendingRefresh, settledBeforeRefresh, guard, requestsBeforeRefresh,
+      refreshed, saveSettled, recovered: captureConcurrency(),
+    });
+  }
+
+  // Exercise the real jfetch wrapper, not just the request-shape mock.
+  const concurrencyFetch = context.fetch;
+  const concurrencyAuthRequests = [];
+  context.jfetch = dashboardJfetch;
+  context.localToken = "concurrency-test-token";
+  context.fetch = async (url, options) => {
+    concurrencyAuthRequests.push({url, options: options || null});
+    return {ok: true, status: 200, json: async () => concurrencyEnvelope(6).body};
+  };
+  await context.saveGptProConcurrency(6);
+  gptProConcurrencyStates.authRequests = concurrencyAuthRequests;
+  context.localToken = null;
+  context.fetch = concurrencyFetch;
   context.jfetch = concurrencyJfetch;
+
+  const feedbackDocument = new FakeDocument(html);
+  const feedbackRequests = [];
+  const feedbackContext = Object.assign({}, context, {document: feedbackDocument});
+  vm.createContext(feedbackContext);
+  vm.runInContext(source, feedbackContext, {filename: javascriptPath});
+  const captureToast = () => {
+    const element = feedbackDocument.getElementById("toast");
+    return {role: element.getAttribute("role"), live: element.getAttribute("aria-live"),
+      atomic: element.getAttribute("aria-atomic"), html: element.innerHTML};
+  };
+  feedbackContext.showToast("<b>First failure</b>", true);
+  const alertToast = captureToast();
+  feedbackContext.showToast("Saved", false);
+  const statusToast = captureToast();
+
+  feedbackContext.LOGIN.attemptId = "feedback-attempt";
+  feedbackContext.renderLoginModal({status: "awaiting-browser", url: "https://example.com/sign-in"});
+  feedbackDocument.getElementById("login-code-input").value = "synthetic-sign-in-code";
+  feedbackContext.jfetch = (url, options) => {
+    feedbackRequests.push({url, options});
+    return Promise.resolve({ok: false, status: 400, body: {error: {message: "<invalid code>"}}});
+  };
+  feedbackContext.submitLoginCode();
+  await new Promise((resolve) => setImmediate(resolve));
+  const codeError = feedbackDocument.getElementById("login-code-error");
+  const rejectedCode = {text: codeError.textContent, hidden: codeError.hidden, toast: captureToast()};
+  feedbackDocument.getElementById("toast").remove();
+  const retainedCodeError = codeError.textContent;
+  feedbackContext.jfetch = (url, options) => {
+    feedbackRequests.push({url, options});
+    return Promise.reject(new Error("code response lost"));
+  };
+  feedbackContext.submitLoginCode();
+  await new Promise((resolve) => setImmediate(resolve));
+  const disconnectedCode = {text: codeError.textContent, hidden: codeError.hidden};
+  feedbackContext.jfetch = (url, options) => {
+    feedbackRequests.push({url, options});
+    return Promise.resolve({ok: true, status: 200, body: {}});
+  };
+  feedbackContext.submitLoginCode();
+  await new Promise((resolve) => setImmediate(resolve));
+  const acceptedCode = {text: codeError.textContent, hidden: codeError.hidden};
+  feedbackContext.LOGIN.attemptId = "new-feedback-attempt";
+  const staleCodeResponse = createDeferred();
+  feedbackContext.jfetch = () => staleCodeResponse.promise;
+  feedbackContext.submitLoginCode();
+  feedbackContext.LOGIN.attemptId = "newer-feedback-attempt";
+  staleCodeResponse.resolve({ok: false, status: 400, body: {error: {message: "stale code error"}}});
+  await new Promise((resolve) => setImmediate(resolve));
+  const staleCodeIgnored = codeError.hidden && codeError.textContent === "";
+
+  feedbackContext.renderGptProConcurrencyState(concurrencyEnvelope(3).body);
+  let persistedLimit = 3;
+  const lostResponseRequests = [];
+  feedbackContext.jfetch = (url, options) => {
+    lostResponseRequests.push({url, options});
+    persistedLimit = JSON.parse(options.body).max_concurrent_asks;
+    return Promise.reject(new Error("response lost after persistence"));
+  };
+  await feedbackContext.saveGptProConcurrency(5);
+  const responseLoss = {persistedLimit, displayedLimit: feedbackDocument.getElementById("gptpro-concurrency").value,
+    message: feedbackDocument.getElementById("gptpro-concurrency-status").textContent, requests: lostResponseRequests};
+  const account = {id: "copy-account", email: "copy@example.com", state: "ready"};
+  const servingCopy = {};
+  feedbackContext.ACCT.serving = account.id;
+  servingCopy.pinned = feedbackContext.acctRowHtml(account);
+  feedbackContext.ACCT.serving = null;
+  servingCopy.unpinned = feedbackContext.acctRowHtml(account);
+  feedbackContext.renderUsageProvider("codex", {status: "ok", session: {used_percent: 5, window_minutes: 60}});
+  const unknownDurationUsage = feedbackDocument.getElementById("usage-body-codex").innerHTML;
+  const operatorFeedback = {alertToast, statusToast, rejectedCode, retainedCodeError, disconnectedCode,
+    acceptedCode, staleCodeIgnored, codeRequests: feedbackRequests, responseLoss, servingCopy, unknownDurationUsage};
 
   const requestSnapshot = JSON.stringify(requests);
   const domSnapshot = document.snapshot();
@@ -1089,6 +1326,7 @@ async function main() {
         error: statusText(document, errorName),
       },
       cards,
+      operatorFeedback,
       gptProConcurrencyStates,
       gptProSessionStates,
       mcpInfoStates,
