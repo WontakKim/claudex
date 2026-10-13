@@ -959,7 +959,23 @@ def test_non_streaming_mid_stream_overflow_reports_numbers() -> None:
     assert stub.context_window_calls == ["gpt-5.6-sol"]
 
 
-def test_context_window_cache_is_reused_across_requests() -> None:
+def test_context_window_cache_is_reused_across_requests(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def reject_host_subprocess(*args: Any, **kwargs: Any) -> None:
+        pytest.fail("Catalog cache test must not start a host subprocess")
+
+    monkeypatch.setattr(subprocess, "Popen", reject_host_subprocess)
+
+    async def communicate_version() -> tuple[bytes, bytes]:
+        return b"codex-cli 0.157.1", b""
+
+    async def spawn_codex_version(*args: Any, **kwargs: Any) -> SimpleNamespace:
+        assert args == ("codex", "--version")
+        return SimpleNamespace(returncode=0, communicate=communicate_version)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn_codex_version)
+
     # Proves the relay reuses the lifespan-owned client and its
     # ModelCatalogCache instead of constructing a fresh one per request:
     # two mapped requests through the same app fetch the catalog exactly
