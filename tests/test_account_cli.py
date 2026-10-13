@@ -8,13 +8,12 @@ established by `test_claude_capture.py` and `test_main.py`:
   `python -m claudex ...` via `subprocess`, with `HOME` isolated to
   `tmp_path` and every `CLAUDEX_*`/`CLAUDE_CONFIG_DIR` variable scrubbed from
   the child's environment.
-- Scenarios that need a successful Claude credential capture call
-  `claudex.cli.accounts._account_main(...)` in-process, so a real macOS
-  Keychain is never touched: either `sys.platform` is forced to `"linux"`
-  (capture then reads plain `.credentials.json`/`.claude.json` files, exactly
-  as `test_claude_capture.py`'s own version-gate tests do), or the login
-  child never reaches credential capture at all (e.g. it is killed by SIGINT
-  while still hanging).
+- Scenarios that exercise Claude credential capture call
+  `claudex.cli.accounts._account_main(...)` in-process. File-based capture
+  forces `sys.platform` to `"linux"`; native-platform login cancellation
+  uses an empty in-process Keychain backend for pre-login checks and cleanup.
+  An autouse guard rejects host Keychain calls, including those before
+  credential capture.
 """
 
 from __future__ import annotations
@@ -36,9 +35,12 @@ from pathlib import Path
 
 import pytest
 
+from test_claude_capture import _FakeKeychainBackend
+
 from claudex import paths
 from claudex.claude import accounts as claude_accounts
 from claudex.claude import capture as claude_capture
+from claudex.claude import keychain as claude_keychain
 from claudex.cli import accounts, admin_client, daemon
 
 # ---------------------------------------------------------------------------
@@ -51,6 +53,14 @@ def _isolated_home(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """Keep every test's `~/.claudex` under a throwaway directory, shared by
     both in-process calls and any subprocess spawned with `_clean_env()`."""
     monkeypatch.setenv("HOME", str(tmp_path))
+
+
+@pytest.fixture(autouse=True)
+def _forbid_host_keychain(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _fail_keychain_access(_args: list[str]) -> None:
+        pytest.fail("Account CLI tests must use an in-process Keychain backend")
+
+    monkeypatch.setattr(claude_keychain, "_run_security", _fail_keychain_access)
 
 
 class _FakeTTYStdin:
@@ -323,6 +333,8 @@ def test_interrupt_sigint_during_interactive_login_exit_code_130_no_account_regi
 ) -> None:
     _make_stdin_a_tty(monkeypatch)
     _prepend_fake_claude(monkeypatch, tmp_path)
+    backend = _FakeKeychainBackend()
+    monkeypatch.setattr(claude_capture, "default_keychain_backend", lambda: backend)
     monkeypatch.setenv("CLAUDEX_FAKE_CLAUDE_MODE", "hang")
     leader_pid_file = tmp_path / "leader.pid"
     monkeypatch.setenv("CLAUDEX_TEST_LEADER_PID_FILE", str(leader_pid_file))
@@ -341,6 +353,7 @@ def test_interrupt_sigint_during_interactive_login_exit_code_130_no_account_regi
 
     assert exit_code == 130
     assert claude_accounts.list_accounts() == []
+    assert backend.store == {}
     leader_pid = int(leader_pid_file.read_text().strip())
     _assert_process_gone(leader_pid)
     # Cleanup ran to completion: no leftover temp Claude config dir.
