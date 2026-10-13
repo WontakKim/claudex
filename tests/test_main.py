@@ -67,6 +67,7 @@ def _is_listening(port: int) -> bool:
 
 def _gateway_env(tmp_path: Path, port: int) -> dict[str, str]:
     env = {key: value for key, value in os.environ.items() if not key.startswith("CLAUDEX_")}
+    env.pop("CODEX_HOME", None)
     env["HOME"] = str(tmp_path)
     env["CLAUDEX_PORT"] = str(port)
     return env
@@ -80,6 +81,41 @@ def _run_cli(env: dict[str, str], *arguments: str) -> subprocess.CompletedProces
         text=True,
         timeout=30,
     )
+
+
+@pytest.mark.parametrize(
+    "has_codex_home_override",
+    [False, True],
+    ids=["absent-override", "external-override"],
+)
+def test_gateway_env_isolates_codex_home_without_mutating_parent_environment(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, has_codex_home_override: bool
+) -> None:
+    test_home = tmp_path / "gateway-home"
+    parent_environment = {
+        "HOME": str(tmp_path / "parent-home"),
+        "PATH": "/synthetic/bin",
+        "UNRELATED_SETTING": "preserved",
+        "CLAUDEX_PORT": "9999",
+        "CLAUDEX_MODEL_MAP": "should-be-removed",
+    }
+    if has_codex_home_override:
+        parent_environment["CODEX_HOME"] = str(tmp_path / "external-codex")
+    original_environment = parent_environment.copy()
+    monkeypatch.setattr(os, "environ", parent_environment)
+
+    env = _gateway_env(test_home, 12345)
+
+    assert parent_environment == original_environment
+    assert env == {
+        "HOME": str(test_home),
+        "PATH": "/synthetic/bin",
+        "UNRELATED_SETTING": "preserved",
+        "CLAUDEX_PORT": "12345",
+    }
+    monkeypatch.setattr(os, "environ", env)
+    config = GatewayConfig.load(settings_file=test_home / "settings.json")
+    assert config.codex_home == test_home / ".codex"
 
 
 @pytest.mark.parametrize(
