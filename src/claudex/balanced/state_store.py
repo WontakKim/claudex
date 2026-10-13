@@ -35,8 +35,10 @@ keep a resurrected retry from ever undoing that later operation's effect,
 every row-scoped write is *fenced*: at the moment it is finally about to
 execute (fresh attempt or retry), it is dropped as a no-op if a
 higher-sequence epoch invalidation or incarnation deletion for its scope
-has already committed. Final state therefore depends on persistence
-sequence order, never on wall-clock retry timing.
+has already committed. A committed row payload also retires older retries
+for its coalescing scope and completes their waiters only after that commit.
+Within a coalescing scope, replacements follow payload submission order,
+never wall-clock retry timing or timestamp magnitude.
 """
 
 from __future__ import annotations
@@ -943,6 +945,13 @@ class ClaudePoolRuntimeStateStore:
             return
 
         with self._cv:
+            if job.scope_key is not None:
+                # A committed newer payload supersedes older same-scope retries.
+                # Their waiters complete only after that commit, as with coalescing.
+                for retry in self._retrying[:]:
+                    if retry.scope_key == job.scope_key and retry.payload_sequence < job.payload_sequence:
+                        self._retrying.remove(retry)
+                        job.pending_writes.extend(retry.pending_writes)
             self._persistence_degraded = bool(self._retrying)
         for pending_write in job.pending_writes:
             pending_write._mark_done()
