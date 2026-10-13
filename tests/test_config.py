@@ -25,11 +25,12 @@ def test_max_reasoning_effort_is_accepted(monkeypatch: pytest.MonkeyPatch) -> No
     assert GatewayConfig.from_env().reasoning_effort_override == "max"
 
 
-def test_codex_fast_service_tier_is_accepted_from_env(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("tier", ["fast", "ultrafast"])
+def test_codex_service_tier_is_accepted_from_env(
+    monkeypatch: pytest.MonkeyPatch, tier: str,
 ) -> None:
-    monkeypatch.setenv("CLAUDEX_CODEX_SERVICE_TIER", "fast")
-    assert GatewayConfig.from_env().codex_service_tier == "fast"
+    monkeypatch.setenv("CLAUDEX_CODEX_SERVICE_TIER", tier)
+    assert GatewayConfig.from_env().codex_service_tier == tier
 
 
 def test_invalid_codex_service_tier_fails(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -262,11 +263,12 @@ class TestSettingsFile:
         monkeypatch.setenv("GPTPRO_MAX_CONCURRENT_ASKS", value)
         assert GatewayConfig.load(settings_file).gptpro_max_concurrent_asks == expected
 
-    def test_codex_fast_service_tier_applies_from_settings_file(
-        self, tmp_path: Path
+    @pytest.mark.parametrize("tier", ["fast", "ultrafast"])
+    def test_codex_service_tier_applies_from_settings_file(
+        self, tmp_path: Path, tier: str
     ) -> None:
-        settings_file = self._write(tmp_path, {"codex.service_tier": "fast"})
-        assert GatewayConfig.load(settings_file).codex_service_tier == "fast"
+        settings_file = self._write(tmp_path, {"codex.service_tier": tier})
+        assert GatewayConfig.load(settings_file).codex_service_tier == tier
 
     def test_nested_registry_groups_apply_from_settings_file(
         self, tmp_path: Path

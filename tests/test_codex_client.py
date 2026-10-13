@@ -40,6 +40,19 @@ class _FakeAuthManager:
         return CodexCredentials(access_token="codex-token-1", account_id="account-1")
 
 
+class _MutableAuthManager(_FakeAuthManager):
+    def __init__(self) -> None:
+        super().__init__()
+        self.credentials = CodexCredentials("codex-token-1", "account-1")
+        self.error: CodexAuthError | None = None
+
+    async def get_credentials(self, force_refresh: bool = False) -> CodexCredentials:
+        self.calls += 1
+        if self.error is not None:
+            raise self.error
+        return self.credentials
+
+
 @pytest.fixture(autouse=True)
 def no_host_codex_probe(monkeypatch: pytest.MonkeyPatch) -> None:
     async def missing_codex(*args: Any, **kwargs: Any) -> Any:
@@ -243,6 +256,44 @@ def test_supports_fast_tier_is_false_when_not_advertised(slug: str) -> None:
             return await client.supports_fast_tier(slug)
 
     assert asyncio.run(scenario()) is False
+
+
+@pytest.mark.parametrize(
+    ("service_tiers", "expected_ids", "supports_fast", "supports_ultrafast"),
+    [
+        ([{"id": "priority"}, {"id": "ultrafast"}, {"id": "flex"}],
+         ("priority", "ultrafast", "flex"), True, True),
+        ([{"id": "ultrafast"}], ("ultrafast",), False, True),
+        ([{"id": "priority"}], ("priority",), True, False),
+        ([{"id": "priority"}, None], ("priority",), True, False),
+        ([], (), False, False),
+        (None, None, False, False),
+        ({"id": "ultrafast"}, None, False, False),
+        ([None, "ultrafast", {"id": 123}], None, False, False),
+    ],
+)
+def test_catalog_preserves_advertised_service_tier_ids(
+    service_tiers: Any,
+    expected_ids: tuple[str, ...] | None,
+    supports_fast: bool,
+    supports_ultrafast: bool,
+) -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={
+            "plan_type": "ProMax",
+            "models": [{"slug": "future-sol", "service_tiers": service_tiers}],
+        })
+
+    async def scenario() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+            client = CodexClient(_FakeAuthManager(), http_client)
+            assert await client.service_tier_ids("future-sol") == expected_ids
+            assert await client.supports_fast_tier("future-sol") is supports_fast
+            assert await client.supports_service_tier("future-sol", "ultrafast") is supports_ultrafast
+            assert await client.service_tier_ids("unlisted-model") is None
+            assert await client.supports_service_tier("unlisted-model", "ultrafast") is False
+
+    asyncio.run(scenario())
 
 
 def test_catalog_fetch_serves_context_window_and_fast_tier() -> None:
@@ -539,7 +590,8 @@ def test_list_models_fetches_fresh_after_context_window_populated_cache(
     assert calls["n"] == 2
 
 
-def test_stream_responses_sends_fast_tier_routing_hint() -> None:
+@pytest.mark.parametrize("wire_tier", ["priority", "ultrafast"])
+def test_stream_responses_sends_service_tier_routing_hint(wire_tier: str) -> None:
     captured: list[httpx.Request] = []
 
     async def handler(request: httpx.Request) -> httpx.Response:
@@ -554,7 +606,7 @@ def test_stream_responses_sends_fast_tier_routing_hint() -> None:
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
             return await _collect(
                 CodexClient(_FakeAuthManager(), http_client),
-                {"model": "gpt-5.6-sol", "service_tier": "priority"},
+                {"model": "gpt-5.6-sol", "service_tier": wire_tier},
             )
 
     events = asyncio.run(scenario())
@@ -565,8 +617,9 @@ def test_stream_responses_sends_fast_tier_routing_hint() -> None:
     assert request.headers["user-agent"].startswith("codex-tui/0.157.1 ")
     assert request.headers["user-agent"].endswith("(codex-tui; 0.157.1)")
     assert request.headers["x-codex-routing-hint"] == (
-        "model=gpt-5.6-sol;tier=priority"
+        f"model=gpt-5.6-sol;tier={wire_tier}"
     )
+    assert json.loads(request.content)["service_tier"] == wire_tier
 
 
 def test_stream_responses_propagates_cancellation_after_first_event() -> None:
@@ -644,7 +697,7 @@ def test_missing_codex_returns_visible_presets_without_auth_or_http() -> None:
             return await CodexClient(auth, http_client).list_models()
 
     assert asyncio.run(scenario()) == [
-        "gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol",
+        "gpt-6.1-sol", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol",
         "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5",
     ]
     assert auth.calls == 0
@@ -972,7 +1025,7 @@ def test_codex_version_cache_refreshes_after_install_and_upgrade(
     results = asyncio.run(scenario())
     assert results[0] == results[1]
     assert results[0] == [
-        "gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol",
+        "gpt-6.1-sol", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol",
         "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5",
     ]
     assert results[2] == results[3] == results[4]
@@ -1064,3 +1117,332 @@ def test_stream_and_metadata_without_cli_use_bundled_identity_and_live_catalog()
     assert len(requests) == 2
     assert requests[0].url.params["client_version"] == "0.157.1"
     assert all(request.headers["user-agent"].startswith("codex-tui/0.157.1 ") for request in requests)
+
+
+@pytest.mark.parametrize("changed_field", ["access_token", "account_id", "is_api_key", "client_version"])
+def test_catalog_refreshes_on_effective_identity_change(
+    changed_field: str, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    auth = _MutableAuthManager()
+    requests: list[httpx.Request] = []
+    version = "0.157.1"
+
+    async def get_version() -> str:
+        return version
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"models": [{
+            "slug": "gpt-6.1-sol",
+            "context_window": 128000 if len(requests) == 1 else 256000,
+            "service_tiers": [{"id": "ultrafast"}] if len(requests) == 1 else [],
+        }]})
+
+    async def scenario() -> None:
+        nonlocal version
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+            client = CodexClient(auth, http_client)
+            monkeypatch.setattr(client._version_discovery, "get_version", get_version)
+            assert await client.supports_service_tier("gpt-6.1-sol", "ultrafast") is True
+            if changed_field == "access_token":
+                auth.credentials = CodexCredentials("codex-token-2", "account-1")
+            elif changed_field == "account_id":
+                auth.credentials = CodexCredentials("codex-token-1", "account-2")
+            elif changed_field == "is_api_key":
+                auth.credentials = CodexCredentials("codex-token-1", "account-1", is_api_key=True)
+            else:
+                version = "0.162.0"
+            assert await client.supports_service_tier("gpt-6.1-sol", "ultrafast") is False
+            assert await client.context_window("gpt-6.1-sol") == 256000
+
+    asyncio.run(scenario())
+    assert len(requests) == 2
+    assert requests[-1].headers["authorization"] == f"Bearer {auth.credentials.access_token}"
+    if changed_field == "client_version":
+        assert requests[-1].url.params["client_version"] == "0.162.0"
+    if changed_field == "account_id":
+        assert requests[-1].headers["Chatgpt-Account-Id"] == "account-2"
+    if changed_field == "is_api_key":
+        assert "Chatgpt-Account-Id" not in requests[-1].headers
+
+
+def test_new_account_catalog_failure_does_not_use_old_account_capabilities() -> None:
+    auth = _MutableAuthManager()
+    calls = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if request.headers["Chatgpt-Account-Id"] == "account-2":
+            return httpx.Response(503, text="new account catalog unavailable")
+        return httpx.Response(200, json={"models": [{
+            "slug": "gpt-6.1-sol", "context_window": 128000,
+            "service_tiers": [{"id": "priority"}, {"id": "ultrafast"}],
+        }]})
+
+    async def scenario() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+            client = CodexClient(auth, http_client)
+            assert await client.context_window("gpt-6.1-sol") == 128000
+            auth.credentials = CodexCredentials("codex-token-2", "account-2")
+            assert await client.context_window("gpt-6.1-sol") is None
+            assert await client.supports_fast_tier("gpt-6.1-sol") is False
+            assert await client.supports_service_tier("gpt-6.1-sol", "ultrafast") is False
+            assert client._catalog_entries.fetched_at is None
+
+    asyncio.run(scenario())
+    assert calls == 2
+
+
+def test_unresolvable_auth_identity_discards_old_capabilities() -> None:
+    auth = _MutableAuthManager()
+    calls = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(200, json={"models": [{
+            "slug": "gpt-6.1-sol", "service_tiers": [{"id": "ultrafast"}],
+        }]})
+
+    async def scenario() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+            client = CodexClient(auth, http_client)
+            assert await client.supports_service_tier("gpt-6.1-sol", "ultrafast") is True
+            auth.error = CodexAuthError("credentials unavailable")
+            assert await client.supports_service_tier("gpt-6.1-sol", "ultrafast") is False
+            assert client._catalog_entries.fetched_at is None
+            auth.error = None
+            assert await client.supports_service_tier("gpt-6.1-sol", "ultrafast") is True
+
+    asyncio.run(scenario())
+    assert calls == 2
+
+
+@pytest.mark.parametrize("old_fetch_fails", [False, True])
+@pytest.mark.parametrize("concurrent_new_lookup", [False, True])
+def test_account_change_during_fetch_cannot_republish_old_capabilities(
+    old_fetch_fails: bool, concurrent_new_lookup: bool,
+) -> None:
+    async def scenario() -> None:
+        auth = _MutableAuthManager()
+        started = asyncio.Event()
+        release = asyncio.Event()
+        accounts: list[str] = []
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            account = request.headers["Chatgpt-Account-Id"]
+            accounts.append(account)
+            if account == "account-1":
+                started.set()
+                await release.wait()
+                if old_fetch_fails:
+                    return httpx.Response(503, text="old account failure")
+            return httpx.Response(200, json={"models": [{
+                "slug": "gpt-6.1-sol",
+                "context_window": 128000 if account == "account-1" else 256000,
+                "service_tiers": [{"id": "ultrafast"}] if account == "account-1" else [],
+            }]})
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+            client = CodexClient(auth, http_client)
+            old_lookup = asyncio.create_task(client.supports_service_tier("gpt-6.1-sol", "ultrafast"))
+            await asyncio.wait_for(started.wait(), timeout=1)
+            auth.credentials = CodexCredentials("codex-token-2", "account-2")
+            new_lookup = None
+            if concurrent_new_lookup:
+                new_lookup = asyncio.create_task(client.supports_service_tier("gpt-6.1-sol", "ultrafast"))
+                await asyncio.sleep(0)
+            release.set()
+            assert await old_lookup is False
+            if new_lookup is not None:
+                assert await new_lookup is False
+            assert await client.context_window("gpt-6.1-sol") == 256000
+            assert client._catalog_entries.last_error is None
+        assert accounts == ["account-1", "account-2"]
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("configured_tier", [None, "fast", "ultrafast"])
+def test_service_tier_capabilities_explain_mixed_and_unknown_models(
+    configured_tier: str | None,
+) -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "GET"
+        return httpx.Response(200, json={"models": [
+            {"slug": "both", "service_tiers": [{"id": "priority"}, {"id": "ultrafast"}, {"id": "flex"}]},
+            {"slug": "fast-only", "service_tiers": [{"id": "priority"}]},
+            {"slug": "partial", "service_tiers": [{"id": "priority"}, None]},
+            {"slug": "standard-only", "service_tiers": []},
+            {"slug": "unknown"},
+        ]})
+
+    async def scenario() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+            client = CodexClient(_FakeAuthManager(), http_client)
+            result = await client.service_tier_capabilities(configured_tier, ["unlisted"])
+            assert result["status"] == "ok"
+            assert result["reason"] is None
+            assert result["configured_tier"] == configured_tier
+            assert isinstance(result["fetched_at"], float)
+            models = result["models"]
+            assert models["both"]["supported_tiers"] == ["standard", "fast", "ultrafast"]
+            assert models["both"]["advertised_tier_ids"] == ["priority", "ultrafast", "flex"]
+            assert models["both"]["applicable_tier"] == configured_tier
+            assert models["both"]["wire_tier"] == {None: None, "fast": "priority", "ultrafast": "ultrafast"}[configured_tier]
+            assert models["fast-only"]["supported_tiers"] == ["standard", "fast"]
+            assert models["partial"]["advertised_tier_ids"] == ["priority"]
+            assert models["partial"]["supported_tiers"] == ["standard", "fast"]
+            assert models["partial"]["status"] == ("unknown" if configured_tier == "ultrafast" else "supported")
+            assert models["standard-only"]["supported_tiers"] == ["standard"]
+            assert models["unknown"]["supported_tiers"] is None
+            assert models["unlisted"]["supported_tiers"] is None
+            if configured_tier == "ultrafast":
+                assert models["fast-only"]["status"] == "unsupported"
+                assert models["fast-only"]["applicable_tier"] is None
+                assert models["fast-only"]["reason"]
+            if configured_tier is not None:
+                assert models["standard-only"]["status"] == "unsupported"
+                for model in ("unknown", "unlisted"):
+                    assert models[model]["status"] == "unknown"
+                    assert models[model]["applicable_tier"] is None
+                    assert models[model]["reason"]
+            else:
+                assert all(model["status"] == "supported" for model in models.values())
+
+    asyncio.run(scenario())
+
+
+def test_explicit_capability_refresh_applies_same_account_upgrade_to_requests() -> None:
+    calls = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(200, json={"models": [{
+            "slug": "gpt-6.1-sol",
+            "service_tiers": [] if calls == 1 else [{"id": "ultrafast"}],
+        }]})
+
+    async def scenario() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+            client = CodexClient(_FakeAuthManager(), http_client)
+            assert await client.supports_service_tier("gpt-6.1-sol", "ultrafast") is False
+            result = await client.service_tier_capabilities("ultrafast", force_refresh=True)
+            assert result["models"]["gpt-6.1-sol"]["applicable_tier"] == "ultrafast"
+            assert await client.supports_service_tier("gpt-6.1-sol", "ultrafast") is True
+
+    asyncio.run(scenario())
+    assert calls == 2
+
+
+def test_capability_refresh_failure_is_stale_only_within_the_same_identity() -> None:
+    auth = _MutableAuthManager()
+    calls = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls != 1:
+            return httpx.Response(503, text="secret-token must not appear in status")
+        return httpx.Response(200, json={"models": [{
+            "slug": "gpt-6.1-sol", "service_tiers": [{"id": "ultrafast"}],
+        }]})
+
+    async def scenario() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+            client = CodexClient(auth, http_client)
+            fresh = await client.service_tier_capabilities("ultrafast")
+            stale = await client.service_tier_capabilities("ultrafast", force_refresh=True)
+            assert stale["status"] == "stale"
+            assert stale["reason"]
+            assert stale["fetched_at"] == fresh["fetched_at"]
+            assert stale["models"]["gpt-6.1-sol"]["applicable_tier"] == "ultrafast"
+            auth.credentials = CodexCredentials("codex-token-2", "account-2")
+            unknown = await client.service_tier_capabilities("ultrafast", ["gpt-6.1-sol"], force_refresh=True)
+            assert unknown["status"] == "unknown"
+            assert unknown["fetched_at"] is None
+            assert unknown["reason"]
+            model = unknown["models"]["gpt-6.1-sol"]
+            assert model["status"] == "unknown"
+            assert model["supported_tiers"] is None
+            assert model["wire_tier"] is None
+            assert "secret-token" not in json.dumps(unknown)
+
+    asyncio.run(scenario())
+    assert calls == 3
+
+
+@pytest.mark.parametrize("wire_tier", ["priority", "ultrafast"])
+@pytest.mark.parametrize("switch_on_retry", [False, True])
+def test_account_change_at_dispatch_does_not_send_old_tier_entitlement(
+    wire_tier: str, switch_on_retry: bool,
+) -> None:
+    class RefreshingAuth(_MutableAuthManager):
+        async def get_credentials(self, force_refresh: bool = False) -> CodexCredentials:
+            if force_refresh:
+                self.credentials = CodexCredentials("codex-token-2", "account-2")
+            return await super().get_credentials(force_refresh)
+
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(200, json={"models": [{
+                "slug": "gpt-6.1-sol", "service_tiers": [{"id": wire_tier}],
+            }]})
+        requests.append(request)
+        if switch_on_retry and request.headers["Chatgpt-Account-Id"] == "account-1":
+            return httpx.Response(401, text="expired")
+        return httpx.Response(200, content=_sse([{"type": "response.completed"}]))
+
+    async def scenario() -> None:
+        auth = RefreshingAuth()
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+            client = CodexClient(auth, http_client)
+            assert await client.service_tier_ids("gpt-6.1-sol") == (wire_tier,)
+            if not switch_on_retry:
+                auth.credentials = CodexCredentials("codex-token-2", "account-2")
+            await _collect(client, {"model": "gpt-6.1-sol", "service_tier": wire_tier})
+            assert client._catalog_entries.fetched_at is None
+
+    asyncio.run(scenario())
+    assert len(requests) == (2 if switch_on_retry else 1)
+    assert requests[-1].headers["Chatgpt-Account-Id"] == "account-2"
+    assert "service_tier" not in json.loads(requests[-1].content)
+    assert "x-codex-routing-hint" not in requests[-1].headers
+
+
+@pytest.mark.parametrize("new_metadata", ["unsupported", "failed", "unresolvable"])
+def test_dispatch_rechecks_current_snapshot_after_another_capability_lookup(
+    new_metadata: str,
+) -> None:
+    auth = _MutableAuthManager()
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            if request.headers["Chatgpt-Account-Id"] == "account-2" and new_metadata == "failed":
+                return httpx.Response(503, text="catalog unavailable")
+            tiers = [{"id": "ultrafast"}] if request.headers["Chatgpt-Account-Id"] == "account-1" else []
+            return httpx.Response(200, json={"models": [{"slug": "gpt-6.1-sol", "service_tiers": tiers}]})
+        requests.append(request)
+        return httpx.Response(200, content=_sse([{"type": "response.completed"}]))
+
+    async def scenario() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+            client = CodexClient(auth, http_client)
+            assert await client.supports_service_tier("gpt-6.1-sol", "ultrafast") is True
+            payload = {"model": "gpt-6.1-sol", "service_tier": "ultrafast"}
+            auth.credentials = CodexCredentials("codex-token-2", "account-2")
+            if new_metadata == "unresolvable":
+                auth.error = CodexAuthError("credentials temporarily unavailable")
+            assert await client.supports_service_tier("gpt-6.1-sol", "ultrafast") is False
+            auth.error = None
+            await _collect(client, payload)
+
+    asyncio.run(scenario())
+    assert len(requests) == 1
+    assert "service_tier" not in json.loads(requests[0].content)
+    assert "x-codex-routing-hint" not in requests[0].headers

@@ -62,6 +62,7 @@ from claudex.admin.settings import (
     _handle_admin_mapping_put,
 )
 from claudex.admin.system import (
+    _handle_admin_codex_capabilities,
     _handle_admin_codex_models,
     _handle_admin_codex_reset_credit,
     _handle_admin_connection_test,
@@ -90,7 +91,7 @@ from claudex.providers.codex_auth import CodexAuthError, CodexAuthManager
 from claudex.providers.anthropic_compatible_client import AnthropicCompatibleClient
 from claudex.providers.backends import AnthropicBackend, ResponsesBackend, RouteBackend
 from claudex.providers.codex_client import (
-    CODEX_FAST_TIER_WIRE_VALUE,
+    CODEX_SERVICE_TIER_WIRE_VALUES,
     CodexClient,
 )
 from claudex.config import (
@@ -143,14 +144,19 @@ def _assemble_route_backends(
         payload: dict[str, Any], model: str
     ) -> dict[str, Any]:
         current_config: GatewayConfig = app.state.config
-        if current_config.codex_service_tier != "fast":
+        tier = current_config.codex_service_tier
+        if tier is None:
             return payload
-        if await codex_client.supports_fast_tier(model):
-            payload["service_tier"] = CODEX_FAST_TIER_WIRE_VALUE
+        supports_tier = (
+            await codex_client.supports_fast_tier(model) if tier == "fast"
+            else await codex_client.supports_service_tier(model, tier)
+        )
+        if supports_tier:
+            payload["service_tier"] = CODEX_SERVICE_TIER_WIRE_VALUES[tier]
         else:
-            logger.debug(
-                "fast tier requested but the codex catalog does not advertise it for %s",
-                model,
+            logger.warning(
+                "%s tier not applied for %s: support is not advertised or metadata is unknown; using Standard",
+                tier, model,
             )
         return payload
 
@@ -475,6 +481,16 @@ def create_app(config: GatewayConfig, daemon_nonce: str | None = None) -> Starle
                 "/admin/providers/codex/models",
                 _handle_admin_codex_models,
                 methods=["GET"],
+            ),
+            Route(
+                "/admin/providers/codex/capabilities",
+                _handle_admin_codex_capabilities,
+                methods=["GET"],
+            ),
+            Route(
+                "/admin/providers/codex/capabilities/refresh",
+                _handle_admin_codex_capabilities,
+                methods=["POST"],
             ),
             Route(
                 "/admin/providers/codex/reset-credit",

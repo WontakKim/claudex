@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import re
 import shutil
 import signal
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from contextlib import aclosing
 from dataclasses import dataclass
 from typing import Any
@@ -25,10 +26,16 @@ from claudex.providers.codex_auth import CodexAuthError, CodexAuthManager, Codex
 from claudex.providers.model_catalog_cache import ModelCatalogCache
 from claudex.upstream_errors import UpstreamError
 
+logger = logging.getLogger(__name__)
+
 CODEX_RESPONSES_URL = "https://chatgpt.com/backend-api/codex/responses"
 CODEX_MODELS_URL = "https://chatgpt.com/backend-api/codex/models"
 # The UI name is "Fast", but the wire keeps the legacy pre-rename value.
 CODEX_FAST_TIER_WIRE_VALUE = "priority"
+CODEX_SERVICE_TIER_WIRE_VALUES = {
+    "fast": CODEX_FAST_TIER_WIRE_VALUE,
+    "ultrafast": "ultrafast",
+}
 
 # The models endpoint requires an explicit client_version; this is the last
 # verified bundled stable identity, not a substitute for an absent CLI catalog.
@@ -38,7 +45,7 @@ _CODEX_VERSION_CLEANUP_TIMEOUT = 1.0
 _CODEX_VERSION_CACHE_SECONDS = 60.0
 _CODEX_VERSION_OUTPUT = re.compile(r"codex-cli (\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)\Z")
 _CODEX_PRESET_MODELS = [
-    "gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol",
+    "gpt-6.1-sol", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol",
     "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5",
 ]
 _CODEX_ORIGINATOR = "codex-tui"
@@ -155,7 +162,8 @@ class CodexUpstreamError(UpstreamError):
 @dataclass(frozen=True)
 class CodexModelEntry:
     context_window: int | None
-    supports_fast_tier: bool
+    service_tier_ids: tuple[str, ...] | None
+    has_complete_service_tier_metadata: bool
 
 
 class CodexClient:
@@ -163,6 +171,13 @@ class CodexClient:
         self._auth_manager = auth_manager
         self._http_client = http_client
         self._version_discovery = CodexVersionDiscovery()
+        self._catalog_identity: tuple[str, str | None, bool, str] | None = None
+        self._catalog_credentials: CodexCredentials | None = None
+        self._catalog_version: str | None = None
+        self._catalog_identity_error: BaseException | None = None
+        # Raw transport payloads need no preflight; once checked, unverified
+        # tier metadata cannot bypass the dispatch guard.
+        self._has_checked_catalog_identity = False
         self._catalog_entries: ModelCatalogCache[CodexModelEntry] = ModelCatalogCache(
             self._fetch_catalog_entries,
             expected_errors=(CodexAuthError, CodexUpstreamError, httpx.HTTPError),
@@ -175,9 +190,30 @@ class CodexClient:
 
         Retries exactly once with force-refreshed credentials on HTTP 401.
         """
+        async def stream_once(credentials: CodexCredentials) -> AsyncIterator[dict[str, Any]]:
+            identity = (
+                credentials.access_token, credentials.account_id,
+                credentials.is_api_key, self._version_discovery.current_version,
+            )
+            if self._has_checked_catalog_identity:
+                if identity != self._catalog_identity:
+                    self._invalidate_catalog_identity()
+                tier = payload.get("service_tier")
+                if tier in CODEX_SERVICE_TIER_WIRE_VALUES.values():
+                    entry = self._catalog_entries.get_cached(payload.get("model"))
+                    if entry is None or tier not in (entry.service_tier_ids or ()):
+                        payload.pop("service_tier")
+                        logger.warning(
+                            "Codex tier support changed or could not be verified at dispatch; using Standard for %s",
+                            payload.get("model"),
+                        )
+            async with aclosing(self._stream_once(payload, session_id, credentials)) as events:
+                async for event in events:
+                    yield event
+
         async for event in stream_with_one_retry(
             self._auth_manager.get_credentials,
-            lambda credentials: self._stream_once(payload, session_id, credentials),
+            stream_once,
             upstream_error=CodexUpstreamError,
             should_retry=lambda exc, credentials: (
                 exc.status_code == 401 and not credentials.is_api_key
@@ -201,17 +237,138 @@ class CodexClient:
 
     async def context_window(self, model: str) -> int | None:
         """Return the cached context-window size for ``model``, or ``None``."""
-        entry = await self._catalog_entries.get(model)
+        snapshot = await self._get_catalog_snapshot()
+        entry = snapshot.get(model) if snapshot is not None else None
         return entry.context_window if entry else None
 
+    async def service_tier_ids(self, model: str) -> tuple[str, ...] | None:
+        """Return valid advertised wire IDs, or None when no usable metadata exists."""
+        snapshot = await self._get_catalog_snapshot()
+        entry = snapshot.get(model) if snapshot is not None else None
+        return entry.service_tier_ids if entry is not None else None
+
+    async def supports_service_tier(self, model: str, service_tier: str) -> bool:
+        """Only an advertised wire ID establishes accelerated-tier support."""
+        wire_tier = CODEX_SERVICE_TIER_WIRE_VALUES[service_tier]
+        tier_ids = await self.service_tier_ids(model)
+        return tier_ids is not None and wire_tier in tier_ids
+
     async def supports_fast_tier(self, model: str) -> bool:
-        """Return whether the live catalog lists the Fast tier for ``model``."""
-        entry = await self._catalog_entries.get(model)
-        return entry.supports_fast_tier if entry is not None else False
+        return await self.supports_service_tier(model, "fast")
+
+    async def service_tier_capabilities(
+        self,
+        configured_tier: str | None,
+        models: Sequence[str] = (),
+        *,
+        force_refresh: bool = False,
+    ) -> dict[str, Any]:
+        """Describe the same identity-scoped snapshot used by request preflight."""
+        snapshot = await self._get_catalog_snapshot(force_refresh=force_refresh)
+        error = self._catalog_identity_error or self._catalog_entries.last_error
+        catalog_status = "ok"
+        catalog_reason = None
+        if snapshot is None:
+            catalog_status = "unknown"
+            catalog_reason = "The authenticated Codex model catalog is unavailable; tier support is unknown."
+            if isinstance(error, CodexAuthError):
+                catalog_reason = "Codex authentication is unavailable; tier support is unknown."
+            elif isinstance(error, CodexDiscoveryError):
+                catalog_reason = "The Codex client version could not be determined; tier support is unknown."
+        elif error is not None:
+            catalog_status = "stale"
+            catalog_reason = "Catalog refresh failed; using the last successful snapshot for this identity."
+
+        entries = snapshot or {}
+        capabilities: dict[str, Any] = {}
+        for model in dict.fromkeys([*entries, *models]):
+            entry = entries.get(model)
+            tier_ids = entry.service_tier_ids if entry is not None else None
+            supported_tiers = None if tier_ids is None else [
+                "standard",
+                *(tier for tier, wire in CODEX_SERVICE_TIER_WIRE_VALUES.items() if wire in tier_ids),
+            ]
+            status = "supported"
+            reason = None
+            if (
+                configured_tier is not None
+                and CODEX_SERVICE_TIER_WIRE_VALUES[configured_tier] not in (tier_ids or ())
+            ):
+                if tier_ids is None or not entry.has_complete_service_tier_metadata:
+                    status = "unknown"
+                    reason = catalog_reason if snapshot is None else (
+                        "The model is not in the authenticated Codex catalog; tier support is unknown."
+                        if entry is None else
+                        "The catalog has missing or incomplete service_tiers for this model; support for this tier is unknown."
+                    )
+                else:
+                    status = "unsupported"
+                    reason = (
+                        f"The authenticated Codex catalog does not advertise {configured_tier} "
+                        "for this model; requests use Standard."
+                    )
+            applicable_tier = configured_tier if status == "supported" else None
+            capabilities[model] = {
+                "supported_tiers": supported_tiers,
+                "advertised_tier_ids": list(tier_ids) if tier_ids is not None else None,
+                "status": status,
+                "reason": reason,
+                "applicable_tier": applicable_tier,
+                "wire_tier": CODEX_SERVICE_TIER_WIRE_VALUES[applicable_tier] if applicable_tier else None,
+            }
+        return {
+            "configured_tier": configured_tier,
+            "status": catalog_status,
+            "reason": catalog_reason,
+            "fetched_at": self._catalog_entries.fetched_at,
+            "models": capabilities,
+        }
+
+    def _invalidate_catalog_identity(self) -> None:
+        self._catalog_entries.invalidate()
+        self._catalog_identity = None
+        self._catalog_credentials = None
+        self._catalog_version = None
+        self._catalog_identity_error = None
+
+    async def _sync_catalog_identity(self) -> tuple[str, str | None, bool, str]:
+        credentials = await self._auth_manager.get_credentials()
+        version = await self._version_discovery.get_version() or _CODEX_CLIENT_VERSION
+        identity = (
+            credentials.access_token, credentials.account_id, credentials.is_api_key, version,
+        )
+        if identity != self._catalog_identity:
+            self._catalog_entries.invalidate()
+            self._catalog_identity = identity
+        self._catalog_credentials = credentials
+        self._catalog_version = version
+        self._catalog_identity_error = None
+        return identity
+
+    async def _get_catalog_snapshot(
+        self, *, force_refresh: bool = False,
+    ) -> dict[str, CodexModelEntry] | None:
+        self._has_checked_catalog_identity = True
+        try:
+            identity = await self._sync_catalog_identity()
+            while True:
+                snapshot = await self._catalog_entries.get_snapshot(force_refresh=force_refresh)
+                current_identity = await self._sync_catalog_identity()
+                if identity == current_identity:
+                    return snapshot
+                identity = current_identity
+                force_refresh = False
+        except (CodexAuthError, CodexDiscoveryError, httpx.HTTPError) as exc:
+            # An unresolvable identity cannot inherit a previous login's metadata.
+            self._invalidate_catalog_identity()
+            self._catalog_identity_error = exc
+            return None
 
     async def _fetch_catalog_entries(self) -> dict[str, CodexModelEntry]:
         """Resolve slug -> catalog entries from the raw, unfiltered catalog."""
-        models = await self._fetch_model_entries()
+        models = await self._fetch_model_entries(
+            self._catalog_version, credentials=self._catalog_credentials,
+        )
         entries: dict[str, CodexModelEntry] = {}
         for model in models:
             if not isinstance(model, dict):
@@ -220,11 +377,16 @@ class CodexClient:
             if not isinstance(slug, str) or not slug:
                 continue
             service_tiers = model.get("service_tiers")
-            supports_fast_tier = isinstance(service_tiers, list) and any(
-                isinstance(tier, dict)
-                and tier.get("id") == CODEX_FAST_TIER_WIRE_VALUE
-                for tier in service_tiers
-            )
+            tier_ids = None
+            has_complete_tier_metadata = False
+            if isinstance(service_tiers, list):
+                valid_ids = [
+                    tier["id"] for tier in service_tiers
+                    if isinstance(tier, dict) and isinstance(tier.get("id"), str) and tier["id"]
+                ]
+                has_complete_tier_metadata = len(valid_ids) == len(service_tiers)
+                if valid_ids or has_complete_tier_metadata:
+                    tier_ids = tuple(dict.fromkeys(valid_ids))
             context_window = coerce_context_window(model.get("context_window"))
             max_context_window = coerce_context_window(model.get("max_context_window"))
             # The catalog's context_window is a conservative client default and
@@ -240,11 +402,17 @@ class CodexClient:
             )
             entries[slug] = CodexModelEntry(
                 context_window=effective_context_window,
-                supports_fast_tier=supports_fast_tier,
+                service_tier_ids=tier_ids,
+                has_complete_service_tier_metadata=has_complete_tier_metadata,
             )
         return entries
 
-    async def _fetch_model_entries(self, client_version: str | None = None) -> list[Any]:
+    async def _fetch_model_entries(
+        self,
+        client_version: str | None = None,
+        *,
+        credentials: CodexCredentials | None = None,
+    ) -> list[Any]:
         """GET the Codex model catalog and return its raw ``models`` list.
 
         Raises ``CodexUpstreamError`` on any structural failure: a non-200
@@ -252,7 +420,8 @@ class CodexClient:
         non-list ``models`` field.
         """
         version = client_version or self._version_discovery.current_version
-        credentials = await self._auth_manager.get_credentials()
+        if credentials is None:
+            credentials = await self._auth_manager.get_credentials()
         headers = self._base_headers(credentials, version)
         headers["Accept"] = "application/json"
         return await fetch_models_list(

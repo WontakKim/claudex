@@ -238,3 +238,123 @@ def test_cancellation_propagates_even_when_expected_errors_would_catch_it() -> N
     # fetches immediately instead of being suppressed for the backoff window.
     assert asyncio.run(cache.get("model-a")) == 128_000
     assert fetch.calls == 2
+
+
+def test_explicit_refresh_replaces_the_same_fresh_snapshot_used_by_get() -> None:
+    fetch = FakeFetch()
+    fetch.queue_result({"model-a": 128_000})
+    fetch.queue_result({"model-a": 256_000, "model-b": 64_000})
+    cache = ModelCatalogCache(fetch, expected_errors=(FetchError,))
+
+    async def scenario() -> None:
+        assert cache.fetched_at is None
+        assert await cache.get("model-a") == 128_000
+        assert cache.fetched_at is not None
+        assert await cache.get_snapshot(force_refresh=True) == {
+            "model-a": 256_000, "model-b": 64_000,
+        }
+        assert await cache.get("model-a") == 256_000
+        assert await cache.get("model-b") == 64_000
+        assert cache.last_error is None
+
+    asyncio.run(scenario())
+    assert fetch.calls == 2
+
+
+def test_explicit_refresh_bypasses_backoff_and_preserves_same_snapshot_on_error() -> None:
+    fetch = FakeFetch()
+    fetch.queue_result({"model-a": 128_000})
+    fetch.queue_error(FetchError("catalog unavailable"))
+    fetch.queue_error(FetchError("catalog still unavailable"))
+    fetch.queue_result({"model-a": 256_000})
+    cache = ModelCatalogCache(fetch, expected_errors=(FetchError,))
+
+    async def scenario() -> None:
+        assert await cache.get_snapshot() == {"model-a": 128_000}
+        fetched_at = cache.fetched_at
+        assert await cache.get_snapshot(force_refresh=True) == {"model-a": 128_000}
+        assert str(cache.last_error) == "catalog unavailable"
+        assert cache.fetched_at == fetched_at
+        assert await cache.get("model-a") == 128_000
+        assert fetch.calls == 2
+        assert await cache.get_snapshot(force_refresh=True) == {"model-a": 128_000}
+        assert str(cache.last_error) == "catalog still unavailable"
+        assert cache.fetched_at == fetched_at
+        assert await cache.get_snapshot(force_refresh=True) == {"model-a": 256_000}
+        assert cache.last_error is None
+        assert await cache.get("model-a") == 256_000
+
+    asyncio.run(scenario())
+    assert fetch.calls == 4
+
+
+def test_invalidation_clears_snapshot_and_error_backoff() -> None:
+    fetch = FakeFetch()
+    fetch.queue_result({"model-a": 128_000})
+    fetch.queue_error(FetchError("old identity unavailable"))
+    fetch.queue_error(FetchError("new identity unavailable"))
+    cache = ModelCatalogCache(fetch, expected_errors=(FetchError,))
+
+    async def scenario() -> None:
+        assert await cache.get("model-a") == 128_000
+        assert await cache.get_snapshot(force_refresh=True) == {"model-a": 128_000}
+        cache.invalidate()
+        assert cache.fetched_at is None
+        assert cache.last_error is None
+        assert await cache.get("model-a") is None
+        assert str(cache.last_error) == "new identity unavailable"
+
+    asyncio.run(scenario())
+    assert fetch.calls == 3
+
+
+@pytest.mark.parametrize("old_fetch_fails", [False, True])
+def test_invalidated_in_flight_fetch_cannot_republish_old_snapshot_or_error(
+    old_fetch_fails: bool,
+) -> None:
+    async def scenario() -> None:
+        started = asyncio.Event()
+        release = asyncio.Event()
+        calls = 0
+
+        async def fetch() -> dict[str, int]:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                started.set()
+                await release.wait()
+                if old_fetch_fails:
+                    raise FetchError("old identity failed")
+                return {"model-a": 128_000}
+            return {"model-a": 256_000}
+
+        cache = ModelCatalogCache(fetch, expected_errors=(FetchError,))
+        old_lookup = asyncio.create_task(cache.get("model-a"))
+        await asyncio.wait_for(started.wait(), timeout=1)
+        cache.invalidate()
+        new_lookup = asyncio.create_task(cache.get("model-a"))
+        release.set()
+        assert await asyncio.gather(old_lookup, new_lookup) == [256_000, 256_000]
+        assert await cache.get("model-a") == 256_000
+        assert cache.last_error is None
+        assert calls == 2
+
+    asyncio.run(scenario())
+
+
+def test_get_cached_reads_last_snapshot_without_triggering_refresh() -> None:
+    clock = FakeClock()
+    fetch = FakeFetch()
+    fetch.queue_result({"model-a": 128_000})
+    cache = ModelCatalogCache(fetch, expected_errors=(FetchError,), clock=clock)
+
+    async def scenario() -> None:
+        assert cache.get_cached("model-a") is None
+        assert await cache.get("model-a") == 128_000
+        clock.advance(901)
+        assert cache.get_cached("model-a") == 128_000
+        cache.invalidate()
+        assert cache.get_cached("model-a") is None
+
+    asyncio.run(scenario())
+    assert fetch.calls == 1

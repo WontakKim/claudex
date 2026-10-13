@@ -23,7 +23,7 @@ BUILTIN_ROUTE_PROVIDERS = ("codex", "kimi", "grok")
 RESERVED_PROVIDER_NAMES = ("codex", "kimi", "grok", "claude", "anthropic")
 
 VALID_REASONING_EFFORTS = ("minimal", "low", "medium", "high", "xhigh", "max")
-VALID_CODEX_SERVICE_TIERS = ("fast",)
+VALID_CODEX_SERVICE_TIERS = ("fast", "ultrafast")
 
 VALID_LOG_LEVELS = ("debug", "info", "warning", "error")
 

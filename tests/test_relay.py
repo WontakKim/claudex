@@ -426,12 +426,14 @@ class StubCodexClient:
         context_window: int | None = None,
         error: CodexUpstreamError | None = None,
         supports_fast_tier: bool = False,
+        supports_ultrafast_tier: bool = False,
     ) -> None:
         self.payloads: list[dict[str, Any]] = []
         self.context_window_calls: list[str] = []
         self._context_window = context_window
         self._error = error or CodexUpstreamError(503, "stub codex upstream")
         self._supports_fast_tier = supports_fast_tier
+        self._supports_ultrafast_tier = supports_ultrafast_tier
 
     async def context_window(self, model: str) -> int | None:
         self.context_window_calls.append(model)
@@ -439,6 +441,10 @@ class StubCodexClient:
 
     async def supports_fast_tier(self, model: str) -> bool:
         return self._supports_fast_tier
+
+    async def supports_service_tier(self, model: str, service_tier: str) -> bool:
+        assert service_tier == "ultrafast"
+        return self._supports_ultrafast_tier
 
     async def stream_responses(self, payload: dict[str, Any], session_id: str):
         self.payloads.append(payload)
@@ -456,6 +462,7 @@ def _gateway(
     codex_context_window: int | None = None,
     codex_error: CodexUpstreamError | None = None,
     codex_supports_fast_tier: bool = False,
+    codex_supports_ultrafast_tier: bool = False,
 ) -> tuple[TestClient, StubCodexClient]:
     app = server.create_app(config)
     # The lifespan requires real Codex credentials, so set the state directly
@@ -464,7 +471,7 @@ def _gateway(
     app.state.compaction_last_reroute = None
     app.state.compaction_reroute_sequence = 0
     stub = StubCodexClient(
-        codex_context_window, codex_error, codex_supports_fast_tier
+        codex_context_window, codex_error, codex_supports_fast_tier, codex_supports_ultrafast_tier
     )
     app.state.codex_client = stub
     app.state.http_client = httpx.AsyncClient(
@@ -653,36 +660,39 @@ def test_codex_astra_model_is_forwarded_unchanged() -> None:
     assert stub.payloads[0]["model"] == "gpt-6-astra"
 
 
-def test_codex_fast_tier_is_sent_for_supported_model(
-    caplog: pytest.LogCaptureFixture,
+@pytest.mark.parametrize(("tier", "wire"), [("fast", "priority"), ("ultrafast", "ultrafast")])
+def test_codex_tier_is_sent_for_supported_model(
+    caplog: pytest.LogCaptureFixture, tier: str, wire: str,
 ) -> None:
     config = GatewayConfig(
-        model_map={"opus": "codex:gpt-5.6-sol"}, codex_service_tier="fast"
+        model_map={"opus": "codex:gpt-5.6-sol"}, codex_service_tier=tier
     )
     client, stub = _gateway(
         config,
         _failing_anthropic_handler,
-        codex_supports_fast_tier=True,
+        codex_supports_fast_tier=tier == "fast",
+        codex_supports_ultrafast_tier=tier == "ultrafast",
     )
     caplog.set_level(logging.INFO, logger="claudex.server")
 
     response = client.post("/v1/messages", json=_message_body("claude-opus-4-6"))
 
     assert response.status_code == 503
-    assert stub.payloads[0]["service_tier"] == "priority"
+    assert stub.payloads[0]["service_tier"] == wire
     assert any(
         record.name == "claudex.server"
         and record.levelno == logging.INFO
-        and "tier=priority" in record.getMessage()
+        and f"tier={wire}" in record.getMessage()
         for record in caplog.records
     )
 
 
-def test_codex_fast_tier_is_omitted_for_unsupported_model(
-    caplog: pytest.LogCaptureFixture,
+@pytest.mark.parametrize("tier", ["fast", "ultrafast"])
+def test_codex_tier_fallback_has_a_visible_explanation(
+    caplog: pytest.LogCaptureFixture, tier: str,
 ) -> None:
     config = GatewayConfig(
-        model_map={"opus": "codex:gpt-5.6-sol"}, codex_service_tier="fast"
+        model_map={"opus": "codex:gpt-5.6-sol"}, codex_service_tier=tier
     )
     client, stub = _gateway(config, _failing_anthropic_handler)
     caplog.set_level(logging.DEBUG, logger="claudex.server")
@@ -693,9 +703,10 @@ def test_codex_fast_tier_is_omitted_for_unsupported_model(
     assert "service_tier" not in stub.payloads[0]
     assert any(
         record.name == "claudex.server"
-        and record.levelno == logging.DEBUG
-        and record.getMessage()
-        == "fast tier requested but the codex catalog does not advertise it for gpt-5.6-sol"
+        and record.levelno == logging.WARNING
+        and f"{tier} tier not applied" in record.getMessage()
+        and "using Standard" in record.getMessage()
+        and "not advertised or metadata is unknown" in record.getMessage()
         for record in caplog.records
     )
     assert any(

@@ -86,6 +86,25 @@ request. A successful connection-test status alone does not prove that the
 upstream served the exact model unless its response makes model identity
 observable.
 
+### Codex model IDs and speed support
+
+The same open-ended mapping contract accepts `codex:gpt-6.1-sol` and future
+Codex IDs without a gateway update. Sol 6.1 is also a no-CLI suggestion; a preset
+or an accepted manual mapping does not establish account access.
+
+The global Codex tier setting is applied per target model, not per Claude-facing
+alias. Mixed mappings can therefore send Ultrafast for one advertised model and
+Standard for another. `GET /admin/providers/codex/capabilities` includes mapped
+IDs even when absent from the catalog, explains unknown versus unsupported tier
+support, and shows configured versus applicable request tiers without running
+inference. See [capability status and refresh](providers.md#capability-status-and-refresh).
+
+An ordinary `POST /admin/test` stays untiered. Only an explicit `service_tier`
+field opts into a tier probe, which can consume allowance; connection success
+alone still does not confirm the requested tier. See
+[explicit tier diagnostics](providers.md#explicit-tier-diagnostics) for the
+requested, sent, and backend-confirmed fields.
+
 ## Custom provider targets
 
 Custom provider names become model-map prefixes. The configured family, not the

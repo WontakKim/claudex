@@ -442,7 +442,7 @@ async def _handle_admin_codex_put(request: Request) -> JSONResponse:
     if "service_tier" not in body:
         return JSONResponse(
             server_support._openai_error_body(
-                "invalid_request_error", "provide 'service_tier' ('fast' or null)"
+                "invalid_request_error", "provide 'service_tier' ('fast', 'ultrafast', or null)"
             ),
             status_code=400,
         )
