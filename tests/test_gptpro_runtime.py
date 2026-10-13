@@ -2342,6 +2342,162 @@ def test_runtime_resizes_admission_live(
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize(
+    ("initial_limit", "has_admitted_ask"),
+    [(2, False), (3, True)],
+    ids=["idle", "partially-occupied"],
+)
+def test_runtime_downsize_reclaims_unused_admission(
+    monkeypatch: pytest.MonkeyPatch,
+    initial_limit: int,
+    has_admitted_ask: bool,
+) -> None:
+    context = _FakeContext()
+    _RuntimeFakes(monkeypatch, [context])
+
+    async def scenario() -> None:
+        started = {question: asyncio.Event() for question in ("one", "two", "three")}
+        finish = {question: asyncio.Event() for question in started}
+
+        async def execute_ask_outcome(
+            page: _FakePage, question: str, **options: Any
+        ) -> ask.AskOutcome:
+            if question == "warmup":
+                return _outcome(question)
+            started[question].set()
+            await finish[question].wait()
+            return _outcome(question)
+
+        monkeypatch.setattr(runtime.ask, "execute_ask_outcome", execute_ask_outcome)
+        ask_runtime = runtime.AskRuntime(max_concurrent_asks=initial_limit)
+        tasks: dict[str, asyncio.Task[ask.AskOutcome]] = {}
+        try:
+            await ask_runtime.ask("warmup")
+            if has_admitted_ask:
+                tasks["one"] = asyncio.create_task(ask_runtime.ask("one"))
+                await started["one"].wait()
+            ask_runtime.set_max_concurrent_asks(1)
+            for question in (("two", "three") if has_admitted_ask else ("one", "two")):
+                tasks[question] = asyncio.create_task(ask_runtime.ask(question))
+            while (
+                sum(event.is_set() for event in started.values())
+                + ask_runtime._waiting_submitters < len(tasks)
+            ):
+                await asyncio.sleep(0)
+            assert [question for question in started if started[question].is_set()] == ["one"]
+            assert sum(page.close_calls == 0 for page in context.pages) == 1
+            assert not tasks["one"].done()
+
+            for question, task in tasks.items():
+                await started[question].wait()
+                assert sum(page.close_calls == 0 for page in context.pages) == 1
+                finish[question].set()
+                assert (await task).text == question
+            assert ask_runtime._ask_semaphore._value == 1
+        finally:
+            for event in finish.values():
+                event.set()
+            await asyncio.gather(*tasks.values())
+            await ask_runtime.aclose()
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=5))
+
+
+@pytest.mark.parametrize("cancel_when", ["waiting", "awakened"])
+def test_runtime_downsize_preserves_cancelled_admission(
+    monkeypatch: pytest.MonkeyPatch, cancel_when: str,
+) -> None:
+    context = _FakeContext()
+    _RuntimeFakes(monkeypatch, [context])
+
+    async def scenario() -> None:
+        started = asyncio.Event()
+
+        async def execute_ask_outcome(
+            page: _FakePage, question: str, **options: Any
+        ) -> ask.AskOutcome:
+            if question == "next":
+                return _outcome(question)
+            assert question == "survivor"
+            started.set()
+            await asyncio.Future()
+
+        monkeypatch.setattr(runtime.ask, "execute_ask_outcome", execute_ask_outcome)
+        ask_runtime = runtime.AskRuntime(max_concurrent_asks=2)
+        gate = ask_runtime._ask_semaphore
+        await gate.acquire()
+        await gate.acquire()
+        tasks = [
+            asyncio.create_task(ask_runtime.ask(question))
+            for question in ("cancelled", "survivor")
+        ]
+        try:
+            while ask_runtime._waiting_submitters != 2:
+                await asyncio.sleep(0)
+            if cancel_when == "awakened":
+                gate.release()
+            ask_runtime.set_max_concurrent_asks(1)
+            tasks[0].cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await tasks[0]
+            if cancel_when == "waiting":
+                gate.release()
+            await asyncio.sleep(0)
+            while not started.is_set() and ask_runtime._waiting_submitters == 0:
+                await asyncio.sleep(0)
+            assert not started.is_set()
+            assert context.pages == []
+            assert ask_runtime._waiting_submitters == 1
+
+            gate.release()
+            await started.wait()
+            tasks[1].cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await tasks[1]
+            assert ask_runtime._waiting_submitters == 0
+            assert gate._value == 1
+            assert (await ask_runtime.ask("next")).text == "next"
+            assert all(page.close_calls == 1 for page in context.pages)
+        finally:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            await ask_runtime.aclose()
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=5))
+
+
+@pytest.mark.parametrize("occupied", [0, 1, 3], ids=["idle", "partial", "saturated"])
+def test_admission_gate_repeated_resize_preserves_capacity(occupied: int) -> None:
+    async def scenario() -> None:
+        gate = runtime._AdmissionGate(3)
+        for _ in range(occupied):
+            await gate.acquire()
+        for limit in (1, 2, 3, 1):
+            gate.set_limit(limit)
+            assert gate.limit == limit
+            assert gate._value == max(0, limit - occupied)
+        for remaining in range(occupied - 1, -1, -1):
+            gate.release()
+            assert gate._value == max(0, 1 - remaining)
+        assert gate._value == 1
+
+        gate.set_limit(3)
+        for _ in range(3):
+            await gate.acquire()
+        gate.set_limit(2)
+        gate.release()
+        assert gate.locked()
+        gate.release()
+        assert gate._value == 1
+        gate.set_limit(1)
+        assert gate.locked()
+        gate.release()
+        assert gate._value == 1
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=5))
+
+
 def test_runtime_resize_rejects_nonpositive_concurrency() -> None:
     ask_runtime = runtime.AskRuntime()
     with pytest.raises(ValueError, match="max_concurrent_asks"):

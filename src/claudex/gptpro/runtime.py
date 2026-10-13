@@ -595,11 +595,11 @@ class DetachPoller:
 
 
 class _AdmissionGate:
-    """Semaphore whose limit can change while asks are in flight.
+    """Live admission limit that preserves already-admitted asks.
 
-    Raising the limit releases permits immediately so waiting submitters
-    wake; lowering it never interrupts admitted asks — the next releases are
-    swallowed instead of returning permits, so the pool shrinks as they finish.
+    Raising the limit releases permits immediately so waiting submitters wake.
+    Lowering it reclaims unused permits immediately and lets admitted asks
+    finish; new asks wait for capacity under the current limit.
     """
 
     def __init__(self, limit: int) -> None:
@@ -619,7 +619,12 @@ class _AdmissionGate:
         return self._semaphore.locked()
 
     async def acquire(self) -> None:
-        await self._semaphore.acquire()
+        while True:
+            await self._semaphore.acquire()
+            # Waiter reservations and cancellation refunds can outlive a downsize.
+            if self._pending_shrink == 0:
+                return
+            self._pending_shrink -= 1
 
     def release(self) -> None:
         if self._pending_shrink > 0:
@@ -631,7 +636,9 @@ class _AdmissionGate:
         delta = new_limit - self._limit
         self._limit = new_limit
         if delta < 0:
-            self._pending_shrink += -delta
+            reclaimed = min(-delta, self._semaphore._value)
+            self._semaphore._value -= reclaimed
+            self._pending_shrink += -delta - reclaimed
             return
         paid = min(delta, self._pending_shrink)
         self._pending_shrink -= paid
