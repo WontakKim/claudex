@@ -350,13 +350,15 @@ class CodexClient:
     ) -> dict[str, CodexModelEntry] | None:
         self._has_checked_catalog_identity = True
         try:
-            identity = await self._sync_catalog_identity()
+            await self._sync_catalog_identity()
             while True:
                 snapshot = await self._catalog_entries.get_snapshot(force_refresh=force_refresh)
-                current_identity = await self._sync_catalog_identity()
-                if identity == current_identity:
+                # Binding objects are reused only until identity invalidation;
+                # equal credentials after restoration have a different binding.
+                snapshot_identity = self._catalog_identity
+                await self._sync_catalog_identity()
+                if snapshot_identity is self._catalog_identity:
                     return snapshot
-                identity = current_identity
                 force_refresh = False
         except (CodexAuthError, CodexDiscoveryError, httpx.HTTPError) as exc:
             # An unresolvable identity cannot inherit a previous login's metadata.

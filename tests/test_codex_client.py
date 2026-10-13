@@ -1446,3 +1446,138 @@ def test_dispatch_rechecks_current_snapshot_after_another_capability_lookup(
     assert len(requests) == 1
     assert "service_tier" not in json.loads(requests[0].content)
     assert "x-codex-routing-hint" not in requests[0].headers
+
+
+@pytest.mark.parametrize("lookup_kind", [
+    "context_window", "service_tier_ids", "supports_service_tier",
+    "supports_fast_tier", "capabilities", "explicit_refresh",
+])
+@pytest.mark.parametrize(
+    ("schedule", "failed_fetch"),
+    [
+        pytest.param("restored_unobserved", None, id="exact-restoration"),
+        pytest.param("restored_unobserved", "initial", id="initial-fetch-error"),
+        pytest.param("restored_unobserved", "intervening", id="intervening-fetch-error"),
+        pytest.param("one_way", None, id="one-way-control"),
+        pytest.param("restored_observed", None, id="observed-restoration-control"),
+    ],
+)
+def test_catalog_snapshot_provenance_survives_exact_identity_restoration(
+    lookup_kind: str, schedule: str, failed_fetch: str | None,
+) -> None:
+    async def scenario() -> None:
+        model = "verification-model"
+        initial_credentials = CodexCredentials("fake-only-token-A", "account-A")
+        intervening_credentials = CodexCredentials("fake-only-token-B", "account-B")
+        intervening_identity_read = asyncio.Event()
+        fetch_started = [asyncio.Event() for _ in range(3)]
+        release_fetch = [asyncio.Event() for _ in range(3)]
+        accounts: list[str] = []
+
+        class SignallingAuthManager(_MutableAuthManager):
+            async def get_credentials(self, force_refresh: bool = False) -> CodexCredentials:
+                credentials = await super().get_credentials(force_refresh)
+                if credentials.account_id == "account-B":
+                    intervening_identity_read.set()
+                return credentials
+
+        auth = SignallingAuthManager()
+        auth.credentials = initial_credentials
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            assert request.method == "GET"
+            assert str(request.url).startswith(CODEX_MODELS_URL)
+            assert request.url.params["client_version"] == "0.157.1"
+            account = request.headers["Chatgpt-Account-Id"]
+            accounts.append(account)
+            fetch_index = len(accounts) - 1
+            assert fetch_index < 3
+            assert account == ("account-B" if fetch_index == 1 else "account-A")
+            fetch_started[fetch_index].set()
+            await release_fetch[fetch_index].wait()
+            if (fetch_index == 0 and failed_fetch == "initial") or (
+                fetch_index == 1 and failed_fetch == "intervening"
+            ):
+                return httpx.Response(503, text="synthetic catalog failure")
+            return httpx.Response(200, json={"models": [{
+                "slug": model,
+                "context_window": 128000 if account == "account-A" else 256000,
+                "service_tiers": [] if account == "account-A" else [{"id": "priority"}, {"id": "ultrafast"}],
+            }]})
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+            client = CodexClient(auth, http_client)
+            lookups = []
+
+            async def get_metadata() -> Any:
+                if lookup_kind in ("capabilities", "explicit_refresh"):
+                    return await client.service_tier_capabilities(
+                        "ultrafast", [model], force_refresh=lookup_kind == "explicit_refresh",
+                    )
+                if lookup_kind == "supports_service_tier":
+                    return await client.supports_service_tier(model, "ultrafast")
+                return await getattr(client, lookup_kind)(model)
+
+            try:
+                first_lookup = asyncio.create_task(get_metadata())
+                lookups.append(first_lookup)
+                await asyncio.wait_for(fetch_started[0].wait(), timeout=1)
+                initial_identity = client._catalog_identity
+                assert initial_identity == ("fake-only-token-A", "account-A", False, "0.157.1")
+
+                auth.credentials = intervening_credentials
+                second_lookup = asyncio.create_task(client.context_window(model))
+                lookups.append(second_lookup)
+                await asyncio.wait_for(intervening_identity_read.wait(), timeout=1)
+                assert client._catalog_identity == ("fake-only-token-B", "account-B", False, "0.157.1")
+                assert len(client._catalog_entries._lock._waiters) == 1
+                release_fetch[0].set()
+                await asyncio.wait_for(fetch_started[1].wait(), timeout=1)
+
+                if schedule != "one_way":
+                    auth.credentials = initial_credentials
+                    assert client._catalog_identity[1] == "account-B"
+                    if schedule == "restored_observed":
+                        lookups.append(asyncio.create_task(client.context_window(model)))
+                        await asyncio.sleep(0)
+                        assert client._catalog_identity == initial_identity
+                        assert len(client._catalog_entries._lock._waiters) == 2
+                release_fetch[1].set()
+                if schedule != "one_way":
+                    await asyncio.wait_for(fetch_started[2].wait(), timeout=1)
+                    assert not first_lookup.done(), first_lookup.result()
+                    release_fetch[2].set()
+
+                results = await asyncio.wait_for(asyncio.gather(*lookups), timeout=1)
+                expected_window = 256000 if schedule == "one_way" else 128000
+                expected_tiers = ("priority", "ultrafast") if schedule == "one_way" else ()
+                if lookup_kind == "context_window":
+                    assert results[0] == expected_window
+                elif lookup_kind == "service_tier_ids":
+                    assert results[0] == expected_tiers
+                elif lookup_kind in ("supports_service_tier", "supports_fast_tier"):
+                    assert results[0] is (schedule == "one_way")
+                else:
+                    capabilities = results[0]
+                    assert capabilities["status"] == "ok"
+                    assert capabilities["reason"] is None
+                    assert capabilities["fetched_at"] is not None
+                    entry = capabilities["models"][model]
+                    assert entry["advertised_tier_ids"] == list(expected_tiers)
+                    assert entry["supported_tiers"] == (["standard", "fast", "ultrafast"] if expected_tiers else ["standard"])
+                    assert entry["status"] == ("supported" if expected_tiers else "unsupported")
+                    assert entry["applicable_tier"] == ("ultrafast" if expected_tiers else None)
+                    assert entry["wire_tier"] == ("ultrafast" if expected_tiers else None)
+                assert all(result == expected_window for result in results[1:])
+                assert await client.context_window(model) == expected_window
+                assert await client.service_tier_ids(model) == expected_tiers
+                assert client._catalog_entries.fetched_at is not None
+                assert client._catalog_entries.last_error is None
+            finally:
+                for lookup in lookups:
+                    if not lookup.done():
+                        lookup.cancel()
+                await asyncio.gather(*lookups, return_exceptions=True)
+        assert accounts == (["account-A", "account-B"] if schedule == "one_way" else ["account-A", "account-B", "account-A"])
+
+    asyncio.run(scenario())
