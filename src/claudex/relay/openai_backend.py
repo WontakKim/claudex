@@ -17,6 +17,7 @@ from starlette.responses import JSONResponse, StreamingResponse
 import claudex.translate.context_overflow as context_overflow
 from claudex import server_support
 from claudex.providers.backends import ResponsesBackend, ResponsesTransport
+from claudex.providers.client_support import _shield_response_cleanup
 from claudex.compaction import (
     build_reroute_headers,
     build_reroute_payload,
@@ -25,6 +26,8 @@ from claudex.compaction import (
 from claudex.config import GatewayConfig, RouteTarget, parse_compaction_model
 from claudex.relay.common import (
     _ANTHROPIC_API_BASE,
+    _UpstreamStreamRelay,
+    _UpstreamStreamingResponse,
     _format_sse,
     _upstream_error_to_claude,
 )
@@ -240,9 +243,8 @@ async def _relay_via_responses_backend(
         )
 
     async def upstream_events() -> AsyncIterator[dict[str, Any]]:
-        # Owns event_stream: Starlette never closes body iterators, so every
-        # exit — exhaustion, error, or client disconnect unwinding through
-        # this generator — must release the Codex HTTP stream here.
+        # This generator owns event_stream after iteration starts; the
+        # streaming response also owns the prefetched stream before that.
         try:
             if first_event is not None:
                 yield first_event
@@ -252,16 +254,19 @@ async def _relay_via_responses_backend(
             await event_stream.aclose()
 
     if claude_request.get("stream"):
-        return StreamingResponse(
-            _translate_claude_sse(
-                claude_request,
-                upstream_events(),
-                context_window,
-                custom_provider=backend.signature_namespace,
-                tool_name_map=active_function_map,
-                function_schemas=function_schemas,
-                regex_dialect="python" if backend.codex_regex_compat else "ecmascript",
-                countable_request=countable_request,
+        return _UpstreamStreamingResponse(
+            _UpstreamStreamRelay(
+                _translate_claude_sse(
+                    claude_request,
+                    upstream_events(),
+                    context_window,
+                    custom_provider=backend.signature_namespace,
+                    tool_name_map=active_function_map,
+                    function_schemas=function_schemas,
+                    regex_dialect="python" if backend.codex_regex_compat else "ecmascript",
+                    countable_request=countable_request,
+                ),
+                event_stream.aclose,
             ),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache"},
@@ -485,6 +490,7 @@ class _CompactionStreamRelay:
     """
 
     def __init__(self, upstream_response: httpx.Response, app_state: Any, sequence: int) -> None:
+        _shield_response_cleanup(upstream_response)
         self._upstream_response = upstream_response
         self._app_state = app_state
         self._sequence = sequence

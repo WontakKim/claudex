@@ -14,6 +14,7 @@ from starlette.responses import JSONResponse, Response, StreamingResponse
 
 from claudex import server_support
 from claudex.providers.backends import AnthropicBackend, AnthropicStreamReadFailure
+from claudex.providers.client_support import _shield_response_cleanup
 from claudex.relay.common import (
     _PASSTHROUGH_SKIP_RESPONSE_HEADERS,
     _format_sse,
@@ -94,6 +95,7 @@ class _AnthropicStreamRelay:
         requested_model: str,
         backend: AnthropicBackend,
     ) -> None:
+        _shield_response_cleanup(upstream_response)
         self._upstream_response = upstream_response
         self._chunks = _rewrite_anthropic_sse(
             upstream_response, requested_model, backend
