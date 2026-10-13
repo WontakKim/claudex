@@ -193,6 +193,7 @@ function render(){
   document.getElementById("cnt").innerHTML=
     "<b>"+dirty+(dirty===1?" change":" changes")+"</b>"+
     (breakdown?'<span class="dim">'+breakdown+"</span>":"");
+  renderCodexCapabilities();
 }
 /* rebuilt flow paths resume mid-cycle so redraws during drag do not freeze the animation */
 function flowPhase(){return (-(performance.now()/1000%1.4)).toFixed(3)+"s"}
@@ -1282,54 +1283,220 @@ document.getElementById("comp-custom-input").addEventListener("input",function()
   COMP.draftCustom=this.value;
 });
 document.getElementById("comp-apply").addEventListener("click",applyCompaction);
-/* --- Codex Fast service tier --------------------------------------------- */
-var CODEX={envName:"CLAUDEX_CODEX_SERVICE_TIER",locked:false,serviceTier:null,draft:false};
+var CODEX={
+  envName:"CLAUDEX_CODEX_SERVICE_TIER",locked:false,serviceTier:null,draft:null,
+  hasLoaded:false,isSaving:false,isLoading:false,requestGeneration:0,message:""
+};
+var CODEX_TIER_LABELS={standard:"Standard",fast:"Fast",ultrafast:"Ultrafast"};
+var CODEX_WIRE_TIERS={standard:null,fast:"priority",ultrafast:"ultrafast"};
+var CODEX_CAPABILITIES={snapshot:null,isLoading:false,requestGeneration:0,error:""};
+var CODEX_SPEED_TEST={isRunning:false};
+function isCodexTier(tier){return tier===null||tier==="fast"||tier==="ultrafast"}
 function isCodexEnvelope(body){
-  return !!body&&typeof body.env_locked==="boolean"&&
-    (body.service_tier===null||body.service_tier==="fast");
+  return !!body&&typeof body.env_locked==="boolean"&&isCodexTier(body.service_tier);
+}
+function isCodexCapabilitiesEnvelope(body){
+  if(!body||!isCodexTier(body.configured_tier)||typeof body.env_locked!=="boolean"||
+    ["ok","stale","unknown"].indexOf(body.status)<0||
+    (body.reason!==null&&typeof body.reason!=="string")||
+    (body.fetched_at!==null&&(typeof body.fetched_at!=="number"||!Number.isFinite(body.fetched_at)||body.fetched_at<0||
+      !Number.isFinite(new Date(body.fetched_at*1000).getTime())))||
+    !body.models||typeof body.models!=="object"||Array.isArray(body.models))return false;
+  return Object.keys(body.models).every(function(model){
+    var entry=body.models[model];
+    return !!entry&&typeof entry==="object"&&!Array.isArray(entry)&&
+      (entry.supported_tiers===null||(Array.isArray(entry.supported_tiers)&&entry.supported_tiers.every(function(tier){
+        return ["standard","fast","ultrafast"].indexOf(tier)>=0;
+      })))&&
+      (entry.advertised_tier_ids===null||(Array.isArray(entry.advertised_tier_ids)&&entry.advertised_tier_ids.every(function(id){
+        return typeof id==="string"&&id.length>0;
+      })))&&["supported","unsupported","unknown"].indexOf(entry.status)>=0&&
+      (entry.reason===null||typeof entry.reason==="string")&&isCodexTier(entry.applicable_tier)&&
+      entry.wire_tier===CODEX_WIRE_TIERS[entry.applicable_tier||"standard"]&&
+      entry.applicable_tier===(entry.status==="supported"?body.configured_tier:null);
+  });
 }
 function renderCodex(){
-  document.getElementById("codex-card").classList.toggle("locked",CODEX.locked);
+  var card=document.getElementById("codex-card");
+  card.classList.toggle("locked",CODEX.locked);
+  card.setAttribute("aria-busy",String(CODEX.isSaving||CODEX.isLoading));
   document.getElementById("codex-lock-env").textContent=CODEX.envName;
-  var checkbox=document.getElementById("codex-fast");
-  checkbox.checked=CODEX.draft;
-  checkbox.disabled=CODEX.locked;
+  var select=document.getElementById("codex-speed");
+  select.value=CODEX.hasLoaded?CODEX.draft||"standard":"";
+  select.disabled=CODEX.locked||CODEX.isSaving||CODEX.isLoading||!CODEX.hasLoaded;
   var btn=document.getElementById("codex-apply");
-  btn.disabled=CODEX.locked||CODEX.draft===(CODEX.serviceTier==="fast");
-  btn.textContent="Apply";
+  btn.disabled=select.disabled||CODEX.draft===CODEX.serviceTier;
+  btn.textContent=CODEX.isSaving?"Saving…":"Apply";
+  document.getElementById("codex-reload").disabled=CODEX.isSaving||CODEX.isLoading;
+  var test=document.getElementById("codex-speed-test");
+  test.disabled=!CODEX.hasLoaded||CODEX.isSaving||CODEX.isLoading||CODEX_SPEED_TEST.isRunning;
+  test.textContent=CODEX_SPEED_TEST.isRunning?"Testing…":"Test selected Codex speed";
+  var status=document.getElementById("codex-settings-status");
+  status.textContent=CODEX.message||(CODEX.hasLoaded?
+    "Configured speed: "+CODEX_TIER_LABELS[CODEX.serviceTier||"standard"]+"."+
+      (CODEX.draft!==CODEX.serviceTier?" Draft speed: "+CODEX_TIER_LABELS[CODEX.draft||"standard"]+" (not applied).":""):
+    "Loading settings…");
+  status.dataset.state=CODEX.message?"error":"";
 }
 function renderCodexState(body){
+  if(!isCodexEnvelope(body))return false;
+  if(CODEX_CAPABILITIES.snapshot&&CODEX_CAPABILITIES.snapshot.configured_tier!==body.service_tier){
+    CODEX_CAPABILITIES.snapshot=null;
+    CODEX_CAPABILITIES.error="Configured speed changed. Refresh capabilities to load its applicability.";
+    renderCodexCapabilities();
+  }
   CODEX.serviceTier=body.service_tier;
-  CODEX.locked=!!body.env_locked;
-  CODEX.draft=body.service_tier==="fast";
+  CODEX.locked=body.env_locked;
+  CODEX.draft=body.service_tier;
+  CODEX.hasLoaded=true;
+  CODEX.message="";
   renderCodex();
+  return true;
+}
+function renderCodexCapabilities(){
+  var body=CODEX_CAPABILITIES.snapshot;
+  var status=document.getElementById("codex-capabilities-status");
+  var state=body?{ok:"Current",stale:"Stale",unknown:"Unknown"}[body.status]:"Unknown";
+  status.textContent=(CODEX_CAPABILITIES.isLoading?"Checking metadata… Last snapshot: ":"")+state+
+    (body?" — configured "+CODEX_TIER_LABELS[body.configured_tier||"standard"]+", applied mappings only.":
+      " — capability metadata has not been loaded.")+(body&&body.reason?" "+body.reason:"")+
+    (CODEX_CAPABILITIES.error?" "+CODEX_CAPABILITIES.error:"");
+  var refresh=document.getElementById("codex-capabilities-refresh");
+  refresh.disabled=CODEX_CAPABILITIES.isLoading;
+  refresh.textContent=CODEX_CAPABILITIES.isLoading?"Refreshing…":"Refresh capabilities";
+  document.getElementById("codex-capabilities").setAttribute("aria-busy",String(CODEX_CAPABILITIES.isLoading));
+  document.getElementById("codex-capabilities-time").textContent="Last fetched: "+
+    (body&&body.fetched_at!==null?new Date(body.fetched_at*1000).toLocaleString():CODEX_CAPABILITIES.error?"Unavailable":"Never");
+  var targets=uniq(Object.values(DIR.LIVE).filter(function(target){return routeOf(target).provider==="codex"}));
+  document.getElementById("codex-capabilities-models").innerHTML=targets.length?targets.map(function(target){
+    var model=routeOf(target).model;
+    var entry=body&&Object.prototype.hasOwnProperty.call(body.models,model)?body.models[model]:null;
+    var supported=entry&&entry.supported_tiers!==null?entry.supported_tiers.map(function(tier){
+      return CODEX_TIER_LABELS[tier]||tier;
+    }).join(", ")||"None":"Unknown";
+    var advertised=entry&&entry.advertised_tier_ids!==null?entry.advertised_tier_ids.join(", ")||"None":"Unknown";
+    return "<li><b>"+esc(model)+"</b><div>Supported speeds: "+esc(supported)+"</div><div>"+
+      (entry?{supported:"Supported",unsupported:"Unsupported",unknown:"Unknown"}[entry.status]:"Unknown")+
+      " · Applicable: "+(entry?CODEX_TIER_LABELS[entry.applicable_tier||"standard"]:"Unknown")+
+      " · Outbound wire: "+(entry?esc(entry.wire_tier||"omitted (Standard)"):"Unknown")+
+      "</div><div>Advertised tier IDs: "+esc(advertised)+"</div>"+
+      (entry&&entry.reason?'<div class="dim">'+esc(entry.reason)+"</div>":
+        !entry?'<div class="dim">No capability entry for this applied model. Use Refresh capabilities.</div>':"")+"</li>";
+  }).join(""):"<li>No applied Codex mappings. Apply Router changes to include new targets.</li>";
+}
+function renderCodexCapabilitiesState(body){
+  if(!isCodexCapabilitiesEnvelope(body))return false;
+  CODEX_CAPABILITIES.snapshot=body;
+  CODEX_CAPABILITIES.error="";
+  renderCodexCapabilities();
+  return true;
+}
+function fetchCodexCapabilities(forceRefresh){
+  if(forceRefresh&&CODEX_CAPABILITIES.isLoading)return Promise.resolve();
+  var generation=++CODEX_CAPABILITIES.requestGeneration;
+  CODEX_CAPABILITIES.isLoading=true;
+  CODEX_CAPABILITIES.error="";
+  renderCodexCapabilities();
+  return jfetch("/admin/providers/codex/capabilities"+(forceRefresh?"/refresh":""),forceRefresh?{
+    method:"POST",headers:JSON_HEADERS,body:JSON.stringify({})
+  }:undefined).then(function(r){
+    if(generation!==CODEX_CAPABILITIES.requestGeneration)return;
+    if(r.ok&&renderCodexCapabilitiesState(r.body))return;
+    CODEX_CAPABILITIES.snapshot=null;
+    CODEX_CAPABILITIES.error=(r.ok?"Invalid capability response.":"Could not load capabilities ("+r.status+"). "+errDetail(r.body))+
+      " Refresh capabilities to retry.";
+  }).catch(function(){
+    if(generation!==CODEX_CAPABILITIES.requestGeneration)return;
+    CODEX_CAPABILITIES.snapshot=null;
+    CODEX_CAPABILITIES.error="Gateway unreachable. Check that the gateway is running and reachable, then use Refresh capabilities to retry.";
+  }).finally(function(){
+    if(generation!==CODEX_CAPABILITIES.requestGeneration)return;
+    CODEX_CAPABILITIES.isLoading=false;
+    renderCodexCapabilities();
+  });
+}
+function showCodexSettingsError(message,detail,status){
+  CODEX.message=message;
+  renderCodex();
+  showToast('<span class="chip chip-err">ERROR</span>'+(status?'<span class="lat">'+status+"</span>":"")+
+    '<br>Codex speed settings<br><span class="dim">'+esc(detail)+"</span>",true);
+}
+function fetchCodexSettings(){
+  if(CODEX.isSaving||CODEX.isLoading)return Promise.resolve();
+  var generation=++CODEX.requestGeneration;
+  CODEX.isLoading=true;
+  renderCodex();
+  return jfetch("/admin/settings/codex").then(function(r){
+    if(generation!==CODEX.requestGeneration)return;
+    if(r.ok&&renderCodexState(r.body)){fetchCodexCapabilities();return}
+    CODEX.hasLoaded=false;
+    showCodexSettingsError("Could not load settings. Editing unavailable. Reload settings to retry.",
+      r.ok?"Invalid settings response.":errDetail(r.body),r.status);
+  }).catch(function(){
+    if(generation!==CODEX.requestGeneration)return;
+    CODEX.hasLoaded=false;
+    showCodexSettingsError("Could not load settings. Editing unavailable. Reload settings to retry.",
+      "Gateway unreachable. Check that the gateway is running and reachable, then retry.");
+  }).finally(function(){
+    if(generation!==CODEX.requestGeneration)return;
+    CODEX.isLoading=false;
+    renderCodex();
+  });
 }
 function applyCodex(){
   var btn=document.getElementById("codex-apply");
-  if(CODEX.locked||btn.disabled)return;
-  applyLockableSetting({
-    button:btn,
-    request:function(){return jfetch("/admin/settings/codex",{
-      method:"PUT",
-      headers:JSON_HEADERS,
-      body:JSON.stringify({service_tier:CODEX.draft?"fast":null})
-    })},
-    refresh:function(){return jfetch("/admin/settings/codex")},
-    lock:function(){CODEX.locked=true},
-    render:renderCodex,
-    isFresh:function(g){return g.ok&&isCodexEnvelope(g.body)},
-    adopt:function(g){renderCodexState(g.body)},
-    envName:CODEX.envName,
-    name:"Codex Fast",
-    refreshName:"Codex Fast refresh",
-    successText:function(body){return "Codex Fast → "+(body.service_tier==="fast"?"Enabled":"Disabled")}
+  if(CODEX.locked||CODEX.isSaving||CODEX.isLoading||!CODEX.hasLoaded||btn.disabled)return Promise.resolve();
+  ++CODEX.requestGeneration;
+  CODEX.isSaving=true;
+  CODEX.message="";
+  renderCodex();
+  var isConflict=false;
+  return jfetch("/admin/settings/codex",{
+    method:"PUT",
+    headers:JSON_HEADERS,
+    body:JSON.stringify({service_tier:CODEX.draft})
+  }).then(function(r){
+    if(r.status===409){
+      isConflict=true;
+      CODEX.locked=true;
+      renderCodex();
+      showToast('<span class="chip chip-err">LOCKED</span><span class="lat">409</span><br>'+esc(CODEX.envName)+
+        '<br><span class="dim">'+esc(errDetail(r.body))+"</span>",true);
+      return jfetch("/admin/settings/codex").then(function(g){
+        if(g.ok&&renderCodexState(g.body)){fetchCodexCapabilities();return}
+        showCodexSettingsError("Could not load current settings. Editing remains locked. Reload settings to retry.",
+          g.ok?"Invalid settings response.":errDetail(g.body),g.status);
+      });
+    }
+    if(!r.ok||!isCodexEnvelope(r.body)){
+      showCodexSettingsError("Could not confirm the save. Draft kept. Reload settings to check the current value before retrying.",
+        r.ok?"Invalid settings response.":errDetail(r.body),r.status);
+      return;
+    }
+    renderCodexState(r.body);
+    fetchCodexCapabilities();
+    showToast('<span class="chip chip-ok">APPLIED</span><br>Codex speed → '+CODEX_TIER_LABELS[r.body.service_tier||"standard"],false);
+  }).catch(function(){
+    showCodexSettingsError(isConflict?
+      "Could not load current settings. Editing remains locked. Reload settings to retry.":
+      "Could not confirm the save. Draft kept. Reload settings to check the current value before retrying.",
+      "Gateway unreachable. Check that the gateway is running and reachable, then retry.");
+  }).finally(function(){
+    CODEX.isSaving=false;
+    renderCodex();
   });
 }
-document.getElementById("codex-fast").addEventListener("change",function(){
-  CODEX.draft=this.checked;
+document.getElementById("codex-speed").addEventListener("change",function(){
+  if(CODEX.locked||CODEX.isSaving||CODEX.isLoading||!CODEX.hasLoaded||
+    ["standard","fast","ultrafast"].indexOf(this.value)<0){renderCodex();return}
+  CODEX.draft=this.value==="standard"?null:this.value;
   renderCodex();
 });
 document.getElementById("codex-apply").addEventListener("click",applyCodex);
+document.getElementById("codex-reload").addEventListener("click",fetchCodexSettings);
+document.getElementById("codex-capabilities-refresh").addEventListener("click",function(){fetchCodexCapabilities(true)});
+renderCodex();
+renderCodexCapabilities();
 var GPTPRO_CONCURRENCY={
   envName:"GPTPRO_MAX_CONCURRENT_ASKS",locked:false,live:null,draft:null,
   hasLoaded:false,isSaving:false,requestGeneration:0,message:"",messageKind:""
@@ -2162,6 +2329,7 @@ function apply(){
     DIR.mapping=Object.assign({},DIR.LIVE);
     DIR.sel=null;
     render();
+    fetchCodexCapabilities();
     showToast('<span class="chip chip-ok">APPLIED</span><br>Router mapping · '+count+" changes",false);
   }).catch(function(){
     showToast('<span class="chip chip-err">ERROR</span><br>Apply Router mapping'+
@@ -2204,6 +2372,84 @@ function runConnTest(){
       '<br><span class="dim">Gateway unreachable. Check that the gateway is running and reachable, then retry.</span>',true);
   });
 }
+function showCodexSpeedResult(html,isError){
+  var result=document.getElementById("codex-speed-result");
+  result.hidden=false;
+  result.setAttribute("role",isError?"alert":"status");
+  result.setAttribute("aria-live",isError?"assertive":"polite");
+  result.dataset.state=isError?"error":"";
+  result.innerHTML=html;
+}
+function isCodexTierDiagnostic(body,requested){
+  if(!body||typeof body!=="object"||Array.isArray(body)||!isCodexTier(body.requested_tier)||body.requested_tier!==requested||
+    [null,"priority","ultrafast"].indexOf(body.sent_tier)<0||
+    (body.backend_confirmed_tier!==null&&typeof body.backend_confirmed_tier!=="string")||
+    ["supported","unsupported","unknown"].indexOf(body.capability_status)<0||
+    (body.capability_reason!==null&&typeof body.capability_reason!=="string")||
+    ["confirmed","different","reported","unconfirmed"].indexOf(body.confirmation_status)<0||
+    (body.confirmation_reason!==null&&typeof body.confirmation_reason!=="string"))return false;
+  var reported=body.backend_confirmed_tier;
+  var wire=CODEX_WIRE_TIERS[requested||"standard"];
+  if(body.confirmation_status==="confirmed")return requested!==null&&reported===wire;
+  if(body.confirmation_status==="different")return requested!==null&&!!reported&&reported!==wire;
+  if(body.confirmation_status==="reported")return requested===null&&!!reported;
+  return true;
+}
+function renderCodexSpeedResult(response,target,requested){
+  var body=response.body||{};
+  var validResponse=typeof body==="object"&&!Array.isArray(body)&&typeof body.ok==="boolean";
+  var diagnostic=isCodexTierDiagnostic(body.tier_diagnostic,requested)?body.tier_diagnostic:null;
+  var connected=response.ok&&validResponse&&body.ok;
+  var reported=diagnostic&&diagnostic.backend_confirmed_tier;
+  var confirmation=connected&&reported?{
+    confirmed:"Confirmed",different:"Different tier",reported:"Reported (no accelerated tier requested)",unconfirmed:"Unconfirmed"
+  }[diagnostic.confirmation_status]:"Unconfirmed";
+  var sent=diagnostic?diagnostic.sent_tier===null?"omitted (Standard)":diagnostic.sent_tier:"Not available";
+  var notice=response.ok&&!validResponse?"Invalid speed-test response. Check the gateway logs and retry.":
+    !Object.prototype.hasOwnProperty.call(body,"tier_diagnostic")?
+      "The gateway did not return tier diagnostics. Connection success alone does not confirm speed.":
+    !diagnostic?"Invalid tier diagnostic response. Check the gateway logs and retest explicitly.":"";
+  showCodexSpeedResult("<b>Selected-speed test: "+esc(target)+"</b><div>Connection: "+
+    (connected?"Responded":"Failed ("+esc(body.status!=null?body.status:response.status)+")")+
+    (body.latency_ms!=null?" · Latency: "+esc(body.latency_ms)+"ms":"")+
+    "</div><div>Requested UI speed: "+CODEX_TIER_LABELS[requested||"standard"]+
+    "</div><div>Final outbound wire tier: "+esc(sent)+
+    "</div><div>Backend-reported tier: "+esc(reported||"Not reported (unconfirmed)")+
+    "</div><div>Speed confirmation: "+confirmation+
+    "</div><div>response.model: "+esc(body.response_model||"Not reported")+"</div>"+
+    (diagnostic?"<div>Capability: "+esc(diagnostic.capability_status)+"</div>":"")+
+    (diagnostic&&diagnostic.capability_reason?"<div>"+esc(diagnostic.capability_reason)+"</div>":"")+
+    (diagnostic&&diagnostic.confirmation_reason?"<div>"+esc(diagnostic.confirmation_reason)+"</div>":"")+
+    (notice?"<div>"+esc(notice)+"</div>":"")+
+    (!connected?"<div>"+esc(body.detail||errDetail(body))+"</div><div>The model response did not complete successfully; no successful selected-speed test is confirmed.</div>":""),
+    !connected||!!notice);
+}
+function runCodexSpeedTest(){
+  if(!CODEX.hasLoaded||CODEX.isSaving||CODEX.isLoading||CODEX_SPEED_TEST.isRunning)return Promise.resolve();
+  var target=document.getElementById("ct-in").value.trim();
+  if(target.indexOf("codex:")!==0||!routeOf(target).model.trim()){
+    showCodexSpeedResult("Enter a codex:model target in the Model connection test field before testing the selected speed.",true);
+    return Promise.resolve();
+  }
+  var requested=CODEX.draft;
+  CODEX_SPEED_TEST.isRunning=true;
+  renderCodex();
+  showCodexSpeedResult("Testing "+esc(target)+" · Requested UI speed: "+CODEX_TIER_LABELS[requested||"standard"]+"…",false);
+  return jfetch("/admin/test",{
+    method:"POST",headers:JSON_HEADERS,body:JSON.stringify({target:target,service_tier:requested})
+  }).then(function(r){
+    renderCodexSpeedResult(r,target,requested);
+  }).catch(function(){
+    showCodexSpeedResult("<b>Selected-speed test: "+esc(target)+"</b><div>Connection: Unreachable</div>"+
+      "<div>Requested UI speed: "+CODEX_TIER_LABELS[requested||"standard"]+"</div>"+
+      "<div>Final outbound wire tier: Not available</div><div>Backend-reported tier: Not reported (unconfirmed)</div>"+
+      "<div>Speed confirmation: Unconfirmed</div><div>Gateway unreachable. Check that the gateway is running and reachable, then retry.</div>",true);
+  }).finally(function(){
+    CODEX_SPEED_TEST.isRunning=false;
+    renderCodex();
+  });
+}
+document.getElementById("codex-speed-test").addEventListener("click",runCodexSpeedTest);
 document.getElementById("ct-btn").addEventListener("click",runConnTest);
 document.getElementById("ct-in").addEventListener("keydown",function(ev){if(ev.key==="Enter")runConnTest()});
 /* Unrecognized or missing prefixes fall back to the Codex icon, matching
@@ -2467,6 +2713,7 @@ window.addEventListener("hashchange",function(){
 });
 /* === Page startup ======================================================== */
 function boot(){
+  var codexSettingsGeneration=++CODEX.requestGeneration;
   document.getElementById("ep").textContent=location.host;
   // Fill the usage bodies before the first request goes out: an empty body
   // would paint short and then grow, which is the jump the skeleton exists
@@ -2484,8 +2731,11 @@ function boot(){
       jfetch("/admin/providers/grok/models"),
       jfetch("/admin/settings/log-level"),
       jfetch("/admin/settings/compaction"),
-      jfetch("/admin/settings/codex"),
-      jfetch("/admin/providers/claude/pool/routing")
+      jfetch("/admin/settings/codex").catch(function(){return{
+        ok:false,status:0,body:{error:{message:"Gateway unreachable while loading Codex speed settings. Use Reload settings to retry."}}
+      }}),
+      jfetch("/admin/providers/claude/pool/routing"),
+      fetchCodexCapabilities()
     ]).then(function(results){
       // Admin retries may replace the token; fetch identities only after they settle.
       return jfetch("/health").then(function(health){
@@ -2504,12 +2754,14 @@ function boot(){
       showToast('<span class="chip chip-err">ERROR</span><span class="lat">'+compactionResp.status+
         '</span><br>GET /admin/settings/compaction<br><span class="dim">'+esc(errDetail(compactionResp.body))+"</span>",true);
     }
-    if(codexResp.ok&&isCodexEnvelope(codexResp.body)){
-      renderCodexState(codexResp.body);
-    }else{
-      renderCodex();
-      showToast('<span class="chip chip-err">ERROR</span><span class="lat">'+codexResp.status+
-        '</span><br>GET /admin/settings/codex<br><span class="dim">'+esc(errDetail(codexResp.body))+"</span>",true);
+    if(codexSettingsGeneration===CODEX.requestGeneration){
+      if(codexResp.ok&&isCodexEnvelope(codexResp.body)){
+        renderCodexState(codexResp.body);
+      }else{
+        CODEX.hasLoaded=false;
+        showCodexSettingsError("Could not load settings. Editing unavailable. Reload settings to retry.",
+          codexResp.ok?"Invalid settings response.":errDetail(codexResp.body),codexResp.status);
+      }
     }
     if(routingResp.ok&&isRoutingEnvelope(routingResp.body)){
       renderRoutingState(routingResp.body);

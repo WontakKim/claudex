@@ -1,13 +1,13 @@
 # Dashboard
 
 The gateway serves a runtime dashboard at `GET /` for editing the model map,
-toggling Codex Fast mode, managing Claude accounts, checking provider
+selecting Codex request speed, managing Claude accounts, checking provider
 readiness, and testing model connections before wiring them.
 
 Opening `http://127.0.0.1:8787/` uses the same guarded admin API as the CLI:
 
 - **Settings** contains the [compaction reroute](compaction.md#compaction-reroute),
-  Codex Fast mode, Claude account routing, and registered-account management.
+  Claude account routing, and registered-account management.
   See [Claude accounts](#claude-accounts) below.
 - **Status** shows built-in login and subscription usage plus custom-provider
   readiness. Kimi and Grok cards remain cosmetically hidden until a login or
@@ -28,9 +28,10 @@ Opening `http://127.0.0.1:8787/` uses the same guarded admin API as the CLI:
   in the first backend card. See [GPT Pro MCP](#gpt-pro-mcp) below.
 - **Log** reads `GET /admin/logs` and changes the persisted runtime log level
   through `PUT /admin/settings/log-level`.
-- **Router** contains the **Router mapping** canvas for editing the
-  provider-prefixed model map. Targets are added through an in-canvas quick-add
-  chooser, and `POST /admin/test` checks connections before wiring.
+- **Router** contains [Codex speed and serving capabilities](#codex-speed-and-serving-capabilities),
+  the **Router mapping** canvas, and model connection tests. Targets are added
+  through an in-canvas quick-add chooser. The ordinary test checks connections;
+  a separate selected-speed test opts into a Codex tier diagnostic.
 
 Open the chooser with the **Add node** button pinned at the board's
 bottom-right corner, by double-clicking or right-clicking empty canvas, or by
@@ -59,9 +60,113 @@ shown only once, and a duplicate commit keeps the chooser open. Contextually
 placed nodes land at the clicked height, nudged down past any node already
 occupying that lane; every other node keeps its position.
 
-The Router becomes view-only when `CLAUDEX_MODEL_MAP` overrides the persisted
-map. The add button, the chooser, and every creation gesture are disabled
-while this lock is active, and an open chooser closes when the lock engages.
+The Router board becomes view-only when `CLAUDEX_MODEL_MAP` overrides the
+persisted map. The add button, the chooser, and every creation gesture are
+disabled while this lock is active, and an open chooser closes when the lock
+engages. This lock does not lock the independent Codex speed setting or tests.
+
+## Codex speed and serving capabilities
+
+Open **Router** and enter the local-token prompt when authentication is required.
+Before choosing a speed, read the consumption notice: under the current provider
+policy, **Ultrafast consumes included allowance at 8x Standard and purchased
+credits at 6x Standard**. These are consumption ratios, not latency or output-speed
+multipliers. A Pro 500 label does not establish entitlement, and the dashboard
+never enables Ultrafast automatically.
+
+1. Inspect the applied Codex mappings in the **Codex speed** card. Each model
+   shows known supported speeds, advertised wire tier IDs, and the applicable
+   speed and outbound wire tier for the **configured** selection. The status
+   and timestamp above the list describe the serving metadata snapshot. Mixed
+   mappings can apply acceleration to one model while another uses Standard.
+2. Use **Refresh capabilities** after a login or subscription change, or to retry
+   an unavailable catalog. It refreshes the same snapshot used for serving,
+   including same-account upgrades with an unchanged token. It sends metadata
+   requests only, not model inference.
+3. Choose **Standard**, **Fast**, or **Ultrafast**. The selection is a draft until
+   you press its **Apply** button. Standard saves `null` and omits the outbound
+   tier; Fast uses `priority`; Ultrafast uses `ultrafast`, subject to each model's
+   support. The card continues to label applicability for the configured speed,
+   not for an unsaved selection. Router draft changes and staged nodes are also
+   excluded from the list until the mapping is applied.
+4. Press **Apply** to persist and apply the speed live. Successful speed or mapping
+   saves read capability status again; they do not force a catalog refresh or
+   run a model request. **Reload settings** reads the actual server selection
+   and replaces the selector draft. It also reloads capability status.
+
+Capability states answer different questions:
+
+- **Current** means the serving snapshot is current; it does not mean every
+  mapped model supports acceleration.
+- **Stale** retains usable last-known metadata and the original last-fetched
+  time. The top-level reason remains visible even when individual models show
+  support. Refresh to retry the failed fetch.
+- **Unknown** means support could not be established, such as an unavailable
+  catalog, an unlisted model, or incomplete tier metadata. It is not proven
+  unsupported. Per-model reasons explain the fallback.
+- **Unsupported** means the model's usable catalog does not advertise the
+  configured accelerated tier. Its applicable tier remains Standard.
+
+A partial catalog can show known Fast support while Ultrafast is unknown.
+Standard remains applicable without accelerated metadata. The list is not an
+allowlist: manual model IDs remain usable in the Router. `Last fetched: Never`
+means the backend has no successful snapshot for the current identity;
+`Unavailable` means the dashboard could not read a valid snapshot. Failed or
+malformed capability responses show Unknown and a retry action, without
+blocking editing of successfully loaded settings.
+
+A failed or invalid save keeps the draft and does not claim success. The server
+may already have persisted a change if its response was lost, so use **Reload
+settings** before retrying. Failed settings reads disable the selector and the
+selected-speed test until a valid reload; the ordinary connection test remains
+available. With `CLAUDEX_CODEX_SERVICE_TIER` set, the selector and Apply are
+read-only behind a LOCKED band. A `409` conflict locks editing immediately and
+adopts state only from a fresh settings GET. A failed conflict refresh stays
+locked until a valid reload. Capability refresh and testing the loaded locked
+selection remain available.
+
+### Explicit selected-speed test
+
+Enter a `codex:<model-id>` target in **Model connection test** below the board.
+The ordinary **Test** button (also Enter in that field) sends a minimal,
+**untiered** connection request, even if the configured Codex speed is Ultrafast.
+Provider usage limits still apply to that real request.
+
+Read the warning before using **Test selected Codex speed**: it runs one real
+Codex request using the selector's draft, **without saving it**, and can consume
+allowance or purchased credits. The small prompt does not bound Codex output
+length; see [Codex limitations](providers.md#limitations). No inference runs on
+page load, speed selection, saves, or capability refresh. Non-Codex targets are
+rejected locally by the selected-speed action.
+
+The result keeps connection outcome separate from three tier observations:
+
+| Observation | What to read |
+| --- | --- |
+| Requested UI speed | The selection submitted for this test, even if the selector changes while it runs |
+| Final outbound wire tier | The backend's final sent tier: `priority`, `ultrafast`, or omitted/Standard |
+| Backend-reported tier | The exact provider response value; a missing report is unconfirmed, not presumed Standard |
+
+**Confirmed** requires a successful model response and provider evidence matching
+an accelerated request. **Different tier** means the provider reported another
+tier. **Reported (no accelerated tier requested)** preserves a provider report
+for a Standard test. **Unconfirmed** covers missing evidence, missing or invalid
+diagnostics, and failed responses. Connection success, `response.model`, a plan
+label, or latency alone does not confirm speed. Diagnostic latency includes
+metadata and stream processing; it is not a speed guarantee or billing estimate.
+
+Unknown or unsupported acceleration can send Standard. The result includes the
+backend reason, including dispatch fallback when authentication or tier support
+changed after preflight. Capability-list wire tiers are preflight applicability,
+not provider confirmation; use the explicit test to inspect what actually went
+out and what the provider reported.
+
+The guarded operations are `GET`/`PUT /admin/settings/codex`,
+`GET /admin/providers/codex/capabilities`, and
+`POST /admin/providers/codex/capabilities/refresh` with `{}`. The ordinary
+`POST /admin/test` omits `service_tier`; the selected-speed action includes
+`null`, `fast`, or `ultrafast`. See [capability status and explicit diagnostics](providers.md#capability-status-and-refresh)
+for the full backend contract.
 
 ## GPT Pro MCP
 

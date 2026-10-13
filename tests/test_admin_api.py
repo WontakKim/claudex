@@ -3820,7 +3820,7 @@ def _lockable_apply_fn(page: str) -> str:
 def _codex_apply_fn(page: str) -> str:
     start = page.index("function applyCodex(){")
     end = page.index(
-        'document.getElementById("codex-fast").addEventListener("change"', start
+        'document.getElementById("codex-speed").addEventListener("change"', start
     )
     return page[start:end]
 
@@ -4061,7 +4061,7 @@ def _codex_section(page: str) -> str:
     return page[start:end]
 
 
-def test_dashboard_codex_fast_card_wires_apply_flow_and_env_lock(
+def test_dashboard_codex_speed_card_wires_apply_flow_and_env_lock(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
@@ -4070,8 +4070,10 @@ def test_dashboard_codex_fast_card_wires_apply_flow_and_env_lock(
         javascript = sources["javascript"]
 
     section = _codex_section(page)
-    assert page.index('id="compaction-card"') < page.index('id="codex-card"')
-    assert 'type="checkbox" id="codex-fast"' in section
+    assert page.index('id="tab-map"') < page.index('id="codex-card"') < page.index('id="board"')
+    assert 'id="codex-speed"' in section
+    for tier in ("standard", "fast", "ultrafast"):
+        assert f'<option value="{tier}">' in section
     assert 'id="codex-apply"' in section
     assert "priority processing for supported Codex models" in section
     assert "Speed and usage costs depend on the provider and workload" in section
@@ -4082,12 +4084,9 @@ def test_dashboard_codex_fast_card_wires_apply_flow_and_env_lock(
     assert 'jfetch("/admin/settings/codex",{' in apply_fn
     assert 'method:"PUT"' in apply_fn
     assert "headers:JSON_HEADERS" in apply_fn
-    assert 'JSON.stringify({service_tier:CODEX.draft?"fast":null})' in apply_fn
-    assert "checkbox.disabled=CODEX.locked" in javascript
-    assert (
-        "btn.disabled=CODEX.locked||CODEX.draft===(CODEX.serviceTier===\"fast\")"
-        in javascript
-    )
+    assert 'JSON.stringify({service_tier:CODEX.draft})' in apply_fn
+    assert "select.disabled=CODEX.locked" in javascript
+    assert "CODEX.draft===CODEX.serviceTier" in javascript
 
 
 def test_dashboard_codex_fast_fetched_in_parallel_boot_sequence(
