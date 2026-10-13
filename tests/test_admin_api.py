@@ -2195,15 +2195,95 @@ class TestAdminCodexCapabilitiesApi:
             assert payload["service_tier"] == sent_tier
             assert requests[-1].headers["x-codex-routing-hint"] == f"model=gpt-6.1-sol;tier={sent_tier}"
 
-    def test_ordinary_probe_is_untiered_even_when_ultrafast_is_configured(
+    @pytest.mark.parametrize(
+        ("events", "has_done_marker", "reported_tier"),
+        [
+            pytest.param(
+                [{"type": "response.created", "response": {"model": "served-sol", "service_tier": "ultrafast"}}],
+                False, "ultrafast", id="created-matching-tier-eof",
+            ),
+            pytest.param(
+                [{"type": "response.created", "response": {"model": "served-sol"}}],
+                False, None, id="created-no-tier-eof",
+            ),
+            pytest.param(
+                [{"type": "response.output_text.delta", "delta": "ping"}],
+                False, None, id="output-without-completion",
+            ),
+            pytest.param(
+                [{"type": "response.created", "response": {"model": "served-sol", "service_tier": "ultrafast"}}],
+                True, "ultrafast", id="done-marker-without-completion",
+            ),
+            pytest.param([], False, None, id="empty-stream"),
+        ],
+    )
+    def test_opt_in_probe_rejects_eof_before_successful_completion(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+        events: list[dict[str, Any]], has_done_marker: bool, reported_tier: str | None,
     ) -> None:
         requests: list[httpx.Request] = []
+        content = "".join(f"data: {json.dumps(event)}\n\n" for event in events)
+        if has_done_marker:
+            content += "data: [DONE]\n\n"
+        stream = TrackedProbeStream(content.encode())
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            if request.method == "GET":
+                assert str(request.url).startswith(CODEX_MODELS_URL)
+                return httpx.Response(200, json={"models": [{
+                    "slug": "gpt-6.1-sol", "service_tiers": [{"id": "ultrafast"}],
+                }]})
+            assert str(request.url) == CODEX_RESPONSES_URL
+            return httpx.Response(200, stream=stream, headers={"content-type": "text/event-stream"})
+
+        http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        try:
+            with _create_test_client(
+                monkeypatch, tmp_path, base_url="http://127.0.0.1:8787",
+                codex_client=lambda auth, _http: CodexClient(auth, http_client),
+            ) as client:
+                response = client.post("/admin/test", json={"target": "codex:gpt-6.1-sol", "service_tier": "ultrafast"})
+        finally:
+            asyncio.run(http_client.aclose())
+        assert response.status_code == 200
+        result = response.json()
+        diagnostic = result["tier_diagnostic"]
+        assert result["ok"] is False, (
+            result["ok"], diagnostic["confirmation_status"], diagnostic["backend_confirmed_tier"],
+        )
+        assert result["status"] == 502
+        assert set(diagnostic) == {
+            "requested_tier", "sent_tier", "backend_confirmed_tier",
+            "capability_status", "capability_reason", "confirmation_status", "confirmation_reason",
+        }
+        assert diagnostic["requested_tier"] == "ultrafast"
+        assert diagnostic["sent_tier"] == "ultrafast"
+        assert diagnostic["backend_confirmed_tier"] == reported_tier
+        assert diagnostic["confirmation_status"] == "unconfirmed"
+        assert diagnostic["confirmation_reason"]
+        if events:
+            assert "response.completed" in result["detail"]
+            assert "response.completed" in diagnostic["confirmation_reason"]
+        assert [request.method for request in requests] == ["GET", "POST"]
+        assert json.loads(requests[-1].content)["service_tier"] == "ultrafast"
+        assert stream.close_calls == 1
+
+    @pytest.mark.parametrize("has_failed_event", [False, True])
+    def test_ordinary_probe_is_untiered_even_when_ultrafast_is_configured(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, has_failed_event: bool,
+    ) -> None:
+        requests: list[httpx.Request] = []
+
+        content = 'data: {"type":"response.created","response":{"model":"gpt-6.1-sol"}}\n\n'
+        if has_failed_event:
+            content += 'data: {"type":"response.failed","response":{"error":{"message":"later failure"}}}\n\n'
+        stream = TrackedProbeStream(content.encode())
 
         async def handler(request: httpx.Request) -> httpx.Response:
             requests.append(request)
             assert request.method == "POST"
-            return httpx.Response(200, content='data: {"type":"response.created","response":{"model":"gpt-6.1-sol"}}\n\n')
+            return httpx.Response(200, stream=stream, headers={"content-type": "text/event-stream"})
 
         http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
         try:
@@ -2220,6 +2300,7 @@ class TestAdminCodexCapabilitiesApi:
         assert len(requests) == 1
         assert "service_tier" not in json.loads(requests[0].content)
         assert "x-codex-routing-hint" not in requests[0].headers
+        assert stream.close_calls == 1
 
     @pytest.mark.parametrize("body", [
         {"target": "codex:gpt-6.1-sol", "service_tier": "priority"},
@@ -2235,13 +2316,22 @@ class TestAdminCodexCapabilitiesApi:
         assert response.status_code == 400
         assert "service_tier" in response.json()["error"]["message"]
 
+    @pytest.mark.parametrize("terminal_event", ["response.failed", "response.incomplete", "error"])
+    @pytest.mark.parametrize("reported_tier", [None, "ultrafast"])
     def test_opt_in_probe_does_not_report_success_for_failed_completion(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+        terminal_event: str, reported_tier: str | None,
     ) -> None:
         async def handler(request: httpx.Request) -> httpx.Response:
             if request.method == "GET":
                 return httpx.Response(200, json={"models": [{"slug": "gpt-6.1-sol", "service_tiers": [{"id": "ultrafast"}]}]})
-            return httpx.Response(200, content='data: {"type":"response.created"}\n\ndata: {"type":"response.failed","response":{"error":{"message":"probe failed"}}}\n\n')
+            created_response = {} if reported_tier is None else {"service_tier": reported_tier}
+            events = [
+                {"type": "response.created", "response": created_response},
+                {"type": terminal_event, "response": {"error": {"message": "probe failed"}}},
+            ]
+            content = "".join(f"data: {json.dumps(event)}\n\n" for event in events)
+            return httpx.Response(200, content=content, headers={"content-type": "text/event-stream"})
 
         http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
         try:
@@ -2254,8 +2344,9 @@ class TestAdminCodexCapabilitiesApi:
             asyncio.run(http_client.aclose())
         assert response.status_code == 200
         assert response.json()["ok"] is False
-        assert response.json()["tier_diagnostic"]["backend_confirmed_tier"] is None
+        assert response.json()["tier_diagnostic"]["backend_confirmed_tier"] == reported_tier
         assert response.json()["tier_diagnostic"]["confirmation_status"] == "unconfirmed"
+        assert "response.completed" in response.json()["tier_diagnostic"]["confirmation_reason"]
 
     def test_probe_reports_actual_sent_tier_when_auth_changes_after_capability_check(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,

@@ -441,6 +441,7 @@ async def _probe_responses_route(
     )
     first_event = None
     response_model = target
+    has_completed_response = False
     try:
         if tier_diagnostic is None:
             first_event = await anext(events, None)
@@ -463,6 +464,7 @@ async def _probe_responses_route(
                 if event.get("type") in ("response.failed", "response.incomplete", "error"):
                     raise UpstreamError(502, "Codex speed probe ended with a failed or incomplete response", provider_name)
                 if event.get("type") == "response.completed":
+                    has_completed_response = True
                     break
     finally:
         await events.aclose()
@@ -472,6 +474,11 @@ async def _probe_responses_route(
                 tier_diagnostic["capability_status"] = "unknown"
                 tier_diagnostic["capability_reason"] = "Tier support changed or could not be verified at dispatch; sent Standard without the earlier selection's tier."
             tier_diagnostic["sent_tier"] = sent_tier
+            if not has_completed_response:
+                tier_diagnostic["confirmation_status"] = "unconfirmed"
+                tier_diagnostic["confirmation_reason"] = (
+                    "The probe ended without a successful response.completed; tier confirmation is unconfirmed."
+                )
     if first_event is None:
         if backend.signature_namespace is None:
             detail = f"{provider_name} stream ended without any events"
@@ -481,6 +488,8 @@ async def _probe_responses_route(
             )
         raise UpstreamError(502, detail, provider_name)
     if tier_diagnostic is not None:
+        if not has_completed_response:
+            raise UpstreamError(502, "Codex speed probe ended before a successful response.completed", provider_name)
         backend_tier = tier_diagnostic["backend_confirmed_tier"]
         if backend_tier is not None:
             requested_tier = tier_diagnostic["requested_tier"]

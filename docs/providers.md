@@ -228,11 +228,15 @@ The normal `{ok, status, latency_ms, target, response_model, detail}` result gai
 | `sent_tier` | Final outbound payload's wire tier: `priority`, `ultrafast`, or `null` for omitted/Standard |
 | `backend_confirmed_tier` | Exact `service_tier` reported in a backend response event, or `null`; never inferred from the request, a plan, or timing |
 | `capability_status`, `capability_reason` | Per-model support decision and any unknown, unsupported, stale, or dispatch-identity explanation |
-| `confirmation_status`, `confirmation_reason` | `confirmed` when backend evidence matches the requested accelerated tier; `different` when it reports another tier; `reported` for a Standard probe with a reported backend tier; otherwise `unconfirmed` |
+| `confirmation_status`, `confirmation_reason` | After a successful `response.completed`, `confirmed` when backend evidence matches the requested accelerated tier; `different` when it reports another tier; `reported` for a Standard probe with a reported backend tier; otherwise `unconfirmed` |
 
-Tier probes keep reading until a completion event or stream end; the latest
-backend tier overrides earlier reports. Failed or incomplete responses do not
-report connection success.
+Opted-in tier probes require `response.completed` before reporting success. EOF
+or a `[DONE]` marker without that event returns a failed connection test with
+`confirmation_status: "unconfirmed"`, even if `response.created` reported the
+requested tier. Observed reports remain in `backend_confirmed_tier`; they alone
+do not prove successful completion. The latest backend tier through completion
+overrides earlier reports. Explicit failed, incomplete, or error events also
+return failed connection tests.
 Unsupported/unknown selections can still run a Standard probe, with an explicit
 capability explanation. `ok: true` means the connection worked, not that the
 requested acceleration was confirmed. Probe `latency_ms` includes metadata and
