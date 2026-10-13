@@ -201,9 +201,9 @@ def test_runtime_initializes_lazily_and_reuses_the_context(
         assert first.text == "answer: first"
         assert second.text == "answer: second"
         assert conversation_id_callbacks[0] is not None
-        assert conversation_id_callbacks[1] is None
+        assert conversation_id_callbacks[1] is not None
         assert marker_callbacks[0] is not None
-        assert marker_callbacks[1] is None
+        assert marker_callbacks[1] is not None
         assert captured_conversation_ids == ["captured-conversation"]
         assert captured_markers == ["captured-marker"]
         assert len(fakes.launch_calls) == 1
@@ -1435,8 +1435,349 @@ def test_runtime_recovers_no_raw_turn_through_detach_poller(
     asyncio.run(scenario())
 
 
-def test_runtime_preserves_no_raw_turn_when_recovery_fails(
+@pytest.mark.parametrize("callback_mode", ["default", "none", "empty"])
+@pytest.mark.parametrize("failure_code", ["no_raw_turn", "echo_timeout", "timeout"])
+@pytest.mark.parametrize("has_known_conversation", [False, True])
+@pytest.mark.parametrize("evidence_source", ["error", "callback"])
+def test_runtime_recovers_without_optional_observers(
     monkeypatch: pytest.MonkeyPatch,
+    callback_mode: str,
+    failure_code: str,
+    has_known_conversation: bool,
+    evidence_source: str,
+) -> None:
+    context = _FakeContext()
+    _RuntimeFakes(monkeypatch, [context])
+    monkeypatch.setenv("GPTPRO_RAW_TURN_RECOVERY_SECONDS", "60")
+    marker = "[gptpro-transport-nonce:unobserved-turn]"
+    failure = ask.GptProAskError(failure_code, "attached answer unavailable")
+    submission_evidence = ask.AskEvidence(
+        submission="confirmed" if failure_code == "no_raw_turn" else "uncertain",
+        conversation_id=_CONVERSATION_ID,
+        failure_stage="answer" if failure_code != "echo_timeout" else "echo",
+    )
+    if evidence_source == "error":
+        failure.evidence = submission_evidence
+    submissions: list[str] = []
+
+    async def execute(
+        page: _FakePage, question: str, *,
+        callbacks: ask.AskCallbacks | None = None, **_options: Any,
+    ) -> ask.AskOutcome:
+        del page
+        submissions.append(question)
+        assert callbacks is not None
+        if callbacks.on_marker is not None:
+            callbacks.on_marker(marker)
+        if callbacks.on_conversation_id is not None:
+            callbacks.on_conversation_id(_CONVERSATION_ID)
+        if callbacks.on_evidence is not None:
+            callbacks.on_evidence(submission_evidence)
+        raise failure
+
+    monkeypatch.setattr(runtime.ask, "execute_ask_outcome", execute)
+
+    async def scenario() -> None:
+        ask_runtime = runtime.AskRuntime(max_concurrent_asks=1)
+        poller = _RuntimeDetachPollerFake(ask_runtime._get_context)
+        ask_runtime._poller = poller
+        options: dict[str, Any] = {}
+        if callback_mode != "default":
+            options["callbacks"] = None if callback_mode == "none" else ask.AskCallbacks()
+        if has_known_conversation:
+            options["conversation_id"] = _CONVERSATION_ID
+        task = asyncio.create_task(ask_runtime.ask("synthetic question", **options))
+        try:
+            while poller.future is None and not task.done():
+                await asyncio.sleep(0)
+            if task.done():
+                await task
+            assert poller.registrations[0][:2] == (_CONVERSATION_ID, marker)
+            assert ask_runtime._ask_semaphore._value == 1
+            assert context.pages[0].close_calls == 1
+            recovered = ask.AskOutcome("recovered answer", marker, _CONVERSATION_ID)
+            assert poller.future is not None
+            poller.future.set_result(recovered)
+            assert await task is recovered
+            assert submissions == ["synthetic question"]
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            await ask_runtime.aclose()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("observer_stage", ["polling", "recovered", "detached", "status"])
+def test_runtime_recovery_isolates_optional_observers(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    observer_stage: str,
+) -> None:
+    context = _FakeContext()
+    _RuntimeFakes(monkeypatch, [context])
+    monkeypatch.setenv("GPTPRO_RAW_TURN_RECOVERY_SECONDS", "60")
+    marker = "[gptpro-transport-nonce:observer-failure]"
+    failure = ask.GptProAskError("no_raw_turn", "raw turn missing")
+    failure.evidence = ask.AskEvidence(
+        submission="confirmed", conversation_id=_CONVERSATION_ID,
+        failure_stage="answer",
+    )
+    submissions: list[str] = []
+    observations: list[ask.AskEvidence] = []
+    private_detail = "synthetic private question; synthetic session cookie"
+
+    def on_evidence(evidence: ask.AskEvidence) -> None:
+        observations.append(evidence)
+        if evidence.recovery == observer_stage:
+            raise RuntimeError(private_detail)
+
+    def on_detached() -> None:
+        if observer_stage == "detached":
+            raise RuntimeError(private_detail)
+
+    def on_status(_message: str) -> None:
+        if observer_stage == "status":
+            raise RuntimeError(private_detail)
+
+    async def execute(
+        page: _FakePage, question: str, **options: Any,
+    ) -> ask.AskOutcome:
+        del page
+        submissions.append(question)
+        callbacks = options["callbacks"]
+        callbacks.on_conversation_id(_CONVERSATION_ID)
+        callbacks.on_marker(marker)
+        raise failure
+
+    async def park_polling(_poller: runtime.DetachPoller) -> None:
+        await asyncio.Future()
+
+    monkeypatch.setattr(runtime.ask, "execute_ask_outcome", execute)
+    monkeypatch.setattr(runtime.DetachPoller, "_run", park_polling)
+
+    async def scenario() -> None:
+        ask_runtime = runtime.AskRuntime(max_concurrent_asks=1)
+        poller = ask_runtime._poller
+        task = asyncio.create_task(ask_runtime.ask(
+            "synthetic question", callbacks=ask.AskCallbacks(
+                on_evidence=on_evidence, on_detached=on_detached, on_status=on_status,
+            ),
+        ))
+        try:
+            while not poller._registrations and not task.done():
+                await asyncio.sleep(0)
+            if task.done():
+                await task
+            registration, = poller._registrations.values()
+            assert (registration.conversation_id, registration.marker) == (
+                _CONVERSATION_ID, marker,
+            )
+            assert ask_runtime._ask_semaphore._value == 1
+            assert context.pages[0].close_calls == 1
+            recovered = ask.AskOutcome("recovered answer", marker, _CONVERSATION_ID)
+            registration.future.set_result(recovered)
+            assert await task is recovered
+            assert registration.future.result() is recovered
+            assert poller._registrations == {}
+            assert submissions == ["synthetic question"]
+            assert [evidence.recovery for evidence in observations] == ["polling", "recovered"]
+            assert observations[-1].raw_extracted is True
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            for registration in tuple(poller._registrations.values()):
+                registration.future.cancel()
+            await ask_runtime.aclose()
+
+    with caplog.at_level(logging.WARNING, logger=runtime.__name__):
+        asyncio.run(scenario())
+    if observer_stage in {"polling", "recovered"}:
+        assert f"evidence observer failed during recovery {observer_stage} (RuntimeError)" in caplog.messages
+    assert private_detail not in caplog.text
+    assert all(record.exc_info is None for record in caplog.records)
+
+
+@pytest.mark.parametrize("recovery_mode", ["disabled", "registration_error", "polling_error"])
+@pytest.mark.parametrize("does_observer_fail", [False, True])
+def test_runtime_recovery_observer_preserves_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    recovery_mode: str,
+    does_observer_fail: bool,
+) -> None:
+    context = _FakeContext()
+    _RuntimeFakes(monkeypatch, [context])
+    monkeypatch.setenv(
+        "GPTPRO_RAW_TURN_RECOVERY_SECONDS", "0" if recovery_mode == "disabled" else "60",
+    )
+    marker = "[gptpro-transport-nonce:failed-recovery]"
+    failure = ask.GptProAskError("no_raw_turn", "raw turn missing")
+    failure.evidence = ask.AskEvidence(
+        submission="confirmed", conversation_id=_CONVERSATION_ID,
+        failure_stage="answer",
+    )
+    recovery_failure = RuntimeError("synthetic poller unavailable")
+    observations: list[ask.AskEvidence] = []
+    submissions: list[str] = []
+    private_detail = "synthetic private observer detail"
+
+    def on_evidence(evidence: ask.AskEvidence) -> None:
+        observations.append(evidence)
+        if does_observer_fail and evidence.recovery in {"unavailable", "exhausted"}:
+            raise RuntimeError(private_detail)
+
+    async def execute(
+        page: _FakePage, question: str, **options: Any,
+    ) -> ask.AskOutcome:
+        del page
+        submissions.append(question)
+        options["callbacks"].on_marker(marker)
+        options["callbacks"].on_conversation_id(_CONVERSATION_ID)
+        raise failure
+
+    async def park_polling(_poller: runtime.DetachPoller) -> None:
+        await asyncio.Future()
+
+    def fail_registration(*_args: Any, **_options: Any) -> asyncio.Future[ask.AskOutcome]:
+        raise recovery_failure
+
+    monkeypatch.setattr(runtime.ask, "execute_ask_outcome", execute)
+    monkeypatch.setattr(runtime.DetachPoller, "_run", park_polling)
+
+    async def scenario() -> None:
+        ask_runtime = runtime.AskRuntime(max_concurrent_asks=1)
+        poller = ask_runtime._poller
+        if recovery_mode == "registration_error":
+            monkeypatch.setattr(poller, "register", fail_registration)
+        task = asyncio.create_task(ask_runtime.ask(
+            "synthetic question", callbacks=ask.AskCallbacks(on_evidence=on_evidence),
+        ))
+        try:
+            if recovery_mode == "polling_error":
+                while not poller._registrations and not task.done():
+                    await asyncio.sleep(0)
+                assert not task.done()
+                registration, = poller._registrations.values()
+                registration.future.set_exception(recovery_failure)
+            with pytest.raises(ask.GptProAskError) as raised:
+                await task
+            assert raised.value is failure
+            assert raised.value.failure == "no_raw_turn"
+            assert raised.value.__cause__ is (None if recovery_mode == "disabled" else recovery_failure)
+            evidence = raised.value.evidence
+            assert evidence is not None
+            assert evidence.failure_stage == "answer"
+            assert evidence.recovery == ("exhausted" if recovery_mode == "polling_error" else "unavailable")
+            assert evidence.recovery_failure == ("disabled" if recovery_mode == "disabled" else "error")
+            assert observations[-1] == evidence
+            assert private_detail not in str(raised.value)
+            assert poller._registrations == {}
+            assert ask_runtime._ask_semaphore._value == 1
+            assert context.pages[0].close_calls == 1
+            assert submissions == ["synthetic question"]
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            for registration in tuple(poller._registrations.values()):
+                registration.future.cancel()
+            await ask_runtime.aclose()
+
+    with caplog.at_level(logging.WARNING, logger=runtime.__name__):
+        asyncio.run(scenario())
+    if does_observer_fail:
+        assert f"evidence observer failed during recovery {observations[-1].recovery} (RuntimeError)" in caplog.messages
+    assert private_detail not in caplog.text
+    assert all(record.exc_info is None for record in caplog.records)
+
+
+@pytest.mark.parametrize(
+    "cancel_when", ["polling_evidence", "polling_detached", "polling_status", "recovered_evidence", "pending"],
+)
+def test_runtime_recovery_cancellation_keeps_poller_ownership(
+    monkeypatch: pytest.MonkeyPatch, cancel_when: str,
+) -> None:
+    context = _FakeContext()
+    _RuntimeFakes(monkeypatch, [context])
+    monkeypatch.setenv("GPTPRO_RAW_TURN_RECOVERY_SECONDS", "60")
+    marker = "[gptpro-transport-nonce:cancelled-recovery]"
+    failure = ask.GptProAskError("no_raw_turn", "raw turn missing")
+    failure.evidence = ask.AskEvidence(
+        submission="confirmed", conversation_id=_CONVERSATION_ID,
+    )
+
+    def on_evidence(evidence: ask.AskEvidence) -> None:
+        if cancel_when == f"{evidence.recovery}_evidence":
+            raise asyncio.CancelledError()
+
+    def on_detached() -> None:
+        if cancel_when == "polling_detached":
+            raise asyncio.CancelledError()
+
+    def on_status(_message: str) -> None:
+        if cancel_when == "polling_status":
+            raise asyncio.CancelledError()
+
+    async def execute(
+        page: _FakePage, question: str, **options: Any,
+    ) -> ask.AskOutcome:
+        del page, question
+        options["callbacks"].on_marker(marker)
+        options["callbacks"].on_conversation_id(_CONVERSATION_ID)
+        raise failure
+
+    async def park_polling(_poller: runtime.DetachPoller) -> None:
+        await asyncio.Future()
+
+    monkeypatch.setattr(runtime.ask, "execute_ask_outcome", execute)
+    monkeypatch.setattr(runtime.DetachPoller, "_run", park_polling)
+
+    async def scenario() -> None:
+        ask_runtime = runtime.AskRuntime(max_concurrent_asks=1)
+        poller = ask_runtime._poller
+        futures: list[asyncio.Future[ask.AskOutcome]] = []
+        register = poller.register
+
+        def capture_registration(*args: Any, **options: Any) -> asyncio.Future[ask.AskOutcome]:
+            future = register(*args, **options)
+            futures.append(future)
+            return future
+
+        monkeypatch.setattr(poller, "register", capture_registration)
+        task = asyncio.create_task(ask_runtime.ask(
+            "synthetic question", callbacks=ask.AskCallbacks(
+                on_evidence=on_evidence, on_detached=on_detached, on_status=on_status,
+            ),
+        ))
+        try:
+            while not futures and not task.done():
+                await asyncio.sleep(0)
+            future, = futures
+            if cancel_when == "pending":
+                task.cancel()
+            elif cancel_when == "recovered_evidence":
+                future.set_result(ask.AskOutcome("recovered", marker, _CONVERSATION_ID))
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            await asyncio.sleep(0)
+            assert future.done()
+            assert future.cancelled() is (cancel_when != "recovered_evidence")
+            assert poller._registrations == {}
+            assert ask_runtime._ask_semaphore._value == 1
+            assert context.pages[0].close_calls == 1
+        finally:
+            task.cancel()
+            for future in futures:
+                future.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            await ask_runtime.aclose()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("callbacks", [None, ask.AskCallbacks()], ids=["none", "empty"])
+def test_runtime_preserves_no_raw_turn_when_recovery_fails(
+    monkeypatch: pytest.MonkeyPatch, callbacks: ask.AskCallbacks | None,
 ) -> None:
     context = _FakeContext()
     _RuntimeFakes(monkeypatch, [context])
@@ -1470,7 +1811,7 @@ def test_runtime_preserves_no_raw_turn_when_recovery_fails(
         poller = _RuntimeDetachPollerFake(ask_runtime._get_context)
         ask_runtime._poller = poller
         outcome_task = asyncio.create_task(
-            ask_runtime.ask("question", callbacks=ask.AskCallbacks())
+            ask_runtime.ask("question", callbacks=callbacks)
         )
         while poller.future is None:
             await asyncio.sleep(0)
@@ -1590,8 +1931,9 @@ def test_runtime_recovers_lost_echo_without_resubmitting(
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("callbacks", [None, ask.AskCallbacks()], ids=["none", "empty"])
 def test_runtime_disables_no_raw_turn_recovery_with_zero_window(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, callbacks: ask.AskCallbacks | None,
 ) -> None:
     context = _FakeContext()
     _RuntimeFakes(monkeypatch, [context])
@@ -1624,7 +1966,7 @@ def test_runtime_disables_no_raw_turn_recovery_with_zero_window(
         poller = _RuntimeDetachPollerFake(ask_runtime._get_context)
         ask_runtime._poller = poller
         with pytest.raises(ask.GptProAskError) as raised:
-            await ask_runtime.ask("question", callbacks=ask.AskCallbacks())
+            await ask_runtime.ask("question", callbacks=callbacks)
 
         assert raised.value is failure
         assert raised.value.failure == "no_raw_turn"
@@ -1766,8 +2108,9 @@ def test_runtime_recovers_uncertain_or_generating_turn_without_another_submit(
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("callbacks", [None, ask.AskCallbacks()], ids=["none", "empty"])
 def test_runtime_never_polls_pre_submit_timeout_even_with_known_thread(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, callbacks: ask.AskCallbacks | None,
 ) -> None:
     context = _FakeContext()
     _RuntimeFakes(monkeypatch, [context])
@@ -1798,7 +2141,7 @@ def test_runtime_never_polls_pre_submit_timeout_even_with_known_thread(
         with pytest.raises(ask.GptProAskError) as raised:
             await ask_runtime.ask(
                 "question", conversation_id=_CONVERSATION_ID,
-                callbacks=ask.AskCallbacks(),
+                callbacks=callbacks,
             )
         assert raised.value is failure
         assert raised.value.evidence.failure_stage == "composer"

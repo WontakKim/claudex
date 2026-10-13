@@ -705,37 +705,49 @@ class AskRuntime:
         captured_conversation_id = conversation_id
         captured_marker: str | None = None
         captured_evidence: AskEvidence | None = None
-        execution_callbacks = callbacks
-        if callbacks is not None:
-            original_on_conversation_id = callbacks.on_conversation_id
-            original_on_marker = callbacks.on_marker
-            original_on_evidence = callbacks.on_evidence
+        callbacks = callbacks if callbacks is not None else AskCallbacks()
+        original_on_conversation_id = callbacks.on_conversation_id
+        original_on_marker = callbacks.on_marker
+        original_on_evidence = callbacks.on_evidence
 
-            def capture_conversation_id(value: str) -> None:
-                nonlocal captured_conversation_id
-                captured_conversation_id = value
-                if original_on_conversation_id is not None:
-                    original_on_conversation_id(value)
+        def capture_conversation_id(value: str) -> None:
+            nonlocal captured_conversation_id
+            captured_conversation_id = value
+            if original_on_conversation_id is not None:
+                original_on_conversation_id(value)
 
-            def capture_marker(value: str) -> None:
-                nonlocal captured_marker
-                captured_marker = value
-                if original_on_marker is not None:
-                    original_on_marker(value)
+        def capture_marker(value: str) -> None:
+            nonlocal captured_marker
+            captured_marker = value
+            if original_on_marker is not None:
+                original_on_marker(value)
 
-            def capture_evidence(evidence: AskEvidence) -> None:
-                nonlocal captured_evidence
-                captured_evidence = evidence
-                if original_on_evidence is not None:
-                    original_on_evidence(evidence)
+        def capture_evidence(evidence: AskEvidence) -> None:
+            nonlocal captured_evidence
+            captured_evidence = evidence
+            if original_on_evidence is not None:
+                original_on_evidence(evidence)
 
-            execution_callbacks = AskCallbacks(
-                on_status=callbacks.on_status,
-                on_conversation_id=capture_conversation_id,
-                on_marker=capture_marker,
-                on_detached=callbacks.on_detached,
-                on_evidence=capture_evidence,
-            )
+        def notify_recovery_evidence(evidence: AskEvidence) -> None:
+            if original_on_evidence is None:
+                return
+            try:
+                original_on_evidence(evidence)
+            except Exception as observer_exc:
+                logger.warning(
+                    "evidence observer failed during recovery %s (%s)",
+                    evidence.recovery,
+                    type(observer_exc).__name__,
+                )
+                return
+
+        execution_callbacks = AskCallbacks(
+            on_status=callbacks.on_status,
+            on_conversation_id=capture_conversation_id,
+            on_marker=capture_marker,
+            on_detached=callbacks.on_detached,
+            on_evidence=capture_evidence,
+        )
 
         try:
             submission_delay = random.uniform(
@@ -786,8 +798,7 @@ class AskRuntime:
                             recovery_detail=detail,
                         )
                         exc.args = (f"{exc}; recovery disabled: {detail}",)
-                        if callbacks is not None and callbacks.on_evidence is not None:
-                            callbacks.on_evidence(exc.evidence)
+                        notify_recovery_evidence(exc.evidence)
                     raise
                 recovery_deadline = min(
                     execution_deadline, _monotonic() + recovery_seconds,
@@ -813,32 +824,32 @@ class AskRuntime:
                         recovery_detail=detail,
                     )
                     exc.args = (f"{exc}; recovery unavailable: {detail}",)
-                    if callbacks is not None and callbacks.on_evidence is not None:
-                        callbacks.on_evidence(exc.evidence)
+                    notify_recovery_evidence(exc.evidence)
                     raise exc from recovery_exc
-                if callbacks is not None:
-                    if evidence is not None and callbacks.on_evidence is not None:
-                        callbacks.on_evidence(replace(evidence, recovery="polling"))
+                # Retain job ownership until the nonce-correlated answer settles.
+                try:
+                    if evidence is not None:
+                        notify_recovery_evidence(replace(evidence, recovery="polling"))
                     if callbacks.on_detached is not None:
                         try:
                             callbacks.on_detached()
-                        except Exception:
-                            pass
+                        except Exception as observer_exc:
+                            logger.warning(
+                                "detached observer failed during recovery (%s)",
+                                type(observer_exc).__name__,
+                            )
                     if callbacks.on_status is not None:
                         try:
                             callbacks.on_status("detached; polling for the answer")
-                        except Exception:
-                            pass
-                release_admission()
-                # Retain job ownership until the nonce-correlated answer settles.
-                try:
+                        except Exception as observer_exc:
+                            logger.warning(
+                                "status observer failed during recovery (%s)",
+                                type(observer_exc).__name__,
+                            )
+                    release_admission()
                     outcome = await _wait_until(future, delivery_deadline)
-                    if (
-                        evidence is not None
-                        and callbacks is not None
-                        and callbacks.on_evidence is not None
-                    ):
-                        callbacks.on_evidence(replace(
+                    if evidence is not None:
+                        notify_recovery_evidence(replace(
                             evidence, recovery="recovered", submission="confirmed",
                             generation_observed=True, answer_seen=True,
                             raw_extracted=True,
@@ -873,8 +884,7 @@ class AskRuntime:
                     exc.args = (
                         f"{exc}; recovery {recovery_failure}: {detail}",
                     )
-                    if callbacks is not None and callbacks.on_evidence is not None:
-                        callbacks.on_evidence(exc.evidence)
+                    notify_recovery_evidence(exc.evidence)
                     raise exc from recovery_exc
         finally:
             release_admission()
