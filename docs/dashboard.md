@@ -12,10 +12,16 @@ Opening `http://127.0.0.1:8787/` uses the same guarded admin API as the CLI:
 - **Status** shows built-in login and subscription usage plus custom-provider
   readiness. Kimi and Grok cards remain cosmetically hidden until a login or
   mapped route makes them relevant; this never affects routing or settings.
-  Custom providers do not receive usage or billing cards. When the Codex
-  account has reset credits, the Codex card can spend one to reset its usage
-  windows immediately (`POST /admin/providers/codex/reset-credit`). Spending
-  is irreversible, so the button only opens a confirmation dialog, and
+  Custom providers do not receive usage or billing cards. Codex plan labels
+  show **Pro 200** for `pro`, **Pro 100** for `prolite`, **Pro 500** for
+  `promax`, and **Plus** for `plus`. Unknown plan names remain escaped raw
+  provider values; the usage API retains its original `plan_type`.
+  ChatGPT Work and Codex share provider-reported usage and credits, including
+  activity outside this gateway. Only reported usage windows are shown; a
+  missing session window does not imply zero usage or an unlimited allowance.
+  When the Codex account has reset credits, the Codex card can spend one to
+  reset its usage windows immediately (`POST /admin/providers/codex/reset-credit`).
+  Spending is irreversible, so the button only opens a confirmation dialog, and
   confirming there is the only action that sends the request.
 - **MCP** keeps gateway-wide Claude Code connection setup above per-backend
   sections, with GPT Pro session, ask concurrency, and diagnostics controls

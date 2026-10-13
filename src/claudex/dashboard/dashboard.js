@@ -2316,8 +2316,13 @@ function usageSkeletonHtml(provider){
 function renderUsageProvider(provider,data){
   // The plan sits above, in the card's status box, so it is written to its
   // own hook rather than into the body this function rebuilds.
+  var planLabel=data&&data.plan_type;
+  if(provider==="codex"){
+    var codexPlanLabels={pro:"Pro 200",prolite:"Pro 100",promax:"Pro 500",plus:"Plus"};
+    if(Object.prototype.hasOwnProperty.call(codexPlanLabels,planLabel))planLabel=codexPlanLabels[planLabel];
+  }
   document.getElementById("usage-plan-"+provider).innerHTML=
-    data?(data.plan_type?"<b>"+esc(data.plan_type)+"</b> plan":""):PLAN_SKELETON;
+    data?(planLabel?"<b>"+esc(planLabel)+"</b> plan":""):PLAN_SKELETON;
   var body=document.getElementById("usage-body-"+provider);
   if(!data){
     body.innerHTML=usageSkeletonHtml(provider);

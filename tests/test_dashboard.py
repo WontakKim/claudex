@@ -1119,3 +1119,97 @@ def test_account_pin_and_usage_labels_do_not_claim_exclusive_serving_or_duration
     assert ">Remove</button>" in feedback["servingCopy"]["unpinned"]
     assert "Session window" in feedback["unknownDurationUsage"]
     assert "5-hour" not in feedback["unknownDurationUsage"]
+
+
+@pytest.mark.parametrize(
+    "plan_type,expected_html",
+    [
+        ("<future-plan>", "<b>&lt;future-plan></b> plan"),
+        ("PRO", "<b>PRO</b> plan"),
+        ("constructor", "<b>constructor</b> plan"),
+        ("toString", "<b>toString</b> plan"),
+        ("__proto__", "<b>__proto__</b> plan"),
+        ("", ""),
+        (None, ""),
+    ],
+)
+def test_usage_plan_preserves_unknown_codex_values(
+    dashboard_runtime_result: dict[str, Any], plan_type: str | None, expected_html: str,
+) -> None:
+    rendered = next(
+        row for row in dashboard_runtime_result["usageRendering"]["plans"]
+        if row["provider"] == "codex" and row["planType"] == plan_type
+    )
+    assert rendered["html"] == expected_html
+    assert rendered["rawPlanType"] == plan_type
+
+
+@pytest.mark.parametrize("provider", ["claude", "kimi", "grok"])
+@pytest.mark.parametrize("plan_type", ["pro", "prolite", "promax", "plus", "<future-plan>"])
+def test_usage_plan_keeps_other_providers_raw(
+    dashboard_runtime_result: dict[str, Any], provider: str, plan_type: str,
+) -> None:
+    rendered = next(
+        row for row in dashboard_runtime_result["usageRendering"]["plans"]
+        if row["provider"] == provider and row["planType"] == plan_type
+    )
+    assert rendered["html"] == f"<b>{plan_type.replace('<', '&lt;')}</b> plan"
+    assert rendered["rawPlanType"] == plan_type
+
+
+def test_codex_usage_windows_preserve_weekly_only(
+    dashboard_runtime_result: dict[str, Any],
+) -> None:
+    body = dashboard_runtime_result["usageRendering"]["windows"]["weeklyOnly"]
+    assert "Weekly window" in body
+    assert "37%" in body
+    assert body.count('class="uwin"') == 1
+    assert "Session window" not in body
+    assert "0%" not in body
+    assert "unlimited" not in body.lower()
+    assert "Reset credits" not in body
+
+
+def test_codex_usage_windows_do_not_invent_unreported_limits(
+    dashboard_runtime_result: dict[str, Any],
+) -> None:
+    body = dashboard_runtime_result["usageRendering"]["windows"]["noWindows"]
+    assert "No usage windows reported" in body
+    assert 'class="uwin"' not in body
+    assert "Session window" not in body
+    assert "Weekly window" not in body
+    assert "0%" not in body
+    assert "unlimited" not in body.lower()
+    assert "Reset credits" not in body
+
+
+@pytest.mark.parametrize(
+    "plan_type,expected_label",
+    [
+        ("pro", "Pro 200"),
+        ("prolite", "Pro 100"),
+        ("promax", "Pro 500"),
+        ("plus", "Plus"),
+    ],
+)
+def test_codex_usage_plan_labels(
+    dashboard_runtime_result: dict[str, Any], plan_type: str, expected_label: str,
+) -> None:
+    rendered = next(
+        row for row in dashboard_runtime_result["usageRendering"]["plans"]
+        if row["provider"] == "codex" and row["planType"] == plan_type
+    )
+    assert rendered["html"] == f"<b>{expected_label}</b> plan"
+    assert rendered["rawPlanType"] == plan_type
+
+
+def test_codex_usage_copy_discloses_shared_provider_usage_and_credits() -> None:
+    match = re.search(
+        r'<h2>Codex Status</h2>.*?<div class="sub">(.*?)</div>',
+        DASHBOARD_HTML,
+        re.DOTALL,
+    )
+    assert match is not None
+    copy = match.group(1)
+    assert "ChatGPT Work and Codex share provider-reported usage and credits" in copy
+    assert "including activity outside this gateway" in copy

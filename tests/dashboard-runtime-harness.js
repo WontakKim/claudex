@@ -1190,6 +1190,25 @@ async function main() {
   const operatorFeedback = {alertToast, statusToast, rejectedCode, retainedCodeError, disconnectedCode,
     acceptedCode, staleCodeIgnored, codeRequests: feedbackRequests, responseLoss, servingCopy, unknownDurationUsage};
 
+  const usageRendering = {plans: [], windows: {}};
+  for (const provider of ["codex", "claude", "kimi", "grok"]) {
+    for (const planType of ["pro", "prolite", "promax", "plus", "<future-plan>", "PRO", "constructor", "toString", "__proto__", "", null]) {
+      const data = {status: "ok", plan_type: planType, updated_at: 1};
+      feedbackContext.renderUsageProvider(provider, data);
+      usageRendering.plans.push({provider, planType, rawPlanType: data.plan_type,
+        html: feedbackDocument.getElementById(`usage-plan-${provider}`).innerHTML});
+    }
+  }
+  for (const [name, data] of Object.entries({
+    weeklyOnly: {status: "ok", plan_type: "promax", session: null,
+      weekly: {used_percent: 37, window_minutes: 10080, resets_at: 1754600000},
+      reset_credits_available: null, updated_at: 1},
+    noWindows: {status: "ok", plan_type: "promax", session: null, weekly: null, updated_at: 1},
+  })) {
+    feedbackContext.renderUsageProvider("codex", data);
+    usageRendering.windows[name] = feedbackDocument.getElementById("usage-body-codex").innerHTML;
+  }
+
   const requestSnapshot = JSON.stringify(requests);
   const domSnapshot = document.snapshot();
   const credentialLeak = [
@@ -1327,6 +1346,7 @@ async function main() {
       },
       cards,
       operatorFeedback,
+      usageRendering,
       gptProConcurrencyStates,
       gptProSessionStates,
       mcpInfoStates,

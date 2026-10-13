@@ -362,7 +362,8 @@ def test_fetch_claude_account_usage_reauth_required_propagates() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_fetch_codex_usage_maps_windows_and_plan() -> None:
+@pytest.mark.parametrize("plan_type", ["plus", "pro", "prolite", "promax", "<future-plan>"])
+def test_fetch_codex_usage_maps_windows_and_plan(plan_type: str) -> None:
     seen: dict[str, Any] = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -371,7 +372,7 @@ def test_fetch_codex_usage_maps_windows_and_plan() -> None:
         return httpx.Response(
             200,
             json={
-                "plan_type": "plus",
+                "plan_type": plan_type,
                 "rate_limit": {
                     "primary_window": {
                         "used_percent": 12,
@@ -394,13 +395,44 @@ def test_fetch_codex_usage_maps_windows_and_plan() -> None:
     assert seen["account"] == "acc-1"
     assert seen["originator"] == "Codex Desktop"
     assert result["status"] == "ok"
-    assert result["plan_type"] == "plus"
+    assert result["plan_type"] == plan_type
     assert result["reset_credits_available"] == 2
     assert result["session"]["used_percent"] == 12
     assert result["session"]["window_minutes"] == 300
     assert result["session"]["resets_at"] == 1754000000.0
     assert result["weekly"]["used_percent"] == 34
     assert result["weekly"]["window_minutes"] == 10080
+
+
+@pytest.mark.parametrize("window_key", ["primary_window", "secondary_window"])
+def test_fetch_codex_usage_promax_with_only_weekly_window(window_key: str) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "plan_type": "promax",
+                "rate_limit": {
+                    window_key: {
+                        "used_percent": 37,
+                        "limit_window_seconds": 604800,
+                        "reset_at": 1754600000,
+                    },
+                },
+            },
+        )
+
+    auth = ChatGPTCredentials(CodexCredentials(access_token="tok", account_id=None))
+    result = _run(provider_usage.fetch_codex_usage(_mock_client(handler), auth))
+
+    assert result["status"] == "ok"
+    assert result["plan_type"] == "promax"
+    assert result["session"] is None
+    assert result["weekly"] == {
+        "used_percent": 37.0,
+        "window_minutes": 10080,
+        "resets_at": 1754600000.0,
+    }
+    assert result["reset_credits_available"] is None
 
 
 def test_fetch_codex_usage_classifies_unknown_durations_legacy_way() -> None:
