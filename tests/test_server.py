@@ -8,7 +8,7 @@ import json
 import logging
 import time
 import uuid
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Iterator
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -210,6 +210,22 @@ class SecretBearingStartupClient(FakeOpenAICompatibleClient):
 _REAL_HOME = Path.home()
 
 
+@pytest.fixture(autouse=True)
+def _reject_unmocked_http(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    attempts: list[str] = []
+
+    async def reject_request(
+        _transport: httpx.AsyncHTTPTransport, request: httpx.Request
+    ) -> httpx.Response:
+        attempts.append(f"{request.method} {request.url}")
+        raise AssertionError("upstream requests require an explicit mock transport")
+
+    monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", reject_request)
+    yield
+    # Background fetches can convert transport errors into cached results.
+    assert not attempts, f"Unmocked upstream HTTP attempts: {attempts}"
+
+
 def _create_test_client(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -240,6 +256,18 @@ def _create_test_client(
     monkeypatch.setattr(server, "GrokClient", grok_client)
     if custom_client is not None:
         monkeypatch.setattr(server, "OpenAICompatibleClient", custom_client)
+
+    def handle_lifespan_request(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and str(request.url) == "https://api.anthropic.com/api/oauth/usage":
+            return httpx.Response(200, json={})
+        raise AssertionError(f"Unexpected lifespan HTTP request: {request.method} {request.url}")
+
+    async_client_type = httpx.AsyncClient
+
+    def create_lifespan_http_client(**kwargs: Any) -> httpx.AsyncClient:
+        return async_client_type(transport=httpx.MockTransport(handle_lifespan_request), **kwargs)
+
+    monkeypatch.setattr(server, "httpx", SimpleNamespace(AsyncClient=create_lifespan_http_client))
     return TestClient(server.create_app(config or GatewayConfig()), base_url=base_url)
 
 
@@ -2968,6 +2996,63 @@ def _wait_until(client: TestClient, predicate: Callable[[], bool], *, timeout: f
         if time.monotonic() >= deadline:
             raise AssertionError("condition not met within timeout")
         client.get("/health")
+
+
+@pytest.mark.parametrize(
+    ("method", "url"),
+    [
+        ("POST", "https://api.anthropic.com/api/oauth/usage"),
+        ("GET", "https://other.example/api/oauth/usage"),
+        ("POST", "https://api.anthropic.com/v1/messages"),
+    ],
+)
+def test_lifespan_transport_rejects_unexpected_http(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, method: str, url: str
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        with pytest.raises(AssertionError, match="Unexpected lifespan HTTP request"):
+            client.portal.call(client.app.state.http_client.request, method, url)
+
+
+@pytest.mark.parametrize("initial_mode", ["disabled", "balanced"])
+def test_lifespan_usage_warmup_uses_synthetic_http(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, initial_mode: str
+) -> None:
+    _balanced_env(monkeypatch, tmp_path)
+    account_id, access_token = _register_balanced_accounts(1)[0]
+    requests: list[httpx.Request] = []
+    handle_request = httpx.MockTransport.handle_async_request
+
+    async def capture_request(
+        transport: httpx.MockTransport, request: httpx.Request
+    ) -> httpx.Response:
+        requests.append(request)
+        return await handle_request(transport, request)
+
+    monkeypatch.setattr(httpx.MockTransport, "handle_async_request", capture_request)
+    config = GatewayConfig(
+        settings_file=tmp_path / "settings.json", claude_account_routing_mode=initial_mode
+    )
+    with _create_test_client(
+        monkeypatch, tmp_path, config=config, base_url="http://127.0.0.1:8787"
+    ) as client:
+        if initial_mode == "disabled":
+            response = client.put("/admin/providers/claude/pool/routing", json={"mode": "balanced"})
+            assert response.status_code == 200
+        coordinator = client.app.state.claude_balanced_runtime.usage_poll_coordinator
+        assert coordinator is not None
+        _wait_until(client, lambda: coordinator.fetched_count == 1)
+        cached = client.app.state.claude_account_usage_cache.peek(account_id)
+        assert cached is not None
+        assert cached["status"] == "ok"
+        assert cached["error"] is None
+        assert cached["session"] is None
+        assert cached["weekly"] is None
+        assert cached["fable_weekly"] is None
+
+    assert [(request.method, str(request.url), request.headers["authorization"]) for request in requests] == [
+        ("GET", "https://api.anthropic.com/api/oauth/usage", f"Bearer {access_token}")
+    ]
 
 
 class TestUsagePollDriver:
