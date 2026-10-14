@@ -78,7 +78,8 @@ async def _rewrite_anthropic_sse(
             yield ("\n".join(event_lines) + "\n").encode()
     except httpx.HTTPError as exc:
         if event_lines:
-            yield ("\n".join(event_lines) + "\n").encode()
+            # Body chunk boundaries do not terminate SSE events.
+            yield ("\n".join(event_lines) + "\n\n").encode()
             await asyncio.sleep(0)
         _, body = backend.error_policy(AnthropicStreamReadFailure(exc))
         yield _format_sse("error", body).encode()

@@ -1538,28 +1538,93 @@ def test_anthropic_stream_early_close_before_first_read_closes_once() -> None:
     assert close_calls == 1
 
 
-def test_anthropic_stream_read_failure_emits_error_and_closes_once() -> None:
-    async def scenario() -> tuple[list[bytes], int]:
-        stream = _TrackingByteStream(
-            [b"event: content_block_delta\n"],
-            httpx.ReadError("stream failed"),
-        )
+def _parse_native_sse_json(body: bytes) -> list[tuple[str, dict[str, Any]]]:
+    assert body.endswith(b"\n\n")
+    events = []
+    for frame in body.decode().split("\n\n"):
+        event_name = "message"
+        data_lines = []
+        for line in frame.splitlines():
+            field, _, value = line.partition(":")
+            if field == "event":
+                event_name = value.removeprefix(" ")
+            elif field == "data":
+                data_lines.append(value.removeprefix(" "))
+        if data_lines:
+            events.append((event_name, json.loads("\n".join(data_lines))))
+    return events
+
+
+@pytest.mark.parametrize("chunk_split", ["whole", "lines", "bytes"])
+@pytest.mark.parametrize("error_policy", ["kimi", "custom"])
+def test_anthropic_stream_read_failure_emits_error_and_closes_once(
+    chunk_split: str, error_policy: str,
+) -> None:
+    delta = {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "hi"}}
+    buffered_event = f"event: content_block_delta\ndata: {json.dumps(delta)}\n".encode()
+    failure = httpx.ReadError("stream failed")
+    backend = _stream_backend()
+    message = f"kimi stream aborted: {failure!r}"
+    if error_policy == "custom":
+        from dataclasses import replace
+        from claudex.relay.anthropic_compatible import _anthropic_compatible_error_to_claude
+
+        backend = replace(backend, error_policy=_anthropic_compatible_error_to_claude)
+        message = "The Anthropic-compatible backend stream was interrupted"
+    if chunk_split == "whole":
+        upstream_chunks = [buffered_event]
+    elif chunk_split == "lines":
+        upstream_chunks = buffered_event.splitlines(keepends=True)
+    else:
+        upstream_chunks = [bytes([value]) for value in buffered_event]
+
+    async def scenario() -> tuple[bytes, bool, int]:
+        stream = _TrackingByteStream(upstream_chunks, failure)
         response = httpx.Response(200, stream=stream)
-        chunks = [
-            chunk
-            async for chunk in _AnthropicStreamRelay(
-                response, "claude-fable-5", _stream_backend()
-            )
-        ]
-        return chunks, stream.close_calls
+        relay = _AnthropicStreamRelay(response, "claude-fable-5", backend)
+        body = b"".join([chunk async for chunk in relay])
+        await relay.aclose()
+        return body, response.is_closed, stream.close_calls
 
-    chunks, close_calls = asyncio.run(scenario())
+    body, is_closed, close_calls = asyncio.run(scenario())
 
-    assert chunks[0] == b"event: content_block_delta\n"
-    assert chunks[1].startswith(b"event: error\ndata: ")
-    error = json.loads(chunks[1].split(b"data: ", 1)[1])
-    assert error["error"]["type"] == "api_error"
-    assert "kimi stream aborted" in error["error"]["message"]
+    assert _parse_native_sse_json(body) == [
+        ("content_block_delta", delta),
+        ("error", {"type": "error", "error": {"type": "api_error", "message": message}}),
+    ]
+    assert body.startswith(buffered_event + b"\n")
+    assert body.count(b"\n\n") == 2
+    assert is_closed is True
+    assert close_calls == 1
+
+
+@pytest.mark.parametrize(
+    "upstream_prefix",
+    [b"", b"event: content_block_delta\n", b"event: ping\ndata: {}\n\n"],
+    ids=["no-buffer", "event-line-only", "completed-event"],
+)
+def test_anthropic_stream_error_preserves_existing_event_boundaries(upstream_prefix: bytes) -> None:
+    failure = httpx.ReadError("stream failed")
+
+    async def scenario() -> tuple[bytes, bool, int]:
+        stream = _TrackingByteStream([upstream_prefix], failure)
+        response = httpx.Response(200, stream=stream)
+        relay = _AnthropicStreamRelay(response, "claude-fable-5", _stream_backend())
+        body = b"".join([chunk async for chunk in relay])
+        await relay.aclose()
+        return body, response.is_closed, stream.close_calls
+
+    body, is_closed, close_calls = asyncio.run(scenario())
+    expected_events = [("ping", {})] if upstream_prefix.endswith(b"\n\n") else []
+    expected_events.append(("error", {
+        "type": "error", "error": {"type": "api_error", "message": f"kimi stream aborted: {failure!r}"},
+    }))
+    assert _parse_native_sse_json(body) == expected_events
+    assert body.count(b"\n\n") == (2 if upstream_prefix else 1)
+    if upstream_prefix:
+        expected_prefix = upstream_prefix if upstream_prefix.endswith(b"\n\n") else upstream_prefix + b"\n"
+        assert body.startswith(expected_prefix)
+    assert is_closed is True
     assert close_calls == 1
 
 
