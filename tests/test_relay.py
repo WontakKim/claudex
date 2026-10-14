@@ -6630,6 +6630,229 @@ def test_balanced_post_2xx_midstream_failure_relays_sse_error_and_retains_the_co
         assert pin.generation == 1
 
 
+@pytest.mark.parametrize("is_pinned", [False, True], ids=["stateless", "pinned"])
+@pytest.mark.parametrize("failure_status", [503, 401], ids=["refresh-unavailable", "post-refresh-rejected"])
+def test_balanced_exhausted_auth_failures_return_first_actionable_response(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, is_pinned: bool, failure_status: int,
+) -> None:
+    _balanced_env(monkeypatch, tmp_path)
+    account_ids = [
+        _register_serving_account(
+            email=f"failed-{index}@example.com", account_uuid=str(uuid.uuid4()),
+            access_token=f"failed-access-{index}", refresh_token=f"failed-refresh-{index}",
+            expires_in_seconds=-60 if failure_status == 503 else 3600,
+        )
+        for index in range(2)
+    ]
+    attempt_ids: list[str] = []
+    failures: list[Response] = []
+    message_calls: list[httpx.Request] = []
+    original_attempt = relay_balanced._attempt_with_account
+
+    async def record_attempt(
+        request: Request, raw_body: bytes, parsed_body: Any, record: Any, **kwargs: Any,
+    ) -> Any:
+        attempt_ids.append(record.id)
+        outcome = await original_attempt(request, raw_body, parsed_body, record, **kwargs)
+        assert isinstance(outcome, relay_registered._FailedAttempt)
+        assert not outcome.rate_limited and outcome.response.status_code == failure_status
+        outcome.response.headers["request-id"] = f"auth-failure-{len(failures)}"
+        outcome.response.headers["x-failure-detail"] = "synthetic-auth"
+        failures.append(outcome.response)
+        return outcome
+
+    monkeypatch.setattr(relay_balanced, "_attempt_with_account", record_attempt)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == CLAUDE_TOKEN_URL:
+            if failure_status == 503:
+                return httpx.Response(503, text="synthetic token endpoint unavailable")
+            return httpx.Response(200, json={
+                "access_token": "synthetic-refreshed-access", "expires_in": 900,
+            })
+        assert request.method == "POST" and request.url.path == "/v1/messages"
+        message_calls.append(request)
+        return httpx.Response(401, json={"type": "error"})
+
+    with _create_test_client(
+        monkeypatch, tmp_path, config=GatewayConfig(), base_url="http://127.0.0.1:8787"
+    ) as client:
+        runtime = _enable_balanced(client, handler)
+        body = _balanced_body(_new_session_id()) if is_pinned else _UNPINNABLE_BODY
+
+        response = client.post("/v1/messages", json=body)
+
+        assert len(attempt_ids) == len(set(attempt_ids)) == 2
+        assert set(attempt_ids) == set(account_ids)
+        assert len(message_calls) == (0 if failure_status == 503 else 4)
+        assert response.status_code == failure_status
+        assert response.content == failures[0].body
+        assert response.headers["request-id"] == "auth-failure-0"
+        assert response.headers["x-failure-detail"] == "synthetic-auth"
+        assert "retry-after" not in response.headers
+        assert response.json()["error"]["type"] == ("api_error" if failure_status == 503 else "authentication_error")
+        assert ("unusable" if failure_status == 503 else "account add") in response.json()["error"]["message"]
+        assert runtime._active_requests == 0 and runtime._drain_complete.is_set()
+        for account_id in account_ids:
+            assert runtime.router.in_flight_count(account_id) == 0
+            assert runtime.router.account_cooldown_deadline(account_id) is None
+            assert runtime.router.family_cooldown_deadline(account_id, "fable") is None
+        if is_pinned:
+            key = derive_session_key(body, runtime.epoch_seed, "fable")
+            pin = runtime.router.get_pin(key.digest)
+            assert pin.account_id == attempt_ids[0] and pin.generation == 0
+            assert runtime.router.get_migration_reservation(key.digest) is None
+        else:
+            assert runtime.router.pin_count() == 0
+        assert {record.state for record in claude_accounts.load_registry()} == ({"ready"} if failure_status == 503 else {"needs-reauth"})
+
+
+@pytest.mark.parametrize("is_pinned", [False, True], ids=["stateless", "pinned"])
+@pytest.mark.parametrize("failure_status", [503, 401], ids=["auth-unavailable", "auth-rejected"])
+@pytest.mark.parametrize("has_retry_after", [False, True], ids=["local-retry-after", "upstream-retry-after"])
+@pytest.mark.parametrize("quota_count", [1, 2], ids=["one-quota", "latest-quota"])
+def test_balanced_exhausted_chain_retains_real_quota_before_auth_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, is_pinned: bool,
+    failure_status: int, has_retry_after: bool, quota_count: int,
+) -> None:
+    from claudex.claude.auth import ClaudeAccountAuthError
+
+    _balanced_env(monkeypatch, tmp_path)
+    accounts = _register_balanced_accounts(quota_count + 1)
+    attempt_ids: list[str] = []
+    quota_responses: list[Response] = []
+    original_attempt = relay_balanced._attempt_with_account
+
+    class UnavailableAuthManager:
+        async def get_credentials(self, force_refresh: bool = False) -> Any:
+            raise ClaudeAccountAuthError("synthetic token refresh unavailable")
+
+    async def record_attempt(
+        request: Request, raw_body: bytes, parsed_body: Any, record: Any, **kwargs: Any,
+    ) -> Any:
+        attempt_ids.append(record.id)
+        if len(attempt_ids) > quota_count and failure_status == 503:
+            request.app.state.claude_account_auth_managers[record.id] = UnavailableAuthManager()
+        outcome = await original_attempt(request, raw_body, parsed_body, record, **kwargs)
+        assert isinstance(outcome, relay_registered._FailedAttempt)
+        if len(attempt_ids) <= quota_count:
+            assert outcome.rate_limited
+            quota_responses.append(outcome.response)
+        else:
+            assert not outcome.rate_limited and outcome.response.status_code == failure_status
+        return outcome
+
+    monkeypatch.setattr(relay_balanced, "_attempt_with_account", record_attempt)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == CLAUDE_TOKEN_URL:
+            return httpx.Response(200, json={"access_token": "synthetic-refreshed-access", "expires_in": 900})
+        assert request.method == "POST" and request.url.path == "/v1/messages"
+        if len(attempt_ids) > quota_count:
+            return httpx.Response(401, json={"type": "error"})
+        headers = {
+            "content-type": "application/octet-stream", "request-id": f"quota-{len(attempt_ids)}",
+            "x-should-retry": "true",
+        }
+        if has_retry_after:
+            headers["retry-after"] = "17"
+        return httpx.Response(429, content=f"quota-{len(attempt_ids)}".encode() + b"\x00\xff", headers=headers)
+
+    with _create_test_client(
+        monkeypatch, tmp_path, config=GatewayConfig(), base_url="http://127.0.0.1:8787"
+    ) as client:
+        runtime = _enable_balanced(client, handler)
+        body = _balanced_body(_new_session_id()) if is_pinned else _UNPINNABLE_BODY
+
+        response = client.post("/v1/messages", json=body)
+
+        assert len(attempt_ids) == len(set(attempt_ids)) == quota_count + 1
+        assert set(attempt_ids) == {account_id for account_id, _token in accounts}
+        assert response.status_code == 429
+        assert response.content == quota_responses[-1].body == f"quota-{quota_count}".encode() + b"\x00\xff"
+        assert response.headers["request-id"] == f"quota-{quota_count}"
+        assert response.headers["content-type"] == "application/octet-stream"
+        assert response.headers["x-should-retry"] == "true"
+        assert response.headers["retry-after"] == ("17" if has_retry_after else "1")
+        assert runtime._active_requests == 0 and runtime._drain_complete.is_set()
+        assert all(runtime.router.in_flight_count(account_id) == 0 for account_id, _token in accounts)
+        if is_pinned:
+            key = derive_session_key(body, runtime.epoch_seed, "fable")
+            pin = runtime.router.get_pin(key.digest)
+            assert pin.account_id == attempt_ids[0] and pin.generation == 0
+            assert runtime.router.get_migration_reservation(key.digest) is None
+        else:
+            assert runtime.router.pin_count() == 0
+
+
+@pytest.mark.parametrize("is_pinned", [False, True], ids=["stateless", "pinned"])
+@pytest.mark.parametrize("failure_status", [503, 401], ids=["refresh-unavailable", "post-refresh-rejected"])
+def test_balanced_auth_failure_still_fails_over_to_a_healthy_account(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, is_pinned: bool, failure_status: int,
+) -> None:
+    _balanced_env(monkeypatch, tmp_path)
+    account_ids = [
+        _register_serving_account(
+            email=f"failover-{index}@example.com", account_uuid=str(uuid.uuid4()),
+            access_token=f"failover-access-{index}", refresh_token=f"failover-refresh-{index}",
+            expires_in_seconds=-60 if failure_status == 503 else 3600,
+        )
+        for index in range(2)
+    ]
+    attempt_ids: list[str] = []
+    message_calls: list[httpx.Request] = []
+    original_attempt = relay_balanced._attempt_with_account
+
+    async def record_attempt(
+        request: Request, raw_body: bytes, parsed_body: Any, record: Any, **kwargs: Any,
+    ) -> Any:
+        attempt_ids.append(record.id)
+        outcome = await original_attempt(request, raw_body, parsed_body, record, **kwargs)
+        if len(attempt_ids) == 1:
+            assert isinstance(outcome, relay_registered._FailedAttempt)
+            assert not outcome.rate_limited and outcome.response.status_code == failure_status
+        else:
+            assert not isinstance(outcome, relay_registered._FailedAttempt)
+        return outcome
+
+    monkeypatch.setattr(relay_balanced, "_attempt_with_account", record_attempt)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == CLAUDE_TOKEN_URL:
+            if failure_status == 503 and len(attempt_ids) < 2:
+                return httpx.Response(503, text="synthetic token endpoint unavailable")
+            return httpx.Response(200, json={"access_token": "synthetic-refreshed-access", "expires_in": 900})
+        assert request.method == "POST" and request.url.path == "/v1/messages"
+        message_calls.append(request)
+        if len(attempt_ids) == 1:
+            return httpx.Response(401, json={"type": "error"})
+        return httpx.Response(200, json={"id": "healthy"}, headers={"request-id": "healthy-response"})
+
+    with _create_test_client(
+        monkeypatch, tmp_path, config=GatewayConfig(), base_url="http://127.0.0.1:8787"
+    ) as client:
+        runtime = _enable_balanced(client, handler)
+        body = _balanced_body(_new_session_id()) if is_pinned else _UNPINNABLE_BODY
+
+        response = client.post("/v1/messages", json=body)
+
+        assert len(attempt_ids) == len(set(attempt_ids)) == 2
+        assert set(attempt_ids) == set(account_ids)
+        assert len(message_calls) == (1 if failure_status == 503 else 3)
+        assert response.status_code == 200 and response.json() == {"id": "healthy"}
+        assert response.headers["request-id"] == "healthy-response"
+        assert "retry-after" not in response.headers
+        assert runtime._active_requests == 0 and runtime._drain_complete.is_set()
+        assert all(runtime.router.in_flight_count(account_id) == 0 for account_id in account_ids)
+        if is_pinned:
+            key = derive_session_key(body, runtime.epoch_seed, "fable")
+            pin = runtime.router.get_pin(key.digest)
+            assert pin.account_id == attempt_ids[-1] and pin.generation == 1
+            assert runtime.router.get_migration_reservation(key.digest) is None
+        else:
+            assert runtime.router.pin_count() == 0
+
+
 def test_chain_exhausted_real_429_without_retry_after_gets_local_retry_after(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

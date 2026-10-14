@@ -449,16 +449,20 @@ def _balanced_all_cooling_response(
     app_state: Any,
     family: str,
     chain_exhausted_429: Response | None,
+    chain_exhausted_failure: Response | None = None,
 ) -> Response:
     """Respond after a retry chain or initial placement finds no eligible account.
 
-    A chain that exhausted on a real upstream 429 relays that response, adding
-    local `Retry-After` guidance only when the upstream omitted it. Otherwise
-    this synthesizes an Anthropic-compatible 429 with `Retry-After` based on the
-    earliest unblock time among registered, ready, capability-eligible
-    accounts. A disabled or capability-denied account cannot shorten that
-    value. An empty candidate set returns 503 only on the synthetic path.
+    A chain that observed a real upstream 429 relays the latest such response,
+    adding local `Retry-After` guidance only when the upstream omitted it.
+    Without a real 429, a retained account failure is returned unchanged. With
+    no retained failure, this synthesizes an Anthropic-compatible 429 with
+    `Retry-After` based on the earliest unblock time among registered, ready,
+    capability-eligible accounts. A disabled or capability-denied account cannot
+    shorten that value. An empty candidate set returns 503 only on the synthetic path.
     """
+    if chain_exhausted_429 is None and chain_exhausted_failure is not None:
+        return chain_exhausted_failure
     candidate_set = _balanced_eligible_candidate_set(records_by_id)
     should_add_retry_after = (
         chain_exhausted_429 is not None
@@ -601,6 +605,7 @@ async def _serve_balanced_stateless_message(
 
     attempted: set[str] = set()
     chain_429: Response | None = None
+    first_failure: Response | None = None
     while True:
         try:
             account_id = _balanced_pick_account(
@@ -613,7 +618,8 @@ async def _serve_balanced_stateless_message(
             )
         except NoEligibleAccountError:
             return _balanced_all_cooling_response(
-                records_by_id, router, app_state=request.app.state, family=family, chain_exhausted_429=chain_429
+                records_by_id, router, app_state=request.app.state, family=family, chain_exhausted_429=chain_429,
+                chain_exhausted_failure=first_failure,
             )
 
         attempted.add(account_id)
@@ -676,7 +682,10 @@ async def _serve_balanced_stateless_message(
             router.end_attempt(account_id)
         if not isinstance(outcome, _FailedAttempt):
             return outcome
-        chain_429 = outcome.response if outcome.rate_limited else None
+        if outcome.rate_limited:
+            chain_429 = outcome.response
+        elif first_failure is None:
+            first_failure = outcome.response
 
 
 async def _serve_balanced_pinned_message(
@@ -782,6 +791,7 @@ async def _serve_balanced_pinned_message(
 
     attempted: set[str] = set()
     chain_429: Response | None = None
+    first_failure: Response | None = None
     owner_attempt_id: str | None = None
     current_target = ""
 
@@ -800,7 +810,8 @@ async def _serve_balanced_pinned_message(
                 )
             except NoEligibleAccountError:
                 return _balanced_all_cooling_response(
-                    records_by_id, router, app_state=request.app.state, family=family, chain_exhausted_429=chain_429
+                    records_by_id, router, app_state=request.app.state, family=family, chain_exhausted_429=chain_429,
+                    chain_exhausted_failure=first_failure,
                 )
             normal_pin_created = placement.created
             if placement.created and placement.durability_barrier is not None:
@@ -961,9 +972,10 @@ async def _serve_balanced_pinned_message(
 
             if not isinstance(outcome, _FailedAttempt):
                 return outcome
-            chain_429 = outcome.response if outcome.rate_limited else None
-        else:
-            chain_429 = None
+            if outcome.rate_limited:
+                chain_429 = outcome.response
+            elif first_failure is None:
+                first_failure = outcome.response
 
         # --- Migration reservation and next-target selection ----------------
         if owner_attempt_id is not None:
@@ -981,7 +993,8 @@ async def _serve_balanced_pinned_message(
             )
         except NoEligibleAccountError:
             return _balanced_all_cooling_response(
-                records_by_id, router, app_state=request.app.state, family=family, chain_exhausted_429=chain_429
+                records_by_id, router, app_state=request.app.state, family=family, chain_exhausted_429=chain_429,
+                chain_exhausted_failure=first_failure,
             )
 
         reservation, is_owner = router.acquire_migration_reservation(

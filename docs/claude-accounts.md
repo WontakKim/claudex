@@ -215,9 +215,13 @@ the session to another eligible account. As in fallback mode, this happens
 only before any response byte reaches the client. A Fable-model `429` cools
 only the account's Fable models when fresh usage readings show the Fable
 weekly window exhausted while the five-hour and seven-day windows still have
-room; otherwise the whole account cools. When no account
-is eligible, the client gets the upstream `429` or a synthesized `429` with
-`Retry-After`. If no account is ready at all, the client gets `503`.
+room; otherwise the whole account cools. Quota exhaustion returns the last
+real upstream `429`, or a synthesized `429` with `Retry-After` when every
+eligible account is already cooling. If accounts were attempted but all
+failed without a real quota `429`, the client gets the first actionable
+account failure unchanged: for example, `503` for unavailable authentication
+or `401` for rejection after a token refresh. If no account is ready to
+attempt, the client gets `503`.
 Token counting follows the session's account when one is already assigned,
 but never moves a session or retries another account.
 
