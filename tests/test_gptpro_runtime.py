@@ -851,12 +851,14 @@ class _PollerFakePage(_FakePage):
         self,
         marker: str,
         conversation_responses: list[
-            tuple[int, dict[str, object] | None] | BaseException
+            tuple[int, dict[str, object] | None] | dict[str, object] | BaseException
         ],
         *,
         on_conversation_fetch: Callable[[], None] | None = None,
+        session_response: dict[str, object] | None = None,
     ) -> None:
         super().__init__()
+        self.session_response = session_response
         self.marker = marker
         self.conversation_responses = list(conversation_responses)
         self.on_conversation_fetch = on_conversation_fetch
@@ -875,6 +877,8 @@ class _PollerFakePage(_FakePage):
         assert isinstance(argument, dict)
         self.fetch_arguments.append(argument)
         if argument["url"] == "https://chatgpt.com/api/auth/session":
+            if self.session_response is not None:
+                return self.session_response
             return {
                 "status": 200,
                 "headers": {},
@@ -888,6 +892,8 @@ class _PollerFakePage(_FakePage):
         response = self.conversation_responses.pop(0)
         if isinstance(response, BaseException):
             raise response
+        if isinstance(response, dict):
+            return response
         status, body = response
         return {
             "status": status,
@@ -1152,13 +1158,96 @@ def test_detach_poller_times_out_immediately_when_fetch_exhausts_deadline(
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("status", [401, 403])
+@pytest.mark.parametrize(
+    ("headers", "body_text", "detail"),
+    [
+        pytest.param(
+            {"cf-mitigated": "challenge"}, "<html>Checking your browser</html>",
+            "Cloudflare mitigation: challenge (cf-mitigated: challenge)",
+            id="mitigation-header",
+        ),
+        pytest.param(
+            {"Cf-Mitigated": " Challenge "}, "",
+            "Cloudflare mitigation: challenge (cf-mitigated: challenge)",
+            id="normalized-header",
+        ),
+        pytest.param(
+            {"cf-ray": "synthetic-ray"}, "<html>cf-chl challenge</html>",
+            "Cloudflare bot challenge on HTTP 403 response",
+            id="ray-and-body",
+        ),
+        pytest.param(
+            {"cf-mitigated": "block"}, "<html>Access denied</html>",
+            "Cloudflare mitigation: block (cf-mitigated: block)",
+            id="mitigation-block",
+        ),
+    ],
+)
+def test_detach_poller_classifies_marked_conversation_challenge(
+    headers: dict[str, str], body_text: str, detail: str,
+) -> None:
+    marker = "[gptpro-transport-nonce:poller-challenge]"
+    page = _PollerFakePage(marker, [{
+        "status": 403,
+        "headers": headers,
+        "text": body_text,
+        "json": None,
+        "fetchError": None,
+        "timedOut": False,
+    }])
+    context = _PollerFakeContext(page)
+
+    async def scenario() -> None:
+        poller = runtime.DetachPoller(lambda: asyncio.sleep(0, result=context))
+        try:
+            future = poller.register(
+                _CONVERSATION_ID, marker, deadline=runtime._monotonic() + 100.0,
+            )
+            with pytest.raises(ask.GptProChallengeError) as raised:
+                await future
+            await _wait_for_poller_idle(poller)
+            assert raised.value.failure == "challenge"
+            assert str(raised.value) == detail
+            assert "sign in" not in str(raised.value)
+            assert [argument["url"] for argument in page.fetch_arguments] == [
+                "https://chatgpt.com/api/auth/session",
+                f"https://chatgpt.com/backend-api/conversation/{_CONVERSATION_ID}",
+            ]
+            assert page.fetch_arguments[-1]["headers"] == {
+                "Authorization": "Bearer access-token",
+            }
+            assert poller._registrations == {}
+            assert page.close_calls == 1
+        finally:
+            await poller.aclose()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("status", "headers", "body_text"),
+    [
+        pytest.param(401, {}, "", id="unauthorized"),
+        pytest.param(403, {}, "", id="forbidden"),
+        pytest.param(
+            403, {"cf-ray": "synthetic-ray"}, "<html>Forbidden</html>",
+            id="ray-without-challenge",
+        ),
+        pytest.param(
+            403, {}, "<html>challenge</html>", id="body-without-ray",
+        ),
+    ],
+)
 def test_detach_poller_classifies_authorization_failure_as_session_expired(
     status: int,
+    headers: dict[str, str],
+    body_text: str,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     marker = "[gptpro-transport-nonce:poller-auth]"
-    page = _PollerFakePage(marker, [(status, None)])
+    page = _PollerFakePage(marker, [{
+        "status": status, "headers": headers, "text": body_text, "json": None,
+    }])
     context = _PollerFakeContext(page)
 
     async def scenario() -> None:
@@ -1180,6 +1269,38 @@ def test_detach_poller_classifies_authorization_failure_as_session_expired(
     assert caplog.messages == [
         f"gptpro detached ask hit an auth failure (thread={_CONVERSATION_ID})"
     ]
+
+
+@pytest.mark.parametrize("status", [401, 403])
+def test_detach_poller_keeps_session_endpoint_auth_policy(status: int) -> None:
+    marker = "[gptpro-transport-nonce:session-policy]"
+    page = _PollerFakePage(marker, [], session_response={
+        "status": status,
+        "headers": {"cf-mitigated": "challenge"},
+        "text": "<html>cf-chl challenge</html>",
+        "json": None,
+    })
+    context = _PollerFakeContext(page)
+
+    async def scenario() -> None:
+        poller = runtime.DetachPoller(lambda: asyncio.sleep(0, result=context))
+        try:
+            future = poller.register(
+                _CONVERSATION_ID, marker, deadline=runtime._monotonic() + 100.0,
+            )
+            with pytest.raises(ask.GptProSessionExpiredError):
+                await future
+            await _wait_for_poller_idle(poller)
+            assert len(page.fetch_arguments) == 1
+            assert page.fetch_arguments[0]["url"] == (
+                "https://chatgpt.com/api/auth/session"
+            )
+            assert poller._registrations == {}
+            assert page.close_calls == 1
+        finally:
+            await poller.aclose()
+
+    asyncio.run(scenario())
 
 
 def test_read_only_recovery_exhausts_after_unmatched_server_turn(
@@ -1880,6 +2001,121 @@ def test_auto_recovery_keeps_original_failure_and_reports_auth_error(
         assert "recovery session_expired" in str(raised.value)
         assert observations[-1] == raised.value.evidence
         await ask_runtime.aclose()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("does_observer_fail", [False, True])
+def test_auto_recovery_reports_real_conversation_challenge(
+    monkeypatch: pytest.MonkeyPatch,
+    does_observer_fail: bool,
+) -> None:
+    context = _FakeContext()
+    _RuntimeFakes(monkeypatch, [context])
+    monkeypatch.setenv("GPTPRO_RAW_TURN_RECOVERY_SECONDS", "60")
+    marker = "[gptpro-transport-nonce:auto-challenge]"
+    page = _PollerFakePage(marker, [{
+        "status": 403,
+        "headers": {"cf-mitigated": "challenge"},
+        "text": "<html>Checking your browser</html>",
+        "json": None,
+        "fetchError": None,
+        "timedOut": False,
+    }])
+    poller_context = _PollerFakeContext(page)
+    failure = ask.GptProAskError("timeout", "original answer timed out")
+    failure.evidence = ask.AskEvidence(
+        submission="uncertain", conversation_id=_CONVERSATION_ID,
+        failure_stage="answer",
+    )
+    observations: list[ask.AskEvidence] = []
+    submissions: list[str] = []
+
+    def on_evidence(evidence: ask.AskEvidence) -> None:
+        observations.append(evidence)
+        if does_observer_fail and evidence.recovery == "unavailable":
+            raise RuntimeError("synthetic observer failure")
+
+    async def execute(
+        _page: _FakePage, question: str, **options: Any,
+    ) -> ask.AskOutcome:
+        submissions.append(question)
+        options["callbacks"].on_marker(marker)
+        options["callbacks"].on_conversation_id(_CONVERSATION_ID)
+        raise failure
+
+    monkeypatch.setattr(runtime.ask, "execute_ask_outcome", execute)
+
+    async def scenario() -> None:
+        ask_runtime = runtime.AskRuntime(max_concurrent_asks=1)
+        ask_runtime._poller = runtime.DetachPoller(
+            lambda: asyncio.sleep(0, result=poller_context),
+        )
+        try:
+            with pytest.raises(ask.GptProAskError) as raised:
+                await ask_runtime.ask(
+                    "synthetic question", callbacks=ask.AskCallbacks(on_evidence=on_evidence),
+                )
+            await _wait_for_poller_idle(ask_runtime._poller)
+            assert raised.value is failure
+            assert raised.value.failure == "timeout"
+            evidence = raised.value.evidence
+            assert evidence is not None
+            assert evidence.failure_stage == "answer"
+            assert evidence.recovery == "unavailable"
+            assert evidence.recovery_failure == "challenge"
+            assert evidence.recovery_detail == (
+                "Cloudflare mitigation: challenge (cf-mitigated: challenge)"
+            )
+            assert isinstance(raised.value.__cause__, ask.GptProChallengeError)
+            assert "recovery challenge" in str(raised.value)
+            assert "sign in" not in str(raised.value)
+            assert observations[-1] == evidence
+            assert submissions == ["synthetic question"]
+            assert len(page.fetch_arguments) == 2
+            assert page.close_calls == 1
+            assert ask_runtime._poller._registrations == {}
+            assert ask_runtime._ask_semaphore._value == 1
+        finally:
+            await ask_runtime.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_manual_recovery_reports_real_conversation_challenge(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GPTPRO_RAW_TURN_RECOVERY_SECONDS", "60")
+    marker = "[gptpro-transport-nonce:manual-challenge]"
+    page = _PollerFakePage(marker, [{
+        "status": 403,
+        "headers": {"cf-mitigated": "challenge"},
+        "text": "<html>Checking your browser</html>",
+        "json": None,
+        "fetchError": None,
+        "timedOut": False,
+    }])
+    context = _PollerFakeContext(page)
+
+    async def scenario() -> None:
+        ask_runtime = runtime.AskRuntime()
+        ask_runtime._poller = runtime.DetachPoller(
+            lambda: asyncio.sleep(0, result=context),
+        )
+        try:
+            with pytest.raises(ask.GptProChallengeError) as raised:
+                await ask_runtime.recover(_CONVERSATION_ID, marker)
+            await _wait_for_poller_idle(ask_runtime._poller)
+            assert raised.value.failure == "challenge"
+            assert str(raised.value) == (
+                "Cloudflare mitigation: challenge (cf-mitigated: challenge)"
+            )
+            assert "sign in" not in str(raised.value)
+            assert len(page.fetch_arguments) == 2
+            assert page.close_calls == 1
+            assert ask_runtime._poller._registrations == {}
+        finally:
+            await ask_runtime.aclose()
 
     asyncio.run(scenario())
 
