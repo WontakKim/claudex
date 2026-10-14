@@ -1154,6 +1154,82 @@ def test_failed_replacement_does_not_acknowledge_or_retire_an_older_retry(tmp_pa
         store.close()
 
 
+@pytest.mark.parametrize("is_terminal", [False, True], ids=["retry", "terminal"])
+def test_failed_pin_delete_does_not_acknowledge_or_retire_an_older_upsert_retry(
+    tmp_path: Path, is_terminal: bool
+) -> None:
+    clock = [0.0]
+    attempts: list[int] = []
+    deletion_retry_started, release_deletion = threading.Event(), threading.Event()
+    delete_error = sqlite3.OperationalError("synthetic failed pin deletion")
+    delete_error.sqlite_errorcode = sqlite3.SQLITE_FULL if is_terminal else sqlite3.SQLITE_BUSY
+
+    def fault_injector(scope_key: Any, sequence: int) -> None:
+        attempts.append(sequence)
+        if sequence == 1 and attempts.count(sequence) == 1:
+            raise sqlite3.OperationalError("synthetic delayed pin upsert")
+        if sequence == 2 and attempts.count(sequence) == 1:
+            raise delete_error
+        if sequence == 2:
+            deletion_retry_started.set()
+            assert release_deletion.wait(timeout=5)
+
+    path = tmp_path / "runtime.sqlite3"
+    store = ClaudePoolRuntimeStateStore.open_(path, clock=lambda: clock[0], debounce_seconds=0.0,
+                                              fault_injector=fault_injector)
+    epoch_id, seed = store.balanced_epoch_id, store.epoch_seed
+    digest = b"\x71" * 32
+    try:
+        older = store.upsert_pin(**_pin_kwargs(session_key_digest=digest, balanced_epoch_id=epoch_id,
+                                               last_seen_utc=2_000_000.0, expires_at_utc=2_000_300.0),
+                                 high_priority=True)
+        with store._cv:
+            assert store._cv.wait_for(lambda: len(store._retrying) == 1, timeout=5)
+        deletion = store.delete_pin(digest, high_priority=True)
+        if is_terminal:
+            with pytest.raises(sqlite3.OperationalError) as failure:
+                deletion.wait(timeout=5)
+            assert failure.value is delete_error
+        else:
+            with store._cv:
+                assert store._cv.wait_for(lambda: len(store._retrying) == 2, timeout=5)
+            with pytest.raises(TimeoutError):
+                deletion.wait(timeout=0)
+        assert store.persistence_degraded and store.get_pin(digest) is None
+        with pytest.raises(TimeoutError):
+            older.wait(timeout=0)
+        with store._cv:
+            clock[0] = 0.5
+            store._cv.notify_all()
+        if not is_terminal:
+            assert deletion_retry_started.wait(timeout=5)
+        older.wait(timeout=5)
+        assert store.get_pin(digest) is not None
+        if is_terminal:
+            with pytest.raises(sqlite3.OperationalError) as failure:
+                deletion.wait(timeout=0)
+            assert failure.value is delete_error
+        else:
+            with pytest.raises(TimeoutError):
+                deletion.wait(timeout=0)
+            release_deletion.set()
+            deletion.wait(timeout=5)
+            assert store.get_pin(digest) is None
+        store.close()
+        assert attempts == ([1, 2, 1] if is_terminal else [1, 2, 1, 2])
+
+        store = ClaudePoolRuntimeStateStore.open_(path, debounce_seconds=0.0)
+        assert (store.balanced_epoch_id, store.epoch_seed) == (epoch_id, seed)
+        rows = store.restore(RestoreValidationContext(now_utc=2_000_000.0))
+        assert (digest in rows.pins) == is_terminal
+    finally:
+        release_deletion.set()
+        with store._cv:
+            clock[0] = 10.0
+            store._cv.notify_all()
+        store.close()
+
+
 def test_retried_pin_write_cannot_resurrect_a_row_after_epoch_invalidation(tmp_path: Path) -> None:
     """Step 9 / Note A check #5.
 

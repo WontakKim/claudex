@@ -220,7 +220,7 @@ class ClaudeBalancedRouter:
     ) -> None:
         self.balanced_epoch_id = balanced_epoch_id
         self.observations = ObservationView()
-        self.persistence_degraded = False
+        self._persistence_degraded = False
 
         self._store = store
         self._clock = clock
@@ -262,6 +262,17 @@ class ClaudeBalancedRouter:
         # `remove_account`'s durable incarnation-scoped deletion, keyed by
         # incarnation so a caller can await its completion afterward.
         self._pending_incarnation_removals: dict[str, Any] = {}
+
+    @property
+    def persistence_degraded(self) -> bool:
+        """Include the store's live status for writes submitted without an async waiter."""
+        return self._persistence_degraded or (
+            self._store is not None and self._store.persistence_degraded
+        )
+
+    @persistence_degraded.setter
+    def persistence_degraded(self, value: bool) -> None:
+        self._persistence_degraded = value
 
     # -- in-flight attempt counting: M(a) -----------------------------------
 
@@ -456,23 +467,30 @@ class ClaudeBalancedRouter:
             return None
         return min(candidates)[1]
 
-    def _ensure_capacity(self, *, now: float) -> None:
-        """Bound 10,000, eviction order expired -> LRU content-hash -> LRU uuid.
+    def _ensure_capacity(self, *, now: float, reserve_for_new_pin: bool = True) -> None:
+        """Eviction order: expired -> LRU content-hash -> LRU uuid.
 
         Entries holding an active migration reservation are never evicted
         (a soft bound): if every remaining entry is reserved, the bound is
         exceeded and `soft_bound_overflow_count` records it instead.
+        Restore needs no insertion slot; placement reserves one.
         """
-        if len(self._pins) < self._pin_map_max_entries:
+        maximum = self._pin_map_max_entries - int(reserve_for_new_pin)
+        if len(self._pins) <= maximum:
             return
         self.purge_expired_pins(now=now)
-        if len(self._pins) < self._pin_map_max_entries:
-            return
-        victim = self._lru_victim(key_kind="content_hash") or self._lru_victim(key_kind="uuid")
-        if victim is None:
-            self.soft_bound_overflow_count += 1
-            return
-        self._remove_pin(victim, reason="evicted_lru")
+        while len(self._pins) > maximum:
+            victim = self._lru_victim(key_kind="content_hash") or self._lru_victim(key_kind="uuid")
+            if victim is None:
+                self.soft_bound_overflow_count += 1
+                return
+            self._remove_pin(victim, reason="evicted_lru")
+            if self._store is not None:
+                try:
+                    # A committed delete supersedes older retries in the full pin-upsert scope.
+                    self._store.delete_pin(victim, high_priority=True)
+                except RuntimeError:
+                    self.persistence_degraded = True
 
     def touch_pin(
         self,
@@ -659,7 +677,8 @@ class ClaudeBalancedRouter:
 
         `restore_result.pins` already excludes expired and epoch-mismatched
         rows (`ClaudePoolRuntimeStateStore.restore`); every remaining row is
-        durable, so it carries no `pending_durability` barrier. Cooldowns and
+        durable, so it carries no `pending_durability` barrier. Oversized pin
+        maps use the same capacity and eviction order as placement. Cooldowns and
         capability evidence get the same wall-to-monotonic conversion, each
         with its own restore clamp and validation. A cooldown's remaining
         duration clamps to `[1s, 7d]`, and a restored capability row is kept
@@ -696,6 +715,7 @@ class ClaudeBalancedRouter:
                 model_family=row.model_family,
             )
         self._restored_any_valid_pin = bool(restore_result.pins)
+        self._ensure_capacity(now=monotonic_now, reserve_for_new_pin=False)
 
         for (account_id, scope, model_family), cooldown_row in restore_result.cooldowns.items():
             remaining = cooldown_row.deadline_utc - wall_now
