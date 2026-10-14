@@ -3431,65 +3431,179 @@ def test_exit_mode_cancelled_while_draining_restores_active_with_epoch_and_store
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("target_mode", ["disabled", "fallback"])
+@pytest.mark.parametrize("cancel_count,cancel_stage", [(1, "rotation"), (2, "rotation"), (3, "cleanup")])
 def test_exit_mode_cancelled_after_persist_still_finalizes_before_the_cancellation_surfaces(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, target_mode: str, cancel_count: int, cancel_stage: str
 ) -> None:
-    """A cancellation delivered AFTER `exit_mode`'s `persist()` commit point --
-    here, while post-commit finalization is awaiting the epoch rotation --
-    must never truncate finalization: `publish()` still runs, the store still
-    closes, and `status` still lands on "disabled"; only once all of that has
-    actually completed does the cancellation surface back to the caller.
-    """
-    rotate_gate = asyncio.Event()
-
-    class _GatedPendingWrite:
-        async def wait_async(self) -> None:
-            await rotate_gate.wait()
-
-    def _gated_rotate_epoch(self: ClaudePoolRuntimeStateStore) -> _GatedPendingWrite:
-        return _GatedPendingWrite()
-
     async def scenario() -> None:
         runtime = ClaudeBalancedRuntime()
         await runtime.prepare_and_publish(
-            accounts=[],
-            accounts_root=tmp_path,
-            runtime_db_path=tmp_path / "runtime.sqlite3",
-            persist=lambda: None,
-            entry="admin_enable",
+            accounts=[], accounts_root=tmp_path, runtime_db_path=tmp_path / "runtime.sqlite3",
+            persist=lambda: None, entry="admin_enable",
         )
-        assert runtime.status == "active"
+        store = runtime._store
+        router = runtime.router
+        assert runtime.status == "active" and store is not None and router is not None
+        rotate_gate = asyncio.Event()
+        rotation_started = asyncio.Event()
+        cleanup_gate = asyncio.Event()
+        cleanup_started = asyncio.Event()
+        events: list[str] = []
+        saved = {"mode": "balanced"}
+        published = {"mode": "balanced"}
+        original_close = store.close
+        original_stop = runtime._stop_usage_poll_driver
+        exit_task: asyncio.Task[None] | None = None
+        waiters: list[asyncio.Task[None]] = []
 
-        monkeypatch.setattr(ClaudePoolRuntimeStateStore, "rotate_epoch", _gated_rotate_epoch)
-        published: list[str] = []
+        class GatedPendingWrite:
+            async def wait_async(self) -> None:
+                events.append("rotate")
+                rotation_started.set()
+                await rotate_gate.wait()
 
-        exit_task = asyncio.create_task(
-            runtime.exit_mode("disabled", publish=lambda: published.append("disabled"))
-        )
-        # Let exit_mode drain (nothing held open) and persist (a no-op),
-        # then reach the gated rotate_epoch await inside its shielded
-        # post-commit finalization.
-        for _ in range(20):
-            await asyncio.sleep(0)
-        assert published == []  # finalization hasn't reached publish() yet
+        def persist() -> None:
+            saved["mode"] = target_mode
+            events.append("persist")
 
-        exit_task.cancel()
-        for _ in range(20):
-            await asyncio.sleep(0)
-        # The caller's cancellation was shielded off finalization: it is
-        # still in flight, blocked on the gated rotation, not yet done.
-        assert not exit_task.done()
-        assert published == []
-        assert runtime.status == "draining"
+        def publish() -> None:
+            published["mode"] = target_mode
+            events.append("publish")
 
-        # Let the rotation complete -- finalization can now run to completion.
-        rotate_gate.set()
-        with pytest.raises(asyncio.CancelledError):
-            await exit_task
+        async def stop_driver() -> None:
+            cleanup_started.set()
+            await cleanup_gate.wait()
+            await original_stop()
+            events.append("poll_stopped")
 
-        assert published == ["disabled"]
-        assert runtime.status == "disabled"
-        assert runtime._store is None
-        assert runtime.router is None
+        def close_store() -> None:
+            events.append("close")
+            original_close()
+
+        async def await_lifecycle_ownership() -> None:
+            async with runtime._lifecycle_lock:
+                pass
+
+        monkeypatch.setattr(store, "rotate_epoch", GatedPendingWrite)
+        monkeypatch.setattr(runtime, "_stop_usage_poll_driver", stop_driver)
+        monkeypatch.setattr(store, "close", close_store)
+        try:
+            exit_task = asyncio.create_task(runtime.exit_mode(target_mode, persist=persist, publish=publish))
+            await asyncio.wait_for(rotation_started.wait(), timeout=1)
+            waiters.extend((asyncio.create_task(runtime.wait_for_transition()),
+                            asyncio.create_task(await_lifecycle_ownership())))
+            assert saved["mode"] == target_mode and published["mode"] == "balanced"
+            if cancel_stage == "cleanup":
+                rotate_gate.set()
+                await asyncio.wait_for(cleanup_started.wait(), timeout=1)
+
+            for _ in range(cancel_count):
+                exit_task.cancel()
+                for _ in range(20):
+                    await asyncio.sleep(0)
+                assert not exit_task.done(), "caller cancellation surfaced before owned cleanup settled"
+                assert all(not waiter.done() for waiter in waiters)
+                assert runtime.status == "draining" and not runtime._transition_event.is_set()
+                assert runtime._store is store and runtime.router is router
+                assert "close" not in events
+                if cancel_stage == "rotation":
+                    assert not cleanup_started.is_set(), "cancellation interrupted rotation and skipped publication"
+                    assert published["mode"] == "balanced"
+                else:
+                    assert published["mode"] == target_mode
+
+            rotate_gate.set()
+            await asyncio.wait_for(cleanup_started.wait(), timeout=1)
+            assert saved == published == {"mode": target_mode}
+            assert not exit_task.done() and all(not waiter.done() for waiter in waiters)
+            assert events == ["persist", "rotate", "publish"]
+            cleanup_gate.set()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(asyncio.shield(exit_task), timeout=1)
+            await asyncio.wait_for(asyncio.gather(*waiters), timeout=1)
+            assert events == ["persist", "rotate", "publish", "poll_stopped", "close"]
+            assert runtime.status == "disabled" and runtime._transition_event.is_set()
+            assert runtime._store is None and runtime.router is None
+            assert store._writer_thread is not None and not store._writer_thread.is_alive()
+        finally:
+            rotate_gate.set()
+            cleanup_gate.set()
+            if exit_task is not None:
+                await asyncio.gather(exit_task, return_exceptions=True)
+            await runtime.shutdown_preserving_epoch()
+            for waiter in waiters:
+                if not waiter.done():
+                    waiter.cancel()
+            await asyncio.gather(*waiters, return_exceptions=True)
+            original_close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("cancel_count", [0, 2])
+def test_exit_mode_propagates_finalization_error_after_driver_and_store_cleanup(
+    monkeypatch: pytest.MonkeyPatch, cancel_count: int
+) -> None:
+    async def scenario() -> None:
+        runtime = ClaudeBalancedRuntime()
+        runtime.status = "active"
+        rotation_started = asyncio.Event()
+        release = asyncio.Event()
+        events: list[str] = []
+        error = RuntimeError("synthetic publication failure")
+
+        class ExitStore:
+            def rotate_epoch(self) -> ExitStore:
+                events.append("rotate")
+                return self
+
+            async def wait_async(self) -> None:
+                rotation_started.set()
+                await release.wait()
+
+            def close(self) -> None:
+                assert runtime._usage_poll_driver_task is None and driver.done()
+                events.append("close")
+
+        async def poll_driver() -> None:
+            try:
+                await asyncio.Event().wait()
+            finally:
+                events.append("poll_stopped")
+
+        def publish() -> None:
+            events.append("publish")
+            raise error
+
+        monkeypatch.setattr(runtime, "_store", ExitStore())
+        driver = asyncio.create_task(poll_driver())
+        runtime._usage_poll_driver_task = driver
+        await asyncio.sleep(0)
+        exit_task = asyncio.create_task(runtime.exit_mode(
+            "disabled", persist=lambda: events.append("persist"), publish=publish
+        ))
+        try:
+            await asyncio.wait_for(rotation_started.wait(), timeout=1)
+            for _ in range(cancel_count):
+                exit_task.cancel()
+                for _ in range(20):
+                    await asyncio.sleep(0)
+                assert not exit_task.done()
+            release.set()
+            with pytest.raises(RuntimeError) as failure:
+                await asyncio.wait_for(asyncio.shield(exit_task), timeout=1)
+            assert failure.value is error
+            assert events == ["persist", "rotate", "publish", "poll_stopped", "close"]
+            assert runtime.status == "disabled" and runtime._transition_event.is_set()
+            assert runtime._store is None and runtime._usage_poll_driver_task is None
+            assert driver.done()
+        finally:
+            release.set()
+            await asyncio.gather(exit_task, return_exceptions=True)
+            await runtime.shutdown_preserving_epoch()
+            if not driver.done():
+                driver.cancel()
+            await asyncio.gather(driver, return_exceptions=True)
 
     asyncio.run(scenario())

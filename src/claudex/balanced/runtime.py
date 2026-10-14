@@ -396,11 +396,15 @@ class ClaudeBalancedRuntime:
             # cancellation; a cancellation delivered to the caller only
             # surfaces again once finalization has actually finished.
             finalize_task = asyncio.create_task(self._finalize_exit(publish))
-            try:
-                await asyncio.shield(finalize_task)
-            except asyncio.CancelledError:
-                await finalize_task
-                raise
+            cancellation_error: asyncio.CancelledError | None = None
+            while not finalize_task.done():
+                try:
+                    await asyncio.shield(finalize_task)
+                except asyncio.CancelledError as exc:
+                    cancellation_error = exc
+            finalize_task.result()
+            if cancellation_error is not None:
+                raise cancellation_error
 
     async def _finalize_exit(self, publish: Callable[[], None]) -> None:
         """Complete `exit_mode` after its settings commit.
