@@ -8,12 +8,16 @@ the server to relay.
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 import httpx
 
+from claudex.providers.client_support import _shield_response_cleanup
 from claudex.providers.kimi_auth import KimiAuthManager, KimiCredentials
 from claudex.upstream_errors import UpstreamError
+
+logger = logging.getLogger(__name__)
 
 KIMI_MESSAGES_URL = "https://api.kimi.com/coding/v1/messages"
 KIMI_COUNT_TOKENS_URL = "https://api.kimi.com/coding/v1/messages/count_tokens"
@@ -76,12 +80,13 @@ class KimiClient:
         credentials = await self._auth_manager.get_credentials()
         response = await self._send_once(url, body, headers, credentials)
         if response.status_code == 401:
-            await self._discard(response)
+            await self._read_rejected_response(response)
             credentials = await self._auth_manager.get_credentials(force_refresh=True)
             response = await self._send_once(url, body, headers, credentials)
         if response.status_code != 200:
-            upstream_body = (await response.aread()).decode("utf-8", errors="replace")
-            await response.aclose()
+            upstream_body = (await self._read_rejected_response(response)).decode(
+                "utf-8", errors="replace"
+            )
             raise KimiUpstreamError(response.status_code, upstream_body)
         return response
 
@@ -96,6 +101,16 @@ class KimiClient:
         return await self._http_client.send(request, stream=True)
 
     @staticmethod
-    async def _discard(response: httpx.Response) -> None:
-        await response.aread()
+    async def _read_rejected_response(response: httpx.Response) -> bytes:
+        _shield_response_cleanup(response)
+        try:
+            body = await response.aread()
+        except BaseException:
+            # Cleanup is secondary to an in-flight read failure or cancellation.
+            try:
+                await response.aclose()
+            except Exception:
+                logger.warning("Kimi rejected response cleanup failed", exc_info=True)
+            raise
         await response.aclose()
+        return body
