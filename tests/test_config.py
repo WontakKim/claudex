@@ -67,17 +67,23 @@ def test_port_must_be_in_tcp_range(monkeypatch: pytest.MonkeyPatch, port: str) -
         GatewayConfig.from_env()
 
 
-def test_non_loopback_bind_requires_local_token(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("CLAUDEX_HOST", "0.0.0.0")
+@pytest.mark.parametrize("host", ["0.0.0.0", "::"])
+def test_non_loopback_bind_requires_local_token(
+    monkeypatch: pytest.MonkeyPatch, host: str
+) -> None:
+    monkeypatch.setenv("CLAUDEX_HOST", host)
     monkeypatch.delenv("CLAUDEX_LOCAL_TOKEN", raising=False)
     with pytest.raises(ConfigError, match="CLAUDEX_LOCAL_TOKEN"):
         GatewayConfig.from_env()
 
 
-def test_non_loopback_bind_accepts_local_token(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("CLAUDEX_HOST", "0.0.0.0")
+@pytest.mark.parametrize("host", ["0.0.0.0", "::"])
+def test_non_loopback_bind_accepts_local_token(
+    monkeypatch: pytest.MonkeyPatch, host: str
+) -> None:
+    monkeypatch.setenv("CLAUDEX_HOST", host)
     monkeypatch.setenv("CLAUDEX_LOCAL_TOKEN", "secret")
-    assert GatewayConfig.from_env().host == "0.0.0.0"
+    assert GatewayConfig.from_env().host == host
 
 
 def test_model_names_must_not_be_empty(monkeypatch: pytest.MonkeyPatch) -> None:

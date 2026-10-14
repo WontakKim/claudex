@@ -799,6 +799,34 @@ def _stub_full_stack_urlopen(
 # --- URL bracketing (IPv6-safe URL construction) ---------------------------
 
 
+@pytest.mark.parametrize(
+    ("host", "expected_url"),
+    [
+        ("::1", "http://[::1]:23456/api/hello"),
+        ("2001:db8::1", "http://[2001:db8::1]:23456/api/hello"),
+        ("127.0.0.1", "http://127.0.0.1:23456/api/hello"),
+        ("localhost", "http://localhost:23456/api/hello"),
+    ],
+)
+def test_daemon_hello_uses_reachable_bracketed_urls(
+    monkeypatch: pytest.MonkeyPatch, host: str, expected_url: str
+) -> None:
+    hello = {"hello": "claudex-gateway", "pid": 777, "nonce": "synthetic-nonce"}
+    requests: list[str] = []
+
+    def open_url(url: str, timeout: float) -> object:
+        assert timeout == 2
+        requests.append(url)
+        if url != expected_url:
+            raise urllib.error.URLError(ConnectionRefusedError("synthetic IPv6 URL is unreachable"))
+        return _FakeResponse(200, json.dumps(hello).encode())
+
+    monkeypatch.setattr(daemon.urllib.request, "urlopen", open_url)
+
+    assert daemon._gateway_hello(host, 23456) == hello, requests
+    assert requests == [expected_url]
+
+
 def test_bracket_host_leaves_ipv4_and_hostnames_unbracketed() -> None:
     assert admin_client._bracket_host("127.0.0.1") == "127.0.0.1"
     assert admin_client._bracket_host("example.com") == "example.com"
@@ -872,13 +900,112 @@ def test_probe_endpoint_converts_wildcard_record_host_via_connect_host(
     assert admin_client._probe_endpoint(config) == ("127.0.0.1", 9999)
 
 
-def test_probe_endpoint_converts_wildcard_config_host_when_no_record(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+@pytest.mark.parametrize("has_record", [False, True], ids=["foreground", "recorded"])
+@pytest.mark.parametrize(
+    ("bind_host", "probe_host"),
+    [
+        ("0.0.0.0", "127.0.0.1"),
+        ("::", "::1"),
+        ("127.0.0.1", "127.0.0.1"),
+        ("::1", "::1"),
+        ("192.0.2.1", "192.0.2.1"),
+        ("localhost", "localhost"),
+    ],
+)
+def test_probe_endpoint_preserves_reachable_address_family(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    has_record: bool, bind_host: str, probe_host: str,
 ) -> None:
-    monkeypatch.setattr(paths, "daemon_record_file", lambda: tmp_path / "gateway.pid")
-    config = GatewayConfig(host="::", port=8787, settings_file=tmp_path / "settings.json")
+    record_file = tmp_path / "gateway.pid"
+    monkeypatch.setattr(paths, "daemon_record_file", lambda: record_file)
+    monkeypatch.setenv("CLAUDEX_HOST", bind_host)
+    monkeypatch.setenv("CLAUDEX_PORT", "12345")
+    monkeypatch.setenv("CLAUDEX_LOCAL_TOKEN", "synthetic-local-token")
+    config = GatewayConfig.load(settings_file=tmp_path / "settings.json")
+    assert config.host == bind_host
+    assert config.local_token == "synthetic-local-token"
+    port = config.port
+    if has_record:
+        port = 23456
+        _write_record(record_file, pid=123, host=bind_host, port=port, nonce="synthetic-nonce")
+    expected_endpoint = (probe_host, port)
+    connections: list[tuple[str, int]] = []
 
-    assert admin_client._probe_endpoint(config) == ("127.0.0.1", 8787)
+    def connect(address: tuple[str, int], timeout: float) -> object:
+        assert timeout == 0.5
+        connections.append(address)
+        if address != expected_endpoint:
+            raise ConnectionRefusedError("synthetic listener has a different address family")
+        return contextlib.nullcontext()
+
+    monkeypatch.setattr(daemon.socket, "create_connection", connect)
+    endpoint = admin_client._probe_endpoint(config)
+
+    assert daemon._is_listening(*endpoint), connections
+    assert endpoint == expected_endpoint
+    assert connections == [expected_endpoint]
+
+
+@pytest.mark.parametrize("has_record", [False, True], ids=["foreground", "recorded"])
+@pytest.mark.parametrize("command", ["compact-off", "account-use-off"])
+@pytest.mark.parametrize("is_reachable", [True, False], ids=["online", "ambiguous"])
+def test_ipv6_live_admin_discovery_never_uses_direct_persistence(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    has_record: bool, command: str, is_reachable: bool,
+) -> None:
+    settings_file = tmp_path / "settings.json"
+    settings_file.write_text("{}\n", encoding="utf-8")
+    monkeypatch.setenv("CLAUDEX_HOST", "::")
+    monkeypatch.setenv("CLAUDEX_PORT", "12345")
+    monkeypatch.setenv("CLAUDEX_LOCAL_TOKEN", "synthetic-local-token")
+    config = GatewayConfig.load(settings_file=settings_file)
+    monkeypatch.setattr(GatewayConfig, "load", staticmethod(lambda *args, **kwargs: config))
+    record_file = tmp_path / "gateway.pid"
+    monkeypatch.setattr(paths, "daemon_record_file", lambda: record_file)
+    port = config.port
+    if has_record:
+        port = 23456
+        _write_record(record_file, pid=777, host="::", port=port, nonce="synthetic-nonce")
+    base_url = f"http://[::1]:{port}"
+    requests: list[tuple[str, str]] = []
+    admin_path = "/admin/settings/compaction" if command == "compact-off" else "/admin/providers/claude/pool/serving"
+    admin_method = "PUT" if command == "compact-off" else "DELETE"
+
+    def forbid_persistence(*arguments: object, **options: object) -> None:
+        raise AssertionError("IPv6 live or ambiguous discovery must not persist settings directly")
+
+    def open_url(request: urllib.request.Request | str, timeout: float) -> object:
+        url = request if isinstance(request, str) else request.full_url
+        method = "GET" if isinstance(request, str) else request.get_method()
+        requests.append((method, url))
+        if not url.startswith(base_url + "/"):
+            raise urllib.error.URLError(ConnectionRefusedError("no synthetic IPv4 listener"))
+        if not is_reachable:
+            raise urllib.error.URLError(TimeoutError("synthetic ambiguous listener"))
+        if url == base_url + "/api/hello":
+            return _FakeResponse(200, _HELLO_BODY)
+        assert (method, url) == (admin_method, base_url + admin_path)
+        assert request.get_header("Authorization") == "Bearer synthetic-local-token"
+        if command == "compact-off":
+            assert json.loads(request.data) == {"model": None}
+            body = {"model": None, "env_locked": False, "last_reroute": None}
+        else:
+            assert request.data is None
+            body = {"account_id": None, "env_locked": False}
+        return _FakeResponse(200, json.dumps(body).encode())
+
+    monkeypatch.setattr(compact, "update_settings_file", forbid_persistence)
+    monkeypatch.setattr(accounts, "update_settings_file", forbid_persistence)
+    monkeypatch.setattr(admin_client, "_urlopen_no_redirect", open_url)
+
+    result = compact._compact_main(["off"]) if command == "compact-off" else accounts._account_main(["use", "off"])
+
+    assert result == (0 if is_reachable else 1)
+    expected_requests = [("GET", base_url + "/api/hello")]
+    if is_reachable:
+        expected_requests.append((admin_method, base_url + admin_path))
+    assert requests == expected_requests
+    assert settings_file.read_text(encoding="utf-8") == "{}\n"
 
 
 # --- Probe classification: the four-way outcome grammar ---------------------

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import logging
 import os
@@ -41,7 +42,11 @@ def _load_config() -> GatewayConfig:
 
 def _connect_host(host: str) -> str:
     """Return the address to probe: wildcard binds answer on loopback."""
-    return "127.0.0.1" if host in ("0.0.0.0", "::") else host
+    if host == "0.0.0.0":
+        return "127.0.0.1"
+    if host == "::":
+        return "::1"
+    return host
 
 
 def _is_listening(host: str, port: int) -> bool:
@@ -52,10 +57,23 @@ def _is_listening(host: str, port: int) -> bool:
         return False
 
 
+def _bracket_host(host: str) -> str:
+    """Bracket an IPv6 literal for URL use; IPv4 addresses/hostnames pass through."""
+    try:
+        parsed = ipaddress.ip_address(host)
+    except ValueError:
+        return host
+    return f"[{host}]" if parsed.version == 6 else host
+
+
+def _http_url(host: str, port: int, path: str) -> str:
+    return f"http://{_bracket_host(host)}:{port}{path}"
+
+
 def _gateway_hello(host: str, port: int) -> dict[str, Any] | None:
     """Fetch /api/hello, or None when the occupant is not claudex-gateway."""
     try:
-        with urllib.request.urlopen(f"http://{host}:{port}/api/hello", timeout=2) as response:
+        with urllib.request.urlopen(_http_url(host, port, "/api/hello"), timeout=2) as response:
             payload = json.load(response)
     except (OSError, ValueError):
         return None
