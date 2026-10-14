@@ -338,6 +338,10 @@ function codexCapabilitiesEnvelope(tier = null, models = {}) {
   }};
 }
 
+function localTokenRejection(message = "Missing or invalid bearer token") {
+  return {error: {message, type: "authentication_error", param: null, code: "invalid_api_key"}};
+}
+
 async function main() {
   const html = fs.readFileSync(htmlPath, "utf8");
   const document = new FakeDocument(html);
@@ -1289,7 +1293,7 @@ async function main() {
         if (url === "/api/hello") body = {local_auth_required: true};
         else if (url.startsWith("/admin/") && !hasValidToken) {
           status = 401;
-          body = {error: {message: "Missing or invalid bearer token"}};
+          body = localTokenRejection();
         } else if (url === "/health") {
           body = {status: "ok", providers: {
             codex: {status: "ok", auth_mode: "chatgpt"},
@@ -2007,7 +2011,7 @@ async function main() {
         if (url === "/api/hello") body = {local_auth_required: authentication !== "none"};
         else if (url.startsWith("/admin/") && authentication !== "none" && !hasValidToken) {
           status = 401;
-          body = {error: {message: "synthetic invalid local token"}};
+          body = localTokenRejection("synthetic invalid local token");
         } else if (url === endpoint) return pendingCatalog.promise;
         else if (url === "/admin/settings/mapping") body = {model_map: savedMapping, env_locked: {model_map: locked}, custom_providers: []};
         else if (url === "/admin/settings/codex") body = {service_tier: "fast", env_locked: false};
@@ -2071,6 +2075,109 @@ async function main() {
     }
   }
 
+  const authErrorScopeStates = {wrappers: [], boots: [], concurrent: null};
+  const providerAuthFailure = {error: {message: "<Synthetic Codex credentials unavailable>", type: "authentication_error", param: null, code: null}};
+  const providerUpstreamFailure = {error: {message: "<Synthetic upstream catalog rejected>", type: "authentication_error", param: null, code: null}};
+  for (const [name, status, body, authRequired, target, promptAnswer] of [
+    ["provider-auth-cancel", 401, providerAuthFailure, true, "/admin/providers/codex/models", null],
+    ["provider-upstream-cancel", 401, providerUpstreamFailure, true, "/admin/providers/codex/models", null],
+    ["provider-auth-reenter", 401, providerAuthFailure, true, "/admin/providers/codex/models", "valid-local-token"],
+    ["unclassified-401", 401, {}, true, "/admin/providers/codex/models", null],
+    ["no-local-auth", 401, localTokenRejection(), false, "/admin/providers/codex/models", null],
+    ["non-admin", 401, localTokenRejection(), true, "/public/catalog", null],
+    ["non-401", 403, localTokenRejection(), true, "/admin/providers/codex/models", null],
+    ["local-retry", 401, localTokenRejection(), true, "/admin/settings/log-level", "valid-local-token"],
+    ["local-cancel", 401, localTokenRejection(), true, "/admin/settings/log-level", null],
+    ["local-repeated-rejection", 401, localTokenRejection(), true, "/admin/settings/log-level", "valid-local-token"],
+  ]) {
+    const scopeDocument = new FakeDocument(html);
+    const scopeContext = Object.assign({}, context, {document: scopeDocument});
+    vm.createContext(scopeContext);
+    vm.runInContext(source, scopeContext, {filename: javascriptPath});
+    scopeContext.authRequired = authRequired;
+    scopeContext.localToken = name.startsWith("local-") ? "wrong-local-token" : "valid-local-token";
+    const scopeRequests = [];
+    let prompts = 0;
+    scopeContext.window = Object.assign({}, context.window, {prompt: () => {prompts += 1; return promptAnswer;}});
+    scopeContext.fetch = async (url, options) => {
+      const hasValidToken = options?.headers?.Authorization === "Bearer valid-local-token";
+      scopeRequests.push({url, hasValidToken});
+      if (url === target) {
+        const shouldRecover = name === "local-retry" && hasValidToken;
+        return {ok: shouldRecover, status: shouldRecover ? 200 : status, json: async () => shouldRecover ? {loaded: true} : body};
+      }
+      return {ok: hasValidToken || url === "/health", status: hasValidToken || url === "/health" ? 200 : 401,
+        json: async () => hasValidToken || url === "/health" ? {loaded: true} : localTokenRejection()};
+    };
+    const response = await scopeContext.jfetch(target);
+    const requestsAtResponse = scopeRequests.slice();
+    const tokenRetained = scopeContext.localToken === "valid-local-token";
+    const tokenCleared = scopeContext.localToken === null;
+    const subsequent = await scopeContext.rawFetch("/admin/settings/codex");
+    await scopeContext.rawFetch("/health");
+    authErrorScopeStates.wrappers.push({name, status: response.status, body: response.body, prompts,
+      requestsAtResponse, tokenRetained, tokenCleared, subsequentStatus: subsequent.status,
+      subsequentRequests: scopeRequests.slice(requestsAtResponse.length)});
+  }
+  for (const [name, failure] of [["provider-auth", providerAuthFailure], ["provider-upstream", providerUpstreamFailure]]) {
+    const bootDocument = new FakeDocument(html);
+    const bootContext = Object.assign({}, context, {document: bootDocument, location: {host: "127.0.0.1:8787", hash: "#map"}});
+    vm.createContext(bootContext);
+    vm.runInContext(source, bootContext, {filename: javascriptPath});
+    let prompts = 0;
+    const bootRequests = [];
+    bootContext.window = Object.assign({}, context.window, {prompt: () => {prompts += 1; return prompts === 1 ? "valid-local-token" : null;}});
+    bootContext.fetch = async (url, options) => {
+      const hasValidToken = options?.headers?.Authorization === "Bearer valid-local-token";
+      bootRequests.push({url, hasValidToken});
+      let status = 200;
+      let body;
+      if (url === "/api/hello") body = {local_auth_required: true};
+      else if (url.startsWith("/admin/") && !hasValidToken) {status = 401; body = localTokenRejection();}
+      else if (url === "/admin/providers/codex/models") {status = 401; body = failure;}
+      else if (url === "/admin/settings/mapping") body = {model_map: {sonnet: "codex:saved-model"}, custom_providers: [], env_locked: {}};
+      else if (url === "/admin/settings/codex") body = {service_tier: "fast", env_locked: false};
+      else if (url === "/admin/providers/codex/capabilities") body = codexCapabilitiesEnvelope("fast").body;
+      else if (url === "/admin/settings/compaction") body = {model: null, env_locked: false};
+      else if (url === "/admin/providers/claude/pool/routing") body = {mode: "disabled", env_locked: false, include_local_login: true};
+      else if (url === "/health") body = {status: "ok", providers: {codex: {status: "ok", auth_mode: "chatgpt", ...(hasValidToken ? {email: "fixture-identity@example.invalid"} : {})}}};
+      else body = {models: [], log_level: "info"};
+      return {ok: status === 200, status, json: async () => body};
+    };
+    bootContext.boot();
+    await flushCodex();
+    const promptsAfterBoot = prompts;
+    const adminResponse = await bootContext.jfetch("/admin/settings/codex");
+    await bootContext.jfetch("/health");
+    authErrorScopeStates.boots.push({name, promptsAfterBoot, prompts, requests: bootRequests,
+      tokenRetained: bootContext.localToken === "valid-local-token", subsequentStatus: adminResponse.status,
+      mapping: {...bootContext.DIR.LIVE}, tier: bootContext.CODEX.serviceTier, hasLoaded: bootContext.CODEX.hasLoaded,
+      identity: bootDocument.getElementById("codex-statline").innerHTML,
+      feedback: bootDocument.getElementById("toast")?.innerHTML || ""});
+  }
+  const concurrentContext = Object.assign({}, context, {document: new FakeDocument(html)});
+  vm.createContext(concurrentContext);
+  vm.runInContext(source, concurrentContext, {filename: javascriptPath});
+  concurrentContext.authRequired = true;
+  concurrentContext.localToken = "wrong-local-token";
+  const pendingLocalRejection = createDeferred();
+  const concurrentRequests = [];
+  let concurrentPrompts = 0;
+  let slowRequests = 0;
+  concurrentContext.window = Object.assign({}, context.window, {prompt: () => {concurrentPrompts += 1; return "valid-local-token";}});
+  concurrentContext.fetch = async (url, options) => {
+    const hasValidToken = options?.headers?.Authorization === "Bearer valid-local-token";
+    concurrentRequests.push({url, hasValidToken});
+    if (url === "/admin/settings/log-level" && ++slowRequests === 1) return pendingLocalRejection.promise;
+    return {ok: hasValidToken, status: hasValidToken ? 200 : 401, json: async () => hasValidToken ? {loaded: true} : localTokenRejection()};
+  };
+  const slow = concurrentContext.jfetch("/admin/settings/log-level");
+  const corrected = await concurrentContext.jfetch("/admin/settings/codex");
+  pendingLocalRejection.resolve({ok: false, status: 401, json: async () => localTokenRejection()});
+  const stale = await slow;
+  authErrorScopeStates.concurrent = {prompts: concurrentPrompts, correctedStatus: corrected.status, staleStatus: stale.status,
+    tokenRetained: concurrentContext.localToken === "valid-local-token", requests: concurrentRequests};
+
   const output = {credentialLeak};
   if (!credentialLeak) {
     Object.assign(output, {
@@ -2087,6 +2194,7 @@ async function main() {
       codexBootFailureStates,
       optionalCatalogBoot,
       healthAuthenticationBoot,
+      authErrorScopeStates,
       localHeroStates,
       localHeroLoadOrder,
       routingEnvelopeValidation,

@@ -327,8 +327,15 @@ behavior, or status semantics.
 When `CLAUDEX_LOCAL_TOKEN` is set, the dashboard prompts for it once per page
 load and retains it in an in-memory closure for that page only. It is attached
 as a bearer header to admin requests and is never written to the DOM, a URL,
-`localStorage`, `sessionStorage`, console output, or gateway logs. When an
-admin request returns `401`, the dashboard prompts once more and retries that
-request once. This page-only token handling is separate from MCP registration,
+`localStorage`, `sessionStorage`, console output, or gateway logs. When the
+local gateway guard rejects an admin request with `401` and
+`error.code: invalid_api_key`, the dashboard prompts once more and retries that
+request once. Cancelling leaves the local token unset; a concurrent stale
+rejection cannot discard a token already corrected by another request.
+Provider authentication failures can also return `401`, but remain provider
+errors: the dashboard reports them without clearing the valid local token,
+asking for it again, or retrying the provider request. Check the failing
+provider's login rather than re-entering `CLAUDEX_LOCAL_TOKEN`.
+This page-only token handling is separate from MCP registration,
 which persists the gateway's configured token in Claude Code's MCP settings as
 described above.

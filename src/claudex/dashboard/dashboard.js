@@ -710,7 +710,9 @@ function rawFetch(url,opts){
 function jfetch(url,opts){
   var requestToken=localToken;
   return rawFetch(url,opts).then(function(r){
-    if(r.status!==401||url.indexOf("/admin/")!==0||!authRequired)return r;
+    // The local-token guard identifies its rejection with invalid_api_key; providers can also return 401.
+    if(r.status!==401||url.indexOf("/admin/")!==0||!authRequired||
+      !r.body||!r.body.error||r.body.error.code!=="invalid_api_key")return r;
     // A stale failure must not discard a token corrected by another request.
     if(localToken!==requestToken)return rawFetch(url,opts);
     localToken=null;   // wrong or missing token: ask once, retry once, no loop

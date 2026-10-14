@@ -1769,3 +1769,77 @@ def test_optional_catalog_boot_preserves_core_state_and_authentication(
         assert "manually" in message
     else:
         assert scenario["toast"] == {"html": "", "role": ""}
+
+
+@pytest.mark.parametrize("name", ["provider-auth-cancel", "provider-upstream-cancel", "provider-auth-reenter", "unclassified-401"])
+def test_provider_401_retains_local_token_without_prompt_or_retry(
+    dashboard_runtime_result: dict[str, Any], name: str,
+) -> None:
+    scenario = next(row for row in dashboard_runtime_result["authErrorScopeStates"]["wrappers"] if row["name"] == name)
+    assert scenario["status"] == 401
+    assert scenario["prompts"] == 0
+    assert scenario["requestsAtResponse"] == [{"url": "/admin/providers/codex/models", "hasValidToken": True}]
+    assert scenario["tokenRetained"] is True
+    assert scenario["tokenCleared"] is False
+    assert scenario["subsequentStatus"] == 200
+    assert scenario["subsequentRequests"] == [
+        {"url": "/admin/settings/codex", "hasValidToken": True}, {"url": "/health", "hasValidToken": True},
+    ]
+    if name != "unclassified-401":
+        assert scenario["body"]["error"]["type"] == "authentication_error"
+        assert scenario["body"]["error"]["code"] is None
+        assert "Synthetic" in scenario["body"]["error"]["message"]
+
+
+@pytest.mark.parametrize("name", ["provider-auth", "provider-upstream"])
+def test_provider_401_boot_surfaces_provider_failure_and_keeps_authenticated_core(
+    dashboard_runtime_result: dict[str, Any], name: str,
+) -> None:
+    scenario = next(row for row in dashboard_runtime_result["authErrorScopeStates"]["boots"] if row["name"] == name)
+    assert scenario["promptsAfterBoot"] == scenario["prompts"] == 1
+    assert scenario["tokenRetained"] is True
+    assert scenario["subsequentStatus"] == 200
+    assert scenario["mapping"] == {"sonnet": "codex:saved-model"}
+    assert scenario["tier"] == "fast"
+    assert scenario["hasLoaded"] is True
+    assert "fixture-identity@example.invalid" in scenario["identity"]
+    assert "GET /admin/providers/codex/models" in scenario["feedback"]
+    assert "401" in scenario["feedback"]
+    assert "&lt;Synthetic" in scenario["feedback"]
+    assert len([row for row in scenario["requests"] if row["url"] == "/admin/providers/codex/models"]) == 1
+    assert all(row["hasValidToken"] for row in scenario["requests"] if row["url"] != "/api/hello")
+    assert all(row["url"] != "/admin/test" for row in scenario["requests"])
+
+
+@pytest.mark.parametrize("name", ["no-local-auth", "non-admin", "non-401", "local-retry", "local-cancel", "local-repeated-rejection"])
+def test_local_token_recovery_remains_bounded_and_respects_existing_guards(
+    dashboard_runtime_result: dict[str, Any], name: str,
+) -> None:
+    scenario = next(row for row in dashboard_runtime_result["authErrorScopeStates"]["wrappers"] if row["name"] == name)
+    is_local = name.startswith("local-")
+    assert scenario["prompts"] == (1 if is_local else 0)
+    assert len(scenario["requestsAtResponse"]) == (2 if name in ("local-retry", "local-repeated-rejection") else 1)
+    assert scenario["status"] == (200 if name == "local-retry" else 403 if name == "non-401" else 401)
+    assert scenario["tokenCleared"] is (name == "local-cancel")
+    assert scenario["tokenRetained"] is (name != "local-cancel")
+    assert scenario["subsequentStatus"] == (401 if name == "local-cancel" else 200)
+    assert all(row["hasValidToken"] is (name != "local-cancel") for row in scenario["subsequentRequests"])
+    if name == "non-admin":
+        assert scenario["requestsAtResponse"] == [{"url": "/public/catalog", "hasValidToken": False}]
+    if name in ("local-retry", "local-repeated-rejection"):
+        assert [row["hasValidToken"] for row in scenario["requestsAtResponse"]] == [False, True]
+
+
+def test_concurrent_stale_local_rejection_does_not_discard_the_corrected_token(
+    dashboard_runtime_result: dict[str, Any],
+) -> None:
+    scenario = dashboard_runtime_result["authErrorScopeStates"]["concurrent"]
+    assert scenario["prompts"] == 1
+    assert scenario["correctedStatus"] == scenario["staleStatus"] == 200
+    assert scenario["tokenRetained"] is True
+    assert scenario["requests"] == [
+        {"url": "/admin/settings/log-level", "hasValidToken": False},
+        {"url": "/admin/settings/codex", "hasValidToken": False},
+        {"url": "/admin/settings/codex", "hasValidToken": True},
+        {"url": "/admin/settings/log-level", "hasValidToken": True},
+    ]
