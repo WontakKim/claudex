@@ -569,7 +569,10 @@ def build_function_validation_schemas(tool_state: ToolState, payload: dict[str, 
     return schemas
 
 
-def _image_data_url(source: dict[str, Any]) -> str | None:
+def _image_url(source: dict[str, Any]) -> str | None:
+    if source.get("type") == "url":
+        url = source.get("url")
+        return url if isinstance(url, str) else None
     data = source.get("data") or source.get("base64")
     if not data:
         return None
@@ -618,9 +621,9 @@ def _translate_tool_result_output(
         if block.get("type") == "text":
             items.append({"type": "input_text", "text": block.get("text", "")})
         elif block.get("type") == "image":
-            data_url = _image_data_url(block.get("source") or {})
-            if data_url:
-                items.append({"type": "input_image", "image_url": data_url})
+            image_url = _image_url(block.get("source") or {})
+            if image_url:
+                items.append({"type": "input_image", "image_url": image_url})
         elif block.get("type") == "document":
             raise TranslationError(
                 "document blocks inside tool_result content are not supported "
@@ -761,9 +764,9 @@ def _translate_messages(
             elif block_type == "document":
                 content_parts.append(_translate_document_block(block, role))
             elif block_type == "image":
-                data_url = _image_data_url(block.get("source") or {})
-                if data_url:
-                    content_parts.append({"type": "input_image", "image_url": data_url})
+                image_url = _image_url(block.get("source") or {})
+                if image_url:
+                    content_parts.append({"type": "input_image", "image_url": image_url})
             elif block_type == "thinking":
                 if role != "assistant":
                     continue

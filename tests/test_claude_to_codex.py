@@ -568,30 +568,194 @@ def test_malformed_carrier_dropped_fail_closed() -> None:
     assert "extra_content" not in _find_items(payload, "function_call")[0]
 
 
-def test_image_block_becomes_data_url() -> None:
+@pytest.mark.parametrize(
+    ("source", "image_url"),
+    [
+        ({"type": "base64", "media_type": "image/png", "data": "aGVsbG8="},
+         "data:image/png;base64,aGVsbG8="),
+        ({"base64": "aGVsbG8=", "mime_type": "image/jpeg"},
+         "data:image/jpeg;base64,aGVsbG8="),
+        ({"data": "aGVsbG8="}, "data:application/octet-stream;base64,aGVsbG8="),
+    ],
+    ids=["base64", "legacy-base64", "legacy-data"],
+)
+def test_image_block_becomes_data_url(source: dict, image_url: str) -> None:
     payload = translate_claude_request_to_codex(
         {
             "messages": [
                 {
                     "role": "user",
-                    "content": [
-                        {
-                            "type": "image",
-                            "source": {
-                                "type": "base64",
-                                "media_type": "image/png",
-                                "data": "aGVsbG8=",
-                            },
-                        }
-                    ],
+                    "content": [{"type": "image", "source": source}],
                 }
             ]
         },
         codex_model="gpt-5.5",
     )
     assert payload["input"][0]["content"] == [
-        {"type": "input_image", "image_url": "data:image/png;base64,aGVsbG8="}
+        {"type": "input_image", "image_url": image_url}
     ]
+
+
+def test_url_image_block_preserves_source_url() -> None:
+    request = {
+        "max_tokens": 64,
+        "messages": [{"role": "user", "content": [{
+            "type": "image",
+            "source": {"type": "url", "url": "https://example.invalid/picture.png"},
+        }]}],
+    }
+    original = deepcopy(request)
+
+    payload = translate_claude_request_to_codex(request, codex_model="gpt-5.5")
+
+    assert payload["input"] == [{
+        "type": "message",
+        "role": "user",
+        "content": [{
+            "type": "input_image", "image_url": "https://example.invalid/picture.png",
+        }],
+    }]
+    assert request == original
+
+
+@pytest.mark.parametrize("source", [
+    {"url": "https://example.invalid/picture.png"},
+    {"type": "file", "url": "https://example.invalid/picture.png"},
+    {"type": "base64", "url": "https://example.invalid/picture.png"},
+    {"type": "url", "url": None},
+    {"type": "url", "url": 123},
+])
+def test_url_image_requires_explicit_type_and_string_url(source: dict) -> None:
+    payload = translate_claude_request_to_codex(
+        {"messages": [{"role": "user", "content": [
+            {"type": "image", "source": source},
+        ]}]},
+        codex_model="gpt-5.5",
+    )
+
+    assert payload["input"] == []
+
+
+@pytest.mark.parametrize("custom_provider", [None, "custom-openai"])
+def test_mixed_user_images_preserve_order_through_validation(
+    custom_provider: str | None,
+) -> None:
+    from claudex.relay.openai_backend import _validate_mapped_claude_request
+    from claudex.translate.tool_protocol import compile_tool_state
+
+    url = "https://example.invalid/picture%20one.png?label=a%2Bb#preview"
+    request = {
+        "max_tokens": 64,
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "Compare these pictures."},
+            {"type": "image", "source": {"type": "url", "url": url}},
+            {"type": "text", "text": "With this one."},
+            {"type": "image", "source": {
+                "type": "base64", "media_type": "image/png", "data": "aGVsbG8=",
+            }},
+            {"type": "image", "source": {
+                "type": "url", "url": "https://example.invalid/picture-two.jpg",
+            }},
+            {"type": "text", "text": "Keep their order."},
+        ]}],
+    }
+    original = deepcopy(request)
+    assert _validate_mapped_claude_request(request) is None
+    tool_state = compile_tool_state(request)
+
+    payload = translate_claude_request_to_codex(
+        request, codex_model="gpt-5.5", custom_provider=custom_provider,
+        tool_state=tool_state,
+    )
+
+    assert payload["input"] == [{
+        "type": "message",
+        "role": "user",
+        "content": [
+            {"type": "input_text", "text": "Compare these pictures."},
+            {"type": "input_image", "image_url": url},
+            {"type": "input_text", "text": "With this one."},
+            {"type": "input_image", "image_url": "data:image/png;base64,aGVsbG8="},
+            {"type": "input_image", "image_url": "https://example.invalid/picture-two.jpg"},
+            {"type": "input_text", "text": "Keep their order."},
+        ],
+    }]
+    assert request == original
+
+
+@pytest.mark.parametrize("custom_provider", [None, "custom-openai"])
+@pytest.mark.parametrize("is_error", [False, True], ids=["success", "error"])
+@pytest.mark.parametrize("is_mixed", [False, True], ids=["image-only", "mixed"])
+@pytest.mark.parametrize(
+    ("source", "image_url"),
+    [
+        ({"type": "url", "url": "https://example.invalid/picture.png"},
+         "https://example.invalid/picture.png"),
+        ({"type": "base64", "media_type": "image/png", "data": "aGVsbG8="},
+         "data:image/png;base64,aGVsbG8="),
+        ({"base64": "aGVsbG8=", "mime_type": "image/jpeg"},
+         "data:image/jpeg;base64,aGVsbG8="),
+        ({"data": "aGVsbG8="}, "data:application/octet-stream;base64,aGVsbG8="),
+    ],
+    ids=["url", "base64", "legacy-base64", "legacy-data"],
+)
+def test_tool_result_images_preserve_content_through_validation(
+    source: dict, image_url: str, is_mixed: bool, is_error: bool,
+    custom_provider: str | None,
+) -> None:
+    from claudex.relay.openai_backend import _validate_mapped_claude_request
+    from claudex.translate.tool_protocol import compile_tool_state
+
+    content = [{"type": "image", "source": source}]
+    expected_output = [{"type": "input_image", "image_url": image_url}]
+    if is_mixed:
+        content = [
+            {"type": "text", "text": "Before the picture."},
+            *content,
+            {"type": "text", "text": "After the picture."},
+        ]
+        expected_output = [
+            {"type": "input_text", "text": "Before the picture."},
+            *expected_output,
+            {"type": "input_text", "text": "After the picture."},
+        ]
+    if is_error:
+        expected_output.insert(0, {"type": "input_text", "text": "[tool error]"})
+    request = {
+        "max_tokens": 64,
+        "tools": [{"name": "get_picture", "input_schema": {"type": "object"}}],
+        "messages": [
+            {"role": "user", "content": "Get the picture."},
+            {"role": "assistant", "content": [{
+                "type": "tool_use", "id": "toolu_picture", "name": "get_picture",
+                "input": {},
+            }]},
+            {"role": "user", "content": [{
+                "type": "tool_result", "tool_use_id": "toolu_picture",
+                "content": content, "is_error": is_error,
+            }]},
+        ],
+    }
+    original = deepcopy(request)
+    assert _validate_mapped_claude_request(request) is None
+    tool_state = compile_tool_state(request)
+
+    payload = translate_claude_request_to_codex(
+        request, codex_model="gpt-5.5", custom_provider=custom_provider,
+        tool_state=tool_state,
+    )
+
+    assert payload["input"] == [
+        {"type": "message", "role": "user", "content": [
+            {"type": "input_text", "text": "Get the picture."},
+        ]},
+        {"type": "function_call", "call_id": "toolu_picture", "name": "get_picture",
+         "arguments": "{}"},
+        {"type": "function_call_output", "call_id": "toolu_picture",
+         "output": expected_output},
+    ]
+    assert [tool["name"] for tool in payload["tools"]] == ["get_picture"]
+    assert request == original
 
 
 def test_tools_are_normalized_and_web_search_translated() -> None:
