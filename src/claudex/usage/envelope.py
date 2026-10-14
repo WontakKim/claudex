@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import logging
 import time
 from datetime import datetime
@@ -82,7 +81,7 @@ async def fetch_usage_payload(
         )
     try:
         data = response.json()
-    except json.JSONDecodeError:
+    except ValueError:
         return (
             None,
             provider_result(

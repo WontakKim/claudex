@@ -3526,6 +3526,76 @@ def test_admin_usage_returns_all_providers(monkeypatch: pytest.MonkeyPatch, tmp_
     assert calls == ["claude", "codex", "kimi", "grok"]
 
 
+@pytest.mark.parametrize(
+    "response_body",
+    [
+        pytest.param(b'{"plan_type":"\xff"}', id="invalid-utf8"),
+        pytest.param(b'{"count":' + b"9" * 5000 + b"}", id="integer-conversion-limit"),
+    ],
+)
+def test_admin_usage_isolates_json_decode_failures(
+    monkeypatch: pytest.MonkeyPatch, response_body: bytes,
+) -> None:
+    claude_result = {"provider": "claude", "status": "ok", "error": None,
+                     "session": {"used_percent": 12, "window_minutes": 300}}
+    grok_result = {"provider": "grok", "status": "ok", "error": None,
+                   "weekly": {"used_percent": 34, "window_minutes": 10080}}
+    codex_requests: list[str] = []
+
+    async def fake_claude(http_client: Any) -> dict[str, Any]:
+        return claude_result
+
+    async def fake_grok(http_client: Any, auth_manager: Any) -> dict[str, Any]:
+        return grok_result
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "GET"
+        assert request.headers["authorization"] == "Bearer codex"
+        codex_requests.append(str(request.url))
+        return httpx.Response(
+            200, content=response_body, headers={"Content-Type": "application/json"}
+        )
+
+    monkeypatch.setattr(admin_system, "fetch_claude_usage", fake_claude)
+    monkeypatch.setattr(admin_system, "fetch_grok_usage", fake_grok)
+
+    async def scenario() -> Any:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+            state = SimpleNamespace(
+                config=GatewayConfig(),
+                http_client=http_client,
+                codex_auth_manager=AvailableCodexAuthManager(),
+                kimi_auth_manager=MissingKimiAuthManager(),
+                grok_auth_manager=AvailableGrokAuthManager(),
+            )
+            request = Request({
+                "type": "http",
+                "method": "GET",
+                "scheme": "http",
+                "path": "/admin/usage",
+                "query_string": b"",
+                "headers": [(b"host", b"127.0.0.1:8787")],
+                "app": SimpleNamespace(state=state),
+            })
+            return await admin_system._handle_admin_usage(request)
+
+    response = asyncio.run(scenario())
+    assert response.status_code == 200
+    body = json.loads(response.body)
+    assert body["claude"] == claude_result
+    assert body["grok"] == grok_result
+    assert body["codex"]["provider"] == "codex"
+    assert body["codex"]["status"] == "error"
+    assert body["codex"]["error"] == "usage API returned a non-JSON body"
+    assert body["codex"]["session"] is None
+    assert body["codex"]["weekly"] is None
+    assert body["codex"]["plan_type"] is None
+    assert body["kimi"]["status"] == "unavailable"
+    assert "no Kimi credentials" in body["kimi"]["error"]
+    assert body["fetched_at"] > 0
+    assert codex_requests == ["https://chatgpt.com/backend-api/wham/usage"]
+
+
 def test_admin_usage_refuses_foreign_host(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
         assert client.get("/admin/usage").status_code == 403

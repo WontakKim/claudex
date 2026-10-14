@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import threading
 import time
 from pathlib import Path
@@ -59,6 +60,97 @@ class ChatGPTCredentials:
 class MissingCredentials:
     async def get_credentials(self, force_refresh: bool = False) -> CodexCredentials:
         raise CodexAuthError("missing Codex credentials")
+
+
+def _fetch_usage_payload(
+    http_client: httpx.AsyncClient,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None, httpx.Response | None]:
+    return _run(usage_envelope.fetch_usage_payload(
+        http_client,
+        "https://usage.example/api",
+        {"Authorization": "Bearer synthetic-token"},
+        provider="codex",
+        api_label="ChatGPT",
+        special_statuses={401: "usage access denied"},
+        logger=logging.getLogger(__name__),
+    ))
+
+
+@pytest.mark.parametrize(
+    "status_code,body,expected_data,expected_error",
+    [
+        pytest.param(200, b'{"plan_type":"pro-\xce\xbb","label":"caf\xc3\xa9"}',
+                     {"plan_type": "pro-λ", "label": "café"}, None, id="unicode-object"),
+        pytest.param(200, b"{}", {}, None, id="empty-object"),
+        pytest.param(200, b'{"plan_type":"\xff"}', None, "usage API returned a non-JSON body", id="invalid-utf8"),
+        pytest.param(200, b'{"count":' + b"9" * 5000 + b"}", None,
+                     "usage API returned a non-JSON body", id="integer-conversion-limit"),
+        pytest.param(200, b"not json", None, "usage API returned a non-JSON body", id="syntax-error"),
+        pytest.param(200, b"[]", None, "usage API returned an unexpected payload", id="array-root"),
+        pytest.param(200, b"null", None, "usage API returned an unexpected payload", id="null-root"),
+        pytest.param(200, b"42", None, "usage API returned an unexpected payload", id="number-root"),
+        pytest.param(200, b'"text"', None, "usage API returned an unexpected payload", id="string-root"),
+        pytest.param(401, b"denied", None, "usage access denied", id="special-status"),
+        pytest.param(500, b"offline", None, "usage API returned 500: offline", id="http-error"),
+    ],
+)
+def test_fetch_usage_payload_preserves_response_contract(
+    status_code: int, body: bytes, expected_data: dict[str, Any] | None,
+    expected_error: str | None,
+) -> None:
+    response = httpx.Response(status_code, content=body, headers={"Content-Type": "application/json"})
+    data, error_result, returned_response = _fetch_usage_payload(_mock_client(lambda request: response))
+
+    assert returned_response is response
+    assert returned_response.content == body
+    assert data == expected_data
+    if expected_error is None:
+        assert error_result is None
+        return
+    assert error_result is not None
+    assert error_result["updated_at"] > 0
+    assert {key: value for key, value in error_result.items() if key != "updated_at"} == {
+        "provider": "codex",
+        "status": "error",
+        "error": expected_error,
+        "session": None,
+        "weekly": None,
+        "plan_type": None,
+        "reset_credits_available": None,
+        "fable_weekly": None,
+        "monthly": None,
+    }
+
+
+def test_fetch_usage_payload_transport_error_has_no_response() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("offline", request=request)
+
+    data, error_result, response = _fetch_usage_payload(_mock_client(handler))
+    assert data is None
+    assert response is None
+    assert error_result is not None
+    assert error_result["status"] == "error"
+    assert error_result["error"] == "failed to reach the ChatGPT usage API: offline"
+
+
+def test_fetch_usage_payload_propagates_cancellation() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        raise asyncio.CancelledError()
+
+    with pytest.raises(asyncio.CancelledError):
+        _fetch_usage_payload(httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+
+
+def test_fetch_usage_payload_propagates_runtime_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    response = httpx.Response(200, json={})
+
+    def fail_json() -> None:
+        raise RuntimeError("decoder failed")
+
+    monkeypatch.setattr(response, "json", fail_json)
+    with pytest.raises(RuntimeError, match="decoder failed"):
+        _fetch_usage_payload(_mock_client(lambda request: response))
 
 
 # ---------------------------------------------------------------------------
