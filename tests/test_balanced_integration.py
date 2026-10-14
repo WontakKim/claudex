@@ -27,11 +27,12 @@ import json
 import sqlite3
 import time
 import uuid
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import anyio
 import httpx
 import pytest
 from starlette.responses import JSONResponse
@@ -302,6 +303,103 @@ class _FakeClock:
 
     def advance(self, seconds: float) -> None:
         self.value += seconds
+
+
+@pytest.mark.parametrize("routing_path", ["fallback", "balanced-stateless", "balanced-pinned"])
+@pytest.mark.parametrize("has_cleanup_error", [False, True], ids=["close-ok", "close-error"])
+def test_quota_read_cancellation_closes_before_propagating(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, routing_path: str, has_cleanup_error: bool
+) -> None:
+    _balanced_env(monkeypatch, tmp_path)
+    account_id = _register_balanced_ready_account()
+    config = GatewayConfig(
+        claude_account_id=account_id,
+        claude_account_routing_mode="fallback" if routing_path == "fallback" else "balanced",
+        settings_file=tmp_path / "settings.json",
+        claude_account_include_local_login=False,
+    )
+    calls: list[httpx.Request] = []
+
+    async def exercise_request(client: TestClient) -> None:
+        read_started = anyio.Event()
+        never_finish_read = anyio.Event()
+        request_scopes: list[anyio.CancelScope] = []
+        responses: list[httpx.Response] = []
+        cleanup_seen_at_cancellation: list[bool] = []
+
+        class BlockingQuotaStream(httpx.AsyncByteStream):
+            def __init__(self) -> None:
+                self.close_calls = 0
+                self.is_close_complete = False
+
+            async def __aiter__(self) -> AsyncIterator[bytes]:
+                yield b'{"type":"error","error":'
+                read_started.set()
+                await never_finish_read.wait()
+
+            async def aclose(self) -> None:
+                self.close_calls += 1
+                await anyio.sleep(0)
+                self.is_close_complete = True
+                if has_cleanup_error:
+                    raise RuntimeError("quota response close failed")
+
+        stream = BlockingQuotaStream()
+        upstream = httpx.Response(429, headers={"retry-after": "3600"}, stream=stream)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.method == "GET" and request.url.path == "/api/oauth/usage":
+                return httpx.Response(200, json={})
+            assert request.method == "POST" and request.url.path == "/v1/messages"
+            calls.append(request)
+            return upstream
+
+        client.app.state.http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        body = (
+            _balanced_body(str(uuid.uuid4()))
+            if routing_path == "balanced-pinned"
+            else _message_body("claude-sonnet-5")
+        )
+
+        async def read_request() -> None:
+            with anyio.CancelScope() as request_scope:
+                request_scopes.append(request_scope)
+                try:
+                    async with httpx.AsyncClient(
+                        transport=httpx.ASGITransport(app=client.app), base_url="http://testserver"
+                    ) as async_client:
+                        responses.append(await async_client.post("/v1/messages", json=body))
+                except asyncio.CancelledError:
+                    cleanup_seen_at_cancellation.append(stream.is_close_complete)
+                    raise
+
+        try:
+            with anyio.fail_after(2):
+                async with anyio.create_task_group() as group:
+                    group.start_soon(read_request)
+                    await read_started.wait()
+                    request_scopes[0].cancel()
+            assert cleanup_seen_at_cancellation == [True]
+            assert responses == []
+            assert upstream.is_closed
+            assert stream.close_calls == 1
+            assert len(calls) == 1
+            assert not client.app.state.claude_account_cooldowns.is_cooling(account_id)
+            assert not client.app.state.claude_usage_refresh_tasks
+            if routing_path != "fallback":
+                runtime = client.app.state.claude_balanced_runtime
+                assert runtime._active_requests == 0
+                assert runtime.router.in_flight_count(account_id) == 0
+                assert runtime.router.account_cooldown_deadline(account_id) is None
+                assert runtime.router.family_cooldown_deadline(account_id, "sonnet") is None
+        finally:
+            await upstream.aclose()
+            if not stream.is_close_complete:
+                await stream.aclose()
+
+    with _create_test_client(monkeypatch, config=config) as client:
+        assert client.portal is not None
+        client.portal.call(exercise_request, client)
 
 
 # ===========================================================================

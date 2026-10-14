@@ -50,6 +50,7 @@ from claudex.claude.session_fingerprint import (
     load_or_create_fingerprint_seed,
     observability_session_fingerprint,
 )
+from claudex.providers.client_support import _shield_response_cleanup
 from claudex.relay.common import (
     _MANAGED_RELAY_SKIP_REQUEST_HEADERS,
     _OAUTH_BETA,
@@ -293,6 +294,24 @@ async def _attempt_with_account(
                     ),
                     content,
                 )
+            if upstream_response.status_code == 429 and rate_limit_failover:
+                _shield_response_cleanup(upstream_response)
+                # Preserve the occurrence-aware collection for evidence capture. The
+                # replay path needs its own plain mapping after httpx has decoded the
+                # buffered response.
+                response_headers = upstream_response.headers
+                replay_headers = dict(response_headers)
+                try:
+                    response_body = await upstream_response.aread()
+                except BaseException:
+                    # Cleanup must not replace a read failure or cancellation.
+                    try:
+                        await upstream_response.aclose()
+                    except Exception:
+                        logger.warning("quota response cleanup failed", exc_info=True)
+                    raise
+                else:
+                    await upstream_response.aclose()
         except httpx.HTTPError as exc:
             logger.warning("anthropic passthrough failed: %s", exc)
             return JSONResponse(
@@ -326,13 +345,6 @@ async def _attempt_with_account(
                 )
             )
         if upstream_response.status_code == 429 and rate_limit_failover:
-            # Preserve the occurrence-aware collection for evidence capture. The
-            # replay path needs its own plain mapping after httpx has decoded the
-            # buffered response.
-            response_headers = upstream_response.headers
-            replay_headers = dict(response_headers)
-            response_body = await upstream_response.aread()
-            await upstream_response.aclose()
             cooldown_decision = rate_limit_cooldown_decision(
                 response_headers,
                 response_body,

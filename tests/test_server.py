@@ -1481,6 +1481,198 @@ def _account_body(model: str = "claude-fable-5") -> dict[str, Any]:
     return body
 
 
+@pytest.mark.parametrize("routing_path", ["fallback", "balanced-stateless", "balanced-pinned"])
+@pytest.mark.parametrize("error_type", [httpx.ReadError, httpx.ReadTimeout])
+@pytest.mark.parametrize(
+    "cleanup_error_type", [None, RuntimeError, httpx.ReadError],
+    ids=["close-ok", "close-error", "close-http-error"],
+)
+def test_quota_read_failure_is_terminal_and_closes_response(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    routing_path: str,
+    error_type: type[httpx.HTTPError],
+    cleanup_error_type: type[Exception] | None,
+) -> None:
+    _balanced_env(monkeypatch, tmp_path)
+    first = _register_serving_account(
+        email="first@example.com", account_uuid="11111111-2222-3333-4444-555555555555"
+    )
+    second = _register_serving_account(
+        email="second@example.com", account_uuid="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+        access_token="pool-access-2",
+    )
+    calls: list[str] = []
+    caplog.set_level(logging.INFO, logger="claudex.server")
+
+    class BrokenQuotaStream(httpx.AsyncByteStream):
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        async def __aiter__(self) -> AsyncIterator[bytes]:
+            yield b'{"type":"error","error":'
+            raise error_type("quota response read failed")
+
+        async def aclose(self) -> None:
+            self.close_calls += 1
+            await asyncio.sleep(0)
+            if cleanup_error_type is not None:
+                raise cleanup_error_type("quota response close failed")
+
+    stream = BrokenQuotaStream()
+    upstream = httpx.Response(429, headers={"retry-after": "3600"}, stream=stream)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/api/oauth/usage":
+            return httpx.Response(200, json={})
+        assert request.method == "POST" and request.url.path == "/v1/messages"
+        calls.append(request.headers["authorization"])
+        return upstream if len(calls) == 1 else httpx.Response(200, json={"id": "unexpected"})
+
+    config = GatewayConfig(
+        claude_account_id=first,
+        claude_account_routing_mode="fallback" if routing_path == "fallback" else "balanced",
+        claude_account_include_local_login=False,
+        settings_file=tmp_path / "settings.json",
+    )
+    with _create_test_client(monkeypatch, tmp_path, config=config) as client:
+        client.app.state.http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        body = (
+            _balanced_body(str(uuid.uuid4()), model="claude-sonnet-5")
+            if routing_path == "balanced-pinned"
+            else _message_body("claude-sonnet-5")
+        )
+
+        async def exercise_request() -> httpx.Response:
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=client.app, raise_app_exceptions=False),
+                base_url="http://testserver",
+            ) as async_client:
+                return await async_client.post("/v1/messages", json=body)
+
+        assert client.portal is not None
+        try:
+            response = client.portal.call(exercise_request)
+            assert response.status_code == 502
+            assert response.json() == {
+                "type": "error",
+                "error": {
+                    "type": "api_error",
+                    "message": "failed to reach the Anthropic API: quota response read failed",
+                },
+            }
+            assert upstream.is_closed
+            assert stream.close_calls == 1
+            assert len(calls) == 1
+            if routing_path == "fallback":
+                assert calls == ["Bearer pool-access-1"]
+            else:
+                runtime = client.app.state.claude_balanced_runtime
+                assert runtime._active_requests == 0
+                for account_id in (first, second):
+                    assert runtime.router.in_flight_count(account_id) == 0
+                    assert runtime.router.account_cooldown_deadline(account_id) is None
+                    assert runtime.router.family_cooldown_deadline(account_id, "sonnet") is None
+            assert not client.app.state.claude_account_cooldowns.is_cooling(first)
+            assert not client.app.state.claude_account_cooldowns.is_cooling(second)
+            assert not client.app.state.claude_usage_refresh_tasks
+            leg_records = [
+                json.loads(record.getMessage()) for record in caplog.records
+                if '"event":"claude_account_leg"' in record.getMessage()
+            ]
+            assert len(leg_records) == 1
+            assert leg_records[0]["result"] == "failed"
+            assert leg_records[0]["attempt"]["ordinal"] == 1
+            cleanup_warnings = [
+                record for record in caplog.records
+                if record.getMessage() == "quota response cleanup failed"
+            ]
+            assert len(cleanup_warnings) == (0 if cleanup_error_type is None else 1)
+        finally:
+            assert client.portal is not None
+            client.portal.call(upstream.aclose)
+
+
+@pytest.mark.parametrize("routing_path", ["fallback", "balanced-stateless", "balanced-pinned"])
+@pytest.mark.parametrize("can_recover", [False, True], ids=["exhausted", "recovered"])
+def test_quota_buffer_success_preserves_failover_and_replay(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, routing_path: str, can_recover: bool
+) -> None:
+    _balanced_env(monkeypatch, tmp_path)
+    accounts = _register_balanced_accounts(2)
+    calls: list[str] = []
+    first_body = b'{"type":"error","error":{"type":"rate_limit_error","message":"first quota"}}'
+    second_body = (
+        b'{"id":"msg_after_quota"}' if can_recover else
+        b'{"type":"error","error":{"type":"rate_limit_error","message":"second quota"}}'
+    )
+
+    class QuotaStream(httpx.AsyncByteStream):
+        def __init__(self, body: bytes) -> None:
+            self.body = body
+            self.close_calls = 0
+
+        async def __aiter__(self) -> AsyncIterator[bytes]:
+            yield self.body[:17]
+            yield self.body[17:]
+
+        async def aclose(self) -> None:
+            self.close_calls += 1
+            await asyncio.sleep(0)
+
+    streams = [QuotaStream(first_body), QuotaStream(second_body)]
+    upstreams = [
+        httpx.Response(
+            status, stream=stream,
+            headers={"content-type": "application/json", "retry-after": "3600",
+                     "x-quota-source": source, "connection": "close"},
+        )
+        for status, stream, source in zip((429, 200 if can_recover else 429), streams, ("first", "second"))
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/api/oauth/usage":
+            return httpx.Response(200, json={})
+        assert request.method == "POST" and request.url.path == "/v1/messages"
+        calls.append(request.headers["authorization"])
+        assert len(calls) <= 2
+        return upstreams[len(calls) - 1]
+
+    config = GatewayConfig(
+        claude_account_id=accounts[0][0],
+        claude_account_routing_mode="fallback" if routing_path == "fallback" else "balanced",
+        claude_account_include_local_login=False,
+        settings_file=tmp_path / "settings.json",
+    )
+    with _create_test_client(monkeypatch, tmp_path, config=config) as client:
+        client.app.state.http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        body = (
+            _balanced_body(str(uuid.uuid4()), model="claude-sonnet-5")
+            if routing_path == "balanced-pinned" else _message_body("claude-sonnet-5")
+        )
+        try:
+            response = client.post("/v1/messages", json=body)
+            assert response.status_code == (200 if can_recover else 429)
+            assert response.content == second_body
+            assert response.headers["x-quota-source"] == "second"
+            assert "connection" not in response.headers
+            assert len(calls) == 2
+            assert set(calls) == {f"Bearer {token}" for _, token in accounts}
+            assert all(upstream.is_closed for upstream in upstreams)
+            assert [stream.close_calls for stream in streams] == [1, 1]
+            by_token = {f"Bearer {token}": account_id for account_id, token in accounts}
+            assert client.app.state.claude_account_cooldowns.is_cooling(by_token[calls[0]])
+            assert client.app.state.claude_account_cooldowns.is_cooling(by_token[calls[1]]) is not can_recover
+            if routing_path != "fallback":
+                runtime = client.app.state.claude_balanced_runtime
+                assert runtime._active_requests == 0
+                assert all(runtime.router.in_flight_count(account_id) == 0 for account_id, _ in accounts)
+        finally:
+            assert client.portal is not None
+            for upstream in upstreams:
+                client.portal.call(upstream.aclose)
+
 
 # ---------------------------------------------------------------------------
 # Admin claude-accounts surface (dashboard account management)
