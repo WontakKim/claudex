@@ -7,6 +7,9 @@ import asyncio
 import hashlib
 import hmac
 import json
+import sqlite3
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -1271,6 +1274,106 @@ def test_failed_durable_write_marks_persistence_degraded_and_releases_both_reque
         assert creator_progressed is True and follower_progressed is True
         assert router.persistence_degraded is True
         assert router.get_pin(session_key.digest) is not None  # the in-memory pin is retained
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("cancel_target", ["none", "creator", "durability"])
+def test_real_sqlite_full_releases_pin_waiters_and_executor_after_cancellation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cancel_target: str
+) -> None:
+    recovery = threading.Event()
+    release = threading.Event()
+    attempts: list[int] = []
+
+    def fault_injector(scope_key: Any, sequence: int) -> None:
+        attempts.append(sequence)
+        assert release.wait(timeout=5)
+        if not recovery.is_set() and len(attempts) <= 100:
+            error = sqlite3.OperationalError("synthetic disk full")
+            error.sqlite_errorcode = sqlite3.SQLITE_FULL
+            raise error
+
+    async def scenario() -> None:
+        loop = asyncio.get_running_loop()
+        executor = ThreadPoolExecutor(max_workers=1)
+        loop.set_default_executor(executor)
+        wait_started = asyncio.Event()
+        wait_finished = asyncio.Event()
+        store = ClaudePoolRuntimeStateStore.open_(
+            tmp_path / "runtime.sqlite3", debounce_seconds=0.0,
+            retry_backoff_initial_seconds=0.02, retry_backoff_max_seconds=0.02,
+            fault_injector=fault_injector,
+        )
+        original_upsert = store.upsert_pin
+
+        def recorded_upsert(**kwargs: Any) -> Any:
+            pending = original_upsert(**kwargs)
+            original_wait = pending.wait
+
+            def recorded_wait(timeout: float | None = None) -> None:
+                loop.call_soon_threadsafe(wait_started.set)
+                try:
+                    original_wait(timeout)
+                finally:
+                    loop.call_soon_threadsafe(wait_finished.set)
+
+            monkeypatch.setattr(pending, "wait", recorded_wait)
+            return pending
+
+        monkeypatch.setattr(store, "upsert_pin", recorded_upsert)
+        router = _make_router(store=store, balanced_epoch_id=store.balanced_epoch_id)
+        session_key = SessionKey(digest=b"\x04" * 32, kind="content_hash")
+        tasks: list[asyncio.Task[None]] = []
+        try:
+            placement = router.place_session(
+                session_key=session_key, model="claude-sonnet-5", candidates=[_candidate("acct-a")], seed=b"seed"
+            )
+            barrier = placement.durability_barrier
+            pin = router.get_pin(session_key.digest)
+            assert barrier is not None and pin is not None
+            durability = asyncio.create_task(router.submit_new_pin_durability(session_key.digest))
+            creator = asyncio.create_task(router.await_pin_durability(session_key.digest))
+            follower = asyncio.create_task(router.await_pin_durability(session_key.digest))
+            tasks.extend((durability, creator, follower))
+            await asyncio.wait_for(wait_started.wait(), timeout=1)
+            assert not barrier.is_resolved
+            assert not creator.done() and not follower.done()
+
+            if cancel_target != "none":
+                cancelled = creator if cancel_target == "creator" else durability
+                cancelled.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await cancelled
+            if cancel_target == "creator":
+                assert not durability.done() and not follower.done()
+                assert not barrier.is_resolved
+            release.set()
+            await asyncio.wait_for(asyncio.gather(*(task for task in tasks if not task.cancelled())), timeout=1)
+            await asyncio.wait_for(wait_finished.wait(), timeout=1)
+            await asyncio.wait_for(loop.run_in_executor(None, lambda: None), timeout=1)
+
+            assert attempts == [1]
+            assert barrier.is_resolved
+            assert store.persistence_degraded
+            if cancel_target != "durability":
+                assert router.persistence_degraded
+            assert router.get_pin(session_key.digest) is pin
+            assert store.get_pin(session_key.digest) is None
+            assert router.place_session(
+                session_key=session_key, model="claude-sonnet-5", candidates=[_candidate("acct-a")], seed=b"seed"
+            ).created is False
+        finally:
+            recovery.set()
+            release.set()
+            store.close()
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            await loop.shutdown_default_executor()
+        assert store._writer_thread is not None and not store._writer_thread.is_alive()
+        assert all(not thread.is_alive() for thread in executor._threads)
 
     asyncio.run(scenario())
 
@@ -2683,6 +2786,137 @@ def test_remove_account_deletes_all_four_durable_row_kinds_for_only_that_incarna
             assert store.get_capability_evidence("acct-a", "opus") is not None
         finally:
             store.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("should_exit_mode", [False, True])
+def test_runtime_shutdown_drains_pin_waiters_after_sqlite_full(tmp_path: Path, should_exit_mode: bool) -> None:
+    async def scenario() -> None:
+        runtime = ClaudeBalancedRuntime()
+        await runtime.prepare_and_publish(
+            accounts=[], accounts_root=tmp_path, runtime_db_path=tmp_path / "runtime.sqlite3",
+            persist=lambda: None, entry="admin_enable",
+        )
+        store = runtime._store
+        router = runtime.router
+        assert store is not None and router is not None
+        loop = asyncio.get_running_loop()
+        write_started = asyncio.Event()
+        release = threading.Event()
+        recovery = threading.Event()
+        attempts: list[int] = []
+        tasks: list[asyncio.Task[None]] = []
+
+        def fault_injector(scope_key: Any, sequence: int) -> None:
+            attempts.append(sequence)
+            loop.call_soon_threadsafe(write_started.set)
+            assert release.wait(timeout=5)
+            if not recovery.is_set() and len(attempts) <= 100:
+                error = sqlite3.OperationalError("synthetic disk full")
+                error.sqlite_errorcode = sqlite3.SQLITE_FULL
+                raise error
+
+        store._fault_injector = fault_injector
+        digest = b"\x05" * 32
+
+        async def request() -> None:
+            assert runtime.begin_request()
+            try:
+                await router.await_pin_durability(digest)
+            finally:
+                runtime.end_request()
+
+        try:
+            placement = router.place_session(
+                session_key=SessionKey(digest=digest, kind="content_hash"), model="claude-sonnet-5",
+                candidates=[_candidate("acct-a")], seed=runtime.epoch_seed,
+            )
+            tasks.extend((asyncio.create_task(router.submit_new_pin_durability(digest)),
+                          asyncio.create_task(request()), asyncio.create_task(request())))
+            await asyncio.wait_for(write_started.wait(), timeout=1)
+            published: list[str] = []
+            shutdown = asyncio.create_task(
+                runtime.exit_mode("disabled", publish=lambda: published.append("disabled"))
+                if should_exit_mode else runtime.shutdown_preserving_epoch()
+            )
+            tasks.append(shutdown)
+            await asyncio.sleep(0)
+            assert runtime.status == "draining" and not shutdown.done()
+            assert runtime._active_requests == 2
+
+            release.set()
+            await asyncio.wait_for(asyncio.gather(*tasks), timeout=1)
+            assert published == (["disabled"] if should_exit_mode else [])
+            assert runtime.status == "disabled" and runtime._transition_event.is_set()
+            assert runtime._store is None and runtime.router is None
+            assert runtime._active_requests == 0
+            assert placement.durability_barrier is not None and placement.durability_barrier.is_resolved
+            assert router.persistence_degraded and router.get_pin(digest) is not None
+            assert store._writer_thread is not None and not store._writer_thread.is_alive()
+        finally:
+            recovery.set()
+            release.set()
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            store.close()
+            await runtime.shutdown_preserving_epoch()
+
+    asyncio.run(scenario())
+
+
+def test_required_startup_rotation_fails_on_sqlite_full_without_publishing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    recovery = threading.Event()
+    opened: list[ClaudePoolRuntimeStateStore] = []
+    attempts: list[int] = []
+    original_open = ClaudePoolRuntimeStateStore.open_
+
+    def fault_injector(scope_key: Any, sequence: int) -> None:
+        attempts.append(sequence)
+        if not recovery.is_set() and len(attempts) <= 100:
+            error = sqlite3.OperationalError("synthetic disk full")
+            error.sqlite_errorcode = sqlite3.SQLITE_FULL
+            raise error
+
+    def faulted_open(cls: Any, path: Path) -> ClaudePoolRuntimeStateStore:
+        store = original_open(
+            path, debounce_seconds=0.0, retry_backoff_initial_seconds=0.02,
+            retry_backoff_max_seconds=0.02, fault_injector=fault_injector,
+        )
+        opened.append(store)
+        return store
+
+    monkeypatch.setattr(ClaudePoolRuntimeStateStore, "open_", classmethod(faulted_open))
+
+    async def scenario() -> None:
+        runtime = ClaudeBalancedRuntime()
+        published: list[str] = []
+        arguments = dict(
+            accounts=[], accounts_root=tmp_path, runtime_db_path=tmp_path / "runtime.sqlite3",
+            persist=lambda: published.append("balanced"), entry="admin_enable",
+        )
+        try:
+            with pytest.raises(sqlite3.OperationalError) as failure:
+                await asyncio.wait_for(runtime.prepare_and_publish(**arguments), timeout=1)
+            assert failure.value.sqlite_errorcode == sqlite3.SQLITE_FULL
+            assert published == [] and attempts == [1]
+            assert runtime.status == "disabled" and runtime._transition_event.is_set()
+            assert runtime._store is None and runtime.router is None
+            assert opened[0]._writer_thread is not None and not opened[0]._writer_thread.is_alive()
+
+            recovery.set()
+            await asyncio.wait_for(runtime.prepare_and_publish(**arguments), timeout=1)
+            assert published == ["balanced"] and runtime.status == "active"
+        finally:
+            recovery.set()
+            await runtime.shutdown_preserving_epoch()
+            for store in opened:
+                store.close()
+        assert all(store._writer_thread is not None and not store._writer_thread.is_alive() for store in opened)
 
     asyncio.run(scenario())
 

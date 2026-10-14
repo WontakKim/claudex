@@ -39,6 +39,12 @@ has already committed. A committed row payload also retires older retries
 for its coalescing scope and completes their waiters only after that commit.
 Within a coalescing scope, replacements follow payload submission order,
 never wall-clock retry timing or timestamp magnitude.
+
+``SQLITE_FULL`` completes a failed job's waiters with the storage error and
+marks persistence degraded; later writes remain accepted and can recover.
+Closing flushes pending jobs and backed-off retries, but a failed closing
+attempt completes its waiters with the error instead of scheduling another
+retry.
 """
 
 from __future__ import annotations
@@ -158,7 +164,7 @@ class ClaudePoolRuntimeStateStore:
         self._retry_backoff_max_seconds = retry_backoff_max_seconds
         # Test-only seam: called before every write attempt (fresh or
         # retried). Production callers must never set this. A raised
-        # exception is treated exactly like a transient SQLite failure.
+        # exception uses the same failure handling as an actual write.
         self._fault_injector = fault_injector
 
         self._cv = threading.Condition()
@@ -245,8 +251,10 @@ class ClaudePoolRuntimeStateStore:
         return self._writer_thread.ident if self._writer_thread is not None else None
 
     def close(self) -> None:
-        """Reject new submissions, drain everything accepted, checkpoint, stop.
+        """Reject new submissions, flush everything accepted, checkpoint, stop.
 
+        Backed-off retries get one final attempt without waiting. Failed
+        closing attempts settle their handles with the error, not a retry.
         Idempotent — a second call is a no-op.
         """
         with self._cv:
@@ -257,6 +265,8 @@ class ClaudePoolRuntimeStateStore:
             now = self._clock()
             for job in self._pending:
                 job.flush_after = min(job.flush_after, now)
+            for job in self._retrying:
+                job.next_attempt_at = now
             self._cv.notify_all()
         if self._writer_thread is not None:
             self._writer_thread.join()
@@ -925,22 +935,30 @@ class ClaudePoolRuntimeStateStore:
             for pending_write in job.pending_writes:
                 pending_write._mark_done(error=exc)
             return
-        except Exception:
-            job.attempts += 1
-            backoff = min(
-                self._retry_backoff_max_seconds,
-                self._retry_backoff_initial_seconds * (2 ** (job.attempts - 1)),
-            )
-            job.next_attempt_at = self._clock() + backoff
-            logger.warning(
-                "claude pool runtime-state write failed (attempt %d); retrying in %.2fs",
-                job.attempts,
-                backoff,
-                exc_info=True,
-            )
+        except Exception as exc:
             with self._cv:
-                self._retrying.append(job)
                 self._persistence_degraded = True
+                if self._stopping or (
+                    isinstance(exc, sqlite3.OperationalError)
+                    and getattr(exc, "sqlite_errorcode", None) == sqlite3.SQLITE_FULL
+                ):
+                    logger.error("claude pool runtime-state write failed; not retrying", exc_info=True)
+                    for pending_write in job.pending_writes:
+                        pending_write._mark_done(error=exc)
+                else:
+                    job.attempts += 1
+                    backoff = min(
+                        self._retry_backoff_max_seconds,
+                        self._retry_backoff_initial_seconds * (2 ** (job.attempts - 1)),
+                    )
+                    job.next_attempt_at = self._clock() + backoff
+                    logger.warning(
+                        "claude pool runtime-state write failed (attempt %d); retrying in %.2fs",
+                        job.attempts,
+                        backoff,
+                        exc_info=True,
+                    )
+                    self._retrying.append(job)
                 self._cv.notify_all()
             return
 

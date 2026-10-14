@@ -1241,13 +1241,55 @@ def test_retried_cooldown_write_cannot_resurrect_a_row_after_incarnation_deletio
 # --------------------------------------------------------------------------
 
 
-def test_persistence_degrades_then_recovers_after_transient_failures(tmp_path: Path) -> None:
+def test_sqlite_full_settles_the_write_and_allows_subsequent_recovery(tmp_path: Path) -> None:
+    recovery = threading.Event()
+    attempts: list[int] = []
+    error = sqlite3.OperationalError("synthetic disk full")
+    error.sqlite_errorcode = sqlite3.SQLITE_FULL
+    error.sqlite_errorname = "SQLITE_FULL"
+
+    def fault_injector(scope_key: Any, sequence: int) -> None:
+        attempts.append(sequence)
+        if not recovery.is_set() and len(attempts) <= 100:
+            raise error
+
+    store = ClaudePoolRuntimeStateStore.open_(
+        tmp_path / "runtime.sqlite3", debounce_seconds=0.0,
+        retry_backoff_initial_seconds=0.02, retry_backoff_max_seconds=0.02,
+        fault_injector=fault_injector,
+    )
+    try:
+        pending = store.upsert_cooldown(**_cooldown_kwargs(), high_priority=True)
+        with pytest.raises(sqlite3.OperationalError) as failure:
+            pending.wait(timeout=1)
+        assert failure.value is error
+        assert attempts == [pending.sequence]
+        assert store.persistence_degraded
+        assert store.get_cooldown("acct-1", "account", "") is None
+
+        recovery.set()
+        store.upsert_cooldown(**_cooldown_kwargs(reason="recovered"), high_priority=True).wait(timeout=5)
+        assert store.get_cooldown("acct-1", "account", "").reason == "recovered"
+        assert not store.persistence_degraded
+    finally:
+        recovery.set()
+        store.close()
+    assert store._writer_thread is not None and not store._writer_thread.is_alive()
+
+
+@pytest.mark.parametrize("sqlite_error_code", [None, sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED, sqlite3.SQLITE_IOERR])
+def test_persistence_degrades_then_recovers_after_transient_failures(
+    tmp_path: Path, sqlite_error_code: int | None
+) -> None:
     calls = {"n": 0}
 
     def fault_injector(scope_key: Any, sequence: int) -> None:
         calls["n"] += 1
         if calls["n"] <= 2:
-            raise sqlite3.OperationalError("simulated transient failure")
+            error = sqlite3.OperationalError("simulated transient failure")
+            if sqlite_error_code is not None:
+                error.sqlite_errorcode = sqlite_error_code
+            raise error
 
     store = ClaudePoolRuntimeStateStore.open_(
         tmp_path / "runtime.sqlite3",
@@ -1301,6 +1343,137 @@ def test_writer_thread_is_single_and_applies_every_write(tmp_path: Path) -> None
 # --------------------------------------------------------------------------
 # close(): reject-new, idempotent, drain-before-return, checkpoint
 # --------------------------------------------------------------------------
+
+
+def test_close_settles_in_flight_coalesced_and_queued_writes_after_failure(tmp_path: Path) -> None:
+    started = threading.Event()
+    release = threading.Event()
+    recovery = threading.Event()
+    closed = threading.Event()
+    attempts: list[int] = []
+    close_errors: list[BaseException] = []
+
+    def fault_injector(scope_key: Any, sequence: int) -> None:
+        attempts.append(sequence)
+        if len(attempts) == 1:
+            started.set()
+            assert release.wait(timeout=5)
+        if not recovery.is_set() and len(attempts) <= 100:
+            error = sqlite3.OperationalError("synthetic database locked")
+            error.sqlite_errorcode = sqlite3.SQLITE_BUSY
+            raise error
+
+    store = ClaudePoolRuntimeStateStore.open_(
+        tmp_path / "runtime.sqlite3", debounce_seconds=5,
+        retry_backoff_initial_seconds=0.02, retry_backoff_max_seconds=0.02,
+        fault_injector=fault_injector,
+    )
+
+    def close_store() -> None:
+        try:
+            store.close()
+        except BaseException as exc:
+            close_errors.append(exc)
+        finally:
+            closed.set()
+
+    close_thread = threading.Thread(target=close_store)
+    try:
+        with store._cv:
+            first = store.upsert_cooldown(**_cooldown_kwargs())
+            coalesced = store.upsert_cooldown(**_cooldown_kwargs(reason="replacement"))
+            queued = store.upsert_cooldown(**_cooldown_kwargs(account_id="queued"), high_priority=True)
+        assert started.wait(timeout=5)
+        close_thread.start()
+        with store._cv:
+            assert store._cv.wait_for(lambda: store._stopping, timeout=5)
+        release.set()
+        assert closed.wait(timeout=1), "close kept retrying failed accepted writes"
+        assert close_errors == []
+        for pending in (first, coalesced, queued):
+            with pytest.raises(sqlite3.OperationalError) as failure:
+                pending.wait(timeout=0)
+            assert failure.value.sqlite_errorcode == sqlite3.SQLITE_BUSY
+        assert attempts == [coalesced.sequence, queued.sequence]
+        assert store.persistence_degraded
+    finally:
+        recovery.set()
+        release.set()
+        if close_thread.ident is not None:
+            close_thread.join(timeout=5)
+        store.close()
+    assert not close_thread.is_alive()
+    assert store._writer_thread is not None and not store._writer_thread.is_alive()
+
+
+@pytest.mark.parametrize("has_recovered", [False, True])
+def test_close_flushes_backed_off_retries_and_settles_their_waiters(tmp_path: Path, has_recovered: bool) -> None:
+    clock = [0.0]
+    recovery = threading.Event()
+    closed = threading.Event()
+    attempts: list[int] = []
+    close_errors: list[BaseException] = []
+
+    def fault_injector(scope_key: Any, sequence: int) -> None:
+        attempts.append(sequence)
+        if not recovery.is_set() and len(attempts) <= 100:
+            error = sqlite3.OperationalError("synthetic database locked")
+            error.sqlite_errorcode = sqlite3.SQLITE_BUSY
+            raise error
+
+    store = ClaudePoolRuntimeStateStore.open_(
+        tmp_path / "runtime.sqlite3", clock=lambda: clock[0],
+        retry_backoff_initial_seconds=30, retry_backoff_max_seconds=30,
+        fault_injector=fault_injector,
+    )
+
+    def close_store() -> None:
+        try:
+            store.close()
+        except BaseException as exc:
+            close_errors.append(exc)
+        finally:
+            closed.set()
+
+    close_thread = threading.Thread(target=close_store)
+    try:
+        pending_writes = []
+        for account_id in ("first", "second"):
+            pending_writes.append(store.upsert_cooldown(**_cooldown_kwargs(account_id=account_id), high_priority=True))
+            with store._cv:
+                assert store._cv.wait_for(lambda: len(store._retrying) == len(pending_writes), timeout=5)
+        if has_recovered:
+            recovery.set()
+        close_thread.start()
+        assert closed.wait(timeout=1), "close waited for retry backoff instead of flushing"
+        assert close_errors == []
+        for pending in pending_writes:
+            if has_recovered:
+                pending.wait(timeout=0)
+            else:
+                with pytest.raises(sqlite3.OperationalError) as failure:
+                    pending.wait(timeout=0)
+                assert failure.value.sqlite_errorcode == sqlite3.SQLITE_BUSY
+        assert attempts == [1, 2, 1, 2]
+        assert store.persistence_degraded is not has_recovered
+        if has_recovered:
+            conn = sqlite3.connect(str(tmp_path / "runtime.sqlite3"))
+            try:
+                assert conn.execute("SELECT account_id FROM cooldowns ORDER BY account_id").fetchall() == [
+                    ("first",), ("second",)
+                ]
+            finally:
+                conn.close()
+    finally:
+        recovery.set()
+        with store._cv:
+            clock[0] = 1000.0
+            store._cv.notify_all()
+        if close_thread.ident is not None:
+            close_thread.join(timeout=5)
+        store.close()
+    assert not close_thread.is_alive()
+    assert store._writer_thread is not None and not store._writer_thread.is_alive()
 
 
 def test_close_rejects_new_submissions(tmp_path: Path) -> None:
