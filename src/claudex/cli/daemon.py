@@ -20,6 +20,7 @@ import uvicorn
 import claudex
 from claudex import paths
 from claudex.config import ConfigError, GatewayConfig
+from claudex.locking import file_lock
 from claudex.server import create_app
 
 _READY_TIMEOUT = 15.0
@@ -79,7 +80,30 @@ def _run_foreground(config: GatewayConfig) -> None:
 
 
 def _start_background(config: GatewayConfig) -> None:
+    with file_lock(paths.daemon_launch_lock()):
+        _start_background_locked(config)
+
+
+def _start_background_locked(config: GatewayConfig) -> None:
     probe_host = _connect_host(config.host)
+    # The identity record and log are shared across configured endpoints.
+    record, _ = _read_daemon_record()
+    if record is not None and (
+        _connect_host(record["host"]), record["port"]
+    ) != (probe_host, config.port):
+        owner_hello = _gateway_hello(_connect_host(record["host"]), record["port"])
+        if (
+            owner_hello is not None
+            and owner_hello.get("pid") == record["pid"]
+            and owner_hello.get("nonce") == record["nonce"]
+        ):
+            print(
+                f"claudex-gateway is already running on http://{record['host']}:{record['port']} "
+                f"(pid {record['pid']}); cannot start on http://{config.host}:{config.port} "
+                "with the same runtime directory; stop the recorded gateway first",
+                file=sys.stderr,
+            )
+            raise SystemExit(1)
     if _is_listening(probe_host, config.port):
         hello = _gateway_hello(probe_host, config.port)
         if hello is None:

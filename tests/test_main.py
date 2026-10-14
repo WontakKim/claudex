@@ -17,11 +17,12 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from claudex import __main__ as gateway_main
-from claudex import paths
+from claudex import locking, paths
 from claudex.cli import accounts, admin_client, compact, daemon
 from claudex.config import GatewayConfig
 from claudex.locking import try_file_lock
@@ -116,6 +117,289 @@ def test_gateway_env_isolates_codex_home_without_mutating_parent_environment(
     monkeypatch.setattr(os, "environ", env)
     config = GatewayConfig.load(settings_file=test_home / "settings.json")
     assert config.codex_home == test_home / ".codex"
+
+
+class _FakeLaunchClock:
+    def __init__(self) -> None:
+        self.elapsed = 0.0
+
+    def monotonic(self) -> float:
+        return self.elapsed
+
+    def sleep(self, seconds: float) -> None:
+        self.elapsed += seconds
+
+
+@pytest.mark.parametrize("failure", ["child-exit", "readiness-timeout"])
+def test_concurrent_background_launch_preserves_the_ready_winner_record(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, failure: str
+) -> None:
+    runtime_dir = tmp_path / "runtime"
+    config = GatewayConfig(port=12345, settings_file=tmp_path / "settings.json")
+    winner_record = {
+        "pid": 101, "host": config.host, "port": config.port, "nonce": "winner-nonce"
+    }
+    loser_waiting = threading.Event()
+    release_loser = threading.Event()
+    winner_progress = threading.Event()
+    winner_ready = threading.Event()
+    events: list[str] = []
+    signals: list[tuple[int, int]] = []
+    outcomes: dict[str, object] = {}
+    monkeypatch.setattr(paths, "runtime_dir", lambda: runtime_dir)
+    monkeypatch.setattr(daemon, "time", _FakeLaunchClock())
+    monkeypatch.setattr(daemon, "_READY_TIMEOUT", 0.01)
+    monkeypatch.setattr(
+        daemon.secrets, "token_hex",
+        lambda count: f"{threading.current_thread().name}-nonce",
+    )
+
+    def is_listening(host: str, port: int) -> bool:
+        assert (host, port) == (config.host, config.port)
+        events.append(f"preflight-{threading.current_thread().name}")
+        return winner_ready.is_set()
+
+    def fetch_hello(host: str, port: int) -> dict | None:
+        assert (host, port) == (config.host, config.port)
+        if not winner_ready.is_set():
+            return None
+        return {"hello": "claudex-gateway", "version": daemon.claudex.__version__, **winner_record}
+
+    class FakeChild:
+        def __init__(self, pid: int) -> None:
+            self.pid = pid
+
+        def poll(self) -> int | None:
+            if self.pid == 202 and failure == "child-exit":
+                events.append("loser-failed")
+                return 3
+            return None
+
+        def terminate(self) -> None:
+            assert self.pid == 202
+            events.append("loser-failed")
+            signals.append((self.pid, signal.SIGTERM))
+
+    def spawn(arguments: list[str], **options: object) -> FakeChild:
+        assert arguments == [sys.executable, "-m", "claudex", "--foreground"]
+        actor = threading.current_thread().name
+        log_handle = options["stdout"]
+        assert isinstance(log_handle, io.TextIOBase)
+        log_handle.write(f"{actor} log\n")
+        if actor == "loser":
+            loser_waiting.set()
+            assert release_loser.wait(timeout=10)
+            return FakeChild(202)
+        assert actor == "winner"
+        winner_ready.set()
+        return FakeChild(101)
+
+    acquire = locking._acquire
+
+    def acquire_with_progress(descriptor: int) -> None:
+        if threading.current_thread().name == "winner":
+            winner_progress.set()
+        acquire(descriptor)
+
+    def kill(pid: int, requested_signal: int) -> None:
+        assert pid == 101
+        if requested_signal == signal.SIGTERM:
+            signals.append((pid, requested_signal))
+            winner_ready.clear()
+            return
+        assert requested_signal == 0
+        assert not winner_ready.is_set()
+        raise ProcessLookupError
+
+    monkeypatch.setattr(daemon, "_is_listening", is_listening)
+    monkeypatch.setattr(daemon, "_gateway_hello", fetch_hello)
+    monkeypatch.setattr(daemon.subprocess, "Popen", spawn)
+    monkeypatch.setattr(locking, "_acquire", acquire_with_progress)
+    monkeypatch.setattr(daemon.os, "kill", kill)
+
+    def launch(actor: str) -> None:
+        try:
+            daemon._start_background(config)
+            outcomes[actor] = 0
+        except SystemExit as exc:
+            outcomes[actor] = exc.code
+        except Exception as exc:
+            outcomes[actor] = exc
+        finally:
+            if actor == "winner":
+                winner_progress.set()
+
+    loser = threading.Thread(target=launch, args=("loser",), name="loser")
+    winner = threading.Thread(target=launch, args=("winner",), name="winner")
+    actors: list[threading.Thread] = []
+    try:
+        loser.start()
+        actors.append(loser)
+        assert loser_waiting.wait(timeout=10)
+        winner.start()
+        actors.append(winner)
+        assert winner_progress.wait(timeout=10)
+    finally:
+        release_loser.set()
+        for actor in actors:
+            actor.join(timeout=10)
+            assert not actor.is_alive()
+
+    assert outcomes == {"loser": 1, "winner": 0}, events
+    record, reason = daemon._read_daemon_record()
+    assert record == winner_record, (reason, events)
+    assert events.index("loser-failed") < events.index("preflight-winner"), events
+    assert paths.log_file().read_text(encoding="utf-8") == "winner log\n"
+    expected_signals = [(202, signal.SIGTERM)] if failure == "readiness-timeout" else []
+    assert signals == expected_signals
+    assert daemon._stop_recorded_daemon() == (True, "101")
+    assert signals == [*expected_signals, (101, signal.SIGTERM)]
+    assert not paths.daemon_record_file().exists()
+
+
+@pytest.mark.parametrize("hello_override", [{"pid": 303}, {"nonce": "foreign-nonce"}])
+def test_background_launch_requires_matching_child_identity(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, hello_override: dict[str, object]
+) -> None:
+    config = GatewayConfig(port=12345, settings_file=tmp_path / "settings.json")
+    terminated: list[int] = []
+    child = SimpleNamespace(
+        pid=202, poll=lambda: None, terminate=lambda: terminated.append(202)
+    )
+
+    def unexpected_signal(*arguments: object) -> None:
+        raise AssertionError("readiness checks must not signal any recorded process")
+
+    monkeypatch.setattr(paths, "runtime_dir", lambda: tmp_path / "runtime")
+    monkeypatch.setattr(daemon, "time", _FakeLaunchClock())
+    monkeypatch.setattr(daemon, "_READY_TIMEOUT", 0.01)
+    monkeypatch.setattr(daemon, "_is_listening", lambda host, port: False)
+    monkeypatch.setattr(
+        daemon, "_gateway_hello",
+        lambda host, port: {"pid": 202, "nonce": "child-nonce", **hello_override},
+    )
+    monkeypatch.setattr(daemon.secrets, "token_hex", lambda count: "child-nonce")
+    monkeypatch.setattr(daemon.subprocess, "Popen", lambda *args, **kwargs: child)
+    monkeypatch.setattr(daemon.os, "kill", unexpected_signal)
+
+    with pytest.raises(SystemExit) as failure:
+        daemon._start_background(config)
+
+    assert failure.value.code == 1
+    assert terminated == [202]
+    assert not paths.daemon_record_file().exists()
+
+
+def test_failed_background_spawn_releases_the_launch_lock(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config = GatewayConfig(port=12345, settings_file=tmp_path / "settings.json")
+    spawn_calls: list[object] = []
+
+    def fail_spawn(*arguments: object, **options: object) -> None:
+        spawn_calls.append(arguments)
+        raise OSError("synthetic spawn failure")
+
+    def unexpected_signal(*arguments: object) -> None:
+        raise AssertionError("failed spawn must not signal a process")
+
+    monkeypatch.setattr(paths, "runtime_dir", lambda: tmp_path / "runtime")
+    monkeypatch.setattr(daemon, "_is_listening", lambda host, port: False)
+    monkeypatch.setattr(daemon, "_gateway_hello", lambda host, port: None)
+    monkeypatch.setattr(daemon.subprocess, "Popen", fail_spawn)
+    monkeypatch.setattr(daemon.os, "kill", unexpected_signal)
+
+    with pytest.raises(OSError, match="synthetic spawn failure"):
+        daemon._start_background(config)
+
+    assert len(spawn_calls) == 1
+    assert not paths.daemon_record_file().exists()
+    handle = try_file_lock(paths.daemon_launch_lock())
+    assert handle is not None
+    handle.release()
+
+
+def test_background_launch_preserves_a_ready_recorded_owner_on_another_endpoint(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setattr(paths, "runtime_dir", lambda: tmp_path / "runtime")
+    config = GatewayConfig(port=12346, settings_file=tmp_path / "settings.json")
+    assert config.claude_account_routing_mode == "disabled"
+    monkeypatch.setenv("CLAUDEX_PORT", str(config.port))
+    owner_record = {
+        "pid": 601, "host": "127.0.0.1", "port": 12345, "nonce": "owner-a-nonce"
+    }
+    owner_endpoint = (owner_record["host"], owner_record["port"])
+    requested_endpoint = (config.host, config.port)
+    hello_by_endpoint = {
+        owner_endpoint: {"hello": "claudex-gateway", "version": daemon.claudex.__version__, **owner_record},
+        requested_endpoint: None,
+    }
+    paths.runtime_dir().mkdir()
+    record_file = paths.daemon_record_file()
+    log_file = paths.log_file()
+    record_file.write_text(json.dumps(owner_record, indent=2) + "\n", encoding="utf-8")
+    log_file.write_text("ready owner A log\n", encoding="utf-8")
+    original_state = {"record": record_file.read_bytes(), "log": log_file.read_bytes()}
+    spawned: list[list[str]] = []
+    signals: list[tuple[int, int]] = []
+    readiness_probes: list[tuple[str, int]] = []
+    pool_lock = paths.claude_account_pool_lock()
+
+    def is_listening(host: str, port: int) -> bool:
+        assert (host, port) in hello_by_endpoint
+        return hello_by_endpoint[(host, port)] is not None
+
+    def fetch_hello(host: str, port: int) -> dict | None:
+        assert (host, port) in hello_by_endpoint
+        readiness_probes.append((host, port))
+        return hello_by_endpoint[(host, port)]
+
+    def fail_child_spawn(arguments: list[str], **options: object) -> object:
+        assert arguments == [sys.executable, "-m", "claudex", "--foreground"]
+        assert options["env"]["CLAUDEX_PORT"] == str(config.port)
+        spawned.append(arguments)
+        assert try_file_lock(pool_lock) is None
+        log_handle = options["stdout"]
+        assert isinstance(log_handle, io.TextIOBase)
+        log_handle.write("claude account pool is already served (balanced-router.lock held)\n")
+        return SimpleNamespace(
+            pid=602, poll=lambda: 3,
+            terminate=lambda: signals.append((602, signal.SIGTERM)),
+        )
+
+    monkeypatch.setattr(daemon, "_is_listening", is_listening)
+    monkeypatch.setattr(daemon, "_gateway_hello", fetch_hello)
+    monkeypatch.setattr(daemon.subprocess, "Popen", fail_child_spawn)
+    monkeypatch.setattr(daemon.os, "kill", lambda pid, requested_signal: signals.append((pid, requested_signal)))
+    assert fetch_hello(*owner_endpoint)["pid"] == owner_record["pid"]
+    assert fetch_hello(*owner_endpoint)["nonce"] == owner_record["nonce"]
+    assert not is_listening(*requested_endpoint)
+    readiness_probes.clear()
+    owner_lease = try_file_lock(pool_lock)
+    assert owner_lease is not None
+    try:
+        with pytest.raises(SystemExit) as failure:
+            daemon._start_background(config)
+
+        assert failure.value.code == 1
+        observed_state = {
+            "record": record_file.read_bytes() if record_file.exists() else None,
+            "log": log_file.read_bytes(),
+        }
+        assert observed_state == original_state
+        assert spawned == []
+        assert signals == []
+        assert owner_endpoint in readiness_probes
+        assert try_file_lock(pool_lock) is None
+        output = capsys.readouterr()
+        assert output.out == ""
+        assert "http://127.0.0.1:12345" in output.err
+        assert "http://127.0.0.1:12346" in output.err
+        assert "already running on http://127.0.0.1:12346" not in output.err
+    finally:
+        owner_lease.release()
 
 
 @pytest.mark.parametrize(
