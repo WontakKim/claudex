@@ -206,6 +206,12 @@ sends Standard until applicable capabilities are available.
 
 `POST /admin/test` with only `{"target": "codex:gpt-6.1-sol"}` keeps the ordinary
 lightweight, untiered connection check, regardless of the global tier setting.
+It reads only the first event and fails if that event is an `error` or
+`response.failed` rejection. A first `response.created` can still count as
+connectivity even if an unread later event fails; `response.incomplete` alone is
+not a definitive rejection. Ordinary success does not guarantee completed
+inference. This first-event rule also applies to custom Responses routes.
+
 Adding `service_tier` explicitly opts into a Codex tier probe; `null`, `fast`, and
 `ultrafast` are accepted. This **runs inference and can consume allowance**. No
 probe runs automatically on settings load, capability reads, or refresh. The

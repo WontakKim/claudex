@@ -2271,6 +2271,76 @@ class TestAdminCodexCapabilitiesApi:
         assert json.loads(requests[-1].content)["service_tier"] == "ultrafast"
         assert stream.close_calls == 1
 
+    @pytest.mark.parametrize("provider_name", ["codex", "wrtn"])
+    @pytest.mark.parametrize("event_kind", ["flat_error", "nested_error", "failed", "incomplete"])
+    def test_ordinary_probe_classifies_only_its_first_event(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+        provider_name: str, event_kind: str,
+    ) -> None:
+        provider = _custom_provider()
+        message = "The requested model does not exist"
+        if provider_name == "wrtn":
+            message += f"; credential {provider.api_key} rejected"
+        error = {"code": "model_not_found", "message": message}
+        if event_kind == "flat_error":
+            event = {"type": "error", "sequence_number": 0, "param": "model", **error}
+        elif event_kind == "nested_error":
+            event = {"type": "error", "error": error}
+        elif event_kind == "failed":
+            event = {"type": "response.failed", "response": {"model": "unavailable-model", "error": error}}
+        else:
+            event = {"type": "response.incomplete", "response": {
+                "model": "served-model", "incomplete_details": {"reason": "max_output_tokens"},
+            }}
+        stream = FirstEventOnlyProbeStream(f"data: {json.dumps(event)}\n\n".encode())
+        requests: list[httpx.Request] = []
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            assert request.method == "POST"
+            return httpx.Response(200, stream=stream, headers={"content-type": "text/event-stream"})
+
+        http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        config = GatewayConfig(
+            codex_service_tier="ultrafast",
+            custom_providers={"wrtn": provider} if provider_name == "wrtn" else {},
+        )
+        try:
+            with _create_test_client(
+                monkeypatch, tmp_path, config=config, base_url="http://127.0.0.1:8787",
+            ) as client:
+                transport = (
+                    CodexClient(AvailableCodexAuthManager(), http_client) if provider_name == "codex"
+                    else OpenAICompatibleClient("wrtn", provider, http_client)
+                )
+                _select_route_transport(client, provider_name, transport)
+                response = client.post("/admin/test", json={"target": f"{provider_name}:unavailable-model"})
+        finally:
+            asyncio.run(http_client.aclose())
+        result = response.json()
+        assert response.status_code == 200
+        assert result["ok"] is (event_kind == "incomplete"), result
+        assert "tier_diagnostic" not in result
+        if event_kind == "incomplete":
+            assert result["status"] == 200
+            assert result["response_model"] == "served-model"
+            assert result["detail"] is None
+        else:
+            assert result["status"] == 502
+            assert result["response_model"] is None
+            expected_detail = (
+                "The requested model does not exist; credential [REDACTED] rejected"
+                if provider_name == "wrtn" else message
+            )
+            assert result["detail"] == expected_detail
+        if provider_name == "wrtn":
+            _assert_secret_absent(provider.api_key, response.text)
+        assert len(requests) == 1
+        assert "service_tier" not in json.loads(requests[0].content)
+        assert "x-codex-routing-hint" not in requests[0].headers
+        assert stream.read_calls == 1
+        assert stream.close_calls == 1
+
     @pytest.mark.parametrize("has_failed_event", [False, True])
     def test_ordinary_probe_is_untiered_even_when_ultrafast_is_configured(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, has_failed_event: bool,
@@ -4724,6 +4794,13 @@ class TrackedProbeStream(httpx.AsyncByteStream):
 
     async def aclose(self) -> None:
         self.close_calls += 1
+
+
+class FirstEventOnlyProbeStream(TrackedProbeStream):
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        self.read_calls += 1
+        yield self.content
+        raise AssertionError("ordinary probe requested more than its first event")
 
 
 class TrackedProbeResponse(httpx.Response):

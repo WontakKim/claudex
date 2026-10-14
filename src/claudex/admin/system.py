@@ -504,6 +504,12 @@ async def _probe_responses_route(
                 tier_diagnostic["confirmation_reason"] = f"The backend reported {backend_tier}, not the requested {requested_tier} tier."
         return response_model
     response = first_event.get("response") if isinstance(first_event, dict) else None
+    if isinstance(first_event, dict) and first_event.get("type") in ("error", "response.failed"):
+        rejection = (
+            response.get("error") if first_event["type"] == "response.failed" and isinstance(response, dict)
+            else first_event.get("error", first_event)
+        )
+        raise UpstreamError(502, json.dumps({"error": rejection}), provider_name)
     model = response.get("model") if isinstance(response, dict) else None
     return model if isinstance(model, str) else target
 
