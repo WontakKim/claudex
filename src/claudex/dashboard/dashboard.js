@@ -1161,16 +1161,19 @@ function setLogLevel(level){
 }
 /* === Lockable settings =================================================== */
 /* A 409 error body is never a settings envelope. Lock immediately, report
-   its error detail, and adopt state only from the authenticated refresh GET. */
+   its error detail, and adopt state only from the authenticated refresh GET.
+   Save ownership includes that refresh, independently of button rerenders. */
 function applyLockableSetting(config){
+  if(config.state.isSaving)return;
+  config.state.isSaving=true;
   setButtonBusy(config.button);
-  config.request().then(function(r){
+  return config.request().then(function(r){
     if(r.status===409){
       config.lock();
       config.render();
       showToast('<span class="chip chip-err">LOCKED</span><span class="lat">409</span><br>'+esc(config.envName)+
         '<br><span class="dim">'+esc(errDetail(r.body))+"</span>",true);
-      config.refresh().then(function(g){
+      return config.refresh().then(function(g){
         if(config.isFresh(g)){
           config.adopt(g);
         }else{
@@ -1180,7 +1183,6 @@ function applyLockableSetting(config){
             '<br><span class="dim">Could not load current state. Reload the dashboard to retry.</span>',true);
         }
       });
-      return;
     }
     if(!r.ok){
       config.render();
@@ -1194,6 +1196,9 @@ function applyLockableSetting(config){
     config.render();
     showToast('<span class="chip chip-err">ERROR</span><br>'+config.name+
       '<br><span class="dim">Gateway unreachable. Check that the gateway is running and reachable, then retry.</span>',true);
+  }).finally(function(){
+    config.state.isSaving=false;
+    config.render();
   });
 }
 
@@ -1202,6 +1207,7 @@ function applyLockableSetting(config){
 var COMP={
   envName:"CLAUDEX_COMPACTION_MODEL",
   locked:false,
+  isSaving:false,
   LIVE:{model:null},
   // draftKind: "disabled" | one of COMPACTION_CURATED_MODELS | "custom"
   draftKind:"disabled",
@@ -1234,8 +1240,8 @@ function renderCompaction(){
   input.value=COMP.draftCustom;
   input.disabled=COMP.locked;
   var btn=document.getElementById("comp-apply");
-  btn.disabled=COMP.locked;
-  btn.textContent="Apply";
+  btn.disabled=COMP.locked||COMP.isSaving;
+  btn.textContent=COMP.isSaving?"…":"Apply";
 }
 /* Adopts a fresh /admin/settings/compaction GET/PUT envelope as the new live state
    and re-derives the draft selection from it. */
@@ -1263,6 +1269,7 @@ function applyCompaction(){
   }
   applyLockableSetting({
     button:btn,
+    state:COMP,
     request:function(){return jfetch("/admin/settings/compaction",{
       method:"PUT",
       headers:JSON_HEADERS,
@@ -1623,7 +1630,7 @@ renderGptProConcurrency();
    Same envelope discipline as the compaction card: adopt the live policy
    from every successful response, 409 flips the local lock and re-syncs from
    a fresh GET. Apply stays inert while the draft equals the live mode. */
-var ROUTING={envName:"CLAUDEX_CLAUDE_ACCOUNT_ROUTING",locked:false,mode:"disabled",draft:"disabled",includeLocalLogin:null};
+var ROUTING={envName:"CLAUDEX_CLAUDE_ACCOUNT_ROUTING",locked:false,isSaving:false,mode:"disabled",draft:"disabled",includeLocalLogin:null};
 var ROUTING_LABELS={disabled:"Disabled",fallback:"Fallback",balanced:"Balanced"};
 var ROUTING_HINTS={
   disabled:"Current: Disabled — use the serving pin, or client credentials when no pin is set; forward 429 responses without pool fallback.",
@@ -1641,8 +1648,8 @@ function renderRouting(){
   select.value=ROUTING.draft;
   select.disabled=ROUTING.locked;
   var btn=document.getElementById("routing-apply");
-  btn.disabled=ROUTING.locked||ROUTING.draft===ROUTING.mode;
-  btn.textContent="Apply";
+  btn.disabled=ROUTING.locked||ROUTING.isSaving||ROUTING.draft===ROUTING.mode;
+  btn.textContent=ROUTING.isSaving?"…":"Apply";
   document.getElementById("routing-current").textContent=ROUTING_HINTS[ROUTING.mode];
 }
 function renderRoutingState(body){
@@ -1658,6 +1665,7 @@ function applyRouting(){
   if(ROUTING.locked||btn.disabled)return;
   applyLockableSetting({
     button:btn,
+    state:ROUTING,
     request:function(){return jfetch("/admin/providers/claude/pool/routing",{
       method:"PUT",
       headers:JSON_HEADERS,

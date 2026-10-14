@@ -227,6 +227,13 @@ The Settings tab's **Claude accounts** category manages the accounts described i
 **General** category and is read-only while `CLAUDEX_CLAUDE_ACCOUNT_ROUTING` is
 set.
 
+Compaction reroute and account routing each allow one pending save. Apply
+shows `…` and stays disabled until the save, including any `409` refresh,
+settles; changing a draft does not submit another request. On success,
+the controls adopt the server-returned value. If a lock refresh fails,
+the setting stays locked. Apply a later draft only after the pending
+operation finishes and the setting is unlocked.
+
 - The local CLI login card shows this machine's own Claude Code login and its
   usage. The card is informational: the login serves traffic only when
   balanced routing includes it (see

@@ -1950,3 +1950,118 @@ def test_concurrent_stale_local_rejection_does_not_discard_the_corrected_token(
         {"url": "/admin/settings/codex", "hasValidToken": True},
         {"url": "/admin/settings/log-level", "hasValidToken": True},
     ]
+
+
+LOCKABLE_SAVE_OUTCOMES = (
+    "success", "success-locked", "http", "network", "conflict-unlocked",
+    "conflict-locked", "refresh-http", "refresh-malformed", "refresh-network",
+)
+
+
+@pytest.mark.parametrize("setting", ["compaction", "routing"])
+@pytest.mark.parametrize("outcome", LOCKABLE_SAVE_OUTCOMES)
+def test_lockable_save_owns_pending_request_across_actual_event_rerenders(
+    dashboard_runtime_result: dict[str, Any], setting: str, outcome: str,
+) -> None:
+    row = next(row for row in dashboard_runtime_result["lockableSaveStates"]
+               if (row["setting"], row["outcome"]) == (setting, outcome))
+    assert row["beforeClick"] == []
+    for phase in ("pending", "rerendered", "afterRepeatedClick", "directGuard"):
+        assert row[phase]["requestCount"] == 1
+        assert row[phase]["buttonDisabled"] is True
+        assert row[phase]["buttonText"] == "…"
+    requests = row["requestsBeforeLater"]
+    puts = [request for request in requests if request["options"]]
+    field = "model" if setting == "compaction" else "mode"
+    assert puts == [{"url": row["endpoint"], "options": {
+        "method": "PUT", "headers": {"Content-Type": "application/json"},
+        "body": json.dumps({field: row["first"]}, separators=(",", ":")),
+    }}]
+    assert all(request["url"] == row["endpoint"] for request in requests)
+    if row["refreshPending"] is not None:
+        pending = row["refreshPending"]
+        assert pending["requestCount"] == 2
+        assert pending["locked"] is pending["buttonDisabled"] is True
+        assert pending["buttonText"] == "…"
+        assert pending["live"] == row["initial"]
+        assert requests[-1] == {"url": row["endpoint"], "options": None}
+
+
+@pytest.mark.parametrize("setting", ["compaction", "routing"])
+@pytest.mark.parametrize("outcome", LOCKABLE_SAVE_OUTCOMES)
+def test_lockable_save_settlement_preserves_live_values_errors_and_refresh_locks(
+    dashboard_runtime_result: dict[str, Any], setting: str, outcome: str,
+) -> None:
+    row = next(row for row in dashboard_runtime_result["lockableSaveStates"]
+               if (row["setting"], row["outcome"]) == (setting, outcome))
+    after = row["after"]
+    expected_live = row["first"] if outcome.startswith("success") else row["next"] if outcome.startswith("conflict") else row["initial"]
+    is_locked = outcome in ("success-locked", "conflict-locked", "refresh-http", "refresh-malformed", "refresh-network")
+    assert after["live"] == expected_live
+    assert after["locked"] is after["cardLocked"] is after["selectDisabled"] is is_locked
+    if setting == "compaction":
+        assert after["customDisabled"] is is_locked
+    assert after["buttonText"] == "Apply"
+    assert after["buttonDisabled"] is (is_locked or (setting == "routing" and after["draft"] == after["live"]))
+    if outcome.startswith("success"):
+        assert after["live"] == row["serverAfter"] == row["first"]
+        assert "APPLIED" in after["toast"]
+    elif outcome.startswith("conflict"):
+        assert "LOCKED" in after["toast"] and "&lt;setting locked>" in after["toast"]
+    elif outcome == "refresh-network":
+        assert "ERROR" in after["toast"] and "Gateway unreachable" in after["toast"]
+    elif outcome.startswith("refresh"):
+        assert "ERROR" in after["toast"] and "Could not load current state" in after["toast"]
+    elif outcome == "http":
+        assert "ERROR" in after["toast"] and "&lt;save failed>" in after["toast"]
+    else:
+        assert "ERROR" in after["toast"] and "Gateway unreachable" in after["toast"]
+
+
+@pytest.mark.parametrize("setting", ["compaction", "routing"])
+@pytest.mark.parametrize("outcome", LOCKABLE_SAVE_OUTCOMES)
+def test_lockable_save_allows_later_intentional_save_only_after_unlocked_settlement(
+    dashboard_runtime_result: dict[str, Any], setting: str, outcome: str,
+) -> None:
+    row = next(row for row in dashboard_runtime_result["lockableSaveStates"]
+               if (row["setting"], row["outcome"]) == (setting, outcome))
+    later_requests = row["requests"][len(row["requestsBeforeLater"]):]
+    if row["after"]["locked"]:
+        assert later_requests == []
+        assert row["later"]["live"] == row["after"]["live"]
+        assert row["later"]["buttonDisabled"] is True
+    else:
+        assert len(later_requests) == 1
+        assert later_requests[0]["url"] == row["endpoint"]
+        assert later_requests[0]["options"]["method"] == "PUT"
+        field = "model" if setting == "compaction" else "mode"
+        assert json.loads(later_requests[0]["options"]["body"]) == {field: row["laterValue"]}
+        assert row["later"]["live"] == row["laterValue"]
+        assert row["later"]["buttonText"] == "Apply"
+        assert row["later"]["locked"] is False
+
+
+@pytest.mark.parametrize("setting", ["compaction", "routing"])
+def test_lockable_save_initial_env_lock_survives_events_and_direct_button_changes(
+    dashboard_runtime_result: dict[str, Any], setting: str,
+) -> None:
+    row = next(row for row in dashboard_runtime_result["lockableSaveStates"]
+               if (row["setting"], row["outcome"]) == (setting, "initial-locked"))
+    assert row["requests"] == row["beforeClick"] == []
+    for phase in ("before", "pending", "rerendered", "afterRepeatedClick", "directGuard"):
+        assert row[phase]["live"] == row["initial"]
+        assert row[phase]["locked"] is row[phase]["cardLocked"] is row[phase]["buttonDisabled"] is row[phase]["selectDisabled"] is True
+        assert row[phase]["buttonText"] == "Apply"
+
+
+def test_lockable_save_ownership_is_per_setting_not_a_global_save_lock(
+    dashboard_runtime_result: dict[str, Any],
+) -> None:
+    row = dashboard_runtime_result["lockableSaveIndependence"]
+    assert row["requests"] == [
+        {"url": "/admin/settings/compaction", "options": {"method": "PUT", "headers": {"Content-Type": "application/json"}, "body": '{"model":"claude:claude-sonnet-5"}'}},
+        {"url": "/admin/providers/claude/pool/routing", "options": {"method": "PUT", "headers": {"Content-Type": "application/json"}, "body": '{"mode":"fallback"}'}},
+    ]
+    assert row["pending"] == [{"disabled": True, "text": "…"}] * 2
+    assert row["compaction"] == "claude:claude-sonnet-5"
+    assert row["routing"] == "fallback"

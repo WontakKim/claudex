@@ -2282,6 +2282,138 @@ async function main() {
       diagnostic: parityDocument.getElementById("codex-speed-result").innerHTML});
   }
 
+  const lockableSaveStates = [];
+  const flushLockableSaves = async () => { for (let index = 0; index < 12; index++) await Promise.resolve(); };
+  for (const setting of ["compaction", "routing"]) {
+    for (const outcome of ["success", "success-locked", "http", "network", "conflict-unlocked", "conflict-locked", "refresh-http", "refresh-malformed", "refresh-network", "initial-locked"]) {
+      const saveDocument = new FakeDocument(html);
+      const saveContext = Object.assign({}, context, {document: saveDocument});
+      vm.createContext(saveContext);
+      vm.runInContext(source, saveContext, {filename: javascriptPath});
+      const isCompaction = setting === "compaction";
+      const endpoint = isCompaction ? "/admin/settings/compaction" : "/admin/providers/claude/pool/routing";
+      const initial = isCompaction ? null : "disabled";
+      const first = isCompaction ? "claude:save-first" : "fallback";
+      const next = isCompaction ? "claude:save-next" : "balanced";
+      const select = saveDocument.getElementById(isCompaction ? "comp-select" : "routing-select");
+      const button = saveDocument.getElementById(isCompaction ? "comp-apply" : "routing-apply");
+      const custom = saveDocument.getElementById("comp-custom-input");
+      const createSettingsEnvelope = (value, locked = false) => ({ok: true, status: 200, body: isCompaction
+        ? {model: value, env_locked: locked, last_reroute: null}
+        : {mode: value, env_locked: locked, include_local_login: true}});
+      const adopt = (body) => isCompaction ? saveContext.renderCompactionState(body) : saveContext.renderRoutingState(body);
+      const render = () => isCompaction ? saveContext.renderCompaction() : saveContext.renderRouting();
+      const change = (value) => {
+        select.value = isCompaction ? "custom" : value;
+        select.dispatchEvent({type: "change"});
+        if (isCompaction) {
+          custom.value = value.slice("claude:".length);
+          custom.dispatchEvent({type: "input"});
+        }
+      };
+      const requests = [];
+      const firstResponse = createDeferred();
+      const prematureResponse = createDeferred();
+      const refreshResponse = createDeferred();
+      let serverValue = initial;
+      let isLaterSave = false;
+      saveContext.jfetch = (url, options) => {
+        if (url !== endpoint) throw new Error("unexpected lockable-setting endpoint: " + url);
+        requests.push({url, options: options || null});
+        if (!options) return refreshResponse.promise;
+        const value = JSON.parse(options.body)[isCompaction ? "model" : "mode"];
+        if (isLaterSave) { serverValue = value; return Promise.resolve(createSettingsEnvelope(value)); }
+        const puts = requests.filter((request) => request.options && request.options.method === "PUT");
+        if (puts.length === 1) {
+          if (outcome.startsWith("success")) serverValue = value;
+          return firstResponse.promise;
+        }
+        serverValue = value;
+        return prematureResponse.promise;
+      };
+      const capture = () => ({
+        live: isCompaction ? saveContext.COMP.LIVE.model : saveContext.ROUTING.mode,
+        draft: isCompaction ? saveContext.COMP.draftCustom : saveContext.ROUTING.draft,
+        locked: isCompaction ? saveContext.COMP.locked : saveContext.ROUTING.locked,
+        buttonDisabled: button.disabled, buttonText: button.textContent,
+        selectDisabled: select.disabled, customDisabled: custom.disabled,
+        cardLocked: saveDocument.getElementById(isCompaction ? "compaction-card" : "routing-card").classList.contains("locked"),
+        requestCount: requests.length, toast: saveDocument.getElementById("toast")?.innerHTML || "",
+      });
+      adopt(createSettingsEnvelope(initial, outcome === "initial-locked").body);
+      const before = capture();
+      change(first);
+      const beforeClick = requests.slice();
+      button.click();
+      const pending = capture();
+      change(next);
+      render();
+      const rerendered = capture();
+      button.click();
+      const afterRepeatedClick = capture();
+      button.disabled = false;
+      button.dispatchEvent({type: "click"});
+      render();
+      const directGuard = capture();
+      if (outcome === "initial-locked") {
+        lockableSaveStates.push({setting, outcome, endpoint, initial, first, next, before, beforeClick,
+          pending, rerendered, afterRepeatedClick, directGuard, requests});
+        continue;
+      }
+      prematureResponse.resolve(createSettingsEnvelope(next));
+      await flushLockableSaves();
+      let refreshPending = null;
+      if (outcome === "network") firstResponse.reject(new Error("PUT disconnected"));
+      else if (outcome === "http") firstResponse.resolve({ok: false, status: 500, body: {error: {message: "<save failed>"}}});
+      else if (outcome.startsWith("success")) firstResponse.resolve(createSettingsEnvelope(first, outcome === "success-locked"));
+      else firstResponse.resolve({ok: false, status: 409, body: {error: {message: "<setting locked>"}, model: "claude:error-body", mode: "balanced"}});
+      await flushLockableSaves();
+      if (outcome.startsWith("conflict") || outcome.startsWith("refresh")) {
+        refreshPending = capture();
+        if (outcome === "refresh-http") refreshResponse.resolve({ok: false, status: 503, body: {error: {message: "refresh unavailable"}}});
+        else if (outcome === "refresh-malformed") refreshResponse.resolve({ok: true, status: 200, body: {env_locked: false}});
+        else if (outcome === "refresh-network") refreshResponse.reject(new Error("GET disconnected"));
+        else refreshResponse.resolve(createSettingsEnvelope(next, outcome === "conflict-locked"));
+        await flushLockableSaves();
+      }
+      const after = capture();
+      const serverAfter = serverValue;
+      const requestsBeforeLater = requests.slice();
+      const laterValue = isCompaction ? "claude:save-later" : after.live === "fallback" ? "balanced" : "fallback";
+      isLaterSave = true;
+      change(laterValue);
+      button.click();
+      await flushLockableSaves();
+      lockableSaveStates.push({setting, outcome, endpoint, initial, first, next, before, beforeClick,
+        pending, rerendered, afterRepeatedClick, directGuard, refreshPending, after, serverAfter,
+        requestsBeforeLater, laterValue, later: capture(), requests});
+    }
+  }
+  const independentDocument = new FakeDocument(html);
+  const independentContext = Object.assign({}, context, {document: independentDocument});
+  vm.createContext(independentContext);
+  vm.runInContext(source, independentContext, {filename: javascriptPath});
+  independentContext.renderCompactionState({model: null, env_locked: false, last_reroute: null});
+  independentContext.renderRoutingState({mode: "disabled", env_locked: false, include_local_login: true});
+  const independentRequests = [];
+  const independentResponses = {compaction: createDeferred(), routing: createDeferred()};
+  independentContext.jfetch = (url, options) => {
+    independentRequests.push({url, options});
+    return independentResponses[url === "/admin/settings/compaction" ? "compaction" : "routing"].promise;
+  };
+  independentDocument.getElementById("comp-select").value = "claude-sonnet-5";
+  independentDocument.getElementById("comp-select").dispatchEvent({type: "change"});
+  independentDocument.getElementById("comp-apply").click();
+  independentDocument.getElementById("routing-select").value = "fallback";
+  independentDocument.getElementById("routing-select").dispatchEvent({type: "change"});
+  independentDocument.getElementById("routing-apply").click();
+  const independentPending = ["comp-apply", "routing-apply"].map((id) => ({disabled: independentDocument.getElementById(id).disabled, text: independentDocument.getElementById(id).textContent}));
+  independentResponses.compaction.resolve({ok: true, status: 200, body: {model: "claude:claude-sonnet-5", env_locked: false, last_reroute: null}});
+  independentResponses.routing.resolve({ok: true, status: 200, body: {mode: "fallback", env_locked: false, include_local_login: true}});
+  await flushLockableSaves();
+  const lockableSaveIndependence = {requests: independentRequests, pending: independentPending,
+    compaction: independentContext.COMP.LIVE.model, routing: independentContext.ROUTING.mode};
+
   const output = {credentialLeak};
   if (!credentialLeak) {
     Object.assign(output, {
@@ -2303,6 +2435,8 @@ async function main() {
       appliedRouteStates,
       normalizedSpeedTargets,
       routeBoundaryParity,
+      lockableSaveStates,
+      lockableSaveIndependence,
       localHeroStates,
       localHeroLoadOrder,
       routingEnvelopeValidation,
