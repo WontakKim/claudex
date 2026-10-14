@@ -79,6 +79,11 @@ never enables Ultrafast automatically.
    speed and outbound wire tier for the **configured** selection. The status
    and timestamp above the list describe the serving metadata snapshot. Mixed
    mappings can apply acceleration to one model while another uses Standard.
+   Provider/model boundary whitespace is ignored for capability lookups and
+   explicit Codex target checks, matching backend parsing. This uses Python's
+   whitespace boundaries, not broader character normalization: opaque model
+   characters such as U+FEFF and later colons remain part of the ID. Stored
+   mapping strings and board-node identities are not rewritten.
 2. Use **Refresh capabilities** after a login or subscription change, or to retry
    an unavailable catalog. It refreshes the same snapshot used for serving,
    including same-account upgrades with an unchanged token. It sends metadata

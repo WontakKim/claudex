@@ -2178,6 +2178,110 @@ async function main() {
   authErrorScopeStates.concurrent = {prompts: concurrentPrompts, correctedStatus: corrected.status, staleStatus: stale.status,
     tokenRetained: concurrentContext.localToken === "valid-local-token", requests: concurrentRequests};
 
+  const routeParsing = [
+    "codex:model", "codex: model", "codex :model", " \tcodex \t: \tmodel:variant:tail \n",
+    "openai-by-name:Manual:Model:alpha", " openai-by-name : Manual:Model:alpha ",
+    "UnlistedCase:UnknownCase:next", " UnlistedCase : UnknownCase:next ",
+  ].map((raw) => ({raw, parsed: context.routeOf(raw)}));
+  const appliedRouteStates = [];
+  for (const raw of ["codex:model:variant:tail", "codex: model:variant:tail", "codex :model:variant:tail", " \tcodex \t: \tmodel:variant:tail \n"]) {
+    for (const isLocked of [false, true]) {
+      for (const support of ["supported", "unsupported", "missing"]) {
+        const routeDocument = new FakeDocument(html);
+        const routeContext = Object.assign({}, context, {document: routeDocument});
+        vm.createContext(routeContext);
+        vm.runInContext(source, routeContext, {filename: javascriptPath});
+        routeContext.DIR.LIVE = {opus: raw, haiku: " openai-by-name : Custom:Model ", sonnet: "codex:canonical-extra"};
+        routeContext.DIR.mapping = {...routeContext.DIR.LIVE, opus: "codex:draft-only"};
+        routeContext.DIR.locked = isLocked;
+        routeContext.addedTargets = ["codex:staged-only"];
+        routeContext.renderCodexState({service_tier: "fast", env_locked: isLocked});
+        const entry = {supported_tiers: support === "unsupported" ? ["standard"] : ["standard", "fast"],
+          advertised_tier_ids: support === "unsupported" ? [] : ["priority"],
+          status: support === "unsupported" ? "unsupported" : "supported",
+          reason: support === "unsupported" ? "Synthetic catalog does not advertise Fast." : null,
+          applicable_tier: support === "unsupported" ? null : "fast", wire_tier: support === "unsupported" ? null : "priority"};
+        const canonical = {...entry, supported_tiers: ["standard", "fast"], advertised_tier_ids: ["priority"],
+          status: "supported", reason: null, applicable_tier: "fast", wire_tier: "priority"};
+        const models = {"canonical-extra": canonical};
+        if (support !== "missing") models["model:variant:tail"] = entry;
+        const body = codexCapabilitiesEnvelope("fast", models).body;
+        routeContext.renderCodexCapabilitiesState(body);
+        routeContext.renderChrome();
+        routeContext.render();
+        const before = routeDocument.getElementById("codex-capabilities-models").innerHTML;
+        const snapshot = {rawLive: {...routeContext.DIR.LIVE}, rawDraft: {...routeContext.DIR.mapping},
+          targetIds: routeContext.DIR.targets.map((target) => target.id),
+          renderedTargetIds: routeDocument.allElements.filter((element) => element.classList.contains("tgt") && element.isConnected).map((element) => element.dataset.id),
+          isLocked: routeContext.DIR.locked, isLockVisible: routeDocument.body.classList.contains("env-locked"),
+          selectDisabled: routeDocument.getElementById("codex-speed").disabled};
+        const routeRequests = [];
+        routeContext.jfetch = (url, options) => {
+          routeRequests.push({url, options});
+          return Promise.resolve({ok: true, status: 200, body});
+        };
+        await routeContext.fetchCodexCapabilities(true);
+        appliedRouteStates.push({raw, isLocked, support, before, after: routeDocument.getElementById("codex-capabilities-models").innerHTML,
+          header: routeDocument.getElementById("codex-capabilities-status").textContent,
+          parsed: routeContext.routeOf(raw), customParsed: routeContext.routeOf(" openai-by-name : Custom:Model "),
+          snapshot, requests: routeRequests});
+      }
+    }
+  }
+
+  const normalizedSpeedTargets = [];
+  for (const raw of ["codex:model:variant:tail", "codex: model:variant:tail", "codex :model:variant:tail", " \tcodex \t: \tmodel:variant:tail \n", " openai-by-name : Custom:Model "]) {
+    const targetDocument = new FakeDocument(html);
+    const targetContext = Object.assign({}, context, {document: targetDocument});
+    vm.createContext(targetContext);
+    vm.runInContext(source, targetContext, {filename: javascriptPath});
+    targetContext.renderCodexState({service_tier: "fast", env_locked: false});
+    const targetRequests = [];
+    targetContext.jfetch = (url, options) => {
+      targetRequests.push({url, options});
+      return Promise.resolve({ok: true, status: 200, body: {ok: true, status: 200, target: raw.trim(), response_model: "model:variant:tail",
+        tier_diagnostic: {requested_tier: "fast", sent_tier: "priority", backend_confirmed_tier: "priority", capability_status: "supported",
+          capability_reason: null, confirmation_status: "confirmed", confirmation_reason: null}}});
+    };
+    targetDocument.getElementById("ct-in").value = raw;
+    const before = targetRequests.slice();
+    await targetContext.runCodexSpeedTest();
+    normalizedSpeedTargets.push({raw, before, requests: targetRequests,
+      result: targetDocument.getElementById("codex-speed-result").innerHTML,
+      savedTier: targetContext.CODEX.serviceTier, draftTier: targetContext.CODEX.draft});
+  }
+
+  const routeBoundaryParity = [];
+  for (const [raw, model] of [
+    ["codex:\u0085model:tail", "model:tail"], ["codex\u0085:model:tail", "model:tail"],
+    ["codex:\ufeffmodel:tail", "\ufeffmodel:tail"], ["codex:model:tail\ufeff", "model:tail\ufeff"],
+  ]) {
+    const parityDocument = new FakeDocument(html);
+    const parityContext = Object.assign({}, context, {document: parityDocument});
+    vm.createContext(parityContext);
+    vm.runInContext(source, parityContext, {filename: javascriptPath});
+    parityContext.DIR.LIVE = {opus: raw};
+    parityContext.DIR.mapping = {...parityContext.DIR.LIVE};
+    parityContext.renderCodexState({service_tier: "fast", env_locked: false});
+    const body = codexCapabilitiesEnvelope("fast", {[model]: {supported_tiers: ["standard", "fast"], advertised_tier_ids: ["priority"],
+      status: "supported", reason: null, applicable_tier: "fast", wire_tier: "priority"}}).body;
+    parityContext.renderCodexCapabilitiesState(body);
+    parityContext.render();
+    const requests = [];
+    parityContext.jfetch = (url, options) => {
+      requests.push({url, options});
+      return Promise.resolve({ok: true, status: 200, body: {ok: true, status: 200, response_model: model,
+        tier_diagnostic: {requested_tier: "fast", sent_tier: "priority", backend_confirmed_tier: "priority", capability_status: "supported",
+          capability_reason: null, confirmation_status: "confirmed", confirmation_reason: null}}});
+    };
+    parityDocument.getElementById("ct-in").value = raw;
+    await parityContext.runCodexSpeedTest();
+    routeBoundaryParity.push({raw, expectedModel: model, parsed: parityContext.routeOf(raw),
+      models: parityDocument.getElementById("codex-capabilities-models").innerHTML,
+      live: {...parityContext.DIR.LIVE}, targetIds: parityContext.DIR.targets.map((target) => target.id), requests,
+      diagnostic: parityDocument.getElementById("codex-speed-result").innerHTML});
+  }
+
   const output = {credentialLeak};
   if (!credentialLeak) {
     Object.assign(output, {
@@ -2195,6 +2299,10 @@ async function main() {
       optionalCatalogBoot,
       healthAuthenticationBoot,
       authErrorScopeStates,
+      routeParsing,
+      appliedRouteStates,
+      normalizedSpeedTargets,
+      routeBoundaryParity,
       localHeroStates,
       localHeroLoadOrder,
       routingEnvelopeValidation,

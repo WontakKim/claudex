@@ -20,12 +20,16 @@ var CATALOG={codex:[],kimi:[],grok:[]};
 /* Curated compaction reroute targets, in the dashboard's <select> order.
    "claude-haiku" is deliberately never a curated choice here. */
 var COMPACTION_CURATED_MODELS=["claude-sonnet-5","claude-opus-5","claude-fable-5"];
+/* Python str.strip includes U+0085 and U+001C–U+001F, but keeps U+FEFF as model data. */
+function stripRouteBoundaryWhitespace(value){
+  return value.replace(/^[\u0009-\u000d\u001c-\u0020\u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+|[\u0009-\u000d\u001c-\u0020\u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+$/g,"");
+}
 /* Reads config.parse_route_target's shape: the first colon separates the
    provider prefix from the complete model portion, including later colons. */
 function routeOf(value){
   var at=String(value).indexOf(":");
-  var prefix=value.slice(0,at);
-  return{provider:prefix,model:value.slice(at+1)};
+  var prefix=stripRouteBoundaryWhitespace(value.slice(0,at));
+  return{provider:prefix,model:stripRouteBoundaryWhitespace(value.slice(at+1))};
 }
 function routeValue(provider,model){return provider+":"+model}
 /* Target nodes staged on the board but not wired yet. The board no longer
@@ -2428,8 +2432,9 @@ function renderCodexSpeedResult(response,target,requested){
 }
 function runCodexSpeedTest(){
   if(!CODEX.hasLoaded||CODEX.isSaving||CODEX.isLoading||CODEX_SPEED_TEST.isRunning)return Promise.resolve();
-  var target=document.getElementById("ct-in").value.trim();
-  if(target.indexOf("codex:")!==0||!routeOf(target).model.trim()){
+  var target=stripRouteBoundaryWhitespace(document.getElementById("ct-in").value);
+  var route=routeOf(target);
+  if(route.provider!=="codex"||!route.model){
     showCodexSpeedResult("Enter a codex:model target in the Model connection test field before testing the selected speed.",true);
     return Promise.resolve();
   }

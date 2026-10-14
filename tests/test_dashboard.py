@@ -34,12 +34,119 @@ def route_of_body() -> str:
     return body
 
 
-def test_route_of_preserves_provider_and_complete_model_suffix() -> None:
-    body = route_of_body()
+@pytest.mark.parametrize("raw,provider,model", [
+    ("codex:model", "codex", "model"),
+    ("codex: model", "codex", "model"),
+    ("codex :model", "codex", "model"),
+    (" \tcodex \t: \tmodel:variant:tail \n", "codex", "model:variant:tail"),
+    ("openai-by-name:Manual:Model:alpha", "openai-by-name", "Manual:Model:alpha"),
+    (" openai-by-name : Manual:Model:alpha ", "openai-by-name", "Manual:Model:alpha"),
+    ("UnlistedCase:UnknownCase:next", "UnlistedCase", "UnknownCase:next"),
+    (" UnlistedCase : UnknownCase:next ", "UnlistedCase", "UnknownCase:next"),
+])
+def test_route_of_preserves_provider_and_complete_model_suffix(
+    dashboard_runtime_result: dict[str, Any], raw: str, provider: str, model: str,
+) -> None:
+    row = next(row for row in dashboard_runtime_result["routeParsing"] if row["raw"] == raw)
+    assert row["raw"] == raw
+    assert row["parsed"] == {"provider": provider, "model": model}
 
-    assert 'String(value).indexOf(":")' in body
-    assert "var prefix=value.slice(0,at);" in body
-    assert "return{provider:prefix,model:value.slice(at+1)};" in body
+
+@pytest.mark.parametrize("raw", [
+    "codex:model:variant:tail", "codex: model:variant:tail", "codex :model:variant:tail",
+    " \tcodex \t: \tmodel:variant:tail \n",
+])
+@pytest.mark.parametrize("is_locked", [False, True])
+@pytest.mark.parametrize("support", ["supported", "unsupported", "missing"])
+def test_applied_route_capabilities_match_backend_parts_without_rewriting_raw_ids(
+    dashboard_runtime_result: dict[str, Any], raw: str, is_locked: bool, support: str,
+) -> None:
+    row = next(row for row in dashboard_runtime_result["appliedRouteStates"]
+               if (row["raw"], row["isLocked"], row["support"]) == (raw, is_locked, support))
+    assert row["parsed"] == {"provider": "codex", "model": "model:variant:tail"}
+    assert row["customParsed"] == {"provider": "openai-by-name", "model": "Custom:Model"}
+    assert "configured Fast" in row["header"] and "applied mappings only" in row["header"]
+    assert row["before"] == row["after"]
+    first = row["after"].split("</li>", 1)[0]
+    assert "<b>model:variant:tail</b>" in first
+    if support == "supported":
+        assert "Supported speeds: Standard, Fast" in first
+        assert "Supported · Applicable: Fast · Outbound wire: priority" in first
+        assert "No capability entry" not in first
+    elif support == "unsupported":
+        assert "Unsupported · Applicable: Standard · Outbound wire: omitted (Standard)" in first
+        assert "Synthetic catalog does not advertise Fast" in first
+    else:
+        assert "Unknown · Applicable: Unknown · Outbound wire: Unknown" in first
+        assert "No capability entry for this applied model" in first
+    assert "canonical-extra" in row["after"]
+    assert "Custom:Model" not in row["after"]
+    assert "draft-only" not in row["after"] and "staged-only" not in row["after"]
+    snapshot = row["snapshot"]
+    assert snapshot["rawLive"] == {"opus": raw, "haiku": " openai-by-name : Custom:Model ", "sonnet": "codex:canonical-extra"}
+    assert snapshot["rawDraft"]["opus"] == "codex:draft-only"
+    assert raw in snapshot["targetIds"] and raw in snapshot["renderedTargetIds"]
+    assert " openai-by-name : Custom:Model " in snapshot["targetIds"]
+    assert snapshot["isLocked"] is snapshot["isLockVisible"] is snapshot["selectDisabled"] is is_locked
+    assert row["requests"] == [{"url": "/admin/providers/codex/capabilities/refresh", "options": {
+        "method": "POST", "headers": {"Content-Type": "application/json"}, "body": "{}",
+    }}]
+
+
+@pytest.mark.parametrize("raw", [
+    "codex:model:variant:tail", "codex: model:variant:tail", "codex :model:variant:tail",
+    " \tcodex \t: \tmodel:variant:tail \n", " openai-by-name : Custom:Model ",
+])
+def test_selected_speed_consumer_accepts_backend_normalized_codex_prefix_only(
+    dashboard_runtime_result: dict[str, Any], raw: str,
+) -> None:
+    row = next(row for row in dashboard_runtime_result["normalizedSpeedTargets"] if row["raw"] == raw)
+    assert row["before"] == []
+    assert row["savedTier"] == row["draftTier"] == "fast"
+    if raw.strip().startswith("openai-by-name"):
+        assert row["requests"] == []
+        assert "Enter a codex:model target" in row["result"]
+    else:
+        assert row["requests"] == [{"url": "/admin/test", "options": {
+            "method": "POST", "headers": {"Content-Type": "application/json"},
+            "body": json.dumps({"target": raw.strip(), "service_tier": "fast"}, separators=(",", ":")),
+        }}]
+        assert "Requested UI speed: Fast" in row["result"]
+        assert "Final outbound wire tier: priority" in row["result"]
+        assert "model:variant:tail" in row["result"]
+        assert "Speed confirmation: Confirmed" in row["result"]
+
+
+@pytest.mark.parametrize("raw,model", [
+    ("codex:\u0085model:tail", "model:tail"), ("codex\u0085:model:tail", "model:tail"),
+    ("codex:\ufeffmodel:tail", "\ufeffmodel:tail"), ("codex:model:tail\ufeff", "model:tail\ufeff"),
+])
+def test_route_boundaries_match_python_strip_and_preserve_opaque_model_data(
+    dashboard_runtime_result: dict[str, Any], raw: str, model: str,
+) -> None:
+    row = next(row for row in dashboard_runtime_result["routeBoundaryParity"] if row["raw"] == raw)
+    assert row["expectedModel"] == model
+    assert row["parsed"] == {"provider": "codex", "model": model}
+    assert f"<b>{model}</b>" in row["models"]
+    assert "Supported · Applicable: Fast · Outbound wire: priority" in row["models"]
+    assert "No capability entry" not in row["models"]
+    assert row["live"] == {"opus": raw}
+    assert row["targetIds"] == [raw]
+
+
+@pytest.mark.parametrize("raw,model", [
+    ("codex:\u0085model:tail", "model:tail"), ("codex\u0085:model:tail", "model:tail"),
+    ("codex:\ufeffmodel:tail", "\ufeffmodel:tail"), ("codex:model:tail\ufeff", "model:tail\ufeff"),
+])
+def test_explicit_target_keeps_backend_opaque_model_characters(
+    dashboard_runtime_result: dict[str, Any], raw: str, model: str,
+) -> None:
+    row = next(row for row in dashboard_runtime_result["routeBoundaryParity"] if row["raw"] == raw)
+    assert len(row["requests"]) == 1
+    assert row["requests"][0]["url"] == "/admin/test"
+    assert json.loads(row["requests"][0]["options"]["body"]) == {"target": raw, "service_tier": "fast"}
+    assert f"response.model: {model}" in row["diagnostic"]
+    assert "Speed confirmation: Confirmed" in row["diagnostic"]
 
 
 def test_route_of_has_no_codex_or_provider_membership_fallback() -> None:
