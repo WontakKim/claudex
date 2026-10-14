@@ -1708,22 +1708,53 @@ def test_compact_off_identified_transport_failure_after_probe_leaves_settings_un
     assert saved == {"compaction.model": "claude:claude-old-5"}
 
 
-def _malformed_reroute_envelope() -> "admin_client._AdminHttpResponse":
-    # Envelope-level fields are fine, but the nested last_reroute is not the
-    # pinned seven-key record — this must be an admin failure, not success.
+@pytest.fixture(
+    params=[None, [], {}], ids=["missing-fields", "array-outcome", "object-outcome"]
+)
+def malformed_reroute_envelope(
+    request: pytest.FixtureRequest,
+) -> "admin_client._AdminHttpResponse":
+    # Envelope fields are valid; the nested record shape or outcome is malformed.
+    last_reroute = {}
+    if request.param is not None:
+        last_reroute = {
+            "outcome": request.param,
+            "timestamp": "",
+            "target_model": "",
+            "mapped_model": "",
+            "estimated_prompt_tokens": 0,
+            "context_window": 0,
+            "detail": None,
+        }
     return admin_client._AdminHttpResponse(
         status=200,
-        body={"model": None, "env_locked": False, "last_reroute": {}},
+        body={"model": None, "env_locked": False, "last_reroute": last_reroute},
         detail="",
     )
 
 
-def test_parse_compaction_envelope_rejects_malformed_nested_reroute_record() -> None:
-    assert (
-        compact._parse_compaction_envelope(
-            {"model": None, "env_locked": False, "last_reroute": {}}
-        )
-        is None
+def test_parse_compaction_envelope_rejects_malformed_nested_reroute_record(
+    malformed_reroute_envelope: "admin_client._AdminHttpResponse",
+) -> None:
+    assert compact._parse_compaction_envelope(malformed_reroute_envelope.body) is None
+
+
+@pytest.mark.parametrize("method", ["GET", "PUT"])
+def test_run_admin_compaction_rejects_malformed_nested_reroute_record(
+    monkeypatch: pytest.MonkeyPatch,
+    malformed_reroute_envelope: "admin_client._AdminHttpResponse",
+    method: str,
+) -> None:
+    _stub_admin_request(monkeypatch, response=malformed_reroute_envelope)
+
+    result = compact._run_admin_compaction(
+        "127.0.0.1", 8080, method, None, None if method == "GET" else {"model": None}
+    )
+
+    assert result == (
+        admin_client._AdminCallOutcome.FAILURE,
+        None,
+        "admin returned a malformed response (status 200)",
     )
 
 
@@ -1740,6 +1771,8 @@ def test_parse_compaction_envelope_rejects_malformed_nested_reroute_record() -> 
         {"outcome": "midstream_error", "detail": "connect_error"},
         {"outcome": "fallback_mapped", "detail": None},
         {"sequence": 7},
+        pytest.param({"outcome": []}, id="array-outcome"),
+        pytest.param({"outcome": {}}, id="object-outcome"),
     ],
 )
 def test_parse_reroute_record_rejects_schema_violations(
@@ -1781,30 +1814,45 @@ def test_compact_show_malformed_nested_record_exits_nonzero(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
+    malformed_reroute_envelope: "admin_client._AdminHttpResponse",
 ) -> None:
     _compact_env(monkeypatch, tmp_path, admin_client.ProbeOutcome.IDENTIFIED)
-    _stub_admin_request(monkeypatch, response=_malformed_reroute_envelope())
+    _stub_admin_request(monkeypatch, response=malformed_reroute_envelope)
 
     exit_code = compact._compact_main([])
+    captured = capsys.readouterr()
 
     assert exit_code != 0
-    assert "malformed" in capsys.readouterr().err
+    assert exit_code == 1
+    assert "malformed" in captured.err
+    assert captured.err == "compact: admin returned a malformed response (status 200)\n"
+    assert captured.out == ""
 
 
 def test_compact_set_malformed_nested_record_exits_nonzero_without_write(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    malformed_reroute_envelope: "admin_client._AdminHttpResponse",
 ) -> None:
     config = _compact_env(monkeypatch, tmp_path, admin_client.ProbeOutcome.IDENTIFIED)
-    _stub_admin_request(monkeypatch, response=_malformed_reroute_envelope())
+    _stub_admin_request(monkeypatch, response=malformed_reroute_envelope)
 
     exit_code = compact._compact_main(["set", "claude:claude-opus-5"])
+    captured = capsys.readouterr()
 
     assert exit_code != 0
+    assert exit_code == 1
     assert not config.settings_file.exists()
+    assert captured.err == "compact: admin returned a malformed response (status 200)\n"
+    assert captured.out == ""
 
 
 def test_compact_off_malformed_nested_record_exits_nonzero_without_write(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    malformed_reroute_envelope: "admin_client._AdminHttpResponse",
 ) -> None:
     settings_file = tmp_path / "settings.json"
     settings_file.write_text(
@@ -1816,13 +1864,17 @@ def test_compact_off_malformed_nested_record_exits_nonzero_without_write(
         admin_client.ProbeOutcome.IDENTIFIED,
         compaction_model="claude:claude-old-5",
     )
-    _stub_admin_request(monkeypatch, response=_malformed_reroute_envelope())
+    _stub_admin_request(monkeypatch, response=malformed_reroute_envelope)
 
     exit_code = compact._compact_main(["off"])
+    captured = capsys.readouterr()
 
     assert exit_code != 0
+    assert exit_code == 1
     saved = json.loads(settings_file.read_text(encoding="utf-8"))
     assert saved == {"compaction.model": "claude:claude-old-5"}
+    assert captured.err == "compact: admin returned a malformed response (status 200)\n"
+    assert captured.out == ""
 
 
 class _RedirectTarget:
