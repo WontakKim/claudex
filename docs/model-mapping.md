@@ -86,6 +86,25 @@ request. A successful connection-test status alone does not prove that the
 upstream served the exact model unless its response makes model identity
 observable.
 
+### Codex model IDs and speed support
+
+The same open-ended mapping contract accepts `codex:gpt-6.1-sol` and future
+Codex IDs without a gateway update. Sol 6.1 is also a no-CLI suggestion; a preset
+or an accepted manual mapping does not establish account access.
+
+The global Codex tier setting is applied per target model, not per Claude-facing
+alias. Mixed mappings can therefore send Ultrafast for one advertised model and
+Standard for another. `GET /admin/providers/codex/capabilities` includes mapped
+IDs even when absent from the catalog, explains unknown versus unsupported tier
+support, and shows configured versus applicable request tiers without running
+inference. See [capability status and refresh](providers.md#capability-status-and-refresh).
+
+An ordinary `POST /admin/test` stays untiered. Only an explicit `service_tier`
+field opts into a tier probe, which can consume allowance; connection success
+alone still does not confirm the requested tier. See
+[explicit tier diagnostics](providers.md#explicit-tier-diagnostics) for the
+requested, sent, and backend-confirmed fields.
+
 ## Custom provider targets
 
 Custom provider names become model-map prefixes. The configured family, not the
@@ -148,10 +167,10 @@ covers consecutive assistant messages, because streaming clients may store one
 response in several records. A user turn ends that pairing scope; later client
 calls reusing an ID keep their own results.
 
-Normal client `tool_use`/user `tool_result` pairs and valid native Anthropic
-server-tool blocks are not reclassified. Unrelated orphan client results are
-not silently deleted. Existing transcript files remain unchanged: repair is
-applied to the outgoing request only.
+Normal client `tool_use`/user `tool_result` pairs are not reclassified.
+Messages-compatible replay also retains valid native Anthropic server-tool
+blocks. Unrelated orphan client results are not silently deleted. Existing
+transcript files remain unchanged: repair is applied to the outgoing request only.
 
 Responses web-search calls are exposed to Claude Code using valid
 `srvtoolu_gateway_...` IDs. A call and its result share the same ID. Repeated
@@ -169,6 +188,9 @@ matching calls.
 The same repair applies to Anthropic passthrough, registered-account routing,
 Kimi, custom Messages providers, native token counting, Anthropic compaction
 reroutes, and built-in or custom Responses providers. Existing client
-transcripts are not modified. Native Anthropic search
-calls and signed results remain untouched, including their citations. Requests
-that need no repair keep the usual passthrough behavior.
+transcripts are not modified. Messages-compatible replay leaves native Anthropic
+search calls and signed results untouched, including their citations. Responses
+instead replays native search history as text, preserving the recoverable
+plaintext search input, source titles, and URLs. Opaque `encrypted_content` is
+omitted, not treated as useful text. Requests that need no repair keep the usual
+passthrough behavior.

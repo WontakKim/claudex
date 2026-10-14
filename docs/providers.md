@@ -102,24 +102,151 @@ The dashboard's Codex add-node suggestions come from the live catalog when
 `codex --version` is available. The gateway uses the newer of the installed
 CLI version and its verified bundled client version (0.157.1) for both the
 catalog request and its User-Agent. After a 60-second cache expires, the
-next suggestion request checks the installed version again, so updating Codex
-does not require restarting the gateway. If the CLI is not installed,
-suggestions use a short built-in list instead, without fetching the catalog
-or requiring Codex credentials. A CLI that cannot report its version or a
-failed live catalog request produces a visible dashboard error rather than
-falling back to that list. These presets only suggest model IDs; context
-windows and Fast availability still come from the live catalog, never from
-preset metadata.
+next suggestion or capability request checks the installed version again, so
+updating Codex does not require restarting the gateway. If the CLI is not
+installed, suggestions use a short built-in list, including `gpt-6.1-sol`,
+without fetching the catalog or requiring Codex credentials. A CLI that cannot
+report its version or a failed live catalog request produces a visible dashboard
+error rather than falling back to that list. Manual and live model IDs remain
+open-ended; suggestions are not a model allowlist. These presets do not establish
+context windows, accelerated-tier availability, or account entitlement; that
+metadata comes from the authenticated catalog.
 
 ### Fast mode
 
-Opt into Codex Fast mode with `"codex": { "service_tier": "fast" }` in
-`settings.json` or `CLAUDEX_CODEX_SERVICE_TIER=fast`; the gateway sends
-Responses `service_tier: "priority"` only when the live model catalog
-advertises Fast, while unknown or unsupported models silently stay standard.
-Actual speed and ChatGPT-plan usage consumption depend on the provider's
-policy and workload; selecting the priority tier does not guarantee a fixed
-speedup or usage multiplier.
+Codex has three gateway selections:
+
+| Selection | Setting/API value | Outbound `service_tier` |
+| --- | --- | --- |
+| Standard | unset, empty environment value, or runtime `null` | omitted |
+| Fast | `fast` | `priority` |
+| Ultrafast | `ultrafast` | `ultrafast` |
+
+Opt in through `codex.service_tier` in `settings.json`,
+`CLAUDEX_CODEX_SERVICE_TIER`, or the [runtime settings API](configuration.md#codex-service-tier).
+Accelerated requests can consume your allowance differently under the provider's
+policy. Neither the selection nor a plan label such as ProMax establishes
+entitlement, a fixed usage multiplier, or an actual speedup.
+
+The authenticated catalog must advertise the exact wire tier ID for each model.
+A model that does not advertise the selected tier uses Standard. Missing,
+incomplete, or unavailable metadata cannot prove that a missing tier is
+unsupported; its support is **unknown**. Valid advertised IDs remain usable even
+if another catalog entry is malformed. Both fallbacks emit a warning and remain
+visible in capability status. One unsupported model does not disable accelerated requests for another
+supported model under the same global setting. Kimi, Grok, and custom providers
+are unaffected.
+
+#### Capability status and refresh
+
+These admin endpoints retain the local Host and `CLAUDEX_LOCAL_TOKEN` guards.
+If `CLAUDEX_LOCAL_TOKEN` is set, add `Authorization: Bearer <local-token>` to the
+requests below. Reading or refreshing capabilities fetches metadata only;
+neither endpoint runs inference or a speed probe:
+
+```sh
+curl http://127.0.0.1:8787/admin/providers/codex/capabilities
+curl -X POST http://127.0.0.1:8787/admin/providers/codex/capabilities/refresh \
+  -H 'Content-Type: application/json' -d '{}'
+```
+
+The existing model-suggestion endpoint keeps its `{"models": ["model-id", ...]}`
+shape. The capability response is separate; this is an illustrative snapshot,
+not evidence of your account's support:
+
+```json
+{
+  "configured_tier": "ultrafast",
+  "env_locked": false,
+  "status": "ok",
+  "reason": null,
+  "fetched_at": 1790000000.0,
+  "models": {
+    "gpt-6.1-sol": {
+      "supported_tiers": ["standard", "fast", "ultrafast"],
+      "advertised_tier_ids": ["priority", "ultrafast"],
+      "status": "supported",
+      "reason": null,
+      "applicable_tier": "ultrafast",
+      "wire_tier": "ultrafast"
+    }
+  }
+}
+```
+
+- `configured_tier` is the global `null`/`fast`/`ultrafast` selection.
+  `env_locked` mirrors the runtime settings lock.
+- Top-level `status` is `ok`, `stale`, or `unknown`; `reason` explains failures.
+  `fetched_at` is the last successful snapshot's Unix timestamp in seconds, or
+  `null` when none is available for the current identity.
+- `models` includes catalog entries and mapped Codex IDs. `supported_tiers` lists
+  known selections, including `standard`, or is `null` when no usable tier
+  metadata is available. A partial catalog can retain known Fast support while
+  Ultrafast remains unknown. `advertised_tier_ids` preserves valid catalog wire
+  IDs, including IDs the gateway does not offer as settings.
+- A model's `status` is `supported`, `unsupported`, or `unknown` for the configured
+  selection. Standard is always applicable without accelerated metadata.
+  `applicable_tier` is the tier request preflight can apply; `null` means Standard.
+  `wire_tier` is its outbound value, not backend confirmation. Model `reason`
+  explains why an accelerated selection cannot be applied.
+
+Ordinary lookups cache successful metadata for 15 minutes and back off for
+5 minutes after a fetch failure. Explicit refresh bypasses both timers and
+updates the **same snapshot used by requests**, so an account upgrade can become
+visible even with an unchanged token. Same-identity catalog failures preserve
+last-known metadata with `status: "stale"` and its original timestamp. Effective
+credentials, account, auth mode, or client-version changes invalidate it; an
+unresolvable identity cannot reuse another login's metadata. An old in-flight
+fetch cannot publish its snapshot or error into the new identity. Dispatch also
+checks the current per-model snapshot. If auth or support changes after selection,
+including a 401 retry, an unverified prior selection is dropped and the request
+sends Standard until applicable capabilities are available.
+
+#### Explicit tier diagnostics
+
+`POST /admin/test` with only `{"target": "codex:gpt-6.1-sol"}` keeps the ordinary
+lightweight, untiered connection check, regardless of the global tier setting.
+It reads only the first event and fails if that event is an `error` or
+`response.failed` rejection. A first `response.created` can still count as
+connectivity even if an unread later event fails; `response.incomplete` alone is
+not a definitive rejection. Ordinary success does not guarantee completed
+inference. This first-event rule also applies to custom Responses routes.
+
+Adding `service_tier` explicitly opts into a Codex tier probe; `null`, `fast`, and
+`ultrafast` are accepted. This **runs inference and can consume allowance**. No
+probe runs automatically on settings load, capability reads, or refresh. The
+prompt is small, but Codex's output length cannot be capped by `max_tokens`; see
+[Limitations](#limitations). The same admin guards apply; include the local-token
+Bearer header when configured.
+
+```sh
+curl -X POST http://127.0.0.1:8787/admin/test \
+  -H 'Content-Type: application/json' \
+  -d '{"target": "codex:gpt-6.1-sol", "service_tier": "ultrafast"}'
+```
+
+The normal `{ok, status, latency_ms, target, response_model, detail}` result gains
+`tier_diagnostic` only for an opted-in probe:
+
+| Field | Meaning |
+| --- | --- |
+| `requested_tier` | Explicit selection: `null`, `fast`, or `ultrafast`; not the global setting |
+| `sent_tier` | Final outbound payload's wire tier: `priority`, `ultrafast`, or `null` for omitted/Standard |
+| `backend_confirmed_tier` | Exact `service_tier` reported in a backend response event, or `null`; never inferred from the request, a plan, or timing |
+| `capability_status`, `capability_reason` | Per-model support decision and any unknown, unsupported, stale, or dispatch-identity explanation |
+| `confirmation_status`, `confirmation_reason` | After a successful `response.completed`, `confirmed` when backend evidence matches the requested accelerated tier; `different` when it reports another tier; `reported` for a Standard probe with a reported backend tier; otherwise `unconfirmed` |
+
+Opted-in tier probes require `response.completed` before reporting success. EOF
+or a `[DONE]` marker without that event returns a failed connection test with
+`confirmation_status: "unconfirmed"`, even if `response.created` reported the
+requested tier. Observed reports remain in `backend_confirmed_tier`; they alone
+do not prove successful completion. The latest backend tier through completion
+overrides earlier reports. Explicit failed, incomplete, or error events also
+return failed connection tests.
+Unsupported/unknown selections can still run a Standard probe, with an explicit
+capability explanation. `ok: true` means the connection worked, not that the
+requested acceleration was confirmed. Probe `latency_ms` includes metadata and
+stream processing; it is not a guaranteed speed measurement or billing estimate.
 
 ## Kimi
 

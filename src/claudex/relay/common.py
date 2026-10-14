@@ -5,15 +5,17 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncGenerator, Awaitable, Callable
 from typing import Any
 
+import anyio
 import httpx
 from starlette.requests import Request
 from starlette.responses import StreamingResponse
 
 import claudex.translate.context_overflow as context_overflow
 from claudex import server_support
+from claudex.providers.client_support import _shield_response_cleanup
 from claudex.upstream_errors import UpstreamError
 
 logger = logging.getLogger("claudex.server")
@@ -118,24 +120,90 @@ async def _send_to_anthropic(
     return await http_client.send(upstream_request, stream=True)
 
 
+class _UpstreamStreamRelay:
+    """Own an open upstream even when the body generator never starts."""
+
+    def __init__(
+        self,
+        chunks: AsyncGenerator[bytes | str, None],
+        close_upstream: Callable[[], Awaitable[None]],
+        on_finished: Callable[[], None] | None = None,
+    ) -> None:
+        self._chunks = chunks
+        self._close_upstream = close_upstream
+        self._on_finished = on_finished
+        self._is_closed = False
+
+    def __aiter__(self) -> _UpstreamStreamRelay:
+        return self
+
+    async def __anext__(self) -> bytes | str:
+        if self._is_closed:
+            raise StopAsyncIteration
+        try:
+            return await anext(self._chunks)
+        except StopAsyncIteration:
+            await self.aclose()
+            raise
+        except BaseException:
+            await self.aclose(has_primary_error=True)
+            raise
+
+    async def aclose(self, *, has_primary_error: bool = False) -> None:
+        if self._is_closed:
+            return
+        self._is_closed = True
+        # Starlette's disconnect listener may leave the serving task inside
+        # a cancelled AnyIO scope; upstream release must outlive that scope.
+        with anyio.CancelScope(shield=True):
+            try:
+                try:
+                    await self._chunks.aclose()
+                finally:
+                    try:
+                        await self._close_upstream()
+                    finally:
+                        if self._on_finished is not None:
+                            self._on_finished()
+            except Exception:
+                if not has_primary_error:
+                    raise
+                # Cleanup is secondary to an in-flight read/send failure or cancellation.
+                logger.warning("upstream stream cleanup failed", exc_info=True)
+
+
+class _UpstreamStreamingResponse(StreamingResponse):
+    """Close the owned stream before or between ASGI body reads."""
+
+    async def stream_response(self, send: Any) -> None:
+        try:
+            await super().stream_response(send)
+        except BaseException:
+            await self.body_iterator.aclose(has_primary_error=True)
+            raise
+        else:
+            await self.body_iterator.aclose()
+
+
 def _relay_anthropic_response(
     upstream_response: httpx.Response, *, on_finished: Callable[[], None] | None = None
 ) -> StreamingResponse:
     """Relay an open Anthropic response verbatim, owning its lifetime.
 
-    `on_finished`, when given, runs synchronously once the body iterator is
-    fully done -- success, mid-stream failure, or cancellation alike -- right
+    `on_finished`, when given, runs synchronously once the owned stream is
+    closed -- success, send/read failure, or cancellation alike -- right
     alongside closing `upstream_response`; the balanced runner uses it to release
     a migrated attempt's migration token only once the whole stream terminates,
     not merely once its 2xx headers commit.
     """
+    _shield_response_cleanup(upstream_response)
     response_headers = {
         key: value
         for key, value in upstream_response.headers.items()
         if key.lower() not in _PASSTHROUGH_SKIP_RESPONSE_HEADERS
     }
 
-    async def forward_body() -> AsyncIterator[bytes]:
+    async def forward_body() -> AsyncGenerator[bytes, None]:
         try:
             async for chunk in upstream_response.aiter_bytes():
                 yield chunk
@@ -152,13 +220,9 @@ def _relay_anthropic_response(
                     "error",
                     server_support._claude_error_body("api_error", f"anthropic stream aborted: {exc!r}"),
                 ).encode()
-        finally:
-            await upstream_response.aclose()
-            if on_finished is not None:
-                on_finished()
 
-    return StreamingResponse(
-        forward_body(),
+    return _UpstreamStreamingResponse(
+        _UpstreamStreamRelay(forward_body(), upstream_response.aclose, on_finished),
         status_code=upstream_response.status_code,
         headers=response_headers,
     )

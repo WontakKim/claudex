@@ -81,6 +81,8 @@ _RELAY_SYMBOL_MANIFEST = {
         "_format_sse",
         "_send_to_anthropic",
         "_relay_anthropic_response",
+        "_UpstreamStreamRelay",
+        "_UpstreamStreamingResponse",
     },
     "registered": {
         "_claude_account_unavailable",
@@ -96,6 +98,7 @@ _RELAY_SYMBOL_MANIFEST = {
         "_install_balanced_quota_cooldown",
         "_record_balanced_capability_evidence",
         "_balanced_routing_not_active",
+        "_BalancedStreamingResponse",
         "_passthrough_with_claude_balanced",
         "_balanced_candidates",
         "_balanced_pick_account",
@@ -164,7 +167,7 @@ def test_relay_symbol_manifest_has_one_canonical_owner() -> None:
         for module_name in _RELAY_SYMBOL_MANIFEST
     }
 
-    assert len(_RELAY_MANIFEST_SYMBOLS) == 55
+    assert len(_RELAY_MANIFEST_SYMBOLS) == 58
     assert definitions_by_module == _RELAY_SYMBOL_MANIFEST
     for symbol in _RELAY_MANIFEST_SYMBOLS:
         owners = [
@@ -426,12 +429,14 @@ class StubCodexClient:
         context_window: int | None = None,
         error: CodexUpstreamError | None = None,
         supports_fast_tier: bool = False,
+        supports_ultrafast_tier: bool = False,
     ) -> None:
         self.payloads: list[dict[str, Any]] = []
         self.context_window_calls: list[str] = []
         self._context_window = context_window
         self._error = error or CodexUpstreamError(503, "stub codex upstream")
         self._supports_fast_tier = supports_fast_tier
+        self._supports_ultrafast_tier = supports_ultrafast_tier
 
     async def context_window(self, model: str) -> int | None:
         self.context_window_calls.append(model)
@@ -439,6 +444,10 @@ class StubCodexClient:
 
     async def supports_fast_tier(self, model: str) -> bool:
         return self._supports_fast_tier
+
+    async def supports_service_tier(self, model: str, service_tier: str) -> bool:
+        assert service_tier == "ultrafast"
+        return self._supports_ultrafast_tier
 
     async def stream_responses(self, payload: dict[str, Any], session_id: str):
         self.payloads.append(payload)
@@ -456,6 +465,7 @@ def _gateway(
     codex_context_window: int | None = None,
     codex_error: CodexUpstreamError | None = None,
     codex_supports_fast_tier: bool = False,
+    codex_supports_ultrafast_tier: bool = False,
 ) -> tuple[TestClient, StubCodexClient]:
     app = server.create_app(config)
     # The lifespan requires real Codex credentials, so set the state directly
@@ -464,7 +474,7 @@ def _gateway(
     app.state.compaction_last_reroute = None
     app.state.compaction_reroute_sequence = 0
     stub = StubCodexClient(
-        codex_context_window, codex_error, codex_supports_fast_tier
+        codex_context_window, codex_error, codex_supports_fast_tier, codex_supports_ultrafast_tier
     )
     app.state.codex_client = stub
     app.state.http_client = httpx.AsyncClient(
@@ -653,36 +663,39 @@ def test_codex_astra_model_is_forwarded_unchanged() -> None:
     assert stub.payloads[0]["model"] == "gpt-6-astra"
 
 
-def test_codex_fast_tier_is_sent_for_supported_model(
-    caplog: pytest.LogCaptureFixture,
+@pytest.mark.parametrize(("tier", "wire"), [("fast", "priority"), ("ultrafast", "ultrafast")])
+def test_codex_tier_is_sent_for_supported_model(
+    caplog: pytest.LogCaptureFixture, tier: str, wire: str,
 ) -> None:
     config = GatewayConfig(
-        model_map={"opus": "codex:gpt-5.6-sol"}, codex_service_tier="fast"
+        model_map={"opus": "codex:gpt-5.6-sol"}, codex_service_tier=tier
     )
     client, stub = _gateway(
         config,
         _failing_anthropic_handler,
-        codex_supports_fast_tier=True,
+        codex_supports_fast_tier=tier == "fast",
+        codex_supports_ultrafast_tier=tier == "ultrafast",
     )
     caplog.set_level(logging.INFO, logger="claudex.server")
 
     response = client.post("/v1/messages", json=_message_body("claude-opus-4-6"))
 
     assert response.status_code == 503
-    assert stub.payloads[0]["service_tier"] == "priority"
+    assert stub.payloads[0]["service_tier"] == wire
     assert any(
         record.name == "claudex.server"
         and record.levelno == logging.INFO
-        and "tier=priority" in record.getMessage()
+        and f"tier={wire}" in record.getMessage()
         for record in caplog.records
     )
 
 
-def test_codex_fast_tier_is_omitted_for_unsupported_model(
-    caplog: pytest.LogCaptureFixture,
+@pytest.mark.parametrize("tier", ["fast", "ultrafast"])
+def test_codex_tier_fallback_has_a_visible_explanation(
+    caplog: pytest.LogCaptureFixture, tier: str,
 ) -> None:
     config = GatewayConfig(
-        model_map={"opus": "codex:gpt-5.6-sol"}, codex_service_tier="fast"
+        model_map={"opus": "codex:gpt-5.6-sol"}, codex_service_tier=tier
     )
     client, stub = _gateway(config, _failing_anthropic_handler)
     caplog.set_level(logging.DEBUG, logger="claudex.server")
@@ -693,9 +706,10 @@ def test_codex_fast_tier_is_omitted_for_unsupported_model(
     assert "service_tier" not in stub.payloads[0]
     assert any(
         record.name == "claudex.server"
-        and record.levelno == logging.DEBUG
-        and record.getMessage()
-        == "fast tier requested but the codex catalog does not advertise it for gpt-5.6-sol"
+        and record.levelno == logging.WARNING
+        and f"{tier} tier not applied" in record.getMessage()
+        and "using Standard" in record.getMessage()
+        and "not advertised or metadata is unknown" in record.getMessage()
         for record in caplog.records
     )
     assert any(
@@ -948,7 +962,23 @@ def test_non_streaming_mid_stream_overflow_reports_numbers() -> None:
     assert stub.context_window_calls == ["gpt-5.6-sol"]
 
 
-def test_context_window_cache_is_reused_across_requests() -> None:
+def test_context_window_cache_is_reused_across_requests(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def reject_host_subprocess(*args: Any, **kwargs: Any) -> None:
+        pytest.fail("Catalog cache test must not start a host subprocess")
+
+    monkeypatch.setattr(subprocess, "Popen", reject_host_subprocess)
+
+    async def communicate_version() -> tuple[bytes, bytes]:
+        return b"codex-cli 0.157.1", b""
+
+    async def spawn_codex_version(*args: Any, **kwargs: Any) -> SimpleNamespace:
+        assert args == ("codex", "--version")
+        return SimpleNamespace(returncode=0, communicate=communicate_version)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn_codex_version)
+
     # Proves the relay reuses the lifespan-owned client and its
     # ModelCatalogCache instead of constructing a fresh one per request:
     # two mapped requests through the same app fetch the catalog exactly
@@ -1508,28 +1538,93 @@ def test_anthropic_stream_early_close_before_first_read_closes_once() -> None:
     assert close_calls == 1
 
 
-def test_anthropic_stream_read_failure_emits_error_and_closes_once() -> None:
-    async def scenario() -> tuple[list[bytes], int]:
-        stream = _TrackingByteStream(
-            [b"event: content_block_delta\n"],
-            httpx.ReadError("stream failed"),
-        )
+def _parse_native_sse_json(body: bytes) -> list[tuple[str, dict[str, Any]]]:
+    assert body.endswith(b"\n\n")
+    events = []
+    for frame in body.decode().split("\n\n"):
+        event_name = "message"
+        data_lines = []
+        for line in frame.splitlines():
+            field, _, value = line.partition(":")
+            if field == "event":
+                event_name = value.removeprefix(" ")
+            elif field == "data":
+                data_lines.append(value.removeprefix(" "))
+        if data_lines:
+            events.append((event_name, json.loads("\n".join(data_lines))))
+    return events
+
+
+@pytest.mark.parametrize("chunk_split", ["whole", "lines", "bytes"])
+@pytest.mark.parametrize("error_policy", ["kimi", "custom"])
+def test_anthropic_stream_read_failure_emits_error_and_closes_once(
+    chunk_split: str, error_policy: str,
+) -> None:
+    delta = {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "hi"}}
+    buffered_event = f"event: content_block_delta\ndata: {json.dumps(delta)}\n".encode()
+    failure = httpx.ReadError("stream failed")
+    backend = _stream_backend()
+    message = f"kimi stream aborted: {failure!r}"
+    if error_policy == "custom":
+        from dataclasses import replace
+        from claudex.relay.anthropic_compatible import _anthropic_compatible_error_to_claude
+
+        backend = replace(backend, error_policy=_anthropic_compatible_error_to_claude)
+        message = "The Anthropic-compatible backend stream was interrupted"
+    if chunk_split == "whole":
+        upstream_chunks = [buffered_event]
+    elif chunk_split == "lines":
+        upstream_chunks = buffered_event.splitlines(keepends=True)
+    else:
+        upstream_chunks = [bytes([value]) for value in buffered_event]
+
+    async def scenario() -> tuple[bytes, bool, int]:
+        stream = _TrackingByteStream(upstream_chunks, failure)
         response = httpx.Response(200, stream=stream)
-        chunks = [
-            chunk
-            async for chunk in _AnthropicStreamRelay(
-                response, "claude-fable-5", _stream_backend()
-            )
-        ]
-        return chunks, stream.close_calls
+        relay = _AnthropicStreamRelay(response, "claude-fable-5", backend)
+        body = b"".join([chunk async for chunk in relay])
+        await relay.aclose()
+        return body, response.is_closed, stream.close_calls
 
-    chunks, close_calls = asyncio.run(scenario())
+    body, is_closed, close_calls = asyncio.run(scenario())
 
-    assert chunks[0] == b"event: content_block_delta\n"
-    assert chunks[1].startswith(b"event: error\ndata: ")
-    error = json.loads(chunks[1].split(b"data: ", 1)[1])
-    assert error["error"]["type"] == "api_error"
-    assert "kimi stream aborted" in error["error"]["message"]
+    assert _parse_native_sse_json(body) == [
+        ("content_block_delta", delta),
+        ("error", {"type": "error", "error": {"type": "api_error", "message": message}}),
+    ]
+    assert body.startswith(buffered_event + b"\n")
+    assert body.count(b"\n\n") == 2
+    assert is_closed is True
+    assert close_calls == 1
+
+
+@pytest.mark.parametrize(
+    "upstream_prefix",
+    [b"", b"event: content_block_delta\n", b"event: ping\ndata: {}\n\n"],
+    ids=["no-buffer", "event-line-only", "completed-event"],
+)
+def test_anthropic_stream_error_preserves_existing_event_boundaries(upstream_prefix: bytes) -> None:
+    failure = httpx.ReadError("stream failed")
+
+    async def scenario() -> tuple[bytes, bool, int]:
+        stream = _TrackingByteStream([upstream_prefix], failure)
+        response = httpx.Response(200, stream=stream)
+        relay = _AnthropicStreamRelay(response, "claude-fable-5", _stream_backend())
+        body = b"".join([chunk async for chunk in relay])
+        await relay.aclose()
+        return body, response.is_closed, stream.close_calls
+
+    body, is_closed, close_calls = asyncio.run(scenario())
+    expected_events = [("ping", {})] if upstream_prefix.endswith(b"\n\n") else []
+    expected_events.append(("error", {
+        "type": "error", "error": {"type": "api_error", "message": f"kimi stream aborted: {failure!r}"},
+    }))
+    assert _parse_native_sse_json(body) == expected_events
+    assert body.count(b"\n\n") == (2 if upstream_prefix else 1)
+    if upstream_prefix:
+        expected_prefix = upstream_prefix if upstream_prefix.endswith(b"\n\n") else upstream_prefix + b"\n"
+        assert body.startswith(expected_prefix)
+    assert is_closed is True
     assert close_calls == 1
 
 
@@ -6600,6 +6695,229 @@ def test_balanced_post_2xx_midstream_failure_relays_sse_error_and_retains_the_co
         assert pin.generation == 1
 
 
+@pytest.mark.parametrize("is_pinned", [False, True], ids=["stateless", "pinned"])
+@pytest.mark.parametrize("failure_status", [503, 401], ids=["refresh-unavailable", "post-refresh-rejected"])
+def test_balanced_exhausted_auth_failures_return_first_actionable_response(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, is_pinned: bool, failure_status: int,
+) -> None:
+    _balanced_env(monkeypatch, tmp_path)
+    account_ids = [
+        _register_serving_account(
+            email=f"failed-{index}@example.com", account_uuid=str(uuid.uuid4()),
+            access_token=f"failed-access-{index}", refresh_token=f"failed-refresh-{index}",
+            expires_in_seconds=-60 if failure_status == 503 else 3600,
+        )
+        for index in range(2)
+    ]
+    attempt_ids: list[str] = []
+    failures: list[Response] = []
+    message_calls: list[httpx.Request] = []
+    original_attempt = relay_balanced._attempt_with_account
+
+    async def record_attempt(
+        request: Request, raw_body: bytes, parsed_body: Any, record: Any, **kwargs: Any,
+    ) -> Any:
+        attempt_ids.append(record.id)
+        outcome = await original_attempt(request, raw_body, parsed_body, record, **kwargs)
+        assert isinstance(outcome, relay_registered._FailedAttempt)
+        assert not outcome.rate_limited and outcome.response.status_code == failure_status
+        outcome.response.headers["request-id"] = f"auth-failure-{len(failures)}"
+        outcome.response.headers["x-failure-detail"] = "synthetic-auth"
+        failures.append(outcome.response)
+        return outcome
+
+    monkeypatch.setattr(relay_balanced, "_attempt_with_account", record_attempt)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == CLAUDE_TOKEN_URL:
+            if failure_status == 503:
+                return httpx.Response(503, text="synthetic token endpoint unavailable")
+            return httpx.Response(200, json={
+                "access_token": "synthetic-refreshed-access", "expires_in": 900,
+            })
+        assert request.method == "POST" and request.url.path == "/v1/messages"
+        message_calls.append(request)
+        return httpx.Response(401, json={"type": "error"})
+
+    with _create_test_client(
+        monkeypatch, tmp_path, config=GatewayConfig(), base_url="http://127.0.0.1:8787"
+    ) as client:
+        runtime = _enable_balanced(client, handler)
+        body = _balanced_body(_new_session_id()) if is_pinned else _UNPINNABLE_BODY
+
+        response = client.post("/v1/messages", json=body)
+
+        assert len(attempt_ids) == len(set(attempt_ids)) == 2
+        assert set(attempt_ids) == set(account_ids)
+        assert len(message_calls) == (0 if failure_status == 503 else 4)
+        assert response.status_code == failure_status
+        assert response.content == failures[0].body
+        assert response.headers["request-id"] == "auth-failure-0"
+        assert response.headers["x-failure-detail"] == "synthetic-auth"
+        assert "retry-after" not in response.headers
+        assert response.json()["error"]["type"] == ("api_error" if failure_status == 503 else "authentication_error")
+        assert ("unusable" if failure_status == 503 else "account add") in response.json()["error"]["message"]
+        assert runtime._active_requests == 0 and runtime._drain_complete.is_set()
+        for account_id in account_ids:
+            assert runtime.router.in_flight_count(account_id) == 0
+            assert runtime.router.account_cooldown_deadline(account_id) is None
+            assert runtime.router.family_cooldown_deadline(account_id, "fable") is None
+        if is_pinned:
+            key = derive_session_key(body, runtime.epoch_seed, "fable")
+            pin = runtime.router.get_pin(key.digest)
+            assert pin.account_id == attempt_ids[0] and pin.generation == 0
+            assert runtime.router.get_migration_reservation(key.digest) is None
+        else:
+            assert runtime.router.pin_count() == 0
+        assert {record.state for record in claude_accounts.load_registry()} == ({"ready"} if failure_status == 503 else {"needs-reauth"})
+
+
+@pytest.mark.parametrize("is_pinned", [False, True], ids=["stateless", "pinned"])
+@pytest.mark.parametrize("failure_status", [503, 401], ids=["auth-unavailable", "auth-rejected"])
+@pytest.mark.parametrize("has_retry_after", [False, True], ids=["local-retry-after", "upstream-retry-after"])
+@pytest.mark.parametrize("quota_count", [1, 2], ids=["one-quota", "latest-quota"])
+def test_balanced_exhausted_chain_retains_real_quota_before_auth_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, is_pinned: bool,
+    failure_status: int, has_retry_after: bool, quota_count: int,
+) -> None:
+    from claudex.claude.auth import ClaudeAccountAuthError
+
+    _balanced_env(monkeypatch, tmp_path)
+    accounts = _register_balanced_accounts(quota_count + 1)
+    attempt_ids: list[str] = []
+    quota_responses: list[Response] = []
+    original_attempt = relay_balanced._attempt_with_account
+
+    class UnavailableAuthManager:
+        async def get_credentials(self, force_refresh: bool = False) -> Any:
+            raise ClaudeAccountAuthError("synthetic token refresh unavailable")
+
+    async def record_attempt(
+        request: Request, raw_body: bytes, parsed_body: Any, record: Any, **kwargs: Any,
+    ) -> Any:
+        attempt_ids.append(record.id)
+        if len(attempt_ids) > quota_count and failure_status == 503:
+            request.app.state.claude_account_auth_managers[record.id] = UnavailableAuthManager()
+        outcome = await original_attempt(request, raw_body, parsed_body, record, **kwargs)
+        assert isinstance(outcome, relay_registered._FailedAttempt)
+        if len(attempt_ids) <= quota_count:
+            assert outcome.rate_limited
+            quota_responses.append(outcome.response)
+        else:
+            assert not outcome.rate_limited and outcome.response.status_code == failure_status
+        return outcome
+
+    monkeypatch.setattr(relay_balanced, "_attempt_with_account", record_attempt)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == CLAUDE_TOKEN_URL:
+            return httpx.Response(200, json={"access_token": "synthetic-refreshed-access", "expires_in": 900})
+        assert request.method == "POST" and request.url.path == "/v1/messages"
+        if len(attempt_ids) > quota_count:
+            return httpx.Response(401, json={"type": "error"})
+        headers = {
+            "content-type": "application/octet-stream", "request-id": f"quota-{len(attempt_ids)}",
+            "x-should-retry": "true",
+        }
+        if has_retry_after:
+            headers["retry-after"] = "17"
+        return httpx.Response(429, content=f"quota-{len(attempt_ids)}".encode() + b"\x00\xff", headers=headers)
+
+    with _create_test_client(
+        monkeypatch, tmp_path, config=GatewayConfig(), base_url="http://127.0.0.1:8787"
+    ) as client:
+        runtime = _enable_balanced(client, handler)
+        body = _balanced_body(_new_session_id()) if is_pinned else _UNPINNABLE_BODY
+
+        response = client.post("/v1/messages", json=body)
+
+        assert len(attempt_ids) == len(set(attempt_ids)) == quota_count + 1
+        assert set(attempt_ids) == {account_id for account_id, _token in accounts}
+        assert response.status_code == 429
+        assert response.content == quota_responses[-1].body == f"quota-{quota_count}".encode() + b"\x00\xff"
+        assert response.headers["request-id"] == f"quota-{quota_count}"
+        assert response.headers["content-type"] == "application/octet-stream"
+        assert response.headers["x-should-retry"] == "true"
+        assert response.headers["retry-after"] == ("17" if has_retry_after else "1")
+        assert runtime._active_requests == 0 and runtime._drain_complete.is_set()
+        assert all(runtime.router.in_flight_count(account_id) == 0 for account_id, _token in accounts)
+        if is_pinned:
+            key = derive_session_key(body, runtime.epoch_seed, "fable")
+            pin = runtime.router.get_pin(key.digest)
+            assert pin.account_id == attempt_ids[0] and pin.generation == 0
+            assert runtime.router.get_migration_reservation(key.digest) is None
+        else:
+            assert runtime.router.pin_count() == 0
+
+
+@pytest.mark.parametrize("is_pinned", [False, True], ids=["stateless", "pinned"])
+@pytest.mark.parametrize("failure_status", [503, 401], ids=["refresh-unavailable", "post-refresh-rejected"])
+def test_balanced_auth_failure_still_fails_over_to_a_healthy_account(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, is_pinned: bool, failure_status: int,
+) -> None:
+    _balanced_env(monkeypatch, tmp_path)
+    account_ids = [
+        _register_serving_account(
+            email=f"failover-{index}@example.com", account_uuid=str(uuid.uuid4()),
+            access_token=f"failover-access-{index}", refresh_token=f"failover-refresh-{index}",
+            expires_in_seconds=-60 if failure_status == 503 else 3600,
+        )
+        for index in range(2)
+    ]
+    attempt_ids: list[str] = []
+    message_calls: list[httpx.Request] = []
+    original_attempt = relay_balanced._attempt_with_account
+
+    async def record_attempt(
+        request: Request, raw_body: bytes, parsed_body: Any, record: Any, **kwargs: Any,
+    ) -> Any:
+        attempt_ids.append(record.id)
+        outcome = await original_attempt(request, raw_body, parsed_body, record, **kwargs)
+        if len(attempt_ids) == 1:
+            assert isinstance(outcome, relay_registered._FailedAttempt)
+            assert not outcome.rate_limited and outcome.response.status_code == failure_status
+        else:
+            assert not isinstance(outcome, relay_registered._FailedAttempt)
+        return outcome
+
+    monkeypatch.setattr(relay_balanced, "_attempt_with_account", record_attempt)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == CLAUDE_TOKEN_URL:
+            if failure_status == 503 and len(attempt_ids) < 2:
+                return httpx.Response(503, text="synthetic token endpoint unavailable")
+            return httpx.Response(200, json={"access_token": "synthetic-refreshed-access", "expires_in": 900})
+        assert request.method == "POST" and request.url.path == "/v1/messages"
+        message_calls.append(request)
+        if len(attempt_ids) == 1:
+            return httpx.Response(401, json={"type": "error"})
+        return httpx.Response(200, json={"id": "healthy"}, headers={"request-id": "healthy-response"})
+
+    with _create_test_client(
+        monkeypatch, tmp_path, config=GatewayConfig(), base_url="http://127.0.0.1:8787"
+    ) as client:
+        runtime = _enable_balanced(client, handler)
+        body = _balanced_body(_new_session_id()) if is_pinned else _UNPINNABLE_BODY
+
+        response = client.post("/v1/messages", json=body)
+
+        assert len(attempt_ids) == len(set(attempt_ids)) == 2
+        assert set(attempt_ids) == set(account_ids)
+        assert len(message_calls) == (1 if failure_status == 503 else 3)
+        assert response.status_code == 200 and response.json() == {"id": "healthy"}
+        assert response.headers["request-id"] == "healthy-response"
+        assert "retry-after" not in response.headers
+        assert runtime._active_requests == 0 and runtime._drain_complete.is_set()
+        assert all(runtime.router.in_flight_count(account_id) == 0 for account_id in account_ids)
+        if is_pinned:
+            key = derive_session_key(body, runtime.epoch_seed, "fable")
+            pin = runtime.router.get_pin(key.digest)
+            assert pin.account_id == attempt_ids[-1] and pin.generation == 1
+            assert runtime.router.get_migration_reservation(key.digest) is None
+        else:
+            assert runtime.router.pin_count() == 0
+
+
 def test_chain_exhausted_real_429_without_retry_after_gets_local_retry_after(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -6629,21 +6947,38 @@ def test_chain_exhausted_retry_after_matches_earliest_local_unblock(
 ) -> None:
     monkeypatch.setattr(relay_balanced.time, "monotonic", lambda: 1_000.0)
     records = {
-        "account-a": SimpleNamespace(id="account-a", state="ready"),
-        "account-b": SimpleNamespace(id="account-b", state="ready"),
+        "account-a": SimpleNamespace(id="account-a", state="ready", account_incarnation_id="inc-a"),
+        "account-b": SimpleNamespace(id="account-b", state="ready", account_incarnation_id="inc-b"),
     }
+    app_state = SimpleNamespace(claude_ambient_accounts=None)
     account_offsets = {"account-a": 9.25, "account-b": 1.0}
     family_offsets = {"account-a": 2.0, "account-b": 5.25}
-    router = SimpleNamespace(
-        account_cooldown_deadline=lambda account_id, *, now: now
-        + account_offsets[account_id],
-        family_cooldown_deadline=lambda account_id, family, *, now: now
-        + family_offsets[account_id],
-    )
+
+    def get_profile_fingerprint(state: Any, account_id: str) -> str:
+        assert state is app_state
+        return f"fp-{account_id}"
+
+    def get_account_deadline(
+        account_id: str, *, account_incarnation_id: str, account_profile_fingerprint: str, now: float
+    ) -> float:
+        assert account_incarnation_id == records[account_id].account_incarnation_id
+        assert account_profile_fingerprint == f"fp-{account_id}"
+        return now + account_offsets[account_id]
+
+    def get_family_deadline(
+        account_id: str, family: str, *, account_incarnation_id: str, account_profile_fingerprint: str, now: float
+    ) -> float:
+        assert family == "fable"
+        assert account_incarnation_id == records[account_id].account_incarnation_id
+        assert account_profile_fingerprint == f"fp-{account_id}"
+        return now + family_offsets[account_id]
+
+    monkeypatch.setattr(relay_balanced.server_support, "_account_profile_fingerprint", get_profile_fingerprint)
+    router = SimpleNamespace(account_cooldown_deadline=get_account_deadline, family_cooldown_deadline=get_family_deadline)
     upstream = Response(content=b"upstream", status_code=429)
 
     returned = relay_balanced._balanced_all_cooling_response(
-        records, router, family="fable", chain_exhausted_429=upstream
+        records, router, app_state=app_state, family="fable", chain_exhausted_429=upstream
     )
 
     assert returned is upstream
@@ -6654,10 +6989,11 @@ def test_chain_exhausted_retry_after_matches_earliest_local_unblock(
 def test_chain_exhausted_real_429_preserves_upstream_retry_after(
     retry_after: str,
 ) -> None:
-    records = {"account-a": SimpleNamespace(id="account-a", state="ready")}
+    records = {"account-a": SimpleNamespace(id="account-a", state="ready", account_incarnation_id="inc-a")}
+    app_state = SimpleNamespace(claude_ambient_accounts=None)
     router = SimpleNamespace(
-        account_cooldown_deadline=lambda account_id, *, now: now + 10.0,
-        family_cooldown_deadline=lambda account_id, family, *, now: now + 20.0,
+        account_cooldown_deadline=lambda account_id, *, account_incarnation_id, account_profile_fingerprint, now: now + 10.0,
+        family_cooldown_deadline=lambda account_id, family, *, account_incarnation_id, account_profile_fingerprint, now: now + 20.0,
     )
     upstream = Response(
         content=b"upstream",
@@ -6667,7 +7003,7 @@ def test_chain_exhausted_real_429_preserves_upstream_retry_after(
     before_headers = list(upstream.raw_headers)
 
     returned = relay_balanced._balanced_all_cooling_response(
-        records, router, family="fable", chain_exhausted_429=upstream
+        records, router, app_state=app_state, family="fable", chain_exhausted_429=upstream
     )
 
     assert returned is upstream
@@ -6923,6 +7259,172 @@ def test_balanced_concurrent_same_session_request_awaits_the_pending_durability_
 
     assert statuses == [200, 200]
     assert len(calls) == 2
+
+
+@pytest.mark.parametrize("first_failure_kind", ["auth", "quota"])
+@pytest.mark.parametrize("scope,cooldown_case", [
+    ("account", "matching"), ("family", "matching"),
+    ("account", "expired"), ("family", "expired"),
+    ("account", "incarnation"), ("family", "incarnation"),
+    ("account", "profile"), ("family", "profile"),
+    ("family", "different-family"), ("account", "absent"),
+])
+def test_balanced_stateless_retry_observes_cooldown_installed_during_previous_leg(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    first_failure_kind: str, scope: str, cooldown_case: str,
+) -> None:
+    from claudex.claude.auth import ClaudeAccountAuthError
+
+    _balanced_env(monkeypatch, tmp_path)
+    (source_id, source_token), (target_id, target_token) = _register_balanced_accounts(2)
+    records = {record.id: record for record in claude_accounts.load_registry()}
+    clock_now = 1_000.0
+    wall_now = time.time()
+    monkeypatch.setattr(relay_balanced, "time", SimpleNamespace(monotonic=lambda: clock_now, time=lambda: wall_now))
+    runtime = ClaudeBalancedRuntime()
+    runtime.status = "active"
+    runtime.epoch_id = "synthetic-stateless-epoch"
+    runtime.epoch_seed = b"s" * 32
+    router = ClaudeBalancedRouter(
+        balanced_epoch_id=runtime.epoch_id, clock=lambda: clock_now, wall_clock=lambda: wall_now,
+    )
+    runtime.router = router
+    for account_id, pressure in ((source_id, 40.0), (target_id, 100.0)):
+        for window in ("five_hour", "seven_day", "fable_weekly"):
+            router.ingest_observation(
+                account_id, window, used_percent=pressure, source="usage_api", reset_in_seconds=3_600.0,
+            )
+    attempts: list[str] = []
+    upstream_calls: list[httpx.Request] = []
+    failures: list[Response] = []
+    derived_digests: list[bytes] = []
+    selection_digests: list[bytes] = []
+    original_digest = relay_balanced.derive_stateless_routing_digest
+    original_pick = relay_balanced._balanced_pick_account
+    original_attempt = relay_balanced._attempt_with_account
+
+    def record_digest(seed: bytes, nonce: bytes) -> bytes:
+        digest = original_digest(seed, nonce)
+        derived_digests.append(digest)
+        return digest
+
+    def record_pick(*args: Any, **kwargs: Any) -> str:
+        selection_digests.append(kwargs["session_key_digest"])
+        return original_pick(*args, **kwargs)
+
+    async def record_attempt(
+        request: Request, raw_body: bytes, parsed_body: Any, record: Any, **kwargs: Any,
+    ) -> Any:
+        attempts.append(record.id)
+        outcome = await original_attempt(request, raw_body, parsed_body, record, **kwargs)
+        if isinstance(outcome, relay_registered._FailedAttempt):
+            assert record.id == source_id
+            assert outcome.rate_limited == (first_failure_kind == "quota")
+            outcome.response.headers["request-id"] = "first-failed-leg"
+            failures.append(outcome.response)
+        return outcome
+
+    monkeypatch.setattr(relay_balanced, "derive_stateless_routing_digest", record_digest)
+    monkeypatch.setattr(relay_balanced, "_balanced_pick_account", record_pick)
+    monkeypatch.setattr(relay_balanced, "_attempt_with_account", record_attempt)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "POST" and request.url.path == "/v1/messages"
+        upstream_calls.append(request)
+        if request.headers["authorization"] == f"Bearer {source_token}":
+            assert first_failure_kind == "quota"
+            response = _quota_429("earlier-real-quota")
+            response.headers["retry-after"] = "17"
+            return response
+        assert request.headers["authorization"] == f"Bearer {target_token}"
+        return httpx.Response(200, json={"id": "healthy"}, headers={"request-id": "healthy-target"})
+
+    client, _stub = _gateway(GatewayConfig(claude_account_routing_mode="balanced"), handler)
+    state = client.app.state
+    state.claude_balanced_runtime = runtime
+    state.claude_ambient_accounts = None
+    state.claude_pin_refresh_tasks = set()
+    state.claude_account_auth_managers = {}
+    original_manager = relay_balanced.server_support._claude_account_auth_manager(state, source_id)
+
+    async def scenario() -> None:
+        first_leg_started = asyncio.Event()
+        release_first_leg = asyncio.Event()
+
+        class GatedAuthManager:
+            async def get_credentials(self, force_refresh: bool = False) -> Any:
+                assert not force_refresh
+                first_leg_started.set()
+                await release_first_leg.wait()
+                if first_failure_kind == "auth":
+                    raise ClaudeAccountAuthError("synthetic previous leg unavailable")
+                return await original_manager.get_credentials()
+
+        state.claude_account_auth_managers[source_id] = GatedAuthManager()
+        task: asyncio.Task[httpx.Response] | None = None
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=client.app), base_url="http://testserver") as async_client:
+            try:
+                task = asyncio.create_task(async_client.post("/v1/messages", json=_UNPINNABLE_BODY))
+                await asyncio.wait_for(first_leg_started.wait(), timeout=2)
+                assert attempts == [source_id] and upstream_calls == []
+                assert runtime._active_requests == 1 and router.in_flight_count(source_id) == 1
+                fingerprint = relay_balanced.server_support._account_profile_fingerprint(state, target_id)
+                assert fingerprint is not None
+                incarnation = records[target_id].account_incarnation_id
+                installed_fingerprint = fingerprint
+                family = "default" if cooldown_case == "different-family" else "fable"
+                if cooldown_case == "incarnation":
+                    incarnation = str(uuid.uuid4())
+                elif cooldown_case == "profile":
+                    installed_fingerprint = "0" * 64 if fingerprint != "0" * 64 else "1" * 64
+                if cooldown_case != "absent":
+                    router.install_cooldown(
+                        account_id=target_id, account_incarnation_id=incarnation,
+                        account_profile_fingerprint=installed_fingerprint, scope=scope,
+                        model_family=family, deadline=clock_now + (-1.0 if cooldown_case == "expired" else 60.0),
+                        reason="synthetic concurrent cooldown",
+                    )
+                current_identity = {
+                    "account_incarnation_id": records[target_id].account_incarnation_id,
+                    "account_profile_fingerprint": fingerprint,
+                }
+                deadline = (
+                    router.account_cooldown_deadline(target_id, **current_identity)
+                    if scope == "account" else router.family_cooldown_deadline(target_id, "fable", **current_identity)
+                )
+                should_skip_target = cooldown_case == "matching"
+                assert (deadline is not None) == should_skip_target
+                release_first_leg.set()
+                response = await asyncio.wait_for(task, timeout=2)
+
+                assert attempts == ([source_id] if should_skip_target else [source_id, target_id])
+                assert len(attempts) == len(set(attempts))
+                assert len(derived_digests) == 1 and selection_digests == [derived_digests[0], derived_digests[0]]
+                assert router.pin_count() == 0
+                assert runtime._active_requests == 0 and runtime._drain_complete.is_set()
+                assert all(router.in_flight_count(account_id) == 0 for account_id in records)
+                expected_source_calls = 1 if first_failure_kind == "quota" else 0
+                assert len(upstream_calls) == expected_source_calls + int(not should_skip_target)
+                if should_skip_target:
+                    assert response.status_code == (429 if first_failure_kind == "quota" else 503)
+                    assert response.content == failures[0].body
+                    assert response.headers["request-id"] == "first-failed-leg"
+                    if first_failure_kind == "quota":
+                        assert response.headers["retry-after"] == "17" and response.headers["x-should-retry"] == "true"
+                    else:
+                        assert "retry-after" not in response.headers and response.json()["error"]["type"] == "api_error"
+                else:
+                    assert response.status_code == 200 and response.json() == {"id": "healthy"}
+                    assert response.headers["request-id"] == "healthy-target"
+            finally:
+                release_first_leg.set()
+                if task is not None:
+                    if not task.done():
+                        task.cancel()
+                    await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), timeout=2)
+                await state.http_client.aclose()
+
+    asyncio.run(scenario())
 
 
 def test_balanced_unpinnable_retry_chain_reuses_one_stateless_digest_and_creates_no_pin(

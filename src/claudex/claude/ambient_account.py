@@ -26,7 +26,12 @@ from .account_profile import compute_account_profile_fingerprint
 from .accounts import AccountRecord
 from .auth import ClaudeAccountAuthError, ClaudeAccountCredentials
 from .capture_model import CaptureError, KeychainBackend
-from .keychain import LEGACY_KEYCHAIN_SERVICE, SecurityKeychainBackend
+from .keychain import (
+    LEGACY_KEYCHAIN_SERVICE,
+    SecurityKeychainBackend,
+    keychain_account,
+    scoped_keychain_service,
+)
 
 AMBIENT_ID_NAMESPACE = uuid.UUID("49d01c38-08d0-4df4-a742-13aa3c192f3e")
 
@@ -163,7 +168,14 @@ class AmbientAccountProvider:
             if self._keychain is None:
                 return None
             try:
-                raw = self._keychain.read(LEGACY_KEYCHAIN_SERVICE, getpass.getuser())
+                config_dir = os.environ.get("CLAUDE_CONFIG_DIR")
+                if config_dir is None:
+                    service = LEGACY_KEYCHAIN_SERVICE
+                    account = getpass.getuser()
+                else:
+                    service = scoped_keychain_service(config_dir)
+                    account = keychain_account()
+                raw = self._keychain.read(service, account)
             except (CaptureError, OSError):
                 return None
             if raw is None:

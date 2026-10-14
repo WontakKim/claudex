@@ -16,15 +16,22 @@ class ThreadRegistry:
         self._bindings: dict[str, tuple[str, float]] = {}
 
     def bind(self, session_id: str, thread_ref: str) -> None:
-        expires_at = self._clock() + THREAD_BINDING_TTL_SECONDS
-        self._bindings[session_id] = (thread_ref, expires_at)
+        now = self._clock()
+        self._remove_expired_bindings(now)
+        self._bindings[session_id] = (thread_ref, now + THREAD_BINDING_TTL_SECONDS)
 
     def lookup(self, session_id: str) -> str | None:
+        self._remove_expired_bindings(self._clock())
         binding = self._bindings.get(session_id)
         if binding is None:
             return None
-        thread_ref, expires_at = binding
-        if expires_at <= self._clock():
+        return binding[0]
+
+    def _remove_expired_bindings(self, now: float) -> None:
+        expired_session_ids = [
+            session_id
+            for session_id, (_, expires_at) in self._bindings.items()
+            if expires_at <= now
+        ]
+        for session_id in expired_session_ids:
             del self._bindings[session_id]
-            return None
-        return thread_ref

@@ -98,6 +98,8 @@ def load_json_credentials(
         raw = path.read_text(encoding=encoding)
     except FileNotFoundError as exc:
         raise error_cls(missing_message) from exc
+    except (OSError, UnicodeDecodeError) as exc:
+        raise error_cls(f"cannot read credentials file {path}") from exc
     try:
         credentials = json.loads(raw)
     except json.JSONDecodeError as exc:
@@ -110,9 +112,32 @@ def load_json_credentials(
 def replace_credentials_file(
     path: Path, temp_file: Path, text: str, encoding: str | None
 ) -> None:
-    temp_file.write_text(text, encoding=encoding)
-    os.chmod(temp_file, 0o600)
-    os.replace(temp_file, path)
+    """Replace text atomically through fresh owner-private staging.
+
+    `temp_file` supplies the staging directory and filename prefix; existing
+    files at that path are not reused or removed.
+    """
+    staging_path = temp_file.with_name(f".{temp_file.name}-{uuid.uuid4().hex}")
+    file_descriptor = os.open(
+        staging_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600
+    )
+    try:
+        try:
+            if hasattr(os, "fchmod"):
+                os.fchmod(file_descriptor, 0o600)
+            else:
+                os.chmod(staging_path, 0o600)
+            # The helper retains descriptor ownership through text-wrapper setup failures.
+            with os.fdopen(
+                file_descriptor, "w", encoding=encoding, closefd=False
+            ) as handle:
+                handle.write(text)
+        finally:
+            os.close(file_descriptor)
+        os.replace(staging_path, path)
+    except BaseException:
+        _remove_path_if_exists(staging_path)
+        raise
 
 
 async def refresh_when_still_stale(

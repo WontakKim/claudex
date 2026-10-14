@@ -28,6 +28,18 @@ _OAUTH_ACCOUNT_FILENAME = "oauth-account.json"
 _TOMBSTONE_SUFFIX = ".tombstone"
 _STAGING_PREFIX = ".staging-"
 
+CredentialGeneration = tuple[int, int, int, int]
+
+
+def _credential_generation(path: Path) -> CredentialGeneration:
+    """Identify an atomic credential-file publication, even for identical JSON.
+
+    Read and compare only under registry.lock. Inode and nanosecond timestamps
+    distinguish replacements without changing the captured credential schema.
+    """
+    info = path.stat()
+    return info.st_dev, info.st_ino, info.st_mtime_ns, info.st_ctime_ns
+
 
 def _read_registry_array(path: Path) -> list[object]:
     """Read `registry.json` into its raw, un-row-validated JSON array.

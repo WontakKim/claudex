@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import enum
-import ipaddress
 import json
 import urllib.error
 import urllib.request
@@ -11,31 +10,11 @@ from dataclasses import dataclass
 from typing import Any
 
 from claudex.cli import daemon
+from claudex.cli.daemon import _bracket_host, _http_url, _urlopen_no_redirect
 from claudex.config import GatewayConfig
 
 _PROBE_TIMEOUT = 2.0
 _ADMIN_TIMEOUT = 5.0
-
-
-class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
-    """Refuse to follow any redirect: the 3xx surfaces as an HTTPError.
-
-    Following a redirect would re-send the request headers — including the
-    local bearer token on admin calls — to whatever host the Location header
-    names, and would classify the probe from the redirect target instead of
-    the actual port occupant.
-    """
-
-    def redirect_request(self, *args: Any, **kwargs: Any) -> None:
-        return None
-
-
-_NO_REDIRECT_OPENER = urllib.request.build_opener(_NoRedirectHandler)
-
-
-def _urlopen_no_redirect(request: urllib.request.Request | str, timeout: float) -> Any:
-    """`urlopen` for probe/admin calls; every 3xx is a final response."""
-    return _NO_REDIRECT_OPENER.open(request, timeout=timeout)
 
 
 class ProbeOutcome(enum.Enum):
@@ -52,19 +31,6 @@ class ProbeOutcome(enum.Enum):
     NO_LISTENER = "no_listener"
     FOREIGN = "foreign"
     AMBIGUOUS = "ambiguous"
-
-
-def _bracket_host(host: str) -> str:
-    """Bracket an IPv6 literal for URL use; IPv4 addresses/hostnames pass through."""
-    try:
-        parsed = ipaddress.ip_address(host)
-    except ValueError:
-        return host
-    return f"[{host}]" if parsed.version == 6 else host
-
-
-def _http_url(host: str, port: int, path: str) -> str:
-    return f"http://{_bracket_host(host)}:{port}{path}"
 
 
 def _probe_endpoint(config: GatewayConfig) -> tuple[str, int]:

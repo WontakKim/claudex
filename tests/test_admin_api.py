@@ -14,9 +14,11 @@ from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock, Mock
 
 import httpx
 import pytest
+from starlette.requests import Request
 from starlette.testclient import TestClient
 
 import claudex.admin.accounts as admin_accounts
@@ -29,6 +31,7 @@ import claudex.server_support as server_support
 from claudex import compaction, paths
 from claudex.claude import accounts as claude_accounts
 from claudex.gptpro import session as gptpro_session
+from claudex.mcp_server import LazyAskRuntime
 from claudex.providers.codex_client import (
     CODEX_MODELS_URL,
     CODEX_RESPONSES_URL,
@@ -149,6 +152,7 @@ _ADMIN_FUNCTION_MANIFEST = {
         "_handle_dashboard_js",
         "_handle_favicon",
         "_handle_admin_codex_models",
+        "_handle_admin_codex_capabilities",
         "_handle_admin_grok_models",
         "_handle_admin_custom_models",
         "_handle_admin_kimi_models",
@@ -785,6 +789,73 @@ def test_health_reports_error_without_codex_credentials(
     assert health.status_code == 503
     assert health.json()["status"] == "error"
     assert health.json()["providers"]["codex"]["status"] == "error"
+
+
+@pytest.mark.parametrize("failure", ["permission", "encoding"])
+def test_codex_read_failure_allows_unrelated_startup_and_traffic_but_health_stays_required(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    caplog: pytest.LogCaptureFixture, failure: str,
+) -> None:
+    from claudex.providers.codex_auth import CodexAuthManager
+
+    codex_home = tmp_path / "synthetic-codex"
+    codex_home.mkdir()
+    auth_file = codex_home / "auth.json"
+    contents = b"\xffdummy-sensitive-content"
+    auth_file.write_bytes(contents)
+    read_text = Path.read_text
+    if failure == "permission":
+        def denied_read(path: Path, *args, **kwargs) -> str:
+            if path == auth_file:
+                raise PermissionError("dummy-sensitive-content")
+            return read_text(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", denied_read)
+    config = GatewayConfig(
+        codex_home=codex_home, model_map={}, claude_account_id=None,
+        claude_account_routing_mode="disabled",
+    )
+    upstream_requests: list[httpx.Request] = []
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        upstream_requests.append(request)
+        assert request.url.path == "/v1/messages"
+        assert request.headers["x-api-key"] == "dummy-client-key"
+        return httpx.Response(200, json={
+            "id": "dummy-message",
+            "content": [{"type": "text", "text": "dummy-response"}],
+        })
+
+    caplog.set_level(logging.WARNING, logger="claudex.server")
+    with _create_test_client(
+        monkeypatch, tmp_path, config=config, codex_auth=CodexAuthManager,
+        base_url="http://127.0.0.1:8787",
+    ) as client:
+        fake_http_client = httpx.AsyncClient(transport=httpx.MockTransport(upstream))
+        client.app.state.http_client = fake_http_client
+        try:
+            hello = client.get("/api/hello")
+            health = client.get("/health")
+            response = client.post("/v1/messages", headers={"x-api-key": "dummy-client-key"}, json={
+                "model": "claude-synthetic-model", "max_tokens": 10,
+                "messages": [{"role": "user", "content": "dummy request"}],
+            })
+        finally:
+            client.portal.call(fake_http_client.aclose)
+
+    assert hello.status_code == 200
+    assert response.status_code == 200
+    assert response.json()["content"] == [{"type": "text", "text": "dummy-response"}]
+    assert len(upstream_requests) == 1
+    assert health.status_code == 503
+    assert health.json()["status"] == "error"
+    assert health.json()["providers"]["codex"]["status"] == "error"
+    assert health.json()["providers"]["kimi"]["required"] is False
+    assert health.json()["providers"]["grok"]["required"] is False
+    assert "codex direction unavailable" in caplog.text
+    assert "dummy-sensitive-content" not in health.text
+    assert "dummy-sensitive-content" not in caplog.text
+    assert auth_file.read_bytes() == contents
 
 
 def test_health_stays_ok_without_kimi_credentials_when_map_has_no_kimi_route(
@@ -1891,7 +1962,7 @@ class TestAdminCompactionApi:
 
 
 class TestAdminCodexApi:
-    """GET/PUT /admin/settings/codex — Codex Fast service tier."""
+    """GET/PUT /admin/settings/codex — Codex request tier settings."""
 
     @staticmethod
     def _admin_client(
@@ -1914,26 +1985,28 @@ class TestAdminCodexApi:
         assert response.status_code == 200
         assert response.json() == {"service_tier": None, "env_locked": False}
 
-    def test_put_fast_persists_and_hot_swaps_live_config(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    @pytest.mark.parametrize("tier", ["fast", "ultrafast"])
+    def test_put_tier_persists_and_hot_swaps_live_config(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, tier: str
     ) -> None:
         settings_file = tmp_path / "settings.json"
         settings_file.write_text('{"port": 9317}', encoding="utf-8")
         with self._admin_client(monkeypatch, tmp_path) as client:
             response = client.put(
-                "/admin/settings/codex", json={"service_tier": "fast"}
+                "/admin/settings/codex", json={"service_tier": tier}
             )
             config_after = client.app.state.config
             reread = client.get("/admin/settings/codex")
 
         assert response.status_code == 200
-        assert response.json() == {"service_tier": "fast", "env_locked": False}
-        assert reread.json() == {"service_tier": "fast", "env_locked": False}
-        assert config_after.codex_service_tier == "fast"
+        assert response.json() == {"service_tier": tier, "env_locked": False}
+        assert reread.json() == {"service_tier": tier, "env_locked": False}
+        assert config_after.codex_service_tier == tier
         assert json.loads(settings_file.read_text(encoding="utf-8")) == {
             "port": 9317,
-            "codex": {"service_tier": "fast"},
+            "codex": {"service_tier": tier},
         }
+        assert GatewayConfig.load(settings_file).codex_service_tier == tier
 
     def test_put_null_removes_key_and_hot_swaps_live_config(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -1981,7 +2054,7 @@ class TestAdminCodexApi:
         assert "error" in response.json()
         assert not (tmp_path / "settings.json").exists()
 
-    @pytest.mark.parametrize("env_value", ["fast", ""])
+    @pytest.mark.parametrize("env_value", ["fast", "ultrafast", ""])
     def test_env_override_locks_get_and_put(
         self,
         monkeypatch: pytest.MonkeyPatch,
@@ -2015,6 +2088,451 @@ class TestAdminCodexApi:
         assert get_response.status_code == 401
         assert put_response.status_code == 401
         assert not (tmp_path / "settings.json").exists()
+
+
+class TestAdminCodexCapabilitiesApi:
+    @pytest.fixture(autouse=True)
+    def mock_codex_version(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        async def spawn(*args: Any, **kwargs: Any) -> Any:
+            assert args == ("codex", "--version")
+            return SimpleNamespace(
+                returncode=0,
+                communicate=lambda: asyncio.sleep(0, result=(b"codex-cli 0.157.1", b"")),
+            )
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+
+    def test_status_and_refresh_share_request_capabilities_without_inference(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ) -> None:
+        calls = 0
+        is_upgraded = False
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal calls
+            assert request.method == "GET"
+            assert str(request.url).startswith(CODEX_MODELS_URL)
+            calls += 1
+            return httpx.Response(200, json={"models": [
+                {"slug": "both", "service_tiers": [{"id": "priority"}, {"id": "ultrafast"}]},
+                {"slug": "fast-only", "service_tiers": [{"id": "priority"}] + ([{"id": "ultrafast"}] if is_upgraded else [])},
+            ]})
+
+        http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        config = GatewayConfig(
+            codex_service_tier="ultrafast",
+            model_map={"opus": "codex:both", "sonnet": "codex:fast-only", "haiku": "codex:manual-new-model"},
+        )
+        try:
+            with _create_test_client(
+                monkeypatch, tmp_path, config=config, base_url="http://127.0.0.1:8787",
+                codex_client=lambda auth, _http: CodexClient(auth, http_client),
+            ) as client:
+                initial = client.get("/admin/providers/codex/capabilities")
+                assert initial.status_code == 200
+                payload = initial.json()
+                assert payload["configured_tier"] == "ultrafast"
+                assert payload["env_locked"] is False
+                assert payload["status"] == "ok"
+                assert payload["models"]["both"]["applicable_tier"] == "ultrafast"
+                assert payload["models"]["fast-only"]["status"] == "unsupported"
+                assert payload["models"]["manual-new-model"]["status"] == "unknown"
+                is_upgraded = True
+                cached = client.get("/admin/providers/codex/capabilities").json()
+                assert cached["models"]["fast-only"]["status"] == "unsupported"
+                refreshed = client.post("/admin/providers/codex/capabilities/refresh", json={})
+                assert refreshed.status_code == 200
+                assert refreshed.json()["models"]["fast-only"]["applicable_tier"] == "ultrafast"
+                assert client.portal.call(client.app.state.codex_client.supports_service_tier, "fast-only", "ultrafast") is True
+                monkeypatch.setenv("CLAUDEX_CODEX_SERVICE_TIER", "")
+                assert client.get("/admin/providers/codex/capabilities").json()["env_locked"] is True
+        finally:
+            asyncio.run(http_client.aclose())
+        assert calls == 2
+
+    def test_refresh_failure_returns_unknown_with_reason_not_unsupported(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ) -> None:
+        async def handler(request: httpx.Request) -> httpx.Response:
+            assert request.method == "GET"
+            return httpx.Response(503, text="metadata unavailable")
+
+        http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        config = GatewayConfig(codex_service_tier="ultrafast", model_map={"opus": "codex:gpt-6.1-sol"})
+        try:
+            with _create_test_client(
+                monkeypatch, tmp_path, config=config, base_url="http://127.0.0.1:8787",
+                codex_client=lambda auth, _http: CodexClient(auth, http_client),
+            ) as client:
+                response = client.post("/admin/providers/codex/capabilities/refresh", json={})
+        finally:
+            asyncio.run(http_client.aclose())
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["status"] == "unknown"
+        assert payload["reason"]
+        assert payload["fetched_at"] is None
+        assert payload["models"]["gpt-6.1-sol"]["status"] == "unknown"
+        assert payload["models"]["gpt-6.1-sol"]["wire_tier"] is None
+
+    def test_capability_routes_retain_admin_guards(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ) -> None:
+        with _create_test_client(
+            monkeypatch, tmp_path, config=GatewayConfig(local_token="secret"), base_url="http://127.0.0.1:8787",
+        ) as client:
+            assert client.get("/admin/providers/codex/capabilities").status_code == 401
+            assert client.post("/admin/providers/codex/capabilities/refresh", json={}).status_code == 401
+            assert client.post(
+                "/admin/providers/codex/capabilities/refresh", content="{}", headers={"Authorization": "Bearer secret"},
+            ).status_code == 415
+            assert client.post(
+                "/admin/providers/codex/capabilities/refresh", json={"service_tier": "ultrafast"}, headers={"Authorization": "Bearer secret"},
+            ).status_code == 400
+
+    @pytest.mark.parametrize(
+        ("requested_tier", "advertised_ids", "created_tier", "completed_tier", "sent_tier", "capability_status", "confirmation_status"),
+        [
+            ("fast", ["priority"], None, "priority", "priority", "supported", "confirmed"),
+            ("ultrafast", ["ultrafast"], None, "ultrafast", "ultrafast", "supported", "confirmed"),
+            ("ultrafast", ["ultrafast"], None, None, "ultrafast", "supported", "unconfirmed"),
+            ("ultrafast", ["ultrafast"], "ultrafast", "priority", "ultrafast", "supported", "different"),
+            ("ultrafast", ["priority"], None, "default", None, "unsupported", "different"),
+            ("ultrafast", None, None, None, None, "unknown", "unconfirmed"),
+            (None, None, None, None, None, "supported", "unconfirmed"),
+        ],
+    )
+    def test_opt_in_probe_separates_requested_sent_and_backend_confirmed_tiers(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+        requested_tier: str | None, advertised_ids: list[str] | None,
+        created_tier: str | None, completed_tier: str | None, sent_tier: str | None,
+        capability_status: str, confirmation_status: str,
+    ) -> None:
+        requests: list[httpx.Request] = []
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            if request.method == "GET":
+                assert str(request.url).startswith(CODEX_MODELS_URL)
+                return httpx.Response(200, json={"models": [{
+                    "slug": "gpt-6.1-sol",
+                    "service_tiers": None if advertised_ids is None else [{"id": tier} for tier in advertised_ids],
+                }]})
+            assert str(request.url) == CODEX_RESPONSES_URL
+            created = {"model": "served-sol"}
+            completed = {"model": "served-sol"}
+            if created_tier is not None:
+                created["service_tier"] = created_tier
+            if completed_tier is not None:
+                completed["service_tier"] = completed_tier
+            events = [
+                {"type": "response.created", "response": created},
+                {"type": "response.completed", "response": completed},
+            ]
+            content = "".join(f"data: {json.dumps(event)}\n\n" for event in events)
+            return httpx.Response(200, content=content, headers={"content-type": "text/event-stream"})
+
+        http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        try:
+            with _create_test_client(
+                monkeypatch, tmp_path, config=GatewayConfig(codex_service_tier="fast"),
+                base_url="http://127.0.0.1:8787",
+                codex_client=lambda auth, _http: CodexClient(auth, http_client),
+            ) as client:
+                response = client.post("/admin/test", json={"target": "codex:gpt-6.1-sol", "service_tier": requested_tier})
+        finally:
+            asyncio.run(http_client.aclose())
+        assert response.status_code == 200
+        result = response.json()
+        assert result["ok"] is True
+        assert result["response_model"] == "served-sol"
+        diagnostic = result["tier_diagnostic"]
+        assert diagnostic["requested_tier"] == requested_tier
+        assert diagnostic["sent_tier"] == sent_tier
+        assert diagnostic["backend_confirmed_tier"] == completed_tier
+        assert diagnostic["capability_status"] == capability_status
+        assert diagnostic["confirmation_status"] == confirmation_status
+        if capability_status != "supported":
+            assert diagnostic["capability_reason"]
+        if confirmation_status != "confirmed":
+            assert diagnostic["confirmation_reason"]
+        assert [request.method for request in requests] == ["GET", "POST"]
+        payload = json.loads(requests[-1].content)
+        if sent_tier is None:
+            assert "service_tier" not in payload
+            assert "x-codex-routing-hint" not in requests[-1].headers
+        else:
+            assert payload["service_tier"] == sent_tier
+            assert requests[-1].headers["x-codex-routing-hint"] == f"model=gpt-6.1-sol;tier={sent_tier}"
+
+    @pytest.mark.parametrize(
+        ("events", "has_done_marker", "reported_tier"),
+        [
+            pytest.param(
+                [{"type": "response.created", "response": {"model": "served-sol", "service_tier": "ultrafast"}}],
+                False, "ultrafast", id="created-matching-tier-eof",
+            ),
+            pytest.param(
+                [{"type": "response.created", "response": {"model": "served-sol"}}],
+                False, None, id="created-no-tier-eof",
+            ),
+            pytest.param(
+                [{"type": "response.output_text.delta", "delta": "ping"}],
+                False, None, id="output-without-completion",
+            ),
+            pytest.param(
+                [{"type": "response.created", "response": {"model": "served-sol", "service_tier": "ultrafast"}}],
+                True, "ultrafast", id="done-marker-without-completion",
+            ),
+            pytest.param([], False, None, id="empty-stream"),
+        ],
+    )
+    def test_opt_in_probe_rejects_eof_before_successful_completion(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+        events: list[dict[str, Any]], has_done_marker: bool, reported_tier: str | None,
+    ) -> None:
+        requests: list[httpx.Request] = []
+        content = "".join(f"data: {json.dumps(event)}\n\n" for event in events)
+        if has_done_marker:
+            content += "data: [DONE]\n\n"
+        stream = TrackedProbeStream(content.encode())
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            if request.method == "GET":
+                assert str(request.url).startswith(CODEX_MODELS_URL)
+                return httpx.Response(200, json={"models": [{
+                    "slug": "gpt-6.1-sol", "service_tiers": [{"id": "ultrafast"}],
+                }]})
+            assert str(request.url) == CODEX_RESPONSES_URL
+            return httpx.Response(200, stream=stream, headers={"content-type": "text/event-stream"})
+
+        http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        try:
+            with _create_test_client(
+                monkeypatch, tmp_path, base_url="http://127.0.0.1:8787",
+                codex_client=lambda auth, _http: CodexClient(auth, http_client),
+            ) as client:
+                response = client.post("/admin/test", json={"target": "codex:gpt-6.1-sol", "service_tier": "ultrafast"})
+        finally:
+            asyncio.run(http_client.aclose())
+        assert response.status_code == 200
+        result = response.json()
+        diagnostic = result["tier_diagnostic"]
+        assert result["ok"] is False, (
+            result["ok"], diagnostic["confirmation_status"], diagnostic["backend_confirmed_tier"],
+        )
+        assert result["status"] == 502
+        assert set(diagnostic) == {
+            "requested_tier", "sent_tier", "backend_confirmed_tier",
+            "capability_status", "capability_reason", "confirmation_status", "confirmation_reason",
+        }
+        assert diagnostic["requested_tier"] == "ultrafast"
+        assert diagnostic["sent_tier"] == "ultrafast"
+        assert diagnostic["backend_confirmed_tier"] == reported_tier
+        assert diagnostic["confirmation_status"] == "unconfirmed"
+        assert diagnostic["confirmation_reason"]
+        if events:
+            assert "response.completed" in result["detail"]
+            assert "response.completed" in diagnostic["confirmation_reason"]
+        assert [request.method for request in requests] == ["GET", "POST"]
+        assert json.loads(requests[-1].content)["service_tier"] == "ultrafast"
+        assert stream.close_calls == 1
+
+    @pytest.mark.parametrize("provider_name", ["codex", "wrtn"])
+    @pytest.mark.parametrize("event_kind", ["flat_error", "nested_error", "failed", "incomplete"])
+    def test_ordinary_probe_classifies_only_its_first_event(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+        provider_name: str, event_kind: str,
+    ) -> None:
+        provider = _custom_provider()
+        message = "The requested model does not exist"
+        if provider_name == "wrtn":
+            message += f"; credential {provider.api_key} rejected"
+        error = {"code": "model_not_found", "message": message}
+        if event_kind == "flat_error":
+            event = {"type": "error", "sequence_number": 0, "param": "model", **error}
+        elif event_kind == "nested_error":
+            event = {"type": "error", "error": error}
+        elif event_kind == "failed":
+            event = {"type": "response.failed", "response": {"model": "unavailable-model", "error": error}}
+        else:
+            event = {"type": "response.incomplete", "response": {
+                "model": "served-model", "incomplete_details": {"reason": "max_output_tokens"},
+            }}
+        stream = FirstEventOnlyProbeStream(f"data: {json.dumps(event)}\n\n".encode())
+        requests: list[httpx.Request] = []
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            assert request.method == "POST"
+            return httpx.Response(200, stream=stream, headers={"content-type": "text/event-stream"})
+
+        http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        config = GatewayConfig(
+            codex_service_tier="ultrafast",
+            custom_providers={"wrtn": provider} if provider_name == "wrtn" else {},
+        )
+        try:
+            with _create_test_client(
+                monkeypatch, tmp_path, config=config, base_url="http://127.0.0.1:8787",
+            ) as client:
+                transport = (
+                    CodexClient(AvailableCodexAuthManager(), http_client) if provider_name == "codex"
+                    else OpenAICompatibleClient("wrtn", provider, http_client)
+                )
+                _select_route_transport(client, provider_name, transport)
+                response = client.post("/admin/test", json={"target": f"{provider_name}:unavailable-model"})
+        finally:
+            asyncio.run(http_client.aclose())
+        result = response.json()
+        assert response.status_code == 200
+        assert result["ok"] is (event_kind == "incomplete"), result
+        assert "tier_diagnostic" not in result
+        if event_kind == "incomplete":
+            assert result["status"] == 200
+            assert result["response_model"] == "served-model"
+            assert result["detail"] is None
+        else:
+            assert result["status"] == 502
+            assert result["response_model"] is None
+            expected_detail = (
+                "The requested model does not exist; credential [REDACTED] rejected"
+                if provider_name == "wrtn" else message
+            )
+            assert result["detail"] == expected_detail
+        if provider_name == "wrtn":
+            _assert_secret_absent(provider.api_key, response.text)
+        assert len(requests) == 1
+        assert "service_tier" not in json.loads(requests[0].content)
+        assert "x-codex-routing-hint" not in requests[0].headers
+        assert stream.read_calls == 1
+        assert stream.close_calls == 1
+
+    @pytest.mark.parametrize("has_failed_event", [False, True])
+    def test_ordinary_probe_is_untiered_even_when_ultrafast_is_configured(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, has_failed_event: bool,
+    ) -> None:
+        requests: list[httpx.Request] = []
+
+        content = 'data: {"type":"response.created","response":{"model":"gpt-6.1-sol"}}\n\n'
+        if has_failed_event:
+            content += 'data: {"type":"response.failed","response":{"error":{"message":"later failure"}}}\n\n'
+        stream = TrackedProbeStream(content.encode())
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            assert request.method == "POST"
+            return httpx.Response(200, stream=stream, headers={"content-type": "text/event-stream"})
+
+        http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        try:
+            with _create_test_client(
+                monkeypatch, tmp_path, config=GatewayConfig(codex_service_tier="ultrafast"),
+                base_url="http://127.0.0.1:8787",
+                codex_client=lambda auth, _http: CodexClient(auth, http_client),
+            ) as client:
+                response = client.post("/admin/test", json={"target": "codex:gpt-6.1-sol"})
+        finally:
+            asyncio.run(http_client.aclose())
+        assert response.json()["ok"] is True
+        assert "tier_diagnostic" not in response.json()
+        assert len(requests) == 1
+        assert "service_tier" not in json.loads(requests[0].content)
+        assert "x-codex-routing-hint" not in requests[0].headers
+        assert stream.close_calls == 1
+
+    @pytest.mark.parametrize("body", [
+        {"target": "codex:gpt-6.1-sol", "service_tier": "priority"},
+        {"target": "codex:gpt-6.1-sol", "service_tier": True},
+        {"target": "codex:gpt-6.1-sol", "service_tier": []},
+        {"target": "grok:grok-model", "service_tier": "fast"},
+    ])
+    def test_opt_in_probe_rejects_invalid_tier_or_provider_before_inference(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, body: dict[str, Any],
+    ) -> None:
+        with _create_test_client(monkeypatch, tmp_path, base_url="http://127.0.0.1:8787") as client:
+            response = client.post("/admin/test", json=body)
+        assert response.status_code == 400
+        assert "service_tier" in response.json()["error"]["message"]
+
+    @pytest.mark.parametrize("terminal_event", ["response.failed", "response.incomplete", "error"])
+    @pytest.mark.parametrize("reported_tier", [None, "ultrafast"])
+    def test_opt_in_probe_does_not_report_success_for_failed_completion(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+        terminal_event: str, reported_tier: str | None,
+    ) -> None:
+        async def handler(request: httpx.Request) -> httpx.Response:
+            if request.method == "GET":
+                return httpx.Response(200, json={"models": [{"slug": "gpt-6.1-sol", "service_tiers": [{"id": "ultrafast"}]}]})
+            created_response = {} if reported_tier is None else {"service_tier": reported_tier}
+            events = [
+                {"type": "response.created", "response": created_response},
+                {"type": terminal_event, "response": {"error": {"message": "probe failed"}}},
+            ]
+            content = "".join(f"data: {json.dumps(event)}\n\n" for event in events)
+            return httpx.Response(200, content=content, headers={"content-type": "text/event-stream"})
+
+        http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        try:
+            with _create_test_client(
+                monkeypatch, tmp_path, base_url="http://127.0.0.1:8787",
+                codex_client=lambda auth, _http: CodexClient(auth, http_client),
+            ) as client:
+                response = client.post("/admin/test", json={"target": "codex:gpt-6.1-sol", "service_tier": "ultrafast"})
+        finally:
+            asyncio.run(http_client.aclose())
+        assert response.status_code == 200
+        assert response.json()["ok"] is False
+        assert response.json()["tier_diagnostic"]["backend_confirmed_tier"] == reported_tier
+        assert response.json()["tier_diagnostic"]["confirmation_status"] == "unconfirmed"
+        assert "response.completed" in response.json()["tier_diagnostic"]["confirmation_reason"]
+
+    def test_probe_reports_actual_sent_tier_when_auth_changes_after_capability_check(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ) -> None:
+        class ChangingAuth(AvailableCodexAuthManager):
+            def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+                self.is_new_account = False
+
+            async def get_credentials(self, force_refresh: bool = False) -> SimpleNamespace:
+                return SimpleNamespace(
+                    access_token="new-token" if self.is_new_account else "old-token",
+                    account_id="new-account" if self.is_new_account else "old-account",
+                    is_api_key=False,
+                )
+
+        class ChangeAfterCapabilityClient(CodexClient):
+            async def service_tier_capabilities(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+                capabilities = await super().service_tier_capabilities(*args, **kwargs)
+                self._auth_manager.is_new_account = True
+                return capabilities
+
+        requests: list[httpx.Request] = []
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            if request.method == "GET":
+                return httpx.Response(200, json={"models": [{"slug": "gpt-6.1-sol", "service_tiers": [{"id": "ultrafast"}]}]})
+            requests.append(request)
+            return httpx.Response(200, content='data: {"type":"response.completed","response":{"model":"gpt-6.1-sol","service_tier":"default"}}\n\n')
+
+        http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        try:
+            with _create_test_client(
+                monkeypatch, tmp_path, base_url="http://127.0.0.1:8787", codex_auth=ChangingAuth,
+                codex_client=lambda auth, _http: ChangeAfterCapabilityClient(auth, http_client),
+            ) as client:
+                response = client.post("/admin/test", json={"target": "codex:gpt-6.1-sol", "service_tier": "ultrafast"})
+        finally:
+            asyncio.run(http_client.aclose())
+        assert response.json()["ok"] is True
+        diagnostic = response.json()["tier_diagnostic"]
+        assert diagnostic["requested_tier"] == "ultrafast"
+        assert diagnostic["sent_tier"] is None
+        assert diagnostic["backend_confirmed_tier"] == "default"
+        assert diagnostic["confirmation_status"] == "different"
+        assert "service_tier" not in json.loads(requests[0].content)
+        assert "x-codex-routing-hint" not in requests[0].headers
 
 
 class TestAdminClaudeAccountApi:
@@ -2574,6 +3092,7 @@ class FakeAdminGptProLoginSession:
         self.is_terminal = terminal
         self.started = False
         self.cancel_requested = False
+        self.on_settled: Callable[[], None] | None = None
         self._status = status or {
             "status": "starting",
             "started_at": 123.0,
@@ -2582,8 +3101,9 @@ class FakeAdminGptProLoginSession:
             "error": None,
         }
 
-    def start(self) -> None:
+    def start(self, *, on_settled: Callable[[], None] | None = None) -> None:
         self.started = True
+        self.on_settled = on_settled
 
     def status(self) -> dict[str, Any]:
         return dict(self._status)
@@ -2592,8 +3112,9 @@ class FakeAdminGptProLoginSession:
         self.cancel_requested = True
 
 
-class FakeAdminGptProRuntime:
+class FakeAdminGptProRuntime(LazyAskRuntime):
     def __init__(self, *, active: bool = False) -> None:
+        super().__init__()
         self.active = active
         self.released = False
 
@@ -2602,6 +3123,216 @@ class FakeAdminGptProRuntime:
 
     async def release_runtime(self) -> None:
         self.released = True
+
+
+@pytest.mark.parametrize("phase", ["releasing", "starting", "running", "cancelling"])
+@pytest.mark.parametrize("operation", ["ask", "recovery"])
+def test_gptpro_login_excludes_new_admission_until_settlement(
+    monkeypatch: pytest.MonkeyPatch, phase: str, operation: str,
+) -> None:
+    from starlette.applications import Starlette
+    from starlette.routing import Route
+
+    from claudex.gptpro import ask, runtime as runtime_module
+    from claudex.gptpro.login_session import GptProLoginSession
+
+    async def scenario() -> None:
+        release_started = asyncio.Event()
+        allow_release = asyncio.Event()
+        driver_started = asyncio.Event()
+        allow_running = asyncio.Event()
+        login_running = asyncio.Event()
+        finish_login = asyncio.Event()
+
+        class WarmRuntime:
+            def __init__(self, *, max_concurrent_asks: int = 2) -> None:
+                self.limit = max_concurrent_asks
+                self.should_gate_close = False
+                self.close_calls = 0
+
+            async def ask(self, question: str, **options: Any) -> ask.AskOutcome:
+                return ask.AskOutcome(text=question, marker="marker", conversation_id=None)
+
+            async def recover(self, conversation_id: str, marker: str) -> ask.AskOutcome:
+                return ask.AskOutcome(text="recovered", marker=marker, conversation_id=conversation_id)
+
+            async def aclose(self) -> None:
+                self.close_calls += 1
+                if self.should_gate_close:
+                    release_started.set()
+                    await allow_release.wait()
+
+        class LoginSession(GptProLoginSession):
+            async def _run(self) -> None:
+                driver_started.set()
+                await allow_running.wait()
+                self._status = "running"
+                login_running.set()
+                await finish_login.wait()
+                self._status = "cancelled" if self._cancel_event.is_set() else "succeeded"
+
+        monkeypatch.setattr(runtime_module, "AskRuntime", WarmRuntime)
+        monkeypatch.setattr(admin_gptpro, "GptProLoginSession", LoginSession)
+        lazy_runtime = LazyAskRuntime()
+        lazy_runtime.set_max_concurrent_asks(3)
+        completed = lazy_runtime.start_ask("completed")
+        while lazy_runtime.has_active_jobs():
+            await asyncio.sleep(0)
+        assert lazy_runtime.job_result(completed.ask_id).answer == "completed"
+        warm_runtime = lazy_runtime._runtime
+        warm_runtime.should_gate_close = True
+        app = Starlette(routes=[
+            Route("/admin/gptpro/login", admin_gptpro._handle_admin_gptpro_login_post, methods=["POST"]),
+            Route("/admin/gptpro/login", admin_gptpro._handle_admin_gptpro_login_delete, methods=["DELETE"]),
+        ])
+        app.state.config = GatewayConfig()
+        app.state.gptpro_ask_runtime = lazy_runtime
+        app.state.gptpro_login_session = None
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1:8787",
+        ) as client:
+            post_task = asyncio.create_task(client.post("/admin/gptpro/login", json={}))
+            try:
+                await release_started.wait()
+                if phase != "releasing":
+                    allow_release.set()
+                    assert (await post_task).status_code == 201
+                    await driver_started.wait()
+                    if phase != "starting":
+                        allow_running.set()
+                        await login_running.wait()
+                    if phase == "cancelling":
+                        response = await client.delete("/admin/gptpro/login")
+                        assert response.json() == {"status": "cancelling"}
+                original_jobs = dict(lazy_runtime._job_service._jobs)
+                with pytest.raises(ask.GptProAskError, match="login"):
+                    if operation == "ask":
+                        lazy_runtime.start_ask("must not be registered")
+                    else:
+                        lazy_runtime.start_recovery(
+                            conversation_id="11111111-1111-4111-8111-111111111111",
+                            marker="[gptpro-transport-nonce:saved-marker]",
+                        )
+                assert lazy_runtime._job_service._jobs == original_jobs
+                assert lazy_runtime.job_status(completed.ask_id).state == "succeeded"
+                assert lazy_runtime.job_result(completed.ask_id).answer == "completed"
+                assert lazy_runtime._runtime is None
+                concurrent = await client.post("/admin/gptpro/login", json={})
+                assert concurrent.status_code == 409
+                assert concurrent.json()["error"]["code"] == "login-active"
+                assert warm_runtime.close_calls == 1
+                allow_release.set()
+                assert (await post_task).status_code == 201
+                allow_running.set()
+                finish_login.set()
+                await app.state.gptpro_login_session._driver_task
+                following = lazy_runtime.start_ask("after login")
+                while lazy_runtime.has_active_jobs():
+                    await asyncio.sleep(0)
+                assert lazy_runtime.job_result(following.ask_id).answer == "after login"
+                assert lazy_runtime._runtime.limit == 3
+            finally:
+                allow_release.set()
+                allow_running.set()
+                finish_login.set()
+                await post_task
+                session = app.state.gptpro_login_session
+                if session is not None:
+                    await session._driver_task
+                await lazy_runtime.aclose()
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=5))
+
+
+@pytest.mark.parametrize("failure", ["release", "start", "cancel-release"])
+def test_gptpro_login_reopens_admission_when_no_driver_started(
+    monkeypatch: pytest.MonkeyPatch, failure: str,
+) -> None:
+    from starlette.applications import Starlette
+    from starlette.routing import Route
+
+    async def scenario() -> None:
+        release_started = asyncio.Event()
+        allow_release = asyncio.Event()
+
+        class Runtime(FakeAdminGptProRuntime):
+            async def release_runtime(self) -> None:
+                release_started.set()
+                if failure == "release":
+                    raise RuntimeError("synthetic release failure")
+                if failure == "cancel-release":
+                    await allow_release.wait()
+                self.released = True
+
+        class LoginSession(FakeAdminGptProLoginSession):
+            def start(self, *, on_settled: Callable[[], None] | None = None) -> None:
+                raise RuntimeError("synthetic start failure")
+
+        monkeypatch.setattr(admin_gptpro, "GptProLoginSession", LoginSession)
+        runtime = Runtime()
+        app = Starlette(routes=[
+            Route("/admin/gptpro/login", admin_gptpro._handle_admin_gptpro_login_post, methods=["POST"]),
+        ])
+        app.state.config = GatewayConfig()
+        app.state.gptpro_ask_runtime = runtime
+        app.state.gptpro_login_session = None
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1:8787",
+        ) as client:
+            post_task = asyncio.create_task(client.post("/admin/gptpro/login", json={}))
+            await release_started.wait()
+            if failure == "cancel-release":
+                assert runtime.reserve_login() == "login-active"
+                post_task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await post_task
+            else:
+                with pytest.raises(RuntimeError, match=f"synthetic {failure} failure"):
+                    await post_task
+            assert app.state.gptpro_login_session is None
+            assert runtime.reserve_login() is None
+            runtime.release_login()
+            await runtime.aclose()
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=5))
+
+
+@pytest.mark.parametrize("state", ["queued", "running", "detached"])
+def test_gptpro_login_rejects_all_existing_active_job_states(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, state: str,
+) -> None:
+    from claudex.gptpro import jobs
+
+    async def unexpected_provider(question: str, **options: Any) -> Any:
+        raise AssertionError("seeded active jobs must not invoke a provider")
+
+    class WarmRuntime:
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        async def aclose(self) -> None:
+            self.close_calls += 1
+
+    runtime = LazyAskRuntime()
+    service = jobs.AskJobService(unexpected_provider)
+    existing = jobs.AskJob(
+        ask_id="active-id", state=state, answer=None, failure=None,
+        error_message=None, status_message=None, nonce_marker=None,
+        thread_ref=None, created_at=1.0, finished_at=None,
+    )
+    service._jobs[existing.ask_id] = existing
+    warm_runtime = WarmRuntime()
+    runtime._job_service = service
+    runtime._runtime = warm_runtime
+    with TestAdminGptProApi()._client(monkeypatch, tmp_path) as client:
+        client.app.state.gptpro_ask_runtime = runtime
+        response = client.post("/admin/gptpro/login", json={})
+        assert response.status_code == 409
+        assert response.json()["error"]["code"] == "asks-active"
+        assert client.app.state.gptpro_login_session is None
+        assert warm_runtime.close_calls == 0
+        assert service._jobs == {existing.ask_id: existing}
+        assert runtime.max_concurrent_asks == 2
 
 
 class FakeAdminSubprocess:
@@ -2617,7 +3348,128 @@ class FakeAdminSubprocess:
         pass
 
 
+class FakeRunningAdminSubprocess:
+    def __init__(self) -> None:
+        self.pid = 12345
+        self.returncode: int | None = None
+        self.communicate_calls = 0
+        self.wait_calls = 0
+        self.kill_calls = 0
+        self.read_started = asyncio.Event()
+        self.cleanup_started = asyncio.Event()
+        self.allow_cleanup = asyncio.Event()
+
+    async def communicate(self) -> tuple[bytes, None]:
+        self.communicate_calls += 1
+        if self.communicate_calls == 1:
+            self.read_started.set()
+            await asyncio.Future()
+        self.cleanup_started.set()
+        await self.wait()
+        return b"partial command output\n", None
+
+    async def wait(self) -> int:
+        self.wait_calls += 1
+        await self.allow_cleanup.wait()
+        self.returncode = -admin_gptpro.signal.SIGKILL
+        return self.returncode
+
+    def kill(self) -> None:
+        self.kill_calls += 1
+
+
+def _gptpro_command_request(operation: str) -> Request:
+    async def receive() -> dict[str, Any]:
+        return {"type": "http.request", "body": b"{}", "more_body": False}
+
+    return Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "scheme": "http",
+            "path": f"/admin/gptpro/{operation}",
+            "headers": [
+                (b"host", b"127.0.0.1"),
+                (b"content-type", b"application/json"),
+            ],
+            "app": SimpleNamespace(state=SimpleNamespace(config=GatewayConfig())),
+        },
+        receive,
+    )
+
+
 class TestAdminGptProApi:
+    @pytest.mark.parametrize("operation", ["doctor", "connect"])
+    @pytest.mark.parametrize("interruption", ["cancellation", "timeout"])
+    @pytest.mark.parametrize("group_error", [None, ProcessLookupError, PermissionError])
+    def test_command_awaits_cleanup_before_timeout_or_cancellation(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        operation: str,
+        interruption: str,
+        group_error: type[OSError] | None,
+    ) -> None:
+        async def scenario() -> None:
+            process = FakeRunningAdminSubprocess()
+            spawn = AsyncMock(return_value=process)
+            kill_group = Mock(side_effect=group_error)
+            monkeypatch.setattr(admin_gptpro.asyncio, "create_subprocess_exec", spawn)
+            monkeypatch.setattr(admin_gptpro.os, "killpg", kill_group)
+            if interruption == "timeout":
+                monkeypatch.setattr(
+                    admin_gptpro, f"_GPTPRO_{operation.upper()}_TIMEOUT", 0.01
+                )
+            handler = getattr(admin_gptpro, f"_handle_admin_gptpro_{operation}")
+            task = asyncio.create_task(handler(_gptpro_command_request(operation)))
+            cleanup_started = asyncio.create_task(process.cleanup_started.wait())
+            try:
+                await asyncio.wait_for(process.read_started.wait(), timeout=1)
+                assert spawn.call_args.kwargs == {
+                    "stdout": asyncio.subprocess.PIPE,
+                    "stderr": asyncio.subprocess.STDOUT,
+                    "start_new_session": True,
+                }
+                if interruption == "cancellation":
+                    task.cancel("request cancelled")
+                finished, _pending = await asyncio.wait(
+                    (task, cleanup_started),
+                    timeout=1,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                assert cleanup_started in finished, (
+                    "handler exited without subprocess cleanup"
+                )
+                kill_group.assert_called_once_with(
+                    process.pid, admin_gptpro.signal.SIGKILL
+                )
+                assert process.kill_calls == int(group_error is PermissionError)
+                assert process.communicate_calls == 2
+                assert process.wait_calls == 1
+                assert process.returncode is None
+                assert not task.done(), "handler must await subprocess cleanup"
+                process.allow_cleanup.set()
+                if interruption == "cancellation":
+                    with pytest.raises(asyncio.CancelledError) as error:
+                        await asyncio.wait_for(task, timeout=1)
+                    assert error.value.args == ("request cancelled",)
+                    assert task.cancelled()
+                else:
+                    response = await asyncio.wait_for(task, timeout=1)
+                    assert response.status_code == 200
+                    assert json.loads(response.body) == {
+                        "ok": False,
+                        "exit_code": None,
+                        "output": f"{operation} failed to run: timed out after 0.01s",
+                    }
+                assert process.returncode == -admin_gptpro.signal.SIGKILL
+            finally:
+                process.allow_cleanup.set()
+                task.cancel()
+                cleanup_started.cancel()
+                await asyncio.gather(task, cleanup_started, return_exceptions=True)
+
+        asyncio.run(scenario())
+
     @staticmethod
     def _client(
         monkeypatch: pytest.MonkeyPatch,
@@ -2943,15 +3795,11 @@ class TestAdminGptProApi:
         exit_code: int,
         expected_ok: bool,
     ) -> None:
-        monkeypatch.setattr(
-            admin_gptpro,
-            "_GPTPRO_DOCTOR_COMMAND",
-            (
-                sys.executable,
-                "-c",
-                f"import sys; print('doctor output'); sys.exit({exit_code})",
-            ),
-        )
+        process = FakeAdminSubprocess(exit_code=exit_code, output="doctor output\n")
+        spawn = AsyncMock(return_value=process)
+        kill_group = Mock()
+        monkeypatch.setattr(admin_gptpro.asyncio, "create_subprocess_exec", spawn)
+        monkeypatch.setattr(admin_gptpro.os, "killpg", kill_group)
         with self._client(monkeypatch, tmp_path) as client:
             response = client.post("/admin/gptpro/doctor", json={})
 
@@ -2960,6 +3808,28 @@ class TestAdminGptProApi:
             "ok": expected_ok,
             "exit_code": exit_code,
             "output": "doctor output\n",
+        }
+        spawn.assert_awaited_once_with(
+            *admin_gptpro._GPTPRO_DOCTOR_COMMAND,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            start_new_session=True,
+        )
+        kill_group.assert_not_called()
+
+    def test_doctor_reports_spawn_error(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        spawn = AsyncMock(side_effect=OSError("spawn failed"))
+        monkeypatch.setattr(admin_gptpro.asyncio, "create_subprocess_exec", spawn)
+        with self._client(monkeypatch, tmp_path) as client:
+            response = client.post("/admin/gptpro/doctor", json={})
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "ok": False,
+            "exit_code": None,
+            "output": "doctor failed to run: spawn failed",
         }
 
     def test_doctor_requires_json_content_type(
@@ -3005,6 +3875,155 @@ def test_admin_usage_returns_all_providers(monkeypatch: pytest.MonkeyPatch, tmp_
     assert body["grok"]["status"] == "ok"
     assert body["fetched_at"] > 0
     assert calls == ["claude", "codex", "kimi", "grok"]
+
+
+@pytest.mark.parametrize(
+    "response_body",
+    [
+        pytest.param(b'{"plan_type":"\xff"}', id="invalid-utf8"),
+        pytest.param(b'{"count":' + b"9" * 5000 + b"}", id="integer-conversion-limit"),
+    ],
+)
+def test_admin_usage_isolates_json_decode_failures(
+    monkeypatch: pytest.MonkeyPatch, response_body: bytes,
+) -> None:
+    claude_result = {"provider": "claude", "status": "ok", "error": None,
+                     "session": {"used_percent": 12, "window_minutes": 300}}
+    grok_result = {"provider": "grok", "status": "ok", "error": None,
+                   "weekly": {"used_percent": 34, "window_minutes": 10080}}
+    codex_requests: list[str] = []
+
+    async def fake_claude(http_client: Any) -> dict[str, Any]:
+        return claude_result
+
+    async def fake_grok(http_client: Any, auth_manager: Any) -> dict[str, Any]:
+        return grok_result
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "GET"
+        assert request.headers["authorization"] == "Bearer codex"
+        codex_requests.append(str(request.url))
+        return httpx.Response(
+            200, content=response_body, headers={"Content-Type": "application/json"}
+        )
+
+    monkeypatch.setattr(admin_system, "fetch_claude_usage", fake_claude)
+    monkeypatch.setattr(admin_system, "fetch_grok_usage", fake_grok)
+
+    async def scenario() -> Any:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+            state = SimpleNamespace(
+                config=GatewayConfig(),
+                http_client=http_client,
+                codex_auth_manager=AvailableCodexAuthManager(),
+                kimi_auth_manager=MissingKimiAuthManager(),
+                grok_auth_manager=AvailableGrokAuthManager(),
+            )
+            request = Request({
+                "type": "http",
+                "method": "GET",
+                "scheme": "http",
+                "path": "/admin/usage",
+                "query_string": b"",
+                "headers": [(b"host", b"127.0.0.1:8787")],
+                "app": SimpleNamespace(state=state),
+            })
+            return await admin_system._handle_admin_usage(request)
+
+    response = asyncio.run(scenario())
+    assert response.status_code == 200
+    body = json.loads(response.body)
+    assert body["claude"] == claude_result
+    assert body["grok"] == grok_result
+    assert body["codex"]["provider"] == "codex"
+    assert body["codex"]["status"] == "error"
+    assert body["codex"]["error"] == "usage API returned a non-JSON body"
+    assert body["codex"]["session"] is None
+    assert body["codex"]["weekly"] is None
+    assert body["codex"]["plan_type"] is None
+    assert body["kimi"]["status"] == "unavailable"
+    assert "no Kimi credentials" in body["kimi"]["error"]
+    assert body["fetched_at"] > 0
+    assert codex_requests == ["https://chatgpt.com/backend-api/wham/usage"]
+
+
+@pytest.mark.parametrize(
+    "reset_json,expected_reset",
+    [
+        pytest.param(b"1754000000", 1754000000.0, id="finite-seconds"),
+        pytest.param(b"1754000000000", 1754000000.0, id="finite-milliseconds"),
+        pytest.param(b'"1754000000"', 1754000000.0, id="numeric-string"),
+        pytest.param(b'"1970-01-01T00:00:00Z"', 0.0, id="iso-zero"),
+        pytest.param(b"null", None, id="unknown-reset"),
+        pytest.param(b'"Infinity"', None, id="positive-infinity-string"),
+        pytest.param(b'"NaN"', None, id="nan-string"),
+        pytest.param(b'"-Infinity"', None, id="negative-infinity-string"),
+        pytest.param(b"1e400", None, id="positive-infinity-number"),
+        pytest.param(b"NaN", None, id="nan-number"),
+        pytest.param(b"-1e400", None, id="negative-infinity-number"),
+        pytest.param(b"1" + b"0" * 400, None, id="unrepresentable-integer"),
+    ],
+)
+def test_admin_usage_preserves_windows_with_optional_reset(
+    monkeypatch: pytest.MonkeyPatch, reset_json: bytes, expected_reset: float | None,
+) -> None:
+    claude_result = {"provider": "claude", "status": "ok", "error": None}
+    grok_result = {"provider": "grok", "status": "ok", "error": None}
+    response_body = (
+        b'{"plan_type":"promax","rate_limit":{'
+        b'"primary_window":{"used_percent":12,"limit_window_seconds":18000,"reset_at":'
+        + reset_json
+        + b'},"secondary_window":{"used_percent":34,"limit_window_seconds":604800,"reset_at":1754600000}},'
+        b'"rate_limit_reset_credits":{"available_count":2}}'
+    )
+
+    async def fake_claude(http_client: Any) -> dict[str, Any]:
+        return claude_result
+
+    async def fake_grok(http_client: Any, auth_manager: Any) -> dict[str, Any]:
+        return grok_result
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert str(request.url) == "https://chatgpt.com/backend-api/wham/usage"
+        return httpx.Response(200, content=response_body, headers={"Content-Type": "application/json"})
+
+    monkeypatch.setattr(admin_system, "fetch_claude_usage", fake_claude)
+    monkeypatch.setattr(admin_system, "fetch_grok_usage", fake_grok)
+
+    async def scenario() -> Any:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+            state = SimpleNamespace(
+                config=GatewayConfig(),
+                http_client=http_client,
+                codex_auth_manager=AvailableCodexAuthManager(),
+                kimi_auth_manager=MissingKimiAuthManager(),
+                grok_auth_manager=AvailableGrokAuthManager(),
+            )
+            request = Request({
+                "type": "http", "method": "GET", "scheme": "http", "path": "/admin/usage",
+                "query_string": b"", "headers": [(b"host", b"127.0.0.1:8787")],
+                "app": SimpleNamespace(state=state),
+            })
+            return await admin_system._handle_admin_usage(request)
+
+    response = asyncio.run(scenario())
+    assert response.status_code == 200
+    body = json.loads(response.body)
+    assert body["claude"] == claude_result
+    assert body["grok"] == grok_result
+    assert body["codex"]["status"] == "ok"
+    assert body["codex"]["error"] is None
+    assert body["codex"]["plan_type"] == "promax"
+    assert body["codex"]["reset_credits_available"] == 2
+    assert body["codex"]["session"] == {
+        "used_percent": 12.0, "window_minutes": 300, "resets_at": expected_reset,
+    }
+    assert body["codex"]["weekly"] == {
+        "used_percent": 34.0, "window_minutes": 10080, "resets_at": 1754600000.0,
+    }
+    assert body["kimi"]["status"] == "unavailable"
+    assert body["fetched_at"] > 0
+    json.dumps(body, allow_nan=False)
 
 
 def test_admin_usage_refuses_foreign_host(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -3533,7 +4552,7 @@ def _lockable_apply_fn(page: str) -> str:
 def _codex_apply_fn(page: str) -> str:
     start = page.index("function applyCodex(){")
     end = page.index(
-        'document.getElementById("codex-fast").addEventListener("change"', start
+        'document.getElementById("codex-speed").addEventListener("change"', start
     )
     return page[start:end]
 
@@ -3774,7 +4793,7 @@ def _codex_section(page: str) -> str:
     return page[start:end]
 
 
-def test_dashboard_codex_fast_card_wires_apply_flow_and_env_lock(
+def test_dashboard_codex_speed_card_wires_apply_flow_and_env_lock(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
@@ -3783,8 +4802,10 @@ def test_dashboard_codex_fast_card_wires_apply_flow_and_env_lock(
         javascript = sources["javascript"]
 
     section = _codex_section(page)
-    assert page.index('id="compaction-card"') < page.index('id="codex-card"')
-    assert 'type="checkbox" id="codex-fast"' in section
+    assert page.index('id="tab-map"') < page.index('id="codex-card"') < page.index('id="board"')
+    assert 'id="codex-speed"' in section
+    for tier in ("standard", "fast", "ultrafast"):
+        assert f'<option value="{tier}">' in section
     assert 'id="codex-apply"' in section
     assert "priority processing for supported Codex models" in section
     assert "Speed and usage costs depend on the provider and workload" in section
@@ -3795,12 +4816,9 @@ def test_dashboard_codex_fast_card_wires_apply_flow_and_env_lock(
     assert 'jfetch("/admin/settings/codex",{' in apply_fn
     assert 'method:"PUT"' in apply_fn
     assert "headers:JSON_HEADERS" in apply_fn
-    assert 'JSON.stringify({service_tier:CODEX.draft?"fast":null})' in apply_fn
-    assert "checkbox.disabled=CODEX.locked" in javascript
-    assert (
-        "btn.disabled=CODEX.locked||CODEX.draft===(CODEX.serviceTier===\"fast\")"
-        in javascript
-    )
+    assert 'JSON.stringify({service_tier:CODEX.draft})' in apply_fn
+    assert "select.disabled=CODEX.locked" in javascript
+    assert "CODEX.draft===CODEX.serviceTier" in javascript
 
 
 def test_dashboard_codex_fast_fetched_in_parallel_boot_sequence(
@@ -4136,6 +5154,13 @@ class TrackedProbeStream(httpx.AsyncByteStream):
 
     async def aclose(self) -> None:
         self.close_calls += 1
+
+
+class FirstEventOnlyProbeStream(TrackedProbeStream):
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        self.read_calls += 1
+        yield self.content
+        raise AssertionError("ordinary probe requested more than its first event")
 
 
 class TrackedProbeResponse(httpx.Response):

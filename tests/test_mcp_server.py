@@ -565,6 +565,51 @@ def test_release_runtime_closes_warm_runtime_and_preserves_jobs() -> None:
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("operation", ["ask_gpt_pro", "recover_gpt_pro"])
+def test_login_reserved_mcp_admission_returns_normal_tool_error(operation: str) -> None:
+    async def provider(question: str, **options: Any) -> ask.AskOutcome:
+        return ask.AskOutcome(text=question, marker="marker", conversation_id=None)
+
+    async def recover(conversation_id: str, marker: str) -> ask.AskOutcome:
+        return ask.AskOutcome(text="recovered", marker=marker, conversation_id=conversation_id)
+
+    runtime = LazyAskRuntime()
+    service = jobs.AskJobService(provider, recover=recover)
+    completed = jobs.AskJob(
+        ask_id="completed-id", state="succeeded", answer="saved answer",
+        failure=None, error_message=None, status_message=None, nonce_marker="marker",
+        thread_ref=_CONVERSATION_A, created_at=1.0, finished_at=2.0,
+    )
+    service._jobs[completed.ask_id] = completed
+    runtime._job_service = service
+    arguments = (
+        {"question": "Question", "thread": "new"}
+        if operation == "ask_gpt_pro"
+        else {"thread_ref": _CONVERSATION_B, "nonce_marker": "[gptpro-transport-nonce:saved-marker]"}
+    )
+    with _mcp_client(runtime) as client:
+        _payload, headers = _initialize(client)
+        assert client.portal.call(runtime.reserve_login) is None
+        rejected = _call_tool(client, headers, operation, arguments)
+        assert rejected == {
+            "content": [{"type": "text", "text": "GPT Pro asks and recovery are unavailable while login is active"}],
+            "isError": True,
+        }
+        assert service._jobs == {completed.ask_id: completed}
+        assert not runtime.has_active_jobs()
+        status = _json_tool_payload(_call_tool(
+            client, headers, "ask_gpt_pro_status", {"ask_id": completed.ask_id},
+        ))
+        result = _json_tool_payload(_call_tool(
+            client, headers, "ask_gpt_pro_result", {"ask_id": completed.ask_id},
+        ))
+        assert status["state"] == "succeeded"
+        assert result["answer"] == "saved answer"
+        client.portal.call(runtime.release_login)
+        admitted = _json_tool_payload(_call_tool(client, headers, operation, arguments))
+        assert admitted["ask_id"] in service._jobs
+
+
 def test_release_runtime_is_a_no_op_without_a_warm_runtime() -> None:
     async def scenario() -> None:
         lazy_runtime = LazyAskRuntime()

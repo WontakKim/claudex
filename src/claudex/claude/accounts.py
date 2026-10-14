@@ -327,7 +327,11 @@ def update_account_credentials(
         return updated
 
 
-def mark_account_needs_reauth(account_id: str) -> AccountRecord:
+def mark_account_needs_reauth(
+    account_id: str,
+    *,
+    expected_generation: claude_account_store.CredentialGeneration | None = None,
+) -> AccountRecord:
     """Set a registered account's state to needs-reauth (durable fact: only a
     fresh interactive login can recover the account).
 
@@ -336,6 +340,9 @@ def mark_account_needs_reauth(account_id: str) -> AccountRecord:
     this is not a generic state setter. Idempotent: an account already in
     needs-reauth is returned unchanged without a registry write. Bumps
     `updatedAt` only — `lastAuthenticatedAt` records logins, not failures.
+    When supplied, `expected_generation` must still identify the current
+    credential file under registry.lock; stale rejections return the current
+    row without a write, even if the registry identity and timestamps match.
     Raises `AccountNotFoundError` for an unknown or non-canonical id.
     """
     canonical_id = claude_account_model._canonicalize_account_id(account_id)
@@ -349,6 +356,18 @@ def mark_account_needs_reauth(account_id: str) -> AccountRecord:
         existing = next((record for record in records if record.id == canonical_id), None)
         if existing is None:
             raise AccountNotFoundError(f"no account registered with id {canonical_id}")
+        if expected_generation is not None:
+            credentials_path = (
+                accounts_root / canonical_id / claude_account_store._CREDENTIALS_FILENAME
+            )
+            try:
+                current_generation = claude_account_store._credential_generation(credentials_path)
+            except OSError as exc:
+                raise AccountRegistryError(
+                    f"cannot check credential generation for account {canonical_id}"
+                ) from exc
+            if current_generation != expected_generation:
+                return existing
         if existing.state == claude_account_model._STATE_NEEDS_REAUTH:
             return existing
 

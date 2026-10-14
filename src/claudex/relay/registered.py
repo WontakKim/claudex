@@ -50,6 +50,7 @@ from claudex.claude.session_fingerprint import (
     load_or_create_fingerprint_seed,
     observability_session_fingerprint,
 )
+from claudex.providers.client_support import _shield_response_cleanup
 from claudex.relay.common import (
     _MANAGED_RELAY_SKIP_REQUEST_HEADERS,
     _OAUTH_BETA,
@@ -218,7 +219,7 @@ async def _attempt_with_account(
             credentials = await manager.get_credentials()
         except ClaudeAccountReauthRequiredError as exc:
             await server_support._mark_account_needs_reauth_best_effort(
-                request.app.state, account_id
+                request.app.state, account_id, expected_generation=exc.credential_generation
             )
             return _FailedAttempt(
                 _claude_account_unavailable(
@@ -261,7 +262,7 @@ async def _attempt_with_account(
                     credentials = await manager.get_credentials(force_refresh=True)
                 except ClaudeAccountReauthRequiredError as exc:
                     await server_support._mark_account_needs_reauth_best_effort(
-                        request.app.state, account_id
+                        request.app.state, account_id, expected_generation=exc.credential_generation
                     )
                     return _FailedAttempt(
                         _claude_account_unavailable(
@@ -283,6 +284,9 @@ async def _attempt_with_account(
                             f"refreshed: {exc}"
                         )
                     )
+                content = _rewrite_metadata_account_uuid(
+                    raw_body, parsed_body, credentials.account_uuid
+                )
                 upstream_response = await _send_to_anthropic(
                     request,
                     _claude_account_request_headers(
@@ -290,6 +294,24 @@ async def _attempt_with_account(
                     ),
                     content,
                 )
+            if upstream_response.status_code == 429 and rate_limit_failover:
+                _shield_response_cleanup(upstream_response)
+                # Preserve the occurrence-aware collection for evidence capture. The
+                # replay path needs its own plain mapping after httpx has decoded the
+                # buffered response.
+                response_headers = upstream_response.headers
+                replay_headers = dict(response_headers)
+                try:
+                    response_body = await upstream_response.aread()
+                except BaseException:
+                    # Cleanup must not replace a read failure or cancellation.
+                    try:
+                        await upstream_response.aclose()
+                    except Exception:
+                        logger.warning("quota response cleanup failed", exc_info=True)
+                    raise
+                else:
+                    await upstream_response.aclose()
         except httpx.HTTPError as exc:
             logger.warning("anthropic passthrough failed: %s", exc)
             return JSONResponse(
@@ -306,11 +328,10 @@ async def _attempt_with_account(
 
         if upstream_response.status_code == 401:
             await upstream_response.aclose()
-            # A freshly refreshed token that Anthropic still rejects is durably
-            # dead — only a human re-login recovers it, which is what the
-            # needs-reauth state means.
+            # A post-refresh 401 rejects the served generation, not a login
+            # that may have replaced it while the request was in flight.
             await server_support._mark_account_needs_reauth_best_effort(
-                request.app.state, account_id
+                request.app.state, account_id, expected_generation=credentials.credential_generation
             )
             return _FailedAttempt(
                 JSONResponse(
@@ -324,13 +345,6 @@ async def _attempt_with_account(
                 )
             )
         if upstream_response.status_code == 429 and rate_limit_failover:
-            # Preserve the occurrence-aware collection for evidence capture. The
-            # replay path needs its own plain mapping after httpx has decoded the
-            # buffered response.
-            response_headers = upstream_response.headers
-            replay_headers = dict(response_headers)
-            response_body = await upstream_response.aread()
-            await upstream_response.aclose()
             cooldown_decision = rate_limit_cooldown_decision(
                 response_headers,
                 response_body,

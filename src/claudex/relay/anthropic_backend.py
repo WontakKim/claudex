@@ -14,6 +14,7 @@ from starlette.responses import JSONResponse, Response, StreamingResponse
 
 from claudex import server_support
 from claudex.providers.backends import AnthropicBackend, AnthropicStreamReadFailure
+from claudex.providers.client_support import _shield_response_cleanup
 from claudex.relay.common import (
     _PASSTHROUGH_SKIP_RESPONSE_HEADERS,
     _format_sse,
@@ -77,7 +78,8 @@ async def _rewrite_anthropic_sse(
             yield ("\n".join(event_lines) + "\n").encode()
     except httpx.HTTPError as exc:
         if event_lines:
-            yield ("\n".join(event_lines) + "\n").encode()
+            # Body chunk boundaries do not terminate SSE events.
+            yield ("\n".join(event_lines) + "\n\n").encode()
             await asyncio.sleep(0)
         _, body = backend.error_policy(AnthropicStreamReadFailure(exc))
         yield _format_sse("error", body).encode()
@@ -94,6 +96,7 @@ class _AnthropicStreamRelay:
         requested_model: str,
         backend: AnthropicBackend,
     ) -> None:
+        _shield_response_cleanup(upstream_response)
         self._upstream_response = upstream_response
         self._chunks = _rewrite_anthropic_sse(
             upstream_response, requested_model, backend

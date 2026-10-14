@@ -174,6 +174,116 @@ print("complete")
     assert snapshots[1]["started_at"] is not None
 
 
+@pytest.mark.parametrize("outcome", ["succeeded", "failed", "cancelled", "driver-cancelled", "spawn-failed"])
+def test_login_reservation_settles_after_fake_child_cleanup(
+    monkeypatch: pytest.MonkeyPatch, outcome: str,
+) -> None:
+    from claudex.gptpro import ask
+    from claudex.mcp_server import LazyAskRuntime
+
+    async def scenario() -> None:
+        spawn_started = asyncio.Event()
+        allow_spawn = asyncio.Event()
+        process_finished = asyncio.Event()
+        cleanup_started = asyncio.Event()
+        allow_cleanup = asyncio.Event()
+        settled: list[str] = []
+
+        class Process:
+            pid = 12345
+            returncode: int | None = None
+
+            def __init__(self) -> None:
+                self.stdout = asyncio.StreamReader()
+                self.stdout.feed_data(b"synthetic login\n")
+                self.stdout.feed_eof()
+
+            async def wait(self) -> int:
+                await process_finished.wait()
+                assert self.returncode is not None
+                return self.returncode
+
+        process = Process()
+
+        async def spawn(*command: str, **options: Any) -> Process:
+            spawn_started.set()
+            await allow_spawn.wait()
+            if outcome == "spawn-failed":
+                raise OSError("synthetic spawn failure")
+            return process
+
+        async def terminate(process_group: int, child: Process) -> None:
+            assert process_group == process.pid and child is process
+            cleanup_started.set()
+            await allow_cleanup.wait()
+            process.returncode = -signal.SIGINT
+            process_finished.set()
+            await process.wait()
+
+        lazy_runtime = LazyAskRuntime()
+
+        async def unexpected_runtime() -> Any:
+            raise AssertionError("no browser runtime may be created by this lifecycle test")
+
+        monkeypatch.setattr(lazy_runtime, "_get_runtime", unexpected_runtime)
+        monkeypatch.setattr(login_session.asyncio, "create_subprocess_exec", spawn)
+        monkeypatch.setattr(login_session, "_terminate_process_group", terminate)
+        assert lazy_runtime.reserve_login() is None
+        session = GptProLoginSession()
+
+        def on_settled() -> None:
+            settled.append(session.status()["status"])
+            lazy_runtime.release_login()
+
+        session.start(on_settled=on_settled)
+        try:
+            await spawn_started.wait()
+            assert session.status()["status"] == "starting"
+            assert set(session.status()) == _STATUS_KEYS
+            assert lazy_runtime.reserve_login() == "login-active"
+            assert settled == []
+            if outcome == "cancelled":
+                session.request_cancel()
+                session.request_cancel()
+            allow_spawn.set()
+            if outcome != "spawn-failed":
+                await _wait_until(lambda: session.status()["status"] == "running")
+                if outcome == "driver-cancelled":
+                    session._driver_task.cancel()
+                elif outcome in ("succeeded", "failed"):
+                    process.returncode = 0 if outcome == "succeeded" else 7
+                    process_finished.set()
+                if outcome in ("cancelled", "driver-cancelled"):
+                    await cleanup_started.wait()
+                    assert settled == []
+                    assert lazy_runtime.reserve_login() == "login-active"
+                    with pytest.raises(ask.GptProAskError, match="login"):
+                        lazy_runtime.start_ask("blocked during cleanup")
+                    assert lazy_runtime._job_service is None
+                    allow_cleanup.set()
+            if outcome == "driver-cancelled":
+                with pytest.raises(asyncio.CancelledError):
+                    await session._driver_task
+            else:
+                await session._driver_task
+            expected = outcome if outcome in ("succeeded", "failed", "cancelled") else "failed"
+            assert session.status()["status"] == expected
+            assert set(session.status()) == _STATUS_KEYS
+            assert settled == [expected]
+            assert lazy_runtime.reserve_login() is None
+            lazy_runtime.release_login()
+        finally:
+            allow_spawn.set()
+            allow_cleanup.set()
+            process_finished.set()
+            if not session._driver_task.done():
+                session._driver_task.cancel()
+            await asyncio.gather(session._driver_task, return_exceptions=True)
+            await lazy_runtime.aclose()
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=5))
+
+
 def _process_is_alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)

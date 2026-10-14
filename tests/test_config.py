@@ -1,6 +1,9 @@
 """Tests for gateway configuration sources and model routing."""
 
+import io
 import json
+import os
+import stat
 from pathlib import Path
 
 import pytest
@@ -25,11 +28,12 @@ def test_max_reasoning_effort_is_accepted(monkeypatch: pytest.MonkeyPatch) -> No
     assert GatewayConfig.from_env().reasoning_effort_override == "max"
 
 
-def test_codex_fast_service_tier_is_accepted_from_env(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("tier", ["fast", "ultrafast"])
+def test_codex_service_tier_is_accepted_from_env(
+    monkeypatch: pytest.MonkeyPatch, tier: str,
 ) -> None:
-    monkeypatch.setenv("CLAUDEX_CODEX_SERVICE_TIER", "fast")
-    assert GatewayConfig.from_env().codex_service_tier == "fast"
+    monkeypatch.setenv("CLAUDEX_CODEX_SERVICE_TIER", tier)
+    assert GatewayConfig.from_env().codex_service_tier == tier
 
 
 def test_invalid_codex_service_tier_fails(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -63,17 +67,23 @@ def test_port_must_be_in_tcp_range(monkeypatch: pytest.MonkeyPatch, port: str) -
         GatewayConfig.from_env()
 
 
-def test_non_loopback_bind_requires_local_token(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("CLAUDEX_HOST", "0.0.0.0")
+@pytest.mark.parametrize("host", ["0.0.0.0", "::"])
+def test_non_loopback_bind_requires_local_token(
+    monkeypatch: pytest.MonkeyPatch, host: str
+) -> None:
+    monkeypatch.setenv("CLAUDEX_HOST", host)
     monkeypatch.delenv("CLAUDEX_LOCAL_TOKEN", raising=False)
     with pytest.raises(ConfigError, match="CLAUDEX_LOCAL_TOKEN"):
         GatewayConfig.from_env()
 
 
-def test_non_loopback_bind_accepts_local_token(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("CLAUDEX_HOST", "0.0.0.0")
+@pytest.mark.parametrize("host", ["0.0.0.0", "::"])
+def test_non_loopback_bind_accepts_local_token(
+    monkeypatch: pytest.MonkeyPatch, host: str
+) -> None:
+    monkeypatch.setenv("CLAUDEX_HOST", host)
     monkeypatch.setenv("CLAUDEX_LOCAL_TOKEN", "secret")
-    assert GatewayConfig.from_env().host == "0.0.0.0"
+    assert GatewayConfig.from_env().host == host
 
 
 def test_model_names_must_not_be_empty(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -262,11 +272,12 @@ class TestSettingsFile:
         monkeypatch.setenv("GPTPRO_MAX_CONCURRENT_ASKS", value)
         assert GatewayConfig.load(settings_file).gptpro_max_concurrent_asks == expected
 
-    def test_codex_fast_service_tier_applies_from_settings_file(
-        self, tmp_path: Path
+    @pytest.mark.parametrize("tier", ["fast", "ultrafast"])
+    def test_codex_service_tier_applies_from_settings_file(
+        self, tmp_path: Path, tier: str
     ) -> None:
-        settings_file = self._write(tmp_path, {"codex.service_tier": "fast"})
-        assert GatewayConfig.load(settings_file).codex_service_tier == "fast"
+        settings_file = self._write(tmp_path, {"codex.service_tier": tier})
+        assert GatewayConfig.load(settings_file).codex_service_tier == tier
 
     def test_nested_registry_groups_apply_from_settings_file(
         self, tmp_path: Path
@@ -343,6 +354,179 @@ class TestSettingsFile:
             "port": 9090,
             "log_level": "debug",
         }
+
+    @pytest.mark.parametrize("existing", [False, True])
+    @pytest.mark.parametrize("phase", ["creation", "staging", "destination"])
+    def test_update_keeps_sensitive_settings_private(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+        existing: bool, phase: str,
+    ) -> None:
+        settings_file = tmp_path / "settings.json"
+        sensitive_settings = {
+            "local_token": "dummy-token-é",
+            "custom_providers": {"dummy": {"api_key": "dummy-api-key"}},
+        }
+        updates: dict[str, object] = {}
+        if existing:
+            settings_file.write_text(json.dumps(sensitive_settings), encoding="utf-8")
+            settings_file.chmod(0o600)
+        else:
+            updates.update(sensitive_settings)
+        updates["port"] = 9090
+        tmp_path.chmod(0o755)
+        observed_modes: dict[str, int] = {}
+        created_sizes: list[int] = []
+        real_open = os.open
+        real_text_open = io.open
+        real_replace = os.replace
+
+        def record_creation(file_descriptor: int) -> None:
+            file_stat = os.fstat(file_descriptor)
+            observed_modes["creation"] = stat.S_IMODE(file_stat.st_mode)
+            created_sizes.append(file_stat.st_size)
+
+        def recording_open(file, flags, mode=0o777, *args, **kwargs):
+            file_descriptor = real_open(file, flags, mode, *args, **kwargs)
+            if flags & os.O_CREAT and Path(file).parent == tmp_path:
+                record_creation(file_descriptor)
+            return file_descriptor
+
+        def recording_text_open(file, mode="r", *args, **kwargs):
+            handle = real_text_open(file, mode, *args, **kwargs)
+            if "w" in mode and isinstance(file, (str, os.PathLike)) and Path(file).parent == tmp_path:
+                record_creation(handle.fileno())
+            return handle
+
+        def recording_replace(source: Path, destination: Path) -> None:
+            assert source.parent == settings_file.parent
+            observed_modes["staging"] = stat.S_IMODE(source.stat().st_mode)
+            real_replace(source, destination)
+            observed_modes["destination"] = stat.S_IMODE(destination.stat().st_mode)
+
+        monkeypatch.setattr(os, "open", recording_open)
+        monkeypatch.setattr(io, "open", recording_text_open)
+        monkeypatch.setattr(os, "replace", recording_replace)
+        previous_umask = os.umask(0o022)
+        try:
+            update_settings_file(settings_file, updates)
+        finally:
+            os.umask(previous_umask)
+
+        expected = {**sensitive_settings, "port": 9090}
+        assert settings_file.read_text(encoding="utf-8") == (
+            json.dumps(expected, indent=2, ensure_ascii=False) + "\n"
+        )
+        assert stat.S_IMODE(tmp_path.stat().st_mode) == 0o755
+        assert created_sizes == [0]
+        assert observed_modes[phase] == 0o600
+        assert list(tmp_path.iterdir()) == [settings_file]
+
+    def test_update_leaves_preexisting_staging_and_reader_untouched(
+        self, tmp_path: Path,
+    ) -> None:
+        settings_file = self._write(tmp_path, {"local_token": "dummy-token"})
+        staging_file = tmp_path / "settings.json.tmp"
+        staging_file.write_text("dummy-unrelated-staging", encoding="utf-8")
+        staging_file.chmod(0o644)
+        original_inode = staging_file.stat().st_ino
+
+        with staging_file.open("r", encoding="utf-8") as existing_reader:
+            update_settings_file(settings_file, {"port": 9090})
+            assert existing_reader.read() == "dummy-unrelated-staging"
+
+        assert staging_file.read_text(encoding="utf-8") == "dummy-unrelated-staging"
+        assert staging_file.stat().st_ino == original_inode
+        assert stat.S_IMODE(staging_file.stat().st_mode) == 0o644
+        assert json.loads(settings_file.read_text(encoding="utf-8")) == {
+            "local_token": "dummy-token", "port": 9090,
+        }
+        assert set(tmp_path.iterdir()) == {settings_file, staging_file}
+
+    @pytest.mark.parametrize("failure", ["serialization", "replace"])
+    def test_update_failure_preserves_destination_and_cleans_owned_staging(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, failure: str,
+    ) -> None:
+        settings_file = self._write(tmp_path, {"local_token": "dummy-original"})
+        settings_file.chmod(0o600)
+        original = settings_file.read_bytes()
+        staging_file = tmp_path / "settings.json.tmp"
+        staging_file.write_text("dummy-unrelated-staging", encoding="utf-8")
+        updates: dict[str, object] = {"port": 9090}
+        error = TypeError if failure == "serialization" else OSError
+
+        def reject_replace(source: Path, destination: Path) -> None:
+            assert source != staging_file
+            assert source.parent == settings_file.parent
+            assert stat.S_IMODE(source.stat().st_mode) == 0o600
+            assert settings_file.read_bytes() == original
+            assert json.loads(source.read_text(encoding="utf-8")) == {
+                "local_token": "dummy-original", "port": 9090,
+            }
+            raise OSError("dummy replacement failure")
+
+        if failure == "serialization":
+            updates["port"] = object()
+        else:
+            monkeypatch.setattr(os, "replace", reject_replace)
+
+        with pytest.raises(error):
+            update_settings_file(settings_file, updates)
+
+        assert settings_file.read_bytes() == original
+        assert stat.S_IMODE(settings_file.stat().st_mode) == 0o600
+        assert staging_file.read_text(encoding="utf-8") == "dummy-unrelated-staging"
+        assert set(tmp_path.iterdir()) == {settings_file, staging_file}
+
+    @pytest.mark.parametrize("contents", [
+        "not-json", "[]", '{"unknown_key": true}',
+        '{"codex.service_tier": "fast", "codex": {"service_tier": "fast"}}',
+    ])
+    def test_update_validates_existing_settings_before_any_write(
+        self, tmp_path: Path, contents: str,
+    ) -> None:
+        settings_file = tmp_path / "settings.json"
+        settings_file.write_text(contents, encoding="utf-8")
+        settings_file.chmod(0o600)
+
+        with pytest.raises(ConfigError):
+            update_settings_file(settings_file, {"port": 9090})
+
+        assert settings_file.read_text(encoding="utf-8") == contents
+        assert stat.S_IMODE(settings_file.stat().st_mode) == 0o600
+        assert list(tmp_path.iterdir()) == [settings_file]
+
+    @pytest.mark.parametrize("operation", ["update", "delete"])
+    def test_update_validates_requested_keys_before_creating_parent(
+        self, tmp_path: Path, operation: str,
+    ) -> None:
+        settings_file = tmp_path / "missing" / "settings.json"
+        updates = {"unknown_key": "dummy"} if operation == "update" else {}
+        deletions = ("unknown_key",) if operation == "delete" else ()
+
+        with pytest.raises(ConfigError):
+            update_settings_file(settings_file, updates, deletions=deletions)
+
+        assert not settings_file.parent.exists()
+
+    def test_update_creates_missing_parent_without_changing_existing_parent(
+        self, tmp_path: Path,
+    ) -> None:
+        settings_file = tmp_path / "nested" / "runtime" / "settings.json"
+        original_parent_mode = stat.S_IMODE(tmp_path.stat().st_mode)
+        previous_umask = os.umask(0o022)
+        try:
+            update_settings_file(settings_file, {"local_token": "dummy-token"})
+        finally:
+            os.umask(previous_umask)
+
+        assert stat.S_IMODE(tmp_path.stat().st_mode) == original_parent_mode
+        assert stat.S_IMODE(settings_file.parent.stat().st_mode) == 0o755
+        assert stat.S_IMODE(settings_file.parent.parent.stat().st_mode) == 0o755
+        assert stat.S_IMODE(settings_file.stat().st_mode) == 0o600
+        assert json.loads(settings_file.read_text(encoding="utf-8")) == {
+            "local_token": "dummy-token",
+        }
+        assert list(settings_file.parent.iterdir()) == [settings_file]
 
     def test_deleting_last_group_key_removes_group(self, tmp_path: Path) -> None:
         settings_file = self._write(

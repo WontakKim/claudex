@@ -258,3 +258,35 @@ def test_missing_auth_file_raises_with_guidance(tmp_path: Path) -> None:
 
     with pytest.raises(CodexAuthError, match="codex login"):
         _run(scenario())
+
+
+@pytest.mark.parametrize("failure", ["permission", "encoding"])
+def test_credential_read_failure_raises_codex_auth_error_before_any_refresh(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, failure: str,
+) -> None:
+    path = tmp_path / "auth.json"
+    contents = b"\xffdummy-sensitive-content"
+    path.write_bytes(contents)
+    read_text = Path.read_text
+    if failure == "permission":
+        def denied_read(file: Path, *args, **kwargs) -> str:
+            if file == path:
+                raise PermissionError("dummy-sensitive-content")
+            return read_text(file, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", denied_read)
+
+    def reject_refresh(request: httpx.Request) -> httpx.Response:
+        pytest.fail("Credential read failure must not start a refresh request")
+
+    async def scenario() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(reject_refresh)) as http_client:
+            await CodexAuthManager(path, http_client).get_credentials()
+
+    with pytest.raises(CodexAuthError, match="cannot read credentials file") as raised:
+        _run(scenario())
+
+    cause = PermissionError if failure == "permission" else UnicodeDecodeError
+    assert isinstance(raised.value.__cause__, cause)
+    assert "dummy-sensitive-content" not in str(raised.value)
+    assert path.read_bytes() == contents

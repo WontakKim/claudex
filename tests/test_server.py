@@ -6,15 +6,17 @@ import asyncio
 import inspect
 import json
 import logging
+import threading
 import time
 import uuid
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Iterator
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 import httpx
 import pytest
+from starlette.requests import Request
 from starlette.testclient import TestClient
 
 import claudex.admin.settings as admin_settings
@@ -22,11 +24,13 @@ import claudex.admin.system as admin_system
 import claudex.relay.endpoints as relay_endpoints
 import claudex.relay.kimi as relay_kimi
 import claudex.relay.openai_backend as relay_openai_backend
+import claudex.relay.registered as relay_registered
 import claudex.server as server
 import claudex.server_support as server_support
 from claudex import compaction, paths
 from claudex.claude import accounts as claude_accounts
 from claudex.claude.account_usage_cache import ClaudeAccountUsageCache
+from claudex.claude.auth import CLAUDE_TOKEN_URL
 from claudex.balanced.polling import ClaudeUsagePollCoordinator, UsagePollAccount
 from claudex.balanced.router import ClaudeBalancedRouter
 from claudex.balanced.runtime import ClaudeBalancedRuntime
@@ -210,6 +214,22 @@ class SecretBearingStartupClient(FakeOpenAICompatibleClient):
 _REAL_HOME = Path.home()
 
 
+@pytest.fixture(autouse=True)
+def _reject_unmocked_http(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    attempts: list[str] = []
+
+    async def reject_request(
+        _transport: httpx.AsyncHTTPTransport, request: httpx.Request
+    ) -> httpx.Response:
+        attempts.append(f"{request.method} {request.url}")
+        raise AssertionError("upstream requests require an explicit mock transport")
+
+    monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", reject_request)
+    yield
+    # Background fetches can convert transport errors into cached results.
+    assert not attempts, f"Unmocked upstream HTTP attempts: {attempts}"
+
+
 def _create_test_client(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -240,7 +260,135 @@ def _create_test_client(
     monkeypatch.setattr(server, "GrokClient", grok_client)
     if custom_client is not None:
         monkeypatch.setattr(server, "OpenAICompatibleClient", custom_client)
+
+    def handle_lifespan_request(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and str(request.url) == "https://api.anthropic.com/api/oauth/usage":
+            return httpx.Response(200, json={})
+        raise AssertionError(f"Unexpected lifespan HTTP request: {request.method} {request.url}")
+
+    async_client_type = httpx.AsyncClient
+
+    def create_lifespan_http_client(**kwargs: Any) -> httpx.AsyncClient:
+        return async_client_type(transport=httpx.MockTransport(handle_lifespan_request), **kwargs)
+
+    monkeypatch.setattr(server, "httpx", SimpleNamespace(AsyncClient=create_lifespan_http_client))
     return TestClient(server.create_app(config or GatewayConfig()), base_url=base_url)
+
+
+@pytest.mark.parametrize("phase", ["proactive", "forced", "post-retry"])
+@pytest.mark.parametrize("reauthenticate", [False, True], ids=["current-generation", "new-login"])
+def test_serving_reauth_marks_are_fenced_at_registry_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, phase: str, reauthenticate: bool
+) -> None:
+    monkeypatch.setattr(paths, "runtime_dir", lambda: tmp_path / "runtime")
+    original = claude_accounts.add_account(
+        "synthetic@example.com", None, None,
+        {"claudeAiOauth": {"accessToken": "login-A", "refreshToken": "refresh-A", "expiresAt": 1 if phase == "proactive" else (time.time() + 3600) * 1000}},
+        {"accountUuid": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"},
+    )
+    started, release = threading.Event(), threading.Event()
+    real_mark = claude_accounts.mark_account_needs_reauth
+
+    def delayed_mark(*args: Any, **kwargs: Any) -> Any:
+        started.set()
+        assert release.wait(timeout=5)
+        return real_mark(*args, **kwargs)
+
+    monkeypatch.setattr(server_support, "mark_account_needs_reauth", delayed_mark)
+
+    async def scenario() -> None:
+        calls = []
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url) == CLAUDE_TOKEN_URL:
+                calls.append("refresh")
+                if phase != "post-retry":
+                    return httpx.Response(400, json={"error": "invalid_grant"})
+                return httpx.Response(200, json={"access_token": "rotated-A", "refresh_token": "rotated-refresh-A", "expires_in": 900})
+            assert str(request.url) == "https://api.anthropic.com/v1/messages"
+            calls.append(request.headers["authorization"])
+            return httpx.Response(401)
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler), trust_env=False) as client:
+            state = SimpleNamespace(http_client=client, claude_account_auth_managers={}, claude_ambient_accounts=None)
+            request = Request({"type": "http", "method": "POST", "path": "/v1/messages", "headers": [], "query_string": b"", "app": SimpleNamespace(state=state)})
+            body = {"model": "synthetic-model", "messages": []}
+            pending = asyncio.create_task(relay_registered._attempt_with_account(
+                request, json.dumps(body).encode(), body, original, attempt_context=None, rate_limit_failover=False,
+            ))
+            try:
+                assert await asyncio.to_thread(started.wait, 5)
+                if reauthenticate:
+                    await asyncio.to_thread(claude_accounts.update_account_credentials, "synthetic@example.com", None, None,
+                        {"claudeAiOauth": {"accessToken": "login-B", "refreshToken": "refresh-B", "expiresAt": (time.time() + 3600) * 1000}},
+                        {"accountUuid": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"})
+            finally:
+                release.set()
+            outcome = await pending
+            assert isinstance(outcome, relay_registered._FailedAttempt)
+            assert outcome.response.status_code == (401 if phase == "post-retry" else 503)
+            assert calls == {
+                "proactive": ["refresh"],
+                "forced": ["Bearer login-A", "refresh"],
+                "post-retry": ["Bearer login-A", "refresh", "Bearer rotated-A"],
+            }[phase]
+
+    asyncio.run(scenario())
+    [current] = claude_accounts.load_registry()
+    assert current.id == original.id
+    assert current.state == ("ready" if reauthenticate else "needs-reauth")
+
+
+def test_serving_401_retry_uses_one_bearer_profile_generation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(paths, "runtime_dir", lambda: tmp_path / "runtime")
+    original_uuid = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    new_uuid = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+    original = claude_accounts.add_account(
+        "synthetic@example.com", None, None,
+        {"claudeAiOauth": {"accessToken": "login-A", "refreshToken": "refresh-A"}},
+        {"accountUuid": original_uuid},
+    )
+
+    async def scenario() -> None:
+        started, release = asyncio.Event(), asyncio.Event()
+        identities = []
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url) == CLAUDE_TOKEN_URL:
+                assert json.loads(request.content)["refresh_token"] == "refresh-B"
+                return httpx.Response(200, json={"access_token": "rotated-B", "refresh_token": "rotated-refresh-B", "expires_in": 900})
+            assert str(request.url) == "https://api.anthropic.com/v1/messages"
+            user_id = json.loads(json.loads(request.content)["metadata"]["user_id"])
+            identities.append((request.headers["authorization"], user_id["account_uuid"]))
+            if len(identities) == 1:
+                started.set()
+                await release.wait()
+                return httpx.Response(401)
+            return httpx.Response(200, json={"synthetic": True})
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler), trust_env=False) as client:
+            state = SimpleNamespace(http_client=client, claude_account_auth_managers={}, claude_ambient_accounts=None)
+            request = Request({"type": "http", "method": "POST", "path": "/v1/messages", "headers": [], "query_string": b"", "app": SimpleNamespace(state=state)})
+            body = {"model": "synthetic-model", "messages": [], "metadata": {"user_id": json.dumps({"account_uuid": "synthetic-client", "session_id": "synthetic-session"})}}
+            pending = asyncio.create_task(relay_registered._attempt_with_account(
+                request, json.dumps(body).encode(), body, original, attempt_context=None, rate_limit_failover=False,
+            ))
+            try:
+                await asyncio.wait_for(started.wait(), timeout=5)
+                await asyncio.to_thread(claude_accounts.update_account_credentials, "synthetic@example.com", None, None,
+                    {"claudeAiOauth": {"accessToken": "login-B", "refreshToken": "refresh-B"}}, {"accountUuid": new_uuid})
+            finally:
+                release.set()
+            outcome = await pending
+            assert not isinstance(outcome, relay_registered._FailedAttempt)
+            assert outcome.status_code == 200
+            async for _ in outcome.body_iterator:
+                pass
+            assert identities == [("Bearer login-A", original_uuid), ("Bearer rotated-B", new_uuid)]
+
+    asyncio.run(scenario())
 
 
 def test_route_ownership_matches_surface_modules() -> None:
@@ -1332,6 +1480,198 @@ def _account_body(model: str = "claude-fable-5") -> dict[str, Any]:
     body["metadata"] = {"user_id": _claude_code_user_id()}
     return body
 
+
+@pytest.mark.parametrize("routing_path", ["fallback", "balanced-stateless", "balanced-pinned"])
+@pytest.mark.parametrize("error_type", [httpx.ReadError, httpx.ReadTimeout])
+@pytest.mark.parametrize(
+    "cleanup_error_type", [None, RuntimeError, httpx.ReadError],
+    ids=["close-ok", "close-error", "close-http-error"],
+)
+def test_quota_read_failure_is_terminal_and_closes_response(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    routing_path: str,
+    error_type: type[httpx.HTTPError],
+    cleanup_error_type: type[Exception] | None,
+) -> None:
+    _balanced_env(monkeypatch, tmp_path)
+    first = _register_serving_account(
+        email="first@example.com", account_uuid="11111111-2222-3333-4444-555555555555"
+    )
+    second = _register_serving_account(
+        email="second@example.com", account_uuid="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+        access_token="pool-access-2",
+    )
+    calls: list[str] = []
+    caplog.set_level(logging.INFO, logger="claudex.server")
+
+    class BrokenQuotaStream(httpx.AsyncByteStream):
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        async def __aiter__(self) -> AsyncIterator[bytes]:
+            yield b'{"type":"error","error":'
+            raise error_type("quota response read failed")
+
+        async def aclose(self) -> None:
+            self.close_calls += 1
+            await asyncio.sleep(0)
+            if cleanup_error_type is not None:
+                raise cleanup_error_type("quota response close failed")
+
+    stream = BrokenQuotaStream()
+    upstream = httpx.Response(429, headers={"retry-after": "3600"}, stream=stream)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/api/oauth/usage":
+            return httpx.Response(200, json={})
+        assert request.method == "POST" and request.url.path == "/v1/messages"
+        calls.append(request.headers["authorization"])
+        return upstream if len(calls) == 1 else httpx.Response(200, json={"id": "unexpected"})
+
+    config = GatewayConfig(
+        claude_account_id=first,
+        claude_account_routing_mode="fallback" if routing_path == "fallback" else "balanced",
+        claude_account_include_local_login=False,
+        settings_file=tmp_path / "settings.json",
+    )
+    with _create_test_client(monkeypatch, tmp_path, config=config) as client:
+        client.app.state.http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        body = (
+            _balanced_body(str(uuid.uuid4()), model="claude-sonnet-5")
+            if routing_path == "balanced-pinned"
+            else _message_body("claude-sonnet-5")
+        )
+
+        async def exercise_request() -> httpx.Response:
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=client.app, raise_app_exceptions=False),
+                base_url="http://testserver",
+            ) as async_client:
+                return await async_client.post("/v1/messages", json=body)
+
+        assert client.portal is not None
+        try:
+            response = client.portal.call(exercise_request)
+            assert response.status_code == 502
+            assert response.json() == {
+                "type": "error",
+                "error": {
+                    "type": "api_error",
+                    "message": "failed to reach the Anthropic API: quota response read failed",
+                },
+            }
+            assert upstream.is_closed
+            assert stream.close_calls == 1
+            assert len(calls) == 1
+            if routing_path == "fallback":
+                assert calls == ["Bearer pool-access-1"]
+            else:
+                runtime = client.app.state.claude_balanced_runtime
+                assert runtime._active_requests == 0
+                for account_id in (first, second):
+                    assert runtime.router.in_flight_count(account_id) == 0
+                    assert runtime.router.account_cooldown_deadline(account_id) is None
+                    assert runtime.router.family_cooldown_deadline(account_id, "sonnet") is None
+            assert not client.app.state.claude_account_cooldowns.is_cooling(first)
+            assert not client.app.state.claude_account_cooldowns.is_cooling(second)
+            assert not client.app.state.claude_usage_refresh_tasks
+            leg_records = [
+                json.loads(record.getMessage()) for record in caplog.records
+                if '"event":"claude_account_leg"' in record.getMessage()
+            ]
+            assert len(leg_records) == 1
+            assert leg_records[0]["result"] == "failed"
+            assert leg_records[0]["attempt"]["ordinal"] == 1
+            cleanup_warnings = [
+                record for record in caplog.records
+                if record.getMessage() == "quota response cleanup failed"
+            ]
+            assert len(cleanup_warnings) == (0 if cleanup_error_type is None else 1)
+        finally:
+            assert client.portal is not None
+            client.portal.call(upstream.aclose)
+
+
+@pytest.mark.parametrize("routing_path", ["fallback", "balanced-stateless", "balanced-pinned"])
+@pytest.mark.parametrize("can_recover", [False, True], ids=["exhausted", "recovered"])
+def test_quota_buffer_success_preserves_failover_and_replay(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, routing_path: str, can_recover: bool
+) -> None:
+    _balanced_env(monkeypatch, tmp_path)
+    accounts = _register_balanced_accounts(2)
+    calls: list[str] = []
+    first_body = b'{"type":"error","error":{"type":"rate_limit_error","message":"first quota"}}'
+    second_body = (
+        b'{"id":"msg_after_quota"}' if can_recover else
+        b'{"type":"error","error":{"type":"rate_limit_error","message":"second quota"}}'
+    )
+
+    class QuotaStream(httpx.AsyncByteStream):
+        def __init__(self, body: bytes) -> None:
+            self.body = body
+            self.close_calls = 0
+
+        async def __aiter__(self) -> AsyncIterator[bytes]:
+            yield self.body[:17]
+            yield self.body[17:]
+
+        async def aclose(self) -> None:
+            self.close_calls += 1
+            await asyncio.sleep(0)
+
+    streams = [QuotaStream(first_body), QuotaStream(second_body)]
+    upstreams = [
+        httpx.Response(
+            status, stream=stream,
+            headers={"content-type": "application/json", "retry-after": "3600",
+                     "x-quota-source": source, "connection": "close"},
+        )
+        for status, stream, source in zip((429, 200 if can_recover else 429), streams, ("first", "second"))
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/api/oauth/usage":
+            return httpx.Response(200, json={})
+        assert request.method == "POST" and request.url.path == "/v1/messages"
+        calls.append(request.headers["authorization"])
+        assert len(calls) <= 2
+        return upstreams[len(calls) - 1]
+
+    config = GatewayConfig(
+        claude_account_id=accounts[0][0],
+        claude_account_routing_mode="fallback" if routing_path == "fallback" else "balanced",
+        claude_account_include_local_login=False,
+        settings_file=tmp_path / "settings.json",
+    )
+    with _create_test_client(monkeypatch, tmp_path, config=config) as client:
+        client.app.state.http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        body = (
+            _balanced_body(str(uuid.uuid4()), model="claude-sonnet-5")
+            if routing_path == "balanced-pinned" else _message_body("claude-sonnet-5")
+        )
+        try:
+            response = client.post("/v1/messages", json=body)
+            assert response.status_code == (200 if can_recover else 429)
+            assert response.content == second_body
+            assert response.headers["x-quota-source"] == "second"
+            assert "connection" not in response.headers
+            assert len(calls) == 2
+            assert set(calls) == {f"Bearer {token}" for _, token in accounts}
+            assert all(upstream.is_closed for upstream in upstreams)
+            assert [stream.close_calls for stream in streams] == [1, 1]
+            by_token = {f"Bearer {token}": account_id for account_id, token in accounts}
+            assert client.app.state.claude_account_cooldowns.is_cooling(by_token[calls[0]])
+            assert client.app.state.claude_account_cooldowns.is_cooling(by_token[calls[1]]) is not can_recover
+            if routing_path != "fallback":
+                runtime = client.app.state.claude_balanced_runtime
+                assert runtime._active_requests == 0
+                assert all(runtime.router.in_flight_count(account_id) == 0 for account_id, _ in accounts)
+        finally:
+            assert client.portal is not None
+            for upstream in upstreams:
+                client.portal.call(upstream.aclose)
 
 
 # ---------------------------------------------------------------------------
@@ -2812,7 +3152,10 @@ class TestBalancedUsageCoordinatorEndpoints:
         with _create_test_client(
             monkeypatch, tmp_path, config=GatewayConfig(), base_url="http://127.0.0.1:8787"
         ) as client:
-            _enable_balanced(client, handler)
+            runtime = _enable_balanced(client, handler)
+            coordinator = runtime.usage_poll_coordinator
+            assert coordinator is not None
+            _wait_until(client, lambda: coordinator.fetched_count == 1)
             response = client.get("/admin/providers/claude/pool/status")
 
         payload = response.json()
@@ -2968,6 +3311,63 @@ def _wait_until(client: TestClient, predicate: Callable[[], bool], *, timeout: f
         if time.monotonic() >= deadline:
             raise AssertionError("condition not met within timeout")
         client.get("/health")
+
+
+@pytest.mark.parametrize(
+    ("method", "url"),
+    [
+        ("POST", "https://api.anthropic.com/api/oauth/usage"),
+        ("GET", "https://other.example/api/oauth/usage"),
+        ("POST", "https://api.anthropic.com/v1/messages"),
+    ],
+)
+def test_lifespan_transport_rejects_unexpected_http(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, method: str, url: str
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        with pytest.raises(AssertionError, match="Unexpected lifespan HTTP request"):
+            client.portal.call(client.app.state.http_client.request, method, url)
+
+
+@pytest.mark.parametrize("initial_mode", ["disabled", "balanced"])
+def test_lifespan_usage_warmup_uses_synthetic_http(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, initial_mode: str
+) -> None:
+    _balanced_env(monkeypatch, tmp_path)
+    account_id, access_token = _register_balanced_accounts(1)[0]
+    requests: list[httpx.Request] = []
+    handle_request = httpx.MockTransport.handle_async_request
+
+    async def capture_request(
+        transport: httpx.MockTransport, request: httpx.Request
+    ) -> httpx.Response:
+        requests.append(request)
+        return await handle_request(transport, request)
+
+    monkeypatch.setattr(httpx.MockTransport, "handle_async_request", capture_request)
+    config = GatewayConfig(
+        settings_file=tmp_path / "settings.json", claude_account_routing_mode=initial_mode
+    )
+    with _create_test_client(
+        monkeypatch, tmp_path, config=config, base_url="http://127.0.0.1:8787"
+    ) as client:
+        if initial_mode == "disabled":
+            response = client.put("/admin/providers/claude/pool/routing", json={"mode": "balanced"})
+            assert response.status_code == 200
+        coordinator = client.app.state.claude_balanced_runtime.usage_poll_coordinator
+        assert coordinator is not None
+        _wait_until(client, lambda: coordinator.fetched_count == 1)
+        cached = client.app.state.claude_account_usage_cache.peek(account_id)
+        assert cached is not None
+        assert cached["status"] == "ok"
+        assert cached["error"] is None
+        assert cached["session"] is None
+        assert cached["weekly"] is None
+        assert cached["fable_weekly"] is None
+
+    assert [(request.method, str(request.url), request.headers["authorization"]) for request in requests] == [
+        ("GET", "https://api.anthropic.com/api/oauth/usage", f"Bearer {access_token}")
+    ]
 
 
 class TestUsagePollDriver:

@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
+
+from claudex.providers.auth_support import replace_credentials_file
 
 from .schema import ConfigError, SETTINGS_KEYS
 
@@ -111,8 +112,9 @@ def update_settings_file(
         group[subkey] = value
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    staging_file = path.with_name(path.name + ".tmp")
-    staging_file.write_text(
-        json.dumps(rendered, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+    replace_credentials_file(
+        path,
+        temp_file=path.with_name(path.name + ".tmp"),
+        text=json.dumps(rendered, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
     )
-    os.replace(staging_file, path)

@@ -4,6 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import threading
+import time
+from pathlib import Path
+from types import SimpleNamespace
 from collections.abc import Callable, Coroutine
 from datetime import datetime, timezone
 from typing import Any
@@ -11,7 +16,10 @@ from typing import Any
 import httpx
 import pytest
 
+from claudex import paths, server_support
+from claudex.claude import accounts as claude_accounts
 from claudex.claude import usage as claude_usage
+from claudex.claude.auth import CLAUDE_TOKEN_URL
 from claudex.usage import envelope as usage_envelope
 from claudex.usage import providers as provider_usage
 from claudex.claude.auth import (
@@ -52,6 +60,97 @@ class ChatGPTCredentials:
 class MissingCredentials:
     async def get_credentials(self, force_refresh: bool = False) -> CodexCredentials:
         raise CodexAuthError("missing Codex credentials")
+
+
+def _fetch_usage_payload(
+    http_client: httpx.AsyncClient,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None, httpx.Response | None]:
+    return _run(usage_envelope.fetch_usage_payload(
+        http_client,
+        "https://usage.example/api",
+        {"Authorization": "Bearer synthetic-token"},
+        provider="codex",
+        api_label="ChatGPT",
+        special_statuses={401: "usage access denied"},
+        logger=logging.getLogger(__name__),
+    ))
+
+
+@pytest.mark.parametrize(
+    "status_code,body,expected_data,expected_error",
+    [
+        pytest.param(200, b'{"plan_type":"pro-\xce\xbb","label":"caf\xc3\xa9"}',
+                     {"plan_type": "pro-λ", "label": "café"}, None, id="unicode-object"),
+        pytest.param(200, b"{}", {}, None, id="empty-object"),
+        pytest.param(200, b'{"plan_type":"\xff"}', None, "usage API returned a non-JSON body", id="invalid-utf8"),
+        pytest.param(200, b'{"count":' + b"9" * 5000 + b"}", None,
+                     "usage API returned a non-JSON body", id="integer-conversion-limit"),
+        pytest.param(200, b"not json", None, "usage API returned a non-JSON body", id="syntax-error"),
+        pytest.param(200, b"[]", None, "usage API returned an unexpected payload", id="array-root"),
+        pytest.param(200, b"null", None, "usage API returned an unexpected payload", id="null-root"),
+        pytest.param(200, b"42", None, "usage API returned an unexpected payload", id="number-root"),
+        pytest.param(200, b'"text"', None, "usage API returned an unexpected payload", id="string-root"),
+        pytest.param(401, b"denied", None, "usage access denied", id="special-status"),
+        pytest.param(500, b"offline", None, "usage API returned 500: offline", id="http-error"),
+    ],
+)
+def test_fetch_usage_payload_preserves_response_contract(
+    status_code: int, body: bytes, expected_data: dict[str, Any] | None,
+    expected_error: str | None,
+) -> None:
+    response = httpx.Response(status_code, content=body, headers={"Content-Type": "application/json"})
+    data, error_result, returned_response = _fetch_usage_payload(_mock_client(lambda request: response))
+
+    assert returned_response is response
+    assert returned_response.content == body
+    assert data == expected_data
+    if expected_error is None:
+        assert error_result is None
+        return
+    assert error_result is not None
+    assert error_result["updated_at"] > 0
+    assert {key: value for key, value in error_result.items() if key != "updated_at"} == {
+        "provider": "codex",
+        "status": "error",
+        "error": expected_error,
+        "session": None,
+        "weekly": None,
+        "plan_type": None,
+        "reset_credits_available": None,
+        "fable_weekly": None,
+        "monthly": None,
+    }
+
+
+def test_fetch_usage_payload_transport_error_has_no_response() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("offline", request=request)
+
+    data, error_result, response = _fetch_usage_payload(_mock_client(handler))
+    assert data is None
+    assert response is None
+    assert error_result is not None
+    assert error_result["status"] == "error"
+    assert error_result["error"] == "failed to reach the ChatGPT usage API: offline"
+
+
+def test_fetch_usage_payload_propagates_cancellation() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        raise asyncio.CancelledError()
+
+    with pytest.raises(asyncio.CancelledError):
+        _fetch_usage_payload(httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+
+
+def test_fetch_usage_payload_propagates_runtime_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    response = httpx.Response(200, json={})
+
+    def fail_json() -> None:
+        raise RuntimeError("decoder failed")
+
+    monkeypatch.setattr(response, "json", fail_json)
+    with pytest.raises(RuntimeError, match="decoder failed"):
+        _fetch_usage_payload(_mock_client(lambda request: response))
 
 
 # ---------------------------------------------------------------------------
@@ -357,12 +456,106 @@ def test_fetch_claude_account_usage_reauth_required_propagates() -> None:
         _run(claude_usage.fetch_claude_account_usage(_unused_client(), manager))
 
 
+@pytest.mark.parametrize("new_uuid", ["aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"], ids=["same-uuid", "changed-uuid"])
+@pytest.mark.parametrize("refresh_status", [400, 500], ids=["invalid-grant", "transient"])
+def test_usage_refresh_rejection_cannot_mark_reauthentication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, new_uuid: str, refresh_status: int
+) -> None:
+    monkeypatch.setattr(paths, "runtime_dir", lambda: tmp_path / "runtime")
+    original = claude_accounts.add_account(
+        "synthetic@example.com", None, None,
+        {"claudeAiOauth": {"accessToken": "login-A", "refreshToken": "refresh-A", "expiresAt": 1}},
+        {"accountUuid": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"},
+    )
+    new_payload = {"claudeAiOauth": {"accessToken": "login-B", "refreshToken": "refresh-B", "expiresAt": (time.time() + 3600) * 1000}}
+
+    async def scenario() -> None:
+        started, release = asyncio.Event(), asyncio.Event()
+        tokens = []
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url) == CLAUDE_TOKEN_URL:
+                assert json.loads(request.content)["refresh_token"] == "refresh-A"
+                started.set()
+                await release.wait()
+                return httpx.Response(refresh_status, json={"error": "invalid_grant" if refresh_status == 400 else "unavailable"})
+            assert str(request.url) == claude_usage._CLAUDE_USAGE_URL
+            tokens.append(request.headers["authorization"])
+            return httpx.Response(200, json={"five_hour": {"utilization": 5}})
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler), trust_env=False) as client:
+            state = SimpleNamespace(http_client=client, claude_account_auth_managers={}, claude_ambient_accounts=None)
+            fetch = server_support._account_usage_fetch(state)
+            pending = asyncio.create_task(fetch(original.id))
+            try:
+                await asyncio.wait_for(started.wait(), timeout=5)
+                await asyncio.to_thread(claude_accounts.update_account_credentials, "synthetic@example.com", None, None, new_payload, {"accountUuid": new_uuid})
+            finally:
+                release.set()
+            result, _ = await pending
+            assert result["status"] == ("ok" if refresh_status == 400 else "unavailable")
+            assert tokens == (["Bearer login-B"] if refresh_status == 400 else [])
+
+    _run(scenario())
+    [current] = claude_accounts.load_registry()
+    assert current.state == "ready"
+    assert json.loads((paths.accounts_dir("claude") / original.id / "credentials.json").read_text()) == new_payload
+
+
+def test_usage_delayed_reauth_mark_is_fenced_at_registry_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(paths, "runtime_dir", lambda: tmp_path / "runtime")
+    monkeypatch.setattr(claude_accounts, "_now_millis", lambda: 123)
+    original = claude_accounts.add_account(
+        "synthetic@example.com", None, None,
+        {"claudeAiOauth": {"accessToken": "login-A", "refreshToken": "refresh-A", "expiresAt": 1}},
+        {"accountUuid": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"},
+    )
+    started, release = threading.Event(), threading.Event()
+    real_mark = claude_accounts.mark_account_needs_reauth
+
+    def delayed_mark(*args: Any, **kwargs: Any) -> Any:
+        started.set()
+        assert release.wait(timeout=5)
+        return real_mark(*args, **kwargs)
+
+    monkeypatch.setattr(server_support, "mark_account_needs_reauth", delayed_mark)
+
+    async def scenario() -> None:
+        async def handler(request: httpx.Request) -> httpx.Response:
+            assert str(request.url) == CLAUDE_TOKEN_URL
+            return httpx.Response(400, json={"error": "invalid_grant"})
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler), trust_env=False) as client:
+            state = SimpleNamespace(http_client=client, claude_account_auth_managers={}, claude_ambient_accounts=None)
+            pending = asyncio.create_task(server_support._account_usage_fetch(state)(original.id))
+            try:
+                assert await asyncio.to_thread(started.wait, 5)
+                # Same profile, same credential JSON, same incarnation, and same
+                # login timestamp still represent a new atomic publication.
+                await asyncio.to_thread(claude_accounts.update_account_credentials, "synthetic@example.com", None, None,
+                    {"claudeAiOauth": {"accessToken": "login-A", "refreshToken": "refresh-A", "expiresAt": 1}},
+                    {"accountUuid": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"})
+            finally:
+                release.set()
+            result, _ = await pending
+            assert result["status"] == "unavailable"
+
+    _run(scenario())
+    [current] = claude_accounts.load_registry()
+    assert current.id == original.id
+    assert current.account_incarnation_id == original.account_incarnation_id
+    assert current.state == "ready"
+
+
 # ---------------------------------------------------------------------------
 # Codex usage fetch
 # ---------------------------------------------------------------------------
 
 
-def test_fetch_codex_usage_maps_windows_and_plan() -> None:
+@pytest.mark.parametrize("plan_type", ["plus", "pro", "prolite", "promax", "<future-plan>"])
+def test_fetch_codex_usage_maps_windows_and_plan(plan_type: str) -> None:
     seen: dict[str, Any] = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -371,7 +564,7 @@ def test_fetch_codex_usage_maps_windows_and_plan() -> None:
         return httpx.Response(
             200,
             json={
-                "plan_type": "plus",
+                "plan_type": plan_type,
                 "rate_limit": {
                     "primary_window": {
                         "used_percent": 12,
@@ -394,13 +587,44 @@ def test_fetch_codex_usage_maps_windows_and_plan() -> None:
     assert seen["account"] == "acc-1"
     assert seen["originator"] == "Codex Desktop"
     assert result["status"] == "ok"
-    assert result["plan_type"] == "plus"
+    assert result["plan_type"] == plan_type
     assert result["reset_credits_available"] == 2
     assert result["session"]["used_percent"] == 12
     assert result["session"]["window_minutes"] == 300
     assert result["session"]["resets_at"] == 1754000000.0
     assert result["weekly"]["used_percent"] == 34
     assert result["weekly"]["window_minutes"] == 10080
+
+
+@pytest.mark.parametrize("window_key", ["primary_window", "secondary_window"])
+def test_fetch_codex_usage_promax_with_only_weekly_window(window_key: str) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "plan_type": "promax",
+                "rate_limit": {
+                    window_key: {
+                        "used_percent": 37,
+                        "limit_window_seconds": 604800,
+                        "reset_at": 1754600000,
+                    },
+                },
+            },
+        )
+
+    auth = ChatGPTCredentials(CodexCredentials(access_token="tok", account_id=None))
+    result = _run(provider_usage.fetch_codex_usage(_mock_client(handler), auth))
+
+    assert result["status"] == "ok"
+    assert result["plan_type"] == "promax"
+    assert result["session"] is None
+    assert result["weekly"] == {
+        "used_percent": 37.0,
+        "window_minutes": 10080,
+        "resets_at": 1754600000.0,
+    }
+    assert result["reset_credits_available"] is None
 
 
 def test_fetch_codex_usage_classifies_unknown_durations_legacy_way() -> None:
@@ -659,6 +883,48 @@ def test_fetch_kimi_usage_without_windows_is_error() -> None:
 # ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        (0, 0.0),
+        (-10, -10.0),
+        (1754000000.5, 1754000000.5),
+        (1754000000500.0, 1754000000.5),
+        ("1754000000000", 1754000000.0),
+        (" 1754000000 ", 1754000000.0),
+        (10_000_000_000, 10_000_000_000.0),
+        (10_000_000_001, 10_000_000.001),
+        (1e100, 1e100 / 1000),
+        (-1e100, -1e100),
+        (False, None),
+        ("", None),
+        (" ", None),
+        ([], None),
+        ({}, None),
+    ],
+)
+def test_usage_envelope_reset_time_preserves_finite_and_invalid_controls(
+    value: Any, expected: float | None,
+) -> None:
+    assert usage_envelope.reset_epoch_seconds(value) == expected
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param("Infinity", id="positive-infinity-string"),
+        pytest.param("NaN", id="nan-string"),
+        pytest.param("-Infinity", id="negative-infinity-string"),
+        pytest.param(float("inf"), id="positive-infinity-number"),
+        pytest.param(float("nan"), id="nan-number"),
+        pytest.param(float("-inf"), id="negative-infinity-number"),
+        pytest.param(10**400, id="unrepresentable-integer"),
+    ],
+)
+def test_usage_envelope_reset_time_rejects_unusable_numbers(value: Any) -> None:
+    assert usage_envelope.reset_epoch_seconds(value) is None
 
 
 def test_usage_envelope_reset_time_normalizes_units() -> None:

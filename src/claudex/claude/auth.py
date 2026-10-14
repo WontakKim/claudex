@@ -17,23 +17,27 @@ refresh token is persisted atomically before the new access token is ever
 returned to a caller — refresh tokens are single-use, so a crash between
 rotation and persistence must lose the *new* token, never the recorded one.
 
-The gateway is the only refresher for a registered account (each account is
-its own OAuth login session, never shared with the user's real `claude`
-CLI), so no cross-process coordination is needed beyond the per-manager
-asyncio lock. Credential values never appear in log lines or exceptions.
+The per-manager asyncio lock coalesces refreshes. Coherent credential/profile
+reads and refresh publication share registry.lock with reauthentication;
+filesystem work runs in a worker thread and the lock is never held during
+HTTP awaits. A refresh may publish or reject only its captured credential-file
+generation.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
-import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import httpx
+
+from claudex.claude import account_store
+from claudex.claude.account_store import CredentialGeneration
+from claudex.locking import file_lock
 
 CLAUDE_TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
 # The public Claude Code OAuth client id (bundle constant CLIENT_ID).
@@ -48,15 +52,21 @@ _OAUTH_ACCOUNT_FILENAME = "oauth-account.json"
 
 class ClaudeAccountAuthError(Exception):
     """Raised when account credentials are missing, malformed, or cannot be
-    refreshed. Messages never contain credential values — only paths and a
-    description of what went wrong."""
+    refreshed."""
 
 
 class ClaudeAccountReauthRequiredError(ClaudeAccountAuthError):
     """The token endpoint conclusively rejected the refresh token
     (invalid_grant): only a fresh interactive login can recover the account.
     Callers use this to mark the registry row needs-reauth. The message
-    carries the status and error code only, never the response body."""
+    carries the status and error code only, never the response body. Its
+    credential generation fences a later asynchronous registry mutation."""
+
+    def __init__(
+        self, message: str, *, credential_generation: CredentialGeneration | None = None
+    ) -> None:
+        super().__init__(message)
+        self.credential_generation = credential_generation
 
 
 @dataclass(frozen=True)
@@ -66,39 +76,49 @@ class ClaudeAccountCredentials:
     # `metadata.user_id` so a request never names a different account than
     # the one serving it. None when the capture did not record it.
     account_uuid: str | None
+    credential_generation: CredentialGeneration | None = field(default=None, repr=False)
 
 
 class ClaudeAccountAuthManager:
     """Loads, refreshes, and persists one registered account's credentials."""
 
     def __init__(self, account_dir: Path, http_client: httpx.AsyncClient) -> None:
+        self._registry_lock_path = account_store._lock_path(account_dir.parent)
         self._credentials_file = account_dir / _CREDENTIALS_FILENAME
         self._oauth_account_file = account_dir / _OAUTH_ACCOUNT_FILENAME
         self._http_client = http_client
         self._refresh_lock = asyncio.Lock()
 
     async def get_credentials(self, force_refresh: bool = False) -> ClaudeAccountCredentials:
-        file_data, oauth_blob = self._load_credentials_file()
-        access_token = _access_token(oauth_blob)
-        if force_refresh or not access_token or _is_expiring(oauth_blob):
-            # Remember which token looked stale: concurrent 401 retries all
-            # force-refresh, and only the first one holding the lock should
-            # actually rotate — with single-use refresh tokens a second POST
-            # for the same generation invalidates the fresh credentials.
-            stale_access_token = access_token
+        file_data, oauth_blob, credentials = await asyncio.to_thread(self._load_credentials)
+        if force_refresh or not credentials.access_token or _is_expiring(oauth_blob):
+            # Concurrent force-refresh callers spend each single-use generation
+            # once, even when a rotation returns the same access token.
+            stale_generation = credentials.credential_generation
             async with self._refresh_lock:
-                file_data, oauth_blob = self._load_credentials_file()
-                access_token = _access_token(oauth_blob)
+                file_data, oauth_blob, credentials = await asyncio.to_thread(self._load_credentials)
                 if (
-                    (force_refresh and access_token == stale_access_token)
-                    or not access_token
+                    (force_refresh and credentials.credential_generation == stale_generation)
+                    or not credentials.access_token
                     or _is_expiring(oauth_blob)
                 ):
-                    oauth_blob = await self._refresh_tokens(file_data, oauth_blob)
-                    access_token = _access_token(oauth_blob)
-        return ClaudeAccountCredentials(
-            access_token=access_token,
+                    credentials = await self._refresh_tokens(file_data, oauth_blob, credentials)
+        return credentials
+
+    def _load_credentials(
+        self,
+    ) -> tuple[dict[str, Any], dict[str, Any], ClaudeAccountCredentials]:
+        with file_lock(self._registry_lock_path):
+            return self._load_credentials_unlocked()
+
+    def _load_credentials_unlocked(
+        self,
+    ) -> tuple[dict[str, Any], dict[str, Any], ClaudeAccountCredentials]:
+        file_data, oauth_blob = self._load_credentials_file()
+        return file_data, oauth_blob, ClaudeAccountCredentials(
+            access_token=_access_token(oauth_blob),
             account_uuid=self._load_account_uuid(),
+            credential_generation=account_store._credential_generation(self._credentials_file),
         )
 
     def _load_credentials_file(self) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -136,8 +156,11 @@ class ClaudeAccountAuthManager:
         return account_uuid if isinstance(account_uuid, str) and account_uuid else None
 
     async def _refresh_tokens(
-        self, file_data: dict[str, Any], oauth_blob: dict[str, Any]
-    ) -> dict[str, Any]:
+        self,
+        file_data: dict[str, Any],
+        oauth_blob: dict[str, Any],
+        credentials: ClaudeAccountCredentials,
+    ) -> ClaudeAccountCredentials:
         refresh_token = oauth_blob.get("refreshToken")
         if not isinstance(refresh_token, str) or not refresh_token:
             raise ClaudeAccountAuthError(
@@ -167,9 +190,8 @@ class ClaudeAccountAuthManager:
             raise ClaudeAccountAuthError(f"token refresh request failed: {exc}") from exc
         if response.status_code != 200:
             if response.status_code in (400, 401) and _is_invalid_grant(response):
-                raise ClaudeAccountReauthRequiredError(
-                    f"token refresh failed with status {response.status_code}: "
-                    "invalid_grant — only a fresh login can recover this account"
+                return await asyncio.to_thread(
+                    self._reject_refresh, credentials.credential_generation, response.status_code
                 )
             raise ClaudeAccountAuthError(
                 f"token refresh failed with status {response.status_code}: {response.text}"
@@ -198,14 +220,59 @@ class ClaudeAccountAuthManager:
             new_blob.pop("expiresAt", None)
         new_file_data = dict(file_data)
         new_file_data["claudeAiOauth"] = new_blob
-        self._persist_credentials_file(new_file_data)
-        return new_blob
+        # A successful rotation owns its generation until publication settles;
+        # cancellation must not release the refresh lock while its worker runs.
+        publication = asyncio.create_task(
+            asyncio.to_thread(
+                self._publish_refresh, new_file_data, credentials.credential_generation
+            )
+        )
+        try:
+            return await asyncio.shield(publication)
+        except asyncio.CancelledError as cancelled:
+            completion = asyncio.gather(publication, return_exceptions=True)
+            while not completion.done():
+                try:
+                    await asyncio.shield(completion)
+                except asyncio.CancelledError:
+                    continue
+            raise cancelled from publication.exception()
+
+    def _reject_refresh(
+        self, expected_generation: CredentialGeneration | None, status_code: int
+    ) -> ClaudeAccountCredentials:
+        with file_lock(self._registry_lock_path):
+            _, _, current = self._load_credentials_unlocked()
+            if current.credential_generation != expected_generation:
+                return current
+            raise ClaudeAccountReauthRequiredError(
+                f"token refresh failed with status {status_code}: "
+                "invalid_grant — only a fresh login can recover this account",
+                credential_generation=expected_generation,
+            )
+
+    def _publish_refresh(
+        self, file_data: dict[str, Any], expected_generation: CredentialGeneration | None
+    ) -> ClaudeAccountCredentials:
+        with file_lock(self._registry_lock_path):
+            _, _, current = self._load_credentials_unlocked()
+            if current.credential_generation != expected_generation:
+                return current
+            self._persist_credentials_file(file_data)
+            return self._load_credentials_unlocked()[2]
 
     def _persist_credentials_file(self, file_data: dict[str, Any]) -> None:
-        temp_file = self._credentials_file.with_name(self._credentials_file.name + ".tmp")
-        temp_file.write_text(json.dumps(file_data, indent=2) + "\n", encoding="utf-8")
-        os.chmod(temp_file, 0o600)
-        os.replace(temp_file, self._credentials_file)
+        try:
+            account_store._write_json_atomic(self._credentials_file, file_data)
+        except account_store._PostCommitFsyncError as exc:
+            raise ClaudeAccountAuthError(
+                "refreshed credential publication has uncertain outcome or durability; "
+                "newer credentials were not rolled back"
+            ) from exc
+        except OSError as exc:
+            raise ClaudeAccountAuthError(
+                f"cannot persist refreshed credentials at {self._credentials_file}"
+            ) from exc
 
 
 def _is_invalid_grant(response: httpx.Response) -> bool:

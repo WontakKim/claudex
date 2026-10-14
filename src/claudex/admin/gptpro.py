@@ -110,32 +110,31 @@ async def _handle_admin_gptpro_login_post(request: Request) -> JSONResponse:
         )
 
     runtime = request.app.state.gptpro_ask_runtime
-    if runtime.has_active_jobs():
+    conflict = runtime.reserve_login()
+    if conflict is not None:
+        message = (
+            "a gptpro login session is already active; poll GET /admin/gptpro/login"
+            if conflict == "login-active"
+            else "cannot start login while a gptpro ask is in progress"
+        )
         return JSONResponse(
             server_support._openai_error_body(
-                "invalid_request_error",
-                "cannot start login while a gptpro ask is in progress",
-                "asks-active",
+                "invalid_request_error", message, conflict,
             ),
             status_code=409,
         )
 
-    await runtime.release_runtime()
-    session = request.app.state.gptpro_login_session
-    if session is not None and not session.is_terminal:
-        return JSONResponse(
-            server_support._openai_error_body(
-                "invalid_request_error",
-                "a gptpro login session is already active; poll GET /admin/gptpro/login",
-                "login-active",
-            ),
-            status_code=409,
-        )
-
-    session = GptProLoginSession()
-    session.start()
-    request.app.state.gptpro_login_session = session
-    return JSONResponse(session.status(), status_code=201)
+    has_started_driver = False
+    try:
+        await runtime.release_runtime()
+        session = GptProLoginSession()
+        session.start(on_settled=runtime.release_login)
+        has_started_driver = True
+        request.app.state.gptpro_login_session = session
+        return JSONResponse(session.status(), status_code=201)
+    finally:
+        if not has_started_driver:
+            runtime.release_login()
 
 
 async def _handle_admin_gptpro_login_delete(request: Request) -> JSONResponse:
@@ -221,7 +220,7 @@ async def _handle_admin_gptpro_doctor(request: Request) -> JSONResponse:
         stdout, _stderr = await asyncio.wait_for(
             process.communicate(), _GPTPRO_DOCTOR_TIMEOUT
         )
-    except TimeoutError:
+    except (TimeoutError, asyncio.CancelledError) as exc:
         try:
             os.killpg(process.pid, signal.SIGKILL)
         except ProcessLookupError:
@@ -229,6 +228,8 @@ async def _handle_admin_gptpro_doctor(request: Request) -> JSONResponse:
         except PermissionError:
             process.kill()
         await process.communicate()
+        if isinstance(exc, asyncio.CancelledError):
+            raise
         return JSONResponse(
             {
                 "ok": False,
@@ -307,7 +308,7 @@ async def _handle_admin_gptpro_connect(request: Request) -> JSONResponse:
         stdout, _stderr = await asyncio.wait_for(
             process.communicate(), _GPTPRO_CONNECT_TIMEOUT
         )
-    except TimeoutError:
+    except (TimeoutError, asyncio.CancelledError) as exc:
         try:
             os.killpg(process.pid, signal.SIGKILL)
         except ProcessLookupError:
@@ -315,6 +316,8 @@ async def _handle_admin_gptpro_connect(request: Request) -> JSONResponse:
         except PermissionError:
             process.kill()
         await process.communicate()
+        if isinstance(exc, asyncio.CancelledError):
+            raise
         return JSONResponse(
             {
                 "ok": False,

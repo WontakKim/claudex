@@ -332,6 +332,16 @@ function statusText(document, name) {
   };
 }
 
+function codexCapabilitiesEnvelope(tier = null, models = {}) {
+  return {ok: true, status: 200, body: {
+    configured_tier: tier, env_locked: false, status: "ok", reason: null, fetched_at: 1790000000, models,
+  }};
+}
+
+function localTokenRejection(message = "Missing or invalid bearer token") {
+  return {error: {message, type: "authentication_error", param: null, code: "invalid_api_key"}};
+}
+
 async function main() {
   const html = fs.readFileSync(htmlPath, "utf8");
   const document = new FakeDocument(html);
@@ -1190,6 +1200,25 @@ async function main() {
   const operatorFeedback = {alertToast, statusToast, rejectedCode, retainedCodeError, disconnectedCode,
     acceptedCode, staleCodeIgnored, codeRequests: feedbackRequests, responseLoss, servingCopy, unknownDurationUsage};
 
+  const usageRendering = {plans: [], windows: {}};
+  for (const provider of ["codex", "claude", "kimi", "grok"]) {
+    for (const planType of ["pro", "prolite", "promax", "plus", "<future-plan>", "PRO", "constructor", "toString", "__proto__", "", null]) {
+      const data = {status: "ok", plan_type: planType, updated_at: 1};
+      feedbackContext.renderUsageProvider(provider, data);
+      usageRendering.plans.push({provider, planType, rawPlanType: data.plan_type,
+        html: feedbackDocument.getElementById(`usage-plan-${provider}`).innerHTML});
+    }
+  }
+  for (const [name, data] of Object.entries({
+    weeklyOnly: {status: "ok", plan_type: "promax", session: null,
+      weekly: {used_percent: 37, window_minutes: 10080, resets_at: 1754600000},
+      reset_credits_available: null, updated_at: 1},
+    noWindows: {status: "ok", plan_type: "promax", session: null, weekly: null, updated_at: 1},
+  })) {
+    feedbackContext.renderUsageProvider("codex", data);
+    usageRendering.windows[name] = feedbackDocument.getElementById("usage-body-codex").innerHTML;
+  }
+
   const requestSnapshot = JSON.stringify(requests);
   const domSnapshot = document.snapshot();
   const credentialLeak = [
@@ -1225,6 +1254,7 @@ async function main() {
     if (url === "/admin/settings/codex") {
       return Promise.resolve({ok: true, body: {env_locked: false, service_tier: null}});
     }
+    if (url === "/admin/providers/codex/capabilities") return Promise.resolve(codexCapabilitiesEnvelope());
     if (url === "/admin/settings/compaction") {
       return Promise.resolve({ok: true, body: {env_locked: false, model: null}});
     }
@@ -1263,7 +1293,7 @@ async function main() {
         if (url === "/api/hello") body = {local_auth_required: true};
         else if (url.startsWith("/admin/") && !hasValidToken) {
           status = 401;
-          body = {error: {message: "Missing or invalid bearer token"}};
+          body = localTokenRejection();
         } else if (url === "/health") {
           body = {status: "ok", providers: {
             codex: {status: "ok", auth_mode: "chatgpt"},
@@ -1279,6 +1309,8 @@ async function main() {
           body = {model_map: {}, custom_providers: []};
         } else if (url === "/admin/settings/codex") {
           body = {env_locked: false, service_tier: null};
+        } else if (url === "/admin/providers/codex/capabilities") {
+          body = codexCapabilitiesEnvelope().body;
         } else if (url === "/admin/settings/compaction") {
           body = {env_locked: false, model: null};
         } else if (url === "/admin/providers/claude/pool/routing") {
@@ -1305,12 +1337,1106 @@ async function main() {
     });
   }
 
+  const codexDocument = new FakeDocument(html);
+  const codexContext = Object.assign({}, context, {document: codexDocument});
+  vm.createContext(codexContext);
+  vm.runInContext(source, codexContext, {filename: javascriptPath});
+  const codexRequests = [];
+  let persistedCodexTier = null;
+  codexContext.jfetch = (url, options) => {
+    codexRequests.push({url, options: options || null});
+    if (url === "/admin/providers/codex/capabilities") return Promise.resolve(codexCapabilitiesEnvelope(persistedCodexTier));
+    if (options) persistedCodexTier = JSON.parse(options.body).service_tier;
+    return Promise.resolve({ok: true, status: 200, body: {service_tier: persistedCodexTier, env_locked: false}});
+  };
+  const codexSelect = codexDocument.getElementById("codex-speed");
+  const captureCodexSelection = () => ({
+    value: codexSelect ? codexSelect.value : null,
+    live: codexContext.CODEX.serviceTier,
+    draft: codexContext.CODEX.draft,
+    applyDisabled: codexDocument.getElementById("codex-apply").disabled,
+  });
+  const changeCodexSpeed = (tier) => {
+    const input = codexSelect || codexDocument.getElementById("codex-fast");
+    input.value = tier || "standard";
+    input.checked = tier === "fast";
+    input.dispatchEvent({type: "change"});
+  };
+  const flushCodex = () => new Promise((resolve) => setImmediate(resolve));
+  const captureCodexSettings = () => ({
+    ...captureCodexSelection(),
+    selectDisabled: codexSelect ? codexSelect.disabled : false,
+    locked: codexContext.CODEX.locked,
+    hasLoaded: !!codexContext.CODEX.hasLoaded,
+    isSaving: !!codexContext.CODEX.isSaving,
+    status: codexDocument.getElementById("codex-settings-status")?.textContent || "",
+    toast: codexDocument.getElementById("toast")?.innerHTML || "",
+  });
+  const codexSettingsStates = {initial: captureCodexSettings(), locks: [], saveErrors: [], loadErrors: [], conflicts: []};
+  codexContext.renderCodexState({service_tier: null, env_locked: false});
+  const codexSpeedStates = {
+    selectPresent: !!codexSelect,
+    validEnvelopes: [null, "fast", "ultrafast"].map((tier) =>
+      codexContext.isCodexEnvelope({service_tier: tier, env_locked: false})),
+    invalidEnvelopes: [{}, {service_tier: "priority", env_locked: false},
+      {service_tier: "ultrafast"}, {service_tier: false, env_locked: false}]
+      .map((body) => codexContext.isCodexEnvelope(body)),
+    initial: captureCodexSelection(),
+    selections: [],
+  };
+  for (const tier of ["fast", "ultrafast", null]) {
+    changeCodexSpeed(tier);
+    const draft = captureCodexSelection();
+    const start = codexRequests.length;
+    codexDocument.getElementById("codex-apply").click();
+    await flushCodex();
+    const request = codexRequests.slice(start).find((item) => item.options);
+    codexSpeedStates.selections.push({draft, saved: captureCodexSelection(),
+      request: request ? JSON.parse(request.options.body) : null});
+  }
+  codexContext.renderCodexState({service_tier: "ultrafast", env_locked: false});
+  codexSpeedStates.reloaded = captureCodexSelection();
+  codexSpeedStates.nonSettingsRequests = codexRequests.filter((item) => item.url !== "/admin/settings/codex");
+
+  const codexResponses = [];
+  codexContext.jfetch = (url, options) => {
+    if (url === "/admin/providers/codex/capabilities") return Promise.resolve(codexCapabilitiesEnvelope(codexContext.CODEX.serviceTier));
+    codexRequests.push({url, options: options || null});
+    if (!codexResponses.length) return Promise.resolve({ok: false, status: 500, body: {error: {message: "unexpected Codex settings request"}}});
+    return Promise.resolve(codexResponses.shift());
+  };
+  const codexEnvelope = (tier, locked = false) => ({ok: true, status: 200,
+    body: {service_tier: tier, env_locked: locked}});
+  const reloadCodexSettings = async () => {
+    codexDocument.getElementById("codex-reload")?.click();
+    await flushCodex();
+  };
+  for (const tier of [null, "fast", "ultrafast"]) {
+    codexContext.renderCodexState(codexEnvelope(tier, true).body);
+    const start = codexRequests.length;
+    changeCodexSpeed(tier === "ultrafast" ? null : "ultrafast");
+    codexContext.applyCodex();
+    await flushCodex();
+    codexSettingsStates.locks.push({tier, state: captureCodexSettings(), requests: codexRequests.slice(start)});
+  }
+  codexContext.renderCodexState(codexEnvelope("fast").body);
+  const invalidStart = codexRequests.length;
+  changeCodexSpeed("priority");
+  codexSettingsStates.invalidChange = {state: captureCodexSettings(), requests: codexRequests.slice(invalidStart)};
+  codexContext.renderCodexState(codexEnvelope("fast").body);
+  changeCodexSpeed("ultrafast");
+  const pendingCodexSave = createDeferred();
+  codexResponses.push(pendingCodexSave.promise);
+  const pendingStart = codexRequests.length;
+  codexDocument.getElementById("codex-apply").click();
+  const pendingState = captureCodexSettings();
+  changeCodexSpeed(null);
+  codexContext.applyCodex();
+  await reloadCodexSettings();
+  const afterForcedEvents = captureCodexSettings();
+  pendingCodexSave.resolve(codexEnvelope("ultrafast"));
+  await flushCodex();
+  codexSettingsStates.pendingSave = {pendingState, afterForcedEvents,
+    requests: codexRequests.slice(pendingStart), saved: captureCodexSettings()};
+  for (const outcome of ["error", "malformed", "missing", "network"]) {
+    codexResponses.length = 0;
+    codexContext.renderCodexState(codexEnvelope("fast").body);
+    changeCodexSpeed("ultrafast");
+    const deferred = createDeferred();
+    codexResponses.push(deferred.promise);
+    codexDocument.getElementById("codex-apply").click();
+    if (outcome === "network") deferred.reject(new Error("settings response lost"));
+    else if (outcome === "error") deferred.resolve({ok: false, status: 500, body: {error: {message: "<save failed>"}}});
+    else if (outcome === "missing") deferred.resolve({ok: true, status: 200, body: {}});
+    else deferred.resolve(codexEnvelope("priority"));
+    await flushCodex();
+    const failed = captureCodexSettings();
+    codexResponses.push(codexEnvelope("ultrafast"));
+    await reloadCodexSettings();
+    codexSettingsStates.saveErrors.push({outcome, failed, recovered: captureCodexSettings()});
+  }
+  for (const outcome of ["error", "malformed", "network"]) {
+    codexResponses.length = 0;
+    codexContext.renderCodexState(codexEnvelope("fast").body);
+    const deferred = createDeferred();
+    codexResponses.push(deferred.promise);
+    const reload = reloadCodexSettings();
+    if (outcome === "network") deferred.reject(new Error("settings load disconnected"));
+    else if (outcome === "error") deferred.resolve({ok: false, status: 503, body: {error: {message: "<load failed>"}}});
+    else deferred.resolve({ok: true, status: 200, body: {service_tier: "ultrafast"}});
+    await reload;
+    const failed = captureCodexSettings();
+    const guardStart = codexRequests.length;
+    changeCodexSpeed("ultrafast");
+    codexContext.applyCodex();
+    const guardRequests = codexRequests.slice(guardStart);
+    codexResponses.length = 0;
+    codexResponses.push(codexEnvelope("ultrafast"));
+    await reloadCodexSettings();
+    codexSettingsStates.loadErrors.push({outcome, failed, guardRequests, recovered: captureCodexSettings()});
+  }
+  for (const outcome of ["unlocked", "locked", "malformed", "error", "network"]) {
+    codexResponses.length = 0;
+    codexContext.renderCodexState(codexEnvelope("fast").body);
+    changeCodexSpeed("ultrafast");
+    const refresh = createDeferred();
+    codexResponses.push({ok: false, status: 409, body: {service_tier: "ultrafast", env_locked: false}}, refresh.promise);
+    const start = codexRequests.length;
+    codexDocument.getElementById("codex-apply").click();
+    await flushCodex();
+    const pendingRefresh = captureCodexSettings();
+    changeCodexSpeed(null);
+    codexContext.applyCodex();
+    await reloadCodexSettings();
+    const beforeRefreshRequests = codexRequests.slice(start);
+    if (outcome === "network") refresh.reject(new Error("conflict refresh disconnected"));
+    else if (outcome === "error") refresh.resolve({ok: false, status: 503, body: {}});
+    else if (outcome === "malformed") refresh.resolve({ok: true, status: 200, body: {}});
+    else refresh.resolve(codexEnvelope(null, outcome === "locked"));
+    await flushCodex();
+    const refreshed = captureCodexSettings();
+    codexResponses.push(codexEnvelope("ultrafast"));
+    await reloadCodexSettings();
+    codexSettingsStates.conflicts.push({outcome, pendingRefresh, beforeRefreshRequests,
+      refreshed, recovered: captureCodexSettings()});
+  }
+
+  const capabilitiesDocument = new FakeDocument(html);
+  const capabilitiesContext = Object.assign({}, context, {document: capabilitiesDocument});
+  vm.createContext(capabilitiesContext);
+  vm.runInContext(source, capabilitiesContext, {filename: javascriptPath});
+  capabilitiesContext.DIR.LIVE = {opus: "codex:both", sonnet: "codex:fast-only",
+    haiku: "codex:manual:future<script>", fable: "codex:partial", external: "kimi:kimi-model"};
+  capabilitiesContext.DIR.mapping = {...capabilitiesContext.DIR.LIVE, sonnet: "codex:draft-only"};
+  capabilitiesContext.addedTargets = ["codex:staged-only"];
+  capabilitiesContext.renderCodexState(codexEnvelope("ultrafast").body);
+  const capabilitiesSnapshot = {
+    configured_tier: "ultrafast", env_locked: false, status: "ok", reason: null, fetched_at: 1790000000,
+    models: {
+      both: {supported_tiers: ["standard", "fast", "ultrafast"], advertised_tier_ids: ["priority", "ultrafast", "future-tier"],
+        status: "supported", reason: null, applicable_tier: "ultrafast", wire_tier: "ultrafast"},
+      "fast-only": {supported_tiers: ["standard", "fast"], advertised_tier_ids: ["priority"],
+        status: "unsupported", reason: "Catalog does not advertise ultrafast for this model.", applicable_tier: null, wire_tier: null},
+      "manual:future<script>": {supported_tiers: null, advertised_tier_ids: null,
+        status: "unknown", reason: "Model is not listed in the authenticated catalog.", applicable_tier: null, wire_tier: null},
+      partial: {supported_tiers: ["standard", "fast"], advertised_tier_ids: ["priority"],
+        status: "unknown", reason: "Model tier metadata is incomplete; Ultrafast support is unknown.", applicable_tier: null, wire_tier: null},
+      unrelated: {supported_tiers: ["standard", "ultrafast"], advertised_tier_ids: ["ultrafast"],
+        status: "supported", reason: null, applicable_tier: "ultrafast", wire_tier: "ultrafast"},
+    },
+  };
+  const captureCapabilities = () => ({
+    header: capabilitiesDocument.getElementById("codex-capabilities-status")?.textContent || "",
+    time: capabilitiesDocument.getElementById("codex-capabilities-time")?.textContent || "",
+    models: capabilitiesDocument.getElementById("codex-capabilities-models")?.innerHTML || "",
+    settings: capabilitiesDocument.getElementById("codex-settings-status")?.textContent || "",
+  });
+  const showCapabilities = (body) => {
+    if (typeof capabilitiesContext.renderCodexCapabilitiesState === "function") {
+      capabilitiesContext.renderCodexCapabilitiesState(body);
+    }
+    return captureCapabilities();
+  };
+  const codexCapabilitiesStates = {
+    initial: captureCapabilities(),
+    mixed: showCapabilities(capabilitiesSnapshot),
+    expectedFetchedTime: new Date(1790000000 * 1000).toLocaleString(),
+  };
+  const capabilitiesSelect = capabilitiesDocument.getElementById("codex-speed");
+  capabilitiesSelect.value = "fast";
+  capabilitiesSelect.dispatchEvent({type: "change"});
+  codexCapabilitiesStates.draftSelection = captureCapabilities();
+  codexCapabilitiesStates.stale = showCapabilities({...capabilitiesSnapshot,
+    status: "stale", reason: "Catalog refresh failed: <busy>. Using last-known metadata."});
+  codexCapabilitiesStates.unknown = showCapabilities({...capabilitiesSnapshot,
+    status: "unknown", reason: "Authentication unavailable.", fetched_at: null,
+    models: Object.fromEntries(Object.keys(capabilitiesSnapshot.models).map((model) => [model,
+      {supported_tiers: null, advertised_tier_ids: null, status: "unknown",
+        reason: "Current account metadata unavailable.", applicable_tier: null, wire_tier: null}]))});
+  capabilitiesContext.DIR.LIVE = {sonnet: "kimi:only-non-codex"};
+  codexCapabilitiesStates.noMappings = showCapabilities(capabilitiesSnapshot);
+
+  const metadataDocument = new FakeDocument(html);
+  const metadataRequests = [];
+  let metadataTier = "ultrafast";
+  let metadataMapping = {opus: "codex:both", sonnet: "codex:fast-only"};
+  let metadataUpgraded = false;
+  const metadataBody = () => {
+    const body = JSON.parse(JSON.stringify(capabilitiesSnapshot));
+    body.configured_tier = metadataTier;
+    for (const [model, entry] of Object.entries(body.models)) {
+      if (model === "fast-only" && metadataUpgraded) {
+        entry.supported_tiers = ["standard", "fast", "ultrafast"];
+        entry.advertised_tier_ids = ["priority", "ultrafast"];
+      }
+      const supported = metadataTier === null || entry.supported_tiers?.includes(metadataTier);
+      if (supported) Object.assign(entry, {status: "supported", reason: null,
+        applicable_tier: metadataTier, wire_tier: metadataTier === "fast" ? "priority" : metadataTier});
+      else Object.assign(entry, {applicable_tier: null, wire_tier: null,
+        status: entry.status === "unknown" ? "unknown" : "unsupported",
+        reason: entry.status === "unknown" ? entry.reason : "Catalog does not advertise the configured tier for this model."});
+    }
+    if (metadataUpgraded) body.fetched_at += 60;
+    return body;
+  };
+  const metadataEnvironment = Object.assign({}, context, {document: metadataDocument,
+    location: {host: "127.0.0.1:8787", hash: "#map"},
+    jfetch: (url, options) => {
+      metadataRequests.push({url, options: options || null});
+      if (url === "/api/hello") return Promise.resolve({ok: true, body: {local_auth_required: false}});
+      if (url === "/health") return Promise.resolve({ok: true, body: {status: "ok", providers: {codex: {status: "ok"}}}});
+      if (url === "/admin/settings/mapping") {
+        if (options) metadataMapping = JSON.parse(options.body).model_map;
+        return Promise.resolve({ok: true, body: {model_map: metadataMapping, custom_providers: [], env_locked: {}}});
+      }
+      if (url === "/admin/settings/codex") {
+        if (options) metadataTier = JSON.parse(options.body).service_tier;
+        return Promise.resolve(codexEnvelope(metadataTier));
+      }
+      if (url.startsWith("/admin/providers/codex/capabilities")) {
+        if (options) metadataUpgraded = true;
+        return Promise.resolve({ok: true, status: 200, body: metadataBody()});
+      }
+      if (url === "/admin/settings/compaction") return Promise.resolve({ok: true, body: {model: null, env_locked: false}});
+      if (url === "/admin/providers/claude/pool/routing") return Promise.resolve({ok: true, body: {mode: "disabled", env_locked: false, include_local_login: true}});
+      return Promise.resolve({ok: true, body: {models: [], log_level: "INFO"}});
+    },
+  });
+  const metadataContext = Object.assign({}, metadataEnvironment);
+  vm.createContext(metadataContext);
+  vm.runInContext(source, metadataContext, {filename: javascriptPath});
+  const metadataRealJfetch = metadataContext.jfetch;
+  metadataContext.jfetch = metadataEnvironment.jfetch;
+  const captureMetadata = () => ({
+    header: metadataDocument.getElementById("codex-capabilities-status")?.textContent || "",
+    models: metadataDocument.getElementById("codex-capabilities-models")?.innerHTML || "",
+    time: metadataDocument.getElementById("codex-capabilities-time")?.textContent || "",
+    value: metadataDocument.getElementById("codex-speed").value,
+  });
+  metadataContext.boot();
+  await flushCodex();
+  const codexMetadataStates = {boot: captureMetadata(), bootRequests: metadataRequests.slice()};
+  const metadataSelect = metadataDocument.getElementById("codex-speed");
+  const selectionStart = metadataRequests.length;
+  metadataSelect.value = "fast";
+  metadataSelect.dispatchEvent({type: "change"});
+  codexMetadataStates.draft = {state: captureMetadata(), requests: metadataRequests.slice(selectionStart)};
+  const applyStart = metadataRequests.length;
+  await metadataContext.applyCodex();
+  await flushCodex();
+  codexMetadataStates.saved = {state: captureMetadata(), requests: metadataRequests.slice(applyStart)};
+  const mappingStart = metadataRequests.length;
+  metadataContext.DIR.mapping.haiku = "codex:unrelated";
+  metadataContext.apply();
+  await flushCodex();
+  codexMetadataStates.mappingSaved = {state: captureMetadata(), requests: metadataRequests.slice(mappingStart)};
+  metadataSelect.value = "ultrafast";
+  metadataSelect.dispatchEvent({type: "change"});
+  await metadataContext.applyCodex();
+  await flushCodex();
+  const refreshStart = metadataRequests.length;
+  metadataDocument.getElementById("codex-capabilities-refresh")?.click();
+  await flushCodex();
+  codexMetadataStates.refreshed = {state: captureMetadata(), requests: metadataRequests.slice(refreshStart)};
+  codexMetadataStates.allRequests = metadataRequests.slice();
+  codexMetadataStates.race = null;
+  codexMetadataStates.authRequests = [];
+  if (typeof metadataContext.fetchCodexCapabilities === "function") {
+    const obsolete = createDeferred();
+    const savedMetadataJfetch = metadataContext.jfetch;
+    metadataContext.jfetch = () => obsolete.promise;
+    const oldRefresh = metadataContext.fetchCodexCapabilities(true);
+    metadataContext.jfetch = () => Promise.resolve({ok: true, status: 200,
+      body: {...metadataBody(), reason: "new current snapshot", fetched_at: 1790000200}});
+    await metadataContext.fetchCodexCapabilities();
+    obsolete.resolve({ok: true, status: 200, body: {...capabilitiesSnapshot,
+      configured_tier: "fast", reason: "obsolete snapshot", env_locked: true}});
+    await oldRefresh;
+    codexMetadataStates.race = {state: captureMetadata(), locked: metadataContext.CODEX.locked};
+    metadataContext.jfetch = savedMetadataJfetch;
+    metadataContext.localToken = "metadata-test-token";
+    metadataContext.fetch = async (url, options) => {
+      codexMetadataStates.authRequests.push({url, options});
+      return {ok: true, status: 200, json: async () => metadataBody()};
+    };
+    metadataContext.jfetch = metadataRealJfetch;
+    await metadataContext.fetchCodexCapabilities(true);
+  }
+
+  const codexMetadataFailureStates = {scenarios: [], pending: null, missingModel: null, changedSetting: null};
+  capabilitiesContext.DIR.LIVE = {opus: "codex:both", haiku: "codex:omitted-from-response"};
+  capabilitiesContext.DIR.mapping = {...capabilitiesContext.DIR.LIVE};
+  capabilitiesContext.renderCodexState(codexEnvelope("ultrafast").body);
+  codexMetadataFailureStates.missingModel = showCapabilities(capabilitiesSnapshot);
+  if (typeof capabilitiesContext.fetchCodexCapabilities === "function") {
+    const malformedSnapshots = [
+      ["empty", {}], ["null", null],
+      ["configured-tier", {...capabilitiesSnapshot, configured_tier: "priority"}],
+      ["env-lock", {...capabilitiesSnapshot, env_locked: "false"}],
+      ["top-status", {...capabilitiesSnapshot, status: "connected"}],
+      ["top-reason", {...capabilitiesSnapshot, reason: 42}],
+      ["timestamp", {...capabilitiesSnapshot, fetched_at: "yesterday"}],
+      ["timestamp-range", {...capabilitiesSnapshot, fetched_at: 1e20}],
+      ["models-array", {...capabilitiesSnapshot, models: []}],
+      ["model-null", {...capabilitiesSnapshot, models: {both: null}}],
+      ["supported-tiers", {...capabilitiesSnapshot, models: {both: {...capabilitiesSnapshot.models.both, supported_tiers: ["standard", "warp"]}}}],
+      ["advertised-ids", {...capabilitiesSnapshot, models: {both: {...capabilitiesSnapshot.models.both, advertised_tier_ids: [42]}}}],
+      ["model-status", {...capabilitiesSnapshot, models: {both: {...capabilitiesSnapshot.models.both, status: "current"}}}],
+      ["model-reason", {...capabilitiesSnapshot, models: {both: {...capabilitiesSnapshot.models.both, reason: {error: "bad"}}}}],
+      ["model-wire", {...capabilitiesSnapshot, models: {both: {...capabilitiesSnapshot.models.both, wire_tier: "priority"}}}],
+      ["model-applicability", {...capabilitiesSnapshot, models: {both: {...capabilitiesSnapshot.models.both, applicable_tier: "fast", wire_tier: "priority"}}}],
+    ];
+    const outcomes = [["http", {ok: false, status: 503, body: {error: {message: "<catalog unavailable>"}}}],
+      ["network", null], ...malformedSnapshots.map(([name, body]) => [name, {ok: true, status: 200, body}])];
+    for (const [outcome, response] of outcomes) {
+      showCapabilities(capabilitiesSnapshot);
+      const failureRequests = [];
+      capabilitiesContext.jfetch = (url, options) => {
+        failureRequests.push({url, options: options || null});
+        return outcome === "network" ? Promise.reject(new Error("metadata disconnected")) : Promise.resolve(response);
+      };
+      await capabilitiesContext.fetchCodexCapabilities(true);
+      const failed = captureCapabilities();
+      const editingEnabled = !capabilitiesDocument.getElementById("codex-speed").disabled;
+      const refreshEnabled = !capabilitiesDocument.getElementById("codex-capabilities-refresh").disabled;
+      capabilitiesContext.jfetch = (url, options) => {
+        failureRequests.push({url, options: options || null});
+        return Promise.resolve({ok: true, status: 200, body: capabilitiesSnapshot});
+      };
+      await capabilitiesContext.fetchCodexCapabilities(true);
+      codexMetadataFailureStates.scenarios.push({outcome, failed, editingEnabled, refreshEnabled,
+        recovered: captureCapabilities(), requests: failureRequests});
+    }
+    const pendingMetadata = createDeferred();
+    const pendingMetadataRequests = [];
+    capabilitiesContext.jfetch = (url, options) => {
+      pendingMetadataRequests.push({url, options: options || null});
+      return pendingMetadata.promise;
+    };
+    const refresh = capabilitiesContext.fetchCodexCapabilities(true);
+    const during = {state: captureCapabilities(), disabled: capabilitiesDocument.getElementById("codex-capabilities-refresh").disabled,
+      busy: capabilitiesDocument.getElementById("codex-capabilities").getAttribute("aria-busy")};
+    capabilitiesDocument.getElementById("codex-capabilities-refresh").click();
+    pendingMetadata.resolve({ok: true, status: 200, body: {...capabilitiesSnapshot, status: "stale", reason: "Same-account fetch failed; using cached support."}});
+    await refresh;
+    codexMetadataFailureStates.pending = {during, after: captureCapabilities(), requests: pendingMetadataRequests};
+
+    showCapabilities(capabilitiesSnapshot);
+    capabilitiesContext.renderCodexState(codexEnvelope("ultrafast").body);
+    const changedMetadata = createDeferred();
+    capabilitiesContext.jfetch = (url, options) => url === "/admin/settings/codex"
+      ? Promise.resolve(codexEnvelope(JSON.parse(options.body).service_tier)) : changedMetadata.promise;
+    capabilitiesSelect.value = "fast";
+    capabilitiesSelect.dispatchEvent({type: "change"});
+    await capabilitiesContext.applyCodex();
+    codexMetadataFailureStates.changedSetting = captureCapabilities();
+    changedMetadata.resolve({ok: true, status: 200, body: {...capabilitiesSnapshot, configured_tier: "fast",
+      models: {both: {...capabilitiesSnapshot.models.both, applicable_tier: "fast", wire_tier: "priority"}}}});
+    await flushCodex();
+    codexMetadataFailureStates.changedSettingResolved = captureCapabilities();
+  }
+
+  const speedDocument = new FakeDocument(html);
+  const speedContext = Object.assign({}, context, {document: speedDocument});
+  vm.createContext(speedContext);
+  vm.runInContext(source, speedContext, {filename: javascriptPath});
+  const speedRealJfetch = speedContext.jfetch;
+  const speedRequests = [];
+  const speedResponses = [];
+  speedContext.jfetch = (url, options) => {
+    speedRequests.push({url, options: options || null});
+    return Promise.resolve(speedResponses.shift() || {ok: false, status: 500, body: {}});
+  };
+  speedContext.renderCodexState(codexEnvelope(null).body);
+  const speedSelect = speedDocument.getElementById("codex-speed");
+  const speedInput = speedDocument.getElementById("ct-in");
+  const speedButton = speedDocument.getElementById("codex-speed-test");
+  const captureSpeedTest = () => ({
+    html: speedDocument.getElementById("codex-speed-result")?.innerHTML || "",
+    hidden: speedDocument.getElementById("codex-speed-result")?.hidden ?? true,
+    role: speedDocument.getElementById("codex-speed-result")?.getAttribute("role") || "",
+    disabled: speedButton?.disabled || false,
+    live: speedContext.CODEX.serviceTier, draft: speedContext.CODEX.draft,
+  });
+  const speedDiagnostic = (requested, sent, reported, confirmation, capability = "supported", reason = null) => ({
+    ok: true, status: 200, latency_ms: 12, target: "codex:manual:model", response_model: "served-model", detail: null,
+    tier_diagnostic: {requested_tier: requested, sent_tier: sent, backend_confirmed_tier: reported,
+      capability_status: capability, capability_reason: reason, confirmation_status: confirmation,
+      confirmation_reason: confirmation === "confirmed" ? null : "Provider evidence does not confirm the selected accelerated tier."},
+  });
+  const codexSpeedTestStates = {rows: [], guards: [], authRequests: []};
+  const diagnosticCases = [
+    [null, null, null, "unconfirmed", "supported", null],
+    ["fast", "priority", "priority", "confirmed", "supported", null],
+    ["ultrafast", "ultrafast", "ultrafast", "confirmed", "supported", null],
+    ["ultrafast", "ultrafast", "priority", "different", "supported", "<provider chose another tier>"],
+    ["ultrafast", null, null, "unconfirmed", "unknown", "Tier support changed or could not be verified at dispatch; sent Standard without the earlier selection's tier."],
+    ["ultrafast", null, "default", "different", "unsupported", "Catalog does not advertise the requested tier."],
+    [null, null, "default", "reported", "supported", null],
+  ];
+  speedInput.value = "codex:manual:model";
+  for (const [requested, sent, reported, confirmation, capability, reason] of diagnosticCases) {
+    const start = speedRequests.length;
+    speedSelect.value = requested || "standard";
+    speedSelect.dispatchEvent({type: "change"});
+    const selectionRequests = speedRequests.slice(start);
+    speedResponses.push({ok: true, status: 200, body: speedDiagnostic(requested, sent, reported, confirmation, capability, reason)});
+    speedButton?.click();
+    await flushCodex();
+    codexSpeedTestStates.rows.push({requested, sent, reported, confirmation, capability, reason,
+      selectionRequests, result: captureSpeedTest(), requests: speedRequests.slice(start)});
+  }
+  speedResponses.length = 0;
+  speedResponses.push({ok: true, status: 200, body: {ok: true, status: 200, latency_ms: 1, response_model: "ordinary-model"}});
+  speedSelect.value = "ultrafast";
+  speedSelect.dispatchEvent({type: "change"});
+  const ordinaryStart = speedRequests.length;
+  speedDocument.getElementById("ct-btn").click();
+  await flushCodex();
+  codexSpeedTestStates.ordinary = {requests: speedRequests.slice(ordinaryStart), toast: speedDocument.getElementById("toast")?.innerHTML || ""};
+  for (const target of ["", "kimi:not-codex", "codex:"]) {
+    speedInput.value = target;
+    const start = speedRequests.length;
+    speedButton?.click();
+    await flushCodex();
+    codexSpeedTestStates.guards.push({target, requests: speedRequests.slice(start), result: captureSpeedTest()});
+  }
+  speedInput.value = "codex:manual:model";
+  const pendingSpeed = createDeferred();
+  speedResponses.push(pendingSpeed.promise);
+  const pendingSpeedStart = speedRequests.length;
+  speedButton?.click();
+  const pendingSpeedState = captureSpeedTest();
+  speedSelect.value = "fast";
+  speedSelect.dispatchEvent({type: "change"});
+  speedButton?.click();
+  if (typeof speedContext.runCodexSpeedTest === "function") speedContext.runCodexSpeedTest();
+  pendingSpeed.resolve({ok: true, status: 200, body: speedDiagnostic("ultrafast", "ultrafast", null, "unconfirmed")});
+  await flushCodex();
+  codexSpeedTestStates.pending = {before: pendingSpeedState, after: captureSpeedTest(), requests: speedRequests.slice(pendingSpeedStart)};
+  if (typeof speedContext.runCodexSpeedTest === "function") {
+    speedContext.jfetch = speedRealJfetch;
+    speedContext.localToken = "speed-test-token";
+    speedContext.fetch = async (url, options) => {
+      codexSpeedTestStates.authRequests.push({url, options});
+      return {ok: true, status: 200, json: async () => speedDiagnostic("fast", "priority", "priority", "confirmed")};
+    };
+    await speedContext.runCodexSpeedTest();
+  }
+
+  const codexSpeedFailureStates = {rows: [], blocked: [], locked: null};
+  speedContext.jfetch = (url, options) => {
+    speedRequests.push({url, options: options || null});
+    return Promise.resolve(speedResponses.shift() || {ok: false, status: 500, body: {}});
+  };
+  speedContext.renderCodexState(codexEnvelope("ultrafast").body);
+  const validSpeedBody = speedDiagnostic("ultrafast", "ultrafast", "ultrafast", "confirmed");
+  const badDiagnostics = [
+    ["null-diagnostic", null], ["array-diagnostic", []],
+    ["invalid-requested", {...validSpeedBody.tier_diagnostic, requested_tier: "priority"}],
+    ["echo-mismatch", {...validSpeedBody.tier_diagnostic, requested_tier: "fast"}],
+    ["missing-wire", Object.fromEntries(Object.entries(validSpeedBody.tier_diagnostic).filter(([key]) => key !== "sent_tier"))],
+    ["invalid-wire", {...validSpeedBody.tier_diagnostic, sent_tier: "warp"}],
+    ["invalid-report", {...validSpeedBody.tier_diagnostic, backend_confirmed_tier: {tier: "ultrafast"}}],
+    ["invalid-confirmation", {...validSpeedBody.tier_diagnostic, confirmation_status: "success"}],
+    ["false-confirmed", {...validSpeedBody.tier_diagnostic, backend_confirmed_tier: "priority"}],
+    ["false-reported", {...validSpeedBody.tier_diagnostic, confirmation_status: "reported"}],
+    ["invalid-capability", {...validSpeedBody.tier_diagnostic, capability_status: "ready"}],
+    ["invalid-capability-reason", {...validSpeedBody.tier_diagnostic, capability_reason: {error: "bad"}}],
+    ["invalid-confirmation-reason", {...validSpeedBody.tier_diagnostic, confirmation_reason: []}],
+  ];
+  const speedOutcomes = [
+    ["legacy", {ok: true, status: 200, body: {ok: true, status: 200, response_model: "legacy-model"}}],
+    ["missing-body", {ok: true, status: 200, body: {}}],
+    ["http", {ok: false, status: 401, body: {error: {message: "<auth failed>"}}}],
+    ["failed-response", {ok: true, status: 200, body: {...validSpeedBody, ok: false, status: 502, detail: "<stream incomplete>"}}],
+    ["network", null],
+    ...badDiagnostics.map(([name, diagnostic]) => [name, {ok: true, status: 200, body: {...validSpeedBody, tier_diagnostic: diagnostic}}]),
+  ];
+  for (const [outcome, response] of speedOutcomes) {
+    speedResponses.length = 0;
+    const start = speedRequests.length;
+    const deferred = createDeferred();
+    speedResponses.push(deferred.promise);
+    speedButton?.click();
+    if (outcome === "network") deferred.reject(new Error("speed request disconnected"));
+    else deferred.resolve(response);
+    await flushCodex();
+    codexSpeedFailureStates.rows.push({outcome, result: captureSpeedTest(), requests: speedRequests.slice(start)});
+  }
+  for (const settingState of ["unloaded", "saving", "loading"]) {
+    speedContext.renderCodexState(codexEnvelope("ultrafast").body);
+    if (settingState === "unloaded") speedContext.CODEX.hasLoaded = false;
+    if (settingState === "saving") speedContext.CODEX.isSaving = true;
+    if (settingState === "loading") speedContext.CODEX.isLoading = true;
+    speedContext.renderCodex();
+    const start = speedRequests.length;
+    if (typeof speedContext.runCodexSpeedTest === "function") await speedContext.runCodexSpeedTest();
+    codexSpeedFailureStates.blocked.push({settingState, disabled: speedButton?.disabled || false, requests: speedRequests.slice(start)});
+    speedContext.CODEX.isSaving = false;
+    speedContext.CODEX.isLoading = false;
+  }
+  speedContext.renderCodexState(codexEnvelope("ultrafast", true).body);
+  const lockedTestStart = speedRequests.length;
+  speedResponses.push({ok: true, status: 200, body: validSpeedBody});
+  speedButton?.click();
+  await flushCodex();
+  codexSpeedFailureStates.locked = {result: captureSpeedTest(), requests: speedRequests.slice(lockedTestStart)};
+
+  const codexBootRaceStates = [];
+  for (const outcome of ["saved", "conflict", "reload-error"]) {
+    const raceDocument = new FakeDocument(html);
+    const raceContext = Object.assign({}, context, {document: raceDocument});
+    vm.createContext(raceContext);
+    vm.runInContext(source, raceContext, {filename: javascriptPath});
+    const slowCatalog = createDeferred();
+    const raceRequests = [];
+    let raceTier = null;
+    let raceLocked = false;
+    let settingsReads = 0;
+    raceContext.jfetch = (url, options) => {
+      raceRequests.push({url, options: options || null});
+      if (url === "/api/hello") return Promise.resolve({ok: true, body: {local_auth_required: false}});
+      if (url === "/health") return Promise.resolve({ok: true, body: {status: "ok", providers: {codex: {status: "ok"}}}});
+      if (url === "/admin/providers/kimi/models") return slowCatalog.promise;
+      if (url === "/admin/settings/mapping") return Promise.resolve({ok: true, body: {model_map: {}, custom_providers: []}});
+      if (url === "/admin/providers/codex/capabilities") return Promise.resolve(codexCapabilitiesEnvelope(raceTier));
+      if (url === "/admin/settings/codex") {
+        if (options) {
+          raceTier = JSON.parse(options.body).service_tier;
+          if (outcome === "conflict") {
+            raceLocked = true;
+            return Promise.resolve({ok: false, status: 409, body: {error: {message: "environment lock"}}});
+          }
+          return Promise.resolve(codexEnvelope(raceTier, raceLocked));
+        }
+        settingsReads += 1;
+        if (settingsReads > 1 && outcome === "reload-error") return Promise.resolve({ok: false, status: 503, body: {}});
+        return Promise.resolve(codexEnvelope(raceTier, raceLocked));
+      }
+      if (url === "/admin/settings/compaction") return Promise.resolve({ok: true, body: {model: null, env_locked: false}});
+      if (url === "/admin/providers/claude/pool/routing") return Promise.resolve({ok: true, body: {mode: "disabled", env_locked: false, include_local_login: true}});
+      return Promise.resolve({ok: true, body: {models: [], log_level: "INFO"}});
+    };
+    const captureRace = () => ({value: raceDocument.getElementById("codex-speed").value,
+      live: raceContext.CODEX.serviceTier, draft: raceContext.CODEX.draft, locked: raceContext.CODEX.locked,
+      hasLoaded: raceContext.CODEX.hasLoaded, disabled: raceDocument.getElementById("codex-speed").disabled,
+      status: raceDocument.getElementById("codex-settings-status").textContent,
+      capabilities: raceDocument.getElementById("codex-capabilities-status").textContent});
+    raceContext.boot();
+    await flushCodex();
+    raceTier = "fast";
+    raceDocument.getElementById("codex-reload").click();
+    await flushCodex();
+    if (outcome !== "reload-error") {
+      const select = raceDocument.getElementById("codex-speed");
+      select.value = "ultrafast";
+      select.dispatchEvent({type: "change"});
+      await raceContext.applyCodex();
+      await flushCodex();
+    }
+    const newer = captureRace();
+    slowCatalog.resolve({ok: true, body: {models: []}});
+    await flushCodex();
+    codexBootRaceStates.push({outcome, newer, final: captureRace(), requests: raceRequests});
+  }
+
+  const codexBootFailureStates = [];
+  for (const outcome of ["http", "malformed", "network"]) {
+    const failureDocument = new FakeDocument(html);
+    const failureContext = Object.assign({}, context, {document: failureDocument});
+    vm.createContext(failureContext);
+    vm.runInContext(source, failureContext, {filename: javascriptPath});
+    const failureRequests = [];
+    failureContext.jfetch = (url, options) => {
+      failureRequests.push({url, options: options || null});
+      if (url === "/api/hello") return Promise.resolve({ok: true, body: {local_auth_required: false}});
+      if (url === "/health") return Promise.resolve({ok: true, body: {status: "ok", providers: {codex: {status: "ok"}}}});
+      if (url === "/admin/settings/mapping") return Promise.resolve({ok: true, body: {model_map: {}, custom_providers: []}});
+      if (url === "/admin/providers/codex/capabilities") return Promise.resolve(codexCapabilitiesEnvelope());
+      if (url === "/admin/settings/codex") {
+        if (outcome === "network") return Promise.reject(new Error("initial Codex settings disconnected"));
+        if (outcome === "http") return Promise.resolve({ok: false, status: 503, body: {error: {message: "<initial settings failed>"}}});
+        return Promise.resolve({ok: true, status: 200, body: {service_tier: "priority", env_locked: false}});
+      }
+      if (url === "/admin/settings/compaction") return Promise.resolve({ok: true, body: {model: null, env_locked: false}});
+      if (url === "/admin/providers/claude/pool/routing") return Promise.resolve({ok: true, body: {mode: "disabled", env_locked: false, include_local_login: true}});
+      return Promise.resolve({ok: true, body: {models: [], log_level: "INFO"}});
+    };
+    failureContext.boot();
+    await flushCodex();
+    const failed = {hasLoaded: failureContext.CODEX.hasLoaded, value: failureDocument.getElementById("codex-speed").value,
+      disabled: failureDocument.getElementById("codex-speed").disabled,
+      testDisabled: failureDocument.getElementById("codex-speed-test").disabled,
+      status: failureDocument.getElementById("codex-settings-status").textContent};
+    failureContext.jfetch = (url, options) => {
+      failureRequests.push({url, options: options || null});
+      return Promise.resolve(url === "/admin/settings/codex" ? codexEnvelope("ultrafast") : codexCapabilitiesEnvelope("ultrafast"));
+    };
+    failureDocument.getElementById("codex-reload").click();
+    await flushCodex();
+    codexBootFailureStates.push({outcome, failed, recovered: {
+      hasLoaded: failureContext.CODEX.hasLoaded, value: failureDocument.getElementById("codex-speed").value,
+      disabled: failureDocument.getElementById("codex-speed").disabled,
+    }, requests: failureRequests});
+  }
+
+  const optionalCatalogBoot = [];
+  async function runOptionalCatalogBoot(provider, locked, authentication, outcome) {
+    const optionalDocument = new FakeDocument(html);
+    const requests = [];
+    const decodedCore = [];
+    const warnings = [];
+    const pendingCatalog = createDeferred();
+    const endpoint = `/admin/providers/${provider}/models`;
+    const savedMapping = {sonnet: "codex:saved-main", haiku: "kimi:saved-secondary"};
+    const coreEndpoints = ["/admin/settings/mapping", "/admin/settings/codex", "/admin/settings/log-level",
+      "/admin/settings/compaction", "/admin/providers/claude/pool/routing"];
+    let prompts = 0;
+    const optionalContext = Object.assign({}, context, {
+      document: optionalDocument,
+      location: {host: "127.0.0.1:8787", hash: "#map"},
+      console: {log() {}, info() {}, debug() {}, error(...values) {warnings.push(["error", ...values]);},
+        warn(...values) {warnings.push(["warn", ...values]);}},
+      window: Object.assign({}, context.window, {prompt: () => {
+        prompts += 1;
+        if (authentication === "none") throw new Error("unexpected optional-catalog token prompt");
+        return authentication === "retry" && prompts === 1 ? "wrong-catalog-boot-token" : "catalog-boot-token";
+      }}),
+      fetch: async (url, options) => {
+        const hasValidToken = options?.headers?.Authorization === "Bearer catalog-boot-token";
+        requests.push({url, method: options?.method || "GET", hasValidToken});
+        let status = 200;
+        let body;
+        if (url === "/api/hello") body = {local_auth_required: authentication !== "none"};
+        else if (url.startsWith("/admin/") && authentication !== "none" && !hasValidToken) {
+          status = 401;
+          body = localTokenRejection("synthetic invalid local token");
+        } else if (url === endpoint) return pendingCatalog.promise;
+        else if (url === "/admin/settings/mapping") body = {model_map: savedMapping, env_locked: {model_map: locked}, custom_providers: []};
+        else if (url === "/admin/settings/codex") body = {service_tier: "fast", env_locked: false};
+        else if (url === "/admin/settings/log-level") body = {log_level: "debug", choices: ["debug", "info", "warning", "error"]};
+        else if (url === "/admin/settings/compaction") body = {model: null, env_locked: false, last_reroute: null};
+        else if (url === "/admin/providers/claude/pool/routing") body = {mode: "disabled", env_locked: false, include_local_login: true};
+        else if (url === "/admin/providers/codex/capabilities") body = codexCapabilitiesEnvelope("fast", {
+          "saved-main": {supported_tiers: ["standard", "fast"], advertised_tier_ids: ["priority"], status: "supported",
+            reason: null, applicable_tier: "fast", wire_tier: "priority"},
+        }).body;
+        else if (url === "/health") body = {status: "ok", providers: {
+          codex: {status: "ok", auth_mode: "api_key"}, kimi: {status: "ok", required: true}, grok: {status: "ok", required: false},
+        }};
+        else if (url === "/admin/providers/codex/models") body = {models: ["saved-main"]};
+        else if (url.endsWith("/models")) body = {models: ["peer-suggestion"]};
+        else throw new Error("unexpected optional-catalog boot endpoint: " + url);
+        return {ok: status === 200, status, json: async () => {
+          if (status === 200 && coreEndpoints.includes(url)) decodedCore.push(url);
+          return body;
+        }};
+      },
+    });
+    vm.createContext(optionalContext);
+    vm.runInContext(source, optionalContext, {filename: javascriptPath});
+    const initial = {live: {...optionalContext.DIR.LIVE}, draft: {...optionalContext.DIR.mapping},
+      locked: optionalContext.DIR.locked, codexLoaded: optionalContext.CODEX.hasLoaded};
+    optionalContext.boot();
+    await flushCodex();
+    if (!coreEndpoints.every((url) => decodedCore.includes(url))) {
+      throw new Error("core JSON responses did not settle before optional catalog failure");
+    }
+    const decodedBeforeFailure = decodedCore.slice();
+    if (outcome === "network") pendingCatalog.reject(new TypeError(`synthetic disconnected ${provider} catalog fetch`));
+    else pendingCatalog.resolve({ok: outcome !== "http", status: outcome === "http" ? 503 : 200, json: async () => {
+      if (outcome === "malformed") throw new SyntaxError("synthetic malformed optional catalog JSON");
+      return {error: {message: "synthetic optional catalog HTTP failure"}};
+    }});
+    await flushCodex();
+    return {provider, locked, authentication, outcome, initial, decodedBeforeFailure, requests, prompts, warnings,
+      toast: {html: optionalDocument.getElementById("toast")?.innerHTML || "",
+        role: optionalDocument.getElementById("toast")?.getAttribute("role") || ""},
+      live: {...optionalContext.DIR.LIVE}, draft: {...optionalContext.DIR.mapping}, isLocked: optionalContext.DIR.locked,
+      isLockVisible: optionalDocument.body.classList.contains("env-locked"),
+      sources: optionalContext.DIR.sources.map((node) => node.id), targets: optionalContext.DIR.targets.map((node) => node.id),
+      codex: {live: optionalContext.CODEX.serviceTier, draft: optionalContext.CODEX.draft,
+        hasLoaded: optionalContext.CODEX.hasLoaded, value: optionalDocument.getElementById("codex-speed").value,
+        disabled: optionalDocument.getElementById("codex-speed").disabled},
+      compaction: optionalContext.COMP.LIVE.model, routing: optionalContext.ROUTING.mode,
+      health: optionalDocument.getElementById("health").innerHTML,
+      capabilities: optionalDocument.getElementById("codex-capabilities-status").textContent,
+      catalogs: {codex: Array.from(optionalContext.CATALOG.codex), kimi: Array.from(optionalContext.CATALOG.kimi), grok: Array.from(optionalContext.CATALOG.grok)},
+    };
+  }
+  for (const provider of ["kimi", "grok"]) {
+    for (const locked of [false, true]) {
+      for (const authentication of ["none", "valid", "retry"]) {
+        for (const outcome of ["network", "http", "malformed"]) {
+          optionalCatalogBoot.push(await runOptionalCatalogBoot(provider, locked, authentication, outcome));
+        }
+      }
+    }
+  }
+
+  const authErrorScopeStates = {wrappers: [], boots: [], concurrent: null};
+  const providerAuthFailure = {error: {message: "<Synthetic Codex credentials unavailable>", type: "authentication_error", param: null, code: null}};
+  const providerUpstreamFailure = {error: {message: "<Synthetic upstream catalog rejected>", type: "authentication_error", param: null, code: null}};
+  for (const [name, status, body, authRequired, target, promptAnswer] of [
+    ["provider-auth-cancel", 401, providerAuthFailure, true, "/admin/providers/codex/models", null],
+    ["provider-upstream-cancel", 401, providerUpstreamFailure, true, "/admin/providers/codex/models", null],
+    ["provider-auth-reenter", 401, providerAuthFailure, true, "/admin/providers/codex/models", "valid-local-token"],
+    ["unclassified-401", 401, {}, true, "/admin/providers/codex/models", null],
+    ["no-local-auth", 401, localTokenRejection(), false, "/admin/providers/codex/models", null],
+    ["non-admin", 401, localTokenRejection(), true, "/public/catalog", null],
+    ["non-401", 403, localTokenRejection(), true, "/admin/providers/codex/models", null],
+    ["local-retry", 401, localTokenRejection(), true, "/admin/settings/log-level", "valid-local-token"],
+    ["local-cancel", 401, localTokenRejection(), true, "/admin/settings/log-level", null],
+    ["local-repeated-rejection", 401, localTokenRejection(), true, "/admin/settings/log-level", "valid-local-token"],
+  ]) {
+    const scopeDocument = new FakeDocument(html);
+    const scopeContext = Object.assign({}, context, {document: scopeDocument});
+    vm.createContext(scopeContext);
+    vm.runInContext(source, scopeContext, {filename: javascriptPath});
+    scopeContext.authRequired = authRequired;
+    scopeContext.localToken = name.startsWith("local-") ? "wrong-local-token" : "valid-local-token";
+    const scopeRequests = [];
+    let prompts = 0;
+    scopeContext.window = Object.assign({}, context.window, {prompt: () => {prompts += 1; return promptAnswer;}});
+    scopeContext.fetch = async (url, options) => {
+      const hasValidToken = options?.headers?.Authorization === "Bearer valid-local-token";
+      scopeRequests.push({url, hasValidToken});
+      if (url === target) {
+        const shouldRecover = name === "local-retry" && hasValidToken;
+        return {ok: shouldRecover, status: shouldRecover ? 200 : status, json: async () => shouldRecover ? {loaded: true} : body};
+      }
+      return {ok: hasValidToken || url === "/health", status: hasValidToken || url === "/health" ? 200 : 401,
+        json: async () => hasValidToken || url === "/health" ? {loaded: true} : localTokenRejection()};
+    };
+    const response = await scopeContext.jfetch(target);
+    const requestsAtResponse = scopeRequests.slice();
+    const tokenRetained = scopeContext.localToken === "valid-local-token";
+    const tokenCleared = scopeContext.localToken === null;
+    const subsequent = await scopeContext.rawFetch("/admin/settings/codex");
+    await scopeContext.rawFetch("/health");
+    authErrorScopeStates.wrappers.push({name, status: response.status, body: response.body, prompts,
+      requestsAtResponse, tokenRetained, tokenCleared, subsequentStatus: subsequent.status,
+      subsequentRequests: scopeRequests.slice(requestsAtResponse.length)});
+  }
+  for (const [name, failure] of [["provider-auth", providerAuthFailure], ["provider-upstream", providerUpstreamFailure]]) {
+    const bootDocument = new FakeDocument(html);
+    const bootContext = Object.assign({}, context, {document: bootDocument, location: {host: "127.0.0.1:8787", hash: "#map"}});
+    vm.createContext(bootContext);
+    vm.runInContext(source, bootContext, {filename: javascriptPath});
+    let prompts = 0;
+    const bootRequests = [];
+    bootContext.window = Object.assign({}, context.window, {prompt: () => {prompts += 1; return prompts === 1 ? "valid-local-token" : null;}});
+    bootContext.fetch = async (url, options) => {
+      const hasValidToken = options?.headers?.Authorization === "Bearer valid-local-token";
+      bootRequests.push({url, hasValidToken});
+      let status = 200;
+      let body;
+      if (url === "/api/hello") body = {local_auth_required: true};
+      else if (url.startsWith("/admin/") && !hasValidToken) {status = 401; body = localTokenRejection();}
+      else if (url === "/admin/providers/codex/models") {status = 401; body = failure;}
+      else if (url === "/admin/settings/mapping") body = {model_map: {sonnet: "codex:saved-model"}, custom_providers: [], env_locked: {}};
+      else if (url === "/admin/settings/codex") body = {service_tier: "fast", env_locked: false};
+      else if (url === "/admin/providers/codex/capabilities") body = codexCapabilitiesEnvelope("fast").body;
+      else if (url === "/admin/settings/compaction") body = {model: null, env_locked: false};
+      else if (url === "/admin/providers/claude/pool/routing") body = {mode: "disabled", env_locked: false, include_local_login: true};
+      else if (url === "/health") body = {status: "ok", providers: {codex: {status: "ok", auth_mode: "chatgpt", ...(hasValidToken ? {email: "fixture-identity@example.invalid"} : {})}}};
+      else body = {models: [], log_level: "info"};
+      return {ok: status === 200, status, json: async () => body};
+    };
+    bootContext.boot();
+    await flushCodex();
+    const promptsAfterBoot = prompts;
+    const adminResponse = await bootContext.jfetch("/admin/settings/codex");
+    await bootContext.jfetch("/health");
+    authErrorScopeStates.boots.push({name, promptsAfterBoot, prompts, requests: bootRequests,
+      tokenRetained: bootContext.localToken === "valid-local-token", subsequentStatus: adminResponse.status,
+      mapping: {...bootContext.DIR.LIVE}, tier: bootContext.CODEX.serviceTier, hasLoaded: bootContext.CODEX.hasLoaded,
+      identity: bootDocument.getElementById("codex-statline").innerHTML,
+      feedback: bootDocument.getElementById("toast")?.innerHTML || ""});
+  }
+  const concurrentContext = Object.assign({}, context, {document: new FakeDocument(html)});
+  vm.createContext(concurrentContext);
+  vm.runInContext(source, concurrentContext, {filename: javascriptPath});
+  concurrentContext.authRequired = true;
+  concurrentContext.localToken = "wrong-local-token";
+  const pendingLocalRejection = createDeferred();
+  const concurrentRequests = [];
+  let concurrentPrompts = 0;
+  let slowRequests = 0;
+  concurrentContext.window = Object.assign({}, context.window, {prompt: () => {concurrentPrompts += 1; return "valid-local-token";}});
+  concurrentContext.fetch = async (url, options) => {
+    const hasValidToken = options?.headers?.Authorization === "Bearer valid-local-token";
+    concurrentRequests.push({url, hasValidToken});
+    if (url === "/admin/settings/log-level" && ++slowRequests === 1) return pendingLocalRejection.promise;
+    return {ok: hasValidToken, status: hasValidToken ? 200 : 401, json: async () => hasValidToken ? {loaded: true} : localTokenRejection()};
+  };
+  const slow = concurrentContext.jfetch("/admin/settings/log-level");
+  const corrected = await concurrentContext.jfetch("/admin/settings/codex");
+  pendingLocalRejection.resolve({ok: false, status: 401, json: async () => localTokenRejection()});
+  const stale = await slow;
+  authErrorScopeStates.concurrent = {prompts: concurrentPrompts, correctedStatus: corrected.status, staleStatus: stale.status,
+    tokenRetained: concurrentContext.localToken === "valid-local-token", requests: concurrentRequests};
+
+  const routeParsing = [
+    "codex:model", "codex: model", "codex :model", " \tcodex \t: \tmodel:variant:tail \n",
+    "openai-by-name:Manual:Model:alpha", " openai-by-name : Manual:Model:alpha ",
+    "UnlistedCase:UnknownCase:next", " UnlistedCase : UnknownCase:next ",
+  ].map((raw) => ({raw, parsed: context.routeOf(raw)}));
+  const appliedRouteStates = [];
+  for (const raw of ["codex:model:variant:tail", "codex: model:variant:tail", "codex :model:variant:tail", " \tcodex \t: \tmodel:variant:tail \n"]) {
+    for (const isLocked of [false, true]) {
+      for (const support of ["supported", "unsupported", "missing"]) {
+        const routeDocument = new FakeDocument(html);
+        const routeContext = Object.assign({}, context, {document: routeDocument});
+        vm.createContext(routeContext);
+        vm.runInContext(source, routeContext, {filename: javascriptPath});
+        routeContext.DIR.LIVE = {opus: raw, haiku: " openai-by-name : Custom:Model ", sonnet: "codex:canonical-extra"};
+        routeContext.DIR.mapping = {...routeContext.DIR.LIVE, opus: "codex:draft-only"};
+        routeContext.DIR.locked = isLocked;
+        routeContext.addedTargets = ["codex:staged-only"];
+        routeContext.renderCodexState({service_tier: "fast", env_locked: isLocked});
+        const entry = {supported_tiers: support === "unsupported" ? ["standard"] : ["standard", "fast"],
+          advertised_tier_ids: support === "unsupported" ? [] : ["priority"],
+          status: support === "unsupported" ? "unsupported" : "supported",
+          reason: support === "unsupported" ? "Synthetic catalog does not advertise Fast." : null,
+          applicable_tier: support === "unsupported" ? null : "fast", wire_tier: support === "unsupported" ? null : "priority"};
+        const canonical = {...entry, supported_tiers: ["standard", "fast"], advertised_tier_ids: ["priority"],
+          status: "supported", reason: null, applicable_tier: "fast", wire_tier: "priority"};
+        const models = {"canonical-extra": canonical};
+        if (support !== "missing") models["model:variant:tail"] = entry;
+        const body = codexCapabilitiesEnvelope("fast", models).body;
+        routeContext.renderCodexCapabilitiesState(body);
+        routeContext.renderChrome();
+        routeContext.render();
+        const before = routeDocument.getElementById("codex-capabilities-models").innerHTML;
+        const snapshot = {rawLive: {...routeContext.DIR.LIVE}, rawDraft: {...routeContext.DIR.mapping},
+          targetIds: routeContext.DIR.targets.map((target) => target.id),
+          renderedTargetIds: routeDocument.allElements.filter((element) => element.classList.contains("tgt") && element.isConnected).map((element) => element.dataset.id),
+          isLocked: routeContext.DIR.locked, isLockVisible: routeDocument.body.classList.contains("env-locked"),
+          selectDisabled: routeDocument.getElementById("codex-speed").disabled};
+        const routeRequests = [];
+        routeContext.jfetch = (url, options) => {
+          routeRequests.push({url, options});
+          return Promise.resolve({ok: true, status: 200, body});
+        };
+        await routeContext.fetchCodexCapabilities(true);
+        appliedRouteStates.push({raw, isLocked, support, before, after: routeDocument.getElementById("codex-capabilities-models").innerHTML,
+          header: routeDocument.getElementById("codex-capabilities-status").textContent,
+          parsed: routeContext.routeOf(raw), customParsed: routeContext.routeOf(" openai-by-name : Custom:Model "),
+          snapshot, requests: routeRequests});
+      }
+    }
+  }
+
+  const normalizedSpeedTargets = [];
+  for (const raw of ["codex:model:variant:tail", "codex: model:variant:tail", "codex :model:variant:tail", " \tcodex \t: \tmodel:variant:tail \n", " openai-by-name : Custom:Model "]) {
+    const targetDocument = new FakeDocument(html);
+    const targetContext = Object.assign({}, context, {document: targetDocument});
+    vm.createContext(targetContext);
+    vm.runInContext(source, targetContext, {filename: javascriptPath});
+    targetContext.renderCodexState({service_tier: "fast", env_locked: false});
+    const targetRequests = [];
+    targetContext.jfetch = (url, options) => {
+      targetRequests.push({url, options});
+      return Promise.resolve({ok: true, status: 200, body: {ok: true, status: 200, target: raw.trim(), response_model: "model:variant:tail",
+        tier_diagnostic: {requested_tier: "fast", sent_tier: "priority", backend_confirmed_tier: "priority", capability_status: "supported",
+          capability_reason: null, confirmation_status: "confirmed", confirmation_reason: null}}});
+    };
+    targetDocument.getElementById("ct-in").value = raw;
+    const before = targetRequests.slice();
+    await targetContext.runCodexSpeedTest();
+    normalizedSpeedTargets.push({raw, before, requests: targetRequests,
+      result: targetDocument.getElementById("codex-speed-result").innerHTML,
+      savedTier: targetContext.CODEX.serviceTier, draftTier: targetContext.CODEX.draft});
+  }
+
+  const routeBoundaryParity = [];
+  for (const [raw, model] of [
+    ["codex:\u0085model:tail", "model:tail"], ["codex\u0085:model:tail", "model:tail"],
+    ["codex:\ufeffmodel:tail", "\ufeffmodel:tail"], ["codex:model:tail\ufeff", "model:tail\ufeff"],
+  ]) {
+    const parityDocument = new FakeDocument(html);
+    const parityContext = Object.assign({}, context, {document: parityDocument});
+    vm.createContext(parityContext);
+    vm.runInContext(source, parityContext, {filename: javascriptPath});
+    parityContext.DIR.LIVE = {opus: raw};
+    parityContext.DIR.mapping = {...parityContext.DIR.LIVE};
+    parityContext.renderCodexState({service_tier: "fast", env_locked: false});
+    const body = codexCapabilitiesEnvelope("fast", {[model]: {supported_tiers: ["standard", "fast"], advertised_tier_ids: ["priority"],
+      status: "supported", reason: null, applicable_tier: "fast", wire_tier: "priority"}}).body;
+    parityContext.renderCodexCapabilitiesState(body);
+    parityContext.render();
+    const requests = [];
+    parityContext.jfetch = (url, options) => {
+      requests.push({url, options});
+      return Promise.resolve({ok: true, status: 200, body: {ok: true, status: 200, response_model: model,
+        tier_diagnostic: {requested_tier: "fast", sent_tier: "priority", backend_confirmed_tier: "priority", capability_status: "supported",
+          capability_reason: null, confirmation_status: "confirmed", confirmation_reason: null}}});
+    };
+    parityDocument.getElementById("ct-in").value = raw;
+    await parityContext.runCodexSpeedTest();
+    routeBoundaryParity.push({raw, expectedModel: model, parsed: parityContext.routeOf(raw),
+      models: parityDocument.getElementById("codex-capabilities-models").innerHTML,
+      live: {...parityContext.DIR.LIVE}, targetIds: parityContext.DIR.targets.map((target) => target.id), requests,
+      diagnostic: parityDocument.getElementById("codex-speed-result").innerHTML});
+  }
+
+  const lockableSaveStates = [];
+  const flushLockableSaves = async () => { for (let index = 0; index < 12; index++) await Promise.resolve(); };
+  for (const setting of ["compaction", "routing"]) {
+    for (const outcome of ["success", "success-locked", "http", "network", "conflict-unlocked", "conflict-locked", "refresh-http", "refresh-malformed", "refresh-network", "initial-locked"]) {
+      const saveDocument = new FakeDocument(html);
+      const saveContext = Object.assign({}, context, {document: saveDocument});
+      vm.createContext(saveContext);
+      vm.runInContext(source, saveContext, {filename: javascriptPath});
+      const isCompaction = setting === "compaction";
+      const endpoint = isCompaction ? "/admin/settings/compaction" : "/admin/providers/claude/pool/routing";
+      const initial = isCompaction ? null : "disabled";
+      const first = isCompaction ? "claude:save-first" : "fallback";
+      const next = isCompaction ? "claude:save-next" : "balanced";
+      const select = saveDocument.getElementById(isCompaction ? "comp-select" : "routing-select");
+      const button = saveDocument.getElementById(isCompaction ? "comp-apply" : "routing-apply");
+      const custom = saveDocument.getElementById("comp-custom-input");
+      const createSettingsEnvelope = (value, locked = false) => ({ok: true, status: 200, body: isCompaction
+        ? {model: value, env_locked: locked, last_reroute: null}
+        : {mode: value, env_locked: locked, include_local_login: true}});
+      const adopt = (body) => isCompaction ? saveContext.renderCompactionState(body) : saveContext.renderRoutingState(body);
+      const render = () => isCompaction ? saveContext.renderCompaction() : saveContext.renderRouting();
+      const change = (value) => {
+        select.value = isCompaction ? "custom" : value;
+        select.dispatchEvent({type: "change"});
+        if (isCompaction) {
+          custom.value = value.slice("claude:".length);
+          custom.dispatchEvent({type: "input"});
+        }
+      };
+      const requests = [];
+      const firstResponse = createDeferred();
+      const prematureResponse = createDeferred();
+      const refreshResponse = createDeferred();
+      let serverValue = initial;
+      let isLaterSave = false;
+      saveContext.jfetch = (url, options) => {
+        if (url !== endpoint) throw new Error("unexpected lockable-setting endpoint: " + url);
+        requests.push({url, options: options || null});
+        if (!options) return refreshResponse.promise;
+        const value = JSON.parse(options.body)[isCompaction ? "model" : "mode"];
+        if (isLaterSave) { serverValue = value; return Promise.resolve(createSettingsEnvelope(value)); }
+        const puts = requests.filter((request) => request.options && request.options.method === "PUT");
+        if (puts.length === 1) {
+          if (outcome.startsWith("success")) serverValue = value;
+          return firstResponse.promise;
+        }
+        serverValue = value;
+        return prematureResponse.promise;
+      };
+      const capture = () => ({
+        live: isCompaction ? saveContext.COMP.LIVE.model : saveContext.ROUTING.mode,
+        draft: isCompaction ? saveContext.COMP.draftCustom : saveContext.ROUTING.draft,
+        locked: isCompaction ? saveContext.COMP.locked : saveContext.ROUTING.locked,
+        buttonDisabled: button.disabled, buttonText: button.textContent,
+        selectDisabled: select.disabled, customDisabled: custom.disabled,
+        cardLocked: saveDocument.getElementById(isCompaction ? "compaction-card" : "routing-card").classList.contains("locked"),
+        requestCount: requests.length, toast: saveDocument.getElementById("toast")?.innerHTML || "",
+      });
+      adopt(createSettingsEnvelope(initial, outcome === "initial-locked").body);
+      const before = capture();
+      change(first);
+      const beforeClick = requests.slice();
+      button.click();
+      const pending = capture();
+      change(next);
+      render();
+      const rerendered = capture();
+      button.click();
+      const afterRepeatedClick = capture();
+      button.disabled = false;
+      button.dispatchEvent({type: "click"});
+      render();
+      const directGuard = capture();
+      if (outcome === "initial-locked") {
+        lockableSaveStates.push({setting, outcome, endpoint, initial, first, next, before, beforeClick,
+          pending, rerendered, afterRepeatedClick, directGuard, requests});
+        continue;
+      }
+      prematureResponse.resolve(createSettingsEnvelope(next));
+      await flushLockableSaves();
+      let refreshPending = null;
+      if (outcome === "network") firstResponse.reject(new Error("PUT disconnected"));
+      else if (outcome === "http") firstResponse.resolve({ok: false, status: 500, body: {error: {message: "<save failed>"}}});
+      else if (outcome.startsWith("success")) firstResponse.resolve(createSettingsEnvelope(first, outcome === "success-locked"));
+      else firstResponse.resolve({ok: false, status: 409, body: {error: {message: "<setting locked>"}, model: "claude:error-body", mode: "balanced"}});
+      await flushLockableSaves();
+      if (outcome.startsWith("conflict") || outcome.startsWith("refresh")) {
+        refreshPending = capture();
+        if (outcome === "refresh-http") refreshResponse.resolve({ok: false, status: 503, body: {error: {message: "refresh unavailable"}}});
+        else if (outcome === "refresh-malformed") refreshResponse.resolve({ok: true, status: 200, body: {env_locked: false}});
+        else if (outcome === "refresh-network") refreshResponse.reject(new Error("GET disconnected"));
+        else refreshResponse.resolve(createSettingsEnvelope(next, outcome === "conflict-locked"));
+        await flushLockableSaves();
+      }
+      const after = capture();
+      const serverAfter = serverValue;
+      const requestsBeforeLater = requests.slice();
+      const laterValue = isCompaction ? "claude:save-later" : after.live === "fallback" ? "balanced" : "fallback";
+      isLaterSave = true;
+      change(laterValue);
+      button.click();
+      await flushLockableSaves();
+      lockableSaveStates.push({setting, outcome, endpoint, initial, first, next, before, beforeClick,
+        pending, rerendered, afterRepeatedClick, directGuard, refreshPending, after, serverAfter,
+        requestsBeforeLater, laterValue, later: capture(), requests});
+    }
+  }
+  const independentDocument = new FakeDocument(html);
+  const independentContext = Object.assign({}, context, {document: independentDocument});
+  vm.createContext(independentContext);
+  vm.runInContext(source, independentContext, {filename: javascriptPath});
+  independentContext.renderCompactionState({model: null, env_locked: false, last_reroute: null});
+  independentContext.renderRoutingState({mode: "disabled", env_locked: false, include_local_login: true});
+  const independentRequests = [];
+  const independentResponses = {compaction: createDeferred(), routing: createDeferred()};
+  independentContext.jfetch = (url, options) => {
+    independentRequests.push({url, options});
+    return independentResponses[url === "/admin/settings/compaction" ? "compaction" : "routing"].promise;
+  };
+  independentDocument.getElementById("comp-select").value = "claude-sonnet-5";
+  independentDocument.getElementById("comp-select").dispatchEvent({type: "change"});
+  independentDocument.getElementById("comp-apply").click();
+  independentDocument.getElementById("routing-select").value = "fallback";
+  independentDocument.getElementById("routing-select").dispatchEvent({type: "change"});
+  independentDocument.getElementById("routing-apply").click();
+  const independentPending = ["comp-apply", "routing-apply"].map((id) => ({disabled: independentDocument.getElementById(id).disabled, text: independentDocument.getElementById(id).textContent}));
+  independentResponses.compaction.resolve({ok: true, status: 200, body: {model: "claude:claude-sonnet-5", env_locked: false, last_reroute: null}});
+  independentResponses.routing.resolve({ok: true, status: 200, body: {mode: "fallback", env_locked: false, include_local_login: true}});
+  await flushLockableSaves();
+  const lockableSaveIndependence = {requests: independentRequests, pending: independentPending,
+    compaction: independentContext.COMP.LIVE.model, routing: independentContext.ROUTING.mode};
+
   const output = {credentialLeak};
   if (!credentialLeak) {
     Object.assign(output, {
       names: {configuredName, connectedName, unusedName, errorName},
       codexCatalogBoot,
+      codexSpeedStates,
+      codexSettingsStates,
+      codexCapabilitiesStates,
+      codexMetadataStates,
+      codexMetadataFailureStates,
+      codexSpeedTestStates,
+      codexSpeedFailureStates,
+      codexBootRaceStates,
+      codexBootFailureStates,
+      optionalCatalogBoot,
       healthAuthenticationBoot,
+      authErrorScopeStates,
+      routeParsing,
+      appliedRouteStates,
+      normalizedSpeedTargets,
+      routeBoundaryParity,
+      lockableSaveStates,
+      lockableSaveIndependence,
       localHeroStates,
       localHeroLoadOrder,
       routingEnvelopeValidation,
@@ -1327,6 +2453,7 @@ async function main() {
       },
       cards,
       operatorFeedback,
+      usageRendering,
       gptProConcurrencyStates,
       gptProSessionStates,
       mcpInfoStates,

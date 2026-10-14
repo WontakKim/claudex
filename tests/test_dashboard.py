@@ -34,12 +34,119 @@ def route_of_body() -> str:
     return body
 
 
-def test_route_of_preserves_provider_and_complete_model_suffix() -> None:
-    body = route_of_body()
+@pytest.mark.parametrize("raw,provider,model", [
+    ("codex:model", "codex", "model"),
+    ("codex: model", "codex", "model"),
+    ("codex :model", "codex", "model"),
+    (" \tcodex \t: \tmodel:variant:tail \n", "codex", "model:variant:tail"),
+    ("openai-by-name:Manual:Model:alpha", "openai-by-name", "Manual:Model:alpha"),
+    (" openai-by-name : Manual:Model:alpha ", "openai-by-name", "Manual:Model:alpha"),
+    ("UnlistedCase:UnknownCase:next", "UnlistedCase", "UnknownCase:next"),
+    (" UnlistedCase : UnknownCase:next ", "UnlistedCase", "UnknownCase:next"),
+])
+def test_route_of_preserves_provider_and_complete_model_suffix(
+    dashboard_runtime_result: dict[str, Any], raw: str, provider: str, model: str,
+) -> None:
+    row = next(row for row in dashboard_runtime_result["routeParsing"] if row["raw"] == raw)
+    assert row["raw"] == raw
+    assert row["parsed"] == {"provider": provider, "model": model}
 
-    assert 'String(value).indexOf(":")' in body
-    assert "var prefix=value.slice(0,at);" in body
-    assert "return{provider:prefix,model:value.slice(at+1)};" in body
+
+@pytest.mark.parametrize("raw", [
+    "codex:model:variant:tail", "codex: model:variant:tail", "codex :model:variant:tail",
+    " \tcodex \t: \tmodel:variant:tail \n",
+])
+@pytest.mark.parametrize("is_locked", [False, True])
+@pytest.mark.parametrize("support", ["supported", "unsupported", "missing"])
+def test_applied_route_capabilities_match_backend_parts_without_rewriting_raw_ids(
+    dashboard_runtime_result: dict[str, Any], raw: str, is_locked: bool, support: str,
+) -> None:
+    row = next(row for row in dashboard_runtime_result["appliedRouteStates"]
+               if (row["raw"], row["isLocked"], row["support"]) == (raw, is_locked, support))
+    assert row["parsed"] == {"provider": "codex", "model": "model:variant:tail"}
+    assert row["customParsed"] == {"provider": "openai-by-name", "model": "Custom:Model"}
+    assert "configured Fast" in row["header"] and "applied mappings only" in row["header"]
+    assert row["before"] == row["after"]
+    first = row["after"].split("</li>", 1)[0]
+    assert "<b>model:variant:tail</b>" in first
+    if support == "supported":
+        assert "Supported speeds: Standard, Fast" in first
+        assert "Supported · Applicable: Fast · Outbound wire: priority" in first
+        assert "No capability entry" not in first
+    elif support == "unsupported":
+        assert "Unsupported · Applicable: Standard · Outbound wire: omitted (Standard)" in first
+        assert "Synthetic catalog does not advertise Fast" in first
+    else:
+        assert "Unknown · Applicable: Unknown · Outbound wire: Unknown" in first
+        assert "No capability entry for this applied model" in first
+    assert "canonical-extra" in row["after"]
+    assert "Custom:Model" not in row["after"]
+    assert "draft-only" not in row["after"] and "staged-only" not in row["after"]
+    snapshot = row["snapshot"]
+    assert snapshot["rawLive"] == {"opus": raw, "haiku": " openai-by-name : Custom:Model ", "sonnet": "codex:canonical-extra"}
+    assert snapshot["rawDraft"]["opus"] == "codex:draft-only"
+    assert raw in snapshot["targetIds"] and raw in snapshot["renderedTargetIds"]
+    assert " openai-by-name : Custom:Model " in snapshot["targetIds"]
+    assert snapshot["isLocked"] is snapshot["isLockVisible"] is snapshot["selectDisabled"] is is_locked
+    assert row["requests"] == [{"url": "/admin/providers/codex/capabilities/refresh", "options": {
+        "method": "POST", "headers": {"Content-Type": "application/json"}, "body": "{}",
+    }}]
+
+
+@pytest.mark.parametrize("raw", [
+    "codex:model:variant:tail", "codex: model:variant:tail", "codex :model:variant:tail",
+    " \tcodex \t: \tmodel:variant:tail \n", " openai-by-name : Custom:Model ",
+])
+def test_selected_speed_consumer_accepts_backend_normalized_codex_prefix_only(
+    dashboard_runtime_result: dict[str, Any], raw: str,
+) -> None:
+    row = next(row for row in dashboard_runtime_result["normalizedSpeedTargets"] if row["raw"] == raw)
+    assert row["before"] == []
+    assert row["savedTier"] == row["draftTier"] == "fast"
+    if raw.strip().startswith("openai-by-name"):
+        assert row["requests"] == []
+        assert "Enter a codex:model target" in row["result"]
+    else:
+        assert row["requests"] == [{"url": "/admin/test", "options": {
+            "method": "POST", "headers": {"Content-Type": "application/json"},
+            "body": json.dumps({"target": raw.strip(), "service_tier": "fast"}, separators=(",", ":")),
+        }}]
+        assert "Requested UI speed: Fast" in row["result"]
+        assert "Final outbound wire tier: priority" in row["result"]
+        assert "model:variant:tail" in row["result"]
+        assert "Speed confirmation: Confirmed" in row["result"]
+
+
+@pytest.mark.parametrize("raw,model", [
+    ("codex:\u0085model:tail", "model:tail"), ("codex\u0085:model:tail", "model:tail"),
+    ("codex:\ufeffmodel:tail", "\ufeffmodel:tail"), ("codex:model:tail\ufeff", "model:tail\ufeff"),
+])
+def test_route_boundaries_match_python_strip_and_preserve_opaque_model_data(
+    dashboard_runtime_result: dict[str, Any], raw: str, model: str,
+) -> None:
+    row = next(row for row in dashboard_runtime_result["routeBoundaryParity"] if row["raw"] == raw)
+    assert row["expectedModel"] == model
+    assert row["parsed"] == {"provider": "codex", "model": model}
+    assert f"<b>{model}</b>" in row["models"]
+    assert "Supported · Applicable: Fast · Outbound wire: priority" in row["models"]
+    assert "No capability entry" not in row["models"]
+    assert row["live"] == {"opus": raw}
+    assert row["targetIds"] == [raw]
+
+
+@pytest.mark.parametrize("raw,model", [
+    ("codex:\u0085model:tail", "model:tail"), ("codex\u0085:model:tail", "model:tail"),
+    ("codex:\ufeffmodel:tail", "\ufeffmodel:tail"), ("codex:model:tail\ufeff", "model:tail\ufeff"),
+])
+def test_explicit_target_keeps_backend_opaque_model_characters(
+    dashboard_runtime_result: dict[str, Any], raw: str, model: str,
+) -> None:
+    row = next(row for row in dashboard_runtime_result["routeBoundaryParity"] if row["raw"] == raw)
+    assert len(row["requests"]) == 1
+    assert row["requests"][0]["url"] == "/admin/test"
+    assert json.loads(row["requests"][0]["options"]["body"]) == {"target": raw, "service_tier": "fast"}
+    assert f"response.model: {model}" in row["diagnostic"]
+    assert "Speed confirmation: Confirmed" in row["diagnostic"]
 
 
 def test_route_of_has_no_codex_or_provider_membership_fallback() -> None:
@@ -1018,12 +1125,15 @@ def test_dashboard_health_boot_sends_token_and_renders_identities_after_admin_re
         assert scenario["helloHasToken"] is False
         assert scenario["promptCount"] == (1 if scenario["firstTokenWasValid"] else 2)
         admin_requests = scenario["adminRequests"]
-        assert len(admin_requests) == (8 if scenario["firstTokenWasValid"] else 16)
+        assert len(admin_requests) == (9 if scenario["firstTokenWasValid"] else 18)
         assert all(
             request["hasValidToken"] is scenario["firstTokenWasValid"]
-            for request in admin_requests[:8]
+            for request in admin_requests[:9]
         )
-        assert all(request["hasValidToken"] for request in admin_requests[8:])
+        assert all(request["hasValidToken"] for request in admin_requests[9:])
+        assert sum(request["url"] == "/admin/providers/codex/capabilities" for request in admin_requests) == (
+            1 if scenario["firstTokenWasValid"] else 2
+        )
         assert scenario["healthRequests"] == [{"url": "/health", "hasValidToken": True}]
         assert "codex-identity@example.com" in scenario["identities"]["codex"]
         assert "kimi-account-identity" in scenario["identities"]["kimi"]
@@ -1119,3 +1229,839 @@ def test_account_pin_and_usage_labels_do_not_claim_exclusive_serving_or_duration
     assert ">Remove</button>" in feedback["servingCopy"]["unpinned"]
     assert "Session window" in feedback["unknownDurationUsage"]
     assert "5-hour" not in feedback["unknownDurationUsage"]
+
+
+@pytest.mark.parametrize(
+    "plan_type,expected_html",
+    [
+        ("<future-plan>", "<b>&lt;future-plan></b> plan"),
+        ("PRO", "<b>PRO</b> plan"),
+        ("constructor", "<b>constructor</b> plan"),
+        ("toString", "<b>toString</b> plan"),
+        ("__proto__", "<b>__proto__</b> plan"),
+        ("", ""),
+        (None, ""),
+    ],
+)
+def test_usage_plan_preserves_unknown_codex_values(
+    dashboard_runtime_result: dict[str, Any], plan_type: str | None, expected_html: str,
+) -> None:
+    rendered = next(
+        row for row in dashboard_runtime_result["usageRendering"]["plans"]
+        if row["provider"] == "codex" and row["planType"] == plan_type
+    )
+    assert rendered["html"] == expected_html
+    assert rendered["rawPlanType"] == plan_type
+
+
+@pytest.mark.parametrize("provider", ["claude", "kimi", "grok"])
+@pytest.mark.parametrize("plan_type", ["pro", "prolite", "promax", "plus", "<future-plan>"])
+def test_usage_plan_keeps_other_providers_raw(
+    dashboard_runtime_result: dict[str, Any], provider: str, plan_type: str,
+) -> None:
+    rendered = next(
+        row for row in dashboard_runtime_result["usageRendering"]["plans"]
+        if row["provider"] == provider and row["planType"] == plan_type
+    )
+    assert rendered["html"] == f"<b>{plan_type.replace('<', '&lt;')}</b> plan"
+    assert rendered["rawPlanType"] == plan_type
+
+
+def test_codex_usage_windows_preserve_weekly_only(
+    dashboard_runtime_result: dict[str, Any],
+) -> None:
+    body = dashboard_runtime_result["usageRendering"]["windows"]["weeklyOnly"]
+    assert "Weekly window" in body
+    assert "37%" in body
+    assert body.count('class="uwin"') == 1
+    assert "Session window" not in body
+    assert "0%" not in body
+    assert "unlimited" not in body.lower()
+    assert "Reset credits" not in body
+
+
+def test_codex_usage_windows_do_not_invent_unreported_limits(
+    dashboard_runtime_result: dict[str, Any],
+) -> None:
+    body = dashboard_runtime_result["usageRendering"]["windows"]["noWindows"]
+    assert "No usage windows reported" in body
+    assert 'class="uwin"' not in body
+    assert "Session window" not in body
+    assert "Weekly window" not in body
+    assert "0%" not in body
+    assert "unlimited" not in body.lower()
+    assert "Reset credits" not in body
+
+
+@pytest.mark.parametrize(
+    "plan_type,expected_label",
+    [
+        ("pro", "Pro 200"),
+        ("prolite", "Pro 100"),
+        ("promax", "Pro 500"),
+        ("plus", "Plus"),
+    ],
+)
+def test_codex_usage_plan_labels(
+    dashboard_runtime_result: dict[str, Any], plan_type: str, expected_label: str,
+) -> None:
+    rendered = next(
+        row for row in dashboard_runtime_result["usageRendering"]["plans"]
+        if row["provider"] == "codex" and row["planType"] == plan_type
+    )
+    assert rendered["html"] == f"<b>{expected_label}</b> plan"
+    assert rendered["rawPlanType"] == plan_type
+
+
+def test_codex_usage_copy_discloses_shared_provider_usage_and_credits() -> None:
+    match = re.search(
+        r'<h2>Codex Status</h2>.*?<div class="sub">(.*?)</div>',
+        DASHBOARD_HTML,
+        re.DOTALL,
+    )
+    assert match is not None
+    copy = match.group(1)
+    assert "ChatGPT Work and Codex share provider-reported usage and credits" in copy
+    assert "including activity outside this gateway" in copy
+
+
+def test_codex_speed_selector_supports_three_tiers_and_reloads(
+    dashboard_runtime_result: dict[str, Any],
+) -> None:
+    states = dashboard_runtime_result["codexSpeedStates"]
+    assert states["selectPresent"] is True
+    assert states["validEnvelopes"] == [True, True, True]
+    assert states["invalidEnvelopes"] == [False, False, False, False]
+    assert states["initial"] == {
+        "value": "standard", "live": None, "draft": None, "applyDisabled": True,
+    }
+    assert [row["request"] for row in states["selections"]] == [
+        {"service_tier": "fast"}, {"service_tier": "ultrafast"}, {"service_tier": None},
+    ]
+    for row, tier, value in zip(
+        states["selections"], ["fast", "ultrafast", None], ["fast", "ultrafast", "standard"],
+    ):
+        assert row["draft"]["draft"] == tier
+        assert row["draft"]["applyDisabled"] is False
+        assert row["saved"] == {"value": value, "live": tier, "draft": tier, "applyDisabled": True}
+    assert states["reloaded"] == {
+        "value": "ultrafast", "live": "ultrafast", "draft": "ultrafast", "applyDisabled": True,
+    }
+    assert states["nonSettingsRequests"] == [
+        {"url": "/admin/providers/codex/capabilities", "options": None},
+    ] * 3
+
+
+def test_codex_speed_control_and_consumption_notice_live_in_router() -> None:
+    router = DASHBOARD_HTML.split('id="tab-map"', 1)[1].split('id="tab-status"', 1)[0]
+    assert 'id="codex-card"' in router
+    assert 'id="codex-fast"' not in DASHBOARD_HTML
+    assert '<option value="standard">Standard</option>' in router
+    assert '<option value="fast">Fast</option>' in router
+    assert '<option value="ultrafast">Ultrafast</option>' in router
+    assert router.index('id="codex-consumption"') < router.index('id="codex-speed"')
+    notice = router.split('id="codex-consumption"', 1)[1].split('</div>', 1)[0]
+    assert "included allowance" in notice
+    assert "8x Standard" in notice
+    assert "purchased credits" in notice
+    assert "6x Standard" in notice
+    assert "not a speed guarantee" in notice
+    assert 'aria-describedby="codex-consumption codex-speed-hint"' in router
+
+
+def test_codex_settings_start_disabled_and_reject_locked_or_invalid_events(
+    dashboard_runtime_result: dict[str, Any],
+) -> None:
+    states = dashboard_runtime_result["codexSettingsStates"]
+    initial = states["initial"]
+    assert initial["hasLoaded"] is False
+    assert initial["value"] == ""
+    assert initial["selectDisabled"] is True
+    assert initial["applyDisabled"] is True
+    for row in states["locks"]:
+        assert row["state"]["locked"] is True
+        assert row["state"]["value"] == (row["tier"] or "standard")
+        assert row["state"]["draft"] == row["tier"]
+        assert row["state"]["selectDisabled"] is True
+        assert row["state"]["applyDisabled"] is True
+        assert row["requests"] == []
+    assert states["invalidChange"]["state"]["value"] == "fast"
+    assert states["invalidChange"]["state"]["draft"] == "fast"
+    assert states["invalidChange"]["requests"] == []
+
+
+def test_codex_settings_block_events_while_save_is_pending(
+    dashboard_runtime_result: dict[str, Any],
+) -> None:
+    scenario = dashboard_runtime_result["codexSettingsStates"]["pendingSave"]
+    for state in (scenario["pendingState"], scenario["afterForcedEvents"]):
+        assert state["isSaving"] is True
+        assert state["selectDisabled"] is True
+        assert state["applyDisabled"] is True
+        assert state["draft"] == "ultrafast"
+    assert len(scenario["requests"]) == 1
+    assert json.loads(scenario["requests"][0]["options"]["body"]) == {"service_tier": "ultrafast"}
+    assert scenario["saved"]["live"] == "ultrafast"
+    assert scenario["saved"]["isSaving"] is False
+
+
+def test_codex_settings_keep_draft_on_save_errors_and_reload_confirmed_state(
+    dashboard_runtime_result: dict[str, Any],
+) -> None:
+    scenarios = dashboard_runtime_result["codexSettingsStates"]["saveErrors"]
+    assert len(scenarios) == 4
+    for row in scenarios:
+        failed = row["failed"]
+        assert failed["live"] == "fast"
+        assert failed["draft"] == "ultrafast"
+        assert failed["value"] == "ultrafast"
+        assert failed["applyDisabled"] is False
+        assert failed["isSaving"] is False
+        assert "Could not confirm" in failed["status"]
+        assert "Reload settings" in failed["status"]
+        assert "APPLIED" not in failed["toast"]
+        recovered = row["recovered"]
+        assert recovered["value"] == "ultrafast"
+        assert recovered["live"] == recovered["draft"] == "ultrafast"
+        assert recovered["hasLoaded"] is True
+        assert recovered["applyDisabled"] is True
+    error = next(row for row in scenarios if row["outcome"] == "error")
+    assert "&lt;save failed>" in error["failed"]["toast"]
+
+
+def test_codex_settings_load_errors_disable_editing_until_reload(
+    dashboard_runtime_result: dict[str, Any],
+) -> None:
+    scenarios = dashboard_runtime_result["codexSettingsStates"]["loadErrors"]
+    assert len(scenarios) == 3
+    for row in scenarios:
+        assert row["failed"]["hasLoaded"] is False
+        assert row["failed"]["selectDisabled"] is True
+        assert row["failed"]["applyDisabled"] is True
+        assert "Reload settings" in row["failed"]["status"]
+        assert row["guardRequests"] == []
+        assert row["recovered"]["hasLoaded"] is True
+        assert row["recovered"]["value"] == "ultrafast"
+        assert row["recovered"]["selectDisabled"] is False
+
+
+def test_codex_settings_conflict_uses_only_valid_refresh_and_keeps_failed_lock(
+    dashboard_runtime_result: dict[str, Any],
+) -> None:
+    scenarios = dashboard_runtime_result["codexSettingsStates"]["conflicts"]
+    assert len(scenarios) == 5
+    for row in scenarios:
+        pending = row["pendingRefresh"]
+        assert pending["locked"] is True
+        assert pending["live"] == "fast"
+        assert pending["draft"] == "ultrafast"
+        assert pending["selectDisabled"] is True
+        assert pending["isSaving"] is True
+        assert [request["url"] for request in row["beforeRefreshRequests"]] == [
+            "/admin/settings/codex", "/admin/settings/codex",
+        ]
+        refreshed = row["refreshed"]
+        assert refreshed["isSaving"] is False
+        if row["outcome"] in ("unlocked", "locked"):
+            assert refreshed["live"] is None
+            assert refreshed["draft"] is None
+            assert refreshed["value"] == "standard"
+            assert refreshed["locked"] is (row["outcome"] == "locked")
+        else:
+            assert refreshed["locked"] is True
+            assert refreshed["live"] == "fast"
+            assert "Editing remains locked" in refreshed["status"]
+        assert row["recovered"]["locked"] is False
+        assert row["recovered"]["value"] == "ultrafast"
+
+
+def test_codex_capabilities_render_mixed_applied_models_without_entitlement_inference(
+    dashboard_runtime_result: dict[str, Any],
+) -> None:
+    states = dashboard_runtime_result["codexCapabilitiesStates"]
+    mixed = states["mixed"]
+    assert "Current" in mixed["header"]
+    assert "configured Ultrafast" in mixed["header"]
+    assert "applied mappings only" in mixed["header"]
+    assert states["expectedFetchedTime"] in mixed["time"]
+    models = mixed["models"]
+    assert "Supported speeds: Standard, Fast, Ultrafast" in models
+    assert "Supported speeds: Standard, Fast" in models
+    assert "Supported speeds: Unknown" in models
+    assert "Applicable: Ultrafast" in models
+    assert "Applicable: Standard" in models
+    assert "Outbound wire: ultrafast" in models
+    assert "Outbound wire: omitted (Standard)" in models
+    assert "Unsupported" in models
+    assert "Unknown" in models
+    assert "Catalog does not advertise ultrafast" in models
+    assert "not listed in the authenticated catalog" in models
+    assert "tier metadata is incomplete" in models
+    assert "Advertised tier IDs: priority, ultrafast, future-tier" in models
+    assert "manual:future&lt;script>" in models
+    assert "manual:future<script>" not in models
+    assert "draft-only" not in models
+    assert "staged-only" not in models
+    assert "unrelated" not in models
+    assert "kimi-model" not in models
+    assert models.count("<b>both</b>") == 1
+    assert "No applied Codex mappings" in states["noMappings"]["models"]
+
+
+def test_codex_capabilities_remain_configured_not_draft_selection(
+    dashboard_runtime_result: dict[str, Any],
+) -> None:
+    states = dashboard_runtime_result["codexCapabilitiesStates"]
+    draft = states["draftSelection"]
+    assert draft["header"] == states["mixed"]["header"]
+    assert draft["models"] == states["mixed"]["models"]
+    assert "Configured speed: Ultrafast" in draft["settings"]
+    assert "Draft speed: Fast (not applied)" in draft["settings"]
+
+
+def test_codex_capabilities_preserve_top_level_stale_unknown_and_fetch_time(
+    dashboard_runtime_result: dict[str, Any],
+) -> None:
+    states = dashboard_runtime_result["codexCapabilitiesStates"]
+    stale = states["stale"]
+    assert "Stale" in stale["header"]
+    assert "Catalog refresh failed: <busy>" in stale["header"]
+    assert stale["time"] == states["mixed"]["time"]
+    assert "Supported" in stale["models"]
+    unknown = states["unknown"]
+    assert "Unknown" in unknown["header"]
+    assert "Authentication unavailable" in unknown["header"]
+    assert "Last fetched: Never" == unknown["time"]
+    assert "Supported speeds: Unknown" in unknown["models"]
+    assert "Current account metadata unavailable" in unknown["models"]
+    assert "Unsupported" not in unknown["models"]
+
+
+def test_codex_metadata_boot_and_setting_or_mapping_saves_read_serving_capabilities_only(
+    dashboard_runtime_result: dict[str, Any],
+) -> None:
+    states = dashboard_runtime_result["codexMetadataStates"]
+    assert "configured Ultrafast" in states["boot"]["header"]
+    assert sum(row["url"] == "/admin/providers/codex/capabilities" for row in states["bootRequests"]) == 1
+    assert states["draft"]["requests"] == []
+    assert states["draft"]["state"]["header"] == states["boot"]["header"]
+    assert [row["url"] for row in states["saved"]["requests"]] == [
+        "/admin/settings/codex", "/admin/providers/codex/capabilities",
+    ]
+    assert "configured Fast" in states["saved"]["state"]["header"]
+    assert "Outbound wire: priority" in states["saved"]["state"]["models"]
+    assert [row["url"] for row in states["mappingSaved"]["requests"]] == [
+        "/admin/settings/mapping", "/admin/providers/codex/capabilities",
+    ]
+    assert "<b>unrelated</b>" in states["mappingSaved"]["state"]["models"]
+    assert all(row["url"] != "/admin/test" for row in states["allRequests"])
+    assert all(
+        row["options"] is None
+        for row in states["allRequests"] if row["url"] == "/admin/providers/codex/capabilities"
+    )
+
+
+def test_codex_metadata_refresh_is_explicit_post_and_updates_same_account_support(
+    dashboard_runtime_result: dict[str, Any],
+) -> None:
+    states = dashboard_runtime_result["codexMetadataStates"]
+    refreshed = states["refreshed"]
+    assert refreshed["requests"] == [{
+        "url": "/admin/providers/codex/capabilities/refresh",
+        "options": {"method": "POST", "headers": {"Content-Type": "application/json"}, "body": "{}"},
+    }]
+    assert "configured Ultrafast" in refreshed["state"]["header"]
+    assert "Unsupported" in states["boot"]["models"]
+    assert "Unsupported" not in refreshed["state"]["models"]
+    assert "<b>fast-only</b>" in refreshed["state"]["models"]
+    assert refreshed["state"]["time"] != states["boot"]["time"]
+    assert "Refresh capabilities" in DASHBOARD_HTML
+    assert "no model request" in DASHBOARD_HTML
+    assert len([row for row in states["allRequests"] if row["url"].endswith("/capabilities/refresh")]) == 1
+
+
+def test_codex_metadata_ignores_obsolete_reply_and_uses_authenticated_json_channel(
+    dashboard_runtime_result: dict[str, Any],
+) -> None:
+    states = dashboard_runtime_result["codexMetadataStates"]
+    assert states["race"] is not None
+    assert "new current snapshot" in states["race"]["state"]["header"]
+    assert "obsolete snapshot" not in states["race"]["state"]["header"]
+    assert states["race"]["state"]["value"] == "ultrafast"
+    assert states["race"]["locked"] is False
+    assert states["authRequests"] == [{
+        "url": "/admin/providers/codex/capabilities/refresh",
+        "options": {"method": "POST", "headers": {
+            "Content-Type": "application/json", "Authorization": "Bearer metadata-test-token",
+        }, "body": "{}"},
+    }]
+
+
+def test_codex_metadata_failures_and_malformed_responses_never_claim_support(
+    dashboard_runtime_result: dict[str, Any],
+) -> None:
+    states = dashboard_runtime_result["codexMetadataFailureStates"]
+    assert len(states["scenarios"]) == 18
+    for row in states["scenarios"]:
+        failed = row["failed"]
+        assert "Unknown" in failed["header"]
+        assert "Refresh capabilities" in failed["header"]
+        assert "Supported speeds: Standard" not in failed["models"]
+        assert "Applicable: Ultrafast" not in failed["models"]
+        assert "Supported speeds: Unknown" in failed["models"]
+        assert failed["time"] == "Last fetched: Unavailable"
+        assert row["editingEnabled"] is True
+        assert row["refreshEnabled"] is True
+        if row["outcome"] not in ("http", "network"):
+            assert "Invalid capability response" in failed["header"]
+            assert "Gateway unreachable" not in failed["header"]
+        assert "Current" in row["recovered"]["header"]
+        assert "Applicable: Ultrafast" in row["recovered"]["models"]
+        assert [request["url"] for request in row["requests"]] == [
+            "/admin/providers/codex/capabilities/refresh",
+            "/admin/providers/codex/capabilities/refresh",
+        ]
+    http = next(row for row in states["scenarios"] if row["outcome"] == "http")
+    assert "<catalog unavailable>" in http["failed"]["header"]
+    assert "No capability entry for this applied model" in states["missingModel"]["models"]
+
+
+def test_codex_metadata_pending_refresh_and_setting_change_keep_scope_honest(
+    dashboard_runtime_result: dict[str, Any],
+) -> None:
+    states = dashboard_runtime_result["codexMetadataFailureStates"]
+    pending = states["pending"]
+    assert pending is not None
+    assert pending["during"]["disabled"] is True
+    assert pending["during"]["busy"] == "true"
+    assert "Checking metadata" in pending["during"]["state"]["header"]
+    assert len(pending["requests"]) == 1
+    assert "Stale" in pending["after"]["header"]
+    assert "Same-account fetch failed" in pending["after"]["header"]
+    changed = states["changedSetting"]
+    assert changed["settings"] == "Configured speed: Fast."
+    assert "configured Ultrafast" not in changed["header"]
+    assert "Unknown" in changed["header"]
+    assert "Applicable: Ultrafast" not in changed["models"]
+    assert "configured Fast" in states["changedSettingResolved"]["header"]
+    assert "Applicable: Fast" in states["changedSettingResolved"]["models"]
+
+
+def test_codex_selected_speed_test_is_explicit_and_retains_ordinary_untiered_test(
+    dashboard_runtime_result: dict[str, Any],
+) -> None:
+    states = dashboard_runtime_result["codexSpeedTestStates"]
+    assert len(states["rows"]) == 7
+    for row in states["rows"]:
+        assert row["selectionRequests"] == []
+        assert len(row["requests"]) == 1
+        assert row["requests"][0]["url"] == "/admin/test"
+        assert row["requests"][0]["options"]["method"] == "POST"
+        assert row["requests"][0]["options"]["headers"] == {"Content-Type": "application/json"}
+        assert json.loads(row["requests"][0]["options"]["body"]) == {
+            "target": "codex:manual:model", "service_tier": row["requested"],
+        }
+        assert row["result"]["live"] is None
+        assert row["result"]["draft"] == row["requested"]
+        assert row["result"]["hidden"] is False
+    assert len(states["ordinary"]["requests"]) == 1
+    ordinary = states["ordinary"]["requests"][0]
+    assert ordinary["url"] == "/admin/test"
+    assert json.loads(ordinary["options"]["body"]) == {"target": "codex:manual:model"}
+    assert "OK" in states["ordinary"]["toast"]
+    assert "ordinary-model" in states["ordinary"]["toast"]
+    assert DASHBOARD_HTML.index('id="codex-consumption"') < DASHBOARD_HTML.index('id="codex-speed-test"')
+    assert 'aria-describedby="codex-speed-warning"' in DASHBOARD_HTML
+    assert "can consume allowance or purchased credits" in DASHBOARD_HTML
+    assert "selector's draft" in DASHBOARD_HTML
+    assert "without saving" in DASHBOARD_HTML
+
+
+def test_codex_selected_speed_test_separates_requested_wire_report_and_confirmation(
+    dashboard_runtime_result: dict[str, Any],
+) -> None:
+    for row in dashboard_runtime_result["codexSpeedTestStates"]["rows"]:
+        html = row["result"]["html"]
+        requested_label = {None: "Standard", "fast": "Fast", "ultrafast": "Ultrafast"}[row["requested"]]
+        assert "Connection: Responded" in html
+        assert f"Requested UI speed: {requested_label}" in html
+        assert f"Final outbound wire tier: {row['sent'] or 'omitted (Standard)'}" in html
+        assert f"Backend-reported tier: {row['reported'] or 'Not reported (unconfirmed)'}" in html
+        confirmation_label = {
+            "confirmed": "Confirmed", "different": "Different tier", "reported": "Reported (no accelerated tier requested)",
+            "unconfirmed": "Unconfirmed",
+        }[row["confirmation"]]
+        assert f"Speed confirmation: {confirmation_label}" in html
+        assert "served-model" in html
+        if row["reported"] is None:
+            assert "Speed confirmation: Confirmed" not in html
+        if row["reason"]:
+            assert row["reason"].replace("<", "&lt;") in html
+        assert "<provider chose another tier>" not in html
+        assert "12ms" in html
+
+
+def test_codex_selected_speed_test_guards_targets_and_preserves_pending_request_choice(
+    dashboard_runtime_result: dict[str, Any],
+) -> None:
+    states = dashboard_runtime_result["codexSpeedTestStates"]
+    for row in states["guards"]:
+        assert row["requests"] == []
+        assert "Enter a codex:model target" in row["result"]["html"]
+        assert row["result"]["role"] == "alert"
+    pending = states["pending"]
+    assert pending["before"]["disabled"] is True
+    assert "Testing" in pending["before"]["html"]
+    assert len(pending["requests"]) == 1
+    assert pending["after"]["disabled"] is False
+    assert pending["after"]["draft"] == "fast"
+    assert "Requested UI speed: Ultrafast" in pending["after"]["html"]
+    assert "Requested UI speed: Fast" not in pending["after"]["html"]
+    assert states["authRequests"] == [{
+        "url": "/admin/test", "options": {"method": "POST", "headers": {
+            "Content-Type": "application/json", "Authorization": "Bearer speed-test-token",
+        }, "body": '{"target":"codex:manual:model","service_tier":"fast"}'},
+    }]
+
+
+@pytest.mark.parametrize("outcome", [
+    "legacy", "missing-body", "http", "failed-response", "network", "null-diagnostic", "array-diagnostic",
+    "invalid-requested", "echo-mismatch", "missing-wire", "invalid-wire", "invalid-report", "invalid-confirmation",
+    "false-confirmed", "false-reported", "invalid-capability", "invalid-capability-reason", "invalid-confirmation-reason",
+])
+def test_codex_selected_speed_missing_or_malformed_diagnostics_are_unconfirmed(
+    dashboard_runtime_result: dict[str, Any], outcome: str,
+) -> None:
+    rows = dashboard_runtime_result["codexSpeedFailureStates"]["rows"]
+    assert len(rows) == 18
+    row = next(row for row in rows if row["outcome"] == outcome)
+    result = row["result"]
+    html = result["html"]
+    assert len(row["requests"]) == 1
+    assert "Requested UI speed: Ultrafast" in html
+    assert "Speed confirmation: Unconfirmed" in html
+    assert "Speed confirmation: Confirmed" not in html
+    assert result["disabled"] is False
+    assert result["hidden"] is False
+    if outcome == "legacy":
+        assert "Connection: Responded" in html
+        assert "did not return tier diagnostics" in html
+        assert "Final outbound wire tier: Not available" in html
+    elif outcome == "missing-body":
+        assert "Invalid speed-test response" in html
+    elif outcome == "http":
+        assert "&lt;auth failed>" in html
+    elif outcome == "failed-response":
+        assert "Connection: Failed (502)" in html
+        assert "&lt;stream incomplete>" in html
+        assert "Backend-reported tier: ultrafast" in html
+        assert "did not complete successfully" in html
+        assert result["role"] == "alert"
+    elif outcome == "network":
+        assert "Connection: Unreachable" in html
+        assert "Gateway unreachable" in html
+        assert result["role"] == "alert"
+    else:
+        assert "Connection: Responded" in html
+        assert "Invalid tier diagnostic response" in html
+        assert "Final outbound wire tier: Not available" in html
+        assert "Backend-reported tier: Not reported (unconfirmed)" in html
+
+
+def test_codex_selected_speed_blocks_unknown_or_busy_settings_but_allows_locked_selection(
+    dashboard_runtime_result: dict[str, Any],
+) -> None:
+    states = dashboard_runtime_result["codexSpeedFailureStates"]
+    assert len(states["blocked"]) == 3
+    for row in states["blocked"]:
+        assert row["disabled"] is True
+        assert row["requests"] == []
+    assert len(states["locked"]["requests"]) == 1
+    assert json.loads(states["locked"]["requests"][0]["options"]["body"]) == {
+        "target": "codex:manual:model", "service_tier": "ultrafast",
+    }
+    assert "Speed confirmation: Confirmed" in states["locked"]["result"]["html"]
+
+
+@pytest.mark.parametrize("outcome", ["saved", "conflict", "reload-error"])
+def test_codex_boot_does_not_overwrite_newer_reload_save_or_conflict_lock(
+    dashboard_runtime_result: dict[str, Any], outcome: str,
+) -> None:
+    scenario = next(row for row in dashboard_runtime_result["codexBootRaceStates"] if row["outcome"] == outcome)
+    newer = scenario["newer"]
+    if outcome == "reload-error":
+        assert newer["hasLoaded"] is False
+        assert newer["disabled"] is True
+        assert "Reload settings" in newer["status"]
+    else:
+        assert newer["live"] == newer["draft"] == "ultrafast"
+        assert newer["value"] == "ultrafast"
+        assert newer["locked"] is (outcome == "conflict")
+    assert scenario["final"] == newer
+    assert all(row["url"] != "/admin/test" for row in scenario["requests"])
+
+
+@pytest.mark.parametrize("outcome", ["http", "malformed", "network"])
+def test_codex_boot_settings_failures_disable_unknown_selection_and_can_reload(
+    dashboard_runtime_result: dict[str, Any], outcome: str,
+) -> None:
+    scenario = next(row for row in dashboard_runtime_result["codexBootFailureStates"] if row["outcome"] == outcome)
+    assert scenario["failed"]["hasLoaded"] is False
+    assert scenario["failed"]["value"] == ""
+    assert scenario["failed"]["disabled"] is True
+    assert scenario["failed"]["testDisabled"] is True
+    assert "Could not load settings" in scenario["failed"]["status"]
+    assert "Reload settings" in scenario["failed"]["status"]
+    assert scenario["recovered"] == {"hasLoaded": True, "value": "ultrafast", "disabled": False}
+    assert all(row["url"] != "/admin/test" for row in scenario["requests"])
+
+
+def test_codex_long_action_labels_do_not_inherit_fixed_connection_button_width() -> None:
+    selectors = "#codex-reload,#codex-capabilities-refresh,#codex-speed-test"
+    rule = re.search(re.escape(selectors) + r"\{([^}]+)\}", DASHBOARD_CSS)
+    assert rule is not None
+    assert "width:auto" in rule.group(1)
+    assert "padding-inline:14px" in rule.group(1)
+    assert "max-width:100%" in rule.group(1)
+    assert ".ctrow button{width:112px;flex:none;padding-inline:0;text-align:center}" in DASHBOARD_CSS
+
+
+@pytest.mark.parametrize("provider", ["kimi", "grok"])
+@pytest.mark.parametrize("locked", [False, True])
+@pytest.mark.parametrize("authentication", ["none", "valid", "retry"])
+@pytest.mark.parametrize("outcome", ["network", "http", "malformed"])
+def test_optional_catalog_boot_preserves_core_state_and_authentication(
+    dashboard_runtime_result: dict[str, Any], provider: str, locked: bool,
+    authentication: str, outcome: str,
+) -> None:
+    scenario = next(row for row in dashboard_runtime_result["optionalCatalogBoot"]
+                    if (row["provider"], row["locked"], row["authentication"], row["outcome"])
+                    == (provider, locked, authentication, outcome))
+    mapping = {"sonnet": "codex:saved-main", "haiku": "kimi:saved-secondary"}
+    assert scenario["initial"] == {"live": {}, "draft": {}, "locked": False, "codexLoaded": False}
+    assert set(scenario["decodedBeforeFailure"]) == {
+        "/admin/settings/mapping", "/admin/settings/codex", "/admin/settings/log-level",
+        "/admin/settings/compaction", "/admin/providers/claude/pool/routing",
+    }
+    assert scenario["live"] == scenario["draft"] == mapping
+    assert scenario["isLocked"] is locked
+    assert scenario["isLockVisible"] is locked
+    assert {"sonnet", "haiku"}.issubset(scenario["sources"])
+    assert set(scenario["targets"]) == set(mapping.values())
+    assert scenario["codex"] == {"live": "fast", "draft": "fast", "hasLoaded": True, "value": "fast", "disabled": False}
+    assert scenario["compaction"] is None
+    assert scenario["routing"] == "disabled"
+    assert "Gateway OK" in scenario["health"]
+    assert "configured Fast" in scenario["capabilities"]
+    assert scenario["catalogs"]["codex"] == ["saved-main"]
+    assert scenario["catalogs"][provider] == []
+    assert scenario["catalogs"]["grok" if provider == "kimi" else "kimi"] == ["peer-suggestion"]
+    requests = scenario["requests"]
+    assert all(row["method"] == "GET" and row["url"] != "/admin/test" for row in requests)
+    assert len(requests) == (20 if authentication == "retry" else 11)
+    assert scenario["prompts"] == {"none": 0, "valid": 1, "retry": 2}[authentication]
+    health = [row for row in requests if row["url"] == "/health"]
+    assert health == [{"url": "/health", "method": "GET", "hasValidToken": authentication != "none"}]
+    optional = [row for row in requests if row["url"] == f"/admin/providers/{provider}/models"]
+    assert [row["hasValidToken"] for row in optional] == (
+        [False, True] if authentication == "retry" else [authentication == "valid"]
+    )
+    assert scenario["warnings"] == []
+    if outcome == "network":
+        message = scenario["toast"]["html"]
+        assert scenario["toast"]["role"] == "alert"
+        assert "SUGGESTIONS UNAVAILABLE" in message
+        assert f"GET /admin/providers/{provider}/models" in message
+        assert "model suggestions" in message
+        assert "manually" in message
+    else:
+        assert scenario["toast"] == {"html": "", "role": ""}
+
+
+@pytest.mark.parametrize("name", ["provider-auth-cancel", "provider-upstream-cancel", "provider-auth-reenter", "unclassified-401"])
+def test_provider_401_retains_local_token_without_prompt_or_retry(
+    dashboard_runtime_result: dict[str, Any], name: str,
+) -> None:
+    scenario = next(row for row in dashboard_runtime_result["authErrorScopeStates"]["wrappers"] if row["name"] == name)
+    assert scenario["status"] == 401
+    assert scenario["prompts"] == 0
+    assert scenario["requestsAtResponse"] == [{"url": "/admin/providers/codex/models", "hasValidToken": True}]
+    assert scenario["tokenRetained"] is True
+    assert scenario["tokenCleared"] is False
+    assert scenario["subsequentStatus"] == 200
+    assert scenario["subsequentRequests"] == [
+        {"url": "/admin/settings/codex", "hasValidToken": True}, {"url": "/health", "hasValidToken": True},
+    ]
+    if name != "unclassified-401":
+        assert scenario["body"]["error"]["type"] == "authentication_error"
+        assert scenario["body"]["error"]["code"] is None
+        assert "Synthetic" in scenario["body"]["error"]["message"]
+
+
+@pytest.mark.parametrize("name", ["provider-auth", "provider-upstream"])
+def test_provider_401_boot_surfaces_provider_failure_and_keeps_authenticated_core(
+    dashboard_runtime_result: dict[str, Any], name: str,
+) -> None:
+    scenario = next(row for row in dashboard_runtime_result["authErrorScopeStates"]["boots"] if row["name"] == name)
+    assert scenario["promptsAfterBoot"] == scenario["prompts"] == 1
+    assert scenario["tokenRetained"] is True
+    assert scenario["subsequentStatus"] == 200
+    assert scenario["mapping"] == {"sonnet": "codex:saved-model"}
+    assert scenario["tier"] == "fast"
+    assert scenario["hasLoaded"] is True
+    assert "fixture-identity@example.invalid" in scenario["identity"]
+    assert "GET /admin/providers/codex/models" in scenario["feedback"]
+    assert "401" in scenario["feedback"]
+    assert "&lt;Synthetic" in scenario["feedback"]
+    assert len([row for row in scenario["requests"] if row["url"] == "/admin/providers/codex/models"]) == 1
+    assert all(row["hasValidToken"] for row in scenario["requests"] if row["url"] != "/api/hello")
+    assert all(row["url"] != "/admin/test" for row in scenario["requests"])
+
+
+@pytest.mark.parametrize("name", ["no-local-auth", "non-admin", "non-401", "local-retry", "local-cancel", "local-repeated-rejection"])
+def test_local_token_recovery_remains_bounded_and_respects_existing_guards(
+    dashboard_runtime_result: dict[str, Any], name: str,
+) -> None:
+    scenario = next(row for row in dashboard_runtime_result["authErrorScopeStates"]["wrappers"] if row["name"] == name)
+    is_local = name.startswith("local-")
+    assert scenario["prompts"] == (1 if is_local else 0)
+    assert len(scenario["requestsAtResponse"]) == (2 if name in ("local-retry", "local-repeated-rejection") else 1)
+    assert scenario["status"] == (200 if name == "local-retry" else 403 if name == "non-401" else 401)
+    assert scenario["tokenCleared"] is (name == "local-cancel")
+    assert scenario["tokenRetained"] is (name != "local-cancel")
+    assert scenario["subsequentStatus"] == (401 if name == "local-cancel" else 200)
+    assert all(row["hasValidToken"] is (name != "local-cancel") for row in scenario["subsequentRequests"])
+    if name == "non-admin":
+        assert scenario["requestsAtResponse"] == [{"url": "/public/catalog", "hasValidToken": False}]
+    if name in ("local-retry", "local-repeated-rejection"):
+        assert [row["hasValidToken"] for row in scenario["requestsAtResponse"]] == [False, True]
+
+
+def test_concurrent_stale_local_rejection_does_not_discard_the_corrected_token(
+    dashboard_runtime_result: dict[str, Any],
+) -> None:
+    scenario = dashboard_runtime_result["authErrorScopeStates"]["concurrent"]
+    assert scenario["prompts"] == 1
+    assert scenario["correctedStatus"] == scenario["staleStatus"] == 200
+    assert scenario["tokenRetained"] is True
+    assert scenario["requests"] == [
+        {"url": "/admin/settings/log-level", "hasValidToken": False},
+        {"url": "/admin/settings/codex", "hasValidToken": False},
+        {"url": "/admin/settings/codex", "hasValidToken": True},
+        {"url": "/admin/settings/log-level", "hasValidToken": True},
+    ]
+
+
+LOCKABLE_SAVE_OUTCOMES = (
+    "success", "success-locked", "http", "network", "conflict-unlocked",
+    "conflict-locked", "refresh-http", "refresh-malformed", "refresh-network",
+)
+
+
+@pytest.mark.parametrize("setting", ["compaction", "routing"])
+@pytest.mark.parametrize("outcome", LOCKABLE_SAVE_OUTCOMES)
+def test_lockable_save_owns_pending_request_across_actual_event_rerenders(
+    dashboard_runtime_result: dict[str, Any], setting: str, outcome: str,
+) -> None:
+    row = next(row for row in dashboard_runtime_result["lockableSaveStates"]
+               if (row["setting"], row["outcome"]) == (setting, outcome))
+    assert row["beforeClick"] == []
+    for phase in ("pending", "rerendered", "afterRepeatedClick", "directGuard"):
+        assert row[phase]["requestCount"] == 1
+        assert row[phase]["buttonDisabled"] is True
+        assert row[phase]["buttonText"] == "…"
+    requests = row["requestsBeforeLater"]
+    puts = [request for request in requests if request["options"]]
+    field = "model" if setting == "compaction" else "mode"
+    assert puts == [{"url": row["endpoint"], "options": {
+        "method": "PUT", "headers": {"Content-Type": "application/json"},
+        "body": json.dumps({field: row["first"]}, separators=(",", ":")),
+    }}]
+    assert all(request["url"] == row["endpoint"] for request in requests)
+    if row["refreshPending"] is not None:
+        pending = row["refreshPending"]
+        assert pending["requestCount"] == 2
+        assert pending["locked"] is pending["buttonDisabled"] is True
+        assert pending["buttonText"] == "…"
+        assert pending["live"] == row["initial"]
+        assert requests[-1] == {"url": row["endpoint"], "options": None}
+
+
+@pytest.mark.parametrize("setting", ["compaction", "routing"])
+@pytest.mark.parametrize("outcome", LOCKABLE_SAVE_OUTCOMES)
+def test_lockable_save_settlement_preserves_live_values_errors_and_refresh_locks(
+    dashboard_runtime_result: dict[str, Any], setting: str, outcome: str,
+) -> None:
+    row = next(row for row in dashboard_runtime_result["lockableSaveStates"]
+               if (row["setting"], row["outcome"]) == (setting, outcome))
+    after = row["after"]
+    expected_live = row["first"] if outcome.startswith("success") else row["next"] if outcome.startswith("conflict") else row["initial"]
+    is_locked = outcome in ("success-locked", "conflict-locked", "refresh-http", "refresh-malformed", "refresh-network")
+    assert after["live"] == expected_live
+    assert after["locked"] is after["cardLocked"] is after["selectDisabled"] is is_locked
+    if setting == "compaction":
+        assert after["customDisabled"] is is_locked
+    assert after["buttonText"] == "Apply"
+    assert after["buttonDisabled"] is (is_locked or (setting == "routing" and after["draft"] == after["live"]))
+    if outcome.startswith("success"):
+        assert after["live"] == row["serverAfter"] == row["first"]
+        assert "APPLIED" in after["toast"]
+    elif outcome.startswith("conflict"):
+        assert "LOCKED" in after["toast"] and "&lt;setting locked>" in after["toast"]
+    elif outcome == "refresh-network":
+        assert "ERROR" in after["toast"] and "Gateway unreachable" in after["toast"]
+    elif outcome.startswith("refresh"):
+        assert "ERROR" in after["toast"] and "Could not load current state" in after["toast"]
+    elif outcome == "http":
+        assert "ERROR" in after["toast"] and "&lt;save failed>" in after["toast"]
+    else:
+        assert "ERROR" in after["toast"] and "Gateway unreachable" in after["toast"]
+
+
+@pytest.mark.parametrize("setting", ["compaction", "routing"])
+@pytest.mark.parametrize("outcome", LOCKABLE_SAVE_OUTCOMES)
+def test_lockable_save_allows_later_intentional_save_only_after_unlocked_settlement(
+    dashboard_runtime_result: dict[str, Any], setting: str, outcome: str,
+) -> None:
+    row = next(row for row in dashboard_runtime_result["lockableSaveStates"]
+               if (row["setting"], row["outcome"]) == (setting, outcome))
+    later_requests = row["requests"][len(row["requestsBeforeLater"]):]
+    if row["after"]["locked"]:
+        assert later_requests == []
+        assert row["later"]["live"] == row["after"]["live"]
+        assert row["later"]["buttonDisabled"] is True
+    else:
+        assert len(later_requests) == 1
+        assert later_requests[0]["url"] == row["endpoint"]
+        assert later_requests[0]["options"]["method"] == "PUT"
+        field = "model" if setting == "compaction" else "mode"
+        assert json.loads(later_requests[0]["options"]["body"]) == {field: row["laterValue"]}
+        assert row["later"]["live"] == row["laterValue"]
+        assert row["later"]["buttonText"] == "Apply"
+        assert row["later"]["locked"] is False
+
+
+@pytest.mark.parametrize("setting", ["compaction", "routing"])
+def test_lockable_save_initial_env_lock_survives_events_and_direct_button_changes(
+    dashboard_runtime_result: dict[str, Any], setting: str,
+) -> None:
+    row = next(row for row in dashboard_runtime_result["lockableSaveStates"]
+               if (row["setting"], row["outcome"]) == (setting, "initial-locked"))
+    assert row["requests"] == row["beforeClick"] == []
+    for phase in ("before", "pending", "rerendered", "afterRepeatedClick", "directGuard"):
+        assert row[phase]["live"] == row["initial"]
+        assert row[phase]["locked"] is row[phase]["cardLocked"] is row[phase]["buttonDisabled"] is row[phase]["selectDisabled"] is True
+        assert row[phase]["buttonText"] == "Apply"
+
+
+def test_lockable_save_ownership_is_per_setting_not_a_global_save_lock(
+    dashboard_runtime_result: dict[str, Any],
+) -> None:
+    row = dashboard_runtime_result["lockableSaveIndependence"]
+    assert row["requests"] == [
+        {"url": "/admin/settings/compaction", "options": {"method": "PUT", "headers": {"Content-Type": "application/json"}, "body": '{"model":"claude:claude-sonnet-5"}'}},
+        {"url": "/admin/providers/claude/pool/routing", "options": {"method": "PUT", "headers": {"Content-Type": "application/json"}, "body": '{"mode":"fallback"}'}},
+    ]
+    assert row["pending"] == [{"disabled": True, "text": "…"}] * 2
+    assert row["compaction"] == "claude:claude-sonnet-5"
+    assert row["routing"] == "fallback"

@@ -23,6 +23,7 @@ from claudex.gptpro.conversation import (
     AssistantTurn,
     extract_assistant_turn,
 )
+from claudex.gptpro.retry import classify_backend_response
 from claudex.gptpro.selectors import PAGE_FETCH_PROBE_JS
 
 logger = logging.getLogger(__name__)
@@ -365,6 +366,22 @@ class DetachPoller:
         )
         if self._complete_if_stale(registration_id, registration):
             return status
+        if not 200 <= status < 300:
+            response = conversation or {}
+            response_headers = response.get("headers")
+            response_text = response.get("text")
+            action = classify_backend_response(
+                status,
+                response_headers if isinstance(response_headers, Mapping) else {},
+                response_text if isinstance(response_text, str) else "",
+            )
+            if action.action in ("challenge", "blocked"):
+                self._registrations.pop(registration_id, None)
+                if not registration.future.done():
+                    registration.future.set_exception(
+                        ask.GptProChallengeError(action.reason)
+                    )
+                return status
         if status in (401, 403):
             self._complete_session_expired(registration_id, registration)
             return status
@@ -463,6 +480,7 @@ class DetachPoller:
         *,
         headers: Mapping[str, str] | None = None,
     ) -> tuple[int, Mapping[str, Any] | None]:
+        """Return parsed JSON on success and response metadata on HTTP failure."""
         page = await self._ensure_page()
         result = await page.evaluate(
             PAGE_FETCH_PROBE_JS,
@@ -478,6 +496,8 @@ class DetachPoller:
         status = result.get("status")
         if not isinstance(status, int):
             return 0, None
+        if not 200 <= status < 300:
+            return status, result
         body = result.get("json")
         if isinstance(body, Mapping):
             return status, body
@@ -595,11 +615,11 @@ class DetachPoller:
 
 
 class _AdmissionGate:
-    """Semaphore whose limit can change while asks are in flight.
+    """Live admission limit that preserves already-admitted asks.
 
-    Raising the limit releases permits immediately so waiting submitters
-    wake; lowering it never interrupts admitted asks — the next releases are
-    swallowed instead of returning permits, so the pool shrinks as they finish.
+    Raising the limit releases permits immediately so waiting submitters wake.
+    Lowering it reclaims unused permits immediately and lets admitted asks
+    finish; new asks wait for capacity under the current limit.
     """
 
     def __init__(self, limit: int) -> None:
@@ -619,7 +639,12 @@ class _AdmissionGate:
         return self._semaphore.locked()
 
     async def acquire(self) -> None:
-        await self._semaphore.acquire()
+        while True:
+            await self._semaphore.acquire()
+            # Waiter reservations and cancellation refunds can outlive a downsize.
+            if self._pending_shrink == 0:
+                return
+            self._pending_shrink -= 1
 
     def release(self) -> None:
         if self._pending_shrink > 0:
@@ -631,7 +656,9 @@ class _AdmissionGate:
         delta = new_limit - self._limit
         self._limit = new_limit
         if delta < 0:
-            self._pending_shrink += -delta
+            reclaimed = min(-delta, self._semaphore._value)
+            self._semaphore._value -= reclaimed
+            self._pending_shrink += -delta - reclaimed
             return
         paid = min(delta, self._pending_shrink)
         self._pending_shrink -= paid
@@ -698,37 +725,49 @@ class AskRuntime:
         captured_conversation_id = conversation_id
         captured_marker: str | None = None
         captured_evidence: AskEvidence | None = None
-        execution_callbacks = callbacks
-        if callbacks is not None:
-            original_on_conversation_id = callbacks.on_conversation_id
-            original_on_marker = callbacks.on_marker
-            original_on_evidence = callbacks.on_evidence
+        callbacks = callbacks if callbacks is not None else AskCallbacks()
+        original_on_conversation_id = callbacks.on_conversation_id
+        original_on_marker = callbacks.on_marker
+        original_on_evidence = callbacks.on_evidence
 
-            def capture_conversation_id(value: str) -> None:
-                nonlocal captured_conversation_id
-                captured_conversation_id = value
-                if original_on_conversation_id is not None:
-                    original_on_conversation_id(value)
+        def capture_conversation_id(value: str) -> None:
+            nonlocal captured_conversation_id
+            captured_conversation_id = value
+            if original_on_conversation_id is not None:
+                original_on_conversation_id(value)
 
-            def capture_marker(value: str) -> None:
-                nonlocal captured_marker
-                captured_marker = value
-                if original_on_marker is not None:
-                    original_on_marker(value)
+        def capture_marker(value: str) -> None:
+            nonlocal captured_marker
+            captured_marker = value
+            if original_on_marker is not None:
+                original_on_marker(value)
 
-            def capture_evidence(evidence: AskEvidence) -> None:
-                nonlocal captured_evidence
-                captured_evidence = evidence
-                if original_on_evidence is not None:
-                    original_on_evidence(evidence)
+        def capture_evidence(evidence: AskEvidence) -> None:
+            nonlocal captured_evidence
+            captured_evidence = evidence
+            if original_on_evidence is not None:
+                original_on_evidence(evidence)
 
-            execution_callbacks = AskCallbacks(
-                on_status=callbacks.on_status,
-                on_conversation_id=capture_conversation_id,
-                on_marker=capture_marker,
-                on_detached=callbacks.on_detached,
-                on_evidence=capture_evidence,
-            )
+        def notify_recovery_evidence(evidence: AskEvidence) -> None:
+            if original_on_evidence is None:
+                return
+            try:
+                original_on_evidence(evidence)
+            except Exception as observer_exc:
+                logger.warning(
+                    "evidence observer failed during recovery %s (%s)",
+                    evidence.recovery,
+                    type(observer_exc).__name__,
+                )
+                return
+
+        execution_callbacks = AskCallbacks(
+            on_status=callbacks.on_status,
+            on_conversation_id=capture_conversation_id,
+            on_marker=capture_marker,
+            on_detached=callbacks.on_detached,
+            on_evidence=capture_evidence,
+        )
 
         try:
             submission_delay = random.uniform(
@@ -779,8 +818,7 @@ class AskRuntime:
                             recovery_detail=detail,
                         )
                         exc.args = (f"{exc}; recovery disabled: {detail}",)
-                        if callbacks is not None and callbacks.on_evidence is not None:
-                            callbacks.on_evidence(exc.evidence)
+                        notify_recovery_evidence(exc.evidence)
                     raise
                 recovery_deadline = min(
                     execution_deadline, _monotonic() + recovery_seconds,
@@ -806,32 +844,32 @@ class AskRuntime:
                         recovery_detail=detail,
                     )
                     exc.args = (f"{exc}; recovery unavailable: {detail}",)
-                    if callbacks is not None and callbacks.on_evidence is not None:
-                        callbacks.on_evidence(exc.evidence)
+                    notify_recovery_evidence(exc.evidence)
                     raise exc from recovery_exc
-                if callbacks is not None:
-                    if evidence is not None and callbacks.on_evidence is not None:
-                        callbacks.on_evidence(replace(evidence, recovery="polling"))
+                # Retain job ownership until the nonce-correlated answer settles.
+                try:
+                    if evidence is not None:
+                        notify_recovery_evidence(replace(evidence, recovery="polling"))
                     if callbacks.on_detached is not None:
                         try:
                             callbacks.on_detached()
-                        except Exception:
-                            pass
+                        except Exception as observer_exc:
+                            logger.warning(
+                                "detached observer failed during recovery (%s)",
+                                type(observer_exc).__name__,
+                            )
                     if callbacks.on_status is not None:
                         try:
                             callbacks.on_status("detached; polling for the answer")
-                        except Exception:
-                            pass
-                release_admission()
-                # Retain job ownership until the nonce-correlated answer settles.
-                try:
+                        except Exception as observer_exc:
+                            logger.warning(
+                                "status observer failed during recovery (%s)",
+                                type(observer_exc).__name__,
+                            )
+                    release_admission()
                     outcome = await _wait_until(future, delivery_deadline)
-                    if (
-                        evidence is not None
-                        and callbacks is not None
-                        and callbacks.on_evidence is not None
-                    ):
-                        callbacks.on_evidence(replace(
+                    if evidence is not None:
+                        notify_recovery_evidence(replace(
                             evidence, recovery="recovered", submission="confirmed",
                             generation_observed=True, answer_seen=True,
                             raw_extracted=True,
@@ -866,8 +904,7 @@ class AskRuntime:
                     exc.args = (
                         f"{exc}; recovery {recovery_failure}: {detail}",
                     )
-                    if callbacks is not None and callbacks.on_evidence is not None:
-                        callbacks.on_evidence(exc.evidence)
+                    notify_recovery_evidence(exc.evidence)
                     raise exc from recovery_exc
         finally:
             release_admission()

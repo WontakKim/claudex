@@ -23,7 +23,7 @@ The other GPT Pro scheduler variables are environment-only; see
 | `CLAUDEX_CONTEXT_WINDOW_MAP` | empty | JSON mapping of exact provider-prefixed model targets to positive integer context-window overrides; an override takes precedence over that provider's catalog value, e.g. `{"codex:gpt-5.6-sol": 872000}` |
 | `CLAUDEX_CUSTOM_PROVIDERS` | empty | JSON-encoded document containing `openai_compatible` and/or `anthropic_compatible` named providers; an empty string means no custom providers. See [Custom providers](custom-providers.md#custom-providers) |
 | `CLAUDEX_REASONING_EFFORT` | derived | Force `minimal`, `low`, `medium`, `high`, `xhigh`, or `max` instead of deriving the effort from each Claude request. Applies to Responses routes: Codex, Grok, and OpenAI-compatible custom providers; Grok narrows it to `low`/`medium`/`high` |
-| `CLAUDEX_CODEX_SERVICE_TIER` | unset | `codex.service_tier` setting: `fast` opts Codex requests into Fast mode where the live catalog advertises it; unset or empty keeps the standard tier. See [Fast mode](providers.md#fast-mode) |
+| `CLAUDEX_CODEX_SERVICE_TIER` | unset | `codex.service_tier` setting: `fast` or `ultrafast` selects an accelerated tier only for models whose authenticated catalog advertises it; unset or empty keeps Standard. See [Codex tiers](providers.md#fast-mode) |
 | `GPTPRO_MAX_CONCURRENT_ASKS` | `2` | `gptpro.max_concurrent_asks` setting: integer 1–10 ask-tab concurrency for the GPT Pro MCP runtime; out-of-range or non-integer values abort the boot; editable at runtime through the dashboard and `PUT /admin/settings/gptpro` |
 | `CODEX_HOME` | `~/.codex` | Directory containing Codex `auth.json` |
 | `GROK_HOME` | `~/.grok` | Directory containing the Grok CLI's `auth.json` |
@@ -70,6 +70,32 @@ The dashboard, the admin API, and the `compact` and `account use` commands
 persist their changes to this file. The admin API refuses a change with `409`
 while the corresponding environment variable is set, because that variable
 would override the persisted value at the next start.
+
+### Codex service tier
+
+Use `"codex": {"service_tier": "fast"}` or
+`"codex": {"service_tier": "ultrafast"}` in the file; omit the setting for
+Standard. Other tier strings, including the wire value `priority`, fail startup
+validation. The runtime API requires one `service_tier` field with value
+`null`, `"fast"`, or `"ultrafast"` and returns the unchanged
+`{"service_tier": ..., "env_locked": boolean}` envelope. The routes require the
+local Host and, when `CLAUDEX_LOCAL_TOKEN` is set, an
+`Authorization: Bearer <local-token>` header:
+
+```sh
+curl http://127.0.0.1:8787/admin/settings/codex
+curl -X PUT http://127.0.0.1:8787/admin/settings/codex \
+  -H 'Content-Type: application/json' \
+  -d '{"service_tier": "ultrafast"}'
+```
+
+A `PUT` persists the selection and applies it to subsequent requests. `null`
+removes the file key. If `CLAUDEX_CODEX_SERVICE_TIER` is present, even empty,
+`env_locked` is `true` and a valid `PUT` returns `409` without changing the file.
+Selecting a tier does not establish model support or actual backend service;
+check [capability status and explicit diagnostics](providers.md#capability-status-and-refresh).
+
+### Custom providers
 
 A custom-provider document can contain both supported families:
 

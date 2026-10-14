@@ -59,7 +59,7 @@ def _parse_reroute_record(record: Any) -> dict[str, Any] | None:
     if not isinstance(record, dict) or set(record) != _REROUTE_RECORD_KEYS:
         return None
     outcome = record["outcome"]
-    if outcome not in _REROUTE_OUTCOMES:
+    if not isinstance(outcome, str) or outcome not in _REROUTE_OUTCOMES:
         return None
     for key in ("timestamp", "target_model", "mapped_model"):
         if not isinstance(record[key], str):

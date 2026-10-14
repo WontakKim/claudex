@@ -1,6 +1,7 @@
 """Tests for preserving provider server-tool history across backends."""
 
 from copy import deepcopy
+import json
 
 import pytest
 
@@ -65,15 +66,25 @@ def test_normalize_preserves_native_search_and_unrelated_blocks_in_mixed_history
 
 @pytest.mark.parametrize("result_content", [[], {"type": "web_search_tool_result_error", "error_code": "max_uses_exceeded"}])
 @pytest.mark.parametrize("tool_id", ["srvtoolu_native", "ws_1", "srvtoolu_gateway_test"])
-def test_empty_and_error_results_follow_the_call_id(tool_id: str, result_content: object) -> None:
+@pytest.mark.parametrize("should_replay_native_search", [False, True])
+def test_empty_and_error_results_follow_the_call_id(
+    tool_id: str, result_content: object, should_replay_native_search: bool,
+) -> None:
     blocks = _search_blocks(tool_id)
     blocks[1]["content"] = result_content
     body = {"messages": [{"role": "assistant", "content": blocks}]}
-    normalized = normalize_server_tool_history(body)
-    if tool_id == "srvtoolu_native":
+    original = deepcopy(body)
+    normalized = normalize_server_tool_history(
+        body, should_replay_native_search=should_replay_native_search,
+    )
+    if tool_id == "srvtoolu_native" and not should_replay_native_search:
         assert normalized is body
     else:
-        assert [block["type"] for block in normalized["messages"][0]["content"]] == ["text", "text"]
+        content = normalized["messages"][0]["content"]
+        assert [block["type"] for block in content] == ["text", "text"]
+        assert json.loads(content[0]["text"].removeprefix("Web search input: ")) == blocks[0]["input"]
+        assert json.loads(content[1]["text"].removeprefix("Web search results: ")) == result_content
+    assert body == original
 
 
 def test_orphan_synthetic_result_is_converted_without_inventing_a_call() -> None:
@@ -165,14 +176,19 @@ def test_server_tool_id_does_not_capture_a_client_result_in_a_later_turn() -> No
     ("bash_code_execution", "bash_code_execution_tool_result"),
     ("text_editor_code_execution", "text_editor_code_execution_tool_result"),
 ])
-def test_native_nonsearch_server_tools_are_unchanged(tool_name: str, result_type: str) -> None:
+@pytest.mark.parametrize("should_replay_native_search", [False, True])
+def test_native_nonsearch_server_tools_are_unchanged(
+    tool_name: str, result_type: str, should_replay_native_search: bool,
+) -> None:
     body = {"messages": [{"role": "assistant", "content": [
         {"type": "server_tool_use", "id": "srvtoolu_native", "name": tool_name, "input": {}},
         {"type": result_type, "tool_use_id": "srvtoolu_native", "content": {"type": "result"}},
         {"type": "mcp_tool_use", "id": "mcptoolu_native", "name": "remote_read", "input": {}},
         {"type": "mcp_tool_result", "tool_use_id": "mcptoolu_native", "content": []},
     ]}]}
-    assert normalize_server_tool_history(body) is body
+    assert normalize_server_tool_history(
+        body, should_replay_native_search=should_replay_native_search,
+    ) is body
 
 
 def test_invalid_nonsearch_server_tool_and_typed_result_are_replayed_together() -> None:
@@ -183,3 +199,68 @@ def test_invalid_nonsearch_server_tool_and_typed_result_are_replayed_together() 
     content = normalize_server_tool_history(body)["messages"][0]["content"]
     assert [block["type"] for block in content] == ["text", "text"]
     assert "Result" in content[1]["text"]
+
+
+@pytest.mark.parametrize("split_messages", [False, True], ids=["merged", "contiguous-split"])
+def test_native_search_text_replay_preserves_coordinates_cache_and_native_default(
+    split_messages: bool,
+) -> None:
+    call, result = _search_blocks("srvtoolu_synthetic_native", signed=True)
+    call["input"] = {"query": "Café δ release"}
+    call["cache_control"] = {"type": "ephemeral", "ttl": "1h"}
+    result["content"][0].update(title="Café δ announcement", url="https://example.invalid/source")
+    result["cache_control"] = {"type": "ephemeral"}
+    text = {"type": "text", "text": "Ordinary summary."}
+    client_call = {"type": "tool_use", "id": "call_client", "name": "read_file", "input": {}}
+    if split_messages:
+        messages = [
+            {"role": "assistant", "content": [text, call]},
+            {"role": "assistant", "content": "Between the call and its result."},
+            {"role": "assistant", "content": [result, client_call]},
+        ]
+        result_coordinate = (2, 0)
+    else:
+        messages = [{"role": "assistant", "content": [text, call, result, client_call]}]
+        result_coordinate = (0, 2)
+    body = {"messages": [*messages, {"role": "user", "content": "Continue."}]}
+    original = deepcopy(body)
+    assert normalize_server_tool_history(body) is body
+
+    normalized = normalize_server_tool_history(body, should_replay_native_search=True)
+
+    assert body == original
+    expected = deepcopy(body)
+    expected["messages"][0]["content"][1] = {
+        "type": "text", "text": 'Web search input: {"query": "Café δ release"}',
+        "cache_control": {"type": "ephemeral", "ttl": "1h"},
+    }
+    message_index, block_index = result_coordinate
+    expected["messages"][message_index]["content"][block_index] = {
+        "type": "text",
+        "text": 'Web search results: [{"type": "web_search_result", "title": "Café δ announcement", "url": "https://example.invalid/source", "page_age": null}]',
+        "cache_control": {"type": "ephemeral"},
+    }
+    assert normalized == expected
+    assert normalized["messages"][0]["content"][0] is text
+    assert normalized["messages"][-1] is body["messages"][-1]
+    assert normalize_server_tool_history(normalized, should_replay_native_search=True) is normalized
+    assert normalize_server_tool_history(body) is body
+
+
+def test_orphan_native_search_replays_only_public_result_without_fabricating_a_call() -> None:
+    result = _search_blocks("srvtoolu_synthetic_native", signed=True)[1]
+    result["content"][0].update(title="Synthetic source", url="https://example.invalid/source")
+    body = {"messages": [{"role": "assistant", "content": [result]}]}
+    original = deepcopy(body)
+    assert normalize_server_tool_history(body) is body
+
+    normalized = normalize_server_tool_history(body, should_replay_native_search=True)
+
+    content = normalized["messages"][0]["content"]
+    assert len(content) == 1
+    assert content[0]["type"] == "text"
+    assert json.loads(content[0]["text"].removeprefix("Web search results: ")) == [{
+        "type": "web_search_result", "title": "Synthetic source",
+        "url": "https://example.invalid/source", "page_age": None,
+    }]
+    assert body == original

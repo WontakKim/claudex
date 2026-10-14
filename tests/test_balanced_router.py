@@ -7,6 +7,9 @@ import asyncio
 import hashlib
 import hmac
 import json
+import sqlite3
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -555,6 +558,7 @@ class _FakeStore:
     """
 
     def __init__(self) -> None:
+        self.persistence_degraded = False
         self.upsert_calls: list[dict[str, Any]] = []
         self.cooldown_calls: list[dict[str, Any]] = []
         self.capability_calls: list[dict[str, Any]] = []
@@ -1142,6 +1146,320 @@ def test_pin_removal_counters_decrement_exactly_once_per_path() -> None:
     assert router.total_removed_pins == 4
 
 
+@pytest.mark.parametrize("capacity", [1, 2])
+def test_capacity_eviction_stays_deleted_across_same_epoch_restarts(tmp_path: Path, capacity: int) -> None:
+    async def scenario() -> None:
+        clock = _FakeClock()
+        wall_clock = _FakeClock(2_000_000.0)
+        path = tmp_path / "runtime.sqlite3"
+        store = ClaudePoolRuntimeStateStore.open_(path, debounce_seconds=0.0)
+        epoch_id, seed = store.balanced_epoch_id, store.epoch_seed
+        keys = [
+            derive_session_key(
+                {"metadata": {"user_id": _claude_code_user_id(f"00000000-0000-4000-8000-{index:012d}")}},
+                seed, "default",
+            )
+            for index in range(capacity + 2)
+        ]
+        assert all(key is not None and key.kind == "uuid" for key in keys)
+        candidates = [_candidate("acct-a")]
+        try:
+            router = _make_router(store=store, balanced_epoch_id=epoch_id, clock=clock,
+                                  wall_clock=wall_clock, pin_map_max_entries=capacity)
+            for key in keys[:-1]:
+                assert key is not None
+                router.place_session(session_key=key, model="claude-sonnet-5", candidates=candidates, seed=seed)
+                await asyncio.wait_for(router.submit_new_pin_durability(key.digest), timeout=5)
+                clock.advance(1.0)
+                wall_clock.advance(1.0)
+            victim = keys[0]
+            assert victim is not None
+            assert router.get_pin(victim.digest) is None
+            assert router.pin_count() == capacity
+            assert router.removed_pin_counts == {"evicted_lru": 1}
+            assert not router.persistence_degraded
+            assert store.get_pin(victim.digest) is None
+            store.close()
+
+            store = ClaudePoolRuntimeStateStore.open_(path, debounce_seconds=0.0)
+            assert (store.balanced_epoch_id, store.epoch_seed) == (epoch_id, seed)
+            rows = store.restore(RestoreValidationContext(now_utc=wall_clock()))
+            assert rows.skip_counts == {}
+            assert len(rows.pins) == capacity and victim.digest not in rows.pins
+            router = _make_router(store=store, balanced_epoch_id=epoch_id, clock=clock,
+                                  wall_clock=wall_clock, pin_map_max_entries=capacity)
+            assert router.restore_from_store(rows) == capacity
+            assert router.get_pin(victim.digest) is None
+            assert router.active_migration_count() == router.soft_bound_overflow_count == 0
+            for key in keys[1:-1]:
+                assert key is not None
+                entry = router.get_pin(key.digest)
+                assert entry is not None and entry.pending_durability is None
+            next_key = keys[-1]
+            assert next_key is not None
+            placement = router.place_session(session_key=next_key, model="claude-sonnet-5",
+                                             candidates=candidates, seed=seed)
+            assert placement.created
+            await asyncio.wait_for(router.submit_new_pin_durability(next_key.digest), timeout=5)
+            assert router.pin_count() == capacity
+            store.close()
+
+            store = ClaudePoolRuntimeStateStore.open_(path, debounce_seconds=0.0)
+            assert (store.balanced_epoch_id, store.epoch_seed) == (epoch_id, seed)
+            rows = store.restore(RestoreValidationContext(now_utc=wall_clock()))
+            assert len(rows.pins) == capacity and victim.digest not in rows.pins
+            assert next_key.digest in rows.pins
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("capacity", [1, 2])
+def test_historical_oversized_restore_trims_and_durably_deletes_lru_victims(tmp_path: Path, capacity: int) -> None:
+    clock, wall_clock = _FakeClock(), _FakeClock(2_000_000.0)
+    path = tmp_path / "runtime.sqlite3"
+    store = ClaudePoolRuntimeStateStore.open_(path, debounce_seconds=0.0)
+    epoch_id, seed = store.balanced_epoch_id, store.epoch_seed
+    keys = [
+        derive_session_key(body, seed, "default") for body in (
+            {"metadata": {"user_id": _claude_code_user_id("00000000-0000-4000-8000-000000000001")}},
+            {"metadata": {"user_id": _claude_code_user_id("00000000-0000-4000-8000-000000000002")}},
+            {"messages": [{"role": "user", "content": "synthetic older content"}]},
+            {"messages": [{"role": "user", "content": "synthetic newer content"}]},
+            {"messages": [{"role": "user", "content": "synthetic expired content"}]},
+        )
+    ]
+    try:
+        for index, key in enumerate(keys):
+            assert key is not None
+            store.upsert_pin(
+                session_key_digest=key.digest, key_kind=key.kind, account_id="acct-a",
+                account_incarnation_id="inc-acct-a", last_seen_utc=wall_clock() - 10 + index,
+                expires_at_utc=wall_clock() + 300 if index != 4 else wall_clock() - 1,
+                generation=index, balanced_epoch_id=epoch_id, model_family=key.family,
+                high_priority=True,
+            ).wait(timeout=5)
+        store.close()
+
+        store = ClaudePoolRuntimeStateStore.open_(path, debounce_seconds=0.0)
+        rows = store.restore(RestoreValidationContext(now_utc=wall_clock()))
+        assert len(rows.pins) == 4 and rows.skip_counts == {"pins.expired": 1}
+        router = _make_router(store=store, balanced_epoch_id=epoch_id, clock=clock,
+                              wall_clock=wall_clock, pin_map_max_entries=capacity)
+        assert router.restore_from_store(rows) == capacity
+        survivors = keys[2 - capacity:2]
+        assert all(key is not None for key in survivors)
+        expected = {key.digest for key in survivors if key is not None}
+        assert {key.digest for key in keys if key is not None and router.get_pin(key.digest)} == expected
+        assert router.removed_pin_counts == {"evicted_lru": 4 - capacity}
+        assert router.total_removed_pins == 4 - capacity
+        assert router.active_migration_count() == router.soft_bound_overflow_count == 0
+        for key in survivors:
+            assert key is not None
+            entry = router.get_pin(key.digest)
+            assert entry is not None and entry.pending_durability is None
+            assert entry.expires_at_monotonic == clock() + 300
+            assert entry.generation == keys.index(key)
+            follow = router.place_session(session_key=key, model="claude-sonnet-5",
+                                          candidates=[_candidate("acct-a")], seed=seed)
+            assert not follow.created and follow.durability_barrier is None
+        store.close()
+
+        store = ClaudePoolRuntimeStateStore.open_(path, debounce_seconds=0.0)
+        assert (store.balanced_epoch_id, store.epoch_seed) == (epoch_id, seed)
+        rows = store.restore(RestoreValidationContext(now_utc=wall_clock()))
+        assert set(rows.pins) == expected and rows.skip_counts == {}
+        router = _make_router(store=store, balanced_epoch_id=epoch_id, clock=clock,
+                              wall_clock=wall_clock, pin_map_max_entries=capacity)
+        assert router.restore_from_store(rows) == capacity
+        assert router.total_removed_pins == 0
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("failure", ["submission", "terminal", "retry"])
+def test_capacity_delete_failure_reports_degraded_without_claiming_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    clock = _FakeClock(0.0)
+    attempts: list[int] = []
+    deletions: list[Any] = []
+
+    def fault_injector(scope_key: Any, sequence: int) -> None:
+        attempts.append(sequence)
+        if sequence == 2 and attempts.count(sequence) == 1:
+            error = sqlite3.OperationalError("synthetic pin deletion failure")
+            error.sqlite_errorcode = sqlite3.SQLITE_FULL if failure == "terminal" else sqlite3.SQLITE_BUSY
+            raise error
+
+    store = ClaudePoolRuntimeStateStore.open_(tmp_path / "runtime.sqlite3", clock=clock,
+                                              debounce_seconds=0.0, fault_injector=fault_injector)
+    delete_pin = store.delete_pin
+
+    def record_delete(digest: bytes, *, high_priority: bool = False) -> Any:
+        assert high_priority
+        if failure == "submission":
+            raise RuntimeError("synthetic rejected pin deletion")
+        pending = delete_pin(digest, high_priority=high_priority)
+        deletions.append(pending)
+        return pending
+
+    monkeypatch.setattr(store, "delete_pin", record_delete)
+    router = _make_router(store=store, balanced_epoch_id=store.balanced_epoch_id, clock=clock,
+                          pin_map_max_entries=1)
+    keys = [derive_session_key({"messages": [{"role": "user", "content": text}]}, store.epoch_seed, "default")
+            for text in ("synthetic victim", "synthetic replacement")]
+    assert all(key is not None for key in keys)
+    victim, replacement = keys
+    assert victim is not None and replacement is not None
+    try:
+        router.place_session(session_key=victim, model="claude-sonnet-5",
+                             candidates=[_candidate("acct-a")], seed=store.epoch_seed)
+        asyncio.run(router.submit_new_pin_durability(victim.digest))
+        placement = router.place_session(session_key=replacement, model="claude-sonnet-5",
+                                         candidates=[_candidate("acct-a")], seed=store.epoch_seed)
+        assert placement.created and router.pin_count() == 1
+        assert router.get_pin(victim.digest) is None
+        if failure != "submission":
+            with store._cv:
+                assert store._cv.wait_for(lambda: store.persistence_degraded, timeout=5)
+            expected_error = sqlite3.OperationalError if failure == "terminal" else TimeoutError
+            with pytest.raises(expected_error):
+                deletions[0].wait(timeout=0)
+        assert router.persistence_degraded
+        assert store.get_pin(victim.digest) is not None
+        if failure == "retry":
+            with store._cv:
+                clock.advance(1.0)
+                store._cv.notify_all()
+            deletions[0].wait(timeout=5)
+            assert store.get_pin(victim.digest) is None
+            assert not router.persistence_degraded
+    finally:
+        with store._cv:
+            clock.advance(10.0)
+            store._cv.notify_all()
+        store.close()
+
+
+def test_capacity_delete_commit_settles_submitted_victim_barrier_without_resurrection(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        clock = _FakeClock(0.0)
+        attempts: list[int] = []
+        deletion_started, release_deletion = threading.Event(), threading.Event()
+
+        def fault_injector(scope_key: Any, sequence: int) -> None:
+            attempts.append(sequence)
+            if sequence == 1 and attempts.count(sequence) == 1:
+                raise sqlite3.OperationalError("synthetic delayed victim upsert")
+            if sequence == 2:
+                deletion_started.set()
+                assert release_deletion.wait(timeout=5)
+
+        path = tmp_path / "runtime.sqlite3"
+        store = ClaudePoolRuntimeStateStore.open_(path, clock=clock, debounce_seconds=0.0,
+                                                  fault_injector=fault_injector)
+        epoch_id, seed = store.balanced_epoch_id, store.epoch_seed
+        router = _make_router(store=store, balanced_epoch_id=epoch_id, clock=clock, pin_map_max_entries=1)
+        keys = [derive_session_key({"messages": [{"role": "user", "content": text}]}, seed, "default")
+                for text in ("synthetic delayed victim", "synthetic survivor")]
+        victim, survivor = keys
+        assert victim is not None and survivor is not None
+        tasks: list[asyncio.Task[Any]] = []
+        try:
+            placement = router.place_session(session_key=victim, model="claude-sonnet-5",
+                                             candidates=[_candidate("acct-a")], seed=seed)
+            barrier = placement.durability_barrier
+            assert barrier is not None
+            tasks.append(asyncio.create_task(router.submit_new_pin_durability(victim.digest)))
+            tasks.append(asyncio.create_task(router.await_pin_durability(victim.digest)))
+
+            def wait_for_retry() -> bool:
+                with store._cv:
+                    return store._cv.wait_for(lambda: store.persistence_degraded, timeout=5)
+
+            assert await asyncio.to_thread(wait_for_retry)
+            router.begin_attempt("acct-a")
+            router.place_session(session_key=survivor, model="claude-sonnet-5",
+                                 candidates=[_candidate("acct-a")], seed=seed)
+            assert await asyncio.to_thread(deletion_started.wait, 5)
+            assert router.get_pin(victim.digest) is None
+            assert router.in_flight_count("acct-a") == 1
+            assert not barrier.is_resolved and all(not task.done() for task in tasks)
+            assert attempts == [1, 2]
+            release_deletion.set()
+            await asyncio.wait_for(asyncio.gather(*tasks), timeout=5)
+            assert barrier.is_resolved and not router.persistence_degraded
+            assert store.get_pin(victim.digest) is None
+            assert router.in_flight_count("acct-a") == 1
+            await asyncio.wait_for(router.submit_new_pin_durability(survivor.digest), timeout=5)
+            with store._cv:
+                clock.advance(1.0)
+                store._cv.notify_all()
+            store.close()
+            assert attempts == [1, 2, 3]
+
+            store = ClaudePoolRuntimeStateStore.open_(path, debounce_seconds=0.0)
+            assert (store.balanced_epoch_id, store.epoch_seed) == (epoch_id, seed)
+            rows = store.restore(RestoreValidationContext(now_utc=2_000_000.0))
+            assert set(rows.pins) == {survivor.digest}
+            assert rows.skip_counts == {}
+        finally:
+            release_deletion.set()
+            with store._cv:
+                clock.advance(10.0)
+                store._cv.notify_all()
+            store.close()
+            router.end_attempt("acct-a")
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+def test_capacity_reclaims_released_soft_overflow_without_touching_in_flight(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        clock = _FakeClock()
+        store = ClaudePoolRuntimeStateStore.open_(tmp_path / "runtime.sqlite3", debounce_seconds=0.0)
+        router = _make_router(store=store, balanced_epoch_id=store.balanced_epoch_id, clock=clock,
+                              pin_map_max_entries=1)
+        keys = [derive_session_key({"messages": [{"role": "user", "content": text}]}, store.epoch_seed, "default")
+                for text in ("synthetic reserved", "synthetic overflow", "synthetic later")]
+        assert all(key is not None for key in keys)
+        try:
+            for index, key in enumerate(keys[:2]):
+                assert key is not None
+                router.place_session(session_key=key, model="claude-sonnet-5",
+                                     candidates=[_candidate("acct-a")], seed=store.epoch_seed)
+                await asyncio.wait_for(router.submit_new_pin_durability(key.digest), timeout=5)
+                if index == 0:
+                    router.set_migration_reserved(key.digest, True)
+                    router.begin_attempt("acct-a")
+                clock.advance(1.0)
+            assert router.pin_count() == 2 and router.active_migration_count() == 1
+            assert router.soft_bound_overflow_count == 1 and router.total_removed_pins == 0
+            reserved, overflow, later = keys
+            assert reserved is not None and overflow is not None and later is not None
+            assert store.get_pin(reserved.digest) is not None
+            router.set_migration_reserved(reserved.digest, False)
+            router.place_session(session_key=later, model="claude-sonnet-5",
+                                 candidates=[_candidate("acct-a")], seed=store.epoch_seed)
+            await asyncio.wait_for(router.submit_new_pin_durability(later.digest), timeout=5)
+            assert router.pin_count() == 1 and router.get_pin(later.digest) is not None
+            assert router.removed_pin_counts == {"evicted_lru": 2}
+            assert router.total_removed_pins == 2 and router.soft_bound_overflow_count == 1
+            assert store.get_pin(reserved.digest) is store.get_pin(overflow.digest) is None
+            assert router.in_flight_count("acct-a") == 1
+        finally:
+            router.end_attempt("acct-a")
+            store.close()
+
+    asyncio.run(scenario())
+
+
 def test_restore_from_store_recomputes_counters_and_remaining_ttl_from_wall_clock_rows(tmp_path: Any) -> None:
     db_path = tmp_path / "runtime.sqlite3"
     store = ClaudePoolRuntimeStateStore.open_(db_path, debounce_seconds=0.0)
@@ -1271,6 +1589,106 @@ def test_failed_durable_write_marks_persistence_degraded_and_releases_both_reque
         assert creator_progressed is True and follower_progressed is True
         assert router.persistence_degraded is True
         assert router.get_pin(session_key.digest) is not None  # the in-memory pin is retained
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("cancel_target", ["none", "creator", "durability"])
+def test_real_sqlite_full_releases_pin_waiters_and_executor_after_cancellation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cancel_target: str
+) -> None:
+    recovery = threading.Event()
+    release = threading.Event()
+    attempts: list[int] = []
+
+    def fault_injector(scope_key: Any, sequence: int) -> None:
+        attempts.append(sequence)
+        assert release.wait(timeout=5)
+        if not recovery.is_set() and len(attempts) <= 100:
+            error = sqlite3.OperationalError("synthetic disk full")
+            error.sqlite_errorcode = sqlite3.SQLITE_FULL
+            raise error
+
+    async def scenario() -> None:
+        loop = asyncio.get_running_loop()
+        executor = ThreadPoolExecutor(max_workers=1)
+        loop.set_default_executor(executor)
+        wait_started = asyncio.Event()
+        wait_finished = asyncio.Event()
+        store = ClaudePoolRuntimeStateStore.open_(
+            tmp_path / "runtime.sqlite3", debounce_seconds=0.0,
+            retry_backoff_initial_seconds=0.02, retry_backoff_max_seconds=0.02,
+            fault_injector=fault_injector,
+        )
+        original_upsert = store.upsert_pin
+
+        def recorded_upsert(**kwargs: Any) -> Any:
+            pending = original_upsert(**kwargs)
+            original_wait = pending.wait
+
+            def recorded_wait(timeout: float | None = None) -> None:
+                loop.call_soon_threadsafe(wait_started.set)
+                try:
+                    original_wait(timeout)
+                finally:
+                    loop.call_soon_threadsafe(wait_finished.set)
+
+            monkeypatch.setattr(pending, "wait", recorded_wait)
+            return pending
+
+        monkeypatch.setattr(store, "upsert_pin", recorded_upsert)
+        router = _make_router(store=store, balanced_epoch_id=store.balanced_epoch_id)
+        session_key = SessionKey(digest=b"\x04" * 32, kind="content_hash")
+        tasks: list[asyncio.Task[None]] = []
+        try:
+            placement = router.place_session(
+                session_key=session_key, model="claude-sonnet-5", candidates=[_candidate("acct-a")], seed=b"seed"
+            )
+            barrier = placement.durability_barrier
+            pin = router.get_pin(session_key.digest)
+            assert barrier is not None and pin is not None
+            durability = asyncio.create_task(router.submit_new_pin_durability(session_key.digest))
+            creator = asyncio.create_task(router.await_pin_durability(session_key.digest))
+            follower = asyncio.create_task(router.await_pin_durability(session_key.digest))
+            tasks.extend((durability, creator, follower))
+            await asyncio.wait_for(wait_started.wait(), timeout=1)
+            assert not barrier.is_resolved
+            assert not creator.done() and not follower.done()
+
+            if cancel_target != "none":
+                cancelled = creator if cancel_target == "creator" else durability
+                cancelled.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await cancelled
+            if cancel_target == "creator":
+                assert not durability.done() and not follower.done()
+                assert not barrier.is_resolved
+            release.set()
+            await asyncio.wait_for(asyncio.gather(*(task for task in tasks if not task.cancelled())), timeout=1)
+            await asyncio.wait_for(wait_finished.wait(), timeout=1)
+            await asyncio.wait_for(loop.run_in_executor(None, lambda: None), timeout=1)
+
+            assert attempts == [1]
+            assert barrier.is_resolved
+            assert store.persistence_degraded
+            if cancel_target != "durability":
+                assert router.persistence_degraded
+            assert router.get_pin(session_key.digest) is pin
+            assert store.get_pin(session_key.digest) is None
+            assert router.place_session(
+                session_key=session_key, model="claude-sonnet-5", candidates=[_candidate("acct-a")], seed=b"seed"
+            ).created is False
+        finally:
+            recovery.set()
+            release.set()
+            store.close()
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            await loop.shutdown_default_executor()
+        assert store._writer_thread is not None and not store._writer_thread.is_alive()
+        assert all(not thread.is_alive() for thread in executor._threads)
 
     asyncio.run(scenario())
 
@@ -2153,6 +2571,127 @@ def test_cooldown_deadline_reflects_the_earlier_of_both_clocks() -> None:
     assert router.account_cooldown_deadline("acct-a") is None
 
 
+@pytest.mark.parametrize("scope", ["account", "family"])
+@pytest.mark.parametrize("should_restore", [False, True], ids=["live", "restart"])
+@pytest.mark.parametrize(
+    ("incarnation", "fingerprint", "is_matching"),
+    [
+        ("inc-old", "fp-a", True),
+        ("inc-new", "fp-a", False),
+        ("inc-old", "fp-b", False),
+        ("inc-old", None, False),
+        (None, "fp-a", False),
+    ],
+    ids=["matching", "changed-incarnation", "changed-profile", "missing-profile", "missing-incarnation"],
+)
+def test_cooldown_deadlines_validate_current_provenance_after_restart(
+    tmp_path: Path, scope: str, should_restore: bool, incarnation: str | None, fingerprint: str | None, is_matching: bool
+) -> None:
+    clock = _FakeClock(5_000.0)
+    wall_clock = _FakeClock(1_700_000_000.0)
+    router = _make_router(clock=clock, wall_clock=wall_clock)
+    router.install_cooldown(
+        account_id="acct-a",
+        account_incarnation_id="inc-old",
+        account_profile_fingerprint="fp-a",
+        scope=scope,
+        model_family="fable" if scope == "family" else "",
+        deadline=clock() + 3_600.0,
+        reason="quota",
+    )
+    if should_restore:
+        db_path = tmp_path / "runtime.sqlite3"
+        store = ClaudePoolRuntimeStateStore.open_(db_path, debounce_seconds=0.0)
+        try:
+            store.upsert_cooldown(
+                account_id="acct-a",
+                account_incarnation_id="inc-old",
+                account_profile_fingerprint="fp-a",
+                scope=scope,
+                model_family="fable" if scope == "family" else "",
+                deadline_utc=wall_clock() + 3_600.0,
+                reason="quota",
+                evidence="",
+                updated_at_utc=wall_clock(),
+                high_priority=True,
+            ).wait(timeout=5.0)
+        finally:
+            store.close()
+        store = ClaudePoolRuntimeStateStore.open_(db_path)
+        try:
+            router.restore_from_store(store.restore(RestoreValidationContext(now_utc=wall_clock())))
+        finally:
+            store.close()
+
+    query = (
+        router.account_cooldown_deadline
+        if scope == "account"
+        else lambda account_id, **kwargs: router.family_cooldown_deadline(account_id, "fable", **kwargs)
+    )
+    result = query("acct-a", account_incarnation_id=incarnation, account_profile_fingerprint=fingerprint)
+    if is_matching:
+        assert result == pytest.approx(clock() + 3_600.0)
+    else:
+        assert result is None
+    assert query("acct-a", account_incarnation_id="inc-old", account_profile_fingerprint="fp-a") == pytest.approx(
+        clock() + 3_600.0
+    )
+
+
+@pytest.mark.parametrize("scope", ["account", "family"])
+def test_unfingerprinted_live_cooldown_is_not_evidence_for_another_identity(scope: str) -> None:
+    clock = _FakeClock()
+    router = _make_router(clock=clock)
+    router.install_cooldown(
+        account_id="acct-a",
+        account_incarnation_id="inc-a",
+        account_profile_fingerprint=None,
+        scope=scope,
+        model_family="fable" if scope == "family" else "",
+        deadline=clock() + 3_600.0,
+        reason="quota",
+    )
+    query = (
+        router.account_cooldown_deadline
+        if scope == "account"
+        else lambda account_id, **kwargs: router.family_cooldown_deadline(account_id, "fable", **kwargs)
+    )
+    assert query("acct-a", account_incarnation_id="inc-a", account_profile_fingerprint=None) is not None
+    assert query("acct-a", account_incarnation_id="inc-b", account_profile_fingerprint=None) is None
+    assert query("acct-a", account_incarnation_id="inc-a", account_profile_fingerprint="fp-a") is None
+
+
+@pytest.mark.parametrize("scope", ["account", "family"])
+@pytest.mark.parametrize(("remaining", "expected"), [(0.5, 1.0), (3_600.0, 3_600.0), (8 * 86_400.0, 7 * 86_400.0)])
+def test_matching_restored_cooldown_preserves_clamps_and_clock_expiry(
+    tmp_path: Path, scope: str, remaining: float, expected: float
+) -> None:
+    clock = _FakeClock(5_000.0)
+    wall_clock = _FakeClock(1_700_000_000.0)
+    store = ClaudePoolRuntimeStateStore.open_(tmp_path / "runtime.sqlite3", debounce_seconds=0.0)
+    try:
+        store.upsert_cooldown(
+            account_id="acct-a", scope=scope, model_family="fable" if scope == "family" else "",
+            account_incarnation_id="inc-a", account_profile_fingerprint="fp-a",
+            deadline_utc=wall_clock() + remaining, reason="quota", evidence="",
+            updated_at_utc=wall_clock(), high_priority=True,
+        ).wait(timeout=5.0)
+        router = _make_router(clock=clock, wall_clock=wall_clock)
+        router.restore_from_store(store.restore(RestoreValidationContext(now_utc=wall_clock())))
+        query = (
+            router.account_cooldown_deadline
+            if scope == "account"
+            else lambda account_id, **kwargs: router.family_cooldown_deadline(account_id, "fable", **kwargs)
+        )
+        assert query("acct-a", account_incarnation_id="inc-a", account_profile_fingerprint="fp-a") == pytest.approx(
+            clock() + expected
+        )
+        wall_clock.advance(expected + 1.0)
+        assert query("acct-a", account_incarnation_id="inc-a", account_profile_fingerprint="fp-a") is None
+    finally:
+        store.close()
+
+
 def test_restored_cooldowns_carry_a_wall_deadline(tmp_path: Any) -> None:
     db_path = tmp_path / "runtime.sqlite3"
     store = ClaudePoolRuntimeStateStore.open_(db_path, debounce_seconds=0.0)
@@ -2687,6 +3226,137 @@ def test_remove_account_deletes_all_four_durable_row_kinds_for_only_that_incarna
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("should_exit_mode", [False, True])
+def test_runtime_shutdown_drains_pin_waiters_after_sqlite_full(tmp_path: Path, should_exit_mode: bool) -> None:
+    async def scenario() -> None:
+        runtime = ClaudeBalancedRuntime()
+        await runtime.prepare_and_publish(
+            accounts=[], accounts_root=tmp_path, runtime_db_path=tmp_path / "runtime.sqlite3",
+            persist=lambda: None, entry="admin_enable",
+        )
+        store = runtime._store
+        router = runtime.router
+        assert store is not None and router is not None
+        loop = asyncio.get_running_loop()
+        write_started = asyncio.Event()
+        release = threading.Event()
+        recovery = threading.Event()
+        attempts: list[int] = []
+        tasks: list[asyncio.Task[None]] = []
+
+        def fault_injector(scope_key: Any, sequence: int) -> None:
+            attempts.append(sequence)
+            loop.call_soon_threadsafe(write_started.set)
+            assert release.wait(timeout=5)
+            if not recovery.is_set() and len(attempts) <= 100:
+                error = sqlite3.OperationalError("synthetic disk full")
+                error.sqlite_errorcode = sqlite3.SQLITE_FULL
+                raise error
+
+        store._fault_injector = fault_injector
+        digest = b"\x05" * 32
+
+        async def request() -> None:
+            assert runtime.begin_request()
+            try:
+                await router.await_pin_durability(digest)
+            finally:
+                runtime.end_request()
+
+        try:
+            placement = router.place_session(
+                session_key=SessionKey(digest=digest, kind="content_hash"), model="claude-sonnet-5",
+                candidates=[_candidate("acct-a")], seed=runtime.epoch_seed,
+            )
+            tasks.extend((asyncio.create_task(router.submit_new_pin_durability(digest)),
+                          asyncio.create_task(request()), asyncio.create_task(request())))
+            await asyncio.wait_for(write_started.wait(), timeout=1)
+            published: list[str] = []
+            shutdown = asyncio.create_task(
+                runtime.exit_mode("disabled", publish=lambda: published.append("disabled"))
+                if should_exit_mode else runtime.shutdown_preserving_epoch()
+            )
+            tasks.append(shutdown)
+            await asyncio.sleep(0)
+            assert runtime.status == "draining" and not shutdown.done()
+            assert runtime._active_requests == 2
+
+            release.set()
+            await asyncio.wait_for(asyncio.gather(*tasks), timeout=1)
+            assert published == (["disabled"] if should_exit_mode else [])
+            assert runtime.status == "disabled" and runtime._transition_event.is_set()
+            assert runtime._store is None and runtime.router is None
+            assert runtime._active_requests == 0
+            assert placement.durability_barrier is not None and placement.durability_barrier.is_resolved
+            assert router.persistence_degraded and router.get_pin(digest) is not None
+            assert store._writer_thread is not None and not store._writer_thread.is_alive()
+        finally:
+            recovery.set()
+            release.set()
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            store.close()
+            await runtime.shutdown_preserving_epoch()
+
+    asyncio.run(scenario())
+
+
+def test_required_startup_rotation_fails_on_sqlite_full_without_publishing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    recovery = threading.Event()
+    opened: list[ClaudePoolRuntimeStateStore] = []
+    attempts: list[int] = []
+    original_open = ClaudePoolRuntimeStateStore.open_
+
+    def fault_injector(scope_key: Any, sequence: int) -> None:
+        attempts.append(sequence)
+        if not recovery.is_set() and len(attempts) <= 100:
+            error = sqlite3.OperationalError("synthetic disk full")
+            error.sqlite_errorcode = sqlite3.SQLITE_FULL
+            raise error
+
+    def faulted_open(cls: Any, path: Path) -> ClaudePoolRuntimeStateStore:
+        store = original_open(
+            path, debounce_seconds=0.0, retry_backoff_initial_seconds=0.02,
+            retry_backoff_max_seconds=0.02, fault_injector=fault_injector,
+        )
+        opened.append(store)
+        return store
+
+    monkeypatch.setattr(ClaudePoolRuntimeStateStore, "open_", classmethod(faulted_open))
+
+    async def scenario() -> None:
+        runtime = ClaudeBalancedRuntime()
+        published: list[str] = []
+        arguments = dict(
+            accounts=[], accounts_root=tmp_path, runtime_db_path=tmp_path / "runtime.sqlite3",
+            persist=lambda: published.append("balanced"), entry="admin_enable",
+        )
+        try:
+            with pytest.raises(sqlite3.OperationalError) as failure:
+                await asyncio.wait_for(runtime.prepare_and_publish(**arguments), timeout=1)
+            assert failure.value.sqlite_errorcode == sqlite3.SQLITE_FULL
+            assert published == [] and attempts == [1]
+            assert runtime.status == "disabled" and runtime._transition_event.is_set()
+            assert runtime._store is None and runtime.router is None
+            assert opened[0]._writer_thread is not None and not opened[0]._writer_thread.is_alive()
+
+            recovery.set()
+            await asyncio.wait_for(runtime.prepare_and_publish(**arguments), timeout=1)
+            assert published == ["balanced"] and runtime.status == "active"
+        finally:
+            recovery.set()
+            await runtime.shutdown_preserving_epoch()
+            for store in opened:
+                store.close()
+        assert all(store._writer_thread is not None and not store._writer_thread.is_alive() for store in opened)
+
+    asyncio.run(scenario())
+
+
 # ==========================================================================
 # `ClaudeBalancedRuntime.exit_mode` cancellation safety (T-22, fix for gap
 # G-7(a)): everything before a successful `persist()` is pre-commit -- ANY
@@ -2761,65 +3431,179 @@ def test_exit_mode_cancelled_while_draining_restores_active_with_epoch_and_store
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("target_mode", ["disabled", "fallback"])
+@pytest.mark.parametrize("cancel_count,cancel_stage", [(1, "rotation"), (2, "rotation"), (3, "cleanup")])
 def test_exit_mode_cancelled_after_persist_still_finalizes_before_the_cancellation_surfaces(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, target_mode: str, cancel_count: int, cancel_stage: str
 ) -> None:
-    """A cancellation delivered AFTER `exit_mode`'s `persist()` commit point --
-    here, while post-commit finalization is awaiting the epoch rotation --
-    must never truncate finalization: `publish()` still runs, the store still
-    closes, and `status` still lands on "disabled"; only once all of that has
-    actually completed does the cancellation surface back to the caller.
-    """
-    rotate_gate = asyncio.Event()
-
-    class _GatedPendingWrite:
-        async def wait_async(self) -> None:
-            await rotate_gate.wait()
-
-    def _gated_rotate_epoch(self: ClaudePoolRuntimeStateStore) -> _GatedPendingWrite:
-        return _GatedPendingWrite()
-
     async def scenario() -> None:
         runtime = ClaudeBalancedRuntime()
         await runtime.prepare_and_publish(
-            accounts=[],
-            accounts_root=tmp_path,
-            runtime_db_path=tmp_path / "runtime.sqlite3",
-            persist=lambda: None,
-            entry="admin_enable",
+            accounts=[], accounts_root=tmp_path, runtime_db_path=tmp_path / "runtime.sqlite3",
+            persist=lambda: None, entry="admin_enable",
         )
-        assert runtime.status == "active"
+        store = runtime._store
+        router = runtime.router
+        assert runtime.status == "active" and store is not None and router is not None
+        rotate_gate = asyncio.Event()
+        rotation_started = asyncio.Event()
+        cleanup_gate = asyncio.Event()
+        cleanup_started = asyncio.Event()
+        events: list[str] = []
+        saved = {"mode": "balanced"}
+        published = {"mode": "balanced"}
+        original_close = store.close
+        original_stop = runtime._stop_usage_poll_driver
+        exit_task: asyncio.Task[None] | None = None
+        waiters: list[asyncio.Task[None]] = []
 
-        monkeypatch.setattr(ClaudePoolRuntimeStateStore, "rotate_epoch", _gated_rotate_epoch)
-        published: list[str] = []
+        class GatedPendingWrite:
+            async def wait_async(self) -> None:
+                events.append("rotate")
+                rotation_started.set()
+                await rotate_gate.wait()
 
-        exit_task = asyncio.create_task(
-            runtime.exit_mode("disabled", publish=lambda: published.append("disabled"))
-        )
-        # Let exit_mode drain (nothing held open) and persist (a no-op),
-        # then reach the gated rotate_epoch await inside its shielded
-        # post-commit finalization.
-        for _ in range(20):
-            await asyncio.sleep(0)
-        assert published == []  # finalization hasn't reached publish() yet
+        def persist() -> None:
+            saved["mode"] = target_mode
+            events.append("persist")
 
-        exit_task.cancel()
-        for _ in range(20):
-            await asyncio.sleep(0)
-        # The caller's cancellation was shielded off finalization: it is
-        # still in flight, blocked on the gated rotation, not yet done.
-        assert not exit_task.done()
-        assert published == []
-        assert runtime.status == "draining"
+        def publish() -> None:
+            published["mode"] = target_mode
+            events.append("publish")
 
-        # Let the rotation complete -- finalization can now run to completion.
-        rotate_gate.set()
-        with pytest.raises(asyncio.CancelledError):
-            await exit_task
+        async def stop_driver() -> None:
+            cleanup_started.set()
+            await cleanup_gate.wait()
+            await original_stop()
+            events.append("poll_stopped")
 
-        assert published == ["disabled"]
-        assert runtime.status == "disabled"
-        assert runtime._store is None
-        assert runtime.router is None
+        def close_store() -> None:
+            events.append("close")
+            original_close()
+
+        async def await_lifecycle_ownership() -> None:
+            async with runtime._lifecycle_lock:
+                pass
+
+        monkeypatch.setattr(store, "rotate_epoch", GatedPendingWrite)
+        monkeypatch.setattr(runtime, "_stop_usage_poll_driver", stop_driver)
+        monkeypatch.setattr(store, "close", close_store)
+        try:
+            exit_task = asyncio.create_task(runtime.exit_mode(target_mode, persist=persist, publish=publish))
+            await asyncio.wait_for(rotation_started.wait(), timeout=1)
+            waiters.extend((asyncio.create_task(runtime.wait_for_transition()),
+                            asyncio.create_task(await_lifecycle_ownership())))
+            assert saved["mode"] == target_mode and published["mode"] == "balanced"
+            if cancel_stage == "cleanup":
+                rotate_gate.set()
+                await asyncio.wait_for(cleanup_started.wait(), timeout=1)
+
+            for _ in range(cancel_count):
+                exit_task.cancel()
+                for _ in range(20):
+                    await asyncio.sleep(0)
+                assert not exit_task.done(), "caller cancellation surfaced before owned cleanup settled"
+                assert all(not waiter.done() for waiter in waiters)
+                assert runtime.status == "draining" and not runtime._transition_event.is_set()
+                assert runtime._store is store and runtime.router is router
+                assert "close" not in events
+                if cancel_stage == "rotation":
+                    assert not cleanup_started.is_set(), "cancellation interrupted rotation and skipped publication"
+                    assert published["mode"] == "balanced"
+                else:
+                    assert published["mode"] == target_mode
+
+            rotate_gate.set()
+            await asyncio.wait_for(cleanup_started.wait(), timeout=1)
+            assert saved == published == {"mode": target_mode}
+            assert not exit_task.done() and all(not waiter.done() for waiter in waiters)
+            assert events == ["persist", "rotate", "publish"]
+            cleanup_gate.set()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(asyncio.shield(exit_task), timeout=1)
+            await asyncio.wait_for(asyncio.gather(*waiters), timeout=1)
+            assert events == ["persist", "rotate", "publish", "poll_stopped", "close"]
+            assert runtime.status == "disabled" and runtime._transition_event.is_set()
+            assert runtime._store is None and runtime.router is None
+            assert store._writer_thread is not None and not store._writer_thread.is_alive()
+        finally:
+            rotate_gate.set()
+            cleanup_gate.set()
+            if exit_task is not None:
+                await asyncio.gather(exit_task, return_exceptions=True)
+            await runtime.shutdown_preserving_epoch()
+            for waiter in waiters:
+                if not waiter.done():
+                    waiter.cancel()
+            await asyncio.gather(*waiters, return_exceptions=True)
+            original_close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("cancel_count", [0, 2])
+def test_exit_mode_propagates_finalization_error_after_driver_and_store_cleanup(
+    monkeypatch: pytest.MonkeyPatch, cancel_count: int
+) -> None:
+    async def scenario() -> None:
+        runtime = ClaudeBalancedRuntime()
+        runtime.status = "active"
+        rotation_started = asyncio.Event()
+        release = asyncio.Event()
+        events: list[str] = []
+        error = RuntimeError("synthetic publication failure")
+
+        class ExitStore:
+            def rotate_epoch(self) -> ExitStore:
+                events.append("rotate")
+                return self
+
+            async def wait_async(self) -> None:
+                rotation_started.set()
+                await release.wait()
+
+            def close(self) -> None:
+                assert runtime._usage_poll_driver_task is None and driver.done()
+                events.append("close")
+
+        async def poll_driver() -> None:
+            try:
+                await asyncio.Event().wait()
+            finally:
+                events.append("poll_stopped")
+
+        def publish() -> None:
+            events.append("publish")
+            raise error
+
+        monkeypatch.setattr(runtime, "_store", ExitStore())
+        driver = asyncio.create_task(poll_driver())
+        runtime._usage_poll_driver_task = driver
+        await asyncio.sleep(0)
+        exit_task = asyncio.create_task(runtime.exit_mode(
+            "disabled", persist=lambda: events.append("persist"), publish=publish
+        ))
+        try:
+            await asyncio.wait_for(rotation_started.wait(), timeout=1)
+            for _ in range(cancel_count):
+                exit_task.cancel()
+                for _ in range(20):
+                    await asyncio.sleep(0)
+                assert not exit_task.done()
+            release.set()
+            with pytest.raises(RuntimeError) as failure:
+                await asyncio.wait_for(asyncio.shield(exit_task), timeout=1)
+            assert failure.value is error
+            assert events == ["persist", "rotate", "publish", "poll_stopped", "close"]
+            assert runtime.status == "disabled" and runtime._transition_event.is_set()
+            assert runtime._store is None and runtime._usage_poll_driver_task is None
+            assert driver.done()
+        finally:
+            release.set()
+            await asyncio.gather(exit_task, return_exceptions=True)
+            await runtime.shutdown_preserving_epoch()
+            if not driver.done():
+                driver.cancel()
+            await asyncio.gather(driver, return_exceptions=True)
 
     asyncio.run(scenario())

@@ -14,6 +14,7 @@ from starlette.responses import JSONResponse
 
 from claudex import paths
 from claudex.claude.account_profile import load_account_profile_fingerprint
+from claudex.claude.account_store import CredentialGeneration
 from claudex.claude.accounts import AccountRegistryError, mark_account_needs_reauth
 from claudex.claude.ambient_account import AmbientAccountProvider, AmbientClaudeAuthManager
 from claudex.claude.auth import (
@@ -98,8 +99,13 @@ def _account_profile_fingerprint(app_state: Any, account_id: str) -> str | None:
     return load_account_profile_fingerprint(paths.accounts_dir("claude") / account_id)
 
 
-async def _mark_account_needs_reauth_best_effort(app_state: Any, account_id: str) -> None:
-    """Persist needs-reauth for `account_id`, never failing the caller.
+async def _mark_account_needs_reauth_best_effort(
+    app_state: Any,
+    account_id: str,
+    *,
+    expected_generation: CredentialGeneration | None,
+) -> None:
+    """Persist needs-reauth only for the rejected generation, without masking errors.
 
     A concurrent `account remove` (AccountNotFoundError) or a registry I/O
     problem must not mask the response the caller is about to return.
@@ -109,7 +115,9 @@ async def _mark_account_needs_reauth_best_effort(app_state: Any, account_id: str
         logger.debug("not marking ambient claude account %s needs-reauth", account_id)
         return
     try:
-        await asyncio.to_thread(mark_account_needs_reauth, account_id)
+        await asyncio.to_thread(
+            mark_account_needs_reauth, account_id, expected_generation=expected_generation
+        )
     except AccountRegistryError as exc:
         logger.warning("could not mark claude account %s needs-reauth: %s", account_id, exc)
 
@@ -149,8 +157,10 @@ def _account_usage_fetch(app_state: Any) -> Any:
         manager = _claude_account_auth_manager(app_state, account_id)
         try:
             return await fetch_claude_account_usage(app_state.http_client, manager)
-        except ClaudeAccountReauthRequiredError:
-            await _mark_account_needs_reauth_best_effort(app_state, account_id)
+        except ClaudeAccountReauthRequiredError as exc:
+            await _mark_account_needs_reauth_best_effort(
+                app_state, account_id, expected_generation=exc.credential_generation
+            )
             return (
                 provider_result(
                     "claude",

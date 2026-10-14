@@ -6,6 +6,7 @@ import asyncio
 import importlib.resources
 import json
 import logging
+import os
 import time
 import uuid
 from typing import Any
@@ -30,8 +31,18 @@ from claudex.providers.backends import (
     RouteBackend,
 )
 from claudex.providers.codex_auth import CodexAuthError
-from claudex.providers.codex_client import CodexDiscoveryError, CodexUpstreamError
-from claudex.config import ConfigError, GatewayConfig, parse_route_target
+from claudex.providers.codex_client import (
+    CODEX_SERVICE_TIER_WIRE_VALUES,
+    CodexDiscoveryError,
+    CodexUpstreamError,
+)
+from claudex.config import (
+    ConfigError,
+    GatewayConfig,
+    SETTINGS_KEYS,
+    VALID_CODEX_SERVICE_TIERS,
+    parse_route_target,
+)
 from claudex.providers.grok_auth import GrokAuthError
 from claudex.providers.grok_client import GrokUpstreamError
 from claudex.providers.kimi_auth import KimiAuthError
@@ -236,6 +247,43 @@ async def _handle_admin_codex_models(request: Request) -> JSONResponse:
     return JSONResponse({"models": models})
 
 
+async def _handle_admin_codex_capabilities(request: Request) -> JSONResponse:
+    """Read or explicitly refresh request metadata without running inference."""
+    denied = _admin_guard(request)
+    if denied is not None:
+        return denied
+    force_refresh = request.method == "POST"
+    if force_refresh:
+        denied = _require_json_content_type(request)
+        if denied is not None:
+            return denied
+        body, error = await _read_json_object(request, server_support._openai_error_body)
+        if error is not None or body is None:
+            return error
+        if body:
+            return JSONResponse(
+                server_support._openai_error_body(
+                    "invalid_request_error", "capability refresh expects an empty JSON object",
+                ),
+                status_code=400,
+            )
+
+    backend = _get_route_backend(request, "codex")
+    if not isinstance(backend, ResponsesBackend):
+        raise RuntimeError("codex route backend must use the Responses wire")
+    config: GatewayConfig = request.app.state.config
+    mapped_models = []
+    for target in config.model_map.values():
+        route = parse_route_target(target, config.route_providers)
+        if route.provider == "codex":
+            mapped_models.append(route.model)
+    payload = await backend.transport.service_tier_capabilities(
+        config.codex_service_tier, mapped_models, force_refresh=force_refresh,
+    )
+    payload["env_locked"] = os.environ.get(SETTINGS_KEYS["codex.service_tier"]) is not None
+    return JSONResponse(payload)
+
+
 async def _handle_admin_grok_models(request: Request) -> JSONResponse:
     """Relay Grok's live model catalog (IDs only) for model_map authoring.
 
@@ -367,7 +415,8 @@ _CONNECTION_TEST_TIMEOUT = 30.0
 
 
 async def _probe_responses_route(
-    backend: ResponsesBackend, provider_name: str, target: str
+    backend: ResponsesBackend, provider_name: str, target: str,
+    *, tier_diagnostic: dict[str, Any] | None = None,
 ) -> str:
     claude_request = {
         "max_tokens": 16,
@@ -377,13 +426,59 @@ async def _probe_responses_route(
         claude_request, target, "low"
     )
     payload = backend.adapt_probe_payload(translated_payload, target)
+    if tier_diagnostic is not None:
+        capabilities = await backend.transport.service_tier_capabilities(
+            tier_diagnostic["requested_tier"], [target],
+        )
+        model_capability = capabilities["models"][target]
+        tier_diagnostic["capability_status"] = model_capability["status"]
+        tier_diagnostic["capability_reason"] = model_capability["reason"] or capabilities["reason"]
+        tier_diagnostic["sent_tier"] = model_capability["wire_tier"]
+        if model_capability["wire_tier"] is not None:
+            payload["service_tier"] = model_capability["wire_tier"]
     events = backend.transport.stream_responses(
         payload, payload["prompt_cache_key"]
     )
+    first_event = None
+    response_model = target
+    has_completed_response = False
     try:
-        first_event = await anext(events, None)
+        if tier_diagnostic is None:
+            first_event = await anext(events, None)
+        else:
+            async for event in events:
+                if first_event is None:
+                    first_event = event
+                if not isinstance(event, dict):
+                    continue
+                response = event.get("response")
+                if isinstance(response, dict):
+                    model = response.get("model")
+                    if isinstance(model, str):
+                        response_model = model
+                    if "service_tier" in response:
+                        tier = response["service_tier"]
+                        tier_diagnostic["backend_confirmed_tier"] = (
+                            tier if isinstance(tier, str) and tier.strip() else None
+                        )
+                if event.get("type") in ("response.failed", "response.incomplete", "error"):
+                    raise UpstreamError(502, "Codex speed probe ended with a failed or incomplete response", provider_name)
+                if event.get("type") == "response.completed":
+                    has_completed_response = True
+                    break
     finally:
         await events.aclose()
+        if tier_diagnostic is not None:
+            sent_tier = payload.get("service_tier")
+            if sent_tier != tier_diagnostic["sent_tier"]:
+                tier_diagnostic["capability_status"] = "unknown"
+                tier_diagnostic["capability_reason"] = "Tier support changed or could not be verified at dispatch; sent Standard without the earlier selection's tier."
+            tier_diagnostic["sent_tier"] = sent_tier
+            if not has_completed_response:
+                tier_diagnostic["confirmation_status"] = "unconfirmed"
+                tier_diagnostic["confirmation_reason"] = (
+                    "The probe ended without a successful response.completed; tier confirmation is unconfirmed."
+                )
     if first_event is None:
         if backend.signature_namespace is None:
             detail = f"{provider_name} stream ended without any events"
@@ -392,7 +487,29 @@ async def _probe_responses_route(
                 f"custom provider {provider_name!r} stream ended without any events"
             )
         raise UpstreamError(502, detail, provider_name)
+    if tier_diagnostic is not None:
+        if not has_completed_response:
+            raise UpstreamError(502, "Codex speed probe ended before a successful response.completed", provider_name)
+        backend_tier = tier_diagnostic["backend_confirmed_tier"]
+        if backend_tier is not None:
+            requested_tier = tier_diagnostic["requested_tier"]
+            if requested_tier is None:
+                tier_diagnostic["confirmation_status"] = "reported"
+                tier_diagnostic["confirmation_reason"] = f"The backend reported {backend_tier}; no accelerated tier was requested."
+            elif backend_tier == CODEX_SERVICE_TIER_WIRE_VALUES[requested_tier]:
+                tier_diagnostic["confirmation_status"] = "confirmed"
+                tier_diagnostic["confirmation_reason"] = None
+            else:
+                tier_diagnostic["confirmation_status"] = "different"
+                tier_diagnostic["confirmation_reason"] = f"The backend reported {backend_tier}, not the requested {requested_tier} tier."
+        return response_model
     response = first_event.get("response") if isinstance(first_event, dict) else None
+    if isinstance(first_event, dict) and first_event.get("type") in ("error", "response.failed"):
+        rejection = (
+            response.get("error") if first_event["type"] == "response.failed" and isinstance(response, dict)
+            else first_event.get("error", first_event)
+        )
+        raise UpstreamError(502, json.dumps({"error": rejection}), provider_name)
     model = response.get("model") if isinstance(response, dict) else None
     return model if isinstance(model, str) else target
 
@@ -467,20 +584,22 @@ async def _handle_admin_connection_test(request: Request) -> JSONResponse:
     target = target.strip()
 
     started_at = time.monotonic()
+    tier_diagnostic = None
 
     def result(
         ok: bool, status: int | None, detail: str | None = None, response_model: str | None = None
     ) -> JSONResponse:
-        return JSONResponse(
-            {
-                "ok": ok,
-                "status": status,
-                "latency_ms": int((time.monotonic() - started_at) * 1000),
-                "target": target,
-                "response_model": response_model,
-                "detail": detail,
-            }
-        )
+        payload = {
+            "ok": ok,
+            "status": status,
+            "latency_ms": int((time.monotonic() - started_at) * 1000),
+            "target": target,
+            "response_model": response_model,
+            "detail": detail,
+        }
+        if tier_diagnostic is not None:
+            payload["tier_diagnostic"] = tier_diagnostic
+        return JSONResponse(payload)
 
     # The target carries the same provider-prefix syntax as model_map values,
     # so the dashboard's test box works for every configured route.
@@ -493,6 +612,28 @@ async def _handle_admin_connection_test(request: Request) -> JSONResponse:
             server_support._openai_error_body("invalid_request_error", detail),
             status_code=400,
         )
+
+    if "service_tier" in body:
+        value = body["service_tier"]
+        if route.provider != "codex" or (
+            value is not None and (not isinstance(value, str) or value not in VALID_CODEX_SERVICE_TIERS)
+        ):
+            return JSONResponse(
+                server_support._openai_error_body(
+                    "invalid_request_error",
+                    "service_tier is a Codex-only opt-in probe setting; use null, 'fast', or 'ultrafast'",
+                ),
+                status_code=400,
+            )
+        tier_diagnostic = {
+            "requested_tier": value,
+            "sent_tier": None,
+            "backend_confirmed_tier": None,
+            "capability_status": "unknown",
+            "capability_reason": "Capability metadata has not been checked.",
+            "confirmation_status": "unconfirmed",
+            "confirmation_reason": "The backend did not report a service_tier; the selected tier is unconfirmed.",
+        }
 
     custom_provider = None
     if route.provider in config.custom_providers:
@@ -514,7 +655,7 @@ async def _handle_admin_connection_test(request: Request) -> JSONResponse:
             probe = _probe_anthropic_route(backend, request, route.model)
         else:
             probe = _probe_responses_route(
-                backend, route.provider, route.model
+                backend, route.provider, route.model, tier_diagnostic=tier_diagnostic,
             )
         response_model = await asyncio.wait_for(probe, _CONNECTION_TEST_TIMEOUT)
     except UpstreamError as exc:

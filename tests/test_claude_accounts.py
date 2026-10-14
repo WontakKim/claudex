@@ -392,6 +392,37 @@ def test_mark_needs_reauth_is_idempotent_without_a_registry_write() -> None:
     assert _registry_path().stat().st_mtime_ns == mtime_after_first
 
 
+@pytest.mark.parametrize("reauthenticate", [False, True])
+def test_mark_needs_reauth_fences_identical_credential_replacement(
+    monkeypatch: pytest.MonkeyPatch, reauthenticate: bool
+) -> None:
+    monkeypatch.setattr(claude_accounts, "_now_millis", lambda: 123)
+    original = _add(oauth_account_json={"accountUuid": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"})
+    credentials_path = _accounts_root() / original.id / "credentials.json"
+    generation = claude_account_store._credential_generation(credentials_path)
+    if reauthenticate:
+        updated = claude_accounts.update_account_credentials(
+            original.email, None, None, _credentials_payload(),
+            {"accountUuid": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"},
+        )
+        assert updated == original
+        assert json.loads(credentials_path.read_text()) == _credentials_payload()
+        assert claude_account_store._credential_generation(credentials_path) != generation
+    registry_before = _registry_path().read_bytes()
+
+    marked = claude_accounts.mark_account_needs_reauth(
+        original.id, expected_generation=generation
+    )
+
+    assert marked.state == ("ready" if reauthenticate else "needs-reauth")
+    assert marked.last_authenticated_at == original.last_authenticated_at
+    assert marked.account_incarnation_id == original.account_incarnation_id
+    if reauthenticate:
+        assert _registry_path().read_bytes() == registry_before
+    [listed] = claude_accounts.load_registry()
+    assert listed == marked
+
+
 def test_mark_needs_reauth_unknown_id_raises_not_found() -> None:
     _add()
     with pytest.raises(claude_account_model.AccountNotFoundError):

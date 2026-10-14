@@ -17,11 +17,12 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from claudex import __main__ as gateway_main
-from claudex import paths
+from claudex import locking, paths
 from claudex.cli import accounts, admin_client, compact, daemon
 from claudex.config import GatewayConfig
 from claudex.locking import try_file_lock
@@ -67,6 +68,7 @@ def _is_listening(port: int) -> bool:
 
 def _gateway_env(tmp_path: Path, port: int) -> dict[str, str]:
     env = {key: value for key, value in os.environ.items() if not key.startswith("CLAUDEX_")}
+    env.pop("CODEX_HOME", None)
     env["HOME"] = str(tmp_path)
     env["CLAUDEX_PORT"] = str(port)
     return env
@@ -80,6 +82,324 @@ def _run_cli(env: dict[str, str], *arguments: str) -> subprocess.CompletedProces
         text=True,
         timeout=30,
     )
+
+
+@pytest.mark.parametrize(
+    "has_codex_home_override",
+    [False, True],
+    ids=["absent-override", "external-override"],
+)
+def test_gateway_env_isolates_codex_home_without_mutating_parent_environment(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, has_codex_home_override: bool
+) -> None:
+    test_home = tmp_path / "gateway-home"
+    parent_environment = {
+        "HOME": str(tmp_path / "parent-home"),
+        "PATH": "/synthetic/bin",
+        "UNRELATED_SETTING": "preserved",
+        "CLAUDEX_PORT": "9999",
+        "CLAUDEX_MODEL_MAP": "should-be-removed",
+    }
+    if has_codex_home_override:
+        parent_environment["CODEX_HOME"] = str(tmp_path / "external-codex")
+    original_environment = parent_environment.copy()
+    monkeypatch.setattr(os, "environ", parent_environment)
+
+    env = _gateway_env(test_home, 12345)
+
+    assert parent_environment == original_environment
+    assert env == {
+        "HOME": str(test_home),
+        "PATH": "/synthetic/bin",
+        "UNRELATED_SETTING": "preserved",
+        "CLAUDEX_PORT": "12345",
+    }
+    monkeypatch.setattr(os, "environ", env)
+    config = GatewayConfig.load(settings_file=test_home / "settings.json")
+    assert config.codex_home == test_home / ".codex"
+
+
+class _FakeLaunchClock:
+    def __init__(self) -> None:
+        self.elapsed = 0.0
+
+    def monotonic(self) -> float:
+        return self.elapsed
+
+    def sleep(self, seconds: float) -> None:
+        self.elapsed += seconds
+
+
+@pytest.mark.parametrize("failure", ["child-exit", "readiness-timeout"])
+def test_concurrent_background_launch_preserves_the_ready_winner_record(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, failure: str
+) -> None:
+    runtime_dir = tmp_path / "runtime"
+    config = GatewayConfig(port=12345, settings_file=tmp_path / "settings.json")
+    winner_record = {
+        "pid": 101, "host": config.host, "port": config.port, "nonce": "winner-nonce"
+    }
+    loser_waiting = threading.Event()
+    release_loser = threading.Event()
+    winner_progress = threading.Event()
+    winner_ready = threading.Event()
+    events: list[str] = []
+    signals: list[tuple[int, int]] = []
+    outcomes: dict[str, object] = {}
+    monkeypatch.setattr(paths, "runtime_dir", lambda: runtime_dir)
+    monkeypatch.setattr(daemon, "time", _FakeLaunchClock())
+    monkeypatch.setattr(daemon, "_READY_TIMEOUT", 0.01)
+    monkeypatch.setattr(
+        daemon.secrets, "token_hex",
+        lambda count: f"{threading.current_thread().name}-nonce",
+    )
+
+    def is_listening(host: str, port: int) -> bool:
+        assert (host, port) == (config.host, config.port)
+        events.append(f"preflight-{threading.current_thread().name}")
+        return winner_ready.is_set()
+
+    def fetch_hello(host: str, port: int) -> dict | None:
+        assert (host, port) == (config.host, config.port)
+        if not winner_ready.is_set():
+            return None
+        return {"hello": "claudex-gateway", "version": daemon.claudex.__version__, **winner_record}
+
+    class FakeChild:
+        def __init__(self, pid: int) -> None:
+            self.pid = pid
+
+        def poll(self) -> int | None:
+            if self.pid == 202 and failure == "child-exit":
+                events.append("loser-failed")
+                return 3
+            return None
+
+        def terminate(self) -> None:
+            assert self.pid == 202
+            events.append("loser-failed")
+            signals.append((self.pid, signal.SIGTERM))
+
+    def spawn(arguments: list[str], **options: object) -> FakeChild:
+        assert arguments == [sys.executable, "-m", "claudex", "--foreground"]
+        actor = threading.current_thread().name
+        log_handle = options["stdout"]
+        assert isinstance(log_handle, io.TextIOBase)
+        log_handle.write(f"{actor} log\n")
+        if actor == "loser":
+            loser_waiting.set()
+            assert release_loser.wait(timeout=10)
+            return FakeChild(202)
+        assert actor == "winner"
+        winner_ready.set()
+        return FakeChild(101)
+
+    acquire = locking._acquire
+
+    def acquire_with_progress(descriptor: int) -> None:
+        if threading.current_thread().name == "winner":
+            winner_progress.set()
+        acquire(descriptor)
+
+    def kill(pid: int, requested_signal: int) -> None:
+        assert pid == 101
+        if requested_signal == signal.SIGTERM:
+            signals.append((pid, requested_signal))
+            winner_ready.clear()
+            return
+        assert requested_signal == 0
+        assert not winner_ready.is_set()
+        raise ProcessLookupError
+
+    monkeypatch.setattr(daemon, "_is_listening", is_listening)
+    monkeypatch.setattr(daemon, "_gateway_hello", fetch_hello)
+    monkeypatch.setattr(daemon.subprocess, "Popen", spawn)
+    monkeypatch.setattr(locking, "_acquire", acquire_with_progress)
+    monkeypatch.setattr(daemon.os, "kill", kill)
+
+    def launch(actor: str) -> None:
+        try:
+            daemon._start_background(config)
+            outcomes[actor] = 0
+        except SystemExit as exc:
+            outcomes[actor] = exc.code
+        except Exception as exc:
+            outcomes[actor] = exc
+        finally:
+            if actor == "winner":
+                winner_progress.set()
+
+    loser = threading.Thread(target=launch, args=("loser",), name="loser")
+    winner = threading.Thread(target=launch, args=("winner",), name="winner")
+    actors: list[threading.Thread] = []
+    try:
+        loser.start()
+        actors.append(loser)
+        assert loser_waiting.wait(timeout=10)
+        winner.start()
+        actors.append(winner)
+        assert winner_progress.wait(timeout=10)
+    finally:
+        release_loser.set()
+        for actor in actors:
+            actor.join(timeout=10)
+            assert not actor.is_alive()
+
+    assert outcomes == {"loser": 1, "winner": 0}, events
+    record, reason = daemon._read_daemon_record()
+    assert record == winner_record, (reason, events)
+    assert events.index("loser-failed") < events.index("preflight-winner"), events
+    assert paths.log_file().read_text(encoding="utf-8") == "winner log\n"
+    expected_signals = [(202, signal.SIGTERM)] if failure == "readiness-timeout" else []
+    assert signals == expected_signals
+    assert daemon._stop_recorded_daemon() == (True, "101")
+    assert signals == [*expected_signals, (101, signal.SIGTERM)]
+    assert not paths.daemon_record_file().exists()
+
+
+@pytest.mark.parametrize("hello_override", [{"pid": 303}, {"nonce": "foreign-nonce"}])
+def test_background_launch_requires_matching_child_identity(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, hello_override: dict[str, object]
+) -> None:
+    config = GatewayConfig(port=12345, settings_file=tmp_path / "settings.json")
+    terminated: list[int] = []
+    child = SimpleNamespace(
+        pid=202, poll=lambda: None, terminate=lambda: terminated.append(202)
+    )
+
+    def unexpected_signal(*arguments: object) -> None:
+        raise AssertionError("readiness checks must not signal any recorded process")
+
+    monkeypatch.setattr(paths, "runtime_dir", lambda: tmp_path / "runtime")
+    monkeypatch.setattr(daemon, "time", _FakeLaunchClock())
+    monkeypatch.setattr(daemon, "_READY_TIMEOUT", 0.01)
+    monkeypatch.setattr(daemon, "_is_listening", lambda host, port: False)
+    monkeypatch.setattr(
+        daemon, "_gateway_hello",
+        lambda host, port: {"pid": 202, "nonce": "child-nonce", **hello_override},
+    )
+    monkeypatch.setattr(daemon.secrets, "token_hex", lambda count: "child-nonce")
+    monkeypatch.setattr(daemon.subprocess, "Popen", lambda *args, **kwargs: child)
+    monkeypatch.setattr(daemon.os, "kill", unexpected_signal)
+
+    with pytest.raises(SystemExit) as failure:
+        daemon._start_background(config)
+
+    assert failure.value.code == 1
+    assert terminated == [202]
+    assert not paths.daemon_record_file().exists()
+
+
+def test_failed_background_spawn_releases_the_launch_lock(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config = GatewayConfig(port=12345, settings_file=tmp_path / "settings.json")
+    spawn_calls: list[object] = []
+
+    def fail_spawn(*arguments: object, **options: object) -> None:
+        spawn_calls.append(arguments)
+        raise OSError("synthetic spawn failure")
+
+    def unexpected_signal(*arguments: object) -> None:
+        raise AssertionError("failed spawn must not signal a process")
+
+    monkeypatch.setattr(paths, "runtime_dir", lambda: tmp_path / "runtime")
+    monkeypatch.setattr(daemon, "_is_listening", lambda host, port: False)
+    monkeypatch.setattr(daemon, "_gateway_hello", lambda host, port: None)
+    monkeypatch.setattr(daemon.subprocess, "Popen", fail_spawn)
+    monkeypatch.setattr(daemon.os, "kill", unexpected_signal)
+
+    with pytest.raises(OSError, match="synthetic spawn failure"):
+        daemon._start_background(config)
+
+    assert len(spawn_calls) == 1
+    assert not paths.daemon_record_file().exists()
+    handle = try_file_lock(paths.daemon_launch_lock())
+    assert handle is not None
+    handle.release()
+
+
+def test_background_launch_preserves_a_ready_recorded_owner_on_another_endpoint(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setattr(paths, "runtime_dir", lambda: tmp_path / "runtime")
+    config = GatewayConfig(port=12346, settings_file=tmp_path / "settings.json")
+    assert config.claude_account_routing_mode == "disabled"
+    monkeypatch.setenv("CLAUDEX_PORT", str(config.port))
+    owner_record = {
+        "pid": 601, "host": "127.0.0.1", "port": 12345, "nonce": "owner-a-nonce"
+    }
+    owner_endpoint = (owner_record["host"], owner_record["port"])
+    requested_endpoint = (config.host, config.port)
+    hello_by_endpoint = {
+        owner_endpoint: {"hello": "claudex-gateway", "version": daemon.claudex.__version__, **owner_record},
+        requested_endpoint: None,
+    }
+    paths.runtime_dir().mkdir()
+    record_file = paths.daemon_record_file()
+    log_file = paths.log_file()
+    record_file.write_text(json.dumps(owner_record, indent=2) + "\n", encoding="utf-8")
+    log_file.write_text("ready owner A log\n", encoding="utf-8")
+    original_state = {"record": record_file.read_bytes(), "log": log_file.read_bytes()}
+    spawned: list[list[str]] = []
+    signals: list[tuple[int, int]] = []
+    readiness_probes: list[tuple[str, int]] = []
+    pool_lock = paths.claude_account_pool_lock()
+
+    def is_listening(host: str, port: int) -> bool:
+        assert (host, port) in hello_by_endpoint
+        return hello_by_endpoint[(host, port)] is not None
+
+    def fetch_hello(host: str, port: int) -> dict | None:
+        assert (host, port) in hello_by_endpoint
+        readiness_probes.append((host, port))
+        return hello_by_endpoint[(host, port)]
+
+    def fail_child_spawn(arguments: list[str], **options: object) -> object:
+        assert arguments == [sys.executable, "-m", "claudex", "--foreground"]
+        assert options["env"]["CLAUDEX_PORT"] == str(config.port)
+        spawned.append(arguments)
+        assert try_file_lock(pool_lock) is None
+        log_handle = options["stdout"]
+        assert isinstance(log_handle, io.TextIOBase)
+        log_handle.write("claude account pool is already served (balanced-router.lock held)\n")
+        return SimpleNamespace(
+            pid=602, poll=lambda: 3,
+            terminate=lambda: signals.append((602, signal.SIGTERM)),
+        )
+
+    monkeypatch.setattr(daemon, "_is_listening", is_listening)
+    monkeypatch.setattr(daemon, "_gateway_hello", fetch_hello)
+    monkeypatch.setattr(daemon.subprocess, "Popen", fail_child_spawn)
+    monkeypatch.setattr(daemon.os, "kill", lambda pid, requested_signal: signals.append((pid, requested_signal)))
+    assert fetch_hello(*owner_endpoint)["pid"] == owner_record["pid"]
+    assert fetch_hello(*owner_endpoint)["nonce"] == owner_record["nonce"]
+    assert not is_listening(*requested_endpoint)
+    readiness_probes.clear()
+    owner_lease = try_file_lock(pool_lock)
+    assert owner_lease is not None
+    try:
+        with pytest.raises(SystemExit) as failure:
+            daemon._start_background(config)
+
+        assert failure.value.code == 1
+        observed_state = {
+            "record": record_file.read_bytes() if record_file.exists() else None,
+            "log": log_file.read_bytes(),
+        }
+        assert observed_state == original_state
+        assert spawned == []
+        assert signals == []
+        assert owner_endpoint in readiness_probes
+        assert try_file_lock(pool_lock) is None
+        output = capsys.readouterr()
+        assert output.out == ""
+        assert "http://127.0.0.1:12345" in output.err
+        assert "http://127.0.0.1:12346" in output.err
+        assert "already running on http://127.0.0.1:12346" not in output.err
+    finally:
+        owner_lease.release()
 
 
 @pytest.mark.parametrize(
@@ -479,6 +799,69 @@ def _stub_full_stack_urlopen(
 # --- URL bracketing (IPv6-safe URL construction) ---------------------------
 
 
+@pytest.mark.parametrize(
+    ("host", "expected_url"),
+    [
+        ("::1", "http://[::1]:23456/api/hello"),
+        ("2001:db8::1", "http://[2001:db8::1]:23456/api/hello"),
+        ("127.0.0.1", "http://127.0.0.1:23456/api/hello"),
+        ("localhost", "http://localhost:23456/api/hello"),
+    ],
+)
+def test_daemon_hello_uses_reachable_bracketed_urls(
+    monkeypatch: pytest.MonkeyPatch, host: str, expected_url: str
+) -> None:
+    hello = {"hello": "claudex-gateway", "pid": 777, "nonce": "synthetic-nonce"}
+    requests: list[str] = []
+
+    def open_url(url: str, timeout: float) -> object:
+        assert timeout == 2
+        requests.append(url)
+        if url != expected_url:
+            raise urllib.error.URLError(ConnectionRefusedError("synthetic IPv6 URL is unreachable"))
+        return _FakeResponse(200, json.dumps(hello).encode())
+
+    monkeypatch.setattr(daemon, "_urlopen_no_redirect", open_url)
+
+    assert daemon._gateway_hello(host, 23456) == hello, requests
+    assert requests == [expected_url]
+
+
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        (b'{"hello":"claudex-gateway","pid":777,"nonce":"synthetic-nonce"}',
+         {"hello": "claudex-gateway", "pid": 777, "nonce": "synthetic-nonce"}),
+        (b'[]', None),
+        (b'{"hello":"foreign"}', None),
+        (b'not-json', None),
+    ],
+)
+def test_daemon_hello_preserves_direct_payload_validation(
+    monkeypatch: pytest.MonkeyPatch, body: bytes, expected: dict | None
+) -> None:
+    monkeypatch.setattr(
+        daemon, "_urlopen_no_redirect",
+        lambda request, timeout: _FakeResponse(200, body),
+    )
+    assert daemon._gateway_hello("127.0.0.1", 23456) == expected
+
+
+@pytest.mark.parametrize("error", [
+    urllib.error.HTTPError("http://127.0.0.1:23456/api/hello", 503, "synthetic error", None, None),
+    urllib.error.URLError(TimeoutError("synthetic timeout")),
+    ConnectionResetError("synthetic reset"),
+])
+def test_daemon_hello_preserves_transport_error_rejection(
+    monkeypatch: pytest.MonkeyPatch, error: OSError
+) -> None:
+    def fail_request(request: object, timeout: float) -> object:
+        raise error
+
+    monkeypatch.setattr(daemon, "_urlopen_no_redirect", fail_request)
+    assert daemon._gateway_hello("127.0.0.1", 23456) is None
+
+
 def test_bracket_host_leaves_ipv4_and_hostnames_unbracketed() -> None:
     assert admin_client._bracket_host("127.0.0.1") == "127.0.0.1"
     assert admin_client._bracket_host("example.com") == "example.com"
@@ -552,13 +935,112 @@ def test_probe_endpoint_converts_wildcard_record_host_via_connect_host(
     assert admin_client._probe_endpoint(config) == ("127.0.0.1", 9999)
 
 
-def test_probe_endpoint_converts_wildcard_config_host_when_no_record(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+@pytest.mark.parametrize("has_record", [False, True], ids=["foreground", "recorded"])
+@pytest.mark.parametrize(
+    ("bind_host", "probe_host"),
+    [
+        ("0.0.0.0", "127.0.0.1"),
+        ("::", "::1"),
+        ("127.0.0.1", "127.0.0.1"),
+        ("::1", "::1"),
+        ("192.0.2.1", "192.0.2.1"),
+        ("localhost", "localhost"),
+    ],
+)
+def test_probe_endpoint_preserves_reachable_address_family(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    has_record: bool, bind_host: str, probe_host: str,
 ) -> None:
-    monkeypatch.setattr(paths, "daemon_record_file", lambda: tmp_path / "gateway.pid")
-    config = GatewayConfig(host="::", port=8787, settings_file=tmp_path / "settings.json")
+    record_file = tmp_path / "gateway.pid"
+    monkeypatch.setattr(paths, "daemon_record_file", lambda: record_file)
+    monkeypatch.setenv("CLAUDEX_HOST", bind_host)
+    monkeypatch.setenv("CLAUDEX_PORT", "12345")
+    monkeypatch.setenv("CLAUDEX_LOCAL_TOKEN", "synthetic-local-token")
+    config = GatewayConfig.load(settings_file=tmp_path / "settings.json")
+    assert config.host == bind_host
+    assert config.local_token == "synthetic-local-token"
+    port = config.port
+    if has_record:
+        port = 23456
+        _write_record(record_file, pid=123, host=bind_host, port=port, nonce="synthetic-nonce")
+    expected_endpoint = (probe_host, port)
+    connections: list[tuple[str, int]] = []
 
-    assert admin_client._probe_endpoint(config) == ("127.0.0.1", 8787)
+    def connect(address: tuple[str, int], timeout: float) -> object:
+        assert timeout == 0.5
+        connections.append(address)
+        if address != expected_endpoint:
+            raise ConnectionRefusedError("synthetic listener has a different address family")
+        return contextlib.nullcontext()
+
+    monkeypatch.setattr(daemon.socket, "create_connection", connect)
+    endpoint = admin_client._probe_endpoint(config)
+
+    assert daemon._is_listening(*endpoint), connections
+    assert endpoint == expected_endpoint
+    assert connections == [expected_endpoint]
+
+
+@pytest.mark.parametrize("has_record", [False, True], ids=["foreground", "recorded"])
+@pytest.mark.parametrize("command", ["compact-off", "account-use-off"])
+@pytest.mark.parametrize("is_reachable", [True, False], ids=["online", "ambiguous"])
+def test_ipv6_live_admin_discovery_never_uses_direct_persistence(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    has_record: bool, command: str, is_reachable: bool,
+) -> None:
+    settings_file = tmp_path / "settings.json"
+    settings_file.write_text("{}\n", encoding="utf-8")
+    monkeypatch.setenv("CLAUDEX_HOST", "::")
+    monkeypatch.setenv("CLAUDEX_PORT", "12345")
+    monkeypatch.setenv("CLAUDEX_LOCAL_TOKEN", "synthetic-local-token")
+    config = GatewayConfig.load(settings_file=settings_file)
+    monkeypatch.setattr(GatewayConfig, "load", staticmethod(lambda *args, **kwargs: config))
+    record_file = tmp_path / "gateway.pid"
+    monkeypatch.setattr(paths, "daemon_record_file", lambda: record_file)
+    port = config.port
+    if has_record:
+        port = 23456
+        _write_record(record_file, pid=777, host="::", port=port, nonce="synthetic-nonce")
+    base_url = f"http://[::1]:{port}"
+    requests: list[tuple[str, str]] = []
+    admin_path = "/admin/settings/compaction" if command == "compact-off" else "/admin/providers/claude/pool/serving"
+    admin_method = "PUT" if command == "compact-off" else "DELETE"
+
+    def forbid_persistence(*arguments: object, **options: object) -> None:
+        raise AssertionError("IPv6 live or ambiguous discovery must not persist settings directly")
+
+    def open_url(request: urllib.request.Request | str, timeout: float) -> object:
+        url = request if isinstance(request, str) else request.full_url
+        method = "GET" if isinstance(request, str) else request.get_method()
+        requests.append((method, url))
+        if not url.startswith(base_url + "/"):
+            raise urllib.error.URLError(ConnectionRefusedError("no synthetic IPv4 listener"))
+        if not is_reachable:
+            raise urllib.error.URLError(TimeoutError("synthetic ambiguous listener"))
+        if url == base_url + "/api/hello":
+            return _FakeResponse(200, _HELLO_BODY)
+        assert (method, url) == (admin_method, base_url + admin_path)
+        assert request.get_header("Authorization") == "Bearer synthetic-local-token"
+        if command == "compact-off":
+            assert json.loads(request.data) == {"model": None}
+            body = {"model": None, "env_locked": False, "last_reroute": None}
+        else:
+            assert request.data is None
+            body = {"account_id": None, "env_locked": False}
+        return _FakeResponse(200, json.dumps(body).encode())
+
+    monkeypatch.setattr(compact, "update_settings_file", forbid_persistence)
+    monkeypatch.setattr(accounts, "update_settings_file", forbid_persistence)
+    monkeypatch.setattr(admin_client, "_urlopen_no_redirect", open_url)
+
+    result = compact._compact_main(["off"]) if command == "compact-off" else accounts._account_main(["use", "off"])
+
+    assert result == (0 if is_reachable else 1)
+    expected_requests = [("GET", base_url + "/api/hello")]
+    if is_reachable:
+        expected_requests.append((admin_method, base_url + admin_path))
+    assert requests == expected_requests
+    assert settings_file.read_text(encoding="utf-8") == "{}\n"
 
 
 # --- Probe classification: the four-way outcome grammar ---------------------
@@ -1261,22 +1743,53 @@ def test_compact_off_identified_transport_failure_after_probe_leaves_settings_un
     assert saved == {"compaction.model": "claude:claude-old-5"}
 
 
-def _malformed_reroute_envelope() -> "admin_client._AdminHttpResponse":
-    # Envelope-level fields are fine, but the nested last_reroute is not the
-    # pinned seven-key record — this must be an admin failure, not success.
+@pytest.fixture(
+    params=[None, [], {}], ids=["missing-fields", "array-outcome", "object-outcome"]
+)
+def malformed_reroute_envelope(
+    request: pytest.FixtureRequest,
+) -> "admin_client._AdminHttpResponse":
+    # Envelope fields are valid; the nested record shape or outcome is malformed.
+    last_reroute = {}
+    if request.param is not None:
+        last_reroute = {
+            "outcome": request.param,
+            "timestamp": "",
+            "target_model": "",
+            "mapped_model": "",
+            "estimated_prompt_tokens": 0,
+            "context_window": 0,
+            "detail": None,
+        }
     return admin_client._AdminHttpResponse(
         status=200,
-        body={"model": None, "env_locked": False, "last_reroute": {}},
+        body={"model": None, "env_locked": False, "last_reroute": last_reroute},
         detail="",
     )
 
 
-def test_parse_compaction_envelope_rejects_malformed_nested_reroute_record() -> None:
-    assert (
-        compact._parse_compaction_envelope(
-            {"model": None, "env_locked": False, "last_reroute": {}}
-        )
-        is None
+def test_parse_compaction_envelope_rejects_malformed_nested_reroute_record(
+    malformed_reroute_envelope: "admin_client._AdminHttpResponse",
+) -> None:
+    assert compact._parse_compaction_envelope(malformed_reroute_envelope.body) is None
+
+
+@pytest.mark.parametrize("method", ["GET", "PUT"])
+def test_run_admin_compaction_rejects_malformed_nested_reroute_record(
+    monkeypatch: pytest.MonkeyPatch,
+    malformed_reroute_envelope: "admin_client._AdminHttpResponse",
+    method: str,
+) -> None:
+    _stub_admin_request(monkeypatch, response=malformed_reroute_envelope)
+
+    result = compact._run_admin_compaction(
+        "127.0.0.1", 8080, method, None, None if method == "GET" else {"model": None}
+    )
+
+    assert result == (
+        admin_client._AdminCallOutcome.FAILURE,
+        None,
+        "admin returned a malformed response (status 200)",
     )
 
 
@@ -1293,6 +1806,8 @@ def test_parse_compaction_envelope_rejects_malformed_nested_reroute_record() -> 
         {"outcome": "midstream_error", "detail": "connect_error"},
         {"outcome": "fallback_mapped", "detail": None},
         {"sequence": 7},
+        pytest.param({"outcome": []}, id="array-outcome"),
+        pytest.param({"outcome": {}}, id="object-outcome"),
     ],
 )
 def test_parse_reroute_record_rejects_schema_violations(
@@ -1334,30 +1849,45 @@ def test_compact_show_malformed_nested_record_exits_nonzero(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
+    malformed_reroute_envelope: "admin_client._AdminHttpResponse",
 ) -> None:
     _compact_env(monkeypatch, tmp_path, admin_client.ProbeOutcome.IDENTIFIED)
-    _stub_admin_request(monkeypatch, response=_malformed_reroute_envelope())
+    _stub_admin_request(monkeypatch, response=malformed_reroute_envelope)
 
     exit_code = compact._compact_main([])
+    captured = capsys.readouterr()
 
     assert exit_code != 0
-    assert "malformed" in capsys.readouterr().err
+    assert exit_code == 1
+    assert "malformed" in captured.err
+    assert captured.err == "compact: admin returned a malformed response (status 200)\n"
+    assert captured.out == ""
 
 
 def test_compact_set_malformed_nested_record_exits_nonzero_without_write(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    malformed_reroute_envelope: "admin_client._AdminHttpResponse",
 ) -> None:
     config = _compact_env(monkeypatch, tmp_path, admin_client.ProbeOutcome.IDENTIFIED)
-    _stub_admin_request(monkeypatch, response=_malformed_reroute_envelope())
+    _stub_admin_request(monkeypatch, response=malformed_reroute_envelope)
 
     exit_code = compact._compact_main(["set", "claude:claude-opus-5"])
+    captured = capsys.readouterr()
 
     assert exit_code != 0
+    assert exit_code == 1
     assert not config.settings_file.exists()
+    assert captured.err == "compact: admin returned a malformed response (status 200)\n"
+    assert captured.out == ""
 
 
 def test_compact_off_malformed_nested_record_exits_nonzero_without_write(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    malformed_reroute_envelope: "admin_client._AdminHttpResponse",
 ) -> None:
     settings_file = tmp_path / "settings.json"
     settings_file.write_text(
@@ -1369,13 +1899,17 @@ def test_compact_off_malformed_nested_record_exits_nonzero_without_write(
         admin_client.ProbeOutcome.IDENTIFIED,
         compaction_model="claude:claude-old-5",
     )
-    _stub_admin_request(monkeypatch, response=_malformed_reroute_envelope())
+    _stub_admin_request(monkeypatch, response=malformed_reroute_envelope)
 
     exit_code = compact._compact_main(["off"])
+    captured = capsys.readouterr()
 
     assert exit_code != 0
+    assert exit_code == 1
     saved = json.loads(settings_file.read_text(encoding="utf-8"))
     assert saved == {"compaction.model": "claude:claude-old-5"}
+    assert captured.err == "compact: admin returned a malformed response (status 200)\n"
+    assert captured.out == ""
 
 
 class _RedirectTarget:
@@ -1385,7 +1919,9 @@ class _RedirectTarget:
         self.requests: list[tuple[str, dict[str, str]]] = []
 
 
-def _serve_redirect_pair() -> "tuple[object, object, int, _RedirectTarget]":
+def _serve_redirect_pair(
+    target_hello: dict[str, object] | None = None,
+) -> "tuple[object, object, int, _RedirectTarget]":
     """Start server A (redirects everything to server B) and recording server B."""
     import http.server
 
@@ -1394,7 +1930,9 @@ def _serve_redirect_pair() -> "tuple[object, object, int, _RedirectTarget]":
     class TargetHandler(http.server.BaseHTTPRequestHandler):
         def _record(self) -> None:
             target.requests.append((self.path, dict(self.headers)))
-            body = b'{"hello": "claudex-gateway"}'
+            body = json.dumps(
+                {"hello": "claudex-gateway"} if target_hello is None else target_hello
+            ).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
@@ -1432,6 +1970,67 @@ def _serve_redirect_pair() -> "tuple[object, object, int, _RedirectTarget]":
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
     return redirect_server, target_server, redirect_port, target
+
+
+@pytest.mark.parametrize("is_same_version", [True, False], ids=["same-version", "old-version"])
+def test_daemon_redirect_probe_never_accepts_target_identity_or_enters_replacement(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    capsys: pytest.CaptureFixture[str], is_same_version: bool,
+) -> None:
+    target_hello = {
+        "hello": "claudex-gateway",
+        "version": daemon.claudex.__version__ if is_same_version else "synthetic-old-version",
+        "pid": 42002,
+        "nonce": "synthetic-target-nonce",
+    }
+    redirect_server, target_server, redirect_port, target = _serve_redirect_pair(target_hello)
+    config = GatewayConfig(port=redirect_port, settings_file=tmp_path / "settings.json")
+    monkeypatch.setattr(paths, "runtime_dir", lambda: tmp_path / "runtime")
+    replacements: list[bool] = []
+    spawns: list[object] = []
+    signals: list[tuple[int, int]] = []
+
+    def refuse_replacement() -> tuple[bool, str]:
+        replacements.append(True)
+        return False, "synthetic unverified record"
+
+    def forbid_spawn(*arguments: object, **options: object) -> None:
+        spawns.append(arguments)
+        raise AssertionError("redirecting port occupant must not start a child")
+
+    monkeypatch.setattr(daemon, "_stop_recorded_daemon", refuse_replacement)
+    monkeypatch.setattr(daemon.subprocess, "Popen", forbid_spawn)
+    monkeypatch.setattr(daemon.os, "kill", lambda pid, requested_signal: signals.append((pid, requested_signal)))
+    exit_code = 0
+    try:
+        try:
+            daemon._start_background(config)
+        except SystemExit as failure:
+            exit_code = failure.code
+
+        output = capsys.readouterr()
+        assert target.requests == [], {
+            "exit_code": exit_code,
+            "stdout": output.out,
+            "stderr": output.err,
+            "replacement_attempts": replacements,
+            "spawns": spawns,
+            "signals": signals,
+        }
+        assert exit_code == 1
+        assert "does not look like claudex-gateway" in output.err
+        assert "already running" not in output.out
+        assert "restarting" not in output.out
+        assert replacements == []
+        assert spawns == []
+        assert signals == []
+        assert not paths.daemon_record_file().exists()
+        assert not paths.log_file().exists()
+    finally:
+        redirect_server.shutdown()
+        target_server.shutdown()
+        redirect_server.server_close()
+        target_server.server_close()
 
 
 def test_probe_and_admin_never_follow_redirects_or_leak_the_bearer() -> None:

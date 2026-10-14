@@ -1,5 +1,6 @@
 """Tests for the Codex Responses -> Anthropic Messages response translation."""
 
+import asyncio
 import json
 import re
 
@@ -1038,6 +1039,438 @@ def test_message_item_fallback_when_no_text_deltas() -> None:
     ]
     assert events[2][1]["delta"] == {"type": "text_delta", "text": "full text"}
     assert events[4][1]["delta"]["stop_reason"] == "end_turn"
+
+
+def _run_responses_stream(
+    codex_events: list[dict], function_schemas: dict | None,
+) -> list[list[tuple[str, dict]]]:
+    translator = CodexToClaudeStreamTranslator(
+        {"model": "claude-opus-4-6"}, function_schemas=function_schemas,
+    )
+
+    async def translate() -> list[list[tuple[str, dict]]]:
+        outputs = [await translator.translate_event_async(event) for event in codex_events]
+        translator.finish()
+        return outputs
+
+    return asyncio.run(translate())
+
+
+def _assert_block_lifecycle(events: list[tuple[str, dict]]) -> None:
+    open_index = None
+    next_index = 0
+    for event_name, payload in events:
+        if event_name == "content_block_start":
+            assert open_index is None
+            assert payload["index"] == next_index
+            open_index = next_index
+        elif event_name == "content_block_delta":
+            assert open_index is not None
+            assert payload["index"] == open_index
+        elif event_name == "content_block_stop":
+            assert open_index is not None
+            assert payload["index"] == open_index
+            open_index = None
+            next_index += 1
+        elif event_name in ("message_delta", "message_stop"):
+            assert open_index is None
+    assert [name for name, _ in events[-2:]] == ["message_delta", "message_stop"]
+
+
+@pytest.mark.parametrize("function_schemas", [None, {}], ids=["ordinary", "validated"])
+@pytest.mark.parametrize("has_terminal_snapshot", [False, True], ids=["empty-output", "snapshot"])
+def test_refusal_deltas_are_streamed_unchanged_without_duplicate_snapshots(
+    function_schemas: dict | None, has_terminal_snapshot: bool,
+) -> None:
+    chunks = ["  I cannot help ", "\nwith that request.  "]
+    refusal = "".join(chunks)
+    part = {"type": "refusal", "refusal": refusal}
+    item = {"type": "message", "id": "msg_refusal", "role": "assistant", "content": [part]}
+    identity = {"item_id": "msg_refusal", "output_index": 0, "content_index": 0}
+    codex_events = [
+        {"type": "response.created", "response": {"id": "resp_refusal", "model": "gpt-5.5"}},
+        {"type": "response.in_progress", "response": {"id": "resp_refusal"}},
+        {"type": "response.output_item.added", "output_index": 0,
+         "item": {**item, "content": []}},
+        {"type": "response.content_part.added", **identity,
+         "part": {"type": "refusal", "refusal": ""}},
+        *[{"type": "response.refusal.delta", **identity, "delta": chunk} for chunk in chunks],
+        {"type": "response.refusal.done", **identity, "refusal": refusal},
+        {"type": "response.content_part.done", **identity, "part": part},
+        {"type": "response.output_item.done", "output_index": 0, "item": item},
+        {"type": "response.completed", "response": {
+            "id": "resp_refusal", "output": [item] if has_terminal_snapshot else [],
+            "usage": {"input_tokens": 10, "output_tokens": 9,
+                      "input_tokens_details": {"cached_tokens": 2}},
+        }},
+    ]
+    outputs = _run_responses_stream(codex_events, function_schemas)
+    for output, chunk in zip(outputs[4:6], chunks):
+        assert output == [("content_block_delta", {
+            "type": "content_block_delta", "index": 0,
+            "delta": {"type": "text_delta", "text": chunk},
+        })]
+    assert outputs[6] == []
+    assert outputs[7] == [("content_block_stop", {"type": "content_block_stop", "index": 0})]
+    assert outputs[8] == []
+    events = [event for output in outputs for event in output]
+    _assert_block_lifecycle(events)
+    message = assemble_claude_message(events)
+    assert message is not None
+    assert message["content"] == [{"type": "text", "text": refusal}]
+    assert message["stop_reason"] == "end_turn"
+    assert message["usage"] == {"input_tokens": 8, "output_tokens": 9, "cache_read_input_tokens": 2}
+
+
+@pytest.mark.parametrize("function_schemas", [None, {}], ids=["ordinary", "validated"])
+@pytest.mark.parametrize("content,expected_text", [
+    ([{"type": "refusal", "refusal": "  I cannot help.\n"}], "  I cannot help.\n"),
+    ([{"type": "output_text", "text": "Before. "},
+      {"type": "refusal", "refusal": "I cannot help. "},
+      {"type": "output_text", "text": "After."}], "Before. I cannot help. After."),
+], ids=["refusal-only", "mixed-content"])
+def test_message_item_fallback_preserves_refusal_content_order(
+    function_schemas: dict | None, content: list[dict], expected_text: str,
+) -> None:
+    item = {"type": "message", "id": "msg_fallback", "content": content}
+    outputs = _run_responses_stream([
+        {"type": "response.created", "response": {"id": "resp_fallback"}},
+        {"type": "response.output_item.done", "output_index": 0, "item": item},
+        {"type": "response.output_item.done", "output_index": 0, "item": item},
+        {"type": "response.completed", "response": {"output": [item]}},
+    ], function_schemas)
+    events = [event for output in outputs for event in output]
+    _assert_block_lifecycle(events)
+    message = assemble_claude_message(events)
+    assert message is not None
+    assert message["content"] == [{"type": "text", "text": expected_text}]
+    assert outputs[2] == []
+
+
+@pytest.mark.parametrize("function_schemas", [None, {}], ids=["ordinary", "validated"])
+def test_refusal_done_fallback_is_scoped_to_each_content_part(
+    function_schemas: dict | None,
+) -> None:
+    content = [
+        {"type": "output_text", "text": "Before."},
+        {"type": "refusal", "refusal": " I cannot help. "},
+        {"type": "refusal", "refusal": "Another refusal."},
+        {"type": "refusal", "refusal": " I cannot help. "},
+        {"type": "output_text", "text": "After."},
+    ]
+    item = {"type": "message", "id": "msg_mixed", "content": content}
+    codex_events = [{"type": "response.created", "response": {"id": "resp_mixed"}}]
+    for content_index, part in enumerate(content):
+        identity = {"item_id": "msg_mixed", "output_index": 0, "content_index": content_index}
+        is_refusal = part["type"] == "refusal"
+        field = "refusal" if is_refusal else "text"
+        codex_events.append({"type": "response.content_part.added", **identity,
+                             "part": {"type": part["type"], field: ""}})
+        if content_index not in (1, 3):
+            codex_events.append({"type": "response.refusal.delta" if is_refusal else "response.output_text.delta",
+                                 **identity, "delta": part[field]})
+        if is_refusal:
+            codex_events.append({"type": "response.refusal.done", **identity, "refusal": part[field]})
+        codex_events.append({"type": "response.content_part.done", **identity, "part": part})
+    codex_events.extend([
+        {"type": "response.output_item.done", "output_index": 0, "item": item},
+        {"type": "response.completed", "response": {"output": [item]}},
+    ])
+    outputs = _run_responses_stream(codex_events, function_schemas)
+    events = [event for output in outputs for event in output]
+    _assert_block_lifecycle(events)
+    message = assemble_claude_message(events)
+    assert message is not None
+    assert message["content"] == [
+        {"type": "text", "text": part.get("refusal", part.get("text"))} for part in content
+    ]
+    assert outputs[-2] == []
+
+
+@pytest.mark.parametrize("function_schemas", [None, {}], ids=["ordinary", "validated"])
+@pytest.mark.parametrize("has_part_added", [False, True], ids=["done-only", "part-added"])
+def test_refusal_content_part_done_recovers_text_without_refusal_events(
+    function_schemas: dict | None, has_part_added: bool,
+) -> None:
+    refusal = "  I cannot help.\n"
+    identity = {"item_id": "msg_part", "output_index": 0, "content_index": 0}
+    done = {"type": "response.content_part.done", **identity,
+            "part": {"type": "refusal", "refusal": refusal}}
+    codex_events = [{"type": "response.created", "response": {"id": "resp_part"}}]
+    if has_part_added:
+        codex_events.append({"type": "response.content_part.added", **identity,
+                             "part": {"type": "refusal", "refusal": ""}})
+    codex_events.extend([done, done, {"type": "response.completed", "response": {"output": []}}])
+    outputs = _run_responses_stream(codex_events, function_schemas)
+    events = [event for output in outputs for event in output]
+    _assert_block_lifecycle(events)
+    message = assemble_claude_message(events)
+    assert message is not None
+    assert message["content"] == [{"type": "text", "text": refusal}]
+    assert outputs[-2] == []
+
+
+@pytest.mark.parametrize("function_schemas", [None, {}], ids=["ordinary", "validated"])
+@pytest.mark.parametrize("terminal_type", ["response.completed", "response.incomplete"])
+@pytest.mark.parametrize("content,expected_text", [
+    ([{"type": "refusal", "refusal": "I cannot help."}], "I cannot help."),
+    ([{"type": "output_text", "text": "Before. "},
+      {"type": "refusal", "refusal": "I cannot help. "},
+      {"type": "output_text", "text": "After."}], "Before. I cannot help. After."),
+], ids=["refusal-only", "mixed-content"])
+def test_terminal_message_fallback_preserves_refusal_text(
+    function_schemas: dict | None, terminal_type: str, content: list[dict], expected_text: str,
+) -> None:
+    response = {"output": [{"type": "message", "id": "msg_terminal", "content": content}],
+                "usage": {"input_tokens": 10, "output_tokens": 9}}
+    if terminal_type == "response.incomplete":
+        response["incomplete_details"] = {"reason": "max_output_tokens"}
+    outputs = _run_responses_stream([
+        {"type": "response.created", "response": {"id": "resp_terminal"}},
+        {"type": terminal_type, "response": response},
+    ], function_schemas)
+    events = [event for output in outputs for event in output]
+    _assert_block_lifecycle(events)
+    message = assemble_claude_message(events)
+    assert message is not None
+    assert message["content"] == [{"type": "text", "text": expected_text}]
+    assert message["stop_reason"] == ("max_tokens" if terminal_type == "response.incomplete" else "end_turn")
+    assert message["usage"] == {"input_tokens": 10, "output_tokens": 9}
+
+
+@pytest.mark.parametrize("function_schemas", [None, {}], ids=["ordinary", "validated"])
+@pytest.mark.parametrize("recovery", ["item", "terminal"])
+@pytest.mark.parametrize("streamed_type", ["output_text", "refusal"])
+def test_message_fallback_recovers_unstreamed_parts_after_a_text_delta(
+    function_schemas: dict | None, recovery: str, streamed_type: str,
+) -> None:
+    first = ({"type": "output_text", "text": "Before. "} if streamed_type == "output_text"
+             else {"type": "refusal", "refusal": "First refusal. "})
+    content = [first, {"type": "refusal", "refusal": "I cannot help. "},
+               {"type": "output_text", "text": "After."}]
+    item = {"type": "message", "id": "msg_recovery", "content": content}
+    identity = {"item_id": "msg_recovery", "output_index": 0, "content_index": 0}
+    first_text = first.get("refusal", first.get("text"))
+    codex_events = [
+        {"type": "response.created", "response": {"id": "resp_recovery"}},
+        {"type": "response.content_part.added", **identity, "part": {"type": streamed_type}},
+        {"type": "response.refusal.delta" if streamed_type == "refusal" else "response.output_text.delta",
+         **identity, "delta": first_text},
+        {"type": "response.content_part.done", **identity, "part": first},
+    ]
+    if recovery == "item":
+        codex_events.extend([
+            {"type": "response.output_item.done", "output_index": 0, "item": item},
+            {"type": "response.output_item.done", "output_index": 0, "item": item},
+        ])
+    codex_events.append({"type": "response.completed", "response": {"output": [item]}})
+    outputs = _run_responses_stream(codex_events, function_schemas)
+    events = [event for output in outputs for event in output]
+    _assert_block_lifecycle(events)
+    message = assemble_claude_message(events)
+    assert message is not None
+    assert message["content"] == [{"type": "text", "text": first_text},
+                                  {"type": "text", "text": "I cannot help. After."}]
+    if recovery == "item":
+        assert outputs[-2] == []
+
+
+@pytest.mark.parametrize("function_schemas", [None, {}], ids=["ordinary", "validated"])
+@pytest.mark.parametrize("recovery", ["item", "terminal"])
+def test_identical_refusals_in_distinct_message_items_are_not_deduplicated(
+    function_schemas: dict | None, recovery: str,
+) -> None:
+    items = [{"type": "message", "id": f"msg_{index}",
+              "content": [{"type": "refusal", "refusal": "I cannot help."}]} for index in range(2)]
+    codex_events = [
+        {"type": "response.created", "response": {"id": "resp_distinct"}},
+        {"type": "response.refusal.delta", "output_index": 0, "content_index": 0,
+         "item_id": "msg_0", "delta": "I cannot help."},
+        {"type": "response.content_part.done", "output_index": 0, "content_index": 0,
+         "item_id": "msg_0", "part": items[0]["content"][0]},
+    ]
+    if recovery == "item":
+        for output_index, item in enumerate(items):
+            codex_events.extend([
+                {"type": "response.output_item.done", "output_index": output_index, "item": item},
+                {"type": "response.output_item.done", "output_index": output_index, "item": item},
+            ])
+    codex_events.append({"type": "response.completed", "response": {"output": items}})
+    outputs = _run_responses_stream(codex_events, function_schemas)
+    events = [event for output in outputs for event in output]
+    _assert_block_lifecycle(events)
+    message = assemble_claude_message(events)
+    assert message is not None
+    assert message["content"] == [{"type": "text", "text": "I cannot help."}] * 2
+
+
+@pytest.mark.parametrize("function_schemas", [None, {"lookup": {"type": "object"}}],
+                         ids=["ordinary", "validated"])
+def test_refusal_deltas_preserve_thinking_tools_and_usage(
+    function_schemas: dict | None,
+) -> None:
+    outputs = _run_responses_stream([
+        {"type": "response.created", "response": {"id": "resp_controls"}},
+        {"type": "response.output_item.added", "output_index": 0,
+         "item": {"type": "reasoning"}},
+        {"type": "response.reasoning_summary_text.delta", "delta": "Thinking."},
+        {"type": "response.output_item.done", "output_index": 0,
+         "item": {"type": "reasoning", "encrypted_content": "reasoning_signature"}},
+        {"type": "response.refusal.delta", "output_index": 1, "content_index": 0,
+         "delta": "I cannot help."},
+        {"type": "response.refusal.done", "output_index": 1, "content_index": 0,
+         "refusal": "I cannot help."},
+        {"type": "response.output_item.added", "output_index": 2,
+         "item": {"type": "function_call", "id": "item_tool", "call_id": "call_tool", "name": "lookup"}},
+        {"type": "response.function_call_arguments.delta", "output_index": 2,
+         "delta": '{"query":"safe"}'},
+        {"type": "response.output_item.done", "output_index": 2,
+         "item": {"type": "function_call", "id": "item_tool", "call_id": "call_tool", "name": "lookup",
+                  "arguments": '{"query":"safe"}'}},
+        {"type": "response.output_text.delta", "output_index": 3, "content_index": 0,
+         "delta": "Ordinary text."},
+        {"type": "response.completed", "response": {"output": [],
+         "usage": {"input_tokens": 12, "output_tokens": 9, "input_tokens_details": {"cached_tokens": 2}}}},
+    ], function_schemas)
+    events = [event for output in outputs for event in output]
+    _assert_block_lifecycle(events)
+    message = assemble_claude_message(events)
+    assert message is not None
+    assert message["content"] == [
+        {"type": "thinking", "thinking": "Thinking.", "signature": "reasoning_signature"},
+        {"type": "text", "text": "I cannot help."},
+        {"type": "tool_use", "id": "call_tool", "name": "lookup", "input": {"query": "safe"}},
+        {"type": "text", "text": "Ordinary text."},
+    ]
+    assert message["stop_reason"] == "tool_use"
+    assert message["usage"] == {"input_tokens": 10, "output_tokens": 9, "cache_read_input_tokens": 2}
+
+
+@pytest.mark.parametrize("function_schemas", [None, {}], ids=["ordinary", "validated"])
+@pytest.mark.parametrize("is_streaming", [False, True], ids=["aggregate", "stream"])
+@pytest.mark.parametrize("delivery", ["deltas", "item", "terminal"])
+def test_refusal_text_reaches_both_responses_relay_modes(
+    function_schemas: dict | None, is_streaming: bool, delivery: str,
+) -> None:
+    from claudex.relay.openai_backend import _aggregate_claude_response, _translate_claude_sse
+
+    refusal = "  I cannot help.\n"
+    item = {"type": "message", "id": "msg_relay",
+            "content": [{"type": "refusal", "refusal": refusal}]}
+    codex_events = [{"type": "response.created", "response": {"id": "resp_relay"}}]
+    if delivery == "deltas":
+        codex_events.append({"type": "response.refusal.delta", "output_index": 0,
+                             "content_index": 0, "delta": refusal})
+    elif delivery == "item":
+        codex_events.append({"type": "response.output_item.done", "output_index": 0, "item": item})
+    codex_events.append({"type": "response.completed", "response": {
+        "output": [item] if delivery == "terminal" else [],
+        "usage": {"input_tokens": 10, "output_tokens": 9},
+    }})
+    closed = []
+
+    async def upstream():
+        try:
+            for event in codex_events:
+                yield event
+        finally:
+            closed.append(True)
+
+    async def relay() -> dict:
+        request = {"model": "claude-opus-4-6"}
+        if is_streaming:
+            wire = "".join([chunk async for chunk in _translate_claude_sse(
+                request, upstream(), function_schemas=function_schemas,
+            )])
+            events = []
+            for frame in wire.split("\n\n"):
+                if not frame:
+                    continue
+                event_line, data_line = frame.split("\n", 1)
+                events.append((event_line.removeprefix("event: "),
+                               json.loads(data_line.removeprefix("data: "))))
+            _assert_block_lifecycle(events)
+            message = assemble_claude_message(events)
+            assert message is not None
+            return message
+        response = await _aggregate_claude_response(
+            request, upstream(), function_schemas=function_schemas,
+        )
+        assert response.status_code == 200
+        return json.loads(response.body)
+
+    message = asyncio.run(relay())
+    assert message["content"] == [{"type": "text", "text": refusal}]
+    assert message["stop_reason"] == "end_turn"
+    assert message["usage"] == {"input_tokens": 10, "output_tokens": 9}
+    assert closed == [True]
+
+
+@pytest.mark.parametrize("function_schemas", [None, {}], ids=["ordinary", "validated"])
+@pytest.mark.parametrize("is_streaming", [False, True], ids=["aggregate", "stream"])
+def test_completed_text_part_precedes_streamed_refusal_in_both_relay_modes(
+    function_schemas: dict | None, is_streaming: bool,
+) -> None:
+    from claudex.relay.openai_backend import _aggregate_claude_response, _translate_claude_sse
+
+    text_part = {"type": "output_text", "text": "Before. "}
+    refusal_part = {"type": "refusal", "refusal": "I cannot help."}
+    item = {"type": "message", "id": "msg_order", "role": "assistant",
+            "content": [text_part, refusal_part]}
+    identity = {"item_id": "msg_order", "output_index": 0}
+    codex_events = [
+        {"type": "response.created", "response": {"id": "resp_order"}},
+        {"type": "response.output_item.added", "output_index": 0, "item": {**item, "content": []}},
+        {"type": "response.content_part.added", **identity, "content_index": 0,
+         "part": {"type": "output_text", "text": ""}},
+        {"type": "response.content_part.done", **identity, "content_index": 0, "part": text_part},
+        {"type": "response.content_part.added", **identity, "content_index": 1,
+         "part": {"type": "refusal", "refusal": ""}},
+        {"type": "response.refusal.delta", **identity, "content_index": 1, "delta": "I cannot help."},
+        {"type": "response.refusal.done", **identity, "content_index": 1, "refusal": "I cannot help."},
+        {"type": "response.content_part.done", **identity, "content_index": 1, "part": refusal_part},
+        {"type": "response.output_item.done", "output_index": 0, "item": item},
+        {"type": "response.completed", "response": {"output": [item],
+         "usage": {"input_tokens": 10, "output_tokens": 9}}},
+    ]
+    emitted_events: list[tuple[str, dict]] = []
+    closed = []
+
+    async def upstream():
+        try:
+            for event in codex_events:
+                if is_streaming and event["type"] == "response.refusal.delta":
+                    assert [payload["delta"]["text"] for name, payload in emitted_events
+                            if name == "content_block_delta"
+                            and payload["delta"]["type"] == "text_delta"] == ["Before. "]
+                yield event
+        finally:
+            closed.append(True)
+
+    async def relay() -> dict:
+        request = {"model": "claude-opus-4-6"}
+        if is_streaming:
+            async for chunk in _translate_claude_sse(
+                request, upstream(), function_schemas=function_schemas,
+            ):
+                payload = json.loads(chunk.split("data: ", 1)[1])
+                emitted_events.append((payload["type"], payload))
+            _assert_block_lifecycle(emitted_events)
+            message = assemble_claude_message(emitted_events)
+            assert message is not None
+            return message
+        response = await _aggregate_claude_response(
+            request, upstream(), function_schemas=function_schemas,
+        )
+        assert response.status_code == 200
+        return json.loads(response.body)
+
+    message = asyncio.run(relay())
+    assert message["content"] == [{"type": "text", "text": "Before. "},
+                                  {"type": "text", "text": "I cannot help."}]
+    assert message["stop_reason"] == "end_turn"
+    assert message["usage"] == {"input_tokens": 10, "output_tokens": 9}
+    assert closed == [True]
 
 
 def test_error_event_translates_to_claude_error() -> None:

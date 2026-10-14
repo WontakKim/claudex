@@ -25,6 +25,10 @@ def daemon_record_file() -> Path:
     return runtime_dir() / "gateway.pid"
 
 
+def daemon_launch_lock() -> Path:
+    return runtime_dir() / "gateway-launch.lock"
+
+
 def log_file() -> Path:
     return runtime_dir() / "gateway.log"
 

@@ -8,6 +8,7 @@ from dataclasses import asdict
 from typing import Any
 
 from claudex.gptpro import conversation
+from claudex.gptpro.ask import GptProAskError
 from claudex.gptpro.jobs.models import AskJob
 
 ASK_GPT_PRO_DESCRIPTION = (
@@ -242,13 +243,16 @@ def build_gptpro_server(app: Any) -> Any:
                 def on_thread_ref(thread_ref: str) -> None:
                     runtime.bind_thread(session_id, thread_ref)
 
-            job = runtime.start_ask(
-                question,
-                conversation_id=conversation_id,
-                on_thread_ref=on_thread_ref,
-                attachment_paths=attachment_paths,
-                session_id=session_id,
-            )
+            try:
+                job = runtime.start_ask(
+                    question,
+                    conversation_id=conversation_id,
+                    on_thread_ref=on_thread_ref,
+                    attachment_paths=attachment_paths,
+                    session_id=session_id,
+                )
+            except GptProAskError as exc:
+                return _tool_error(types, str(exc))
             return _json_result(
                 types,
                 {"ask_id": job.ask_id, "thread_ref": job.thread_ref},
@@ -280,7 +284,7 @@ def build_gptpro_server(app: Any) -> Any:
                 job = runtime.start_recovery(
                     ask_id=ask_id, conversation_id=thread_ref, marker=marker,
                 )
-            except ValueError as exc:
+            except (ValueError, GptProAskError) as exc:
                 return _tool_error(types, str(exc))
             return _json_result(types, {
                 "ask_id": job.ask_id, "source_ask_id": job.source_ask_id,

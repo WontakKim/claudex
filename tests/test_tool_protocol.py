@@ -814,3 +814,86 @@ def test_malformed_preceding_server_result_has_contextual_control_error(malforme
     ]}
     with pytest.raises(ToolProtocolError, match=r'messages\[0\].content\[0\].type: must be a nonempty string'):
         compile_tool_state(request)
+
+
+@pytest.mark.parametrize("precompiled", [False, True], ids=["direct", "serving-precompiled"])
+@pytest.mark.parametrize("split_messages", [False, True], ids=["merged", "contiguous-split"])
+def test_native_search_replay_keeps_compiled_controls_references_and_client_identity(
+    precompiled: bool, split_messages: bool,
+) -> None:
+    from claudex.relay.openai_backend import _validate_mapped_claude_request
+    from claudex.translate.claude_to_codex import translate_claude_request_to_codex
+    from claudex.translate.server_tool_history import normalize_server_tool_history
+
+    call = {"type": "server_tool_use", "id": "srvtoolu_synthetic_native", "name": "web_search",
+            "input": {"query": "synthetic native query"}}
+    result = {"type": "web_search_tool_result", "tool_use_id": "srvtoolu_synthetic_native", "content": [
+        {"type": "web_search_result", "title": "Synthetic native source", "url": "https://example.invalid/source",
+         "encrypted_content": "synthetic-opaque-state"},
+    ]}
+    history = [_assistant([call]), _assistant([result])] if split_messages else [_assistant([call, result])]
+    control_index = len(history) + 1
+    reference_index = control_index + 2
+    request = {"max_tokens": 64, "tools": [
+        {"type": "web_search_20250305", "name": "web_search"},
+        _tool("ToolSearch"), _tool("hidden", deferred=True),
+    ], "messages": [
+        _user(), *history, _system(_addition(_tool("read_file"))),
+        _assistant([_call("ToolSearch", "srvtoolu_synthetic_native")]),
+        _user([_result("hidden", call_id="srvtoolu_synthetic_native")]),
+    ]}
+    original = deepcopy(request)
+    assert _validate_mapped_claude_request(request) is None
+    assert normalize_server_tool_history(request) is request
+    state = compile_tool_state(request, beta_header=INLINE_TOOLS_BETA)
+    state_snapshot = deepcopy(state)
+    assert set(state.markers) == {(control_index, 0)}
+    assert set(state.references) == {(reference_index, 0, 0)}
+    assert "hidden" in state.active_name_map
+
+    payload = translate_claude_request_to_codex(
+        request, "gpt-5.5", tool_state=state if precompiled else None, beta_header=INLINE_TOOLS_BETA,
+    )
+
+    developer_messages = [item for item in payload["input"] if item.get("role") == "developer"]
+    assert developer_messages == [{"type": "message", "role": "developer", "content": [
+        {"type": "input_text", "text": state.markers[control_index, 0]},
+    ]}]
+    assert [item for item in payload["input"] if item["type"] == "function_call"] == [{
+        "type": "function_call", "call_id": "srvtoolu_synthetic_native", "name": "ToolSearch", "arguments": "{}",
+    }]
+    assert [item for item in payload["input"] if item["type"] == "function_call_output"] == [{
+        "type": "function_call_output", "call_id": "srvtoolu_synthetic_native", "output": [
+            {"type": "input_text", "text": state.references[reference_index, 0, 0]},
+        ],
+    }]
+    assert {tool.get("name") for tool in payload["tools"] if tool["type"] == "function"} == {"ToolSearch", "read_file", "hidden"}
+    assert "synthetic native query" in json.dumps(payload["input"])
+    assert "Synthetic native source" in json.dumps(payload["input"])
+    assert "synthetic-opaque-state" not in json.dumps(payload)
+    assert request == original
+    assert state == state_snapshot
+    assert normalize_server_tool_history(request) is request
+
+
+@pytest.mark.parametrize("scenario", ["paused-server-result", "outstanding-client-pair"])
+def test_native_search_replay_does_not_bypass_control_placement_errors(scenario: str) -> None:
+    from claudex.translate.claude_to_codex import TranslationError, translate_claude_request_to_codex
+
+    response = _assistant([
+        {"type": "server_tool_use", "id": "srvtoolu_synthetic_native", "name": "web_search", "input": {}},
+        {"type": "web_search_tool_result", "tool_use_id": "srvtoolu_synthetic_native", "content": []},
+    ])
+    if scenario == "paused-server-result":
+        response["stop_reason"] = "pause_turn"
+        error = "cannot follow a paused server result"
+    else:
+        response["content"].insert(0, _call("read_file", "call_client"))
+        error = "cannot split a tool_use/tool_result pair"
+    request = {"max_tokens": 64, "messages": [response, _system(_addition(_tool("new")))]}
+    original = deepcopy(request)
+    with pytest.raises(ToolProtocolError, match=error):
+        compile_tool_state(request, beta_header=INLINE_TOOLS_BETA)
+    with pytest.raises(TranslationError, match=error):
+        translate_claude_request_to_codex(request, "gpt-5.5", beta_header=INLINE_TOOLS_BETA)
+    assert request == original
