@@ -4,6 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
+import time
+from pathlib import Path
+from types import SimpleNamespace
 from collections.abc import Callable, Coroutine
 from datetime import datetime, timezone
 from typing import Any
@@ -11,7 +15,10 @@ from typing import Any
 import httpx
 import pytest
 
+from claudex import paths, server_support
+from claudex.claude import accounts as claude_accounts
 from claudex.claude import usage as claude_usage
+from claudex.claude.auth import CLAUDE_TOKEN_URL
 from claudex.usage import envelope as usage_envelope
 from claudex.usage import providers as provider_usage
 from claudex.claude.auth import (
@@ -355,6 +362,99 @@ def test_fetch_claude_account_usage_reauth_required_propagates() -> None:
     manager = _FailingAccountCredentials(ClaudeAccountReauthRequiredError("invalid_grant"))
     with pytest.raises(ClaudeAccountReauthRequiredError):
         _run(claude_usage.fetch_claude_account_usage(_unused_client(), manager))
+
+
+@pytest.mark.parametrize("new_uuid", ["aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"], ids=["same-uuid", "changed-uuid"])
+@pytest.mark.parametrize("refresh_status", [400, 500], ids=["invalid-grant", "transient"])
+def test_usage_refresh_rejection_cannot_mark_reauthentication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, new_uuid: str, refresh_status: int
+) -> None:
+    monkeypatch.setattr(paths, "runtime_dir", lambda: tmp_path / "runtime")
+    original = claude_accounts.add_account(
+        "synthetic@example.com", None, None,
+        {"claudeAiOauth": {"accessToken": "login-A", "refreshToken": "refresh-A", "expiresAt": 1}},
+        {"accountUuid": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"},
+    )
+    new_payload = {"claudeAiOauth": {"accessToken": "login-B", "refreshToken": "refresh-B", "expiresAt": (time.time() + 3600) * 1000}}
+
+    async def scenario() -> None:
+        started, release = asyncio.Event(), asyncio.Event()
+        tokens = []
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url) == CLAUDE_TOKEN_URL:
+                assert json.loads(request.content)["refresh_token"] == "refresh-A"
+                started.set()
+                await release.wait()
+                return httpx.Response(refresh_status, json={"error": "invalid_grant" if refresh_status == 400 else "unavailable"})
+            assert str(request.url) == claude_usage._CLAUDE_USAGE_URL
+            tokens.append(request.headers["authorization"])
+            return httpx.Response(200, json={"five_hour": {"utilization": 5}})
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler), trust_env=False) as client:
+            state = SimpleNamespace(http_client=client, claude_account_auth_managers={}, claude_ambient_accounts=None)
+            fetch = server_support._account_usage_fetch(state)
+            pending = asyncio.create_task(fetch(original.id))
+            try:
+                await asyncio.wait_for(started.wait(), timeout=5)
+                await asyncio.to_thread(claude_accounts.update_account_credentials, "synthetic@example.com", None, None, new_payload, {"accountUuid": new_uuid})
+            finally:
+                release.set()
+            result, _ = await pending
+            assert result["status"] == ("ok" if refresh_status == 400 else "unavailable")
+            assert tokens == (["Bearer login-B"] if refresh_status == 400 else [])
+
+    _run(scenario())
+    [current] = claude_accounts.load_registry()
+    assert current.state == "ready"
+    assert json.loads((paths.accounts_dir("claude") / original.id / "credentials.json").read_text()) == new_payload
+
+
+def test_usage_delayed_reauth_mark_is_fenced_at_registry_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(paths, "runtime_dir", lambda: tmp_path / "runtime")
+    monkeypatch.setattr(claude_accounts, "_now_millis", lambda: 123)
+    original = claude_accounts.add_account(
+        "synthetic@example.com", None, None,
+        {"claudeAiOauth": {"accessToken": "login-A", "refreshToken": "refresh-A", "expiresAt": 1}},
+        {"accountUuid": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"},
+    )
+    started, release = threading.Event(), threading.Event()
+    real_mark = claude_accounts.mark_account_needs_reauth
+
+    def delayed_mark(*args: Any, **kwargs: Any) -> Any:
+        started.set()
+        assert release.wait(timeout=5)
+        return real_mark(*args, **kwargs)
+
+    monkeypatch.setattr(server_support, "mark_account_needs_reauth", delayed_mark)
+
+    async def scenario() -> None:
+        async def handler(request: httpx.Request) -> httpx.Response:
+            assert str(request.url) == CLAUDE_TOKEN_URL
+            return httpx.Response(400, json={"error": "invalid_grant"})
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler), trust_env=False) as client:
+            state = SimpleNamespace(http_client=client, claude_account_auth_managers={}, claude_ambient_accounts=None)
+            pending = asyncio.create_task(server_support._account_usage_fetch(state)(original.id))
+            try:
+                assert await asyncio.to_thread(started.wait, 5)
+                # Same profile, same credential JSON, same incarnation, and same
+                # login timestamp still represent a new atomic publication.
+                await asyncio.to_thread(claude_accounts.update_account_credentials, "synthetic@example.com", None, None,
+                    {"claudeAiOauth": {"accessToken": "login-A", "refreshToken": "refresh-A", "expiresAt": 1}},
+                    {"accountUuid": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"})
+            finally:
+                release.set()
+            result, _ = await pending
+            assert result["status"] == "unavailable"
+
+    _run(scenario())
+    [current] = claude_accounts.load_registry()
+    assert current.id == original.id
+    assert current.account_incarnation_id == original.account_incarnation_id
+    assert current.state == "ready"
 
 
 # ---------------------------------------------------------------------------
