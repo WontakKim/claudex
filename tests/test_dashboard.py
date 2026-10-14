@@ -1717,3 +1717,55 @@ def test_codex_long_action_labels_do_not_inherit_fixed_connection_button_width()
     assert "padding-inline:14px" in rule.group(1)
     assert "max-width:100%" in rule.group(1)
     assert ".ctrow button{width:112px;flex:none;padding-inline:0;text-align:center}" in DASHBOARD_CSS
+
+
+@pytest.mark.parametrize("provider", ["kimi", "grok"])
+@pytest.mark.parametrize("locked", [False, True])
+@pytest.mark.parametrize("authentication", ["none", "valid", "retry"])
+@pytest.mark.parametrize("outcome", ["network", "http", "malformed"])
+def test_optional_catalog_boot_preserves_core_state_and_authentication(
+    dashboard_runtime_result: dict[str, Any], provider: str, locked: bool,
+    authentication: str, outcome: str,
+) -> None:
+    scenario = next(row for row in dashboard_runtime_result["optionalCatalogBoot"]
+                    if (row["provider"], row["locked"], row["authentication"], row["outcome"])
+                    == (provider, locked, authentication, outcome))
+    mapping = {"sonnet": "codex:saved-main", "haiku": "kimi:saved-secondary"}
+    assert scenario["initial"] == {"live": {}, "draft": {}, "locked": False, "codexLoaded": False}
+    assert set(scenario["decodedBeforeFailure"]) == {
+        "/admin/settings/mapping", "/admin/settings/codex", "/admin/settings/log-level",
+        "/admin/settings/compaction", "/admin/providers/claude/pool/routing",
+    }
+    assert scenario["live"] == scenario["draft"] == mapping
+    assert scenario["isLocked"] is locked
+    assert scenario["isLockVisible"] is locked
+    assert {"sonnet", "haiku"}.issubset(scenario["sources"])
+    assert set(scenario["targets"]) == set(mapping.values())
+    assert scenario["codex"] == {"live": "fast", "draft": "fast", "hasLoaded": True, "value": "fast", "disabled": False}
+    assert scenario["compaction"] is None
+    assert scenario["routing"] == "disabled"
+    assert "Gateway OK" in scenario["health"]
+    assert "configured Fast" in scenario["capabilities"]
+    assert scenario["catalogs"]["codex"] == ["saved-main"]
+    assert scenario["catalogs"][provider] == []
+    assert scenario["catalogs"]["grok" if provider == "kimi" else "kimi"] == ["peer-suggestion"]
+    requests = scenario["requests"]
+    assert all(row["method"] == "GET" and row["url"] != "/admin/test" for row in requests)
+    assert len(requests) == (20 if authentication == "retry" else 11)
+    assert scenario["prompts"] == {"none": 0, "valid": 1, "retry": 2}[authentication]
+    health = [row for row in requests if row["url"] == "/health"]
+    assert health == [{"url": "/health", "method": "GET", "hasValidToken": authentication != "none"}]
+    optional = [row for row in requests if row["url"] == f"/admin/providers/{provider}/models"]
+    assert [row["hasValidToken"] for row in optional] == (
+        [False, True] if authentication == "retry" else [authentication == "valid"]
+    )
+    assert scenario["warnings"] == []
+    if outcome == "network":
+        message = scenario["toast"]["html"]
+        assert scenario["toast"]["role"] == "alert"
+        assert "SUGGESTIONS UNAVAILABLE" in message
+        assert f"GET /admin/providers/{provider}/models" in message
+        assert "model suggestions" in message
+        assert "manually" in message
+    else:
+        assert scenario["toast"] == {"html": "", "role": ""}

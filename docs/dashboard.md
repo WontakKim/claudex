@@ -308,9 +308,13 @@ Built-in quick-add suggestions use:
 - `GET /admin/providers/grok/models`
 
 Catalog-capable custom providers use
-`GET /admin/providers/custom/{name}/models`. Catalog failures only remove
-suggestions. The chooser's manual entry remains authoritative: a typed model
-ID can be staged and mapped even when it did not come from a catalog.
+`GET /admin/providers/custom/{name}/models`. Catalogs supply suggestions, not a
+model allowlist. A browser transport failure for an optional Kimi or Grok catalog
+shows a **Suggestions unavailable** notice without stopping successful saved
+mapping, settings, and health responses from loading. Enter a model ID manually
+when suggestions are unavailable. The chooser's manual entry remains
+authoritative: a typed model ID can be staged and mapped even when it did not
+come from a catalog.
 Catalog-less Anthropic-compatible providers therefore require manual model
 IDs; the chooser shows a short notice for them instead of an empty list.
 

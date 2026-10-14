@@ -2727,8 +2727,16 @@ function boot(){
       jfetch("/admin/settings/mapping"),
       null,
       jfetch("/admin/providers/codex/models"),
-      jfetch("/admin/providers/kimi/models"),
-      jfetch("/admin/providers/grok/models"),
+      jfetch("/admin/providers/kimi/models").catch(function(){
+        var message="Kimi model suggestions are unavailable: GET /admin/providers/kimi/models failed. Enter a model ID manually.";
+        showToast('<span class="chip chip-err">SUGGESTIONS UNAVAILABLE</span><br>'+esc(message),true);
+        return{ok:false,status:0,body:{models:[],error:{message:message}}};
+      }),
+      jfetch("/admin/providers/grok/models").catch(function(){
+        var message="Grok model suggestions are unavailable: GET /admin/providers/grok/models failed. Enter a model ID manually.";
+        showToast('<span class="chip chip-err">SUGGESTIONS UNAVAILABLE</span><br>'+esc(message),true);
+        return{ok:false,status:0,body:{models:[],error:{message:message}}};
+      }),
       jfetch("/admin/settings/log-level"),
       jfetch("/admin/settings/compaction"),
       jfetch("/admin/settings/codex").catch(function(){return{

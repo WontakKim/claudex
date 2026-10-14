@@ -1977,6 +1977,100 @@ async function main() {
     }, requests: failureRequests});
   }
 
+  const optionalCatalogBoot = [];
+  async function runOptionalCatalogBoot(provider, locked, authentication, outcome) {
+    const optionalDocument = new FakeDocument(html);
+    const requests = [];
+    const decodedCore = [];
+    const warnings = [];
+    const pendingCatalog = createDeferred();
+    const endpoint = `/admin/providers/${provider}/models`;
+    const savedMapping = {sonnet: "codex:saved-main", haiku: "kimi:saved-secondary"};
+    const coreEndpoints = ["/admin/settings/mapping", "/admin/settings/codex", "/admin/settings/log-level",
+      "/admin/settings/compaction", "/admin/providers/claude/pool/routing"];
+    let prompts = 0;
+    const optionalContext = Object.assign({}, context, {
+      document: optionalDocument,
+      location: {host: "127.0.0.1:8787", hash: "#map"},
+      console: {log() {}, info() {}, debug() {}, error(...values) {warnings.push(["error", ...values]);},
+        warn(...values) {warnings.push(["warn", ...values]);}},
+      window: Object.assign({}, context.window, {prompt: () => {
+        prompts += 1;
+        if (authentication === "none") throw new Error("unexpected optional-catalog token prompt");
+        return authentication === "retry" && prompts === 1 ? "wrong-catalog-boot-token" : "catalog-boot-token";
+      }}),
+      fetch: async (url, options) => {
+        const hasValidToken = options?.headers?.Authorization === "Bearer catalog-boot-token";
+        requests.push({url, method: options?.method || "GET", hasValidToken});
+        let status = 200;
+        let body;
+        if (url === "/api/hello") body = {local_auth_required: authentication !== "none"};
+        else if (url.startsWith("/admin/") && authentication !== "none" && !hasValidToken) {
+          status = 401;
+          body = {error: {message: "synthetic invalid local token"}};
+        } else if (url === endpoint) return pendingCatalog.promise;
+        else if (url === "/admin/settings/mapping") body = {model_map: savedMapping, env_locked: {model_map: locked}, custom_providers: []};
+        else if (url === "/admin/settings/codex") body = {service_tier: "fast", env_locked: false};
+        else if (url === "/admin/settings/log-level") body = {log_level: "debug", choices: ["debug", "info", "warning", "error"]};
+        else if (url === "/admin/settings/compaction") body = {model: null, env_locked: false, last_reroute: null};
+        else if (url === "/admin/providers/claude/pool/routing") body = {mode: "disabled", env_locked: false, include_local_login: true};
+        else if (url === "/admin/providers/codex/capabilities") body = codexCapabilitiesEnvelope("fast", {
+          "saved-main": {supported_tiers: ["standard", "fast"], advertised_tier_ids: ["priority"], status: "supported",
+            reason: null, applicable_tier: "fast", wire_tier: "priority"},
+        }).body;
+        else if (url === "/health") body = {status: "ok", providers: {
+          codex: {status: "ok", auth_mode: "api_key"}, kimi: {status: "ok", required: true}, grok: {status: "ok", required: false},
+        }};
+        else if (url === "/admin/providers/codex/models") body = {models: ["saved-main"]};
+        else if (url.endsWith("/models")) body = {models: ["peer-suggestion"]};
+        else throw new Error("unexpected optional-catalog boot endpoint: " + url);
+        return {ok: status === 200, status, json: async () => {
+          if (status === 200 && coreEndpoints.includes(url)) decodedCore.push(url);
+          return body;
+        }};
+      },
+    });
+    vm.createContext(optionalContext);
+    vm.runInContext(source, optionalContext, {filename: javascriptPath});
+    const initial = {live: {...optionalContext.DIR.LIVE}, draft: {...optionalContext.DIR.mapping},
+      locked: optionalContext.DIR.locked, codexLoaded: optionalContext.CODEX.hasLoaded};
+    optionalContext.boot();
+    await flushCodex();
+    if (!coreEndpoints.every((url) => decodedCore.includes(url))) {
+      throw new Error("core JSON responses did not settle before optional catalog failure");
+    }
+    const decodedBeforeFailure = decodedCore.slice();
+    if (outcome === "network") pendingCatalog.reject(new TypeError(`synthetic disconnected ${provider} catalog fetch`));
+    else pendingCatalog.resolve({ok: outcome !== "http", status: outcome === "http" ? 503 : 200, json: async () => {
+      if (outcome === "malformed") throw new SyntaxError("synthetic malformed optional catalog JSON");
+      return {error: {message: "synthetic optional catalog HTTP failure"}};
+    }});
+    await flushCodex();
+    return {provider, locked, authentication, outcome, initial, decodedBeforeFailure, requests, prompts, warnings,
+      toast: {html: optionalDocument.getElementById("toast")?.innerHTML || "",
+        role: optionalDocument.getElementById("toast")?.getAttribute("role") || ""},
+      live: {...optionalContext.DIR.LIVE}, draft: {...optionalContext.DIR.mapping}, isLocked: optionalContext.DIR.locked,
+      isLockVisible: optionalDocument.body.classList.contains("env-locked"),
+      sources: optionalContext.DIR.sources.map((node) => node.id), targets: optionalContext.DIR.targets.map((node) => node.id),
+      codex: {live: optionalContext.CODEX.serviceTier, draft: optionalContext.CODEX.draft,
+        hasLoaded: optionalContext.CODEX.hasLoaded, value: optionalDocument.getElementById("codex-speed").value,
+        disabled: optionalDocument.getElementById("codex-speed").disabled},
+      compaction: optionalContext.COMP.LIVE.model, routing: optionalContext.ROUTING.mode,
+      health: optionalDocument.getElementById("health").innerHTML,
+      capabilities: optionalDocument.getElementById("codex-capabilities-status").textContent,
+      catalogs: {codex: Array.from(optionalContext.CATALOG.codex), kimi: Array.from(optionalContext.CATALOG.kimi), grok: Array.from(optionalContext.CATALOG.grok)},
+    };
+  }
+  for (const provider of ["kimi", "grok"]) {
+    for (const locked of [false, true]) {
+      for (const authentication of ["none", "valid", "retry"]) {
+        for (const outcome of ["network", "http", "malformed"]) {
+          optionalCatalogBoot.push(await runOptionalCatalogBoot(provider, locked, authentication, outcome));
+        }
+      }
+    }
+  }
+
   const output = {credentialLeak};
   if (!credentialLeak) {
     Object.assign(output, {
@@ -1991,6 +2085,7 @@ async function main() {
       codexSpeedFailureStates,
       codexBootRaceStates,
       codexBootFailureStates,
+      optionalCatalogBoot,
       healthAuthenticationBoot,
       localHeroStates,
       localHeroLoadOrder,
