@@ -967,7 +967,9 @@ def translate_claude_request_to_codex(
     name_map = tool_state.name_map
     # Server-history normalization replaces blocks in place, preserving event
     # coordinates. Compile controls first so legal native placement is retained.
-    claude_request = normalize_server_tool_history(claude_request)
+    claude_request = normalize_server_tool_history(
+        claude_request, should_replay_native_search=True,
+    )
 
     payload: dict[str, Any] = {
         "model": codex_model,

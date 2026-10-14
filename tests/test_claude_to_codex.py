@@ -1899,3 +1899,148 @@ def test_forced_inline_web_search_uses_native_choice_type() -> None:
     payload = translate_claude_request_to_codex(body, 'gpt-5.5')
     assert payload['tools'] == [{'type': 'web_search'}]
     assert payload['tool_choice'] == {'type': 'web_search'}
+
+
+@pytest.mark.parametrize("precompiled", [False, True], ids=["direct", "serving-precompiled"])
+def test_native_search_pair_retains_public_context_without_opaque_state(precompiled: bool) -> None:
+    from claudex.relay.openai_backend import _validate_mapped_claude_request
+    from claudex.translate.server_tool_history import normalize_server_tool_history
+    from claudex.translate.tool_protocol import compile_tool_state
+
+    request = {
+        "model": "claude-opus-review-synthetic", "max_tokens": 64,
+        "metadata": {"user_id": "verify-D2-synthetic-session"},
+        "tools": [{"type": "web_search_20250305", "name": "web_search"}],
+        "messages": [
+            {"role": "user", "content": "Find the latest release information."},
+            {"role": "assistant", "content": [
+                {"type": "server_tool_use", "name": "web_search", "id": "srvtoolu_D2_native",
+                 "input": {"query": "D2_QUERY_MARKER violet atlas release announcement"}},
+                {"type": "web_search_tool_result", "tool_use_id": "srvtoolu_D2_native",
+                 "content": [{"type": "web_search_result",
+                              "title": "D2_TITLE_MARKER Violet Atlas official announcement",
+                              "url": "https://example.invalid/d2-source-marker", "page_age": None,
+                              "encrypted_content": "D2_SYNTHETIC_NATIVE_OPAQUE_CONTENT_NOT_REAL_CIPHERTEXT"}]},
+            ]},
+            {"role": "user", "content": "Give the title and link of the source from that search."},
+        ],
+    }
+    original = deepcopy(request)
+    assert _validate_mapped_claude_request(request) is None
+    state = compile_tool_state(request, beta_header="")
+    assert normalize_server_tool_history(request) is request
+
+    payload = translate_claude_request_to_codex(
+        request, "gpt-5.5", tool_state=state if precompiled else None, beta_header="",
+    )
+
+    assert payload["input"] == [
+        {"type": "message", "role": "user", "content": [
+            {"type": "input_text", "text": "Find the latest release information."},
+        ]},
+        {"type": "message", "role": "assistant", "content": [
+            {"type": "output_text", "text": 'Web search input: {"query": "D2_QUERY_MARKER violet atlas release announcement"}'},
+            {"type": "output_text", "text": 'Web search results: [{"type": "web_search_result", "title": "D2_TITLE_MARKER Violet Atlas official announcement", "url": "https://example.invalid/d2-source-marker", "page_age": null}]'},
+        ]},
+        {"type": "message", "role": "user", "content": [
+            {"type": "input_text", "text": "Give the title and link of the source from that search."},
+        ]},
+    ]
+    assert payload["tools"] == [{"type": "web_search"}]
+    assert "D2_SYNTHETIC_NATIVE_OPAQUE_CONTENT_NOT_REAL_CIPHERTEXT" not in json.dumps(payload)
+    assert request == original
+    assert normalize_server_tool_history(request) is request
+
+
+@pytest.mark.parametrize("precompiled", [False, True], ids=["direct", "serving-precompiled"])
+@pytest.mark.parametrize("normalized_first", [False, True], ids=["original", "gateway-normalized"])
+@pytest.mark.parametrize("split_messages", [False, True], ids=["merged", "contiguous-split"])
+def test_mixed_native_search_history_keeps_exact_order_images_and_client_pair(
+    precompiled: bool, normalized_first: bool, split_messages: bool,
+) -> None:
+    from claudex.relay.openai_backend import _validate_mapped_claude_request
+    from claudex.translate.server_tool_history import normalize_server_tool_history
+    from claudex.translate.tool_protocol import compile_tool_state
+    from claudex.translate.tool_validation import compile_function_validators, validate_function_arguments
+
+    call = {"type": "server_tool_use", "id": "srvtoolu_synthetic_native", "name": "web_search",
+            "input": {"query": "native source query"}}
+    result = {"type": "web_search_tool_result", "tool_use_id": "srvtoolu_synthetic_native", "content": [
+        {"type": "web_search_result", "title": "Native source title", "url": "https://example.invalid/native",
+         "encrypted_content": "synthetic-opaque-search-state"},
+    ]}
+    before = {"type": "text", "text": "Before search."}
+    between = {"type": "text", "text": "Between the search pair."}
+    tail = [result, {"type": "text", "text": "After native search."},
+            {"type": "server_tool_use", "id": "srvtoolu_gateway_synthetic", "name": "web_search",
+             "input": {"query": "unsigned source query"}},
+            {"type": "web_search_tool_result", "tool_use_id": "srvtoolu_gateway_synthetic", "content": [
+                {"type": "web_search_result", "title": "Unsigned source title", "url": "https://example.invalid/unsigned"},
+            ]},
+            {"type": "tool_use", "id": "call_client", "name": "read_file", "input": {"path": "synthetic.txt"}}]
+    if split_messages:
+        history = [{"role": "assistant", "content": [before, call]},
+                   {"role": "assistant", "content": between["text"]},
+                   {"role": "assistant", "content": tail}]
+    else:
+        history = [{"role": "assistant", "content": [before, call, between, *tail]}]
+    images = [
+        {"type": "image", "source": {"type": "url", "url": "https://example.invalid/image.png"}},
+        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "c3ludGhldGljLWltYWdl"}},
+    ]
+    request = {"model": "claude-synthetic", "max_tokens": 64, "tools": [
+        {"type": "web_search_20260209", "name": "web_search"},
+        {"name": "read_file", "input_schema": {"type": "object", "properties": {"path": {"type": "string"}},
+                                                "required": ["path"]}},
+    ], "messages": [
+        {"role": "user", "content": [{"type": "text", "text": "Before images."}, *images,
+                                      {"type": "text", "text": "After images."}]},
+        *history,
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "call_client", "content": [
+            {"type": "text", "text": "Client output."}, *images, {"type": "text", "text": "After result images."},
+        ]}]},
+        {"role": "user", "content": "Give the source links."},
+    ]}
+    original = deepcopy(request)
+    replay_request = normalize_server_tool_history(request) if normalized_first else request
+    replay_snapshot = deepcopy(replay_request)
+    assert _validate_mapped_claude_request(replay_request) is None
+    state = compile_tool_state(replay_request, beta_header="")
+
+    payload = translate_claude_request_to_codex(
+        replay_request, "gpt-5.5", tool_state=state if precompiled else None, beta_header="",
+    )
+
+    expected_images = [
+        {"type": "input_image", "image_url": "https://example.invalid/image.png"},
+        {"type": "input_image", "image_url": "data:image/png;base64,c3ludGhldGljLWltYWdl"},
+    ]
+    expected_history = [
+        {"type": "output_text", "text": "Before search."},
+        {"type": "output_text", "text": 'Web search input: {"query": "native source query"}'},
+        {"type": "output_text", "text": "Between the search pair."},
+        {"type": "output_text", "text": 'Web search results: [{"type": "web_search_result", "title": "Native source title", "url": "https://example.invalid/native"}]'},
+        {"type": "output_text", "text": "After native search."},
+        {"type": "output_text", "text": 'Web search input: {"query": "unsigned source query"}'},
+        {"type": "output_text", "text": 'Web search results: [{"type": "web_search_result", "title": "Unsigned source title", "url": "https://example.invalid/unsigned"}]'},
+    ]
+    history_parts = [expected_history[:2], expected_history[2:3], expected_history[3:]] if split_messages else [expected_history]
+    assert payload["input"] == [
+        {"type": "message", "role": "user", "content": [
+            {"type": "input_text", "text": "Before images."}, *expected_images,
+            {"type": "input_text", "text": "After images."},
+        ]},
+        *[{"type": "message", "role": "assistant", "content": parts} for parts in history_parts],
+        {"type": "function_call", "call_id": "call_client", "name": "read_file", "arguments": '{"path": "synthetic.txt"}'},
+        {"type": "function_call_output", "call_id": "call_client", "output": [
+            {"type": "input_text", "text": "Client output."}, *expected_images,
+            {"type": "input_text", "text": "After result images."},
+        ]},
+        {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Give the source links."}]},
+    ]
+    validators = compile_function_validators(claude_to_codex.build_function_validation_schemas(state, payload))
+    assert set(validators) == {"read_file"}
+    validate_function_arguments(validators, "read_file", '{"path": "synthetic.txt"}')
+    assert request == original
+    assert replay_request == replay_snapshot
+    assert "synthetic-opaque-search-state" not in json.dumps(payload)

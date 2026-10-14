@@ -167,10 +167,10 @@ covers consecutive assistant messages, because streaming clients may store one
 response in several records. A user turn ends that pairing scope; later client
 calls reusing an ID keep their own results.
 
-Normal client `tool_use`/user `tool_result` pairs and valid native Anthropic
-server-tool blocks are not reclassified. Unrelated orphan client results are
-not silently deleted. Existing transcript files remain unchanged: repair is
-applied to the outgoing request only.
+Normal client `tool_use`/user `tool_result` pairs are not reclassified.
+Messages-compatible replay also retains valid native Anthropic server-tool
+blocks. Unrelated orphan client results are not silently deleted. Existing
+transcript files remain unchanged: repair is applied to the outgoing request only.
 
 Responses web-search calls are exposed to Claude Code using valid
 `srvtoolu_gateway_...` IDs. A call and its result share the same ID. Repeated
@@ -188,6 +188,9 @@ matching calls.
 The same repair applies to Anthropic passthrough, registered-account routing,
 Kimi, custom Messages providers, native token counting, Anthropic compaction
 reroutes, and built-in or custom Responses providers. Existing client
-transcripts are not modified. Native Anthropic search
-calls and signed results remain untouched, including their citations. Requests
-that need no repair keep the usual passthrough behavior.
+transcripts are not modified. Messages-compatible replay leaves native Anthropic
+search calls and signed results untouched, including their citations. Responses
+instead replays native search history as text, preserving the recoverable
+plaintext search input, source titles, and URLs. Opaque `encrypted_content` is
+omitted, not treated as useful text. Requests that need no repair keep the usual
+passthrough behavior.

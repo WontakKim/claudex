@@ -50,13 +50,17 @@ def _assistant_block_groups(
         yield group
 
 
-def normalize_server_tool_history(body: Any) -> Any:
+def normalize_server_tool_history(
+    body: Any, *, should_replay_native_search: bool = False,
+) -> Any:
     """Copy repaired blocks, preserving native tools and unchanged request identity.
 
     Provider-internal calls may use non-Anthropic IDs or return tool_result
     inside the assistant response. Replay those pairs as text rather than as
     client-executed calls. Unsigned Responses search results also need text
     replay because they cannot supply Anthropic's native encrypted_content.
+    Responses consumers opt into native search text replay without opaque
+    encrypted_content; the default retains signed blocks for Anthropic.
     """
     if not isinstance(body, dict) or not isinstance(body.get("messages"), list):
         return body
@@ -84,7 +88,8 @@ def normalize_server_tool_history(body: Any) -> Any:
             if block.get("type") != "web_search_tool_result":
                 continue
             if (
-                tool_id.startswith(GATEWAY_SERVER_TOOL_ID_PREFIX)
+                should_replay_native_search
+                or tool_id.startswith(GATEWAY_SERVER_TOOL_ID_PREFIX)
                 or not _SERVER_TOOL_ID_PATTERN.fullmatch(tool_id)
             ):
                 text_ids.add(tool_id)
@@ -115,6 +120,17 @@ def normalize_server_tool_history(body: Any) -> Any:
                 label, value = f"{label} results", block.get("content", [])
                 if block.get("is_error"):
                     label += " (error)"
+                if (
+                    should_replay_native_search
+                    and block["type"] == "web_search_tool_result"
+                    and isinstance(value, list)
+                ):
+                    value = [
+                        {key: item for key, item in result.items() if key != "encrypted_content"}
+                        if isinstance(result, dict) and result.get("type") == "web_search_result"
+                        else result
+                        for result in value
+                    ]
             text_block: dict[str, Any] = {
                 "type": "text",
                 "text": f"{label}: {json.dumps(value, ensure_ascii=False)}",
