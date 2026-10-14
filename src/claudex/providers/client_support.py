@@ -55,7 +55,7 @@ async def stream_sse_events(
     *,
     make_error: Callable[[int, str], Exception],
 ) -> AsyncIterator[dict[str, Any]]:
-    """POST a payload and yield each valid SSE data event."""
+    """POST a payload and yield SSE data events with JSON object payloads."""
     async with http_client.stream(
         "POST", url, json=payload, headers=headers
     ) as response:
@@ -71,7 +71,9 @@ async def stream_sse_events(
             if not data or data == "[DONE]":
                 continue
             try:
-                yield json.loads(data)
+                event = json.loads(data)
+                if isinstance(event, dict):
+                    yield event
             except json.JSONDecodeError:
                 continue
 

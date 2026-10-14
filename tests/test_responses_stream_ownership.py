@@ -498,3 +498,180 @@ def test_uvicorn23_disconnect_and_explicit_cancellation_release_upstream(
                         await task
 
     asyncio.run(scenario())
+
+
+async def _relay_event_roots(client: httpx.AsyncClient, *, should_stream: bool):
+    async def adapt_payload(payload: dict[str, Any], model: str) -> dict[str, Any]:
+        return payload
+
+    backend = ResponsesBackend(
+        transport=SyntheticResponsesTransport(client),
+        adapt_payload=adapt_payload,
+        adapt_probe_payload=lambda payload, model: payload,
+        signature_namespace=None,
+        codex_regex_compat=True,
+    )
+    app = SimpleNamespace(state=SimpleNamespace(
+        config=GatewayConfig(), route_backends={"synthetic": backend},
+    ))
+    request = Request({
+        "type": "http", "method": "POST", "path": "/v1/messages", "headers": [], "app": app,
+    })
+    return await _relay_via_responses_backend(
+        request,
+        {"model": "synthetic", "max_tokens": 16, "stream": should_stream,
+         "messages": [{"role": "user", "content": "synthetic input"}]},
+        RouteTarget("synthetic", "synthetic"),
+    )
+
+
+@pytest.mark.parametrize("invalid_root, position", [([], 0), (42, 0), (None, 1)], ids=["first-array", "first-number", "mid-null"])
+def test_shared_sse_client_filters_non_object_roots(invalid_root: Any, position: int) -> None:
+    async def scenario() -> None:
+        expected_events = [_RESPONSE_EVENTS[0], {}, *_RESPONSE_EVENTS[1:]]
+        roots = list(expected_events)
+        roots.insert(position, invalid_root)
+        stream = TrackedByteStream(tuple(f"data: {json.dumps(root)}\n\n".encode() for root in roots))
+        upstream = httpx.Response(200, stream=stream)
+        async with httpx.AsyncClient(transport=httpx.MockTransport(lambda request: upstream), trust_env=False) as client:
+            events = [event async for event in stream_sse_events(
+                client, "https://synthetic.invalid/responses", {}, {}, make_error=UpstreamError,
+            )]
+        assert events == expected_events
+        assert all(isinstance(event, dict) for event in events)
+        assert upstream.is_closed
+        assert stream.close_calls == 1
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("should_stream", [True, False], ids=["stream", "aggregate"])
+@pytest.mark.parametrize("invalid_root, position", [([], 0), (42, 0), (None, 1)], ids=["first-array", "first-number", "mid-null"])
+def test_responses_relay_filters_invalid_roots_without_losing_valid_events(
+    invalid_root: Any, position: int, should_stream: bool,
+) -> None:
+    async def scenario() -> None:
+        roots = list(_RESPONSE_EVENTS)
+        roots.insert(position, invalid_root)
+        stream = TrackedByteStream(tuple(f"data: {json.dumps(root)}\n\n".encode() for root in roots))
+        upstream = httpx.Response(200, stream=stream)
+        async with httpx.AsyncClient(transport=httpx.MockTransport(lambda request: upstream), trust_env=False) as client:
+            try:
+                response = await _relay_event_roots(client, should_stream=should_stream)
+                assert response.status_code == 200
+                if should_stream:
+                    body = "".join([chunk async for chunk in response.body_iterator])
+                    assert body.count("event: message_stop\n") == 1
+                    assert '"text": "hello"' in body
+                    assert "event: error\n" not in body
+                    await response.body_iterator.aclose()
+                else:
+                    body = json.loads(response.body)
+                    assert body["type"] == "message"
+                    assert body["model"] == "synthetic"
+                    assert body["content"] == [{"type": "text", "text": "hello"}]
+                    assert body["stop_reason"] == "end_turn"
+                assert upstream.is_closed
+                assert stream.close_calls == 1
+            finally:
+                await upstream.aclose()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("should_stream", [True, False], ids=["stream", "aggregate"])
+def test_responses_first_null_alone_remains_controlled_empty_stream(should_stream: bool) -> None:
+    async def scenario() -> TrackedByteStream:
+        stream = TrackedByteStream((b"data: null\n\n",))
+        upstream = httpx.Response(200, stream=stream)
+        async with httpx.AsyncClient(transport=httpx.MockTransport(lambda request: upstream), trust_env=False) as client:
+            try:
+                response = await _relay_event_roots(client, should_stream=should_stream)
+                assert response.status_code == 502
+                assert json.loads(response.body) == {
+                    "type": "error", "error": {"type": "api_error", "message": "synthetic stream ended without any events"},
+                }
+            finally:
+                await upstream.aclose()
+        return stream
+
+    stream = asyncio.run(scenario())
+    assert stream.close_calls == 1
+
+
+@pytest.mark.parametrize("invalid_root", [False, "scalar", 1.5, [{"type": "response.created"}]], ids=["boolean", "string", "float", "object-array"])
+def test_shared_sse_client_filters_other_scalar_and_array_roots(invalid_root: Any) -> None:
+    async def scenario() -> None:
+        stream = TrackedByteStream((f"data: {json.dumps(invalid_root)}\n\ndata: {{}}\n\n".encode(),))
+        upstream = httpx.Response(200, stream=stream)
+        async with httpx.AsyncClient(transport=httpx.MockTransport(lambda request: upstream), trust_env=False) as client:
+            events = [event async for event in stream_sse_events(
+                client, "https://synthetic.invalid/responses", {}, {}, make_error=UpstreamError,
+            )]
+        assert events == [{}]
+        assert upstream.is_closed
+        assert stream.close_calls == 1
+
+    asyncio.run(scenario())
+
+
+def test_shared_sse_root_filter_preserves_compression_framing_and_object_order() -> None:
+    async def scenario() -> None:
+        expected = [{"type": "before", "text": "café"}, {}, {"type": "after", "index": 2}]
+        wire_body = gzip.compress((
+            ': heartbeat\r\nevent: ignored\r\ndata: \r\n\r\ndata: []\r\n\r\n'
+            f'data: {json.dumps(expected[0], ensure_ascii=False)}\r\n\r\n'
+            'data: 42\n\ndata: null\n\ndata: not-json\n\ndata: [DONE]\n\ndata: {}\n\n'
+            f'data: {json.dumps(expected[2])}\n\n'
+        ).encode())
+        stream = TrackedByteStream(tuple(bytes([value]) for value in wire_body))
+        upstream = httpx.Response(200, stream=stream, headers={"content-encoding": "gzip"})
+        async with httpx.AsyncClient(transport=httpx.MockTransport(lambda request: upstream), trust_env=False) as client:
+            events = [event async for event in stream_sse_events(
+                client, "https://synthetic.invalid/responses", {}, {}, make_error=UpstreamError,
+            )]
+        assert events == expected
+        assert upstream.is_closed
+        assert stream.close_calls == 1
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("should_stream", [True, False], ids=["stream", "aggregate"])
+@pytest.mark.parametrize("has_created_event", [False, True], ids=["all-invalid", "terminal-less"])
+def test_responses_filtered_sequences_remain_controlled_errors(
+    should_stream: bool, has_created_event: bool,
+) -> None:
+    async def scenario() -> None:
+        roots = [[], 42, None, False, "scalar"]
+        if has_created_event:
+            roots.insert(0, _RESPONSE_EVENTS[0])
+        stream = TrackedByteStream(tuple(f"data: {json.dumps(root)}\n\n".encode() for root in roots))
+        upstream = httpx.Response(200, stream=stream)
+        async with httpx.AsyncClient(transport=httpx.MockTransport(lambda request: upstream), trust_env=False) as client:
+            try:
+                response = await _relay_event_roots(client, should_stream=should_stream)
+                if should_stream and has_created_event:
+                    assert response.status_code == 200
+                    body = "".join([chunk async for chunk in response.body_iterator])
+                    assert body.count("event: error\n") == 1
+                    assert "event: message_stop\n" not in body
+                    assert "event: message_delta\n" not in body
+                    terminal = body.rstrip().rsplit("event: error\ndata: ", 1)[1]
+                    error = json.loads(terminal)
+                    await response.body_iterator.aclose()
+                else:
+                    assert response.status_code == 502
+                    error = json.loads(response.body)
+                assert error["type"] == "error"
+                assert error["error"]["type"] == "api_error"
+                if has_created_event:
+                    assert "without a terminal response event" in error["error"]["message"]
+                else:
+                    assert error["error"]["message"] == "synthetic stream ended without any events"
+                assert upstream.is_closed
+                assert stream.close_calls == 1
+            finally:
+                await upstream.aclose()
+
+    asyncio.run(scenario())
