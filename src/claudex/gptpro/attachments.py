@@ -194,11 +194,13 @@ def _load_descriptors(attachment_paths: Sequence[str]) -> list[dict[str, str]]:
     loaded: list[tuple[str, bytes, str]] = []
     total_bytes = 0
     for attachment_path in attachment_paths:
-        data = Path(attachment_path).read_bytes()
+        with Path(attachment_path).open("rb") as attachment_file:
+            # One extra byte distinguishes an exact-budget file from overflow.
+            data = attachment_file.read(MAX_TOTAL_ATTACHMENT_BYTES - total_bytes + 1)
         total_bytes += len(data)
         if total_bytes > MAX_TOTAL_ATTACHMENT_BYTES:
             raise ValueError(
-                f"Attachments total {total_bytes} bytes exceeds the "
+                f"Attachments total at least {total_bytes} bytes, exceeding the "
                 f"{MAX_TOTAL_ATTACHMENT_BYTES}-byte limit per ask."
             )
         loaded.append((attachment_path, data, Path(attachment_path).name))

@@ -6,6 +6,7 @@ import asyncio
 import base64
 import json
 from collections.abc import Callable
+from io import BytesIO
 from pathlib import Path
 from typing import Any
 
@@ -112,11 +113,92 @@ def test_attachment_count_limit_is_validated_before_reading() -> None:
         asyncio.run(attachments.attach_files(object(), paths))
 
 
-def test_total_attachment_size_is_limited(tmp_path: Path) -> None:
-    attachment = tmp_path / "large.txt"
-    attachment.write_bytes(b"x" * (attachments.MAX_TOTAL_ATTACHMENT_BYTES + 1))
+class _BoundedAttachmentFile(BytesIO):
+    def __init__(self, data: bytes, max_read_bytes: int) -> None:
+        super().__init__(data)
+        self.max_read_bytes = max_read_bytes
+        self.read_sizes: list[int] = []
+        self.bytes_read = 0
 
-    with pytest.raises(ValueError, match="1200001 bytes.*1200000-byte limit"):
+    def read(self, size: int = -1) -> bytes:
+        self.read_sizes.append(size)
+        assert 0 < size <= self.max_read_bytes, f"Unbounded attachment read({size})"
+        data = super().read(size)
+        self.bytes_read += len(data)
+        return data
+
+
+def test_oversized_attachment_read_is_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(attachments, "MAX_TOTAL_ATTACHMENT_BYTES", 8)
+    attachment_file = _BoundedAttachmentFile(b"x" * 40, max_read_bytes=9)
+    monkeypatch.setattr(Path, "open", lambda self, mode: attachment_file)
+
+    with pytest.raises(ValueError, match="at least 9 bytes.*8-byte limit"):
+        attachments._load_descriptors(["large.txt"])
+
+    assert attachment_file.read_sizes == [9]
+    assert attachment_file.bytes_read == 9
+    assert attachment_file.closed
+
+
+@pytest.mark.parametrize(("first_size", "remaining_read_bytes"), [(7, 2), (8, 1)])
+def test_aggregate_attachment_reads_use_remaining_budget(
+    monkeypatch: pytest.MonkeyPatch,
+    first_size: int,
+    remaining_read_bytes: int,
+) -> None:
+    monkeypatch.setattr(attachments, "MAX_TOTAL_ATTACHMENT_BYTES", 8)
+    files = {
+        "first.txt": _BoundedAttachmentFile(b"x" * first_size, max_read_bytes=9),
+        "large.txt": _BoundedAttachmentFile(b"y" * 40, max_read_bytes=remaining_read_bytes),
+        "unread.txt": _BoundedAttachmentFile(b"z", max_read_bytes=1),
+    }
+    monkeypatch.setattr(Path, "open", lambda self, mode: files[str(self)])
+
+    with pytest.raises(ValueError, match="at least 9 bytes.*8-byte limit"):
+        attachments._load_descriptors(list(files))
+
+    assert files["first.txt"].read_sizes == [9]
+    assert files["large.txt"].read_sizes == [remaining_read_bytes]
+    assert files["unread.txt"].read_sizes == []
+    assert sum(attachment_file.bytes_read for attachment_file in files.values()) == 9
+    assert files["first.txt"].closed
+    assert files["large.txt"].closed
+
+
+@pytest.mark.parametrize("contents", [
+    [b"abcdefg"],
+    [b"abcdefgh"],
+    [b"abcd", b"efgh"],
+    [b"", b"abcd", b"", b"efgh", b""],
+    [b""] * attachments.MAX_ATTACHMENTS_PER_ASK,
+    [b"\xc3\xa9", b"\xe2\x82\xacabc"],
+])
+def test_attachments_within_byte_budget_preserve_content(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, contents: list[bytes],
+) -> None:
+    monkeypatch.setattr(attachments, "MAX_TOTAL_ATTACHMENT_BYTES", 8)
+    paths = [tmp_path / f"file-{index}.txt" for index in range(len(contents))]
+    for path, data in zip(paths, contents):
+        path.write_bytes(data)
+
+    descriptors = attachments._load_descriptors([str(path) for path in paths])
+
+    assert [base64.b64decode(item["bytesBase64"]) for item in descriptors] == contents
+    assert [item["name"] for item in descriptors] == [path.name for path in paths]
+    assert all(item["mime"] == "text/plain" for item in descriptors)
+
+
+def test_total_attachment_size_is_limited(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(attachments, "MAX_TOTAL_ATTACHMENT_BYTES", 8)
+    attachment = tmp_path / "large.txt"
+    attachment.write_bytes(b"x" * 9)
+
+    with pytest.raises(ValueError, match="at least 9 bytes.*8-byte limit"):
         asyncio.run(attachments.attach_files(object(), [str(attachment)]))
 
 
