@@ -3666,6 +3666,85 @@ def test_admin_usage_isolates_json_decode_failures(
     assert codex_requests == ["https://chatgpt.com/backend-api/wham/usage"]
 
 
+@pytest.mark.parametrize(
+    "reset_json,expected_reset",
+    [
+        pytest.param(b"1754000000", 1754000000.0, id="finite-seconds"),
+        pytest.param(b"1754000000000", 1754000000.0, id="finite-milliseconds"),
+        pytest.param(b'"1754000000"', 1754000000.0, id="numeric-string"),
+        pytest.param(b'"1970-01-01T00:00:00Z"', 0.0, id="iso-zero"),
+        pytest.param(b"null", None, id="unknown-reset"),
+        pytest.param(b'"Infinity"', None, id="positive-infinity-string"),
+        pytest.param(b'"NaN"', None, id="nan-string"),
+        pytest.param(b'"-Infinity"', None, id="negative-infinity-string"),
+        pytest.param(b"1e400", None, id="positive-infinity-number"),
+        pytest.param(b"NaN", None, id="nan-number"),
+        pytest.param(b"-1e400", None, id="negative-infinity-number"),
+        pytest.param(b"1" + b"0" * 400, None, id="unrepresentable-integer"),
+    ],
+)
+def test_admin_usage_preserves_windows_with_optional_reset(
+    monkeypatch: pytest.MonkeyPatch, reset_json: bytes, expected_reset: float | None,
+) -> None:
+    claude_result = {"provider": "claude", "status": "ok", "error": None}
+    grok_result = {"provider": "grok", "status": "ok", "error": None}
+    response_body = (
+        b'{"plan_type":"promax","rate_limit":{'
+        b'"primary_window":{"used_percent":12,"limit_window_seconds":18000,"reset_at":'
+        + reset_json
+        + b'},"secondary_window":{"used_percent":34,"limit_window_seconds":604800,"reset_at":1754600000}},'
+        b'"rate_limit_reset_credits":{"available_count":2}}'
+    )
+
+    async def fake_claude(http_client: Any) -> dict[str, Any]:
+        return claude_result
+
+    async def fake_grok(http_client: Any, auth_manager: Any) -> dict[str, Any]:
+        return grok_result
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert str(request.url) == "https://chatgpt.com/backend-api/wham/usage"
+        return httpx.Response(200, content=response_body, headers={"Content-Type": "application/json"})
+
+    monkeypatch.setattr(admin_system, "fetch_claude_usage", fake_claude)
+    monkeypatch.setattr(admin_system, "fetch_grok_usage", fake_grok)
+
+    async def scenario() -> Any:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+            state = SimpleNamespace(
+                config=GatewayConfig(),
+                http_client=http_client,
+                codex_auth_manager=AvailableCodexAuthManager(),
+                kimi_auth_manager=MissingKimiAuthManager(),
+                grok_auth_manager=AvailableGrokAuthManager(),
+            )
+            request = Request({
+                "type": "http", "method": "GET", "scheme": "http", "path": "/admin/usage",
+                "query_string": b"", "headers": [(b"host", b"127.0.0.1:8787")],
+                "app": SimpleNamespace(state=state),
+            })
+            return await admin_system._handle_admin_usage(request)
+
+    response = asyncio.run(scenario())
+    assert response.status_code == 200
+    body = json.loads(response.body)
+    assert body["claude"] == claude_result
+    assert body["grok"] == grok_result
+    assert body["codex"]["status"] == "ok"
+    assert body["codex"]["error"] is None
+    assert body["codex"]["plan_type"] == "promax"
+    assert body["codex"]["reset_credits_available"] == 2
+    assert body["codex"]["session"] == {
+        "used_percent": 12.0, "window_minutes": 300, "resets_at": expected_reset,
+    }
+    assert body["codex"]["weekly"] == {
+        "used_percent": 34.0, "window_minutes": 10080, "resets_at": 1754600000.0,
+    }
+    assert body["kimi"]["status"] == "unavailable"
+    assert body["fetched_at"] > 0
+    json.dumps(body, allow_nan=False)
+
+
 def test_admin_usage_refuses_foreign_host(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
         assert client.get("/admin/usage").status_code == 403

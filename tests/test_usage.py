@@ -885,6 +885,48 @@ def test_fetch_kimi_usage_without_windows_is_error() -> None:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        (0, 0.0),
+        (-10, -10.0),
+        (1754000000.5, 1754000000.5),
+        (1754000000500.0, 1754000000.5),
+        ("1754000000000", 1754000000.0),
+        (" 1754000000 ", 1754000000.0),
+        (10_000_000_000, 10_000_000_000.0),
+        (10_000_000_001, 10_000_000.001),
+        (1e100, 1e100 / 1000),
+        (-1e100, -1e100),
+        (False, None),
+        ("", None),
+        (" ", None),
+        ([], None),
+        ({}, None),
+    ],
+)
+def test_usage_envelope_reset_time_preserves_finite_and_invalid_controls(
+    value: Any, expected: float | None,
+) -> None:
+    assert usage_envelope.reset_epoch_seconds(value) == expected
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param("Infinity", id="positive-infinity-string"),
+        pytest.param("NaN", id="nan-string"),
+        pytest.param("-Infinity", id="negative-infinity-string"),
+        pytest.param(float("inf"), id="positive-infinity-number"),
+        pytest.param(float("nan"), id="nan-number"),
+        pytest.param(float("-inf"), id="negative-infinity-number"),
+        pytest.param(10**400, id="unrepresentable-integer"),
+    ],
+)
+def test_usage_envelope_reset_time_rejects_unusable_numbers(value: Any) -> None:
+    assert usage_envelope.reset_epoch_seconds(value) is None
+
+
 def test_usage_envelope_reset_time_normalizes_units() -> None:
     assert usage_envelope.reset_epoch_seconds(1754000000) == 1754000000.0
     assert usage_envelope.reset_epoch_seconds(1754000000000) == 1754000000.0

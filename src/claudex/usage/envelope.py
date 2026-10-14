@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import time
 from datetime import datetime
 from typing import Any
@@ -105,9 +106,15 @@ def reset_epoch_seconds(value: Any) -> float | None:
     if isinstance(value, bool):
         return None
     if isinstance(value, (int, float)):
+        try:
+            numeric_value = float(value)
+        except OverflowError:
+            return None
+        if not math.isfinite(numeric_value):
+            return None
         # 1e10 sits between any plausible seconds epoch (<2286) and any
         # milliseconds epoch (>2001), distinguishing the two units.
-        return float(value) / 1000 if value > 10_000_000_000 else float(value)
+        return numeric_value / 1000 if numeric_value > 10_000_000_000 else numeric_value
     if isinstance(value, str) and value.strip():
         text = value.strip()
         try:
