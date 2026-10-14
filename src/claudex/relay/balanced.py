@@ -302,7 +302,7 @@ async def _passthrough_with_claude_balanced(
 
 
 def _balanced_candidates(
-    records: Iterable[AccountRecord], router: ClaudeBalancedRouter, *, family: str, now: float
+    records: Iterable[AccountRecord], router: ClaudeBalancedRouter, *, app_state: Any, family: str, now: float
 ) -> list[AccountCandidate]:
     """One `AccountCandidate` per registered account for a request's whole retry chain.
 
@@ -315,14 +315,30 @@ def _balanced_candidates(
     candidates = []
     for record in records:
         ready = record.state == "ready"
+        fingerprint = server_support._account_profile_fingerprint(app_state, record.id) if ready else None
         candidates.append(
             AccountCandidate(
                 account_id=record.id,
                 account_incarnation_id=record.account_incarnation_id,
                 ready=ready,
-                account_cooldown_until=router.account_cooldown_deadline(record.id, now=now) if ready else None,
+                account_cooldown_until=(
+                    router.account_cooldown_deadline(
+                        record.id,
+                        account_incarnation_id=record.account_incarnation_id,
+                        account_profile_fingerprint=fingerprint,
+                        now=now,
+                    )
+                    if ready else None
+                ),
                 family_cooldown_until=(
-                    router.family_cooldown_deadline(record.id, family, now=now) if ready else None
+                    router.family_cooldown_deadline(
+                        record.id,
+                        family,
+                        account_incarnation_id=record.account_incarnation_id,
+                        account_profile_fingerprint=fingerprint,
+                        now=now,
+                    )
+                    if ready else None
                 ),
             )
         )
@@ -386,6 +402,7 @@ def _balanced_all_cooling_response(
     records_by_id: Mapping[str, AccountRecord],
     router: ClaudeBalancedRouter,
     *,
+    app_state: Any,
     family: str,
     chain_exhausted_429: Response | None,
 ) -> Response:
@@ -418,8 +435,20 @@ def _balanced_all_cooling_response(
     # An account unblocks at the later of its account-wide and family
     # deadlines; Retry-After uses the earliest unblock time across accounts.
     def _unblock_at(record: AccountRecord) -> float:
-        account_deadline = router.account_cooldown_deadline(record.id, now=now) or now
-        family_deadline = router.family_cooldown_deadline(record.id, family, now=now) or now
+        fingerprint = server_support._account_profile_fingerprint(app_state, record.id)
+        account_deadline = router.account_cooldown_deadline(
+            record.id,
+            account_incarnation_id=record.account_incarnation_id,
+            account_profile_fingerprint=fingerprint,
+            now=now,
+        ) or now
+        family_deadline = router.family_cooldown_deadline(
+            record.id,
+            family,
+            account_incarnation_id=record.account_incarnation_id,
+            account_profile_fingerprint=fingerprint,
+            now=now,
+        ) or now
         return max(account_deadline, family_deadline)
 
     min_unblock_at = min(_unblock_at(record) for record in candidate_set)
@@ -522,7 +551,9 @@ async def _serve_balanced_stateless_message(
     assert router is not None
     family = quota_family(model)
     digest = derive_stateless_routing_digest(runtime.epoch_seed, secrets.token_bytes(32))
-    candidates = _balanced_candidates(records_by_id.values(), router, family=family, now=time.monotonic())
+    candidates = _balanced_candidates(
+        records_by_id.values(), router, app_state=request.app.state, family=family, now=time.monotonic()
+    )
 
     attempted: set[str] = set()
     chain_429: Response | None = None
@@ -537,7 +568,9 @@ async def _serve_balanced_stateless_message(
                 already_attempted=frozenset(attempted),
             )
         except NoEligibleAccountError:
-            return _balanced_all_cooling_response(records_by_id, router, family=family, chain_exhausted_429=chain_429)
+            return _balanced_all_cooling_response(
+                records_by_id, router, app_state=request.app.state, family=family, chain_exhausted_429=chain_429
+            )
 
         attempted.add(account_id)
         record = records_by_id[account_id]
@@ -637,14 +670,18 @@ async def _serve_balanced_pinned_message(
     family = quota_family(model)
     digest = session_key.digest
     now = time.monotonic()
-    candidates = _balanced_candidates(records_by_id.values(), router, family=family, now=now)
+    candidates = _balanced_candidates(
+        records_by_id.values(), router, app_state=request.app.state, family=family, now=now
+    )
 
     try:
         placement = router.place_session(
             session_key=session_key, model=model, candidates=candidates, seed=runtime.epoch_seed, now=now
         )
     except NoEligibleAccountError:
-        return _balanced_all_cooling_response(records_by_id, router, family=family, chain_exhausted_429=None)
+        return _balanced_all_cooling_response(
+            records_by_id, router, app_state=request.app.state, family=family, chain_exhausted_429=None
+        )
 
     normal_pin_created = placement.created
     if placement.created and placement.durability_barrier is not None:
@@ -713,13 +750,13 @@ async def _serve_balanced_pinned_message(
                     session_key=session_key,
                     model=model,
                     candidates=_balanced_candidates(
-                        records_by_id.values(), router, family=family, now=time.monotonic()
+                        records_by_id.values(), router, app_state=request.app.state, family=family, now=time.monotonic()
                     ),
                     seed=runtime.epoch_seed,
                 )
             except NoEligibleAccountError:
                 return _balanced_all_cooling_response(
-                    records_by_id, router, family=family, chain_exhausted_429=chain_429
+                    records_by_id, router, app_state=request.app.state, family=family, chain_exhausted_429=chain_429
                 )
             normal_pin_created = placement.created
             if placement.created and placement.durability_barrier is not None:
@@ -733,11 +770,26 @@ async def _serve_balanced_pinned_message(
 
         record = records_by_id.get(current_target)
         cooldown_check_now = time.monotonic()
+        fingerprint = (
+            server_support._account_profile_fingerprint(request.app.state, current_target)
+            if record is not None and record.state == "ready" else None
+        )
         eligible_now = (
             record is not None
             and record.state == "ready"
-            and router.account_cooldown_deadline(current_target, now=cooldown_check_now) is None
-            and router.family_cooldown_deadline(current_target, family, now=cooldown_check_now) is None
+            and router.account_cooldown_deadline(
+                current_target,
+                account_incarnation_id=record.account_incarnation_id,
+                account_profile_fingerprint=fingerprint,
+                now=cooldown_check_now,
+            ) is None
+            and router.family_cooldown_deadline(
+                current_target,
+                family,
+                account_incarnation_id=record.account_incarnation_id,
+                account_profile_fingerprint=fingerprint,
+                now=cooldown_check_now,
+            ) is None
         )
         attempted.add(current_target)
 
@@ -884,7 +936,9 @@ async def _serve_balanced_pinned_message(
                 already_attempted=frozenset(attempted),
             )
         except NoEligibleAccountError:
-            return _balanced_all_cooling_response(records_by_id, router, family=family, chain_exhausted_429=chain_429)
+            return _balanced_all_cooling_response(
+                records_by_id, router, app_state=request.app.state, family=family, chain_exhausted_429=chain_429
+            )
 
         reservation, is_owner = router.acquire_migration_reservation(
             digest,
@@ -956,7 +1010,9 @@ async def _serve_balanced_count_tokens(
         else derive_stateless_routing_digest(runtime.epoch_seed, secrets.token_bytes(32))
     )
     family = quota_family(model)
-    candidates = _balanced_candidates(records_by_id.values(), router, family=family, now=time.monotonic())
+    candidates = _balanced_candidates(
+        records_by_id.values(), router, app_state=request.app.state, family=family, now=time.monotonic()
+    )
     try:
         account_id = _balanced_pick_account(
             router,
@@ -966,7 +1022,9 @@ async def _serve_balanced_count_tokens(
             seed=runtime.epoch_seed,
         )
     except NoEligibleAccountError:
-        return _balanced_all_cooling_response(records_by_id, router, family=family, chain_exhausted_429=None)
+        return _balanced_all_cooling_response(
+            records_by_id, router, app_state=request.app.state, family=family, chain_exhausted_429=None
+        )
     record = records_by_id[account_id]
     attempt_context = try_begin_account_leg(leg_tracker,None)
     outcome = await _attempt_with_account(

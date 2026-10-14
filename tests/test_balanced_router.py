@@ -2256,6 +2256,127 @@ def test_cooldown_deadline_reflects_the_earlier_of_both_clocks() -> None:
     assert router.account_cooldown_deadline("acct-a") is None
 
 
+@pytest.mark.parametrize("scope", ["account", "family"])
+@pytest.mark.parametrize("should_restore", [False, True], ids=["live", "restart"])
+@pytest.mark.parametrize(
+    ("incarnation", "fingerprint", "is_matching"),
+    [
+        ("inc-old", "fp-a", True),
+        ("inc-new", "fp-a", False),
+        ("inc-old", "fp-b", False),
+        ("inc-old", None, False),
+        (None, "fp-a", False),
+    ],
+    ids=["matching", "changed-incarnation", "changed-profile", "missing-profile", "missing-incarnation"],
+)
+def test_cooldown_deadlines_validate_current_provenance_after_restart(
+    tmp_path: Path, scope: str, should_restore: bool, incarnation: str | None, fingerprint: str | None, is_matching: bool
+) -> None:
+    clock = _FakeClock(5_000.0)
+    wall_clock = _FakeClock(1_700_000_000.0)
+    router = _make_router(clock=clock, wall_clock=wall_clock)
+    router.install_cooldown(
+        account_id="acct-a",
+        account_incarnation_id="inc-old",
+        account_profile_fingerprint="fp-a",
+        scope=scope,
+        model_family="fable" if scope == "family" else "",
+        deadline=clock() + 3_600.0,
+        reason="quota",
+    )
+    if should_restore:
+        db_path = tmp_path / "runtime.sqlite3"
+        store = ClaudePoolRuntimeStateStore.open_(db_path, debounce_seconds=0.0)
+        try:
+            store.upsert_cooldown(
+                account_id="acct-a",
+                account_incarnation_id="inc-old",
+                account_profile_fingerprint="fp-a",
+                scope=scope,
+                model_family="fable" if scope == "family" else "",
+                deadline_utc=wall_clock() + 3_600.0,
+                reason="quota",
+                evidence="",
+                updated_at_utc=wall_clock(),
+                high_priority=True,
+            ).wait(timeout=5.0)
+        finally:
+            store.close()
+        store = ClaudePoolRuntimeStateStore.open_(db_path)
+        try:
+            router.restore_from_store(store.restore(RestoreValidationContext(now_utc=wall_clock())))
+        finally:
+            store.close()
+
+    query = (
+        router.account_cooldown_deadline
+        if scope == "account"
+        else lambda account_id, **kwargs: router.family_cooldown_deadline(account_id, "fable", **kwargs)
+    )
+    result = query("acct-a", account_incarnation_id=incarnation, account_profile_fingerprint=fingerprint)
+    if is_matching:
+        assert result == pytest.approx(clock() + 3_600.0)
+    else:
+        assert result is None
+    assert query("acct-a", account_incarnation_id="inc-old", account_profile_fingerprint="fp-a") == pytest.approx(
+        clock() + 3_600.0
+    )
+
+
+@pytest.mark.parametrize("scope", ["account", "family"])
+def test_unfingerprinted_live_cooldown_is_not_evidence_for_another_identity(scope: str) -> None:
+    clock = _FakeClock()
+    router = _make_router(clock=clock)
+    router.install_cooldown(
+        account_id="acct-a",
+        account_incarnation_id="inc-a",
+        account_profile_fingerprint=None,
+        scope=scope,
+        model_family="fable" if scope == "family" else "",
+        deadline=clock() + 3_600.0,
+        reason="quota",
+    )
+    query = (
+        router.account_cooldown_deadline
+        if scope == "account"
+        else lambda account_id, **kwargs: router.family_cooldown_deadline(account_id, "fable", **kwargs)
+    )
+    assert query("acct-a", account_incarnation_id="inc-a", account_profile_fingerprint=None) is not None
+    assert query("acct-a", account_incarnation_id="inc-b", account_profile_fingerprint=None) is None
+    assert query("acct-a", account_incarnation_id="inc-a", account_profile_fingerprint="fp-a") is None
+
+
+@pytest.mark.parametrize("scope", ["account", "family"])
+@pytest.mark.parametrize(("remaining", "expected"), [(0.5, 1.0), (3_600.0, 3_600.0), (8 * 86_400.0, 7 * 86_400.0)])
+def test_matching_restored_cooldown_preserves_clamps_and_clock_expiry(
+    tmp_path: Path, scope: str, remaining: float, expected: float
+) -> None:
+    clock = _FakeClock(5_000.0)
+    wall_clock = _FakeClock(1_700_000_000.0)
+    store = ClaudePoolRuntimeStateStore.open_(tmp_path / "runtime.sqlite3", debounce_seconds=0.0)
+    try:
+        store.upsert_cooldown(
+            account_id="acct-a", scope=scope, model_family="fable" if scope == "family" else "",
+            account_incarnation_id="inc-a", account_profile_fingerprint="fp-a",
+            deadline_utc=wall_clock() + remaining, reason="quota", evidence="",
+            updated_at_utc=wall_clock(), high_priority=True,
+        ).wait(timeout=5.0)
+        router = _make_router(clock=clock, wall_clock=wall_clock)
+        router.restore_from_store(store.restore(RestoreValidationContext(now_utc=wall_clock())))
+        query = (
+            router.account_cooldown_deadline
+            if scope == "account"
+            else lambda account_id, **kwargs: router.family_cooldown_deadline(account_id, "fable", **kwargs)
+        )
+        assert query("acct-a", account_incarnation_id="inc-a", account_profile_fingerprint="fp-a") == pytest.approx(
+            clock() + expected
+        )
+        wall_clock.advance(expected + 1.0)
+        assert query("acct-a", account_incarnation_id="inc-a", account_profile_fingerprint="fp-a") is None
+    finally:
+        store.close()
+
+
 def test_restored_cooldowns_carry_a_wall_deadline(tmp_path: Any) -> None:
     db_path = tmp_path / "runtime.sqlite3"
     store = ClaudePoolRuntimeStateStore.open_(db_path, debounce_seconds=0.0)

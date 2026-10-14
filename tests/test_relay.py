@@ -6658,21 +6658,38 @@ def test_chain_exhausted_retry_after_matches_earliest_local_unblock(
 ) -> None:
     monkeypatch.setattr(relay_balanced.time, "monotonic", lambda: 1_000.0)
     records = {
-        "account-a": SimpleNamespace(id="account-a", state="ready"),
-        "account-b": SimpleNamespace(id="account-b", state="ready"),
+        "account-a": SimpleNamespace(id="account-a", state="ready", account_incarnation_id="inc-a"),
+        "account-b": SimpleNamespace(id="account-b", state="ready", account_incarnation_id="inc-b"),
     }
+    app_state = SimpleNamespace(claude_ambient_accounts=None)
     account_offsets = {"account-a": 9.25, "account-b": 1.0}
     family_offsets = {"account-a": 2.0, "account-b": 5.25}
-    router = SimpleNamespace(
-        account_cooldown_deadline=lambda account_id, *, now: now
-        + account_offsets[account_id],
-        family_cooldown_deadline=lambda account_id, family, *, now: now
-        + family_offsets[account_id],
-    )
+
+    def get_profile_fingerprint(state: Any, account_id: str) -> str:
+        assert state is app_state
+        return f"fp-{account_id}"
+
+    def get_account_deadline(
+        account_id: str, *, account_incarnation_id: str, account_profile_fingerprint: str, now: float
+    ) -> float:
+        assert account_incarnation_id == records[account_id].account_incarnation_id
+        assert account_profile_fingerprint == f"fp-{account_id}"
+        return now + account_offsets[account_id]
+
+    def get_family_deadline(
+        account_id: str, family: str, *, account_incarnation_id: str, account_profile_fingerprint: str, now: float
+    ) -> float:
+        assert family == "fable"
+        assert account_incarnation_id == records[account_id].account_incarnation_id
+        assert account_profile_fingerprint == f"fp-{account_id}"
+        return now + family_offsets[account_id]
+
+    monkeypatch.setattr(relay_balanced.server_support, "_account_profile_fingerprint", get_profile_fingerprint)
+    router = SimpleNamespace(account_cooldown_deadline=get_account_deadline, family_cooldown_deadline=get_family_deadline)
     upstream = Response(content=b"upstream", status_code=429)
 
     returned = relay_balanced._balanced_all_cooling_response(
-        records, router, family="fable", chain_exhausted_429=upstream
+        records, router, app_state=app_state, family="fable", chain_exhausted_429=upstream
     )
 
     assert returned is upstream
@@ -6683,10 +6700,11 @@ def test_chain_exhausted_retry_after_matches_earliest_local_unblock(
 def test_chain_exhausted_real_429_preserves_upstream_retry_after(
     retry_after: str,
 ) -> None:
-    records = {"account-a": SimpleNamespace(id="account-a", state="ready")}
+    records = {"account-a": SimpleNamespace(id="account-a", state="ready", account_incarnation_id="inc-a")}
+    app_state = SimpleNamespace(claude_ambient_accounts=None)
     router = SimpleNamespace(
-        account_cooldown_deadline=lambda account_id, *, now: now + 10.0,
-        family_cooldown_deadline=lambda account_id, family, *, now: now + 20.0,
+        account_cooldown_deadline=lambda account_id, *, account_incarnation_id, account_profile_fingerprint, now: now + 10.0,
+        family_cooldown_deadline=lambda account_id, family, *, account_incarnation_id, account_profile_fingerprint, now: now + 20.0,
     )
     upstream = Response(
         content=b"upstream",
@@ -6696,7 +6714,7 @@ def test_chain_exhausted_real_429_preserves_upstream_retry_after(
     before_headers = list(upstream.raw_headers)
 
     returned = relay_balanced._balanced_all_cooling_response(
-        records, router, family="fable", chain_exhausted_429=upstream
+        records, router, app_state=app_state, family="fable", chain_exhausted_429=upstream
     )
 
     assert returned is upstream

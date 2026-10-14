@@ -39,6 +39,7 @@ from starlette.testclient import TestClient
 
 from claudex import paths
 from claudex.claude import accounts as claude_accounts
+from claudex.claude.account_profile import compute_account_profile_fingerprint
 from claudex.claude.ambient_account import AmbientClaudeAuthManager
 from claudex.balanced.router import CAPABILITY_CLASSIFIER_VERSION, ClaudeBalancedRouter
 from claudex.balanced.runtime import ClaudeBalancedRuntime
@@ -332,7 +333,7 @@ def test_distinct_ambient_login_joins_balanced_candidates_and_serves_request(
         records_by_id = {record.id: record for record in records}
         records_by_id[member.record.id] = member.record
         candidates = relay_balanced._balanced_candidates(
-            records_by_id.values(), runtime.router, family="default", now=time.monotonic()
+            records_by_id.values(), runtime.router, app_state=client.app.state, family="default", now=time.monotonic()
         )
         assert {candidate.account_id for candidate in candidates} == {
             registered_id,
@@ -1061,6 +1062,282 @@ def test_restored_unknown_usage_observation_has_no_row_to_restore_at_all(tmp_pat
         assert store.get_usage_observation("acct-a", "seven_day") is None
     finally:
         store.close()
+
+
+@pytest.fixture
+def _restored_cooldown_context(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, scope: str, identity: str
+) -> Iterator[SimpleNamespace]:
+    clock = _FakeClock(5_000.0)
+    wall_clock = _FakeClock(1_700_000_000.0)
+    monkeypatch.setattr(relay_balanced.time, "monotonic", clock)
+    monkeypatch.setattr(relay_balanced.time, "time", wall_clock)
+    profiles_root = tmp_path / "profile"
+    profile_dir = profiles_root / "acct-a"
+    profile_dir.mkdir(parents=True)
+    monkeypatch.setattr(server_support.paths, "accounts_dir", lambda _provider: profiles_root)
+    old_profile = {"accountUuid": _BALANCED_ACCOUNT_UUID, "seatTier": "pro"}
+    current_profile = dict(old_profile)
+    incarnation = "inc-old"
+    if identity == "upstream":
+        current_profile["accountUuid"] = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+        incarnation = "inc-new"
+    elif identity == "profile":
+        current_profile["seatTier"] = "max"
+    elif identity == "unrecognized":
+        current_profile["displayName"] = "Synthetic changed label"
+    if identity != "missing-profile":
+        (profile_dir / "oauth-account.json").write_text(json.dumps(current_profile))
+    record = SimpleNamespace(id="acct-a", state="ready", account_incarnation_id=incarnation)
+    app_state = SimpleNamespace(claude_ambient_accounts=None, claude_pin_refresh_tasks=set())
+    request = SimpleNamespace(app=SimpleNamespace(state=app_state))
+    db_path = tmp_path / "runtime.sqlite3"
+    store = ClaudePoolRuntimeStateStore.open_(db_path, debounce_seconds=0.0)
+    try:
+        store.upsert_cooldown(
+            account_id=record.id,
+            scope=scope,
+            model_family="fable" if scope == "family" else "",
+            account_incarnation_id="inc-old",
+            account_profile_fingerprint=compute_account_profile_fingerprint(old_profile),
+            deadline_utc=wall_clock() + 3_600.0,
+            reason="quota",
+            evidence="",
+            updated_at_utc=wall_clock(),
+            high_priority=True,
+        ).wait(timeout=5.0)
+    finally:
+        store.close()
+    store = ClaudePoolRuntimeStateStore.open_(db_path)
+    try:
+        router = ClaudeBalancedRouter(
+            balanced_epoch_id=store.balanced_epoch_id, clock=clock, wall_clock=wall_clock
+        )
+        router.restore_from_store(store.restore(RestoreValidationContext(now_utc=wall_clock())))
+        yield SimpleNamespace(
+            clock=clock,
+            wall_clock=wall_clock,
+            request=request,
+            record=record,
+            records={record.id: record},
+            router=router,
+            runtime=SimpleNamespace(router=router, epoch_seed=b"synthetic-seed"),
+            profile=current_profile,
+        )
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("scope", ["account", "family"])
+@pytest.mark.parametrize("identity", ["same", "upstream", "profile", "missing-profile", "unrecognized"])
+@pytest.mark.parametrize("endpoint", ["stateless", "count_tokens"])
+@pytest.mark.parametrize("model", ["claude-fable-5", "claude-sonnet-5"])
+def test_restored_cooldown_candidates_use_current_profile(
+    monkeypatch: pytest.MonkeyPatch, _restored_cooldown_context: SimpleNamespace,
+    scope: str, identity: str, endpoint: str, model: str
+) -> None:
+    context = _restored_cooldown_context
+    attempts: list[str] = []
+
+    async def attempt(_request: Any, _raw: bytes, _body: Any, record: Any, **_kwargs: Any) -> JSONResponse:
+        attempts.append(record.id)
+        return JSONResponse({"id": "synthetic-response"})
+
+    monkeypatch.setattr(relay_balanced, "_attempt_with_account", attempt)
+    monkeypatch.setattr(relay_balanced, "AccountLegTracker", lambda *_args, **_kwargs: None)
+    body = {"model": model}
+    if endpoint == "stateless":
+        response = asyncio.run(relay_balanced._serve_balanced_stateless_message(
+            context.request, b"{}", body, context.runtime, context.records, model
+        ))
+    else:
+        response = asyncio.run(relay_balanced._serve_balanced_count_tokens(
+            context.request, b"{}", body, context.runtime, context.records, None, model
+        ))
+    is_cooling = identity in ("same", "unrecognized") and (scope == "account" or model == "claude-fable-5")
+    assert response.status_code == (429 if is_cooling else 200)
+    assert attempts == ([] if is_cooling else [context.record.id])
+    if is_cooling:
+        assert response.headers["retry-after"] == "3600"
+    assert context.router.pin_count() == 0
+
+
+@pytest.mark.parametrize("scope", ["account", "family"])
+@pytest.mark.parametrize("identity", ["same", "upstream", "profile", "missing-profile", "unrecognized"])
+def test_restored_cooldown_pin_eligibility_uses_current_profile(
+    monkeypatch: pytest.MonkeyPatch, _restored_cooldown_context: SimpleNamespace, scope: str, identity: str
+) -> None:
+    context = _restored_cooldown_context
+    key = SessionKey(digest=b"\x44" * 32, kind="content_hash")
+    context.router.place_session(
+        session_key=key,
+        model="claude-fable-5",
+        candidates=[AccountCandidate(
+            account_id=context.record.id, account_incarnation_id=context.record.account_incarnation_id
+        )],
+        seed=context.runtime.epoch_seed,
+    )
+    asyncio.run(context.router.submit_new_pin_durability(key.digest))
+    attempts: list[str] = []
+
+    async def attempt(_request: Any, _raw: bytes, _body: Any, record: Any, **_kwargs: Any) -> JSONResponse:
+        attempts.append(record.id)
+        return JSONResponse({"id": "synthetic-response"})
+
+    monkeypatch.setattr(relay_balanced, "_attempt_with_account", attempt)
+    monkeypatch.setattr(relay_balanced, "AccountLegTracker", lambda *_args, **_kwargs: None)
+    response = asyncio.run(relay_balanced._serve_balanced_pinned_message(
+        context.request, b"{}", {"model": "claude-fable-5"}, context.runtime,
+        context.records, key, "claude-fable-5"
+    ))
+    is_cooling = identity in ("same", "unrecognized")
+    assert response.status_code == (429 if is_cooling else 200)
+    assert attempts == ([] if is_cooling else [context.record.id])
+    assert context.router.get_pin(key.digest).generation == 0
+    assert context.router.in_flight_count(context.record.id) == 0
+
+
+@pytest.mark.parametrize("scope", ["account", "family"])
+@pytest.mark.parametrize("identity", ["same", "upstream", "profile", "missing-profile", "unrecognized"])
+@pytest.mark.parametrize("has_upstream_429", [False, True])
+def test_restored_cooldown_retry_after_uses_current_profile(
+    _restored_cooldown_context: SimpleNamespace, scope: str, identity: str, has_upstream_429: bool
+) -> None:
+    context = _restored_cooldown_context
+    upstream = JSONResponse({"error": "synthetic-quota"}, status_code=429, headers={"request-id": "synthetic"})
+    response = relay_balanced._balanced_all_cooling_response(
+        context.records,
+        context.router,
+        app_state=context.request.app.state,
+        family="fable",
+        chain_exhausted_429=upstream if has_upstream_429 else None,
+    )
+    assert response.status_code == 429
+    assert response.headers["retry-after"] == ("3600" if identity in ("same", "unrecognized") else "1")
+    if has_upstream_429:
+        assert response is upstream
+        assert response.body == b'{"error":"synthetic-quota"}'
+        assert response.headers["request-id"] == "synthetic"
+
+
+@pytest.mark.parametrize("scope", ["account", "family"])
+@pytest.mark.parametrize("identity", ["same", "upstream", "profile", "missing-profile"])
+def test_cooldown_migration_preserves_current_target_identity(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    _restored_cooldown_context: SimpleNamespace, scope: str, identity: str
+) -> None:
+    context = _restored_cooldown_context
+    source_record = SimpleNamespace(id="acct-source", state="ready", account_incarnation_id="inc-source")
+    context.records[source_record.id] = source_record
+    source_dir = tmp_path / "profile" / source_record.id
+    source_dir.mkdir()
+    source_profile = {"accountUuid": "11111111-1111-4111-8111-111111111111"}
+    (source_dir / "oauth-account.json").write_text(json.dumps(source_profile))
+    key = SessionKey(digest=b"\x55" * 32, kind="content_hash")
+    context.router.place_session(
+        session_key=key, model="claude-fable-5",
+        candidates=[AccountCandidate(account_id=source_record.id, account_incarnation_id="inc-source")],
+        seed=context.runtime.epoch_seed,
+    )
+    asyncio.run(context.router.submit_new_pin_durability(key.digest))
+    context.router.install_cooldown(
+        account_id=source_record.id, account_incarnation_id="inc-source",
+        account_profile_fingerprint=compute_account_profile_fingerprint(source_profile),
+        scope="account", deadline=context.clock() + 3_600.0, reason="quota",
+    )
+    attempts: list[str] = []
+
+    async def attempt(_request: Any, _raw: bytes, _body: Any, record: Any, **kwargs: Any) -> JSONResponse:
+        attempts.append(record.id)
+        await kwargs["commit_hook"](httpx.Response(200))
+        kwargs["on_relay_complete"]()
+        return JSONResponse({"id": "synthetic-response"})
+
+    monkeypatch.setattr(relay_balanced, "_attempt_with_account", attempt)
+    monkeypatch.setattr(relay_balanced, "AccountLegTracker", lambda *_args, **_kwargs: None)
+    response = asyncio.run(relay_balanced._serve_balanced_pinned_message(
+        context.request, b"{}", {"model": "claude-fable-5"}, context.runtime,
+        context.records, key, "claude-fable-5"
+    ))
+    is_cooling = identity == "same"
+    assert response.status_code == (429 if is_cooling else 200)
+    assert attempts == ([] if is_cooling else [context.record.id])
+    pin = context.router.get_pin(key.digest)
+    assert pin.account_id == (source_record.id if is_cooling else context.record.id)
+    assert pin.generation == (0 if is_cooling else 1)
+    assert pin.account_incarnation_id == ("inc-source" if is_cooling else context.record.account_incarnation_id)
+    assert context.router.get_migration_reservation(key.digest) is None
+    assert context.router.in_flight_count(context.record.id) == 0
+    assert context.router.in_flight_count(source_record.id) == 0
+
+
+@pytest.mark.parametrize("scope", ["account", "family"])
+@pytest.mark.parametrize("identity", ["same", "upstream", "profile", "missing-profile"])
+def test_cooldown_queries_use_the_current_ambient_profile(
+    monkeypatch: pytest.MonkeyPatch, _restored_cooldown_context: SimpleNamespace, scope: str, identity: str
+) -> None:
+    context = _restored_cooldown_context
+    member = SimpleNamespace(
+        record=context.record,
+        profile_fingerprint=(None if identity == "missing-profile" else compute_account_profile_fingerprint(context.profile)),
+    )
+    context.request.app.state.claude_ambient_accounts = SimpleNamespace(
+        is_ambient_account_id=lambda account_id: account_id == context.record.id,
+        pool_member=lambda: member,
+    )
+
+    def reject_registered_profile(_account_dir: Path) -> None:
+        raise AssertionError("ambient cooldown queries must not read a registered profile")
+
+    monkeypatch.setattr(server_support, "load_account_profile_fingerprint", reject_registered_profile)
+    candidates = relay_balanced._balanced_candidates(
+        context.records.values(), context.router, app_state=context.request.app.state,
+        family="fable", now=context.clock()
+    )
+    is_cooling = identity == "same"
+    assert (candidates[0].account_cooldown_until is not None) == (is_cooling and scope == "account")
+    assert (candidates[0].family_cooldown_until is not None) == (is_cooling and scope == "family")
+    response = relay_balanced._balanced_all_cooling_response(
+        context.records, context.router, app_state=context.request.app.state,
+        family="fable", chain_exhausted_429=None
+    )
+    assert response.headers["retry-after"] == ("3600" if is_cooling else "1")
+
+
+@pytest.mark.parametrize("scope", ["account", "family"])
+@pytest.mark.parametrize("identity", ["same"])
+def test_pin_cooldown_query_refreshes_profile_after_durability_wait(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    _restored_cooldown_context: SimpleNamespace, scope: str, identity: str
+) -> None:
+    context = _restored_cooldown_context
+    key = SessionKey(digest=b"\x66" * 32, kind="content_hash")
+    context.router.place_session(
+        session_key=key, model="claude-fable-5",
+        candidates=[AccountCandidate(account_id=context.record.id, account_incarnation_id="inc-old")],
+        seed=context.runtime.epoch_seed,
+    )
+    asyncio.run(context.router.submit_new_pin_durability(key.digest))
+    await_durability = context.router.await_pin_durability
+
+    async def wait_and_change_profile(digest: bytes) -> None:
+        await await_durability(digest)
+        profile = dict(context.profile, seatTier="max")
+        (tmp_path / "profile" / context.record.id / "oauth-account.json").write_text(json.dumps(profile))
+
+    async def attempt(_request: Any, _raw: bytes, _body: Any, record: Any, **_kwargs: Any) -> JSONResponse:
+        assert record is context.record
+        return JSONResponse({"id": "synthetic-response"})
+
+    monkeypatch.setattr(context.router, "await_pin_durability", wait_and_change_profile)
+    monkeypatch.setattr(relay_balanced, "_attempt_with_account", attempt)
+    monkeypatch.setattr(relay_balanced, "AccountLegTracker", lambda *_args, **_kwargs: None)
+    response = asyncio.run(relay_balanced._serve_balanced_pinned_message(
+        context.request, b"{}", {"model": "claude-fable-5"}, context.runtime,
+        context.records, key, "claude-fable-5"
+    ))
+    assert response.status_code == 200
+    assert context.router.get_pin(key.digest).generation == 0
 
 
 # ===========================================================================

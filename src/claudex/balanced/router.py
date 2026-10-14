@@ -53,15 +53,29 @@ class _CooldownEntry:
     deadline_monotonic: float
     deadline_wall: float
     account_incarnation_id: str
+    account_profile_fingerprint: str | None
     reason: str
 
 
-def _entry_cooldown_deadline(entry: _CooldownEntry | None, now: float, wall_now: float) -> float | None:
+def _entry_cooldown_deadline(
+    entry: _CooldownEntry | None,
+    now: float,
+    wall_now: float,
+    *,
+    account_incarnation_id: str | None = None,
+    account_profile_fingerprint: str | None = None,
+) -> float | None:
     """The entry's effective monotonic deadline — the earlier of its two
     deadlines, re-expressed on the monotonic clock — or `None` when the entry
-    is absent or either deadline has passed."""
+    is absent, either deadline has passed, or supplied identity provenance
+    does not match. With no provenance supplied, this is a raw diagnostic read."""
     if entry is None:
         return None
+    if account_incarnation_id is not None or account_profile_fingerprint is not None:
+        if entry.account_incarnation_id != account_incarnation_id:
+            return None
+        if entry.account_profile_fingerprint != account_profile_fingerprint:
+            return None
     remaining = min(entry.deadline_monotonic - now, entry.deadline_wall - wall_now)
     if remaining <= 0.0:
         return None
@@ -650,10 +664,9 @@ class ClaudeBalancedRouter:
         with its own restore clamp and validation. A cooldown's remaining
         duration clamps to `[1s, 7d]`, and a restored capability row is kept
         only while it is still `eligible`, still carries a TTL, is not yet
-        expired, and matches this build's `CAPABILITY_CLASSIFIER_VERSION` (the
-        incarnation/fingerprint match is enforced lazily, at query time,
-        against the live candidate the caller supplies — the same backstop
-        pattern pins rely on).
+        expired, and matches this build's `CAPABILITY_CLASSIFIER_VERSION`.
+        Cooldown and capability incarnation/fingerprint matches are enforced
+        lazily at query time against the live candidate the caller supplies.
         """
         monotonic_now = self._clock() if now is None else now
         wall_now = self._wall_clock() if wall_now is None else wall_now
@@ -693,6 +706,7 @@ class ClaudeBalancedRouter:
                 deadline_monotonic=monotonic_now + clamped_remaining,
                 deadline_wall=wall_now + clamped_remaining,
                 account_incarnation_id=cooldown_row.account_incarnation_id,
+                account_profile_fingerprint=cooldown_row.account_profile_fingerprint,
                 reason=cooldown_row.reason,
             )
             if scope == "account":
@@ -763,6 +777,7 @@ class ClaudeBalancedRouter:
             deadline_monotonic=deadline,
             deadline_wall=wall_now + (deadline - now),
             account_incarnation_id=account_incarnation_id,
+            account_profile_fingerprint=account_profile_fingerprint,
             reason=reason,
         )
         if scope == "account":
@@ -786,24 +801,53 @@ class ClaudeBalancedRouter:
         )
 
     def account_cooldown_deadline(
-        self, account_id: str, *, now: float | None = None, wall_now: float | None = None
+        self,
+        account_id: str,
+        *,
+        account_incarnation_id: str | None = None,
+        account_profile_fingerprint: str | None = None,
+        now: float | None = None,
+        wall_now: float | None = None,
     ) -> float | None:
         """The account-wide cooldown's monotonic deadline, or `None` when absent
-        or expired on either clock. The returned value reflects the earlier of
-        the entry's two deadlines, expressed on the monotonic clock."""
+        or expired on either clock, or mismatched to current provenance.
+        Serving callers supply the current
+        incarnation and profile: a mismatch invalidates local attribution,
+        not the provider's quota. Omitting both reads raw state for diagnostics.
+        The deadline reflects the earlier of the entry's two clocks."""
         now = self._clock() if now is None else now
         wall_now = self._wall_clock() if wall_now is None else wall_now
-        return _entry_cooldown_deadline(self._account_cooldowns.get(account_id), now, wall_now)
+        return _entry_cooldown_deadline(
+            self._account_cooldowns.get(account_id),
+            now,
+            wall_now,
+            account_incarnation_id=account_incarnation_id,
+            account_profile_fingerprint=account_profile_fingerprint,
+        )
 
     def family_cooldown_deadline(
-        self, account_id: str, model_family: str, *, now: float | None = None, wall_now: float | None = None
+        self,
+        account_id: str,
+        model_family: str,
+        *,
+        account_incarnation_id: str | None = None,
+        account_profile_fingerprint: str | None = None,
+        now: float | None = None,
+        wall_now: float | None = None,
     ) -> float | None:
         """The `(account_id, model_family)` cooldown's monotonic deadline, or `None`
-        when absent or expired on either clock. The returned value reflects the
-        earlier of the entry's two deadlines, expressed on the monotonic clock."""
+        when absent, expired on either clock, or mismatched to the supplied
+        current incarnation/profile. Omitting both reads raw diagnostic state;
+        serving queries require them, as with `account_cooldown_deadline`."""
         now = self._clock() if now is None else now
         wall_now = self._wall_clock() if wall_now is None else wall_now
-        return _entry_cooldown_deadline(self._family_cooldowns.get((account_id, model_family)), now, wall_now)
+        return _entry_cooldown_deadline(
+            self._family_cooldowns.get((account_id, model_family)),
+            now,
+            wall_now,
+            account_incarnation_id=account_incarnation_id,
+            account_profile_fingerprint=account_profile_fingerprint,
+        )
 
     # -- eligible-only capability evidence with TTLs -----------------------
 
