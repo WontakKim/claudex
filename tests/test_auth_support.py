@@ -1,4 +1,4 @@
-"""Tests for private credential text replacement."""
+"""Tests for credential reads and private text replacement."""
 
 import io
 import os
@@ -291,3 +291,81 @@ def test_replace_credentials_file_preserves_encoding_error_and_owns_descriptor_c
                     unrelated_stat.st_dev, unrelated_stat.st_ino,
                 )
                 real_close(unrelated_descriptor)
+
+
+@pytest.mark.parametrize("provider", ["codex", "kimi", "grok"])
+@pytest.mark.parametrize("failure", ["permission", "encoding"])
+def test_load_json_credentials_types_read_failures_without_exposing_contents(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, provider: str, failure: str,
+) -> None:
+    from claudex.providers.codex_auth import CodexAuthError
+    from claudex.providers.grok_auth import GrokAuthError
+    from claudex.providers.kimi_auth import KimiAuthError
+
+    error_cls = {"codex": CodexAuthError, "kimi": KimiAuthError, "grok": GrokAuthError}[provider]
+    path = tmp_path / "auth.json"
+    contents = b"\xffdummy-sensitive-content"
+    path.write_bytes(contents)
+    read_text = Path.read_text
+    if failure == "permission":
+        def denied_read(file: Path, *args, **kwargs) -> str:
+            if file == path:
+                raise PermissionError("dummy-sensitive-content")
+            return read_text(file, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", denied_read)
+    expected_cause = PermissionError if failure == "permission" else UnicodeDecodeError
+
+    with pytest.raises(error_cls, match="cannot read credentials file") as raised:
+        auth_support.load_json_credentials(
+            path, error_cls=error_cls, missing_message="dummy login guidance", encoding="utf-8"
+        )
+
+    assert isinstance(raised.value.__cause__, expected_cause)
+    assert str(path) in str(raised.value)
+    assert "dummy-sensitive-content" not in str(raised.value)
+    assert path.read_bytes() == contents
+
+
+def test_load_json_credentials_preserves_missing_file_guidance(tmp_path: Path) -> None:
+    from claudex.providers.codex_auth import CodexAuthError
+
+    with pytest.raises(CodexAuthError) as raised:
+        auth_support.load_json_credentials(
+            tmp_path / "missing.json", error_cls=CodexAuthError,
+            missing_message="dummy login guidance", encoding="utf-8",
+        )
+
+    assert str(raised.value) == "dummy login guidance"
+    assert isinstance(raised.value.__cause__, FileNotFoundError)
+
+
+def test_load_json_credentials_preserves_valid_json_objects(tmp_path: Path) -> None:
+    from claudex.providers.codex_auth import CodexAuthError
+
+    path = tmp_path / "auth.json"
+    path.write_text('{"token": "dummy-token", "native": [1, true, null]}', encoding="utf-8")
+
+    assert auth_support.load_json_credentials(
+        path, error_cls=CodexAuthError, missing_message="dummy login guidance", encoding="utf-8"
+    ) == {"token": "dummy-token", "native": [1, True, None]}
+
+
+@pytest.mark.parametrize(("contents", "message"), [
+    ("not-json", "is not valid JSON"),
+    ("[]", "has an unexpected format"),
+    ('"dummy-string"', "has an unexpected format"),
+    ("null", "has an unexpected format"),
+])
+def test_load_json_credentials_preserves_invalid_json_contracts(
+    tmp_path: Path, contents: str, message: str,
+) -> None:
+    from claudex.providers.codex_auth import CodexAuthError
+
+    path = tmp_path / "auth.json"
+    path.write_text(contents, encoding="utf-8")
+
+    with pytest.raises(CodexAuthError, match=message):
+        auth_support.load_json_credentials(
+            path, error_cls=CodexAuthError, missing_message="dummy login guidance", encoding="utf-8"
+        )

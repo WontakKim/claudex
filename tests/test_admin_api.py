@@ -791,6 +791,73 @@ def test_health_reports_error_without_codex_credentials(
     assert health.json()["providers"]["codex"]["status"] == "error"
 
 
+@pytest.mark.parametrize("failure", ["permission", "encoding"])
+def test_codex_read_failure_allows_unrelated_startup_and_traffic_but_health_stays_required(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    caplog: pytest.LogCaptureFixture, failure: str,
+) -> None:
+    from claudex.providers.codex_auth import CodexAuthManager
+
+    codex_home = tmp_path / "synthetic-codex"
+    codex_home.mkdir()
+    auth_file = codex_home / "auth.json"
+    contents = b"\xffdummy-sensitive-content"
+    auth_file.write_bytes(contents)
+    read_text = Path.read_text
+    if failure == "permission":
+        def denied_read(path: Path, *args, **kwargs) -> str:
+            if path == auth_file:
+                raise PermissionError("dummy-sensitive-content")
+            return read_text(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", denied_read)
+    config = GatewayConfig(
+        codex_home=codex_home, model_map={}, claude_account_id=None,
+        claude_account_routing_mode="disabled",
+    )
+    upstream_requests: list[httpx.Request] = []
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        upstream_requests.append(request)
+        assert request.url.path == "/v1/messages"
+        assert request.headers["x-api-key"] == "dummy-client-key"
+        return httpx.Response(200, json={
+            "id": "dummy-message",
+            "content": [{"type": "text", "text": "dummy-response"}],
+        })
+
+    caplog.set_level(logging.WARNING, logger="claudex.server")
+    with _create_test_client(
+        monkeypatch, tmp_path, config=config, codex_auth=CodexAuthManager,
+        base_url="http://127.0.0.1:8787",
+    ) as client:
+        fake_http_client = httpx.AsyncClient(transport=httpx.MockTransport(upstream))
+        client.app.state.http_client = fake_http_client
+        try:
+            hello = client.get("/api/hello")
+            health = client.get("/health")
+            response = client.post("/v1/messages", headers={"x-api-key": "dummy-client-key"}, json={
+                "model": "claude-synthetic-model", "max_tokens": 10,
+                "messages": [{"role": "user", "content": "dummy request"}],
+            })
+        finally:
+            client.portal.call(fake_http_client.aclose)
+
+    assert hello.status_code == 200
+    assert response.status_code == 200
+    assert response.json()["content"] == [{"type": "text", "text": "dummy-response"}]
+    assert len(upstream_requests) == 1
+    assert health.status_code == 503
+    assert health.json()["status"] == "error"
+    assert health.json()["providers"]["codex"]["status"] == "error"
+    assert health.json()["providers"]["kimi"]["required"] is False
+    assert health.json()["providers"]["grok"]["required"] is False
+    assert "codex direction unavailable" in caplog.text
+    assert "dummy-sensitive-content" not in health.text
+    assert "dummy-sensitive-content" not in caplog.text
+    assert auth_file.read_bytes() == contents
+
+
 def test_health_stays_ok_without_kimi_credentials_when_map_has_no_kimi_route(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

@@ -98,6 +98,8 @@ def load_json_credentials(
         raw = path.read_text(encoding=encoding)
     except FileNotFoundError as exc:
         raise error_cls(missing_message) from exc
+    except (OSError, UnicodeDecodeError) as exc:
+        raise error_cls(f"cannot read credentials file {path}") from exc
     try:
         credentials = json.loads(raw)
     except json.JSONDecodeError as exc:
