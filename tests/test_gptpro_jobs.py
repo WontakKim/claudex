@@ -1760,14 +1760,67 @@ def test_thread_registry_returns_bound_thread_and_none_for_unknown_session() -> 
     assert registry.lookup("session") == "thread"
 
 
-def test_thread_registry_removes_expired_binding_on_lookup() -> None:
+@pytest.mark.parametrize(
+    ("expiry_offset", "expected_thread"), [(-1, "thread"), (0, None), (1, None)]
+)
+def test_thread_registry_observes_exact_expiry(
+    expiry_offset: int, expected_thread: str | None,
+) -> None:
     now = [100.0]
     registry = jobs.ThreadRegistry(clock=lambda: now[0])
     registry.bind("session", "thread")
 
-    now[0] += jobs.THREAD_BINDING_TTL_SECONDS
+    now[0] += jobs.THREAD_BINDING_TTL_SECONDS + expiry_offset
 
+    assert registry.lookup("session") == expected_thread
+    assert ("session" in registry._bindings) == (expected_thread is not None)
+
+
+def test_thread_registry_rebinding_refreshes_expiry() -> None:
+    now = 100.0
+    registry = jobs.ThreadRegistry(clock=lambda: now)
+    registry.bind("session", "original-thread")
+
+    now += jobs.THREAD_BINDING_TTL_SECONDS - 1
+    assert registry.bind("session", "rebound-thread") is None
+    now += 1
+    assert registry.lookup("session") == "rebound-thread"
+    assert set(registry._bindings) == {"session"}
+
+    now += jobs.THREAD_BINDING_TTL_SECONDS - 2
+    assert registry.lookup("session") == "rebound-thread"
+    now += 1
     assert registry.lookup("session") is None
+    assert registry._bindings == {}
+
+
+@pytest.mark.parametrize("activity", ["bind", "lookup", "unknown-lookup"])
+def test_thread_registry_reclaims_abandoned_bindings_on_activity(
+    activity: str,
+) -> None:
+    now = 100.0
+    registry = jobs.ThreadRegistry(clock=lambda: now)
+
+    for batch_number in range(3):
+        for session_number in range(4):
+            assert registry.bind(
+                f"abandoned-{batch_number}-{session_number}", "abandoned-thread"
+            ) is None
+        now += jobs.THREAD_BINDING_TTL_SECONDS - 1
+        assert registry.bind("active-session", "active-thread") is None
+        now += 1
+
+        expected_sessions = {"active-session"}
+        if activity == "bind":
+            assert registry.bind("new-session", "new-thread") is None
+            expected_sessions.add("new-session")
+        elif activity == "lookup":
+            assert registry.lookup("active-session") == "active-thread"
+        else:
+            assert registry.lookup("unknown-session") is None
+
+        assert set(registry._bindings) == expected_sessions
+        assert registry.lookup("active-session") == "active-thread"
 
 
 @pytest.mark.parametrize(
