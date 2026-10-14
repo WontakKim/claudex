@@ -21,7 +21,7 @@ The per-manager asyncio lock coalesces refreshes. Coherent credential/profile
 reads and refresh publication share registry.lock with reauthentication;
 filesystem work runs in a worker thread and the lock is never held during
 HTTP awaits. A refresh may publish or reject only its captured credential-file
-generation. Credential values never appear in log lines or exceptions.
+generation.
 """
 
 from __future__ import annotations
@@ -52,8 +52,7 @@ _OAUTH_ACCOUNT_FILENAME = "oauth-account.json"
 
 class ClaudeAccountAuthError(Exception):
     """Raised when account credentials are missing, malformed, or cannot be
-    refreshed. Messages never contain credential values — only paths and a
-    description of what went wrong."""
+    refreshed."""
 
 
 class ClaudeAccountReauthRequiredError(ClaudeAccountAuthError):
