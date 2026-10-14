@@ -301,6 +301,70 @@ def test_read_chromium_user_agent_returns_probe_ua_and_closes_resources(
     assert playwright.stopped
 
 
+def test_read_chromium_user_agent_close_error_still_stops_the_driver(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    chromium = _FakeUserAgentChromium()
+    playwright = _FakePlaywright(chromium)
+    close_error = RuntimeError("probe browser close failed")
+
+    async def start_playwright() -> _FakePlaywright:
+        return playwright
+
+    async def close_browser() -> None:
+        chromium.user_agent_browser.closed = True
+        raise close_error
+
+    monkeypatch.setattr(browser, "_start_playwright", start_playwright)
+    monkeypatch.setattr(chromium.user_agent_browser, "close", close_browser)
+
+    with pytest.raises(RuntimeError) as raised:
+        asyncio.run(browser.read_chromium_user_agent())
+
+    assert raised.value is close_error
+    assert chromium.user_agent_browser.context.closed
+    assert chromium.user_agent_browser.closed
+    assert playwright.stopped
+
+
+def test_read_chromium_user_agent_close_cancellation_still_stops_the_driver(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    chromium = _FakeUserAgentChromium()
+    playwright = _FakePlaywright(chromium)
+    close_started = asyncio.Event()
+
+    async def start_playwright() -> _FakePlaywright:
+        return playwright
+
+    async def close_browser() -> None:
+        chromium.user_agent_browser.closed = True
+        close_started.set()
+        await asyncio.Future()
+
+    async def stop_playwright() -> None:
+        await asyncio.sleep(0)
+        playwright.stopped = True
+
+    monkeypatch.setattr(browser, "_start_playwright", start_playwright)
+    monkeypatch.setattr(chromium.user_agent_browser, "close", close_browser)
+    monkeypatch.setattr(playwright, "stop", stop_playwright)
+
+    async def scenario() -> None:
+        task = asyncio.create_task(browser.read_chromium_user_agent())
+        await asyncio.wait_for(close_started.wait(), 1.0)
+        assert task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert task.cancelled()
+
+    asyncio.run(scenario())
+
+    assert chromium.user_agent_browser.context.closed
+    assert chromium.user_agent_browser.closed
+    assert playwright.stopped
+
+
 def test_persistent_profile_passes_user_agent_only_when_provided(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

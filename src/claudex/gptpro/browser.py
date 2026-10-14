@@ -306,8 +306,10 @@ async def read_chromium_user_agent() -> str | None:
         finally:
             await context.close()
     finally:
-        await browser.close()
-        await playwright.stop()
+        try:
+            await browser.close()
+        finally:
+            await playwright.stop()
     return user_agent if isinstance(user_agent, str) else None
 
 
