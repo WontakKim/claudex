@@ -31,6 +31,7 @@ import claudex.server_support as server_support
 from claudex import compaction, paths
 from claudex.claude import accounts as claude_accounts
 from claudex.gptpro import session as gptpro_session
+from claudex.mcp_server import LazyAskRuntime
 from claudex.providers.codex_client import (
     CODEX_MODELS_URL,
     CODEX_RESPONSES_URL,
@@ -3024,6 +3025,7 @@ class FakeAdminGptProLoginSession:
         self.is_terminal = terminal
         self.started = False
         self.cancel_requested = False
+        self.on_settled: Callable[[], None] | None = None
         self._status = status or {
             "status": "starting",
             "started_at": 123.0,
@@ -3032,8 +3034,9 @@ class FakeAdminGptProLoginSession:
             "error": None,
         }
 
-    def start(self) -> None:
+    def start(self, *, on_settled: Callable[[], None] | None = None) -> None:
         self.started = True
+        self.on_settled = on_settled
 
     def status(self) -> dict[str, Any]:
         return dict(self._status)
@@ -3042,8 +3045,9 @@ class FakeAdminGptProLoginSession:
         self.cancel_requested = True
 
 
-class FakeAdminGptProRuntime:
+class FakeAdminGptProRuntime(LazyAskRuntime):
     def __init__(self, *, active: bool = False) -> None:
+        super().__init__()
         self.active = active
         self.released = False
 
@@ -3052,6 +3056,216 @@ class FakeAdminGptProRuntime:
 
     async def release_runtime(self) -> None:
         self.released = True
+
+
+@pytest.mark.parametrize("phase", ["releasing", "starting", "running", "cancelling"])
+@pytest.mark.parametrize("operation", ["ask", "recovery"])
+def test_gptpro_login_excludes_new_admission_until_settlement(
+    monkeypatch: pytest.MonkeyPatch, phase: str, operation: str,
+) -> None:
+    from starlette.applications import Starlette
+    from starlette.routing import Route
+
+    from claudex.gptpro import ask, runtime as runtime_module
+    from claudex.gptpro.login_session import GptProLoginSession
+
+    async def scenario() -> None:
+        release_started = asyncio.Event()
+        allow_release = asyncio.Event()
+        driver_started = asyncio.Event()
+        allow_running = asyncio.Event()
+        login_running = asyncio.Event()
+        finish_login = asyncio.Event()
+
+        class WarmRuntime:
+            def __init__(self, *, max_concurrent_asks: int = 2) -> None:
+                self.limit = max_concurrent_asks
+                self.should_gate_close = False
+                self.close_calls = 0
+
+            async def ask(self, question: str, **options: Any) -> ask.AskOutcome:
+                return ask.AskOutcome(text=question, marker="marker", conversation_id=None)
+
+            async def recover(self, conversation_id: str, marker: str) -> ask.AskOutcome:
+                return ask.AskOutcome(text="recovered", marker=marker, conversation_id=conversation_id)
+
+            async def aclose(self) -> None:
+                self.close_calls += 1
+                if self.should_gate_close:
+                    release_started.set()
+                    await allow_release.wait()
+
+        class LoginSession(GptProLoginSession):
+            async def _run(self) -> None:
+                driver_started.set()
+                await allow_running.wait()
+                self._status = "running"
+                login_running.set()
+                await finish_login.wait()
+                self._status = "cancelled" if self._cancel_event.is_set() else "succeeded"
+
+        monkeypatch.setattr(runtime_module, "AskRuntime", WarmRuntime)
+        monkeypatch.setattr(admin_gptpro, "GptProLoginSession", LoginSession)
+        lazy_runtime = LazyAskRuntime()
+        lazy_runtime.set_max_concurrent_asks(3)
+        completed = lazy_runtime.start_ask("completed")
+        while lazy_runtime.has_active_jobs():
+            await asyncio.sleep(0)
+        assert lazy_runtime.job_result(completed.ask_id).answer == "completed"
+        warm_runtime = lazy_runtime._runtime
+        warm_runtime.should_gate_close = True
+        app = Starlette(routes=[
+            Route("/admin/gptpro/login", admin_gptpro._handle_admin_gptpro_login_post, methods=["POST"]),
+            Route("/admin/gptpro/login", admin_gptpro._handle_admin_gptpro_login_delete, methods=["DELETE"]),
+        ])
+        app.state.config = GatewayConfig()
+        app.state.gptpro_ask_runtime = lazy_runtime
+        app.state.gptpro_login_session = None
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1:8787",
+        ) as client:
+            post_task = asyncio.create_task(client.post("/admin/gptpro/login", json={}))
+            try:
+                await release_started.wait()
+                if phase != "releasing":
+                    allow_release.set()
+                    assert (await post_task).status_code == 201
+                    await driver_started.wait()
+                    if phase != "starting":
+                        allow_running.set()
+                        await login_running.wait()
+                    if phase == "cancelling":
+                        response = await client.delete("/admin/gptpro/login")
+                        assert response.json() == {"status": "cancelling"}
+                original_jobs = dict(lazy_runtime._job_service._jobs)
+                with pytest.raises(ask.GptProAskError, match="login"):
+                    if operation == "ask":
+                        lazy_runtime.start_ask("must not be registered")
+                    else:
+                        lazy_runtime.start_recovery(
+                            conversation_id="11111111-1111-4111-8111-111111111111",
+                            marker="[gptpro-transport-nonce:saved-marker]",
+                        )
+                assert lazy_runtime._job_service._jobs == original_jobs
+                assert lazy_runtime.job_status(completed.ask_id).state == "succeeded"
+                assert lazy_runtime.job_result(completed.ask_id).answer == "completed"
+                assert lazy_runtime._runtime is None
+                concurrent = await client.post("/admin/gptpro/login", json={})
+                assert concurrent.status_code == 409
+                assert concurrent.json()["error"]["code"] == "login-active"
+                assert warm_runtime.close_calls == 1
+                allow_release.set()
+                assert (await post_task).status_code == 201
+                allow_running.set()
+                finish_login.set()
+                await app.state.gptpro_login_session._driver_task
+                following = lazy_runtime.start_ask("after login")
+                while lazy_runtime.has_active_jobs():
+                    await asyncio.sleep(0)
+                assert lazy_runtime.job_result(following.ask_id).answer == "after login"
+                assert lazy_runtime._runtime.limit == 3
+            finally:
+                allow_release.set()
+                allow_running.set()
+                finish_login.set()
+                await post_task
+                session = app.state.gptpro_login_session
+                if session is not None:
+                    await session._driver_task
+                await lazy_runtime.aclose()
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=5))
+
+
+@pytest.mark.parametrize("failure", ["release", "start", "cancel-release"])
+def test_gptpro_login_reopens_admission_when_no_driver_started(
+    monkeypatch: pytest.MonkeyPatch, failure: str,
+) -> None:
+    from starlette.applications import Starlette
+    from starlette.routing import Route
+
+    async def scenario() -> None:
+        release_started = asyncio.Event()
+        allow_release = asyncio.Event()
+
+        class Runtime(FakeAdminGptProRuntime):
+            async def release_runtime(self) -> None:
+                release_started.set()
+                if failure == "release":
+                    raise RuntimeError("synthetic release failure")
+                if failure == "cancel-release":
+                    await allow_release.wait()
+                self.released = True
+
+        class LoginSession(FakeAdminGptProLoginSession):
+            def start(self, *, on_settled: Callable[[], None] | None = None) -> None:
+                raise RuntimeError("synthetic start failure")
+
+        monkeypatch.setattr(admin_gptpro, "GptProLoginSession", LoginSession)
+        runtime = Runtime()
+        app = Starlette(routes=[
+            Route("/admin/gptpro/login", admin_gptpro._handle_admin_gptpro_login_post, methods=["POST"]),
+        ])
+        app.state.config = GatewayConfig()
+        app.state.gptpro_ask_runtime = runtime
+        app.state.gptpro_login_session = None
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1:8787",
+        ) as client:
+            post_task = asyncio.create_task(client.post("/admin/gptpro/login", json={}))
+            await release_started.wait()
+            if failure == "cancel-release":
+                assert runtime.reserve_login() == "login-active"
+                post_task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await post_task
+            else:
+                with pytest.raises(RuntimeError, match=f"synthetic {failure} failure"):
+                    await post_task
+            assert app.state.gptpro_login_session is None
+            assert runtime.reserve_login() is None
+            runtime.release_login()
+            await runtime.aclose()
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=5))
+
+
+@pytest.mark.parametrize("state", ["queued", "running", "detached"])
+def test_gptpro_login_rejects_all_existing_active_job_states(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, state: str,
+) -> None:
+    from claudex.gptpro import jobs
+
+    async def unexpected_provider(question: str, **options: Any) -> Any:
+        raise AssertionError("seeded active jobs must not invoke a provider")
+
+    class WarmRuntime:
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        async def aclose(self) -> None:
+            self.close_calls += 1
+
+    runtime = LazyAskRuntime()
+    service = jobs.AskJobService(unexpected_provider)
+    existing = jobs.AskJob(
+        ask_id="active-id", state=state, answer=None, failure=None,
+        error_message=None, status_message=None, nonce_marker=None,
+        thread_ref=None, created_at=1.0, finished_at=None,
+    )
+    service._jobs[existing.ask_id] = existing
+    warm_runtime = WarmRuntime()
+    runtime._job_service = service
+    runtime._runtime = warm_runtime
+    with TestAdminGptProApi()._client(monkeypatch, tmp_path) as client:
+        client.app.state.gptpro_ask_runtime = runtime
+        response = client.post("/admin/gptpro/login", json={})
+        assert response.status_code == 409
+        assert response.json()["error"]["code"] == "asks-active"
+        assert client.app.state.gptpro_login_session is None
+        assert warm_runtime.close_calls == 0
+        assert service._jobs == {existing.ask_id: existing}
+        assert runtime.max_concurrent_asks == 2
 
 
 class FakeAdminSubprocess:

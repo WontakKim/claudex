@@ -21,7 +21,7 @@ import os
 import signal
 import sys
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -42,7 +42,7 @@ _FAILURE_LINE_PREFIX = "gptpro login failed ["
 
 
 class GptProLoginSession:
-    """One daemon-driven ChatGPT Pro login, from spawn to CLI exit."""
+    """Own one daemon-driven ChatGPT Pro login through child cleanup."""
 
     def __init__(
         self,
@@ -66,12 +66,14 @@ class GptProLoginSession:
 
     # -- public surface ----------------------------------------------------
 
-    def start(self) -> None:
-        """Spawn the driver task. Call exactly once, from the event loop."""
+    def start(self, *, on_settled: Callable[[], None] | None = None) -> None:
+        """Spawn once; notify settlement only after the driver and cleanup finish."""
         if self._driver_task is not None:
             raise RuntimeError("login session already started")
         self._started_at = time.time()
         self._driver_task = asyncio.create_task(self._run())
+        if on_settled is not None:
+            self._driver_task.add_done_callback(lambda _task: on_settled())
 
     def status(self) -> dict[str, Any]:
         """A JSON-ready snapshot with a stable key set."""

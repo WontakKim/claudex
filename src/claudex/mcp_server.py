@@ -13,11 +13,11 @@ from starlette.types import Receive, Scope, Send
 from claudex import mcp_tools
 from claudex.config.schema import DEFAULT_GPTPRO_MAX_CONCURRENT_ASKS
 from claudex.gptpro import jobs
-from claudex.gptpro.ask import AskCallbacks
+from claudex.gptpro.ask import AskCallbacks, GptProAskError
 
 
 class LazyAskRuntime:
-    """Create the optional ChatGPT Pro runtime on its first background ask."""
+    """Own the lazy ask runtime and exclude new job admission throughout login."""
 
     def __init__(self) -> None:
         self._max_concurrent_asks: int = DEFAULT_GPTPRO_MAX_CONCURRENT_ASKS
@@ -25,6 +25,25 @@ class LazyAskRuntime:
         self._job_service: jobs.AskJobService | None = None
         self._thread_registry = jobs.ThreadRegistry()
         self._lock = asyncio.Lock()
+        self._is_login_reserved = False
+
+    def reserve_login(self) -> str | None:
+        """Reserve login before any await, or return the conflicting activity."""
+        if self._is_login_reserved:
+            return "login-active"
+        if self.has_active_jobs():
+            return "asks-active"
+        self._is_login_reserved = True
+        return None
+
+    def release_login(self) -> None:
+        self._is_login_reserved = False
+
+    def _require_job_admission(self) -> None:
+        if self._is_login_reserved:
+            raise GptProAskError(
+                "error", "GPT Pro asks and recovery are unavailable while login is active",
+            )
 
     def set_max_concurrent_asks(self, limit: int) -> None:
         self._max_concurrent_asks = limit
@@ -66,6 +85,7 @@ class LazyAskRuntime:
         conversation_id: str | None = None,
         marker: str | None = None,
     ) -> jobs.AskJob:
+        self._require_job_admission()
         if self._job_service is None:
             self._job_service = jobs.AskJobService(self.ask, recover=self.recover)
         return self._job_service.start_recovery(
@@ -81,6 +101,7 @@ class LazyAskRuntime:
         attachment_paths: Sequence[str] | None = None,
         session_id: str | None = None,
     ) -> jobs.AskJob:
+        self._require_job_admission()
         if self._job_service is None:
             self._job_service = jobs.AskJobService(self.ask, recover=self.recover)
         return self._job_service.start(

@@ -73,7 +73,10 @@ profile. If login reports that another gptpro ask is using the browser
 profile, stop the gateway process that owns the runtime before logging in again.
 Starting sign-in from the dashboard instead releases the gateway's idle ask
 runtime itself; the dashboard refuses to start sign-in while any GPT Pro ask is
-queued, running, or detached.
+queued, running, or detached. The daemon rejects new MCP asks and recoveries,
+without creating jobs, while releasing the warm runtime and until sign-in cleanup
+finishes, including cancellation. Completed job status and results remain
+available.
 
 Cloudflare clearance cookies are bound to the browser that obtained them, so
 clearance from the visible login browser does not carry over to the headless
