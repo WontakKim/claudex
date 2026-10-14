@@ -14,9 +14,11 @@ from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock, Mock
 
 import httpx
 import pytest
+from starlette.requests import Request
 from starlette.testclient import TestClient
 
 import claudex.admin.accounts as admin_accounts
@@ -2995,7 +2997,128 @@ class FakeAdminSubprocess:
         pass
 
 
+class FakeRunningAdminSubprocess:
+    def __init__(self) -> None:
+        self.pid = 12345
+        self.returncode: int | None = None
+        self.communicate_calls = 0
+        self.wait_calls = 0
+        self.kill_calls = 0
+        self.read_started = asyncio.Event()
+        self.cleanup_started = asyncio.Event()
+        self.allow_cleanup = asyncio.Event()
+
+    async def communicate(self) -> tuple[bytes, None]:
+        self.communicate_calls += 1
+        if self.communicate_calls == 1:
+            self.read_started.set()
+            await asyncio.Future()
+        self.cleanup_started.set()
+        await self.wait()
+        return b"partial command output\n", None
+
+    async def wait(self) -> int:
+        self.wait_calls += 1
+        await self.allow_cleanup.wait()
+        self.returncode = -admin_gptpro.signal.SIGKILL
+        return self.returncode
+
+    def kill(self) -> None:
+        self.kill_calls += 1
+
+
+def _gptpro_command_request(operation: str) -> Request:
+    async def receive() -> dict[str, Any]:
+        return {"type": "http.request", "body": b"{}", "more_body": False}
+
+    return Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "scheme": "http",
+            "path": f"/admin/gptpro/{operation}",
+            "headers": [
+                (b"host", b"127.0.0.1"),
+                (b"content-type", b"application/json"),
+            ],
+            "app": SimpleNamespace(state=SimpleNamespace(config=GatewayConfig())),
+        },
+        receive,
+    )
+
+
 class TestAdminGptProApi:
+    @pytest.mark.parametrize("operation", ["doctor", "connect"])
+    @pytest.mark.parametrize("interruption", ["cancellation", "timeout"])
+    @pytest.mark.parametrize("group_error", [None, ProcessLookupError, PermissionError])
+    def test_command_awaits_cleanup_before_timeout_or_cancellation(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        operation: str,
+        interruption: str,
+        group_error: type[OSError] | None,
+    ) -> None:
+        async def scenario() -> None:
+            process = FakeRunningAdminSubprocess()
+            spawn = AsyncMock(return_value=process)
+            kill_group = Mock(side_effect=group_error)
+            monkeypatch.setattr(admin_gptpro.asyncio, "create_subprocess_exec", spawn)
+            monkeypatch.setattr(admin_gptpro.os, "killpg", kill_group)
+            if interruption == "timeout":
+                monkeypatch.setattr(
+                    admin_gptpro, f"_GPTPRO_{operation.upper()}_TIMEOUT", 0.01
+                )
+            handler = getattr(admin_gptpro, f"_handle_admin_gptpro_{operation}")
+            task = asyncio.create_task(handler(_gptpro_command_request(operation)))
+            cleanup_started = asyncio.create_task(process.cleanup_started.wait())
+            try:
+                await asyncio.wait_for(process.read_started.wait(), timeout=1)
+                assert spawn.call_args.kwargs == {
+                    "stdout": asyncio.subprocess.PIPE,
+                    "stderr": asyncio.subprocess.STDOUT,
+                    "start_new_session": True,
+                }
+                if interruption == "cancellation":
+                    task.cancel("request cancelled")
+                finished, _pending = await asyncio.wait(
+                    (task, cleanup_started),
+                    timeout=1,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                assert cleanup_started in finished, (
+                    "handler exited without subprocess cleanup"
+                )
+                kill_group.assert_called_once_with(
+                    process.pid, admin_gptpro.signal.SIGKILL
+                )
+                assert process.kill_calls == int(group_error is PermissionError)
+                assert process.communicate_calls == 2
+                assert process.wait_calls == 1
+                assert process.returncode is None
+                assert not task.done(), "handler must await subprocess cleanup"
+                process.allow_cleanup.set()
+                if interruption == "cancellation":
+                    with pytest.raises(asyncio.CancelledError) as error:
+                        await asyncio.wait_for(task, timeout=1)
+                    assert error.value.args == ("request cancelled",)
+                    assert task.cancelled()
+                else:
+                    response = await asyncio.wait_for(task, timeout=1)
+                    assert response.status_code == 200
+                    assert json.loads(response.body) == {
+                        "ok": False,
+                        "exit_code": None,
+                        "output": f"{operation} failed to run: timed out after 0.01s",
+                    }
+                assert process.returncode == -admin_gptpro.signal.SIGKILL
+            finally:
+                process.allow_cleanup.set()
+                task.cancel()
+                cleanup_started.cancel()
+                await asyncio.gather(task, cleanup_started, return_exceptions=True)
+
+        asyncio.run(scenario())
+
     @staticmethod
     def _client(
         monkeypatch: pytest.MonkeyPatch,
@@ -3321,15 +3444,11 @@ class TestAdminGptProApi:
         exit_code: int,
         expected_ok: bool,
     ) -> None:
-        monkeypatch.setattr(
-            admin_gptpro,
-            "_GPTPRO_DOCTOR_COMMAND",
-            (
-                sys.executable,
-                "-c",
-                f"import sys; print('doctor output'); sys.exit({exit_code})",
-            ),
-        )
+        process = FakeAdminSubprocess(exit_code=exit_code, output="doctor output\n")
+        spawn = AsyncMock(return_value=process)
+        kill_group = Mock()
+        monkeypatch.setattr(admin_gptpro.asyncio, "create_subprocess_exec", spawn)
+        monkeypatch.setattr(admin_gptpro.os, "killpg", kill_group)
         with self._client(monkeypatch, tmp_path) as client:
             response = client.post("/admin/gptpro/doctor", json={})
 
@@ -3338,6 +3457,28 @@ class TestAdminGptProApi:
             "ok": expected_ok,
             "exit_code": exit_code,
             "output": "doctor output\n",
+        }
+        spawn.assert_awaited_once_with(
+            *admin_gptpro._GPTPRO_DOCTOR_COMMAND,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            start_new_session=True,
+        )
+        kill_group.assert_not_called()
+
+    def test_doctor_reports_spawn_error(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        spawn = AsyncMock(side_effect=OSError("spawn failed"))
+        monkeypatch.setattr(admin_gptpro.asyncio, "create_subprocess_exec", spawn)
+        with self._client(monkeypatch, tmp_path) as client:
+            response = client.post("/admin/gptpro/doctor", json={})
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "ok": False,
+            "exit_code": None,
+            "output": "doctor failed to run: spawn failed",
         }
 
     def test_doctor_requires_json_content_type(

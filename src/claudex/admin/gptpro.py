@@ -221,7 +221,7 @@ async def _handle_admin_gptpro_doctor(request: Request) -> JSONResponse:
         stdout, _stderr = await asyncio.wait_for(
             process.communicate(), _GPTPRO_DOCTOR_TIMEOUT
         )
-    except TimeoutError:
+    except (TimeoutError, asyncio.CancelledError) as exc:
         try:
             os.killpg(process.pid, signal.SIGKILL)
         except ProcessLookupError:
@@ -229,6 +229,8 @@ async def _handle_admin_gptpro_doctor(request: Request) -> JSONResponse:
         except PermissionError:
             process.kill()
         await process.communicate()
+        if isinstance(exc, asyncio.CancelledError):
+            raise
         return JSONResponse(
             {
                 "ok": False,
@@ -307,7 +309,7 @@ async def _handle_admin_gptpro_connect(request: Request) -> JSONResponse:
         stdout, _stderr = await asyncio.wait_for(
             process.communicate(), _GPTPRO_CONNECT_TIMEOUT
         )
-    except TimeoutError:
+    except (TimeoutError, asyncio.CancelledError) as exc:
         try:
             os.killpg(process.pid, signal.SIGKILL)
         except ProcessLookupError:
@@ -315,6 +317,8 @@ async def _handle_admin_gptpro_connect(request: Request) -> JSONResponse:
         except PermissionError:
             process.kill()
         await process.communicate()
+        if isinstance(exc, asyncio.CancelledError):
+            raise
         return JSONResponse(
             {
                 "ok": False,
