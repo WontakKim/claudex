@@ -7,7 +7,7 @@ Claude's block-oriented SSE protocol:
 - one Codex ``reasoning`` item -> one Claude ``thinking`` block; its
   ``encrypted_content`` is emitted as a ``signature_delta`` so the client can
   replay it on the next turn
-- ``output_text`` deltas -> a ``text`` block
+- ``output_text`` and ``refusal`` deltas -> a ``text`` block
 - ``function_call`` items -> ``tool_use`` blocks fed by ``input_json_delta``;
   items that arrive without a name are parked as pending and hydrated when the
   name shows up (``output_item.done`` or the terminal ``response.completed``)
@@ -183,7 +183,8 @@ class CodexToClaudeStreamTranslator:
     _function_call_block_item_id: str = ""
     _function_call_signature: str = ""
     _has_received_arguments_delta: bool = False
-    _has_text_delta: bool = False
+    # Completion snapshots repeat parts identified by (output_index, content_index).
+    _emitted_message_parts: set[tuple[Any, Any]] = field(default_factory=set)
     _has_emitted_tool_use: bool = False
     _terminal_received: bool = False
     _allocated_tool_ids: set[str] = field(default_factory=set)
@@ -333,6 +334,9 @@ class CodexToClaudeStreamTranslator:
         events.extend(self._finalize_open_blocks())
         events.extend(self._flush_pending_calls_from_terminal(response))
         events.extend(self._emit_closed_call_carriers_from_terminal(response))
+        for output_index, item in enumerate(response.get("output") or []):
+            if isinstance(item, dict) and item.get("type") == "message":
+                events.extend(self._emit_message_item_fallback(item, output_index))
 
         input_tokens, output_tokens, cached_tokens = extract_responses_usage(response.get("usage"))
         usage: dict[str, Any] = {"input_tokens": input_tokens, "output_tokens": output_tokens}
@@ -377,12 +381,13 @@ class CodexToClaudeStreamTranslator:
     def _on_content_part_added(self, event: dict[str, Any]) -> list[ClaudeEvent]:
         events = self._finalize_thinking_block()
         part = event.get("part") or {}
-        if part.get("type") == "output_text":
+        if part.get("type") in ("output_text", "refusal"):
             events.extend(self._start_text_block())
         return events
 
     def _on_output_text_delta(self, event: dict[str, Any]) -> list[ClaudeEvent]:
-        self._has_text_delta = True
+        if event.get("delta"):
+            self._emitted_message_parts.add((event.get("output_index", 0), event.get("content_index", 0)))
         events = self._finalize_thinking_block()
         events.extend(self._start_text_block())
         events.append(
@@ -397,11 +402,28 @@ class CodexToClaudeStreamTranslator:
         )
         return events
 
+    _on_refusal_delta = _on_output_text_delta
+
+    def _on_refusal_done(self, event: dict[str, Any]) -> list[ClaudeEvent]:
+        key = (event.get("output_index", 0), event.get("content_index", 0))
+        refusal = event.get("refusal")
+        if key in self._emitted_message_parts or not refusal:
+            return []
+        return self._on_refusal_delta({**event, "delta": refusal})
+
     def _on_content_part_done(self, event: dict[str, Any]) -> list[ClaudeEvent]:
         part = event.get("part") or {}
-        if part.get("type") == "output_text":
-            return self._stop_text_block()
-        return []
+        events: list[ClaudeEvent] = []
+        if part.get("type") == "refusal":
+            events.extend(self._on_refusal_done({**event, "refusal": part.get("refusal")}))
+        elif part.get("type") == "output_text":
+            key = (event.get("output_index", 0), event.get("content_index", 0))
+            text = part.get("text")
+            if key not in self._emitted_message_parts and text:
+                events.extend(self._on_output_text_delta({**event, "delta": text}))
+        if part.get("type") in ("output_text", "refusal"):
+            events.extend(self._stop_text_block())
+        return events
 
     # --- output item events ---------------------------------------------------
 
@@ -460,7 +482,7 @@ class CodexToClaudeStreamTranslator:
         item_type = item.get("type")
 
         if item_type == "message":
-            return self._emit_message_item_fallback(item)
+            return self._emit_message_item_fallback(item, event.get("output_index", 0))
 
         if item_type == "function_call":
             signature = self._function_call_thought_signature(item)
@@ -530,18 +552,25 @@ class CodexToClaudeStreamTranslator:
 
         return []
 
-    def _emit_message_item_fallback(self, item: dict[str, Any]) -> list[ClaudeEvent]:
-        """Emit the full message text when the stream never sent text deltas."""
-        if self._has_text_delta:
-            return []
+    def _emit_message_item_fallback(
+        self, item: dict[str, Any], output_index: Any,
+    ) -> list[ClaudeEvent]:
+        """Emit message content parts not already delivered by the stream."""
         content = item.get("content")
         if not isinstance(content, list):
             return []
-        text = "".join(
-            part.get("text", "")
-            for part in content
-            if isinstance(part, dict) and part.get("type") == "output_text"
-        )
+        chunks: list[str] = []
+        for content_index, part in enumerate(content):
+            if not isinstance(part, dict) or part.get("type") not in ("output_text", "refusal"):
+                continue
+            key = (output_index, content_index)
+            if key in self._emitted_message_parts:
+                continue
+            text = part.get("refusal", "") if part.get("type") == "refusal" else part.get("text", "")
+            if text:
+                chunks.append(text)
+                self._emitted_message_parts.add(key)
+        text = "".join(chunks)
         if not text:
             return []
 
@@ -558,7 +587,6 @@ class CodexToClaudeStreamTranslator:
             )
         )
         events.extend(self._stop_text_block())
-        self._has_text_delta = True
         return events
 
     # --- web search (server tool) events --------------------------------------
