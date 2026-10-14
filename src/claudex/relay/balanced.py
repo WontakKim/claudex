@@ -582,7 +582,8 @@ async def _serve_balanced_stateless_message(
     """Route an unpinnable request using one fresh stateless HRW digest.
 
     The digest is reused for the request's complete retry chain, never
-    persisted, and never inserted into the pin map.
+    persisted, and never inserted into the pin map. Each selection re-reads
+    matching cooldowns against the request's registry snapshot.
     """
     try:
         extracted_session = extract_session_uuid(
@@ -599,14 +600,14 @@ async def _serve_balanced_stateless_message(
     assert router is not None
     family = quota_family(model)
     digest = derive_stateless_routing_digest(runtime.epoch_seed, secrets.token_bytes(32))
-    candidates = _balanced_candidates(
-        records_by_id.values(), router, app_state=request.app.state, family=family, now=time.monotonic()
-    )
 
     attempted: set[str] = set()
     chain_429: Response | None = None
     first_failure: Response | None = None
     while True:
+        candidates = _balanced_candidates(
+            records_by_id.values(), router, app_state=request.app.state, family=family, now=time.monotonic()
+        )
         try:
             account_id = _balanced_pick_account(
                 router,
