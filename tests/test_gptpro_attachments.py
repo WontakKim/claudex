@@ -4,14 +4,18 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import gc
 import json
 from collections.abc import Callable
 from io import BytesIO
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
-from playwright.async_api import async_playwright
+from playwright._impl._network import Request as ImplementationRequest
+from playwright._impl._network import Response as ImplementationResponse
+from playwright.async_api import Error, Response, async_playwright
 
 from claudex.gptpro import attachments
 
@@ -1083,3 +1087,200 @@ def test_attachment_probe_runs_in_local_synthetic_dom() -> None:
         },
         failed={"failed.txt": 1, "error.txt": 1},
     )
+
+
+def _create_lifecycle_response(closed: asyncio.Future[Any]) -> Response:
+    """Use installed Playwright lifecycle methods without a connection or browser."""
+    request = ImplementationRequest.__new__(ImplementationRequest)
+    page = SimpleNamespace(_closed_or_crashed_future=closed)
+    request._initializer = {
+        "frame": SimpleNamespace(_object=SimpleNamespace(_page=page)),
+    }
+    implementation = ImplementationResponse.__new__(ImplementationResponse)
+    implementation._loop = asyncio.get_running_loop()
+    implementation._request = request
+    implementation._finished_future = implementation._loop.create_future()
+    return Response(implementation)
+
+
+async def _flush_response_completion() -> None:
+    for _ in range(8):
+        await asyncio.sleep(0)
+    gc.collect()
+    await asyncio.sleep(0)
+
+
+async def _assert_response_completion_cleanup(
+    responses: list[Response], closed: asyncio.Future[Any],
+    initial_tasks: set[asyncio.Task[Any]], warnings: list[str],
+) -> None:
+    await _flush_response_completion()
+    residual_tasks = [
+        task.get_coro().__qualname__ for task in asyncio.all_tasks() - initial_tasks
+    ]
+    callbacks = [len(closed._callbacks or ())] + [
+        len(response._impl_obj._finished_future._callbacks or ())
+        for response in responses
+    ]
+    assert not closed.cancelled()
+    assert all(not response._impl_obj._finished_future.cancelled() for response in responses)
+    if not closed.done():
+        closed.set_result(Error("synthetic late close"))
+    await _flush_response_completion()
+    assert not residual_tasks
+    assert callbacks == [0] * (len(responses) + 1)
+    assert asyncio.all_tasks() == initial_tasks
+    assert warnings == []
+
+
+@pytest.mark.parametrize("endpoint", ["create", "processing"])
+@pytest.mark.parametrize("mode", [
+    "prefinished", "success", "cancel", "timeout", "close", "completion_error",
+])
+def test_response_completion_attachment_call_sites(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, endpoint: str, mode: str,
+) -> None:
+    file = tmp_path / "upload.txt"
+    file.write_text("attachment", encoding="utf-8")
+
+    async def poll_sleep(seconds: float) -> None:
+        await asyncio.sleep(min(seconds, 0.001))
+
+    monkeypatch.setattr(attachments, "_sleep", poll_sleep)
+
+    async def run() -> None:
+        loop = asyncio.get_running_loop()
+        warnings: list[str] = []
+        loop.set_exception_handler(lambda loop, context: warnings.append(context["message"]))
+        initial_tasks = asyncio.all_tasks()
+        closed = loop.create_future()
+        response = _create_lifecycle_response(closed)
+        if mode == "prefinished":
+            response._impl_obj._finished_future.set_result(None)
+        create = _NamedCreateResponse(file.name, "file_upload")
+        processing = _ProcessingResponse(_processing_frames("file_upload", file.name))
+        observed = create if endpoint == "create" else processing
+        observed._impl_obj = response._impl_obj
+        observed.finished = response.finished
+        page = _FakePage(
+            responses=[create, processing],
+            states=[_attachment_state()] + [_attachment_state(ready={file.name: 1})] * 20,
+        )
+        progress: list[tuple[int, int]] = []
+        task = asyncio.create_task(attachments.attach_files(
+            page, [str(file)], timeout_seconds=0.5,
+            on_progress=lambda receipts, ready: progress.append((receipts, ready)),
+        ))
+        await _flush_response_completion()
+        if mode == "success":
+            response._impl_obj._finished_future.set_result(None)
+        elif mode == "cancel":
+            task.cancel()
+        elif mode == "close":
+            closed.set_result(Error("synthetic close"))
+        elif mode == "completion_error":
+            response._impl_obj._finished_future.set_exception(ValueError("completion failed"))
+        if mode in ("prefinished", "success"):
+            assert await task == {file.name: (0, 1)}
+            assert progress[-1] == (1, 1)
+        elif mode == "cancel":
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        elif endpoint == "processing" and mode in ("close", "completion_error"):
+            with pytest.raises(attachments.AttachmentUploadFailedError, match="processing observation failed"):
+                await task
+            assert progress[-1][0] == 1
+        else:
+            with pytest.raises(attachments.AttachmentSettleTimeoutError) as raised:
+                await task
+            assert raised.value.completed_file_create_responses == (0 if endpoint == "create" else 1)
+        del task
+        assert page.listeners["response"] == []
+        assert all(handle.dispose_calls == 1 for handle in page.handles)
+        await _assert_response_completion_cleanup([response], closed, initial_tasks, warnings)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("mode", [
+    "success", "prefinished", "cancel", "timeout", "close", "already_closed",
+    "simultaneous", "shared_success", "shared_close", "shared_cancel", "completion_error", "close_error",
+])
+def test_response_completion_lifecycle(mode: str) -> None:
+    async def run() -> None:
+        loop = asyncio.get_running_loop()
+        warnings: list[str] = []
+        loop.set_exception_handler(lambda loop, context: warnings.append(context["message"]))
+        initial_tasks = asyncio.all_tasks()
+        closed = loop.create_future()
+        responses = [_create_lifecycle_response(closed) for _ in range(3 if mode.startswith("shared") else 1)]
+        if mode in ("prefinished", "simultaneous"):
+            responses[0]._impl_obj._finished_future.set_result(None)
+        if mode in ("already_closed", "simultaneous"):
+            closed.set_result(Error("synthetic close"))
+        tasks = [asyncio.create_task(attachments._wait_for_response_completion(response))
+                 for response in responses]
+        await _flush_response_completion()
+        if mode in ("success", "shared_success", "shared_cancel"):
+            if mode == "shared_cancel":
+                tasks[0].cancel()
+            for response in responses:
+                response._impl_obj._finished_future.set_result(None)
+        elif mode == "cancel":
+            tasks[0].cancel()
+        elif mode == "timeout":
+            with pytest.raises(TimeoutError):
+                await asyncio.wait_for(tasks[0], timeout=0.001)
+        elif mode in ("close", "shared_close"):
+            closed.set_result(Error("synthetic close"))
+        elif mode == "completion_error":
+            responses[0]._impl_obj._finished_future.set_exception(ValueError("completion failed"))
+        elif mode == "close_error":
+            closed.set_exception(ValueError("close failed"))
+        outcomes = await asyncio.gather(*tasks, return_exceptions=True)
+        if mode in ("close", "already_closed", "simultaneous", "shared_close"):
+            assert all(isinstance(outcome, Error) and str(outcome) == "Target closed"
+                       for outcome in outcomes)
+        elif mode in ("cancel", "timeout"):
+            assert isinstance(outcomes[0], asyncio.CancelledError)
+        elif mode == "shared_cancel":
+            assert isinstance(outcomes[0], asyncio.CancelledError)
+            assert outcomes[1:] == [None, None]
+        elif mode.endswith("error"):
+            assert isinstance(outcomes[0], ValueError)
+            assert str(outcomes[0]) == ("completion failed" if mode == "completion_error" else "close failed")
+        else:
+            assert outcomes == [None] * len(responses)
+        del outcomes, tasks
+        if mode in ("success", "prefinished", "shared_success"):
+            for response in responses:
+                await attachments._wait_for_response_completion(response)
+        await _assert_response_completion_cleanup(responses, closed, initial_tasks, warnings)
+        if mode in ("success", "prefinished", "shared_success"):
+            # Reusing completed responses after close must still observe target closure.
+            for response in responses:
+                with pytest.raises(Error, match="Target closed"):
+                    await attachments._wait_for_response_completion(response)
+            await _assert_response_completion_cleanup(responses, closed, initial_tasks, warnings)
+
+    asyncio.run(run())
+
+
+def test_response_completion_public_boundary() -> None:
+    class FailedResponse(_FakeResponse):
+        async def finished(self) -> None:
+            raise Error("public completion failed")
+
+    async def run() -> None:
+        assert await attachments._wait_for_response_completion(_FakeResponse()) is None
+        with pytest.raises(Error, match="public completion failed"):
+            await attachments._wait_for_response_completion(FailedResponse())
+        response = _create_lifecycle_response(asyncio.get_running_loop().create_future())
+        del response._impl_obj._finished_future
+        with pytest.raises(AttributeError, match="_finished_future"):
+            await attachments._wait_for_response_completion(response)
+        response._impl_obj = object()
+        with pytest.raises(TypeError, match="Unsupported Playwright response"):
+            await attachments._wait_for_response_completion(response)
+
+    asyncio.run(run())
