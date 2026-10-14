@@ -821,10 +821,45 @@ def test_daemon_hello_uses_reachable_bracketed_urls(
             raise urllib.error.URLError(ConnectionRefusedError("synthetic IPv6 URL is unreachable"))
         return _FakeResponse(200, json.dumps(hello).encode())
 
-    monkeypatch.setattr(daemon.urllib.request, "urlopen", open_url)
+    monkeypatch.setattr(daemon, "_urlopen_no_redirect", open_url)
 
     assert daemon._gateway_hello(host, 23456) == hello, requests
     assert requests == [expected_url]
+
+
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        (b'{"hello":"claudex-gateway","pid":777,"nonce":"synthetic-nonce"}',
+         {"hello": "claudex-gateway", "pid": 777, "nonce": "synthetic-nonce"}),
+        (b'[]', None),
+        (b'{"hello":"foreign"}', None),
+        (b'not-json', None),
+    ],
+)
+def test_daemon_hello_preserves_direct_payload_validation(
+    monkeypatch: pytest.MonkeyPatch, body: bytes, expected: dict | None
+) -> None:
+    monkeypatch.setattr(
+        daemon, "_urlopen_no_redirect",
+        lambda request, timeout: _FakeResponse(200, body),
+    )
+    assert daemon._gateway_hello("127.0.0.1", 23456) == expected
+
+
+@pytest.mark.parametrize("error", [
+    urllib.error.HTTPError("http://127.0.0.1:23456/api/hello", 503, "synthetic error", None, None),
+    urllib.error.URLError(TimeoutError("synthetic timeout")),
+    ConnectionResetError("synthetic reset"),
+])
+def test_daemon_hello_preserves_transport_error_rejection(
+    monkeypatch: pytest.MonkeyPatch, error: OSError
+) -> None:
+    def fail_request(request: object, timeout: float) -> object:
+        raise error
+
+    monkeypatch.setattr(daemon, "_urlopen_no_redirect", fail_request)
+    assert daemon._gateway_hello("127.0.0.1", 23456) is None
 
 
 def test_bracket_host_leaves_ipv4_and_hostnames_unbracketed() -> None:
@@ -1884,7 +1919,9 @@ class _RedirectTarget:
         self.requests: list[tuple[str, dict[str, str]]] = []
 
 
-def _serve_redirect_pair() -> "tuple[object, object, int, _RedirectTarget]":
+def _serve_redirect_pair(
+    target_hello: dict[str, object] | None = None,
+) -> "tuple[object, object, int, _RedirectTarget]":
     """Start server A (redirects everything to server B) and recording server B."""
     import http.server
 
@@ -1893,7 +1930,9 @@ def _serve_redirect_pair() -> "tuple[object, object, int, _RedirectTarget]":
     class TargetHandler(http.server.BaseHTTPRequestHandler):
         def _record(self) -> None:
             target.requests.append((self.path, dict(self.headers)))
-            body = b'{"hello": "claudex-gateway"}'
+            body = json.dumps(
+                {"hello": "claudex-gateway"} if target_hello is None else target_hello
+            ).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
@@ -1931,6 +1970,67 @@ def _serve_redirect_pair() -> "tuple[object, object, int, _RedirectTarget]":
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
     return redirect_server, target_server, redirect_port, target
+
+
+@pytest.mark.parametrize("is_same_version", [True, False], ids=["same-version", "old-version"])
+def test_daemon_redirect_probe_never_accepts_target_identity_or_enters_replacement(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    capsys: pytest.CaptureFixture[str], is_same_version: bool,
+) -> None:
+    target_hello = {
+        "hello": "claudex-gateway",
+        "version": daemon.claudex.__version__ if is_same_version else "synthetic-old-version",
+        "pid": 42002,
+        "nonce": "synthetic-target-nonce",
+    }
+    redirect_server, target_server, redirect_port, target = _serve_redirect_pair(target_hello)
+    config = GatewayConfig(port=redirect_port, settings_file=tmp_path / "settings.json")
+    monkeypatch.setattr(paths, "runtime_dir", lambda: tmp_path / "runtime")
+    replacements: list[bool] = []
+    spawns: list[object] = []
+    signals: list[tuple[int, int]] = []
+
+    def refuse_replacement() -> tuple[bool, str]:
+        replacements.append(True)
+        return False, "synthetic unverified record"
+
+    def forbid_spawn(*arguments: object, **options: object) -> None:
+        spawns.append(arguments)
+        raise AssertionError("redirecting port occupant must not start a child")
+
+    monkeypatch.setattr(daemon, "_stop_recorded_daemon", refuse_replacement)
+    monkeypatch.setattr(daemon.subprocess, "Popen", forbid_spawn)
+    monkeypatch.setattr(daemon.os, "kill", lambda pid, requested_signal: signals.append((pid, requested_signal)))
+    exit_code = 0
+    try:
+        try:
+            daemon._start_background(config)
+        except SystemExit as failure:
+            exit_code = failure.code
+
+        output = capsys.readouterr()
+        assert target.requests == [], {
+            "exit_code": exit_code,
+            "stdout": output.out,
+            "stderr": output.err,
+            "replacement_attempts": replacements,
+            "spawns": spawns,
+            "signals": signals,
+        }
+        assert exit_code == 1
+        assert "does not look like claudex-gateway" in output.err
+        assert "already running" not in output.out
+        assert "restarting" not in output.out
+        assert replacements == []
+        assert spawns == []
+        assert signals == []
+        assert not paths.daemon_record_file().exists()
+        assert not paths.log_file().exists()
+    finally:
+        redirect_server.shutdown()
+        target_server.shutdown()
+        redirect_server.server_close()
+        target_server.server_close()
 
 
 def test_probe_and_admin_never_follow_redirects_or_leak_the_bearer() -> None:

@@ -70,10 +70,31 @@ def _http_url(host: str, port: int, path: str) -> str:
     return f"http://{_bracket_host(host)}:{port}{path}"
 
 
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Refuse to follow any redirect: the 3xx surfaces as an HTTPError.
+
+    Following a redirect would re-send the request headers — including the
+    local bearer token on admin calls — to whatever host the Location header
+    names, and would classify the probe from the redirect target instead of
+    the actual port occupant.
+    """
+
+    def redirect_request(self, *args: Any, **kwargs: Any) -> None:
+        return None
+
+
+_NO_REDIRECT_OPENER = urllib.request.build_opener(_NoRedirectHandler)
+
+
+def _urlopen_no_redirect(request: urllib.request.Request | str, timeout: float) -> Any:
+    """`urlopen` for probe/admin calls; every 3xx is a final response."""
+    return _NO_REDIRECT_OPENER.open(request, timeout=timeout)
+
+
 def _gateway_hello(host: str, port: int) -> dict[str, Any] | None:
     """Fetch /api/hello, or None when the occupant is not claudex-gateway."""
     try:
-        with urllib.request.urlopen(_http_url(host, port, "/api/hello"), timeout=2) as response:
+        with _urlopen_no_redirect(_http_url(host, port, "/api/hello"), timeout=2) as response:
             payload = json.load(response)
     except (OSError, ValueError):
         return None
