@@ -98,6 +98,7 @@ _RELAY_SYMBOL_MANIFEST = {
         "_install_balanced_quota_cooldown",
         "_record_balanced_capability_evidence",
         "_balanced_routing_not_active",
+        "_BalancedStreamingResponse",
         "_passthrough_with_claude_balanced",
         "_balanced_candidates",
         "_balanced_pick_account",
@@ -166,7 +167,7 @@ def test_relay_symbol_manifest_has_one_canonical_owner() -> None:
         for module_name in _RELAY_SYMBOL_MANIFEST
     }
 
-    assert len(_RELAY_MANIFEST_SYMBOLS) == 57
+    assert len(_RELAY_MANIFEST_SYMBOLS) == 58
     assert definitions_by_module == _RELAY_SYMBOL_MANIFEST
     for symbol in _RELAY_MANIFEST_SYMBOLS:
         owners = [

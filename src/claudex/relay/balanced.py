@@ -8,13 +8,13 @@ import math
 import secrets
 import time
 import uuid
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import AsyncGenerator, Iterable, Mapping, Sequence
 from datetime import datetime, timezone
 from typing import Any
 
 import httpx
 from starlette.requests import Request
-from starlette.responses import JSONResponse, Response
+from starlette.responses import JSONResponse, Response, StreamingResponse
 
 from claudex import server_support
 from claudex.balanced.router import ClaudeBalancedRouter
@@ -51,6 +51,7 @@ from claudex.claude.session_fingerprint import (
     observability_session_fingerprint,
 )
 from claudex.config import GatewayConfig
+from claudex.relay.common import _UpstreamStreamRelay, _UpstreamStreamingResponse
 from claudex.relay.registered import (
     _FailedAttempt,
     _attempt_with_account,
@@ -269,6 +270,42 @@ def _balanced_routing_not_active() -> JSONResponse:
     return _claude_account_unavailable("balanced routing is not active")
 
 
+class _BalancedStreamingResponse(_UpstreamStreamingResponse):
+    """Hold one admitted runtime slot independently of account-attempt ownership."""
+
+    def __init__(self, response: StreamingResponse, runtime: ClaudeBalancedRuntime) -> None:
+        self._runtime = runtime
+        self._is_streaming = False
+        self._is_finished = False
+
+        async def forward_body() -> AsyncGenerator[bytes | str, None]:
+            async for chunk in response.body_iterator:
+                yield chunk
+
+        super().__init__(
+            _UpstreamStreamRelay(forward_body(), response.body_iterator.aclose, self._finish_request),
+            status_code=response.status_code,
+            media_type=response.media_type,
+            background=response.background,
+        )
+        self.raw_headers = response.raw_headers
+
+    def _finish_request(self) -> None:
+        if self._is_streaming or self._is_finished:
+            return
+        self._is_finished = True
+        self._runtime.end_request()
+
+    async def stream_response(self, send: Any) -> None:
+        # Iterator exhaustion closes the upstream before ASGI's terminal body send.
+        self._is_streaming = True
+        try:
+            await super().stream_response(send)
+        finally:
+            self._is_streaming = False
+            self._finish_request()
+
+
 async def _passthrough_with_claude_balanced(
     request: Request, raw_body: bytes, parsed_body: Any
 ) -> Response:
@@ -281,7 +318,8 @@ async def _passthrough_with_claude_balanced(
     never rejected merely because a controlled transition is running. The 503
     "balanced routing is not active" is reserved for the inconsistent state outside a
     controlled transition; balanced traffic never falls through to single-account or
-    fallback routing.
+    fallback routing. An admitted streaming response owns its runtime slot through
+    body termination; buffered responses and failed dispatches release it immediately.
     """
     app_state = request.app.state
     runtime: ClaudeBalancedRuntime = app_state.claude_balanced_runtime
@@ -293,10 +331,16 @@ async def _passthrough_with_claude_balanced(
                 return await _passthrough_to_anthropic(request, raw_body, parsed_body)
             continue
         if runtime.begin_request():
+            is_response_owned = False
             try:
-                return await _passthrough_with_balanced_pool(request, raw_body, parsed_body, runtime)
+                response = await _passthrough_with_balanced_pool(request, raw_body, parsed_body, runtime)
+                if isinstance(response, StreamingResponse):
+                    response = _BalancedStreamingResponse(response, runtime)
+                    is_response_owned = True
+                return response
             finally:
-                runtime.end_request()
+                if not is_response_owned:
+                    runtime.end_request()
         break
     return _balanced_routing_not_active()
 

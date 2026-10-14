@@ -1,14 +1,14 @@
 """End-to-end integration tests for the balanced router's restart/drain/
 corruption gates (T-17): real temporary `ClaudePoolRuntimeStateStore` SQLite
-files throughout, `TestClient` for the scenarios that need the full HTTP
-dispatch stack, and a deterministic fake clock (`_FakeClock`, mirroring
+files for persisted-state gates, memory-only stores for response-drain
+ordering, `TestClient` for scenarios that need the full HTTP dispatch stack,
+and a deterministic fake clock (`_FakeClock`, mirroring
 `test_balanced_router.py`'s own helper) wherever precise
 freshness/TTL timing matters.
 
-Every scenario here is locally reproducible with exactly ONE registered
-account -- unlike the deferred gates in `test_balanced_deferred_gates.py`,
-which need a second live account to observe a real cross-account race or
-failover.
+Restart and corruption scenarios need only one synthetic registered account;
+response-drain migration controls use a second synthetic account. No live
+accounts are needed, unlike the deferred gates in `test_balanced_deferred_gates.py`.
 
 Reservation-aware LRU eviction and restored-cooldown no-repeat-burst
 behavior are intentionally NOT duplicated in this file: both are already
@@ -35,7 +35,9 @@ from typing import Any
 import anyio
 import httpx
 import pytest
-from starlette.responses import JSONResponse
+from starlette.background import BackgroundTask
+from starlette.requests import Request
+from starlette.responses import JSONResponse, StreamingResponse
 from starlette.testclient import TestClient
 
 from claudex import paths
@@ -44,7 +46,7 @@ from claudex.claude.account_profile import compute_account_profile_fingerprint
 from claudex.claude.ambient_account import AmbientClaudeAuthManager
 from claudex.balanced.router import CAPABILITY_CLASSIFIER_VERSION, ClaudeBalancedRouter
 from claudex.balanced.runtime import ClaudeBalancedRuntime
-from claudex.balanced.selection import AccountCandidate, SessionKey, derive_session_key
+from claudex.balanced.selection import AccountCandidate, SessionKey, derive_session_key, quota_family
 from claudex.balanced.state_model import SCHEMA_VERSION, RestoreValidationContext
 from claudex.balanced.state_store import ClaudePoolRuntimeStateStore
 from claudex.config import GatewayConfig
@@ -53,6 +55,7 @@ from claudex.providers.kimi_auth import KimiCredentials
 
 import claudex.admin.settings as admin_settings
 import claudex.relay.balanced as relay_balanced
+import claudex.relay.registered as relay_registered
 import claudex.server as server
 import claudex.server_support as server_support
 
@@ -1680,5 +1683,545 @@ def test_disable_while_streaming_drains_the_in_flight_stream_before_epoch_rotati
             assert restore_result.pins == {}
         finally:
             inspect_store.close()
+
+    asyncio.run(scenario())
+
+
+class _BalancedDrainStore:
+    def __init__(self) -> None:
+        self.rotations = 0
+        self.is_closed = False
+
+    def rotate_epoch(self) -> _BalancedDrainStore:
+        assert not self.is_closed
+        self.rotations += 1
+        return self
+
+    async def wait_async(self) -> None:
+        pass
+
+    def close(self) -> None:
+        assert not self.is_closed
+        self.is_closed = True
+
+
+class _BalancedDrainStream(httpx.AsyncByteStream):
+    def __init__(self) -> None:
+        self.parts = [b'event: ping\ndata: {}\n\n', b'event: message_stop\ndata: {}\n\n']
+        self.read_started = asyncio.Event()
+        self.release = asyncio.Event()
+        self.close_calls = 0
+        self.is_close_complete = False
+        self.read_error: Exception | None = None
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        yield self.parts[0]
+        self.read_started.set()
+        await self.release.wait()
+        if self.read_error is not None:
+            raise self.read_error
+        yield self.parts[1]
+
+    async def aclose(self) -> None:
+        self.close_calls += 1
+        await asyncio.sleep(0)
+        self.is_close_complete = True
+
+
+@pytest.fixture
+def _balanced_drain_context(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> SimpleNamespace:
+    _balanced_env(monkeypatch, tmp_path)
+    account_id = _register_balanced_ready_account()
+    record = claude_accounts.load_registry()[0]
+    runtime = ClaudeBalancedRuntime()
+    runtime.status = "active"
+    runtime.epoch_id = "synthetic-epoch"
+    runtime.epoch_seed = b"d" * 32
+    runtime.router = ClaudeBalancedRouter(balanced_epoch_id=runtime.epoch_id)
+    store = _BalancedDrainStore()
+    runtime._store = store
+    release_calls: list[None] = []
+    original_end = runtime.end_request
+
+    def end_request() -> None:
+        release_calls.append(None)
+        original_end()
+
+    monkeypatch.setattr(runtime, "end_request", end_request)
+
+    class SyntheticAuthManager:
+        def __init__(self, account_uuid: str) -> None:
+            self.account_uuid = account_uuid
+
+        async def get_credentials(self, force_refresh: bool = False) -> SimpleNamespace:
+            assert not force_refresh
+            return SimpleNamespace(access_token="synthetic-access", account_uuid=self.account_uuid)
+
+    state = SimpleNamespace(
+        claude_balanced_runtime=runtime,
+        claude_ambient_accounts=None,
+        claude_account_auth_managers={account_id: SyntheticAuthManager(_BALANCED_ACCOUNT_UUID)},
+        claude_pin_refresh_tasks=set(),
+        config=SimpleNamespace(claude_account_routing_mode="balanced"),
+    )
+    scope = {
+        "type": "http", "asgi": {"version": "3.0", "spec_version": "2.4"},
+        "method": "POST", "scheme": "http", "path": "/v1/messages",
+        "query_string": b"", "headers": [(b"content-type", b"application/json")],
+        "server": ("testserver", 80), "client": ("127.0.0.1", 1),
+        "app": SimpleNamespace(state=state),
+    }
+    completion_calls: list[None] = []
+    background_calls: list[None] = []
+    original_relay = relay_registered._relay_anthropic_response
+
+    def relay_response(upstream: httpx.Response, *, on_finished: Any = None) -> StreamingResponse:
+        def on_complete() -> None:
+            completion_calls.append(None)
+            on_finished()
+
+        async def on_background() -> None:
+            background_calls.append(None)
+
+        response = original_relay(upstream, on_finished=on_complete if on_finished is not None else None)
+        response.raw_headers.extend([(b"set-cookie", b"first=1"), (b"set-cookie", b"second=2")])
+        response.background = BackgroundTask(on_background)
+        return response
+
+    monkeypatch.setattr(relay_registered, "_relay_anthropic_response", relay_response)
+    body = _balanced_body("11111111-1111-4111-8111-111111111111")
+    body["stream"] = True
+    return SimpleNamespace(
+        runtime=runtime, router=runtime.router, store=store, record=record,
+        state=state, scope=scope, body=body, release_calls=release_calls,
+        completion_calls=completion_calls, background_calls=background_calls,
+    )
+
+
+async def _prepare_balanced_drain_migration(context: SimpleNamespace) -> str:
+    target_uuid = "22222222-2222-4222-8222-222222222222"
+    target_id = _register_balanced_ready_account(email="target@example.com", account_uuid=target_uuid)
+    manager_type = type(context.state.claude_account_auth_managers[context.record.id])
+    context.state.claude_account_auth_managers[target_id] = manager_type(target_uuid)
+    key = derive_session_key(context.body, context.runtime.epoch_seed, quota_family(context.body["model"]))
+    assert key is not None
+    context.router.place_session(
+        session_key=key, model=context.body["model"],
+        candidates=[AccountCandidate(context.record.id, context.record.account_incarnation_id)],
+        seed=context.runtime.epoch_seed,
+    )
+    await context.router.submit_new_pin_durability(key.digest)
+    context.router.install_cooldown(
+        account_id=context.record.id, account_incarnation_id=context.record.account_incarnation_id,
+        account_profile_fingerprint=server_support._account_profile_fingerprint(context.state, context.record.id),
+        scope="account", deadline=time.monotonic() + 60, reason="quota",
+    )
+    return target_id
+
+
+@pytest.mark.parametrize("lifecycle", ["exit", "shutdown"])
+@pytest.mark.parametrize("request_kind", ["pinned-sse", "pinned-json", "stateless", "count-tokens", "migrated"])
+def test_balanced_exit_waits_for_dispatched_response_body(
+    _balanced_drain_context: SimpleNamespace, lifecycle: str, request_kind: str,
+) -> None:
+    context = _balanced_drain_context
+    if request_kind == "stateless":
+        context.body = {"model": "claude-sonnet-5", "messages": [], "stream": True}
+        assert derive_session_key(context.body, context.runtime.epoch_seed, quota_family(context.body["model"])) is None
+    elif request_kind == "count-tokens":
+        context.scope["path"] = "/v1/messages/count_tokens"
+    elif request_kind == "pinned-json":
+        context.body["stream"] = False
+
+    async def scenario() -> None:
+        target_id = await _prepare_balanced_drain_migration(context) if request_kind == "migrated" else context.record.id
+        stream = _BalancedDrainStream()
+        content_type = "text/event-stream"
+        if request_kind in ("pinned-json", "count-tokens"):
+            content_type = "application/json"
+            stream.parts = [b'{"synthetic":', b'"response"}']
+        upstream = httpx.Response(201, stream=stream, headers={"content-type": content_type, "request-id": "synthetic"})
+        messages: list[dict[str, Any]] = []
+
+        async def send(message: dict[str, Any]) -> None:
+            messages.append(message)
+
+        async def receive() -> dict[str, Any]:
+            raise AssertionError("ASGI 2.4 does not listen for disconnects")
+
+        def publish() -> None:
+            context.state.config.claude_account_routing_mode = "disabled"
+
+        tasks: list[asyncio.Task[Any]] = []
+        response: StreamingResponse | None = None
+        async with httpx.AsyncClient(transport=httpx.MockTransport(lambda _request: upstream)) as client:
+            context.state.http_client = client
+            try:
+                response = await relay_balanced._passthrough_with_claude_balanced(
+                    Request(context.scope), json.dumps(context.body).encode(), context.body
+                )
+                assert isinstance(response, StreamingResponse)
+                assert response.status_code == 201 and response.headers["request-id"] == "synthetic"
+                assert response.headers.getlist("set-cookie") == ["first=1", "second=2"]
+                assert context.router.in_flight_count(target_id) == int(request_kind == "migrated")
+                key = derive_session_key(context.body, context.runtime.epoch_seed, quota_family(context.body["model"]))
+                if request_kind == "migrated":
+                    pin = context.router.get_pin(key.digest)
+                    assert pin.account_id == target_id and pin.generation == 1
+                    assert context.router.get_migration_reservation(key.digest) is None
+                elif request_kind in ("stateless", "count-tokens"):
+                    assert context.router.pin_count() == 0
+                body_task = asyncio.create_task(response(context.scope, receive, send))
+                tasks.append(body_task)
+                await asyncio.wait_for(stream.read_started.wait(), timeout=2)
+                exit_task = asyncio.create_task(
+                    context.runtime.exit_mode("disabled", publish=publish)
+                    if lifecycle == "exit" else context.runtime.shutdown_preserving_epoch()
+                )
+                tasks.append(exit_task)
+                await asyncio.sleep(0)
+                assert context.runtime._active_requests == 1
+                assert not exit_task.done()
+                assert context.runtime.status == "draining"
+                assert context.runtime.router is context.router
+                assert not context.store.is_closed and context.store.rotations == 0
+                assert context.release_calls == []
+                assert not upstream.is_closed
+
+                stream.release.set()
+                await asyncio.wait_for(asyncio.gather(*tasks), timeout=2)
+                assert context.runtime._active_requests == 0
+                assert context.runtime.status == "disabled"
+                assert context.store.is_closed and context.store.rotations == int(lifecycle == "exit")
+                assert context.state.config.claude_account_routing_mode == ("disabled" if lifecycle == "exit" else "balanced")
+                assert context.release_calls == [None]
+                assert context.router.in_flight_count(target_id) == 0
+                assert context.completion_calls == ([None] if request_kind == "migrated" else [])
+                assert context.background_calls == [None]
+                assert stream.close_calls == 1 and stream.is_close_complete
+                assert b"".join(message.get("body", b"") for message in messages) == b"".join(stream.parts)
+                assert messages[-1] == {"type": "http.response.body", "body": b"", "more_body": False}
+            finally:
+                stream.release.set()
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=2)
+                if response is not None:
+                    await response.body_iterator.aclose()
+                await upstream.aclose()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("outcome", ["success", "failure", "cancellation"])
+def test_balanced_shutdown_waits_for_terminal_body_send(
+    _balanced_drain_context: SimpleNamespace, outcome: str,
+) -> None:
+    context = _balanced_drain_context
+
+    async def scenario() -> None:
+        stream = _BalancedDrainStream()
+        stream.release.set()
+        upstream = httpx.Response(200, stream=stream)
+        terminal_send_started = asyncio.Event()
+        release_send = asyncio.Event()
+        tasks: list[asyncio.Task[Any]] = []
+
+        async def send(message: dict[str, Any]) -> None:
+            if message["type"] == "http.response.body" and not message["more_body"]:
+                terminal_send_started.set()
+                await release_send.wait()
+                if outcome == "failure":
+                    raise RuntimeError("synthetic terminal send failure")
+
+        async def receive() -> dict[str, Any]:
+            raise AssertionError("ASGI 2.4 does not listen for disconnects")
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(lambda _request: upstream)) as client:
+            context.state.http_client = client
+            try:
+                response = await relay_balanced._passthrough_with_claude_balanced(
+                    Request(context.scope), json.dumps(context.body).encode(), context.body
+                )
+                tasks.append(asyncio.create_task(response(context.scope, receive, send)))
+                await asyncio.wait_for(terminal_send_started.wait(), timeout=2)
+                shutdown_task = asyncio.create_task(context.runtime.shutdown_preserving_epoch())
+                tasks.append(shutdown_task)
+                await asyncio.sleep(0)
+                assert upstream.is_closed and stream.is_close_complete
+                assert context.runtime._active_requests == 1
+                assert context.release_calls == []
+                assert not shutdown_task.done() and not context.store.is_closed
+                if outcome == "cancellation":
+                    tasks[0].cancel()
+                else:
+                    release_send.set()
+                results = await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=2)
+                if outcome == "success":
+                    assert results == [None, None]
+                else:
+                    expected = asyncio.CancelledError if outcome == "cancellation" else RuntimeError
+                    assert isinstance(results[0], expected) and results[1] is None
+                assert context.release_calls == [None]
+                assert context.runtime._active_requests == 0
+                assert context.store.is_closed and context.store.rotations == 0
+                assert context.background_calls == ([None] if outcome == "success" else [])
+            finally:
+                release_send.set()
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=2)
+                await upstream.aclose()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("is_migrated", [False, True], ids=["ordinary", "migrated"])
+@pytest.mark.parametrize("termination", [
+    "unstarted-close", "header-failure", "body-failure", "read-failure",
+    "read-http-failure", "cancel-header", "cancel-read", "cancel-send", "disconnect",
+])
+def test_balanced_response_termination_releases_runtime_and_migration_once(
+    _balanced_drain_context: SimpleNamespace, is_migrated: bool, termination: str,
+) -> None:
+    context = _balanced_drain_context
+
+    async def scenario() -> None:
+        target_id = await _prepare_balanced_drain_migration(context) if is_migrated else context.record.id
+        stream = _BalancedDrainStream()
+        upstream = httpx.Response(200, stream=stream, headers={"content-type": "text/event-stream"})
+        if termination in ("read-failure", "read-http-failure"):
+            stream.read_error = (
+                httpx.ReadError("synthetic read failure") if termination == "read-http-failure"
+                else RuntimeError("synthetic read failure")
+            )
+            stream.release.set()
+        send_started = asyncio.Event()
+        release_send = asyncio.Event()
+        disconnect = asyncio.Event()
+        messages: list[dict[str, Any]] = []
+        tasks: list[asyncio.Task[Any]] = []
+        response: StreamingResponse | None = None
+        if termination == "disconnect":
+            context.scope["asgi"]["spec_version"] = "2.3"
+
+        async def send(message: dict[str, Any]) -> None:
+            messages.append(message)
+            if message["type"] == "http.response.start":
+                if termination == "header-failure":
+                    raise RuntimeError("synthetic send failure")
+                if termination == "cancel-header":
+                    send_started.set()
+                    await release_send.wait()
+            if message["type"] == "http.response.body" and message["more_body"]:
+                if termination == "body-failure":
+                    raise RuntimeError("synthetic send failure")
+                if termination in ("cancel-send", "disconnect"):
+                    send_started.set()
+                    await release_send.wait()
+
+        async def receive() -> dict[str, Any]:
+            assert termination == "disconnect"
+            await disconnect.wait()
+            return {"type": "http.disconnect"}
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(lambda _request: upstream)) as client:
+            context.state.http_client = client
+            try:
+                response = await relay_balanced._passthrough_with_claude_balanced(
+                    Request(context.scope), json.dumps(context.body).encode(), context.body
+                )
+                assert context.runtime._active_requests == 1 and context.release_calls == []
+                assert context.router.in_flight_count(target_id) == int(is_migrated)
+                assert context.completion_calls == []
+                if termination == "unstarted-close":
+                    await response.body_iterator.aclose()
+                else:
+                    body_task = asyncio.create_task(response(context.scope, receive, send))
+                    tasks.append(body_task)
+                    if termination == "cancel-read":
+                        await asyncio.wait_for(stream.read_started.wait(), timeout=2)
+                        body_task.cancel()
+                    elif termination in ("cancel-header", "cancel-send", "disconnect"):
+                        await asyncio.wait_for(send_started.wait(), timeout=2)
+                        assert not stream.read_started.is_set()
+                        assert context.runtime._active_requests == 1
+                        if termination == "disconnect":
+                            disconnect.set()
+                        else:
+                            body_task.cancel()
+                    if termination.startswith("cancel-"):
+                        with pytest.raises(asyncio.CancelledError):
+                            await asyncio.wait_for(body_task, timeout=2)
+                    elif termination in ("header-failure", "body-failure", "read-failure"):
+                        with pytest.raises(RuntimeError, match="synthetic (send|read) failure"):
+                            await asyncio.wait_for(body_task, timeout=2)
+                    else:
+                        await asyncio.wait_for(body_task, timeout=2)
+                assert context.runtime._active_requests == 0 and context.runtime._drain_complete.is_set()
+                assert upstream.is_closed and stream.close_calls == 1 and stream.is_close_complete
+                assert context.router.in_flight_count(target_id) == 0
+                assert context.completion_calls == ([None] if is_migrated else [])
+                await response.body_iterator.aclose()
+                assert context.release_calls == [None]
+                assert context.completion_calls == ([None] if is_migrated else [])
+                assert context.background_calls == ([None] if termination in ("read-http-failure", "disconnect") else [])
+                if termination == "header-failure":
+                    assert not stream.read_started.is_set()
+                    assert [message["type"] for message in messages] == ["http.response.start"]
+                if termination == "read-http-failure":
+                    content = b"".join(message.get("body", b"") for message in messages)
+                    assert content.startswith(stream.parts[0]) and b"event: error" in content
+                    error_data = content.split(b"event: error\ndata: ", 1)[1].strip()
+                    assert json.loads(error_data)["error"]["type"] == "api_error"
+                await asyncio.wait_for(context.runtime.exit_mode("disabled", publish=lambda: None), timeout=2)
+                assert context.store.is_closed and context.store.rotations == 1
+            finally:
+                stream.release.set()
+                release_send.set()
+                disconnect.set()
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=2)
+                if response is not None:
+                    await response.body_iterator.aclose()
+                await upstream.aclose()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("outcome", ["nonstream", "registry-error", "transport-error", "exception", "cancellation"])
+def test_balanced_dispatch_without_stream_ownership_releases_slot(
+    monkeypatch: pytest.MonkeyPatch, _balanced_drain_context: SimpleNamespace, outcome: str,
+) -> None:
+    context = _balanced_drain_context
+    buffered = JSONResponse({"synthetic": "buffered"}, status_code=418, headers={"request-id": "synthetic"})
+    if outcome == "nonstream":
+        async def dispatch(*_args: Any) -> JSONResponse:
+            return buffered
+        monkeypatch.setattr(relay_balanced, "_passthrough_with_balanced_pool", dispatch)
+    elif outcome == "registry-error":
+        def load_registry() -> Any:
+            raise claude_accounts.AccountRegistryError("synthetic registry failure")
+        monkeypatch.setattr(relay_balanced, "load_registry", load_registry)
+
+    async def scenario() -> None:
+        dispatch_started = asyncio.Event()
+        release_dispatch = asyncio.Event()
+        tasks: list[asyncio.Task[Any]] = []
+
+        async def handler(_request: httpx.Request) -> httpx.Response:
+            if outcome == "transport-error":
+                raise httpx.ConnectError("synthetic transport failure")
+            if outcome == "exception":
+                raise RuntimeError("synthetic dispatch failure")
+            assert outcome == "cancellation"
+            dispatch_started.set()
+            await release_dispatch.wait()
+            raise AssertionError("cancelled dispatch must not resume")
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            context.state.http_client = client
+            try:
+                task = asyncio.create_task(relay_balanced._passthrough_with_claude_balanced(
+                    Request(context.scope), json.dumps(context.body).encode(), context.body
+                ))
+                tasks.append(task)
+                if outcome == "cancellation":
+                    await asyncio.wait_for(dispatch_started.wait(), timeout=2)
+                    assert context.runtime._active_requests == 1
+                    task.cancel()
+                    with pytest.raises(asyncio.CancelledError):
+                        await asyncio.wait_for(task, timeout=2)
+                elif outcome == "exception":
+                    with pytest.raises(RuntimeError, match="synthetic dispatch failure"):
+                        await asyncio.wait_for(task, timeout=2)
+                else:
+                    response = await asyncio.wait_for(task, timeout=2)
+                    if outcome == "nonstream":
+                        assert response is buffered
+                        assert response.body == b'{"synthetic":"buffered"}' and response.status_code == 418
+                        assert response.headers["request-id"] == "synthetic"
+                    else:
+                        assert response.status_code == (503 if outcome == "registry-error" else 502)
+                        assert json.loads(response.body)["error"]["type"] == "api_error"
+                assert context.runtime._active_requests == 0 and context.runtime._drain_complete.is_set()
+                assert context.release_calls == [None]
+                assert context.router.in_flight_count(context.record.id) == 0
+                await asyncio.wait_for(context.runtime.shutdown_preserving_epoch(), timeout=2)
+                assert context.store.is_closed and context.store.rotations == 0
+            finally:
+                release_dispatch.set()
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=2)
+
+    asyncio.run(scenario())
+
+
+def test_balanced_waiter_dispatches_under_published_mode_after_body_drain(
+    monkeypatch: pytest.MonkeyPatch, _balanced_drain_context: SimpleNamespace,
+) -> None:
+    context = _balanced_drain_context
+    target_response = JSONResponse({"synthetic": "target-mode"})
+    reentry_calls: list[None] = []
+
+    async def dispatch_under_target(*_args: Any) -> JSONResponse:
+        assert context.state.config.claude_account_routing_mode == "fallback"
+        assert context.runtime.status == "disabled" and context.store.is_closed
+        reentry_calls.append(None)
+        return target_response
+
+    monkeypatch.setattr(relay_balanced, "_passthrough_to_anthropic", dispatch_under_target)
+
+    async def scenario() -> None:
+        stream = _BalancedDrainStream()
+        upstream = httpx.Response(200, stream=stream)
+        tasks: list[asyncio.Task[Any]] = []
+        response: StreamingResponse | None = None
+
+        async def send(_message: dict[str, Any]) -> None:
+            pass
+
+        async def receive() -> dict[str, Any]:
+            raise AssertionError("ASGI 2.4 does not listen for disconnects")
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(lambda _request: upstream)) as client:
+            context.state.http_client = client
+            try:
+                response = await relay_balanced._passthrough_with_claude_balanced(
+                    Request(context.scope), json.dumps(context.body).encode(), context.body
+                )
+                tasks.append(asyncio.create_task(response(context.scope, receive, send)))
+                await asyncio.wait_for(stream.read_started.wait(), timeout=2)
+                tasks.append(asyncio.create_task(context.runtime.exit_mode(
+                    "fallback", publish=lambda: setattr(context.state.config, "claude_account_routing_mode", "fallback")
+                )))
+                await asyncio.sleep(0)
+                assert context.runtime.status == "draining"
+                waiter = asyncio.create_task(relay_balanced._passthrough_with_claude_balanced(
+                    Request(context.scope), json.dumps(context.body).encode(), context.body
+                ))
+                tasks.append(waiter)
+                await asyncio.sleep(0)
+                assert not waiter.done() and reentry_calls == []
+                assert context.runtime._active_requests == 1
+                stream.release.set()
+                await asyncio.wait_for(asyncio.gather(*tasks), timeout=2)
+                assert waiter.result() is target_response and reentry_calls == [None]
+                assert context.release_calls == [None] and context.runtime._active_requests == 0
+            finally:
+                stream.release.set()
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=2)
+                if response is not None:
+                    await response.body_iterator.aclose()
+                await upstream.aclose()
 
     asyncio.run(scenario())
