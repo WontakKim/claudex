@@ -1140,15 +1140,20 @@ def test_dashboard_health_boot_sends_token_and_renders_identities_after_admin_re
         assert "grok-identity@example.com" in scenario["identities"]["grok"]
 
 
-def test_operator_guidance_discloses_scope_and_prerequisites() -> None:
+def test_operator_guidance_discloses_scope_and_prerequisites(
+    dashboard_runtime_result: dict[str, Any],
+) -> None:
     assert "on the gateway machine, across all projects" in DASHBOARD_HTML
     assert "registration stores the configured local token" in DASHBOARD_HTML
     assert "with a graphical desktop available" in DASHBOARD_HTML
     assert "No graphical browser available?" not in DASHBOARD_HTML
     assert "local cookie check, not a live check" in DASHBOARD_HTML
     assert "provider-prefixed target (provider:model)" in DASHBOARD_HTML
-    assert "models whose catalog does not advertise Fast stay standard" in DASHBOARD_HTML
+    fast = next(row["state"] for row in dashboard_runtime_result["codexSettingsStates"]["loaded"] if row["tier"] == "fast")
+    assert "Models without advertised Fast support use Standard." in fast["hint"]
     assert "Speed and usage costs depend on the provider and workload" in DASHBOARD_HTML
+    router = DASHBOARD_HTML.split('id="tab-map"', 1)[1].split('id="tab-status"', 1)[0]
+    assert "a plan label does not establish eligibility" in router
     assert "~1.5x" not in DASHBOARD_HTML
     assert "~2–2.5x" not in DASHBOARD_HTML
     assert "Clearing a serving pin does not remove an account from the Balanced pool" in DASHBOARD_HTML
@@ -1352,21 +1357,89 @@ def test_codex_speed_selector_supports_three_tiers_and_reloads(
     ] * 3
 
 
-def test_codex_speed_control_and_consumption_notice_live_in_router() -> None:
+def test_codex_speed_controls_live_once_in_general_and_support_stays_in_router() -> None:
+    general = DASHBOARD_HTML.split('id="scard-general"', 1)[1].split('id="scard-accounts"', 1)[0]
     router = DASHBOARD_HTML.split('id="tab-map"', 1)[1].split('id="tab-status"', 1)[0]
-    assert 'id="codex-card"' in router
+    assert '<div class="srow" id="codex-card">' in general
+    assert general.index('id="compaction-card"') < general.index('id="codex-card"') < general.index('id="routing-card"')
     assert 'id="codex-fast"' not in DASHBOARD_HTML
-    assert '<option value="standard">Standard</option>' in router
-    assert '<option value="fast">Fast</option>' in router
-    assert '<option value="ultrafast">Ultrafast</option>' in router
-    assert router.index('id="codex-consumption"') < router.index('id="codex-speed"')
-    notice = router.split('id="codex-consumption"', 1)[1].split('</div>', 1)[0]
-    assert "included allowance" in notice
-    assert "8x Standard" in notice
-    assert "purchased credits" in notice
-    assert "6x Standard" in notice
-    assert "not a speed guarantee" in notice
-    assert 'aria-describedby="codex-consumption codex-speed-hint"' in router
+    identifiers = re.findall(r'\bid="([^"]+)"', DASHBOARD_HTML)
+    assert len(identifiers) == len(set(identifiers))
+    for identifier in ("codex-card", "codex-speed", "codex-apply", "codex-reload", "codex-settings-status"):
+        assert DASHBOARD_HTML.count(f'id="{identifier}"') == 1
+        assert f'id="{identifier}"' in general
+        assert f'id="{identifier}"' not in router
+    for tier, label in (("standard", "Standard"), ("fast", "Fast"), ("ultrafast", "Ultrafast")):
+        assert f'<option value="{tier}">{label}</option>' in general
+    notice = re.search(r'<(?:div|span)[^>]*id="codex-consumption"[^>]*>(.*?)</(?:div|span)>', general)
+    assert notice is not None
+    assert "included allowance" in notice.group(1)
+    assert "8x Standard" in notice.group(1)
+    assert "purchased credits" in notice.group(1)
+    assert "6x Standard" in notice.group(1)
+    assert "not a speed guarantee" in notice.group(1)
+    assert 'aria-describedby="codex-consumption codex-speed-hint"' in general
+    assert '<label class="name" for="codex-speed">Codex speed</label>' in general
+    assert '<h2>Codex model support</h2>' in router
+    for identifier in ("codex-capabilities", "codex-capabilities-status", "codex-capabilities-time",
+                       "codex-capabilities-refresh", "codex-capabilities-models", "ct-in", "ct-btn",
+                       "codex-speed-test", "codex-speed-warning", "codex-speed-result"):
+        assert f'id="{identifier}"' in router
+        assert f'id="{identifier}"' not in general
+
+
+@pytest.mark.parametrize("tier", [None, "fast", "ultrafast"])
+def test_codex_loaded_speed_row_is_compact(
+    dashboard_runtime_result: dict[str, Any], tier: str | None,
+) -> None:
+    row = next(row for row in dashboard_runtime_result["codexSettingsStates"]["loaded"] if row["tier"] == tier)
+    state = row["state"]
+    assert state["value"] == (tier or "standard")
+    assert state["live"] == state["draft"] == tier
+    assert state["selectDisabled"] is False
+    assert state["applyDisabled"] is True
+    assert state["statusHidden"] is True
+    assert state["reloadHidden"] is True
+    assert state["busy"] == "false"
+
+
+@pytest.mark.parametrize("tier,expected_hint", [
+    (None, "Uses the standard service tier. No acceleration is requested."),
+    ("fast", "Fast requests priority processing. Models without advertised Fast support use Standard."),
+    ("ultrafast", "Requires advertised Ultrafast support; otherwise Standard applies."),
+])
+def test_codex_speed_hint_matches_loaded_tier_and_warns_before_ultrafast_use(
+    dashboard_runtime_result: dict[str, Any], tier: str | None, expected_hint: str,
+) -> None:
+    state = next(row["state"] for row in dashboard_runtime_result["codexSettingsStates"]["loaded"] if row["tier"] == tier)
+    assert state["hint"] == expected_hint
+    assert state["hintHidden"] is False
+    assert state["consumptionHidden"] is (tier != "ultrafast")
+
+
+@pytest.mark.parametrize("live_tier", [None, "fast", "ultrafast"])
+@pytest.mark.parametrize("draft_tier", [None, "fast", "ultrafast"])
+def test_codex_draft_hint_keeps_live_ultrafast_warning_and_never_sends_a_request(
+    dashboard_runtime_result: dict[str, Any], live_tier: str | None, draft_tier: str | None,
+) -> None:
+    row = next(row for row in dashboard_runtime_result["codexSettingsStates"]["drafts"]
+               if row["liveTier"] == live_tier and row["draftTier"] == draft_tier)
+    state = row["state"]
+    assert state["live"] == live_tier
+    assert state["draft"] == draft_tier
+    assert state["value"] == (draft_tier or "standard")
+    loaded = next(row["state"] for row in dashboard_runtime_result["codexSettingsStates"]["loaded"] if row["tier"] == draft_tier)
+    assert state["hint"] == loaded["hint"]
+    assert state["hintHidden"] is False
+    assert state["consumptionHidden"] is ("ultrafast" not in (live_tier, draft_tier))
+    assert state["statusHidden"] is (live_tier == draft_tier)
+    assert state["reloadHidden"] is True
+    assert state["applyDisabled"] is (live_tier == draft_tier)
+    if live_tier != draft_tier:
+        assert "Configured speed:" in state["status"]
+        assert "Draft speed:" in state["status"]
+        assert "(not applied)" in state["status"]
+    assert row["requests"] == []
 
 
 def test_codex_settings_start_disabled_and_reject_locked_or_invalid_events(
@@ -1378,12 +1451,19 @@ def test_codex_settings_start_disabled_and_reject_locked_or_invalid_events(
     assert initial["value"] == ""
     assert initial["selectDisabled"] is True
     assert initial["applyDisabled"] is True
+    assert initial["statusHidden"] is False
+    assert initial["status"] == "Loading settings…"
+    assert initial["reloadHidden"] is True
+    assert initial["hintHidden"] is True
     for row in states["locks"]:
         assert row["state"]["locked"] is True
         assert row["state"]["value"] == (row["tier"] or "standard")
         assert row["state"]["draft"] == row["tier"]
         assert row["state"]["selectDisabled"] is True
         assert row["state"]["applyDisabled"] is True
+        assert row["state"]["lockVisible"] is True
+        assert row["state"]["consumptionHidden"] is (row["tier"] != "ultrafast")
+        assert row["state"]["reloadHidden"] is True
         assert row["requests"] == []
     assert states["invalidChange"]["state"]["value"] == "fast"
     assert states["invalidChange"]["state"]["draft"] == "fast"
@@ -1399,10 +1479,36 @@ def test_codex_settings_block_events_while_save_is_pending(
         assert state["selectDisabled"] is True
         assert state["applyDisabled"] is True
         assert state["draft"] == "ultrafast"
+        assert state["statusHidden"] is False
+        assert "Saving" in state["status"]
+        assert state["applyText"] == "Saving…"
+        assert state["reloadHidden"] is True
+        assert state["reloadDisabled"] is True
+        assert state["consumptionHidden"] is False
+        assert state["busy"] == "true"
     assert len(scenario["requests"]) == 1
     assert json.loads(scenario["requests"][0]["options"]["body"]) == {"service_tier": "ultrafast"}
     assert scenario["saved"]["live"] == "ultrafast"
     assert scenario["saved"]["isSaving"] is False
+
+
+def test_codex_settings_pending_load_shows_progress_and_blocks_draft_save_or_duplicate_load(
+    dashboard_runtime_result: dict[str, Any],
+) -> None:
+    scenario = dashboard_runtime_result["codexSettingsStates"]["pendingLoad"]
+    for state in (scenario["pendingState"], scenario["afterForcedEvents"]):
+        assert state["isLoading"] is True
+        assert state["busy"] == "true"
+        assert state["status"] == "Loading settings…"
+        assert state["statusHidden"] is False
+        assert state["selectDisabled"] is True
+        assert state["applyDisabled"] is True
+        assert state["reloadDisabled"] is True
+        assert state["live"] == state["draft"] == "fast"
+    assert scenario["requests"] == [{"url": "/admin/settings/codex", "options": None}]
+    assert scenario["loaded"]["isLoading"] is False
+    assert scenario["loaded"]["statusHidden"] is True
+    assert scenario["loaded"]["selectDisabled"] is False
 
 
 def test_codex_settings_keep_draft_on_save_errors_and_reload_confirmed_state(
@@ -1419,12 +1525,20 @@ def test_codex_settings_keep_draft_on_save_errors_and_reload_confirmed_state(
         assert failed["isSaving"] is False
         assert "Could not confirm" in failed["status"]
         assert "Reload settings" in failed["status"]
+        assert failed["statusHidden"] is False
+        assert failed["statusState"] == "error"
+        assert failed["reloadHidden"] is False
+        assert failed["reloadDisabled"] is False
+        assert failed["consumptionHidden"] is False
+        assert failed["toastRole"] == "alert"
         assert "APPLIED" not in failed["toast"]
         recovered = row["recovered"]
         assert recovered["value"] == "ultrafast"
         assert recovered["live"] == recovered["draft"] == "ultrafast"
         assert recovered["hasLoaded"] is True
         assert recovered["applyDisabled"] is True
+        assert recovered["statusHidden"] is True
+        assert recovered["reloadHidden"] is True
     error = next(row for row in scenarios if row["outcome"] == "error")
     assert "&lt;save failed>" in error["failed"]["toast"]
 
@@ -1439,10 +1553,18 @@ def test_codex_settings_load_errors_disable_editing_until_reload(
         assert row["failed"]["selectDisabled"] is True
         assert row["failed"]["applyDisabled"] is True
         assert "Reload settings" in row["failed"]["status"]
+        assert row["failed"]["statusHidden"] is False
+        assert row["failed"]["statusState"] == "error"
+        assert row["failed"]["reloadHidden"] is False
+        assert row["failed"]["reloadDisabled"] is False
+        assert row["failed"]["hintHidden"] is True
+        assert row["failed"]["toastRole"] == "alert"
         assert row["guardRequests"] == []
         assert row["recovered"]["hasLoaded"] is True
         assert row["recovered"]["value"] == "ultrafast"
         assert row["recovered"]["selectDisabled"] is False
+        assert row["recovered"]["statusHidden"] is True
+        assert row["recovered"]["reloadHidden"] is True
 
 
 def test_codex_settings_conflict_uses_only_valid_refresh_and_keeps_failed_lock(
@@ -1457,6 +1579,11 @@ def test_codex_settings_conflict_uses_only_valid_refresh_and_keeps_failed_lock(
         assert pending["draft"] == "ultrafast"
         assert pending["selectDisabled"] is True
         assert pending["isSaving"] is True
+        assert pending["statusHidden"] is False
+        assert "Saving" in pending["status"]
+        assert pending["lockVisible"] is True
+        assert pending["reloadDisabled"] is True
+        assert pending["busy"] == "true"
         assert [request["url"] for request in row["beforeRefreshRequests"]] == [
             "/admin/settings/codex", "/admin/settings/codex",
         ]
@@ -1471,6 +1598,13 @@ def test_codex_settings_conflict_uses_only_valid_refresh_and_keeps_failed_lock(
             assert refreshed["locked"] is True
             assert refreshed["live"] == "fast"
             assert "Editing remains locked" in refreshed["status"]
+            assert refreshed["statusHidden"] is False
+            assert refreshed["statusState"] == "error"
+            assert refreshed["reloadHidden"] is False
+            assert refreshed["reloadDisabled"] is False
+            assert refreshed["toastRole"] == "alert"
+        assert row["recovered"]["statusHidden"] is True
+        assert row["recovered"]["reloadHidden"] is True
         assert row["recovered"]["locked"] is False
         assert row["recovered"]["value"] == "ultrafast"
 
@@ -1670,11 +1804,18 @@ def test_codex_selected_speed_test_is_explicit_and_retains_ordinary_untiered_tes
     assert json.loads(ordinary["options"]["body"]) == {"target": "codex:manual:model"}
     assert "OK" in states["ordinary"]["toast"]
     assert "ordinary-model" in states["ordinary"]["toast"]
-    assert DASHBOARD_HTML.index('id="codex-consumption"') < DASHBOARD_HTML.index('id="codex-speed-test"')
-    assert 'aria-describedby="codex-speed-warning"' in DASHBOARD_HTML
-    assert "can consume allowance or purchased credits" in DASHBOARD_HTML
-    assert "selector's draft" in DASHBOARD_HTML
-    assert "without saving" in DASHBOARD_HTML
+    router = DASHBOARD_HTML.split('id="tab-map"', 1)[1].split('id="tab-status"', 1)[0]
+    warning = router.split('id="codex-speed-warning"', 1)[1].split('</div>', 1)[0]
+    assert router.index('id="codex-speed-warning"') < router.index('id="codex-speed-test"')
+    assert 'aria-describedby="codex-speed-warning"' in router
+    assert 'href="#settings/general"' in warning
+    assert "can consume allowance or purchased credits" in warning
+    assert "selector's draft" in warning
+    assert "without saving" in warning
+    assert "included allowance at 8x Standard" in warning
+    assert "purchased credits at 6x Standard" in warning
+    assert "not a speed guarantee" in warning
+    assert "above" not in warning
 
 
 def test_codex_selected_speed_test_separates_requested_wire_report_and_confirmation(

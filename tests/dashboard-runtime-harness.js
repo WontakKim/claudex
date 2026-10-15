@@ -1369,10 +1369,26 @@ async function main() {
     locked: codexContext.CODEX.locked,
     hasLoaded: !!codexContext.CODEX.hasLoaded,
     isSaving: !!codexContext.CODEX.isSaving,
+    isLoading: !!codexContext.CODEX.isLoading,
+    busy: codexDocument.getElementById("codex-card").getAttribute("aria-busy"),
     status: codexDocument.getElementById("codex-settings-status")?.textContent || "",
+    statusHidden: codexDocument.getElementById("codex-settings-status").hidden,
+    statusState: codexDocument.getElementById("codex-settings-status").dataset.state,
+    applyText: codexDocument.getElementById("codex-apply").textContent,
+    lockVisible: codexDocument.getElementById("codex-card").classList.contains("locked"),
+    reloadHidden: codexDocument.getElementById("codex-reload").hidden,
+    reloadDisabled: codexDocument.getElementById("codex-reload").disabled,
+    hint: codexDocument.getElementById("codex-speed-hint")?.textContent || "",
+    hintHidden: codexDocument.getElementById("codex-context-hint")?.hidden || false,
+    consumptionHidden: codexDocument.getElementById("codex-consumption").hidden,
+    toastRole: codexDocument.getElementById("toast")?.getAttribute("role") || "",
     toast: codexDocument.getElementById("toast")?.innerHTML || "",
   });
-  const codexSettingsStates = {initial: captureCodexSettings(), locks: [], saveErrors: [], loadErrors: [], conflicts: []};
+  const codexSettingsStates = {initial: captureCodexSettings(), loaded: [], locks: [], saveErrors: [], loadErrors: [], conflicts: []};
+  for (const tier of [null, "fast", "ultrafast"]) {
+    codexContext.renderCodexState({service_tier: tier, env_locked: false});
+    codexSettingsStates.loaded.push({tier, state: captureCodexSettings()});
+  }
   codexContext.renderCodexState({service_tier: null, env_locked: false});
   const codexSpeedStates = {
     selectPresent: !!codexSelect,
@@ -1423,6 +1439,16 @@ async function main() {
   const invalidStart = codexRequests.length;
   changeCodexSpeed("priority");
   codexSettingsStates.invalidChange = {state: captureCodexSettings(), requests: codexRequests.slice(invalidStart)};
+  codexSettingsStates.drafts = [];
+  for (const liveTier of [null, "fast", "ultrafast"]) {
+    for (const draftTier of [null, "fast", "ultrafast"]) {
+      codexContext.renderCodexState(codexEnvelope(liveTier).body);
+      const start = codexRequests.length;
+      changeCodexSpeed(draftTier);
+      codexSettingsStates.drafts.push({liveTier, draftTier, state: captureCodexSettings(),
+        requests: codexRequests.slice(start)});
+    }
+  }
   codexContext.renderCodexState(codexEnvelope("fast").body);
   changeCodexSpeed("ultrafast");
   const pendingCodexSave = createDeferred();
@@ -1455,6 +1481,20 @@ async function main() {
     await reloadCodexSettings();
     codexSettingsStates.saveErrors.push({outcome, failed, recovered: captureCodexSettings()});
   }
+  codexContext.renderCodexState(codexEnvelope("fast").body);
+  const pendingCodexLoad = createDeferred();
+  codexResponses.push(pendingCodexLoad.promise);
+  const pendingLoadStart = codexRequests.length;
+  const pendingLoad = codexContext.fetchCodexSettings();
+  const pendingLoadState = captureCodexSettings();
+  changeCodexSpeed("ultrafast");
+  codexContext.applyCodex();
+  await codexContext.fetchCodexSettings();
+  const afterForcedLoadEvents = captureCodexSettings();
+  pendingCodexLoad.resolve(codexEnvelope("fast"));
+  await pendingLoad;
+  codexSettingsStates.pendingLoad = {pendingState: pendingLoadState, afterForcedEvents: afterForcedLoadEvents,
+    requests: codexRequests.slice(pendingLoadStart), loaded: captureCodexSettings()};
   for (const outcome of ["error", "malformed", "network"]) {
     codexResponses.length = 0;
     codexContext.renderCodexState(codexEnvelope("fast").body);

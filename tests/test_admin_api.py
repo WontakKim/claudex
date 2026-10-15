@@ -4802,14 +4802,20 @@ def test_dashboard_codex_speed_card_wires_apply_flow_and_env_lock(
         javascript = sources["javascript"]
 
     section = _codex_section(page)
-    assert page.index('id="tab-map"') < page.index('id="codex-card"') < page.index('id="board"')
+    assert (
+        page.index('id="scard-general"') < page.index('id="compaction-card"')
+        < page.index('id="codex-card"') < page.index('id="routing-card"')
+        < page.index('id="scard-accounts"')
+    )
     assert 'id="codex-speed"' in section
     for tier in ("standard", "fast", "ultrafast"):
         assert f'<option value="{tier}">' in section
     assert 'id="codex-apply"' in section
-    assert "priority processing for supported Codex models" in section
-    assert "Speed and usage costs depend on the provider and workload" in section
-    assert "models whose catalog does not advertise Fast stay standard" in section
+    assert "Request faster processing for supported Codex models." in section
+    assert 'id="codex-context-hint" aria-live="polite"' in section
+    assert 'aria-describedby="codex-consumption codex-speed-hint"' in section
+    assert "Fast requests priority processing. Models without advertised Fast support use Standard." in javascript
+    assert "Requires advertised Ultrafast support; otherwise Standard applies." in javascript
     assert "CLAUDEX_CODEX_SERVICE_TIER" in javascript
     assert 'jfetch("/admin/settings/codex")' in javascript
     apply_fn = _codex_apply_fn(javascript)
