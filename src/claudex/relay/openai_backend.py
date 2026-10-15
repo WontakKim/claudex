@@ -10,6 +10,7 @@ from collections.abc import AsyncGenerator, AsyncIterator
 from datetime import datetime, timezone
 from typing import Any
 
+import anyio
 import httpx
 from starlette.requests import Request
 from starlette.responses import JSONResponse, StreamingResponse
@@ -43,6 +44,9 @@ from claudex.translate.claude_to_codex import build_function_validation_schemas
 from claudex.translate.tool_validation import compile_function_validators
 
 logger = logging.getLogger("claudex.server")
+
+_RESPONSES_HEARTBEAT_INTERVAL_SECONDS = 10
+_RESPONSES_OUTPUT_INACTIVITY_TIMEOUT_SECONDS = 600
 
 
 async def _resolve_context_window(
@@ -256,15 +260,17 @@ async def _relay_via_responses_backend(
     if claude_request.get("stream"):
         return _UpstreamStreamingResponse(
             _UpstreamStreamRelay(
-                _translate_claude_sse(
-                    claude_request,
-                    upstream_events(),
-                    context_window,
-                    custom_provider=backend.signature_namespace,
-                    tool_name_map=active_function_map,
-                    function_schemas=function_schemas,
-                    regex_dialect="python" if backend.codex_regex_compat else "ecmascript",
-                    countable_request=countable_request,
+                _with_responses_heartbeats(
+                    _translate_claude_sse(
+                        claude_request,
+                        upstream_events(),
+                        context_window,
+                        custom_provider=backend.signature_namespace,
+                        tool_name_map=active_function_map,
+                        function_schemas=function_schemas,
+                        regex_dialect="python" if backend.codex_regex_compat else "ecmascript",
+                        countable_request=countable_request,
+                    ),
                 ),
                 event_stream.aclose,
             ),
@@ -559,6 +565,68 @@ class _OwnedStreamingResponse(StreamingResponse):
             aclose = getattr(self.body_iterator, "aclose", None)
             if aclose is not None:
                 await aclose()
+
+
+async def _with_responses_heartbeats(
+    translated_events: AsyncGenerator[str, None],
+) -> AsyncGenerator[str, None]:
+    pending_read: asyncio.Task[str] | None = None
+    has_primary_error = False
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + _RESPONSES_OUTPUT_INACTIVITY_TIMEOUT_SECONDS
+    try:
+        while True:
+            if pending_read is None:
+                pending_read = asyncio.create_task(anext(translated_events))
+            done, _ = await asyncio.wait(
+                (pending_read,),
+                timeout=max(0, min(_RESPONSES_HEARTBEAT_INTERVAL_SECONDS, deadline - loop.time())),
+            )
+            if not done:
+                if loop.time() >= deadline:
+                    has_primary_error = True
+                    break
+                yield _format_sse("ping", {"type": "ping"})
+                continue
+            completed_read = pending_read
+            pending_read = None
+            try:
+                chunk = completed_read.result()
+            except StopAsyncIteration:
+                return
+            deadline = loop.time() + _RESPONSES_OUTPUT_INACTIVITY_TIMEOUT_SECONDS
+            if chunk.startswith("event: error\n"):
+                has_primary_error = True
+            yield chunk
+            # Terminal output ends liveness even if the provider leaves HTTP open.
+            if chunk.startswith(("event: message_stop\n", "event: error\n")):
+                return
+    except BaseException as exc:
+        # Without an active API failure, explicit aclose() exposes cleanup errors.
+        has_primary_error = has_primary_error or not isinstance(exc, GeneratorExit)
+        raise
+    finally:
+        # Join the owned read before closing its generator, even in a
+        # cancelled disconnect scope or between downstream heartbeat sends.
+        with anyio.CancelScope(shield=True):
+            try:
+                try:
+                    if pending_read is not None:
+                        pending_read.cancel()
+                        with contextlib.suppress(asyncio.CancelledError, StopAsyncIteration):
+                            await pending_read
+                finally:
+                    await translated_events.aclose()
+            except Exception:
+                if not has_primary_error:
+                    raise
+                logger.warning("responses stream cleanup failed", exc_info=True)
+
+    yield _format_sse("error", server_support._claude_error_body(
+        "api_error",
+        f"responses stream timed out after {_RESPONSES_OUTPUT_INACTIVITY_TIMEOUT_SECONDS:g} "
+        "seconds without translated output",
+    ))
 
 
 async def _translate_claude_sse(

@@ -345,6 +345,26 @@ The complete schemas, authentication boundaries, dashboard semantics, and
 validation scope are in [Custom providers](custom-providers.md#custom-providers).
 No custom provider is added to built-in usage or billing views.
 
+## Responses stream liveness
+
+Ordinary streaming Codex, Grok, and custom Responses routes emit SSE `ping`
+events every 10 seconds while no translated event is ready. Pings begin only
+after the first upstream event has been received; earlier failures keep their
+normal HTTP status. A ping keeps the connection active without reporting
+content, usage, model progress, or success.
+
+After 600 seconds without a translated event, the gateway sends an `error`
+event with type `api_error`, closes the upstream stream, and stops pinging.
+Upstream comments, unknown events, and buffered function arguments do not reset
+this timer. Real translated output resets it, so actively delivering streams
+can run longer than 600 seconds. Arguments held for schema validation remain
+subject to the same inactivity bound.
+
+These intervals are fixed, not configurable. They do not apply to non-streaming
+aggregation, native Messages or Anthropic passthrough, compaction-reroute
+streams, or admin diagnostics. The limit bounds the gateway's wait, not the
+provider's compute time.
+
 ## Limitations
 
 Two Anthropic contract points cannot be preserved on the Codex path and are
@@ -352,7 +372,7 @@ explicit choices, not bugs:
 
 - `max_tokens` is validated but not enforced: the Codex backend rejects the
   Responses `max_output_tokens` parameter, so mapped requests cannot cap
-  output length upstream and the gateway does not truncate locally.
+  output length upstream and the gateway does not enforce a local token limit.
 - `POST /v1/messages/count_tokens` for Codex-mapped models returns a
   characters/4 estimate. Mapped prompts are never sent to Anthropic just to
   be counted and no Codex tokenizer is available, so treat the number as a
