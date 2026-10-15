@@ -197,7 +197,6 @@ function render(){
   document.getElementById("cnt").innerHTML=
     "<b>"+dirty+(dirty===1?" change":" changes")+"</b>"+
     (breakdown?'<span class="dim">'+breakdown+"</span>":"");
-  renderCodexCapabilities();
 }
 /* rebuilt flow paths resume mid-cycle so redraws during drag do not freeze the animation */
 function flowPhase(){return (-(performance.now()/1000%1.4)).toFixed(3)+"s"}
@@ -1306,33 +1305,9 @@ var CODEX_TIER_HINTS={
   fast:"Fast requests priority processing. Models without advertised Fast support use Standard.",
   ultrafast:"Requires advertised Ultrafast support; otherwise Standard applies."
 };
-var CODEX_WIRE_TIERS={standard:null,fast:"priority",ultrafast:"ultrafast"};
-var CODEX_CAPABILITIES={snapshot:null,isLoading:false,requestGeneration:0,error:""};
-var CODEX_SPEED_TEST={isRunning:false};
 function isCodexTier(tier){return tier===null||tier==="fast"||tier==="ultrafast"}
 function isCodexEnvelope(body){
   return !!body&&typeof body.env_locked==="boolean"&&isCodexTier(body.service_tier);
-}
-function isCodexCapabilitiesEnvelope(body){
-  if(!body||!isCodexTier(body.configured_tier)||typeof body.env_locked!=="boolean"||
-    ["ok","stale","unknown"].indexOf(body.status)<0||
-    (body.reason!==null&&typeof body.reason!=="string")||
-    (body.fetched_at!==null&&(typeof body.fetched_at!=="number"||!Number.isFinite(body.fetched_at)||body.fetched_at<0||
-      !Number.isFinite(new Date(body.fetched_at*1000).getTime())))||
-    !body.models||typeof body.models!=="object"||Array.isArray(body.models))return false;
-  return Object.keys(body.models).every(function(model){
-    var entry=body.models[model];
-    return !!entry&&typeof entry==="object"&&!Array.isArray(entry)&&
-      (entry.supported_tiers===null||(Array.isArray(entry.supported_tiers)&&entry.supported_tiers.every(function(tier){
-        return ["standard","fast","ultrafast"].indexOf(tier)>=0;
-      })))&&
-      (entry.advertised_tier_ids===null||(Array.isArray(entry.advertised_tier_ids)&&entry.advertised_tier_ids.every(function(id){
-        return typeof id==="string"&&id.length>0;
-      })))&&["supported","unsupported","unknown"].indexOf(entry.status)>=0&&
-      (entry.reason===null||typeof entry.reason==="string")&&isCodexTier(entry.applicable_tier)&&
-      entry.wire_tier===CODEX_WIRE_TIERS[entry.applicable_tier||"standard"]&&
-      entry.applicable_tier===(entry.status==="supported"?body.configured_tier:null);
-  });
 }
 function renderCodex(){
   var card=document.getElementById("codex-card");
@@ -1348,9 +1323,6 @@ function renderCodex(){
   var reload=document.getElementById("codex-reload");
   reload.disabled=CODEX.isSaving||CODEX.isLoading;
   reload.hidden=!CODEX.message;
-  var test=document.getElementById("codex-speed-test");
-  test.disabled=!CODEX.hasLoaded||CODEX.isSaving||CODEX.isLoading||CODEX_SPEED_TEST.isRunning;
-  test.textContent=CODEX_SPEED_TEST.isRunning?"Testing…":"Test selected Codex speed";
   var status=document.getElementById("codex-settings-status");
   status.textContent=CODEX.message||(CODEX.isSaving?"Saving settings…":
     CODEX.isLoading||!CODEX.hasLoaded?"Loading settings…":
@@ -1365,11 +1337,6 @@ function renderCodex(){
 }
 function renderCodexState(body){
   if(!isCodexEnvelope(body))return false;
-  if(CODEX_CAPABILITIES.snapshot&&CODEX_CAPABILITIES.snapshot.configured_tier!==body.service_tier){
-    CODEX_CAPABILITIES.snapshot=null;
-    CODEX_CAPABILITIES.error="Configured speed changed. Refresh capabilities to load its applicability.";
-    renderCodexCapabilities();
-  }
   CODEX.serviceTier=body.service_tier;
   CODEX.locked=body.env_locked;
   CODEX.draft=body.service_tier;
@@ -1377,68 +1344,6 @@ function renderCodexState(body){
   CODEX.message="";
   renderCodex();
   return true;
-}
-function renderCodexCapabilities(){
-  var body=CODEX_CAPABILITIES.snapshot;
-  var status=document.getElementById("codex-capabilities-status");
-  var state=body?{ok:"Current",stale:"Stale",unknown:"Unknown"}[body.status]:"Unknown";
-  status.textContent=(CODEX_CAPABILITIES.isLoading?"Checking metadata… Last snapshot: ":"")+state+
-    (body?" — configured "+CODEX_TIER_LABELS[body.configured_tier||"standard"]+", applied mappings only.":
-      " — capability metadata has not been loaded.")+(body&&body.reason?" "+body.reason:"")+
-    (CODEX_CAPABILITIES.error?" "+CODEX_CAPABILITIES.error:"");
-  var refresh=document.getElementById("codex-capabilities-refresh");
-  refresh.disabled=CODEX_CAPABILITIES.isLoading;
-  refresh.textContent=CODEX_CAPABILITIES.isLoading?"Refreshing…":"Refresh capabilities";
-  document.getElementById("codex-capabilities").setAttribute("aria-busy",String(CODEX_CAPABILITIES.isLoading));
-  document.getElementById("codex-capabilities-time").textContent="Last fetched: "+
-    (body&&body.fetched_at!==null?new Date(body.fetched_at*1000).toLocaleString():CODEX_CAPABILITIES.error?"Unavailable":"Never");
-  var targets=uniq(Object.values(DIR.LIVE).filter(function(target){return routeOf(target).provider==="codex"}));
-  document.getElementById("codex-capabilities-models").innerHTML=targets.length?targets.map(function(target){
-    var model=routeOf(target).model;
-    var entry=body&&Object.prototype.hasOwnProperty.call(body.models,model)?body.models[model]:null;
-    var supported=entry&&entry.supported_tiers!==null?entry.supported_tiers.map(function(tier){
-      return CODEX_TIER_LABELS[tier]||tier;
-    }).join(", ")||"None":"Unknown";
-    var advertised=entry&&entry.advertised_tier_ids!==null?entry.advertised_tier_ids.join(", ")||"None":"Unknown";
-    return "<li><b>"+esc(model)+"</b><div>Supported speeds: "+esc(supported)+"</div><div>"+
-      (entry?{supported:"Supported",unsupported:"Unsupported",unknown:"Unknown"}[entry.status]:"Unknown")+
-      " · Applicable: "+(entry?CODEX_TIER_LABELS[entry.applicable_tier||"standard"]:"Unknown")+
-      " · Outbound wire: "+(entry?esc(entry.wire_tier||"omitted (Standard)"):"Unknown")+
-      "</div><div>Advertised tier IDs: "+esc(advertised)+"</div>"+
-      (entry&&entry.reason?'<div class="dim">'+esc(entry.reason)+"</div>":
-        !entry?'<div class="dim">No capability entry for this applied model. Use Refresh capabilities.</div>':"")+"</li>";
-  }).join(""):"<li>No applied Codex mappings. Apply Router changes to include new targets.</li>";
-}
-function renderCodexCapabilitiesState(body){
-  if(!isCodexCapabilitiesEnvelope(body))return false;
-  CODEX_CAPABILITIES.snapshot=body;
-  CODEX_CAPABILITIES.error="";
-  renderCodexCapabilities();
-  return true;
-}
-function fetchCodexCapabilities(forceRefresh){
-  if(forceRefresh&&CODEX_CAPABILITIES.isLoading)return Promise.resolve();
-  var generation=++CODEX_CAPABILITIES.requestGeneration;
-  CODEX_CAPABILITIES.isLoading=true;
-  CODEX_CAPABILITIES.error="";
-  renderCodexCapabilities();
-  return jfetch("/admin/providers/codex/capabilities"+(forceRefresh?"/refresh":""),forceRefresh?{
-    method:"POST",headers:JSON_HEADERS,body:JSON.stringify({})
-  }:undefined).then(function(r){
-    if(generation!==CODEX_CAPABILITIES.requestGeneration)return;
-    if(r.ok&&renderCodexCapabilitiesState(r.body))return;
-    CODEX_CAPABILITIES.snapshot=null;
-    CODEX_CAPABILITIES.error=(r.ok?"Invalid capability response.":"Could not load capabilities ("+r.status+"). "+errDetail(r.body))+
-      " Refresh capabilities to retry.";
-  }).catch(function(){
-    if(generation!==CODEX_CAPABILITIES.requestGeneration)return;
-    CODEX_CAPABILITIES.snapshot=null;
-    CODEX_CAPABILITIES.error="Gateway unreachable. Check that the gateway is running and reachable, then use Refresh capabilities to retry.";
-  }).finally(function(){
-    if(generation!==CODEX_CAPABILITIES.requestGeneration)return;
-    CODEX_CAPABILITIES.isLoading=false;
-    renderCodexCapabilities();
-  });
 }
 function showCodexSettingsError(message,detail,status){
   CODEX.message=message;
@@ -1453,7 +1358,7 @@ function fetchCodexSettings(){
   renderCodex();
   return jfetch("/admin/settings/codex").then(function(r){
     if(generation!==CODEX.requestGeneration)return;
-    if(r.ok&&renderCodexState(r.body)){fetchCodexCapabilities();return}
+    if(r.ok&&renderCodexState(r.body))return;
     CODEX.hasLoaded=false;
     showCodexSettingsError("Could not load settings. Editing unavailable. Reload settings to retry.",
       r.ok?"Invalid settings response.":errDetail(r.body),r.status);
@@ -1488,7 +1393,7 @@ function applyCodex(){
       showToast('<span class="chip chip-err">LOCKED</span><span class="lat">409</span><br>'+esc(CODEX.envName)+
         '<br><span class="dim">'+esc(errDetail(r.body))+"</span>",true);
       return jfetch("/admin/settings/codex").then(function(g){
-        if(g.ok&&renderCodexState(g.body)){fetchCodexCapabilities();return}
+        if(g.ok&&renderCodexState(g.body))return;
         showCodexSettingsError("Could not load current settings. Editing remains locked. Reload settings to retry.",
           g.ok?"Invalid settings response.":errDetail(g.body),g.status);
       });
@@ -1499,7 +1404,6 @@ function applyCodex(){
       return;
     }
     renderCodexState(r.body);
-    fetchCodexCapabilities();
     showToast('<span class="chip chip-ok">APPLIED</span><br>Codex speed → '+CODEX_TIER_LABELS[r.body.service_tier||"standard"],false);
   }).catch(function(){
     showCodexSettingsError(isConflict?
@@ -1519,9 +1423,7 @@ document.getElementById("codex-speed").addEventListener("change",function(){
 });
 document.getElementById("codex-apply").addEventListener("click",applyCodex);
 document.getElementById("codex-reload").addEventListener("click",fetchCodexSettings);
-document.getElementById("codex-capabilities-refresh").addEventListener("click",function(){fetchCodexCapabilities(true)});
 renderCodex();
-renderCodexCapabilities();
 var GPTPRO_CONCURRENCY={
   envName:"GPTPRO_MAX_CONCURRENT_ASKS",locked:false,live:null,draft:null,
   hasLoaded:false,isSaving:false,requestGeneration:0,message:"",messageKind:""
@@ -2355,7 +2257,6 @@ function apply(){
     DIR.mapping=Object.assign({},DIR.LIVE);
     DIR.sel=null;
     render();
-    fetchCodexCapabilities();
     showToast('<span class="chip chip-ok">APPLIED</span><br>Router mapping · '+count+" changes",false);
   }).catch(function(){
     showToast('<span class="chip chip-err">ERROR</span><br>Apply Router mapping'+
@@ -2398,85 +2299,6 @@ function runConnTest(){
       '<br><span class="dim">Gateway unreachable. Check that the gateway is running and reachable, then retry.</span>',true);
   });
 }
-function showCodexSpeedResult(html,isError){
-  var result=document.getElementById("codex-speed-result");
-  result.hidden=false;
-  result.setAttribute("role",isError?"alert":"status");
-  result.setAttribute("aria-live",isError?"assertive":"polite");
-  result.dataset.state=isError?"error":"";
-  result.innerHTML=html;
-}
-function isCodexTierDiagnostic(body,requested){
-  if(!body||typeof body!=="object"||Array.isArray(body)||!isCodexTier(body.requested_tier)||body.requested_tier!==requested||
-    [null,"priority","ultrafast"].indexOf(body.sent_tier)<0||
-    (body.backend_confirmed_tier!==null&&typeof body.backend_confirmed_tier!=="string")||
-    ["supported","unsupported","unknown"].indexOf(body.capability_status)<0||
-    (body.capability_reason!==null&&typeof body.capability_reason!=="string")||
-    ["confirmed","different","reported","unconfirmed"].indexOf(body.confirmation_status)<0||
-    (body.confirmation_reason!==null&&typeof body.confirmation_reason!=="string"))return false;
-  var reported=body.backend_confirmed_tier;
-  var wire=CODEX_WIRE_TIERS[requested||"standard"];
-  if(body.confirmation_status==="confirmed")return requested!==null&&reported===wire;
-  if(body.confirmation_status==="different")return requested!==null&&!!reported&&reported!==wire;
-  if(body.confirmation_status==="reported")return requested===null&&!!reported;
-  return true;
-}
-function renderCodexSpeedResult(response,target,requested){
-  var body=response.body||{};
-  var validResponse=typeof body==="object"&&!Array.isArray(body)&&typeof body.ok==="boolean";
-  var diagnostic=isCodexTierDiagnostic(body.tier_diagnostic,requested)?body.tier_diagnostic:null;
-  var connected=response.ok&&validResponse&&body.ok;
-  var reported=diagnostic&&diagnostic.backend_confirmed_tier;
-  var confirmation=connected&&reported?{
-    confirmed:"Confirmed",different:"Different tier",reported:"Reported (no accelerated tier requested)",unconfirmed:"Unconfirmed"
-  }[diagnostic.confirmation_status]:"Unconfirmed";
-  var sent=diagnostic?diagnostic.sent_tier===null?"omitted (Standard)":diagnostic.sent_tier:"Not available";
-  var notice=response.ok&&!validResponse?"Invalid speed-test response. Check the gateway logs and retry.":
-    !Object.prototype.hasOwnProperty.call(body,"tier_diagnostic")?
-      "The gateway did not return tier diagnostics. Connection success alone does not confirm speed.":
-    !diagnostic?"Invalid tier diagnostic response. Check the gateway logs and retest explicitly.":"";
-  showCodexSpeedResult("<b>Selected-speed test: "+esc(target)+"</b><div>Connection: "+
-    (connected?"Responded":"Failed ("+esc(body.status!=null?body.status:response.status)+")")+
-    (body.latency_ms!=null?" · Latency: "+esc(body.latency_ms)+"ms":"")+
-    "</div><div>Requested UI speed: "+CODEX_TIER_LABELS[requested||"standard"]+
-    "</div><div>Final outbound wire tier: "+esc(sent)+
-    "</div><div>Backend-reported tier: "+esc(reported||"Not reported (unconfirmed)")+
-    "</div><div>Speed confirmation: "+confirmation+
-    "</div><div>response.model: "+esc(body.response_model||"Not reported")+"</div>"+
-    (diagnostic?"<div>Capability: "+esc(diagnostic.capability_status)+"</div>":"")+
-    (diagnostic&&diagnostic.capability_reason?"<div>"+esc(diagnostic.capability_reason)+"</div>":"")+
-    (diagnostic&&diagnostic.confirmation_reason?"<div>"+esc(diagnostic.confirmation_reason)+"</div>":"")+
-    (notice?"<div>"+esc(notice)+"</div>":"")+
-    (!connected?"<div>"+esc(body.detail||errDetail(body))+"</div><div>The model response did not complete successfully; no successful selected-speed test is confirmed.</div>":""),
-    !connected||!!notice);
-}
-function runCodexSpeedTest(){
-  if(!CODEX.hasLoaded||CODEX.isSaving||CODEX.isLoading||CODEX_SPEED_TEST.isRunning)return Promise.resolve();
-  var target=stripRouteBoundaryWhitespace(document.getElementById("ct-in").value);
-  var route=routeOf(target);
-  if(route.provider!=="codex"||!route.model){
-    showCodexSpeedResult("Enter a codex:model target in the Model connection test field before testing the selected speed.",true);
-    return Promise.resolve();
-  }
-  var requested=CODEX.draft;
-  CODEX_SPEED_TEST.isRunning=true;
-  renderCodex();
-  showCodexSpeedResult("Testing "+esc(target)+" · Requested UI speed: "+CODEX_TIER_LABELS[requested||"standard"]+"…",false);
-  return jfetch("/admin/test",{
-    method:"POST",headers:JSON_HEADERS,body:JSON.stringify({target:target,service_tier:requested})
-  }).then(function(r){
-    renderCodexSpeedResult(r,target,requested);
-  }).catch(function(){
-    showCodexSpeedResult("<b>Selected-speed test: "+esc(target)+"</b><div>Connection: Unreachable</div>"+
-      "<div>Requested UI speed: "+CODEX_TIER_LABELS[requested||"standard"]+"</div>"+
-      "<div>Final outbound wire tier: Not available</div><div>Backend-reported tier: Not reported (unconfirmed)</div>"+
-      "<div>Speed confirmation: Unconfirmed</div><div>Gateway unreachable. Check that the gateway is running and reachable, then retry.</div>",true);
-  }).finally(function(){
-    CODEX_SPEED_TEST.isRunning=false;
-    renderCodex();
-  });
-}
-document.getElementById("codex-speed-test").addEventListener("click",runCodexSpeedTest);
 document.getElementById("ct-btn").addEventListener("click",runConnTest);
 document.getElementById("ct-in").addEventListener("keydown",function(ev){if(ev.key==="Enter")runConnTest()});
 /* Unrecognized or missing prefixes fall back to the Codex icon, matching
@@ -2769,8 +2591,7 @@ function boot(){
       jfetch("/admin/settings/codex").catch(function(){return{
         ok:false,status:0,body:{error:{message:"Gateway unreachable while loading Codex speed settings. Use Reload settings to retry."}}
       }}),
-      jfetch("/admin/providers/claude/pool/routing"),
-      fetchCodexCapabilities()
+      jfetch("/admin/providers/claude/pool/routing")
     ]).then(function(results){
       // Admin retries may replace the token; fetch identities only after they settle.
       return jfetch("/health").then(function(health){
