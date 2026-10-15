@@ -71,6 +71,11 @@ an upstream's wording; use an exact provider-prefixed
 `context_window_map` override when catalog metadata is unavailable or
 insufficient.
 
+Streaming requests share the [Responses stream liveness](providers.md#responses-stream-liveness)
+behavior: 10-second SSE pings after first-event prefetch and a 600-second
+translated-output inactivity limit, including while function arguments are
+buffered. These are fixed relay intervals, not custom-provider settings.
+
 An upstream `401` is returned as an upstream error. The gateway does not refresh
 or retry a custom OpenAI-compatible credential.
 
