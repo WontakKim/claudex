@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 from types import SimpleNamespace
 from typing import Any
 
@@ -329,14 +330,62 @@ def test_immediately_ready_translated_data_and_end_do_not_ping(monkeypatch, shou
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("traffic", ["comments", "unknown-events", "buffered-arguments"])
-def test_raw_upstream_activity_does_not_reset_translated_inactivity(monkeypatch, traffic):
-    clock = ManualClock()
-    clock.should_tick = False
-    clock.install(monkeypatch)
-
+@pytest.mark.parametrize("traffic, should_delay_worker", [
+    pytest.param("comments", False, id="comments"),
+    pytest.param("unknown-events", False, id="unknown-events"),
+    pytest.param("buffered-arguments", False, id="buffered-arguments"),
+    pytest.param("buffered-arguments", True, id="buffered-arguments-delayed-worker"),
+])
+def test_raw_upstream_activity_does_not_reset_translated_inactivity(
+    monkeypatch, traffic, should_delay_worker,
+):
     async def scenario():
         packets = asyncio.Queue()
+
+        class TrafficClock(ManualClock):
+            async def wait(self, tasks, *, timeout):
+                if self.should_tick:
+                    await packets.join()
+                return await super().wait(tasks, timeout=timeout)
+
+        clock = TrafficClock()
+        clock.should_tick = False
+        clock.install(monkeypatch)
+        initial_tasks = asyncio.all_tasks()
+        release_worker = threading.Event()
+        worker_finished = threading.Event()
+        worker_release_times = []
+        release_handle = None
+        if should_delay_worker:
+            loop = asyncio.get_running_loop()
+            translate_event = relay.CodexToClaudeStreamTranslator.translate_event
+            turns = 2 * (
+                relay._RESPONSES_OUTPUT_INACTIVITY_TIMEOUT_SECONDS
+                // relay._RESPONSES_HEARTBEAT_INTERVAL_SECONDS
+            ) + 4
+
+            def release_after_turns(remaining):
+                nonlocal release_handle
+                if remaining:
+                    release_handle = loop.call_soon(release_after_turns, remaining - 1)
+                else:
+                    worker_release_times.append(clock.now)
+                    release_worker.set()
+
+            def delayed_translate_event(self, event):
+                nonlocal release_handle
+                if event.get("type") != "response.output_item.added":
+                    return translate_event(self, event)
+                # Outlast a full set of unsynchronized virtual timeout ticks.
+                release_handle = loop.call_soon_threadsafe(release_after_turns, turns)
+                release_worker.wait()
+                result = translate_event(self, event)
+                worker_finished.set()
+                return result
+
+            monkeypatch.setattr(
+                relay.CodexToClaudeStreamTranslator, "translate_event", delayed_translate_event,
+            )
 
         class TrafficStream(httpx.AsyncByteStream):
             def __init__(self):
@@ -351,7 +400,11 @@ def test_raw_upstream_activity_does_not_reset_translated_inactivity(monkeypatch,
                     self.read_tasks.append(asyncio.current_task())
                     packet = await packets.get()
                     self.chunks_read += 1
-                    yield packet
+                    try:
+                        yield packet
+                    finally:
+                        # Resumption acknowledges the real parser/translator handoff.
+                        packets.task_done()
 
             async def aclose(self):
                 await asyncio.sleep(0)
@@ -401,7 +454,14 @@ def test_raw_upstream_activity_does_not_reset_translated_inactivity(monkeypatch,
                 assert stream.close_calls == 1
                 with pytest.raises(StopAsyncIteration):
                     await anext(response.body_iterator)
+                assert asyncio.all_tasks() <= initial_tasks
+                if should_delay_worker:
+                    assert worker_finished.is_set()
+                    assert worker_release_times == [0]
             finally:
+                release_worker.set()
+                if release_handle is not None:
+                    release_handle.cancel()
                 await response.body_iterator.aclose()
 
     asyncio.run(scenario())
