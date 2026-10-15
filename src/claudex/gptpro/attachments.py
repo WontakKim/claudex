@@ -274,6 +274,30 @@ async def _dispose_handle(handle: Any) -> None:
         return
 
 
+async def _wait_for_response_completion(response: Any) -> None:
+    from playwright._impl._network import Response as ImplementationResponse
+    from playwright.async_api import Error, Response
+
+    implementation = getattr(response, "_impl_obj", None)
+    if not isinstance(implementation, ImplementationResponse):
+        if isinstance(response, Response):
+            raise TypeError("Unsupported Playwright response implementation")
+        await response.finished()
+        return
+
+    # Playwright's public finished() leaves a close watcher behind. These futures
+    # belong to Playwright (the close future is shared), so never cancel them.
+    finished = implementation._finished_future
+    closed = implementation._request._target_closed_future()
+    done, _ = await asyncio.wait(
+        (finished, closed), return_when=asyncio.FIRST_COMPLETED,
+    )
+    if closed in done:
+        closed.result()
+        raise Error("Target closed")
+    finished.result()
+
+
 async def attach_files(
     page: Any,
     attachment_paths: Sequence[str],
@@ -314,7 +338,7 @@ async def attach_files(
     async def record_completed_response(response: Any) -> None:
         nonlocal completed_file_create_responses, processing_failure
         try:
-            await response.finished()
+            await _wait_for_response_completion(response)
         except Exception:
             return
         completed_file_create_responses += 1
@@ -354,7 +378,8 @@ async def attach_files(
         nonlocal processing_failure, processing_pending
         try:
             await asyncio.wait_for(
-                response.finished(), timeout=max(0.001, deadline - _monotonic())
+                _wait_for_response_completion(response),
+                timeout=max(0.001, deadline - _monotonic())
             )
             if not 200 <= response.status < 300:
                 processing_failure = "processing response failed"
