@@ -7,7 +7,8 @@ readiness, and testing model connections before wiring them.
 Opening `http://127.0.0.1:8787/` uses the same guarded admin API as the CLI:
 
 - **Settings** contains the [compaction reroute](compaction.md#compaction-reroute),
-  Claude account routing, and registered-account management.
+  [Codex speed](#codex-speed-and-serving-capabilities), Claude account routing,
+  and registered-account management. The speed selector lives in **General**.
   See [Claude accounts](#claude-accounts) below.
 - **Status** shows built-in login and subscription usage plus custom-provider
   readiness. Kimi and Grok cards remain cosmetically hidden until a login or
@@ -28,7 +29,7 @@ Opening `http://127.0.0.1:8787/` uses the same guarded admin API as the CLI:
   in the first backend card. See [GPT Pro MCP](#gpt-pro-mcp) below.
 - **Log** reads `GET /admin/logs` and changes the persisted runtime log level
   through `PUT /admin/settings/log-level`.
-- **Router** contains [Codex speed and serving capabilities](#codex-speed-and-serving-capabilities),
+- **Router** contains [Codex model support](#codex-speed-and-serving-capabilities),
   the **Router mapping** canvas, and model connection tests. Targets are added
   through an in-canvas quick-add chooser. The ordinary test checks connections;
   a separate selected-speed test opts into a Codex tier diagnostic.
@@ -67,17 +68,21 @@ engages. This lock does not lock the independent Codex speed setting or tests.
 
 ## Codex speed and serving capabilities
 
-Open **Router** and enter the local-token prompt when authentication is required.
-Before choosing a speed, read the consumption notice: under the current provider
-policy, **Ultrafast consumes included allowance at 8x Standard and purchased
-credits at 6x Standard**. These are consumption ratios, not latency or output-speed
-multipliers. A Pro 500 label does not establish entitlement, and the dashboard
-never enables Ultrafast automatically.
+The **Codex speed** row lives in **Settings > General**; model support and
+connection tests remain in **Router**. Enter the local-token prompt when
+authentication is required.
 
-1. Inspect the applied Codex mappings in the **Codex speed** card. Each model
-   shows known supported speeds, advertised wire tier IDs, and the applicable
-   speed and outbound wire tier for the **configured** selection. The status
-   and timestamp above the list describe the serving metadata snapshot. Mixed
+Before applying Ultrafast, read its contextual consumption notice: under the
+current provider policy, **Ultrafast consumes included allowance at 8x Standard
+and purchased credits at 6x Standard**. These are consumption ratios, not latency
+or output-speed multipliers. A Pro 500 label does not establish entitlement, and
+the dashboard never enables Ultrafast automatically. The notice stays visible
+while Ultrafast is selected or still configured, even with a different draft.
+
+1. In **Router**, inspect the applied Codex mappings in the **Codex model support**
+   card. Each model shows known supported speeds, advertised wire tier IDs, and
+   the applicable speed and outbound wire tier for the **configured** selection.
+   The status and timestamp above the list describe the serving metadata snapshot. Mixed
    mappings can apply acceleration to one model while another uses Standard.
    Provider/model boundary whitespace is ignored for capability lookups and
    explicit Codex target checks, matching backend parsing. This uses Python's
@@ -88,16 +93,19 @@ never enables Ultrafast automatically.
    an unavailable catalog. It refreshes the same snapshot used for serving,
    including same-account upgrades with an unchanged token. It sends metadata
    requests only, not model inference.
-3. Choose **Standard**, **Fast**, or **Ultrafast**. The selection is a draft until
-   you press its **Apply** button. Standard saves `null` and omits the outbound
-   tier; Fast uses `priority`; Ultrafast uses `ultrafast`, subject to each model's
-   support. The card continues to label applicability for the configured speed,
-   not for an unsaved selection. Router draft changes and staged nodes are also
-   excluded from the list until the mapping is applied.
-4. Press **Apply** to persist and apply the speed live. Successful speed or mapping
-   saves read capability status again; they do not force a catalog refresh or
-   run a model request. **Reload settings** reads the actual server selection
-   and replaces the selector draft. It also reloads capability status.
+3. In **Settings > General**, choose **Standard**, **Fast**, or **Ultrafast**.
+   The selection is a draft until you press its **Apply** button; a changed draft
+   shows the configured and not-yet-applied speeds. Standard saves `null` and
+   omits the outbound tier; Fast uses `priority`; Ultrafast uses `ultrafast`,
+   subject to each model's support. The Router support card continues to label
+   applicability for the configured speed, not for an unsaved selection. Router
+   draft changes and staged nodes are also excluded until the mapping is applied.
+4. Press the speed row's **Apply** to persist and apply the speed live. Successful
+   speed or mapping saves read capability status again; they do not force a
+   catalog refresh or run a model request. The loaded row returns to its compact
+   selector, Apply, and contextual hint. **Reload settings** appears after a
+   settings error: it reads the actual server selection, replaces the selector
+   draft, and reloads capability status.
 
 Capability states answer different questions:
 
@@ -138,8 +146,9 @@ The ordinary **Test** button (also Enter in that field) sends a minimal,
 Provider usage limits still apply to that real request.
 
 Read the warning before using **Test selected Codex speed**: it runs one real
-Codex request using the selector's draft, **without saving it**, and can consume
-allowance or purchased credits. The small prompt does not bound Codex output
+Codex request using the **Settings > General** selector's draft, **without saving
+it**, and can consume allowance or purchased credits. The small prompt does not
+bound Codex output
 length; see [Codex limitations](providers.md#limitations). No inference runs on
 page load, speed selection, saves, or capability refresh. Non-Codex targets are
 rejected locally by the selected-speed action.

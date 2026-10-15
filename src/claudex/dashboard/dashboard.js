@@ -1301,6 +1301,11 @@ var CODEX={
   hasLoaded:false,isSaving:false,isLoading:false,requestGeneration:0,message:""
 };
 var CODEX_TIER_LABELS={standard:"Standard",fast:"Fast",ultrafast:"Ultrafast"};
+var CODEX_TIER_HINTS={
+  standard:"Uses the standard service tier. No acceleration is requested.",
+  fast:"Fast requests priority processing. Models without advertised Fast support use Standard.",
+  ultrafast:"Requires advertised Ultrafast support; otherwise Standard applies."
+};
 var CODEX_WIRE_TIERS={standard:null,fast:"priority",ultrafast:"ultrafast"};
 var CODEX_CAPABILITIES={snapshot:null,isLoading:false,requestGeneration:0,error:""};
 var CODEX_SPEED_TEST={isRunning:false};
@@ -1340,16 +1345,23 @@ function renderCodex(){
   var btn=document.getElementById("codex-apply");
   btn.disabled=select.disabled||CODEX.draft===CODEX.serviceTier;
   btn.textContent=CODEX.isSaving?"Saving…":"Apply";
-  document.getElementById("codex-reload").disabled=CODEX.isSaving||CODEX.isLoading;
+  var reload=document.getElementById("codex-reload");
+  reload.disabled=CODEX.isSaving||CODEX.isLoading;
+  reload.hidden=!CODEX.message;
   var test=document.getElementById("codex-speed-test");
   test.disabled=!CODEX.hasLoaded||CODEX.isSaving||CODEX.isLoading||CODEX_SPEED_TEST.isRunning;
   test.textContent=CODEX_SPEED_TEST.isRunning?"Testing…":"Test selected Codex speed";
   var status=document.getElementById("codex-settings-status");
-  status.textContent=CODEX.message||(CODEX.hasLoaded?
+  status.textContent=CODEX.message||(CODEX.isSaving?"Saving settings…":
+    CODEX.isLoading||!CODEX.hasLoaded?"Loading settings…":
     "Configured speed: "+CODEX_TIER_LABELS[CODEX.serviceTier||"standard"]+"."+
-      (CODEX.draft!==CODEX.serviceTier?" Draft speed: "+CODEX_TIER_LABELS[CODEX.draft||"standard"]+" (not applied).":""):
-    "Loading settings…");
+      (CODEX.draft!==CODEX.serviceTier?" Draft speed: "+CODEX_TIER_LABELS[CODEX.draft||"standard"]+" (not applied).":""));
   status.dataset.state=CODEX.message?"error":"";
+  status.hidden=CODEX.hasLoaded&&!CODEX.message&&!CODEX.isSaving&&!CODEX.isLoading&&CODEX.draft===CODEX.serviceTier;
+  document.getElementById("codex-context-hint").hidden=!CODEX.hasLoaded;
+  document.getElementById("codex-speed-hint").textContent=CODEX_TIER_HINTS[CODEX.draft||"standard"];
+  // Applied Ultrafast remains in use until a different draft is saved.
+  document.getElementById("codex-consumption").hidden=CODEX.draft!=="ultrafast"&&CODEX.serviceTier!=="ultrafast";
 }
 function renderCodexState(body){
   if(!isCodexEnvelope(body))return false;

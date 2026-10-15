@@ -59,6 +59,32 @@
             </div>
           </div>
           <!-- compaction-section:end -->
+          <!-- codex-section:start -->
+          <div class="srow" id="codex-card">
+            <div>
+              <label class="name" for="codex-speed">Codex speed</label>
+              <div class="desc">Request faster processing for supported Codex models.</div>
+            </div>
+            <div>
+              <div class="complock" id="codex-lockband"><b>LOCKED</b> — <code id="codex-lock-env"></code> takes precedence. Codex speed is read-only.</div>
+              <div class="ctrow">
+                <select id="codex-speed" aria-describedby="codex-consumption codex-speed-hint" disabled>
+                  <option value="" hidden disabled>—</option>
+                  <option value="standard">Standard</option>
+                  <option value="fast">Fast</option>
+                  <option value="ultrafast">Ultrafast</option>
+                </select>
+                <button id="codex-apply" disabled>Apply</button>
+                <button id="codex-reload" hidden>Reload settings</button>
+              </div>
+              <div class="cthint" id="codex-settings-status" role="status" aria-live="polite" aria-atomic="true"></div>
+              <div class="cthint" id="codex-context-hint" aria-live="polite" aria-atomic="true" hidden>
+                <span id="codex-speed-hint"></span>
+                <span id="codex-consumption" hidden>Under the current provider policy, Ultrafast consumes included allowance at 8x Standard and purchased credits at 6x Standard. These are consumption ratios, not a speed guarantee.</span>
+              </div>
+            </div>
+          </div>
+          <!-- codex-section:end -->
           <!-- routing-section:start -->
           <div class="srow" id="routing-card">
             <div>
@@ -107,24 +133,9 @@
 
     <!-- Router tab -->
     <section id="tab-map">
-      <!-- codex-section:start -->
-      <div class="card" id="codex-card">
-        <h2>Codex speed</h2>
-        <div class="cthint" id="codex-consumption">Under the current provider policy, Ultrafast consumes included allowance at 8x Standard and purchased credits at 6x Standard. These are consumption ratios, not a speed guarantee.</div>
-        <div class="complock" id="codex-lockband"><b>LOCKED</b> — <code id="codex-lock-env"></code> takes precedence. Codex speed is read-only.</div>
-        <div class="ctrow">
-          <label for="codex-speed">Request speed</label>
-          <select id="codex-speed" aria-describedby="codex-consumption codex-speed-hint" disabled>
-            <option value="" hidden disabled>—</option>
-            <option value="standard">Standard</option>
-            <option value="fast">Fast</option>
-            <option value="ultrafast">Ultrafast</option>
-          </select>
-          <button id="codex-apply" disabled>Apply</button>
-          <button id="codex-reload">Reload settings</button>
-        </div>
-        <div class="cthint" id="codex-settings-status" role="status" aria-live="polite" aria-atomic="true"></div>
-        <div class="cthint" id="codex-speed-hint">Fast requests priority processing for supported Codex models. Speed and usage costs depend on the provider and workload; models whose catalog does not advertise Fast stay standard. Ultrafast requires advertised model support; a plan label does not establish eligibility.</div>
+      <div class="card" id="codex-model-support">
+        <h2>Codex model support</h2>
+        <div class="cthint">Choose Codex speed in <a class="route-link" href="#settings/general">Settings &gt; General</a>. Applicability below uses the configured speed, not an unsaved draft. Speed and usage costs depend on the provider and workload; a plan label does not establish eligibility.</div>
         <div id="codex-capabilities">
           <div class="cthint" id="codex-capabilities-status" role="status" aria-live="polite" aria-atomic="true"></div>
           <div class="ctrow">
@@ -135,7 +146,6 @@
           <ul id="codex-capabilities-models" aria-label="Speed support for applied Codex mappings"></ul>
         </div>
       </div>
-      <!-- codex-section:end -->
       <div class="lockband"><b>LOCKED</b> — <code id="lock-env"></code> takes precedence. The board is read-only.</div>
       <div class="board" id="board" tabindex="0" role="group" aria-label="Router board. Double-click or right-click empty space to add a target node there.">
         <div class="wstatus"><span>ROUTER · VECTOR MODE</span></div>
@@ -175,7 +185,7 @@
             <button id="ct-btn">Test</button>
           </div>
           <div class="cthint">Enter a provider-prefixed target (provider:model). Test sends one real model request to check its response; provider usage limits apply. This ordinary test does not request a Codex speed tier.</div>
-          <div class="cthint" id="codex-speed-warning">The selected-speed test uses the selector's draft for the same codex:model target, without saving. It sends one real model request and can consume allowance or purchased credits. Ultrafast uses the consumption ratios shown above; connection success and latency are not a speed guarantee.</div>
+          <div class="cthint" id="codex-speed-warning">The selected-speed test uses the selector's draft in <a class="route-link" href="#settings/general">Settings &gt; General</a> for the same codex:model target, without saving. It sends one real model request and can consume allowance or purchased credits. Under the current provider policy, Ultrafast consumes included allowance at 8x Standard and purchased credits at 6x Standard. These are consumption ratios, not a speed guarantee; connection success and latency do not confirm speed.</div>
           <div class="ctrow">
             <button id="codex-speed-test" aria-describedby="codex-speed-warning" disabled>Test selected Codex speed</button>
           </div>
