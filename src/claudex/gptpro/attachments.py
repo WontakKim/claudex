@@ -508,6 +508,38 @@ async def attach_files(
                     completed[filename] += remainder
             return names, completed
 
+        def describe_processing(file_id: str) -> str:
+            details = processing_events.get(file_id)
+            has_completion = bool(details and details.get("completed"))
+            has_indexed_display_name = bool(details and details.get("display_name"))
+            missing = [
+                condition for condition, present in (
+                    ("completion", has_completion),
+                    ("indexed display name", has_indexed_display_name),
+                ) if not present
+            ]
+            missing_conditions = (
+                ", ".join(missing) or "none"
+                if details is not None else "not required without observation"
+            )
+            return (
+                f"processing {file_id}: observed={'yes' if details is not None else 'no'}, "
+                f"completion={'yes' if has_completion else 'no'}, "
+                f"indexed display name={'yes' if has_indexed_display_name else 'no'}, "
+                f"missing={missing_conditions}"
+            )
+
+        def describe_observations() -> str:
+            required_names, _ = resolved_names()
+            observed_ready_attachments = sum(
+                min(count, max(0, last_state["ready"].get(name, 0) - initial_count_for(name)))
+                for name, count in required_names.items()
+            )
+            return (
+                f"{observed_ready_attachments}/{len(filenames)} observed composer-ready "
+                f"attachments; {processing_pending} pending processing responses"
+            )
+
         def describe_files() -> str:
             descriptions = []
             for descriptor in descriptors:
@@ -551,8 +583,10 @@ async def attach_files(
                     f"; composer name(s) {', '.join(repr(name) for name in display_names)}"
                     if display_names != [filename] else ""
                 )
+                processing = "; ".join(describe_processing(file_id) for file_id in ids)
                 descriptions.append(
-                    f"{filename!r}: {statuses[0]}; receipt file ID {receipt}{display}"
+                    f"{filename!r}: {statuses[0]}; receipt file ID {receipt}{display}; "
+                    f"{processing or 'processing unavailable (no attributable receipt file ID)'}"
                 )
             return "; ".join(descriptions)
 
@@ -577,7 +611,8 @@ async def attach_files(
                 f"Attachments did not settle within {settle_timeout:g} seconds: "
                 f"{completed_file_create_responses}/{len(filenames)} completed "
                 f"POST {FILE_CREATE_PATH} responses; {ready_attachments}/"
-                f"{len(filenames)} ready composer attachments; expected filename "
+                f"{len(filenames)} processing-qualified ready attachments; "
+                f"{describe_observations()}; expected filename "
                 f"chips for {expected}. File states: {describe_files()}; "
                 f"{describe_receipts()}; no send click attempted by attachment upload.",
                 completed_file_create_responses=completed_file_create_responses,
@@ -620,7 +655,8 @@ async def attach_files(
                 )
                 raise AttachmentUploadFailedError(
                     f"Attachment {reason}. File states: {describe_files()}; "
-                    f"{describe_receipts()}; no send click attempted by attachment upload."
+                    f"{describe_observations()}; {describe_receipts()}; "
+                    "no send click attempted by attachment upload."
                 )
             for name in required_names:
                 if state["failed"].get(name, 0) > initial_state[
@@ -628,8 +664,8 @@ async def attach_files(
                 ].get(name, 0):
                     raise AttachmentUploadFailedError(
                         f"Composer attachment upload failed for {name!r}. "
-                        f"File states: {describe_files()}; {describe_receipts()}; "
-                        "no send click attempted by attachment upload."
+                        f"File states: {describe_files()}; {describe_observations()}; "
+                        f"{describe_receipts()}; no send click attempted by attachment upload."
                     )
             ready_attachments = sum(
                 min(count, max(0, state["ready"].get(name, 0) - initial_count_for(name)))

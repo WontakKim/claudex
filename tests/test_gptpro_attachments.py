@@ -430,6 +430,9 @@ def test_unready_chip_does_not_confirm_upload(
         assert raised.value.ready_attachments == 0
     else:
         assert "stuck.txt" in str(raised.value)
+        assert "0/1 observed composer-ready attachments" in str(raised.value)
+        assert "0 pending processing responses" in str(raised.value)
+        assert "processing unavailable (no attributable receipt file ID)" in str(raised.value)
 
 
 def test_timeout_reports_file_statuses_and_unattributed_receipt_ids(
@@ -555,6 +558,134 @@ def _processing_frames(file_id: str, display_name: str) -> list[dict[str, Any]]:
     ]
 
 
+@pytest.mark.parametrize(("frames", "expected_processing"), [
+    pytest.param(
+        _processing_frames("file_effect", "effect.ts")[:1],
+        "observed=yes, completion=no, indexed display name=yes, missing=completion",
+        id="missing-completion",
+    ),
+    pytest.param(
+        _processing_frames("file_effect", "effect.ts")[1:],
+        "observed=yes, completion=yes, indexed display name=no, missing=indexed display name",
+        id="missing-indexed-name",
+    ),
+])
+def test_ready_chip_timeout_explains_incomplete_processing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    frames: list[dict[str, Any]], expected_processing: str,
+) -> None:
+    original = tmp_path / "effect.ts"
+    original.write_text("synthetic", encoding="utf-8")
+    page = _FakePage(states=[
+        _attachment_state(),
+        *[_attachment_state(ready={"effect.ts": 1})] * 3,
+    ], responses=[
+        _NamedCreateResponse("effect.ts", "file_effect"),
+        _ProcessingResponse(frames),
+    ])
+    clock = _FakeClock()
+    monkeypatch.setattr(attachments, "_monotonic", clock.monotonic)
+    monkeypatch.setattr(attachments, "_sleep", clock.sleep)
+    progress = []
+
+    with pytest.raises(attachments.AttachmentSettleTimeoutError) as raised:
+        asyncio.run(attachments.attach_files(
+            page, [str(original)], timeout_seconds=0.5,
+            on_progress=lambda receipts, ready: progress.append((receipts, ready)),
+        ))
+
+    assert raised.value.completed_file_create_responses == 1
+    assert raised.value.ready_attachments == 0
+    assert progress[0] == (0, 0)
+    assert progress[-1] == (1, 0)
+    assert clock.value == 0.5
+    message = str(raised.value)
+    assert "0/1 processing-qualified ready attachments" in message
+    assert "1/1 observed composer-ready attachments" in message
+    assert "0 pending processing responses" in message
+    assert "'effect.ts': ready (composer has a file-specific action)" in message
+    assert f"processing file_effect: {expected_processing}" in message
+
+
+def test_timeout_distinguishes_unobserved_and_incomplete_processing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    paths = []
+    for name in ("unobserved.ts", "incomplete.ts"):
+        path = tmp_path / name
+        path.write_text("synthetic", encoding="utf-8")
+        paths.append(str(path))
+    page = _FakePage(states=[
+        _attachment_state(),
+        *[_attachment_state(ready={"unobserved.ts": 1, "incomplete.ts": 1})] * 3,
+    ], responses=[
+        _NamedCreateResponse("incomplete.ts", "file_incomplete"),
+        _ProcessingResponse([{
+            "file_id": "file_incomplete", "event": "file.processing.started",
+        }]),
+        _NamedCreateResponse("unobserved.ts", "file_unobserved"),
+    ])
+    clock = _FakeClock()
+    monkeypatch.setattr(attachments, "_monotonic", clock.monotonic)
+    monkeypatch.setattr(attachments, "_sleep", clock.sleep)
+
+    with pytest.raises(attachments.AttachmentSettleTimeoutError) as raised:
+        asyncio.run(attachments.attach_files(page, paths, timeout_seconds=0.5))
+
+    assert raised.value.completed_file_create_responses == 2
+    assert raised.value.ready_attachments == 1
+    message = str(raised.value)
+    assert "1/2 processing-qualified ready attachments" in message
+    assert "2/2 observed composer-ready attachments" in message
+    assert (
+        "processing file_unobserved: observed=no, completion=no, "
+        "indexed display name=no, missing=not required without observation"
+    ) in message
+    assert (
+        "processing file_incomplete: observed=yes, completion=no, "
+        "indexed display name=no, missing=completion, indexed display name"
+    ) in message
+
+
+def test_ready_chip_timeout_reports_pending_processing_response(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    class PendingProcessingResponse(_ProcessingResponse):
+        async def finished(self) -> None:
+            await asyncio.Event().wait()
+
+    original = tmp_path / "effect.ts"
+    original.write_text("synthetic", encoding="utf-8")
+    page = _FakePage(states=[
+        _attachment_state(),
+        *[_attachment_state(ready={"effect.ts": 1})] * 3,
+    ], responses=[
+        _NamedCreateResponse("effect.ts", "file_effect"),
+        PendingProcessingResponse([]),
+    ])
+    clock = _FakeClock()
+    monkeypatch.setattr(attachments, "_monotonic", clock.monotonic)
+    monkeypatch.setattr(attachments, "_sleep", clock.sleep)
+    progress = []
+
+    with pytest.raises(attachments.AttachmentSettleTimeoutError) as raised:
+        asyncio.run(attachments.attach_files(
+            page, [str(original)], timeout_seconds=0.5,
+            on_progress=lambda receipts, ready: progress.append((receipts, ready)),
+        ))
+
+    assert raised.value.completed_file_create_responses == 1
+    assert raised.value.ready_attachments == 1
+    assert progress[-1] == (1, 1)
+    message = str(raised.value)
+    assert "1/1 processing-qualified ready attachments" in message
+    assert "1/1 observed composer-ready attachments" in message
+    assert "1 pending processing responses" in message
+    assert "processing file_effect: observed=no" in message
+    assert page.listeners == {"response": []}
+    assert all(handle.dispose_calls == 1 for handle in page.handles)
+
+
 def test_server_renamed_attachment_settles_under_authoritative_display_name(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
@@ -573,11 +704,15 @@ def test_server_renamed_attachment_settles_under_authoritative_display_name(
     monkeypatch.setattr(attachments, "_monotonic", clock.monotonic)
     monkeypatch.setattr(attachments, "_sleep", clock.sleep)
 
+    progress = []
     counts = asyncio.run(attachments.attach_files(
         page, [str(original)], timeout_seconds=0.5,
+        on_progress=lambda receipts, ready: progress.append((receipts, ready)),
     ))
 
     assert counts == {renamed: (0, 1)}
+    assert progress[0] == (0, 0)
+    assert progress[-1] == (1, 1)
     assert original.name == "effect.ts"
     probes = [argument for script, argument in page.evaluate_calls
               if script == attachments.READ_COMPOSER_ATTACHMENT_STATE_JS]
@@ -637,20 +772,28 @@ def test_preexisting_renamed_chip_is_not_new_upload_evidence(
         ))
 
     assert raised.value.ready_attachments == 0
+    assert "0/1 observed composer-ready attachments" in str(raised.value)
+    assert (
+        "processing file_effect: observed=yes, completion=yes, "
+        "indexed display name=yes, missing=none"
+    ) in str(raised.value)
 
 
 def test_processing_failure_blocks_even_ready_original_chip(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
     original = tmp_path / "effect.ts"
-    original.write_text("synthetic", encoding="utf-8")
+    original.write_text("private attachment contents", encoding="utf-8")
+    receipt = _NamedCreateResponse("effect.ts", "file_effect")
+    receipt.request.post_data_json["credential"] = "synthetic request credential"
     page = _FakePage(states=[
         _attachment_state(), *[_attachment_state(ready={"effect.ts": 1})] * 3,
     ], responses=[
-        _NamedCreateResponse("effect.ts", "file_effect"),
+        receipt,
         _ProcessingResponse([{
             "file_id": "file_effect", "event": "file.processing.failed",
             "message": "do not leak raw server text",
+            "extra": {"detail": "private event detail"},
         }]),
     ])
     clock = _FakeClock()
@@ -664,6 +807,19 @@ def test_processing_failure_blocks_even_ready_original_chip(
 
     assert "do not leak raw server text" not in str(raised.value)
     assert "file_effect" in str(raised.value)
+
+    message = str(raised.value)
+    for private_value in (
+        "private attachment contents", "synthetic request credential",
+        "private event detail", "file.processing.failed",
+    ):
+        assert private_value not in message
+    assert (
+        "processing file_effect: observed=yes, completion=no, "
+        "indexed display name=no, missing=completion, indexed display name"
+    ) in message
+    assert "1/1 observed composer-ready attachments" in message
+    assert "0 pending processing responses" in message
 
 
 def test_duplicate_file_id_cannot_count_as_two_requested_files(
@@ -824,6 +980,7 @@ def test_duplicate_filename_partial_readiness_is_not_claimed_per_file(
 
     assert "'same.txt': ambiguous (1/2 ready)" in str(raised.value)
     assert raised.value.ready_attachments == 1
+    assert "1/2 observed composer-ready attachments" in str(raised.value)
 
 
 def test_settled_upload_returns_total_ready_counts_for_pre_send_check(
