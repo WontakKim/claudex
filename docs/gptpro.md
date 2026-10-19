@@ -178,12 +178,21 @@ UUID.
 `attachments` contains file paths on the gateway host. Files must be UTF-8
 plain text without NUL bytes. An ask accepts at most 10 files and 1,200,000
 bytes in total. A completed file-create response does not confirm composer
-readiness: ChatGPT may rename a file during indexing, so a renamed composer
-chip counts only when its displayed name comes from the trusted processing
-stream for that file's create-receipt ID and processing completes. Any missing,
-failed, or unsettled attachment blocks submission, including immediately before
-Send; failure details show requested and resolved names, available file IDs, and
-observed composer states.
+readiness. ChatGPT may rename a file during indexing; once processing is observed
+from the trusted stream for that file's create-receipt ID, a ready chip counts
+toward settlement only when
+both processing completes and a validated indexed display name is available, even
+if the name is unchanged. Without a per-file processing observation, the original
+filename readiness check applies. Pending processing responses also block
+settlement. Any missing, failed, or unsettled attachment blocks submission,
+including immediately before Send.
+
+Failure details show requested and resolved names, available file IDs, observed
+composer states, and the pending processing response count. Per-file processing
+details distinguish no observation from incomplete processing and identify missing
+completion or indexed display-name metadata. The observed composer-ready count
+includes only new ready chips under the currently resolved names. It is
+diagnostic-only and does not satisfy processing requirements.
 
 Questions larger than 35,000 UTF-8 bytes are automatically moved into a
 temporary text attachment, so callers should send the complete question rather
@@ -288,9 +297,12 @@ Status and result snapshots include independent observations in `evidence`:
 `submission` is `not_attempted`, `uncertain` (click attempted without
 confirmation), or `confirmed` (a nonce-matched server user echo or recovered
 server answer); neither an upload response, click, nor outgoing request alone
-confirms server acceptance. `upload_receipts` counts
-completed file-create responses, while `ready_attachments` counts attachments
-seen ready in the composer; either may be null when not observed.
+confirms server acceptance. `upload_receipts` counts completed file-create
+responses. During upload, `ready_attachments` uses the processing-qualified
+readiness count described above, not the diagnostic-only observed composer-ready
+count. A visible ready chip can therefore leave `ready_attachments` at zero while
+processing completion or an indexed display name is missing. Job snapshots retain
+the highest observed counts; either field may be null when not observed.
 `conversation_id` is the known thread ID, either explicitly selected or
 observed from a correlated ChatGPT event. `generation_observed` and
 `answer_seen` do not imply `raw_extracted`: only a completed, correlated raw
