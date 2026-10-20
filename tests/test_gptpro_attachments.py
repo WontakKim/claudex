@@ -6,6 +6,8 @@ import asyncio
 import base64
 import gc
 import json
+import shutil
+import subprocess
 from collections.abc import Callable
 from io import BytesIO
 from pathlib import Path
@@ -53,6 +55,59 @@ class _FakeHandle:
         self.dispose_calls += 1
 
 
+class _FakeBindingTracker(_FakeHandle):
+    def __init__(self, states: list[dict[str, Any]], baseline_valid: bool) -> None:
+        super().__init__("binding-tracker")
+        self.states = iter(states)
+        self.baseline_valid = baseline_valid
+        self.last_state = {"valid": True, "conflict": False, "bindings": [], "failed_aliases": []}
+
+    async def evaluate(self, script: str, argument: Any = None) -> Any:
+        if script == "(tracker) => tracker.baseline_valid":
+            return self.baseline_valid
+        if script == attachments.READ_ATTACHMENT_BINDINGS_JS:
+            self.last_state = next(self.states, self.last_state)
+            return self.last_state
+        raise AssertionError("unexpected binding tracker evaluation")
+
+
+class _FakeComposerFormHandle(_FakeHandle):
+    def __init__(
+        self, page: _FakePage, *, invalidate_after_state: bool = False,
+        composer_selector: str = attachments.COMPOSER_SELECTOR,
+    ) -> None:
+        super().__init__("composer-form")
+        self.page = page
+        self.invalidate_after_state = invalidate_after_state
+        self.composer_selector = composer_selector
+        self.is_current = True
+        self.calls: list[tuple[str, Any]] = []
+        self.drop_calls = 0
+
+    def as_element(self) -> _FakeComposerFormHandle:
+        return self
+
+    async def evaluate(self, script: str, argument: Any = None) -> Any:
+        self.calls.append((script, argument))
+        if script == attachments.COMPOSER_FORM_CURRENT_JS:
+            return self.is_current
+        if script == attachments.READ_EXISTING_ATTACHMENT_NAMES_FOR_FORM_JS:
+            return self.page.existing_names
+        if script == attachments.READ_COMPOSER_ATTACHMENT_STATE_FOR_FORM_JS:
+            state = await self.page.evaluate(attachments.READ_COMPOSER_ATTACHMENT_STATE_JS, argument)
+            if self.invalidate_after_state:
+                self.is_current = False
+            return state
+        if script == attachments._dispatch_attachment_drop_for_form_js(
+            self.composer_selector,
+        ):
+            self.drop_calls += 1
+            return await self.page.evaluate(
+                attachments.DISPATCH_ATTACHMENT_DROP_JS, argument,
+            )
+        raise AssertionError("unexpected composer form evaluation")
+
+
 class _FakePage:
     def __init__(
         self,
@@ -60,7 +115,11 @@ class _FakePage:
         states: list[dict[str, Any]] | None = None,
         responses: list[Any] | None = None,
         existing_names: list[str] | None = None,
+        bindings: list[dict[str, Any]] | None = None,
+        baseline_valid: bool = True,
     ) -> None:
+        self.binding_states = bindings or []
+        self.baseline_valid = baseline_valid
         self.states = iter(states or [])
         self.responses = responses
         self.existing_names = existing_names or []
@@ -81,14 +140,19 @@ class _FakePage:
 
     async def evaluate_handle(self, script: str, argument: Any) -> _FakeHandle:
         self.evaluate_handle_calls.append((script, argument))
-        handle = _FakeHandle(f"handle-{len(self.handles)}")
+        if script == attachments.CAPTURE_COMPOSER_FORM_HANDLE_JS:
+            handle = _FakeComposerFormHandle(self, composer_selector=argument)
+        elif script == attachments.CREATE_ATTACHMENT_BINDING_TRACKER_JS:
+            handle = _FakeBindingTracker(self.binding_states, self.baseline_valid)
+        else:
+            handle = _FakeHandle(f"handle-{len(self.handles)}")
         self.handles.append(handle)
         return handle
 
     async def evaluate(self, script: str, argument: Any = None) -> Any:
         self.evaluate_calls.append((script, argument))
         if script == attachments.DISPATCH_ATTACHMENT_DROP_JS:
-            file_count = len(self.evaluate_handle_calls) - 1
+            file_count = sum(script == attachments.CREATE_ATTACHMENT_FILE_JS for script, _ in self.evaluate_handle_calls)
             responses = self.responses
             if responses is None:
                 responses = [_FakeResponse() for _ in range(file_count)]
@@ -254,6 +318,7 @@ def test_attach_files_dispatches_drop_and_waits_for_settlement(
     first.write_text("first body", encoding="utf-8")
     second.write_text("second body", encoding="utf-8")
     page = _FakePage(
+        bindings=[_bound_cards(("upload-1", "first-card", "first.txt", "ready", True), ("upload-2", "second-card", "second.txt", "ready", True))],
         states=[
             {"ready": {}, "processing": {}, "failed": {}},
             {
@@ -262,6 +327,10 @@ def test_attach_files_dispatches_drop_and_waits_for_settlement(
                 "failed": {},
             },
         ],
+        responses=[
+            _NamedCreateResponse("first.txt", "file_first"),
+            _NamedCreateResponse("second.txt", "file_second"),
+        ],
     )
 
     asyncio.run(
@@ -269,12 +338,14 @@ def test_attach_files_dispatches_drop_and_waits_for_settlement(
     )
 
     assert [call[0] for call in page.evaluate_handle_calls] == [
+        attachments.CAPTURE_COMPOSER_FORM_HANDLE_JS,
         attachments.CREATE_ATTACHMENT_FILE_JS,
         attachments.CREATE_ATTACHMENT_FILE_JS,
         attachments.CREATE_ATTACHMENT_DATA_TRANSFER_JS,
+        attachments.CREATE_ATTACHMENT_BINDING_TRACKER_JS,
     ]
-    first_descriptor = page.evaluate_handle_calls[0][1]
-    second_descriptor = page.evaluate_handle_calls[1][1]
+    first_descriptor = page.evaluate_handle_calls[1][1]
+    second_descriptor = page.evaluate_handle_calls[2][1]
     assert base64.b64decode(first_descriptor["bytesBase64"]) == b"first body"
     assert base64.b64decode(second_descriptor["bytesBase64"]) == b"second body"
     assert (first_descriptor["name"], first_descriptor["mime"]) == (
@@ -285,9 +356,9 @@ def test_attach_files_dispatches_drop_and_waits_for_settlement(
         "second.txt",
         "text/plain",
     )
-    assert page.evaluate_handle_calls[2][1] == page.handles[:2]
+    assert page.evaluate_handle_calls[3][1] == page.handles[1:3]
     assert (
-        attachments.DISPATCH_ATTACHMENT_DROP_JS, page.handles[2]
+        attachments.DISPATCH_ATTACHMENT_DROP_JS, page.handles[3]
     ) in page.evaluate_calls
     assert any(
         script == attachments.READ_COMPOSER_ATTACHMENT_STATE_JS
@@ -305,6 +376,35 @@ def test_drop_dispatch_targets_redesigned_composer_form() -> None:
     )
     assert "#thread-bottom-container" not in drop_js
     assert "const fallbackSelector = 'main'" in drop_js
+
+
+def test_form_replacement_after_baseline_blocks_attachment_drop(
+    tmp_path: Path,
+) -> None:
+    attachment = tmp_path / "bound.txt"
+    attachment.write_text("synthetic", encoding="utf-8")
+    page = _FakePage(states=[_attachment_state()])
+    composer_selector = "form[data-chatgpt-composer] div.ProseMirror"
+    form_handle = _FakeComposerFormHandle(
+        page, invalidate_after_state=True, composer_selector=composer_selector,
+    )
+
+    with pytest.raises(RuntimeError, match="intended composer form changed"):
+        asyncio.run(attachments.attach_files(
+            page,
+            [str(attachment)],
+            composer_form_handle=form_handle,
+            composer_selector=composer_selector,
+        ))
+
+    assert any(script == attachments.READ_EXISTING_ATTACHMENT_NAMES_FOR_FORM_JS
+               for script, _ in form_handle.calls)
+    assert any(script == attachments.READ_COMPOSER_ATTACHMENT_STATE_FOR_FORM_JS
+               for script, _ in form_handle.calls)
+    assert form_handle.drop_calls == 0
+    assert not any(script == attachments.DISPATCH_ATTACHMENT_DROP_JS
+                   for script, _ in page.evaluate_calls)
+    assert page.listeners == {"response": []}
 
 
 def test_attach_files_timeout_reports_settle_state(
@@ -375,12 +475,14 @@ def test_completed_upload_waits_for_delayed_ready_chip(
     attachment = tmp_path / "delayed.txt"
     attachment.write_text("body", encoding="utf-8")
     page = _FakePage(
+        bindings=[_bound_cards(("upload-1", "delayed-card", "delayed.txt", "processing", True)), _bound_cards(("upload-1", "delayed-card", "delayed.txt", "processing", True)), _bound_cards(("upload-1", "delayed-card", "delayed.txt", "ready", True))],
         states=[
             _attachment_state(),
             _attachment_state(processing={"delayed.txt": 1}),
             _attachment_state(processing={"delayed.txt": 1}),
             _attachment_state(ready={"delayed.txt": 1}),
         ],
+        responses=[_NamedCreateResponse("delayed.txt", "file_delayed")],
     )
     clock = _FakeClock()
     monkeypatch.setattr(attachments, "_monotonic", clock.monotonic)
@@ -476,10 +578,11 @@ def test_timeout_reports_file_statuses_and_unattributed_receipt_ids(
         ("missing.txt", "unknown"),
     ):
         assert f"{name!r}: {status}" in message
-    assert "file_2" in message and "file_0" in message and "file_1" in message
+    assert "upload-1" in message and "upload-2" in message and "upload-3" in message
     assert "unattributed" in message
     assert raised.value.completed_file_create_responses == 3
-    assert raised.value.ready_attachments == 1
+    assert raised.value.ready_attachments == 0
+    assert "1/3 observed composer-ready attachments" in message
 
 
 def test_out_of_order_receipt_ids_match_request_file_names(
@@ -519,9 +622,9 @@ def test_out_of_order_receipt_ids_match_request_file_names(
 
     assert "'first.txt': ready" in str(raised.value)
     assert "'second.txt': unknown" in str(raised.value)
-    assert "'first.txt': ready" in str(raised.value).split("file_first")[0]
-    assert "file_first" in str(raised.value).split("'second.txt': unknown")[0]
-    assert "file_second" in str(raised.value).split("'second.txt': unknown")[1]
+    message = str(raised.value)
+    assert "receipt file ID upload-2" in message.split("'second.txt': unknown")[0]
+    assert "receipt file ID upload-1" in message.split("'second.txt': unknown")[1]
 
 
 class _NamedCreateResponse(_FakeResponse):
@@ -604,7 +707,179 @@ def test_ready_chip_timeout_explains_incomplete_processing(
     assert "1/1 observed composer-ready attachments" in message
     assert "0 pending processing responses" in message
     assert "'effect.ts': ready (composer has a file-specific action)" in message
-    assert f"processing file_effect: {expected_processing}" in message
+    assert f"processing upload-1: {expected_processing}" in message
+
+
+def test_deferred_indexing_started_name_does_not_satisfy_processing_completion(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    attachment = tmp_path / "deferred.txt"
+    attachment.write_text("synthetic", encoding="utf-8")
+    page = _FakePage(
+        states=[
+            _attachment_state(),
+            *[_attachment_state(ready={attachment.name: 1})] * 3,
+        ],
+        responses=[
+            _NamedCreateResponse(attachment.name, "file_deferred"),
+            _ProcessingResponse([{
+                "file_id": "file_deferred",
+                "event": "file.indexing.started",
+                "extra": {
+                    "library_file_name": attachment.name,
+                    "metadata_object_id": "metadata_object_1",
+                    "retrieval_indexing_deferred": True,
+                },
+            }]),
+        ],
+    )
+    clock = _FakeClock()
+    monkeypatch.setattr(attachments, "_monotonic", clock.monotonic)
+    monkeypatch.setattr(attachments, "_sleep", clock.sleep)
+
+    with pytest.raises(attachments.AttachmentSettleTimeoutError) as raised:
+        asyncio.run(attachments.attach_files(
+            page, [str(attachment)], timeout_seconds=0.5,
+        ))
+
+    assert raised.value.ready_attachments == 0
+    assert "processing upload-1: observed=yes, completion=no" in str(raised.value)
+    assert "no send click attempted by attachment upload" in str(raised.value)
+
+
+def test_deferred_indexing_name_is_candidate_not_card_binding(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    attachment = tmp_path / "deferred-name.txt"
+    attachment.write_text("synthetic", encoding="utf-8")
+    frames = [
+        {"file_id": "file_deferred", "event": "file.processing.started"},
+        {"file_id": "file_deferred", "event": "file.processing.file_ready"},
+        {
+            "file_id": "file_deferred",
+            "event": "file.indexing.started",
+            "extra": {
+                "library_file_name": attachment.name,
+                "retrieval_indexing_deferred": True,
+            },
+        },
+        {"file_id": "file_deferred", "event": "file.processing.completed"},
+    ]
+    page = _FakePage(
+        states=[
+            _attachment_state(),
+            *[_attachment_state(ready={attachment.name: 1})] * 3,
+        ],
+        responses=[
+            _NamedCreateResponse(attachment.name, "file_deferred"),
+            _ProcessingResponse(frames),
+        ],
+    )
+    clock = _FakeClock()
+    monkeypatch.setattr(attachments, "_monotonic", clock.monotonic)
+    monkeypatch.setattr(attachments, "_sleep", clock.sleep)
+
+    with pytest.raises(attachments.AttachmentSettleTimeoutError) as raised:
+        asyncio.run(attachments.attach_files(
+            page, [str(attachment)], timeout_seconds=0.5,
+        ))
+
+    message = str(raised.value)
+    assert raised.value.ready_attachments == 0
+    assert "name source candidate=deferred-indexing-started" in message
+    assert "card binding=unverified" in message
+    assert "processing upload-1: observed=yes, completion=yes" in message
+
+
+def test_invalid_deferred_name_fails_without_becoming_absence(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    attachment = tmp_path / "deferred-invalid.txt"
+    attachment.write_text("synthetic", encoding="utf-8")
+    private_name = "../private-name.txt"
+    frames = [
+        {
+            "file_id": "file_deferred_invalid",
+            "event": "file.indexing.started",
+            "extra": {
+                "library_file_name": private_name,
+                "retrieval_indexing_deferred": True,
+            },
+        },
+        {"file_id": "file_deferred_invalid", "event": "file.processing.completed"},
+    ]
+    page = _FakePage(
+        states=[
+            _attachment_state(),
+            *[_attachment_state(ready={attachment.name: 1})] * 3,
+        ],
+        responses=[
+            _NamedCreateResponse(attachment.name, "file_deferred_invalid"),
+            _ProcessingResponse(frames),
+        ],
+    )
+    clock = _FakeClock()
+    monkeypatch.setattr(attachments, "_monotonic", clock.monotonic)
+    monkeypatch.setattr(attachments, "_sleep", clock.sleep)
+
+    with pytest.raises(attachments.AttachmentUploadFailedError) as raised:
+        asyncio.run(attachments.attach_files(
+            page, [str(attachment)], timeout_seconds=0.5,
+        ))
+
+    message = str(raised.value)
+    assert "name source candidate=deferred-indexing-started-invalid" in message
+    assert private_name not in message
+
+
+def test_conflicting_deferred_names_fail_for_the_correlated_id(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    attachment = tmp_path / "deferred-conflict.txt"
+    attachment.write_text("synthetic", encoding="utf-8")
+    conflicting_name = "alternate-name.txt"
+    file_id = "file_deferred_conflict"
+    frames = [
+        {
+            "file_id": file_id,
+            "event": "file.indexing.started",
+            "extra": {
+                "library_file_name": attachment.name,
+                "retrieval_indexing_deferred": True,
+            },
+        },
+        {
+            "file_id": file_id,
+            "event": "file.indexing.started",
+            "extra": {
+                "library_file_name": conflicting_name,
+                "retrieval_indexing_deferred": True,
+            },
+        },
+        {"file_id": file_id, "event": "file.processing.completed"},
+    ]
+    page = _FakePage(
+        states=[
+            _attachment_state(),
+            *[_attachment_state(ready={attachment.name: 1})] * 3,
+        ],
+        responses=[
+            _NamedCreateResponse(attachment.name, file_id),
+            _ProcessingResponse(frames),
+        ],
+    )
+    clock = _FakeClock()
+    monkeypatch.setattr(attachments, "_monotonic", clock.monotonic)
+    monkeypatch.setattr(attachments, "_sleep", clock.sleep)
+
+    with pytest.raises(attachments.AttachmentUploadFailedError) as raised:
+        asyncio.run(attachments.attach_files(
+            page, [str(attachment)], timeout_seconds=0.5,
+        ))
+
+    message = str(raised.value)
+    assert "name source candidate=deferred-indexing-started-conflicting" in message
+    assert conflicting_name not in message
 
 
 def test_timeout_distinguishes_unobserved_and_incomplete_processing(
@@ -615,7 +890,9 @@ def test_timeout_distinguishes_unobserved_and_incomplete_processing(
         path = tmp_path / name
         path.write_text("synthetic", encoding="utf-8")
         paths.append(str(path))
-    page = _FakePage(states=[
+    page = _FakePage(
+        bindings=[_bound_cards(("upload-1", "incomplete-card", "incomplete.ts", "ready", True), ("upload-2", "unobserved-card", "unobserved.ts", "ready", True))],
+        states=[
         _attachment_state(),
         *[_attachment_state(ready={"unobserved.ts": 1, "incomplete.ts": 1})] * 3,
     ], responses=[
@@ -638,11 +915,11 @@ def test_timeout_distinguishes_unobserved_and_incomplete_processing(
     assert "1/2 processing-qualified ready attachments" in message
     assert "2/2 observed composer-ready attachments" in message
     assert (
-        "processing file_unobserved: observed=no, completion=no, "
+        "processing upload-2: observed=no, completion=no, "
         "indexed display name=no, missing=not required without observation"
     ) in message
     assert (
-        "processing file_incomplete: observed=yes, completion=no, "
+        "processing upload-1: observed=yes, completion=no, "
         "indexed display name=no, missing=completion, indexed display name"
     ) in message
 
@@ -656,7 +933,9 @@ def test_ready_chip_timeout_reports_pending_processing_response(
 
     original = tmp_path / "effect.ts"
     original.write_text("synthetic", encoding="utf-8")
-    page = _FakePage(states=[
+    page = _FakePage(
+        bindings=[_bound_cards(("upload-1", "pending-card", "effect.ts", "ready", True))],
+        states=[
         _attachment_state(),
         *[_attachment_state(ready={"effect.ts": 1})] * 3,
     ], responses=[
@@ -681,7 +960,7 @@ def test_ready_chip_timeout_reports_pending_processing_response(
     assert "1/1 processing-qualified ready attachments" in message
     assert "1/1 observed composer-ready attachments" in message
     assert "1 pending processing responses" in message
-    assert "processing file_effect: observed=no" in message
+    assert "processing upload-1: observed=no" in message
     assert page.listeners == {"response": []}
     assert all(handle.dispose_calls == 1 for handle in page.handles)
 
@@ -693,6 +972,7 @@ def test_server_renamed_attachment_settles_under_authoritative_display_name(
     original.write_text("synthetic", encoding="utf-8")
     renamed = "effect(20260927-120843).ts"
     page = _FakePage(
+        bindings=[_bound_cards(("upload-1", "renamed-card", renamed, "ready", True))],
         states=[_attachment_state(), _attachment_state(processing={"effect.ts": 1}),
                 *[_attachment_state(ready={renamed: 1})] * 3],
         responses=[
@@ -746,7 +1026,7 @@ def test_unattributed_or_incomplete_rename_fails_closed(
         ))
 
     assert raised.value.ready_attachments == 0
-    assert "file_effect" in str(raised.value)
+    assert "upload-1" in str(raised.value)
 
 
 def test_preexisting_renamed_chip_is_not_new_upload_evidence(
@@ -755,7 +1035,9 @@ def test_preexisting_renamed_chip_is_not_new_upload_evidence(
     original = tmp_path / "effect.ts"
     original.write_text("synthetic", encoding="utf-8")
     renamed = "effect(20260927-120843).ts"
-    page = _FakePage(states=[
+    page = _FakePage(
+        bindings=[_bound_cards(("upload-1", "prior-card", renamed, "ready", False))],
+        states=[
         _attachment_state(ready={renamed: 1}),
         *[_attachment_state(ready={renamed: 1})] * 3,
     ], existing_names=[renamed], responses=[
@@ -774,7 +1056,7 @@ def test_preexisting_renamed_chip_is_not_new_upload_evidence(
     assert raised.value.ready_attachments == 0
     assert "0/1 observed composer-ready attachments" in str(raised.value)
     assert (
-        "processing file_effect: observed=yes, completion=yes, "
+        "processing upload-1: observed=yes, completion=yes, "
         "indexed display name=yes, missing=none"
     ) in str(raised.value)
 
@@ -806,7 +1088,7 @@ def test_processing_failure_blocks_even_ready_original_chip(
         ))
 
     assert "do not leak raw server text" not in str(raised.value)
-    assert "file_effect" in str(raised.value)
+    assert "upload-1" in str(raised.value)
 
     message = str(raised.value)
     for private_value in (
@@ -815,7 +1097,7 @@ def test_processing_failure_blocks_even_ready_original_chip(
     ):
         assert private_value not in message
     assert (
-        "processing file_effect: observed=yes, completion=no, "
+        "processing upload-1: observed=yes, completion=no, "
         "indexed display name=no, missing=completion, indexed display name"
     ) in message
     assert "1/1 observed composer-ready attachments" in message
@@ -841,7 +1123,10 @@ def test_duplicate_file_id_cannot_count_as_two_requested_files(
     monkeypatch.setattr(attachments, "_monotonic", clock.monotonic)
     monkeypatch.setattr(attachments, "_sleep", clock.sleep)
 
-    with pytest.raises(attachments.AttachmentUploadFailedError, match="file_reused"):
+    with pytest.raises(
+        attachments.AttachmentUploadFailedError,
+        match="duplicate receipt file ID upload-1",
+    ):
         asyncio.run(attachments.attach_files(page, paths, timeout_seconds=0.5))
 
 
@@ -859,7 +1144,7 @@ def test_stream_identity_change_during_composer_probe_requires_new_name(
         async def evaluate(self, script: str, argument: Any = None) -> Any:
             if (script == attachments.READ_COMPOSER_ATTACHMENT_STATE_JS
                     and argument == ["effect.ts"] and not self.changed
-                    and self.evaluate_handle_calls):
+                    and any(script == attachments.CREATE_ATTACHMENT_FILE_JS for script, _ in self.evaluate_handle_calls)):
                 self.changed = True
                 for listener in tuple(self.listeners["response"]):
                     listener(stream)
@@ -867,7 +1152,9 @@ def test_stream_identity_change_during_composer_probe_requires_new_name(
                 return _attachment_state(ready={"effect.ts": 1})
             return await super().evaluate(script, argument)
 
-    page = ChangingPage(states=[
+    page = ChangingPage(
+        bindings=[_bound_cards(("upload-1", "renamed-card", renamed, "ready", True))],
+        states=[
         _attachment_state(),
         *[_attachment_state(ready={renamed: 1})] * 3,
     ], responses=[_NamedCreateResponse("effect.ts", "file_effect")])
@@ -890,7 +1177,9 @@ def test_seven_renamed_files_correlate_out_of_order_streams(
         path = tmp_path / name
         path.write_text("synthetic", encoding="utf-8")
         paths.append(str(path))
-    page = _FakePage(states=[
+    page = _FakePage(
+        bindings=[_bound_cards(*[(f"upload-{index + 1}", f"card-{index}", renamed[index], "ready", True) for index in range(7)])],
+        states=[
         _attachment_state(),
         *[_attachment_state(ready={name: 1 for name in renamed})] * 3,
     ], responses=[
@@ -940,10 +1229,15 @@ def test_duplicate_filenames_require_distinct_ready_chips(
     second.parent.mkdir()
     first.write_text("first", encoding="utf-8")
     second.write_text("second", encoding="utf-8")
-    page = _FakePage(states=[
+    page = _FakePage(
+        bindings=[_bound_cards(("upload-1", "first-card", "same.txt", "ready", True)), _bound_cards(("upload-1", "first-card", "same.txt", "ready", True), ("upload-2", "second-card", "same.txt", "ready", True))],
+        states=[
         _attachment_state(),
         _attachment_state(ready={"same.txt": 1}),
         _attachment_state(ready={"same.txt": 2}),
+    ], responses=[
+        _NamedCreateResponse("same.txt", "file_same_first"),
+        _NamedCreateResponse("same.txt", "file_same_second"),
     ])
     clock = _FakeClock()
     monkeypatch.setattr(attachments, "_monotonic", clock.monotonic)
@@ -967,10 +1261,11 @@ def test_duplicate_filename_partial_readiness_is_not_claimed_per_file(
         file = directory / "same.txt"
         file.write_text(f"synthetic-{index}", encoding="utf-8")
         paths.append(str(file))
-    page = _FakePage(states=[
-        _attachment_state(),
-        *[_attachment_state(ready={"same.txt": 1})] * 3,
-    ])
+    page = _FakePage(
+        states=[_attachment_state(), *[_attachment_state(ready={"same.txt": 1})] * 3],
+        responses=[_NamedCreateResponse("same.txt", "file_first"), _NamedCreateResponse("same.txt", "file_second")],
+        bindings=[_bound_cards(("upload-1", "first-card", "same.txt", "ready", True))],
+    )
     clock = _FakeClock()
     monkeypatch.setattr(attachments, "_monotonic", clock.monotonic)
     monkeypatch.setattr(attachments, "_sleep", clock.sleep)
@@ -988,10 +1283,12 @@ def test_settled_upload_returns_total_ready_counts_for_pre_send_check(
 ) -> None:
     attachment = tmp_path / "existing.txt"
     attachment.write_text("new body", encoding="utf-8")
-    page = _FakePage(states=[
+    page = _FakePage(
+        bindings=[_bound_cards(("upload-1", "new-card", "existing.txt", "ready", True))],
+        states=[
         _attachment_state(ready={"existing.txt": 1}),
         _attachment_state(ready={"existing.txt": 2}),
-    ])
+    ], responses=[_NamedCreateResponse("existing.txt", "file_existing")])
 
     expected_ready_counts = asyncio.run(
         attachments.attach_files(page, [str(attachment)])
@@ -1005,11 +1302,13 @@ def test_existing_composer_chip_is_not_new_upload_evidence(
 ) -> None:
     attachment = tmp_path / "existing.txt"
     attachment.write_text("new body", encoding="utf-8")
-    page = _FakePage(states=[
+    page = _FakePage(
+        bindings=[_bound_cards(), _bound_cards(("upload-1", "new-card", "existing.txt", "ready", True))],
+        states=[
         _attachment_state(ready={"existing.txt": 1}),
         _attachment_state(ready={"existing.txt": 1}),
         _attachment_state(ready={"existing.txt": 2}),
-    ])
+    ], responses=[_NamedCreateResponse("existing.txt", "file_existing")])
     clock = _FakeClock()
     monkeypatch.setattr(attachments, "_monotonic", clock.monotonic)
     monkeypatch.setattr(attachments, "_sleep", clock.sleep)
@@ -1043,7 +1342,7 @@ def test_ready_chip_without_upload_receipt_is_not_confirmation(
         )
 
     assert raised.value.completed_file_create_responses == 0
-    assert raised.value.ready_attachments == 1
+    assert raised.value.ready_attachments == 0
 
 
 def test_processing_events_only_count_trusted_exact_endpoint() -> None:
@@ -1161,11 +1460,13 @@ def test_preexisting_processing_chip_becoming_ready_is_not_new_attachment(
 ) -> None:
     attachment = tmp_path / "existing.txt"
     attachment.write_text("new body", encoding="utf-8")
-    page = _FakePage(states=[
+    page = _FakePage(
+        bindings=[_bound_cards(), _bound_cards(("upload-1", "new-card", "existing.txt", "ready", True))],
+        states=[
         _attachment_state(processing={"existing.txt": 1}),
         _attachment_state(ready={"existing.txt": 1}),
         _attachment_state(ready={"existing.txt": 2}),
-    ])
+    ], responses=[_NamedCreateResponse("existing.txt", "file_existing")])
     clock = _FakeClock()
     monkeypatch.setattr(attachments, "_monotonic", clock.monotonic)
     monkeypatch.setattr(attachments, "_sleep", clock.sleep)
@@ -1320,6 +1621,7 @@ def test_response_completion_attachment_call_sites(
         observed._impl_obj = response._impl_obj
         observed.finished = response.finished
         page = _FakePage(
+            bindings=[_bound_cards(("upload-1", "upload-card", file.name, "ready", True))],
             responses=[create, processing],
             states=[_attachment_state()] + [_attachment_state(ready={file.name: 1})] * 20,
         )
@@ -1440,4 +1742,917 @@ def test_response_completion_public_boundary() -> None:
         with pytest.raises(TypeError, match="Unsupported Playwright response"):
             await attachments._wait_for_response_completion(response)
 
+    asyncio.run(run())
+
+
+def test_unattributed_receipt_does_not_use_original_name_readiness(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    class ReceiptWithoutRequestName(_FakeResponse):
+        async def json(self) -> dict[str, str]:
+            return {"file_id": "file_candidate"}
+
+    attachment = tmp_path / "candidate.txt"
+    attachment.write_text("synthetic", encoding="utf-8")
+    page = _FakePage(
+        states=[
+            _attachment_state(),
+            *[_attachment_state(ready={attachment.name: 1})] * 3,
+        ],
+        responses=[ReceiptWithoutRequestName()],
+    )
+    clock = _FakeClock()
+    monkeypatch.setattr(attachments, "_monotonic", clock.monotonic)
+    monkeypatch.setattr(attachments, "_sleep", clock.sleep)
+
+    with pytest.raises(attachments.AttachmentSettleTimeoutError) as raised:
+        asyncio.run(attachments.attach_files(
+            page, [str(attachment)], timeout_seconds=0.5,
+        ))
+
+    assert "upload-1" in str(raised.value)
+    assert "receipt metadata unavailable" in str(raised.value)
+
+
+def test_surplus_distinct_receipt_id_is_not_truncated_to_requested_count(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    attachment = tmp_path / "one.txt"
+    attachment.write_text("synthetic", encoding="utf-8")
+    page = _FakePage(
+        states=[
+            _attachment_state(),
+            *[_attachment_state(ready={attachment.name: 1})] * 3,
+        ],
+        responses=[
+            _NamedCreateResponse(attachment.name, "file_one"),
+            _NamedCreateResponse(attachment.name, "file_surplus"),
+        ],
+    )
+    clock = _FakeClock()
+    monkeypatch.setattr(attachments, "_monotonic", clock.monotonic)
+    monkeypatch.setattr(attachments, "_sleep", clock.sleep)
+
+    with pytest.raises(attachments.AttachmentSettleTimeoutError) as raised:
+        asyncio.run(attachments.attach_files(
+            page, [str(attachment)], timeout_seconds=0.5,
+        ))
+
+    assert "surplus receipt IDs" in str(raised.value)
+    assert "receipt attribution=failed" in str(raised.value)
+
+
+def test_pending_receipt_attribution_blocks_ready_original_name(
+    tmp_path: Path,
+) -> None:
+    async def run() -> None:
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        class DelayedReceipt(_NamedCreateResponse):
+            async def json(self) -> dict[str, str]:
+                started.set()
+                await release.wait()
+                return await super().json()
+
+        attachment = tmp_path / "delayed-receipt.txt"
+        attachment.write_text("synthetic", encoding="utf-8")
+        page = _FakePage(
+            bindings=[_bound_cards(("upload-1", "delayed-card", attachment.name, "ready", True))],
+            states=[
+                _attachment_state(),
+                *[_attachment_state(ready={attachment.name: 1})] * 3,
+            ],
+            responses=[DelayedReceipt(attachment.name, "file_delayed_receipt")],
+        )
+        task = asyncio.create_task(attachments.attach_files(
+            page, [str(attachment)], timeout_seconds=1,
+        ))
+
+        await asyncio.wait_for(started.wait(), timeout=0.5)
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(asyncio.shield(task), timeout=0.05)
+        release.set()
+        assert await task == {attachment.name: (0, 1)}
+        assert page.listeners == {"response": []}
+        assert all(handle.dispose_calls == 1 for handle in page.handles)
+
+    asyncio.run(run())
+
+
+def test_distinct_receipt_names_converging_to_one_display_name_keep_count(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    paths = []
+    for name in ("first.txt", "second.txt"):
+        attachment = tmp_path / name
+        attachment.write_text("synthetic", encoding="utf-8")
+        paths.append(str(attachment))
+    display_name = "combined.txt"
+    page = _FakePage(
+        bindings=[_bound_cards(("upload-1", "first-card", display_name, "ready", True), ("upload-2", "second-card", display_name, "ready", True))],
+        states=[
+            _attachment_state(),
+            *[_attachment_state(ready={display_name: 2})] * 3,
+        ],
+        responses=[
+            _ProcessingResponse(_processing_frames("file_first", display_name)),
+            _NamedCreateResponse("first.txt", "file_first"),
+            _ProcessingResponse(_processing_frames("file_second", display_name)),
+            _NamedCreateResponse("second.txt", "file_second"),
+        ],
+    )
+    clock = _FakeClock()
+    monkeypatch.setattr(attachments, "_monotonic", clock.monotonic)
+    monkeypatch.setattr(attachments, "_sleep", clock.sleep)
+
+    assert asyncio.run(attachments.attach_files(
+        page, paths, timeout_seconds=1,
+    )) == {display_name: (0, 2)}
+
+
+def test_surplus_receipt_diagnostics_remain_bounded(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    attachment = tmp_path / "bounded.txt"
+    attachment.write_text("synthetic", encoding="utf-8")
+    page = _FakePage(
+        states=[
+            _attachment_state(),
+            *[_attachment_state(ready={attachment.name: 1})] * 3,
+        ],
+        responses=[
+            _NamedCreateResponse(attachment.name, f"file_surplus_{index}")
+            for index in range(100)
+        ],
+    )
+    clock = _FakeClock()
+    monkeypatch.setattr(attachments, "_monotonic", clock.monotonic)
+    monkeypatch.setattr(attachments, "_sleep", clock.sleep)
+
+    with pytest.raises(attachments.AttachmentSettleTimeoutError) as raised:
+        asyncio.run(attachments.attach_files(
+            page, [str(attachment)], timeout_seconds=0.5,
+        ))
+
+    assert len(str(raised.value)) <= 4_096
+    assert "surplus" in str(raised.value)
+
+
+def test_attachment_diagnostics_use_attempt_aliases_for_receipt_ids(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    attachment = tmp_path / "diagnostic.txt"
+    attachment.write_text("synthetic", encoding="utf-8")
+    file_id = "file_private_diagnostic"
+    page = _FakePage(
+        states=[
+            _attachment_state(),
+            *[_attachment_state(ready={attachment.name: 1})] * 3,
+        ],
+        responses=[
+            _NamedCreateResponse(attachment.name, file_id),
+            _ProcessingResponse([{
+                "file_id": file_id, "event": "file.processing.started",
+            }]),
+        ],
+    )
+    clock = _FakeClock()
+    monkeypatch.setattr(attachments, "_monotonic", clock.monotonic)
+    monkeypatch.setattr(attachments, "_sleep", clock.sleep)
+
+    with pytest.raises(attachments.AttachmentSettleTimeoutError) as raised:
+        asyncio.run(attachments.attach_files(
+            page, [str(attachment)], timeout_seconds=0.5,
+        ))
+
+    message = str(raised.value)
+    assert file_id not in message
+    assert "upload-1" in message
+
+
+def test_settlement_observer_catches_late_failure_before_submit(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    async def run() -> None:
+        attachment = tmp_path / "observed.txt"
+        attachment.write_text("synthetic", encoding="utf-8")
+        page = _FakePage(
+            bindings=[_bound_cards(("upload-1", "observed-card", attachment.name, "ready", True))],
+            states=[
+                _attachment_state(),
+                _attachment_state(ready={attachment.name: 1}),
+                _attachment_state(ready={attachment.name: 1}),
+            ],
+            responses=[
+                _NamedCreateResponse(attachment.name, "file_observed"),
+                _ProcessingResponse(_processing_frames("file_observed", attachment.name)),
+            ],
+        )
+        observations = []
+        counts = await attachments.attach_files(
+            page,
+            [str(attachment)],
+            timeout_seconds=1,
+            on_settlement=observations.append,
+        )
+
+        assert counts == {attachment.name: (0, 1)}
+        assert len(observations) == 1
+        assert len(page.listeners["response"]) == 1
+        assert await observations[0].revalidate_before_submit() is None
+        late_failure = _ProcessingResponse([{
+            "file_id": "file_observed", "event": "file.processing.failed",
+        }])
+        for listener in tuple(page.listeners["response"]):
+            listener(late_failure)
+
+        assert await observations[0].revalidate_before_submit() == "processing-failed"
+        await observations[0].close()
+        assert page.listeners["response"] == []
+
+    clock = _FakeClock()
+    monkeypatch.setattr(attachments, "_monotonic", clock.monotonic)
+    monkeypatch.setattr(attachments, "_sleep", clock.sleep)
+    asyncio.run(run())
+
+
+_BINDING_GRAPH_PROGRAM = r"""
+(function () {
+  const fs = require('fs');
+  const input = JSON.parse(fs.readFileSync(0, 'utf8'));
+  const createTracker = new Function(`return (${input.source});`)();
+  class Element {
+    constructor(tag, attributes = {}) {
+      this.tagName = tag.toUpperCase();
+      this.attributes = Object.entries(attributes).map(([name, value]) => ({ name, value }));
+      this.children = [];
+      this.parentElement = null;
+      this.parentNode = null;
+      this.isConnected = true;
+      this.textContent = '';
+      this.style = { display: 'block', visibility: 'visible', opacity: '1' };
+    }
+    append(child) { child.parentElement = this; child.parentNode = this; this.children.push(child); return child; }
+    getAttribute(name) { return this.attributes.find((item) => item.name === name)?.value ?? null; }
+    contains(node) { return this === node || this.children.some((child) => child.contains(node)); }
+    getBoundingClientRect() { return { width: this.boxless ? 0 : 10, height: this.boxless ? 0 : 10 }; }
+    getClientRects() { return this.boxless ? [] : [this.getBoundingClientRect()]; }
+    matches(selector) {
+      return selector === 'form[data-chatgpt-composer]' && this.tagName === 'FORM' &&
+        this.getAttribute('data-chatgpt-composer') !== null;
+    }
+    closest(selector) {
+      for (let node = this; node; node = node.parentElement) {
+        if (selector === 'form' && node.tagName === 'FORM') return node;
+        if (selector === 'button' && node.tagName === 'BUTTON') return node;
+        if (selector === '[role="dialog"], dialog, nav, aside' &&
+            (['DIALOG', 'NAV', 'ASIDE'].includes(node.tagName) || node.getAttribute('role') === 'dialog')) return node;
+        if (selector.includes('[role="search"]') &&
+            (node.tagName === 'SEARCH' || node.getAttribute('role') === 'search' ||
+             node.getAttribute('data-message-author-role') !== null)) return node;
+        if (selector === '[contenteditable], [role="textbox"]' &&
+            (node.getAttribute('contenteditable') !== null || node.getAttribute('role') === 'textbox')) return node;
+      }
+      return null;
+    }
+    querySelectorAll(selector) {
+      const result = [];
+      const visit = (parent) => parent.children.forEach((child) => { result.push(child); visit(child); });
+      visit(this);
+      return selector === '*' ? result : result.filter((node) => selector === 'button[aria-label]' &&
+        node.tagName === 'BUTTON' && node.getAttribute('aria-label') !== null);
+    }
+  }
+  const container = new Element('main');
+  const form = container.append(new Element('form', { 'data-chatgpt-composer': '' }));
+  const composer = form.append(new Element('textarea', { class: 'composer' }));
+  globalThis.document = {
+    querySelectorAll: (selector) => selector === '.composer' ? [composer]
+      : selector === 'form[data-chatgpt-composer]' ? container.querySelectorAll('*').filter((node) => node.matches(selector)) : [],
+    querySelector: (selector) => document.querySelectorAll(selector)[0] || null,
+  };
+  globalThis.getComputedStyle = (node) => node.style;
+  const fiber = (tag, stateNode) => ({ tag, stateNode, flags: 0, return: null, alternate: null, child: null, sibling: null });
+  const pair = (tag, stateNode) => {
+    const current = fiber(tag, stateNode); const alternate = fiber(tag, stateNode);
+    current.alternate = alternate; alternate.alternate = current;
+    return { current, alternate };
+  };
+  const children = (parent, items) => {
+    for (const branch of ['current', 'alternate']) {
+      parent[branch].child = items[0]?.[branch] ?? null;
+      items.forEach((item, index) => { item[branch].return = parent[branch]; item[branch].sibling = items[index + 1]?.[branch] ?? null; });
+    }
+  };
+  const rootState = { current: null, containerInfo: container };
+  const root = pair(3, rootState); rootState.current = root.current;
+  const formPair = pair(5, form); children(root, [formPair]);
+  const cardPairs = [];
+  function addCard(name, identifier, branch = 'current', state = 'ready') {
+    const wrapper3 = form.append(new Element('div'));
+    const wrapper2 = wrapper3.append(new Element('div'));
+    const wrapper1 = wrapper2.append(new Element('div'));
+    const card = wrapper1.append(new Element('div', state === 'processing' ? { 'aria-busy': 'true' } :
+      state === 'failed' ? { 'data-state': 'failed' } : {}));
+    const label = card.append(new Element('span', { title: name })); label.textContent = name;
+    if (state !== 'unknown') card.append(new Element('button', { 'aria-label': 'Remove attachment' }));
+    const wrapper3Pair = pair(5, wrapper3); const wrapper2Pair = pair(5, wrapper2);
+    const wrapper1Pair = pair(5, wrapper1); const cardPair = pair(5, card);
+    const owners = Array.from({ length: 6 }, () => pair(0, null));
+    children(wrapper3Pair, [wrapper2Pair]);
+    children(wrapper2Pair, [owners[5]]);
+    for (let index = 5; index > 0; index -= 1) children(owners[index], [owners[index - 1]]);
+    children(owners[0], [wrapper1Pair]); children(wrapper1Pair, [cardPair]);
+    owners[2][branch].memoizedProps = { attachment: { id: identifier } };
+    owners[3][branch].memoizedProps = { attachment: { id: identifier } };
+    for (const owner of owners) {
+      owner.current.memoizedProps ??= {}; owner.alternate.memoizedProps ??= {};
+    }
+    Object.defineProperty(wrapper1, '__reactFiber$test', { value: wrapper1Pair.current });
+    cardPairs.push(wrapper3Pair); children(formPair, cardPairs);
+    return { card, label, wrapper1, wrapper1Pair, wrapper2Pair, owners };
+  }
+  const mode = input.mode;
+  const priorState = mode.startsWith('baseline-') ? mode.slice('baseline-'.length) : null;
+  if (mode === 'control-title') { const control = form.append(new Element('button')); control.append(new Element('span', { title: 'Voice input' })); }
+  if (priorState) {
+    const prior = addCard(['unlabelled-unknown', 'opaque'].includes(priorState) ? 'other-prior.txt' : 'prior.txt',
+      'file_current', 'current', ['unlabelled-unknown', 'opaque'].includes(priorState) ? 'unknown' : priorState);
+    if (priorState === 'opaque') prior.label.attributes = [];
+    if (priorState === 'unlabelled-unknown') {
+      prior.label.attributes = [];
+      const icon = new Element('span'); icon.append(new Element('svg'));
+      const name = new Element('span'); name.append(new Element('span')); name.append(prior.label);
+      prior.card.children = []; prior.card.append(icon); prior.card.append(name);
+    }
+  }
+  if (mode === 'generic-form' || mode === 'form-standard-replacement') form.attributes = [];
+  if (mode === 'boxless-form') { form.boxless = true; form.style.display = 'contents'; }
+  const tracker = createTracker({ form, composerSelector: '.composer', names: ['upload.txt', 'prior.txt'] });
+  if (priorState === 'opaque') {
+    if (tracker.baseline_valid !== false) throw new Error('an unclassifiable prior attachment was treated as an empty baseline');
+    return;
+  }
+  if (tracker.baseline_valid !== true) throw new Error('synthetic baseline was not captured');
+  if (priorState) {
+    for (const node of form.children.slice(1)) node.isConnected = false;
+    form.children = [composer]; cardPairs.length = 0;
+  }
+  const currentBranch = mode === 'alternate-current' || mode === 'stale-marker-only' ? 'alternate' : 'current';
+  rootState.current = root[currentBranch];
+  const idBranch = mode === 'stale-marker-only' ? 'current' : mode === 'stale-alternate-only' ? 'alternate' : currentBranch;
+  const item = addCard(priorState ? 'renamed.txt' : 'upload.txt', 'file_current', idBranch);
+  if (mode === 'conflicting-owners') item.owners[3].current.memoizedProps.attachment.id = 'file_other';
+  if (mode === 'duplicate-cards') addCard('upload.txt', 'file_current');
+  if (mode === 'wrong-field') {
+    item.owners[2].current.memoizedProps = { attachment: { metadata_object_id: 'file_current' } };
+    item.owners[3].current.memoizedProps = { attachment: { file_id: 'file_current' } };
+    item.wrapper1Pair.current.key = 'file_current';
+  }
+  if (mode === 'card-limit') for (let index = 0; index < 100; index += 1) addCard(`other-${index}.txt`, `file_other_${index}`);
+  if (mode === 'unrelated-root') rootState.containerInfo = {};
+  if (mode === 'disconnected-form') form.isConnected = false;
+  if (mode === 'mismatched-alternate-host') item.wrapper1Pair.alternate.stateNode = {};
+  if (mode === 'unrelated-owner') item.owners[2].current.child = null;
+  if (mode === 'hidden-card') item.card.style.visibility = 'hidden';
+  if (mode === 'boxless-wrapper') item.wrapper1.boxless = true;
+  if (mode === 'processing-card') item.card.attributes.push({ name: 'aria-busy', value: 'true' });
+  if (mode === 'failed-card') item.card.attributes.push({ name: 'data-state', value: 'failed' });
+  if (mode === 'return-cycle') item.owners[5].current.return = item.owners[5].current;
+  let getterCalls = 0;
+  if (mode === 'accessor') Object.defineProperty(item.owners[2].current, 'memoizedProps', {
+    get() { getterCalls += 1; return { attachment: { id: 'file_current' } }; },
+  });
+  if (mode === 'depth-cutoff') {
+    let parent = root;
+    for (let index = 0; index < 520; index += 1) { const next = pair(0, null); children(parent, [next]); parent = next; }
+    children(parent, [formPair]);
+  }
+  const options = { aliases: { file_current: 'upload-1', file_other: 'upload-2' }, names: ['upload.txt', 'renamed.txt'] };
+  let snapshot = tracker.read(options);
+  if (mode.startsWith('form-')) {
+    const strongCheck = new Function(`return (${input.form_current});`)();
+    if (!strongCheck(form, '.composer') || !snapshot.valid || snapshot.bindings.length !== 1 ||
+        snapshot.bindings[0].state !== 'ready' || snapshot.bindings[0].alias !== 'upload-1') {
+      throw new Error('coherent form regression requires one valid current ready bound card before mutation');
+    }
+    if (mode === 'form-hidden') form.style.visibility = 'hidden';
+    else if (mode === 'form-search') composer.attributes.push({ name: 'role', value: 'search' });
+    else if (mode === 'form-standard-replacement') container.append(new Element('form', { 'data-chatgpt-composer': '' }));
+    else {
+      const ancestor = new Element(mode.slice('form-'.length));
+      container.children[container.children.indexOf(form)] = ancestor;
+      ancestor.parentElement = container; ancestor.parentNode = container;
+      ancestor.append(form);
+    }
+    const after = strongCheck(form, '.composer');
+    snapshot = tracker.read(options);
+    if (after || snapshot.valid || snapshot.bindings.length !== 0) {
+      throw new Error(`form became ineligible between evaluations but its new ready-card snapshot qualified: ${JSON.stringify({ strong: after, snapshot })}`);
+    }
+  }
+  if (mode === 'reassigned-card') {
+    item.owners[2].current.memoizedProps.attachment.id = 'file_other';
+    item.owners[3].current.memoizedProps.attachment.id = 'file_other';
+    snapshot = tracker.read(options);
+  }
+  if (mode === 'failed-card') {
+    item.card.attributes = [];
+    snapshot = tracker.read(options);
+  }
+  const ready = snapshot.bindings.filter((binding) => binding.alias === 'upload-1' && binding.state === 'ready' &&
+    binding.visible && binding.is_new && !snapshot.failed_aliases.includes(binding.alias));
+  const positives = ['marker-current', 'alternate-current', 'boxless-wrapper', 'control-title', 'generic-form', 'boxless-form'];
+  if (positives.includes(mode)) {
+    if (!snapshot.valid || snapshot.conflict || ready.length !== 1 || snapshot.bindings.length !== 1) {
+      throw new Error(`expected one current bound card: ${JSON.stringify(snapshot)}`);
+    }
+  } else if (ready.length !== 0 && !snapshot.conflict) {
+    throw new Error(`uncertain/stale/baseline card qualified: ${JSON.stringify(snapshot)}`);
+  }
+  if (['conflicting-owners', 'duplicate-cards', 'reassigned-card'].includes(mode) && !snapshot.conflict) {
+    throw new Error('conflicting current ID/card assignment was not latched');
+  }
+  if (mode === 'failed-card' && !snapshot.failed_aliases.includes('upload-1')) throw new Error('failure latch was lost');
+  if (getterCalls !== 0) throw new Error('application getter was invoked');
+  console.log(JSON.stringify({ valid: snapshot.valid, conflict: snapshot.conflict, ready: ready.length }));
+})();
+"""
+
+
+@pytest.mark.parametrize("mode", [
+    "marker-current", "alternate-current", "boxless-wrapper", "control-title", "generic-form", "boxless-form",
+    "form-dialog", "form-nav", "form-aside", "form-hidden", "form-search", "form-standard-replacement",
+    "stale-marker-only", "stale-alternate-only", "unrelated-owner", "mismatched-alternate-host",
+    "conflicting-owners", "duplicate-cards", "reassigned-card",
+    "hidden-card", "processing-card", "failed-card", "return-cycle", "accessor",
+    "depth-cutoff", "wrong-field", "card-limit", "unrelated-root", "disconnected-form",
+    "baseline-ready", "baseline-processing", "baseline-failed", "baseline-unknown", "baseline-unlabelled-unknown", "baseline-opaque",
+])
+def test_current_attachment_binding_runs_in_isolated_javascript(mode: str) -> None:
+    node = shutil.which("node")
+    if node is None:
+        pytest.fail("Node.js is required for executable attachment identity tests")
+    completed = subprocess.run(
+        [node, "-e", _BINDING_GRAPH_PROGRAM],
+        input=json.dumps({"source": attachments.CREATE_ATTACHMENT_BINDING_TRACKER_JS, "mode": mode,
+                          "form_current": attachments.COMPOSER_FORM_CURRENT_JS}),
+        text=True, capture_output=True, check=False, timeout=10,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_production_renderer_currentness_parent_sets_and_depth_are_executable() -> None:
+    node = shutil.which("node")
+    if node is None:
+        pytest.fail("Node.js is required for executable attachment identity tests")
+    program = r"""
+(function () {
+  const fs = require('fs');
+  const input = JSON.parse(fs.readFileSync(0, 'utf8'));
+  const boundary = input.source.indexOf('  const getCardsInForm =');
+  if (boundary < 0) throw new Error('production identity helpers not found');
+  const createHelpers = new Function(`return (${input.source.slice(0, boundary)}
+    return { resolveCurrentFiber, ownsSelectedHostByChildren };
+  });`)();
+  const container = {};
+  const form = { isConnected: true, parentNode: container };
+  const helpers = createHelpers({ form, composerSelector: '.composer', names: [] });
+  const pair = (tag, stateNode) => {
+    const a = { tag, stateNode, flags: 0, return: null, alternate: null, child: null, sibling: null };
+    const b = { ...a }; a.alternate = b; b.alternate = a;
+    return [a, b];
+  };
+  function graph(hops, sharedChild = false) {
+    const state = { current: null, containerInfo: container };
+    const root = pair(3, state); state.current = root[0];
+    const pairs = [root];
+    for (let depth = 0; depth < hops; depth += 1) {
+      const next = pair(0, null); const parent = pairs[pairs.length - 1];
+      for (const branch of [0, 1]) { parent[branch].child = next[branch]; next[branch].return = parent[branch]; }
+      pairs.push(next);
+    }
+    if (sharedChild) pairs[pairs.length - 2][1].child = pairs[pairs.length - 1][0];
+    return { state, root, pairs, leaf: pairs[pairs.length - 1] };
+  }
+  for (const childIndex of [0, 1]) {
+    const item = graph(2);
+    item.state.current = item.root[1];
+    const parent = item.pairs[1]; const candidate = item.leaf;
+    candidate[0].return = parent[0]; candidate[1].return = parent[0];
+    parent[0].child = null; parent[1].child = candidate[childIndex];
+    const result = helpers.resolveCurrentFiber(candidate[0], form);
+    if (result.state !== 'resolved' || result.candidate_is_current !== (childIndex === 0)) {
+      throw new Error(`parent-B-only mapping reversed: ${JSON.stringify({ childIndex, state: result.state, current: result.candidate_is_current })}`);
+    }
+  }
+  const sharedReturn = graph(2);
+  sharedReturn.leaf[1].return = sharedReturn.pairs[1][0];
+  if (!helpers.resolveCurrentFiber(sharedReturn.leaf[0], form).candidate_is_current) throw new Error('shared return failed');
+  const sharedChild = graph(322, true);
+  sharedChild.state.current = sharedChild.root[1];
+  if (!helpers.resolveCurrentFiber(sharedChild.leaf[0], form).candidate_is_current) throw new Error('shared child mounted subwalk failed');
+  const deep = graph(512);
+  if (!helpers.resolveCurrentFiber(deep.leaf[0], form).candidate_is_current) throw new Error('valid bounded deep chain failed');
+  deep.state.current = deep.root[1];
+  if (helpers.resolveCurrentFiber(deep.leaf[0], form).candidate_is_current) throw new Error('deep stale branch promoted');
+  const overBudget = graph(513);
+  if (helpers.resolveCurrentFiber(overBudget.leaf[0], form).state !== 'inconclusive') throw new Error('unbounded root walk');
+  const mountedOverBudget = graph(515, true);
+  if (helpers.resolveCurrentFiber(mountedOverBudget.leaf[0], form).state !== 'inconclusive') throw new Error('unbounded mounted subwalk');
+  const disconnected = graph(2);
+  disconnected.state.containerInfo = {};
+  if (helpers.resolveCurrentFiber(disconnected.leaf[0], form).state !== 'inconclusive') throw new Error('unrelated renderer root accepted');
+  const cycle = graph(2); cycle.leaf[0].return = cycle.leaf[0];
+  if (helpers.resolveCurrentFiber(cycle.leaf[0], form).state !== 'inconclusive') throw new Error('cycle accepted');
+  const accessor = graph(2); let getterCalls = 0;
+  Object.defineProperty(accessor.leaf[0], 'alternate', { get() { getterCalls += 1; return null; } });
+  if (helpers.resolveCurrentFiber(accessor.leaf[0], form).state !== 'inconclusive' || getterCalls) throw new Error('accessor read');
+})();
+"""
+    completed = subprocess.run(
+        [node, "-e", program], input=json.dumps({"source": attachments.CREATE_ATTACHMENT_BINDING_TRACKER_JS}),
+        text=True, capture_output=True, check=False, timeout=10,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
+def _bound_cards(*cards: tuple[str, str, str, str, bool]) -> dict[str, Any]:
+    return {
+        "valid": True,
+        "conflict": False,
+        "failed_aliases": [],
+        "bindings": [
+            {"alias": alias, "card": card, "name": name, "state": state, "visible": True, "is_new": is_new}
+            for alias, card, name, state, is_new in cards
+        ],
+    }
+
+
+def test_deferred_name_and_completed_receipt_settle_with_current_ready_card(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    path = tmp_path / "deferred-bound.txt"
+    path.write_text("synthetic", encoding="utf-8")
+    file_id = "file_deferred_bound"
+    page = _FakePage(
+        states=[_attachment_state(), *[_attachment_state(ready={path.name: 1})] * 3],
+        responses=[_NamedCreateResponse(path.name, file_id), _ProcessingResponse([
+            {"file_id": file_id, "event": "file.indexing.started", "extra": {
+                "retrieval_indexing_deferred": True, "library_file_name": path.name,
+            }},
+            {"file_id": file_id, "event": "file.processing.completed"},
+        ])],
+        bindings=[_bound_cards(("upload-1", "current-card", path.name, "ready", True))],
+    )
+    clock = _FakeClock()
+    monkeypatch.setattr(attachments, "_monotonic", clock.monotonic)
+    monkeypatch.setattr(attachments, "_sleep", clock.sleep)
+
+    result = asyncio.run(attachments.attach_files(page, [str(path)], timeout_seconds=0.5))
+
+    assert result == {path.name: (0, 1)}
+    assert page.listeners == {"response": []}
+    assert all(handle.dispose_calls == 1 for handle in page.handles)
+
+
+@pytest.mark.parametrize("frames", [[], [{"file_id": "file_absent", "event": "file.processing.completed"}]])
+def test_absent_name_policy_requires_current_receipt_bound_card(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, frames: list[dict[str, Any]],
+) -> None:
+    path = tmp_path / "absent.txt"
+    path.write_text("synthetic", encoding="utf-8")
+    page = _FakePage(
+        states=[_attachment_state(), *[_attachment_state(ready={path.name: 1})] * 3],
+        responses=[_NamedCreateResponse(path.name, "file_absent"), *([_ProcessingResponse(frames)] if frames else [])],
+        bindings=[_bound_cards(("upload-1", "current-card", path.name, "ready", True))],
+    )
+    clock = _FakeClock()
+    monkeypatch.setattr(attachments, "_monotonic", clock.monotonic)
+    monkeypatch.setattr(attachments, "_sleep", clock.sleep)
+
+    assert asyncio.run(attachments.attach_files(page, [str(path)], timeout_seconds=0.5)) == {path.name: (0, 1)}
+
+
+@pytest.mark.parametrize("binding", [
+    _bound_cards(),
+    _bound_cards(("upload-1", "replacement", "mixed.txt", "processing", True)),
+    _bound_cards(("upload-2", "replacement", "mixed.txt", "ready", True)),
+    _bound_cards(("upload-1", "prior-card", "mixed.txt", "ready", False)),
+])
+def test_name_counts_cannot_lend_readiness_to_a_different_current_snapshot(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, binding: dict[str, Any],
+) -> None:
+    path = tmp_path / "mixed.txt"
+    path.write_text("synthetic", encoding="utf-8")
+    page = _FakePage(
+        states=[_attachment_state(), *[_attachment_state(ready={path.name: 1})] * 3],
+        responses=[_NamedCreateResponse(path.name, "file_mixed")],
+        bindings=[binding],
+    )
+    clock = _FakeClock()
+    monkeypatch.setattr(attachments, "_monotonic", clock.monotonic)
+    monkeypatch.setattr(attachments, "_sleep", clock.sleep)
+
+    with pytest.raises(attachments.AttachmentSettleTimeoutError) as raised:
+        asyncio.run(attachments.attach_files(page, [str(path)], timeout_seconds=0.5))
+
+    assert raised.value.ready_attachments == 0
+    assert "1/1 observed composer-ready attachments" in str(raised.value)
+    assert "0/1 processing-qualified ready attachments" in str(raised.value)
+
+
+@pytest.mark.parametrize("frames", [
+    [{"file_id": "file_other", "event": "file.processing.completed"}],
+    [
+        {"file_id": "file_requested", "event": "file.indexing.started", "extra": {
+            "library_file_name": "requested.txt", "retrieval_indexing_deferred": False,
+        }},
+        {"file_id": "file_requested", "event": "file.processing.completed"},
+    ],
+])
+def test_requested_name_fallback_rejects_unknown_attribution_and_unsupported_present_name(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, frames: list[dict[str, Any]],
+) -> None:
+    path = tmp_path / "requested.txt"
+    path.write_text("synthetic", encoding="utf-8")
+    page = _FakePage(
+        states=[_attachment_state(), *[_attachment_state(ready={path.name: 1})] * 3],
+        responses=[_NamedCreateResponse(path.name, "file_requested"), _ProcessingResponse(frames)],
+        bindings=[_bound_cards(("upload-1", "current-card", path.name, "ready", True))],
+    )
+    clock = _FakeClock()
+    monkeypatch.setattr(attachments, "_monotonic", clock.monotonic)
+    monkeypatch.setattr(attachments, "_sleep", clock.sleep)
+
+    with pytest.raises(attachments.AttachmentSettleTimeoutError) as raised:
+        asyncio.run(attachments.attach_files(page, [str(path)], timeout_seconds=0.5))
+
+    assert raised.value.ready_attachments == 0
+    assert "1/1 observed composer-ready attachments" in str(raised.value)
+
+
+@pytest.mark.parametrize("frames", [
+    _processing_frames("file_requested", "renamed.txt"),
+    [
+        {"file_id": "file_requested", "event": "file.indexing.started", "extra": {
+            "library_file_name": "renamed.txt", "retrieval_indexing_deferred": True,
+        }},
+        {"file_id": "file_requested", "event": "file.processing.completed"},
+    ],
+])
+def test_authoritative_rename_cannot_borrow_requested_name_binding(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, frames: list[dict[str, Any]],
+) -> None:
+    path = tmp_path / "requested.txt"
+    path.write_text("synthetic", encoding="utf-8")
+    page = _FakePage(
+        states=[_attachment_state(), *[_attachment_state(ready={"renamed.txt": 1})] * 3],
+        responses=[_NamedCreateResponse(path.name, "file_requested"), _ProcessingResponse(frames)],
+        bindings=[_bound_cards(("upload-1", "current-card", path.name, "ready", True))],
+    )
+    clock = _FakeClock()
+    monkeypatch.setattr(attachments, "_monotonic", clock.monotonic)
+    monkeypatch.setattr(attachments, "_sleep", clock.sleep)
+
+    with pytest.raises(attachments.AttachmentSettleTimeoutError) as raised:
+        asyncio.run(attachments.attach_files(page, [str(path)], timeout_seconds=0.5))
+
+    assert raised.value.ready_attachments == 0
+
+
+@pytest.mark.parametrize("changed", [
+    _bound_cards(("upload-1", "replacement", "observed.txt", "processing", True)),
+    _bound_cards(("upload-2", "replacement", "observed.txt", "ready", True)),
+    _bound_cards(("upload-1", "replacement", "other.txt", "ready", True)),
+    _bound_cards(),
+])
+def test_pre_submit_current_binding_rejects_same_name_replacement(
+    tmp_path: Path, changed: dict[str, Any],
+) -> None:
+    async def run() -> None:
+        path = tmp_path / "observed.txt"
+        path.write_text("synthetic", encoding="utf-8")
+        current = _bound_cards(("upload-1", "settled-card", path.name, "ready", True))
+        page = _FakePage(
+            states=[_attachment_state(), *[_attachment_state(ready={path.name: 1})] * 5],
+            responses=[_NamedCreateResponse(path.name, "file_observed")],
+            bindings=[current],
+        )
+        observations = []
+        await attachments.attach_files(page, [str(path)], timeout_seconds=1, on_settlement=observations.append)
+        tracker = next(handle for handle in page.handles if isinstance(handle, _FakeBindingTracker))
+        tracker.states = iter([changed])
+
+        assert await observations[0].revalidate_before_submit() == "attachments-not-ready"
+        assert page.listeners["response"]
+        await observations[0].close()
+        assert page.listeners == {"response": []}
+        assert tracker.dispose_calls == 1
+        assert await observations[0].revalidate_before_submit() == "observer-closed"
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("snapshot", [
+    {**_bound_cards(), "conflict": True},
+    {**_bound_cards(), "failed_aliases": ["upload-1"]},
+    _bound_cards(("upload-1", "same-card", "conflict.txt", "ready", True),
+                 ("upload-2", "same-card", "conflict.txt", "ready", True)),
+    _bound_cards(("upload-1", "card-one", "conflict.txt", "ready", True),
+                 ("upload-1", "card-two", "conflict.txt", "ready", True)),
+])
+def test_current_card_conflicts_or_failure_never_count_as_partial_success(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, snapshot: dict[str, Any],
+) -> None:
+    path = tmp_path / "conflict.txt"
+    path.write_text("synthetic", encoding="utf-8")
+    page = _FakePage(
+        states=[_attachment_state(), *[_attachment_state(ready={path.name: 1})] * 3],
+        responses=[_NamedCreateResponse(path.name, "file_conflict")], bindings=[snapshot],
+    )
+    clock = _FakeClock()
+    monkeypatch.setattr(attachments, "_monotonic", clock.monotonic)
+    monkeypatch.setattr(attachments, "_sleep", clock.sleep)
+
+    with pytest.raises(attachments.AttachmentUploadFailedError):
+        asyncio.run(attachments.attach_files(page, [str(path)], timeout_seconds=0.5))
+
+    assert page.listeners == {"response": []}
+    assert all(handle.dispose_calls == 1 for handle in page.handles)
+
+
+def test_standalone_upload_pins_generic_form_before_local_drop(tmp_path: Path) -> None:
+    path = tmp_path / "local.txt"
+    path.write_text("synthetic", encoding="utf-8")
+
+    async def run() -> None:
+        async with async_playwright() as playwright:
+            executable = Path(playwright.chromium.executable_path)
+            if not executable.is_file():
+                candidates = sorted((Path.home() / "Library/Caches/ms-playwright").glob(
+                    "chromium-*/chrome-mac*/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing"
+                ))
+                if not candidates:
+                    pytest.skip("No local Chromium executable available")
+                executable = candidates[-1]
+            browser = await playwright.chromium.launch(executable_path=str(executable), headless=True)
+            try:
+                page = await browser.new_page()
+                await page.set_content('<main id="fallback"><form id="other"></form><form id="intended"><textarea id="composer"></textarea></form></main>')
+                await page.evaluate("""() => {
+                  window.dropTargets = [];
+                  document.querySelector('main').addEventListener('drop', (event) => {
+                    event.preventDefault(); window.dropTargets.push(event.target.id);
+                  });
+                }""")
+                with pytest.raises(attachments.AttachmentSettleTimeoutError):
+                    await attachments.attach_files(page, [str(path)], composer_selector="#composer", timeout_seconds=0.3)
+                assert await page.evaluate("window.dropTargets") == ["intended"]
+            finally:
+                await browser.close()
+
+    asyncio.run(run())
+
+
+def test_current_attachment_binding_with_real_dom_visibility_and_replacement() -> None:
+    async def run() -> None:
+        async with async_playwright() as playwright:
+            executable = Path(playwright.chromium.executable_path)
+            if not executable.is_file():
+                candidates = sorted((Path.home() / "Library/Caches/ms-playwright").glob(
+                    "chromium-*/chrome-mac*/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing"
+                ))
+                if not candidates:
+                    pytest.skip("No local Chromium executable available")
+                executable = candidates[-1]
+            browser = await playwright.chromium.launch(executable_path=str(executable), headless=True)
+            try:
+                page = await browser.new_page()
+                await page.set_content('<main><form data-chatgpt-composer><textarea class="composer"></textarea></form></main>')
+                result = await page.evaluate(r"""(source) => {
+                  const form = document.querySelector('form');
+                  const create = new Function(`return (${source});`)();
+                  const tracker = create({ form, composerSelector: '.composer', names: ['dom.txt'] });
+                  const wrapper2 = form.appendChild(document.createElement('div'));
+                  wrapper2.style.display = 'contents';
+                  wrapper2.innerHTML = '<div style="display:contents"><div><span><svg></svg></span><span><span>Text</span><span>dom.txt</span></span><span>91 B</span><button aria-label="Remove dom.txt">Remove</button></div></div>';
+                  const wrapper1 = wrapper2.firstElementChild;
+                  const card = wrapper1.firstElementChild;
+                  const pair = (tag, stateNode) => {
+                    const a = { tag, stateNode, flags: 0, return: null, alternate: null, child: null, sibling: null };
+                    const b = { ...a }; a.alternate = b; b.alternate = a; return [a, b];
+                  };
+                  const rootState = { current: null, containerInfo: document.querySelector('main') };
+                  const root = pair(3, rootState); rootState.current = root[0];
+                  const host = pair(5, wrapper1);
+                  const chain = [root, pair(5, form), pair(5, wrapper2), ...Array.from({ length: 6 }, () => pair(0, null)), host];
+                  for (let index = 0; index < chain.length - 1; index += 1) {
+                    for (const branch of [0, 1]) { chain[index][branch].child = chain[index + 1][branch]; chain[index + 1][branch].return = chain[index][branch]; }
+                  }
+                  for (const distance of [3, 4]) {
+                    const owner = chain[chain.length - 1 - distance];
+                    owner[0].memoizedProps = { attachment: { id: 'file_dom' } };
+                    owner[1].memoizedProps = {};
+                  }
+                  Object.defineProperty(wrapper1, '__reactFiber$test', { value: host[0] });
+                  const options = { aliases: { file_dom: 'upload-1' }, names: ['dom.txt'] };
+                  const ready = tracker.read(options);
+                  card.setAttribute('aria-busy', 'true');
+                  const processing = tracker.read(options);
+                  card.removeAttribute('aria-busy');
+                  card.style.visibility = 'hidden';
+                  const hidden = tracker.read(options);
+                  card.style.visibility = 'visible';
+                  const navigation = document.createElement('nav');
+                  const originalParent = form.parentElement;
+                  originalParent.appendChild(navigation);
+                  navigation.appendChild(form);
+                  const ineligibleForm = tracker.read(options);
+                  originalParent.appendChild(form);
+                  navigation.remove();
+                  rootState.current = root[1];
+                  const stale = tracker.read(options);
+                  return { ready, processing, hidden, ineligibleForm, stale };
+                }""", attachments.CREATE_ATTACHMENT_BINDING_TRACKER_JS)
+            finally:
+                await browser.close()
+        ready = result["ready"]
+        assert ready["valid"] and not ready["conflict"]
+        assert len(ready["bindings"]) == 1
+        assert ready["bindings"][0] == {
+            "alias": "upload-1", "card": "card-1", "name": "dom.txt",
+            "state": "ready", "visible": True, "is_new": True,
+        }
+        assert result["processing"]["bindings"][0]["state"] == "processing"
+        assert result["hidden"]["bindings"][0]["visible"] is False
+        assert result["ineligibleForm"]["valid"] is False
+        assert result["ineligibleForm"]["bindings"] == []
+        assert result["stale"]["bindings"] == []
+        assert result["stale"]["valid"] is False
+
+    asyncio.run(run())
+
+
+def test_processing_failure_during_binding_snapshot_is_not_settled(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    async def run() -> None:
+        observed = asyncio.Event()
+        failed = asyncio.Event()
+
+        class CompletedProcessing(_ProcessingResponse):
+            async def text(self) -> str:
+                result = await super().text()
+                observed.set()
+                return result
+
+        class LateFailure(_ProcessingResponse):
+            async def text(self) -> str:
+                result = await super().text()
+                failed.set()
+                return result
+
+        class LateFailurePage(_FakePage):
+            async def evaluate(self, script: str, argument: Any = None) -> Any:
+                if script == attachments.READ_COMPOSER_ATTACHMENT_STATE_JS and any(
+                    expression == attachments.CREATE_ATTACHMENT_FILE_JS for expression, _ in self.evaluate_handle_calls
+                ):
+                    await observed.wait()
+                return await super().evaluate(script, argument)
+
+            async def evaluate_handle(self, script: str, argument: Any) -> _FakeHandle:
+                handle = await super().evaluate_handle(script, argument)
+                if isinstance(handle, _FakeBindingTracker):
+                    read = handle.evaluate
+
+                    async def read_with_failure(expression: str, options: Any = None) -> Any:
+                        snapshot = await read(expression, options)
+                        if expression == attachments.READ_ATTACHMENT_BINDINGS_JS and not failed.is_set():
+                            response = LateFailure([{"file_id": "file_race", "event": "file.processing.failed"}])
+                            for listener in tuple(self.listeners["response"]):
+                                listener(response)
+                            await failed.wait()
+                            await asyncio.sleep(0)
+                        return snapshot
+
+                    handle.evaluate = read_with_failure
+                return handle
+
+        path = tmp_path / "race.txt"
+        path.write_text("synthetic", encoding="utf-8")
+        page = LateFailurePage(
+            states=[_attachment_state(), *[_attachment_state(ready={path.name: 1})] * 5],
+            responses=[_NamedCreateResponse(path.name, "file_race"), CompletedProcessing(_processing_frames("file_race", path.name))],
+            bindings=[_bound_cards(("upload-1", "race-card", path.name, "ready", True))],
+        )
+        with pytest.raises(attachments.AttachmentUploadFailedError):
+            await attachments.attach_files(page, [str(path)], timeout_seconds=1)
+        assert failed.is_set()
+        assert page.listeners == {"response": []}
+
+    clock = _FakeClock()
+    monkeypatch.setattr(attachments, "_monotonic", clock.monotonic)
+    monkeypatch.setattr(attachments, "_sleep", clock.sleep)
     asyncio.run(run())
