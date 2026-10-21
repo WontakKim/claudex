@@ -177,22 +177,46 @@ UUID.
 
 `attachments` contains file paths on the gateway host. Files must be UTF-8
 plain text without NUL bytes. An ask accepts at most 10 files and 1,200,000
-bytes in total. A completed file-create response does not confirm composer
-readiness. ChatGPT may rename a file during indexing; once processing is observed
-from the trusted stream for that file's create-receipt ID, a ready chip counts
-toward settlement only when
-both processing completes and a validated indexed display name is available, even
-if the name is unchanged. Without a per-file processing observation, the original
-filename readiness check applies. Pending processing responses also block
-settlement. Any missing, failed, or unsettled attachment blocks submission,
-including immediately before Send.
+bytes in total. Each create receipt must identify a distinct file and match its
+requested filename exactly. A completed create response is not processing
+completion, composer readiness, or submission confirmation.
 
-Failure details show requested and resolved names, available file IDs, observed
-composer states, and the pending processing response count. Per-file processing
-details distinguish no observation from incomplete processing and identify missing
-completion or indexed display-name metadata. The observed composer-ready count
-includes only new ready chips under the currently resolved names. It is
-diagnostic-only and does not satisfy processing requirements.
+ChatGPT may rename an attachment. The gateway accepts a validated
+`extra.library_file_name` from `file.indexing.completed`, or from
+`file.indexing.started` when `extra.retrieval_indexing_deferred` is exactly
+`true`. Indexing-started supplies a name, never completion: an observed file
+still needs `file.processing.completed` for the same receipt ID. A genuinely
+absent name may use the requested name after that completion; empty, invalid,
+conflicting, or unsupported present metadata is not absence. With no per-file
+processing observation, the requested name remains eligible, but pending or
+unattributed processing evidence cannot be treated as no observation.
+
+Every naming path also requires a current, visible, ready card whose name and
+`memoizedProps.attachment.id` match that receipt in the pinned composer form.
+The bounded renderer check resolves the current branch through its root and
+verifies that the current file owner actually owns the selected card wrapper.
+A marker, matching host node, filename, or ready count alone is insufficient.
+Unknown, malformed, stale, unrelated, or over-budget identity cannot qualify.
+Pre-existing cards in any state are excluded across renames and rerenders.
+Unclassifiable non-control composer content stops the upload before the drop;
+it is not treated as an empty attachment baseline.
+Same-name files require distinct receipt IDs and distinct new cards; repeated
+ID witnesses within one card count once, while conflicting ID/card assignments
+block settlement.
+
+The observer stays live through prompt fill and revalidates the current per-card
+ID, name, visibility, and state together immediately before Send. Pending work,
+late failures, form replacement, or lost readiness block submission. Inspection
+is deliberately bounded, including 512 renderer-return links and a 512-node,
+64-level owner subtree; a changed UI schema or exhausted bound fails closed
+rather than forcing Send. These checks establish attachment/card readiness, not
+that ChatGPT read every byte. An uncertain submission is never resubmitted.
+
+Failure details distinguish receipts, processing completion, name sources,
+current binding, and observed composer states. File IDs are shown as
+attempt-local aliases such as `upload-1`, not raw IDs. Per-name composer-ready
+counts are diagnostic only: a ready card from one snapshot cannot lend readiness
+to another card or ID from a later snapshot.
 
 Questions larger than 35,000 UTF-8 bytes are automatically moved into a
 temporary text attachment, so callers should send the complete question rather
@@ -301,8 +325,10 @@ confirms server acceptance. `upload_receipts` counts completed file-create
 responses. During upload, `ready_attachments` uses the processing-qualified
 readiness count described above, not the diagnostic-only observed composer-ready
 count. A visible ready chip can therefore leave `ready_attachments` at zero while
-processing completion or an indexed display name is missing. Job snapshots retain
-the highest observed counts; either field may be null when not observed.
+receipt attribution, processing completion, a supported name, or current card
+binding is missing. Job snapshots retain the highest observed counts; they are
+not current eligibility predicates and do not prove submission or content
+consumption. Either field may be null when not observed.
 `conversation_id` is the known thread ID, either explicitly selected or
 observed from a correlated ChatGPT event. `generation_observed` and
 `answer_seen` do not imply `raw_extracted`: only a completed, correlated raw

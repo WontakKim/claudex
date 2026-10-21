@@ -65,6 +65,48 @@ class _FakeResponse:
         self.request = request or _FakeRequest(url, "POST")
 
 
+class _FakeElementHandle:
+    def __init__(self, page: _FakePage, selector: str | None = None) -> None:
+        self.page = page
+        self.selector = selector
+        self.disposed = False
+
+    def as_element(self) -> _FakeElementHandle:
+        return self
+
+    async def evaluate(self, expression: str, argument: Any = None) -> Any:
+        if expression == ask.COMPOSER_ELEMENT_READBACK_PROBE_JS:
+            return await self.page.evaluate(
+                selectors.COMPOSER_READBACK_PROBE_JS,
+                {"selector": self.selector or selectors.COMPOSER_SELECTOR},
+            )
+        if expression == ask.attachments.READ_COMPOSER_ATTACHMENT_STATE_FOR_FORM_JS:
+            return await self.page.evaluate(
+                ask.attachments.READ_COMPOSER_ATTACHMENT_STATE_JS, argument,
+            )
+        return self.page.form_is_current
+
+    async def evaluate_handle(
+        self, expression: str, argument: Any = None,
+    ) -> _FakeElementHandle:
+        return _FakeElementHandle(self.page, selector=argument)
+
+    async def fill(self, value: str, *, timeout: int | None = None) -> None:
+        await self.page.fill(
+            self.selector or selectors.COMPOSER_SELECTOR, value, strict=True,
+        )
+
+    async def click(self, *, timeout: int) -> None:
+        await self.page.click(
+            self.selector or selectors.SEND_BUTTON_SELECTOR,
+            timeout=timeout,
+            strict=True,
+        )
+
+    async def dispose(self) -> None:
+        self.disposed = True
+
+
 class _FakePage:
     def __init__(
         self,
@@ -134,6 +176,9 @@ class _FakePage:
         self.goto_checked_listeners = False
         self.relock_id = "user-relocked"
         self.call_order: list[str] = []
+        self.form_is_current = True
+        self.form_capture_count = 0
+        self.form_handle = _FakeElementHandle(self)
 
     def on(self, event: str, listener: Callable[[Any], None]) -> None:
         self.listeners[event].append(listener)
@@ -155,6 +200,13 @@ class _FakePage:
             self.goto_checked_listeners = True
         if self.initial_response is not None:
             self._emit("response", self.initial_response)
+
+    async def evaluate_handle(
+        self, expression: str, argument: Any = None,
+    ) -> _FakeElementHandle:
+        self.form_capture_count += 1
+        self.form_handle.selector = argument
+        return self.form_handle
 
     async def wait_for_selector(
         self, selector: str, *, state: str, timeout: int
@@ -698,6 +750,23 @@ def test_listener_is_installed_before_navigation_and_submit(
     assert page.click_count == 1
 
 
+
+def _transfer_attachment_observation(callback: Any, blockers: tuple[str | None, ...] = (None,)) -> None:
+    remaining = iter(blockers)
+    last: str | None = None
+
+    async def revalidate() -> str | None:
+        nonlocal last
+        last = next(remaining, last)
+        return last
+
+    async def close() -> None:
+        return None
+
+    assert callable(callback)
+    callback(ask.attachments.AttachmentObservation(revalidate, close))
+
+
 def test_attachment_upload_runs_after_composer_and_before_fill(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -711,10 +780,17 @@ def test_attachment_upload_runs_after_composer_and_before_fill(
         *,
         timeout_seconds: float | None = None,
         on_progress: Callable[[int, int], None] | None = None,
+        composer_form_handle: Any | None = None,
+        composer_selector: str | None = None,
+        on_settlement: Callable[[attachments.AttachmentObservation], None] | None = None,
     ) -> dict[str, tuple[int, int]]:
         assert attached_page is page
+        assert composer_form_handle is page.form_handle
+        assert composer_selector == selectors.COMPOSER_SELECTOR
+        assert callable(on_settlement)
         page.call_order.append("attach")
         captured.append((attachment_paths, timeout_seconds))
+        _transfer_attachment_observation(on_settlement)
         return {"notes.txt": (0, 1)}
 
     monkeypatch.setattr(ask.attachments, "attach_files", attach_files)
@@ -732,6 +808,80 @@ def test_attachment_upload_runs_after_composer_and_before_fill(
     assert captured == [
         (("notes.txt",), ask.attachments.ATTACH_SETTLE_TIMEOUT_SECONDS)
     ]
+
+
+def test_wait_for_composer_pins_the_intended_form_handle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_clock(monkeypatch)
+    page = _FakePage()
+    execution = ask._AskExecution(page, "question", None)
+
+    asyncio.run(execution._wait_for_composer())
+
+    assert page.form_capture_count == 1
+    assert getattr(execution, "composer_form_handle", None) is page.form_handle
+
+
+def test_form_replacement_after_attachment_blocks_fill_and_submit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_clock(monkeypatch)
+    page = _FakePage()
+
+    async def replace_form_after_attachment(
+        *_args: Any, **_kwargs: Any,
+    ) -> dict[str, tuple[int, int]]:
+        page.form_is_current = False
+        return {"notes.txt": (0, 1)}
+
+    monkeypatch.setattr(ask.attachments, "attach_files", replace_form_after_attachment)
+    with pytest.raises(ask.GptProAskError) as raised:
+        asyncio.run(ask.execute_ask_outcome(
+            page, "question", attachment_paths=["notes.txt"],
+        ))
+
+    assert raised.value.failure == "error"
+    assert raised.value.evidence is not None
+    assert raised.value.evidence.failure_stage == "composer"
+    assert raised.value.evidence.submission == "not_attempted"
+    assert page.fill_actions == []
+    assert page.click_count == 0
+    assert page.form_capture_count == 1
+    assert page.form_handle.disposed
+
+
+def test_late_attachment_failure_blocks_send_and_closes_observer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_clock(monkeypatch)
+    page = _FakePage()
+    observer_state = {"closed": False}
+
+    async def revalidate() -> str | None:
+        return "processing-failed"
+
+    async def close() -> None:
+        observer_state["closed"] = True
+
+    async def attach_with_late_failure(
+        *_args: Any,
+        on_settlement: Callable[[ask.attachments.AttachmentObservation], None] | None = None,
+        **_kwargs: Any,
+    ) -> dict[str, tuple[int, int]]:
+        if on_settlement is not None:
+            on_settlement(ask.attachments.AttachmentObservation(revalidate, close))
+        return {"notes.txt": (0, 1)}
+
+    monkeypatch.setattr(ask.attachments, "attach_files", attach_with_late_failure)
+    with pytest.raises(ask.GptProAskError, match="attachment settlement changed before send"):
+        asyncio.run(ask.execute_ask_outcome(
+            page, "question", attachment_paths=["notes.txt"],
+        ))
+
+    assert page.click_count == 0
+    assert observer_state["closed"]
+    assert page.form_handle.disposed
 
 
 def test_renamed_attachment_is_checked_again_before_send(
@@ -756,6 +906,7 @@ def test_renamed_attachment_is_checked_again_before_send(
     page = RenamedAttachmentPage()
 
     async def attach_files(*_args: Any, **_kwargs: Any) -> dict[str, tuple[int, int]]:
+        _transfer_attachment_observation(_kwargs.get("on_settlement"), (None, "attachments-not-ready"))
         return {"effect(20260927-120843).ts": (0, 1)}
 
     monkeypatch.setattr(ask.attachments, "attach_files", attach_files)
@@ -788,6 +939,7 @@ def test_disappearing_attachment_blocks_enabled_send_button(
     page = ReRenderedPage()
 
     async def attach_files(*_args: Any, **_kwargs: Any) -> dict[str, tuple[int, int]]:
+        _transfer_attachment_observation(_kwargs.get("on_settlement"), ("attachments-not-ready",))
         return {"notes.txt": (0, 1)}
 
     monkeypatch.setattr(ask.attachments, "attach_files", attach_files)
@@ -823,6 +975,7 @@ def test_attachment_disappearing_after_send_ready_still_blocks_click(
     page = LateRerenderPage()
 
     async def attach_files(*_args: Any, **_kwargs: Any) -> dict[str, tuple[int, int]]:
+        _transfer_attachment_observation(_kwargs.get("on_settlement"), (None, "attachments-not-ready"))
         return {"notes.txt": (0, 1)}
 
     monkeypatch.setattr(ask.attachments, "attach_files", attach_files)
@@ -854,6 +1007,7 @@ def test_invalid_composer_attachment_count_blocks_send(
     page = InvalidAttachmentPage()
 
     async def attach_files(*_args: Any, **_kwargs: Any) -> dict[str, tuple[int, int]]:
+        _transfer_attachment_observation(_kwargs.get("on_settlement"), (None,))
         return {"notes.txt": (0, 1)}
 
     monkeypatch.setattr(ask.attachments, "attach_files", attach_files)
@@ -1284,6 +1438,167 @@ def test_dom_completion_observation_fetches_raw_turn(
 
     assert _run(page) == "raw from DOM trigger"
     assert page.fetch_count == 1
+
+
+
+def test_dom_completion_captures_late_page_conversation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_clock(monkeypatch)
+    page = _FakePage(
+        signal="none",
+        raw_text="raw from late conversation identity",
+        turn_states=[_dom_state(has_stop=True), _dom_state(has_stop=False)],
+    )
+    observed_conversation_ids: list[str] = []
+    evidence: list[ask.AskEvidence] = []
+    completion_observations: list[tuple[str, tuple[str, ...], int]] = []
+    original_evaluate = page.evaluate
+
+    async def evaluate_with_late_conversation(
+        expression: str, argument: Any = None,
+    ) -> Any:
+        result = await original_evaluate(expression, argument)
+        if expression == selectors.TURN_STATE_PROBE_JS and not result["hasStop"]:
+            page.url = f"https://chatgpt.com/c/{_CONVERSATION_ID}"
+        return result
+
+    def on_status(message: str) -> None:
+        if message == "completion observed; fetching the server answer":
+            completion_observations.append((
+                page.url, tuple(observed_conversation_ids), page.fetch_count,
+            ))
+
+    monkeypatch.setattr(page, "evaluate", evaluate_with_late_conversation)
+
+    outcome = asyncio.run(ask.execute_ask_outcome(
+        page, "Review this code",
+        callbacks=ask.AskCallbacks(
+            on_status=on_status,
+            on_conversation_id=observed_conversation_ids.append,
+            on_evidence=evidence.append,
+        ),
+    ))
+
+    assert outcome.text == "raw from late conversation identity"
+    assert outcome.conversation_id == _CONVERSATION_ID
+    assert observed_conversation_ids == [_CONVERSATION_ID]
+    assert completion_observations == [(
+        f"https://chatgpt.com/c/{_CONVERSATION_ID}", (), 0,
+    )]
+    assert next(item for item in evidence if item.answer_seen).conversation_id is None
+    assert evidence[-1].raw_extracted
+    assert all(
+        item.failure_stage is None and item.recovery == "not_attempted"
+        for item in evidence
+    )
+    assert page.click_count == 1
+    assert page.fetch_count == 1
+    assert page.session_fetch_count == 1
+    assert page.listeners == {"request": [], "requestfinished": [], "response": []}
+
+
+@pytest.mark.parametrize(
+    ("page_url", "has_correlated_request", "has_locked_user_echo", "expected_id"),
+    [
+        pytest.param(
+            f"https://chatgpt.com/c/{_CONVERSATION_ID}", True, False,
+            _CONVERSATION_ID, id="correlated-request",
+        ),
+        pytest.param(
+            f"https://chatgpt.com/c/{_CONVERSATION_ID.upper()}", False, True,
+            _CONVERSATION_ID, id="locked-echo",
+        ),
+        pytest.param("", False, True, None, id="absent-url"),
+        pytest.param("https://chatgpt.com/", False, True, None, id="fresh-url"),
+        pytest.param(
+            f"https://evil.example/c/{_CONVERSATION_ID}", False, True,
+            None, id="untrusted-origin",
+        ),
+        pytest.param(
+            f"http://chatgpt.com/c/{_CONVERSATION_ID}", True, False,
+            None, id="insecure-origin",
+        ),
+        pytest.param("https://[invalid/c/", False, True, None, id="malformed-url"),
+        pytest.param(
+            "https://chatgpt.com/c/not-a-uuid", False, True,
+            None, id="malformed-id",
+        ),
+        pytest.param(
+            f"https://chatgpt.com/c/{_CONVERSATION_ID}/other", False, True,
+            None, id="noncanonical-path",
+        ),
+        pytest.param(
+            f"https://chatgpt.com/c/{_CONVERSATION_ID}", False, False,
+            None, id="uncorrelated",
+        ),
+    ],
+)
+def test_response_fetch_captures_only_trusted_correlated_page_identity(
+    monkeypatch: pytest.MonkeyPatch,
+    page_url: str,
+    has_correlated_request: bool,
+    has_locked_user_echo: bool,
+    expected_id: str | None,
+) -> None:
+    _install_clock(monkeypatch)
+    page = _FakePage(signal="none")
+    page.url = page_url
+    observed_conversation_ids: list[str] = []
+    execution = ask._AskExecution(
+        page, "Review this code",
+        ask.AskCallbacks(on_conversation_id=observed_conversation_ids.append),
+    )
+    page.filled_prompt = execution.prompt
+    execution.has_correlated_request = has_correlated_request
+    execution.has_locked_user_echo = has_locked_user_echo
+
+    text = asyncio.run(execution._fetch_finished_turn())
+
+    assert text == ("server **raw** markdown" if expected_id is not None else None)
+    assert execution.network.conversation_id == expected_id
+    assert execution.evidence.conversation_id == expected_id
+    assert observed_conversation_ids == (
+        [expected_id] if expected_id is not None else []
+    )
+    assert [arguments["url"] for arguments in page.fetch_arguments] == (
+        [
+            "https://chatgpt.com/api/auth/session",
+            f"https://chatgpt.com/backend-api/conversation/{expected_id}",
+        ]
+        if expected_id is not None else []
+    )
+
+
+@pytest.mark.parametrize("identity_source", ["provided", "observed"])
+def test_response_fetch_preserves_latched_conversation(
+    monkeypatch: pytest.MonkeyPatch, identity_source: str,
+) -> None:
+    _install_clock(monkeypatch)
+    page = _FakePage(signal="none")
+    page.url = f"https://chatgpt.com/c/{_EVIL_CONVERSATION_ID}"
+    observed_conversation_ids: list[str] = []
+    provided_id = _CONVERSATION_ID.upper() if identity_source == "provided" else None
+    execution = ask._AskExecution(
+        page, "Review this code",
+        ask.AskCallbacks(on_conversation_id=observed_conversation_ids.append),
+        conversation_id=provided_id,
+    )
+    if identity_source == "observed":
+        execution._latch_conversation_id(_CONVERSATION_ID)
+    page.filled_prompt = execution.prompt
+    execution.has_locked_user_echo = True
+
+    assert asyncio.run(execution._fetch_finished_turn()) == "server **raw** markdown"
+    expected_id = provided_id or _CONVERSATION_ID
+    assert execution.network.conversation_id == expected_id
+    assert execution.evidence.conversation_id == expected_id
+    assert observed_conversation_ids == (
+        [_CONVERSATION_ID] if identity_source == "observed" else []
+    )
+    assert page.fetch_arguments[-1]["url"] == (
+        f"https://chatgpt.com/backend-api/conversation/{expected_id}"
+    )
 
 
 def test_dom_completion_without_raw_turn_is_no_raw_turn(
@@ -2847,7 +3162,85 @@ def test_playwright_click_timeout_abandons(isolated_locator_book):
     assert raised.value.failure == "submit_failed"
     assert execution.evidence.submission == "uncertain"
     assert page.click_count == 1
+    with pytest.raises(ask.GptProAskError) as reentry:
+        asyncio.run(execution._click_send())
+    assert reentry.value.failure == "submit_failed"
+    assert page.click_count == 1
+    assert execution.evidence.submission == "uncertain"
     assert not book.pending and not book.path.exists()
+
+
+def test_concurrent_click_send_calls_reserve_one_client_attempt() -> None:
+    page = _FakePage()
+    execution = ask._AskExecution(page, "question", None, timeout_seconds=10.0)
+    both_at_boundary = asyncio.Event()
+    release_revalidation = asyncio.Event()
+    release_click = asyncio.Event()
+    revalidation_calls = 0
+    click_calls = 0
+
+    class ValidCheck:
+        verdict = "valid"
+
+        def describe(self) -> str:
+            return "valid"
+
+    class DelayedClickHandle:
+        async def click(self, *, timeout: int) -> None:
+            nonlocal click_calls
+            assert timeout > 0
+            click_calls += 1
+            await release_click.wait()
+            raise RuntimeError("synthetic uncertain click")
+
+        async def dispose(self) -> None:
+            return None
+
+    async def no_op(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    async def no_missing_attachments() -> list[str]:
+        return []
+
+    async def check_send(_target: str, _selector: str) -> ValidCheck:
+        return ValidCheck()
+
+    async def create_send_handle(*_args: Any, **_kwargs: Any) -> DelayedClickHandle:
+        return DelayedClickHandle()
+
+    async def rendezvous_revalidation() -> None:
+        nonlocal revalidation_calls
+        revalidation_calls += 1
+        if revalidation_calls == 2:
+            both_at_boundary.set()
+        await release_revalidation.wait()
+
+    execution._dismiss_modal = no_op
+    execution._ensure_composer_form_current = no_op
+    execution._wait_for_send_ready = no_op
+    execution._process_network_actions = no_op
+    execution._missing_ready_attachments = no_missing_attachments
+    execution._check_locator = check_send
+    execution._element_in_composer_form = create_send_handle
+    execution._revalidate_attachment_observation = rendezvous_revalidation
+
+    async def run() -> list[BaseException | None]:
+        first = asyncio.create_task(execution._click_send())
+        second = asyncio.create_task(execution._click_send())
+        await asyncio.wait_for(both_at_boundary.wait(), timeout=1.0)
+        release_revalidation.set()
+        for _ in range(3):
+            await asyncio.sleep(0)
+        release_click.set()
+        return await asyncio.gather(first, second, return_exceptions=True)
+
+    outcomes = asyncio.run(run())
+
+    assert len(outcomes) == 2
+    assert all(isinstance(outcome, ask.GptProAskError) for outcome in outcomes)
+    assert click_calls == 1
+    assert execution.has_submitted is True
+    assert execution.evidence.submission == "uncertain"
 
 
 @pytest.mark.parametrize("target", ["composer", "send"])
@@ -3107,3 +3500,46 @@ def test_first_use_after_wait_phase_end(monkeypatch, isolated_locator_book, fail
     counted = not overall_expired and failure != "click_timeout"
     assert book._record("en-US", target).get("consecutive_failures", 0) == int(counted)
     assert (book.refusal("en-US", target) is not None) == counted
+
+
+def test_attachment_submission_requires_the_live_binding_observer() -> None:
+    page = _FakePage()
+    execution = ask._AskExecution(page, "question", None, attachment_paths=("notes.txt",))
+    execution.attachment_ready_counts = {"notes.txt": (0, 1)}
+
+    with pytest.raises(ask.GptProAskError, match="attachment.*observer.*unavailable"):
+        asyncio.run(execution._revalidate_attachment_observation())
+
+    assert page.click_count == 0
+    assert execution.has_submitted is False
+
+
+def test_per_name_counters_cannot_override_current_binding_readiness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_clock(monkeypatch)
+
+    class OldCounterPage(_FakePage):
+        async def evaluate(self, expression: str, argument: Any = None) -> Any:
+            if expression == ask.attachments.READ_COMPOSER_ATTACHMENT_STATE_JS:
+                return {"ready": {}, "processing": {}, "failed": {}, "unknown": {}}
+            return await super().evaluate(expression, argument)
+
+    page = OldCounterPage()
+    execution = ask._AskExecution(page, "question", None, attachment_paths=("notes.txt",))
+    execution.composer_form_handle = page.form_handle
+    execution.composer_selector = selectors.COMPOSER_SELECTOR
+    execution.attachment_ready_counts = {"notes.txt": (1, 1)}
+    validated = []
+
+    async def revalidate() -> str | None:
+        validated.append(True)
+        return None
+
+    async def close() -> None:
+        return None
+
+    execution.attachment_observation = ask.attachments.AttachmentObservation(revalidate, close)
+
+    assert asyncio.run(execution._missing_ready_attachments()) == []
+    assert validated == [True]

@@ -41,7 +41,6 @@ from claudex.gptpro.retry import (
 from claudex.gptpro.selectors import (
     ASSISTANT_MESSAGE_SELECTOR,
     CHALLENGE_DOM_PROBE_JS,
-    COMPOSER_READBACK_PROBE_JS,
     DISMISS_MODAL_PROBE_JS,
     MESSAGE_ID_ATTRIBUTE,
     MODAL_BUTTON_TEXTS,
@@ -56,6 +55,27 @@ from claudex.gptpro.selectors import (
     USER_MESSAGE_SELECTOR,
     VISIBLE_MODAL_PROBE_JS,
 )
+
+COMPOSER_ELEMENT_HANDLE_JS = """(form, selector) => {
+  const composers = Array.from(document.querySelectorAll(selector))
+    .filter((composer) => composer.closest('form') === form);
+  return composers.length === 1 ? composers[0] : null;
+}"""
+
+SEND_BUTTON_ELEMENT_HANDLE_JS = """(form, selector) => {
+  const buttons = Array.from(document.querySelectorAll(selector))
+    .filter((button) => button.form === form || button.closest('form') === form);
+  return buttons.length === 1 ? buttons[0] : null;
+}"""
+
+COMPOSER_ELEMENT_READBACK_PROBE_JS = r"""
+(composer) => {
+  if (!composer) return null;
+  if (typeof composer.value === 'string') return composer.value;
+  if (typeof composer.innerText === 'string') return composer.innerText;
+  return composer.textContent;
+}
+"""
 
 # Watchdog bound from ask submission.
 # Long-running workloads raise it via GPTPRO_OVERALL_TIMEOUT_SECONDS.
@@ -321,6 +341,9 @@ class _AskExecution:
         self.prompt = f"{self.marker}\n\n{question}\n\n{self.marker}"
         self.attachment_paths = tuple(attachment_paths or ())
         self.attachment_ready_counts: dict[str, tuple[int, int]] = {}
+        self.attachment_observation: attachments.AttachmentObservation | None = None
+        self.composer_form_handle: Any | None = None
+        self.composer_selector: str | None = None
         self.should_detach = should_detach
         self.on_detach = on_detach
         self.network = _NetworkState(conversation_id=conversation_id)
@@ -706,7 +729,7 @@ class _AskExecution:
         check = await self._await_page_operation(
             check_locator(
                 self.page.evaluate, target, selector,
-                composer_selector=self._selector("composer"),
+                composer_selector=(self.composer_selector or self._selector("composer")),
             )
         )
         if self.locator_environment is None and check.lang:
@@ -782,6 +805,94 @@ class _AskExecution:
         except OSError as exc:
             logger.warning("Could not record optional %s locator result: %s", target, exc)
 
+    async def _bind_composer_form(self, selector: str) -> None:
+        self._ensure_deadline()
+        try:
+            raw_handle = await self._await_page_operation(
+                self.page.evaluate_handle(
+                    attachments.CAPTURE_COMPOSER_FORM_HANDLE_JS, selector,
+                )
+            )
+        except _DeadlineExpired:
+            raise
+        except Exception as exc:
+            raise GptProAskError(
+                "locator_unresolved", "could not capture the intended composer form",
+            ) from exc
+        form_handle = raw_handle.as_element()
+        if form_handle is None:
+            await attachments._dispose_handle(raw_handle)
+            raise GptProAskError(
+                "locator_unresolved", "could not bind the intended composer form",
+            )
+        try:
+            is_current = await self._await_page_operation(
+                form_handle.evaluate(attachments.COMPOSER_FORM_CURRENT_JS, selector)
+            )
+        except _DeadlineExpired:
+            await attachments._dispose_handle(form_handle)
+            raise
+        except Exception as exc:
+            await attachments._dispose_handle(form_handle)
+            raise GptProAskError(
+                "locator_unresolved", "could not verify the intended composer form",
+            ) from exc
+        if is_current is not True:
+            await attachments._dispose_handle(form_handle)
+            raise GptProAskError(
+                "locator_unresolved",
+                "the intended composer form is not current and visible",
+            )
+        self.composer_form_handle = form_handle
+        self.composer_selector = selector
+
+    async def _ensure_composer_form_current(self) -> None:
+        if self.composer_form_handle is None:
+            await self._bind_composer_form(self._selector("composer"))
+        if self.composer_form_handle is None or self.composer_selector is None:
+            raise GptProAskError(
+                "error", "the active composer form binding is unavailable",
+            )
+        try:
+            is_current = await self._await_page_operation(
+                self.composer_form_handle.evaluate(
+                    attachments.COMPOSER_FORM_CURRENT_JS,
+                    self.composer_selector,
+                )
+            )
+        except _DeadlineExpired:
+            raise
+        except Exception as exc:
+            raise GptProAskError(
+                "error", "could not verify the active composer form",
+            ) from exc
+        if is_current is not True:
+            raise GptProAskError(
+                "error", "the active composer form changed",
+            )
+
+    async def _element_in_composer_form(
+        self, expression: str, selector: str, failure_message: str,
+    ) -> Any:
+        await self._ensure_composer_form_current()
+        if self.composer_form_handle is None:
+            raise GptProAskError(
+                "error", "the active composer form binding is unavailable",
+            )
+        try:
+            raw_handle = await self._await_page_operation(
+                self.composer_form_handle.evaluate_handle(expression, selector)
+            )
+        except _DeadlineExpired:
+            raise
+        except Exception as exc:
+            raise GptProAskError("error", failure_message) from exc
+        element_handle = raw_handle.as_element()
+        if element_handle is None:
+            await attachments._dispose_handle(raw_handle)
+            raise GptProAskError("error", failure_message)
+        return element_handle
+
     async def _wait_for_composer(self) -> None:
         end = min(self.deadline, _monotonic() + COMPOSER_TIMEOUT_MS / 1_000)
         # One bounded grace window per invocation: markers that vanish and
@@ -822,6 +933,7 @@ class _AskExecution:
                 if selector != self._selector("composer"):
                     continue
                 self.locator_selectors["composer"] = selector
+                await self._bind_composer_form(selector)
                 return
             markers = await self._probe_challenge()
             if markers:
@@ -862,6 +974,7 @@ class _AskExecution:
 
     async def _attach_files(self) -> None:
         self._ensure_deadline()
+        await self._ensure_composer_form_current()
         timeout_seconds = min(
             attachments.ATTACH_SETTLE_TIMEOUT_SECONDS, self._remaining()
         )
@@ -870,8 +983,13 @@ class _AskExecution:
                 self.page,
                 self.attachment_paths,
                 timeout_seconds=timeout_seconds,
+                composer_form_handle=self.composer_form_handle,
+                composer_selector=self.composer_selector or self._selector("composer"),
                 on_progress=lambda receipts, ready: self._record_evidence(
                     upload_receipts=receipts, ready_attachments=ready,
+                ),
+                on_settlement=lambda observation: setattr(
+                    self, "attachment_observation", observation,
                 ),
             )
             if not isinstance(ready_counts, dict) or not ready_counts or not all(
@@ -930,7 +1048,7 @@ class _AskExecution:
         return latest
 
     async def _fill_and_verify(self) -> None:
-        selector = self._selector("composer")
+        selector = self.composer_selector or self._selector("composer")
         check = await self._check_locator("composer", selector)
         if check.verdict != "valid":
             self._ensure_deadline()
@@ -943,32 +1061,47 @@ class _AskExecution:
                 f"the ChatGPT composer locator failed before fill ({check.describe()})",
             )
         self.locator_selectors["composer"] = selector
+        composer_handle = await self._element_in_composer_form(
+            COMPOSER_ELEMENT_HANDLE_JS,
+            selector,
+            "the composer no longer belongs to the active form",
+        )
+        readback_handle: Any | None = None
         try:
-            await self._await_page_operation(
-                self.page.fill(selector, self.prompt, strict=True)
+            try:
+                await self._await_page_operation(composer_handle.fill(self.prompt))
+            except _DeadlineExpired:
+                raise
+            except Exception as exc:
+                self._ensure_deadline()
+                self._settle_rediscovered(
+                    "composer", "failure", "could not fill the ChatGPT composer",
+                )
+                raise GptProAskError(
+                    "submit_failed", "could not fill the ChatGPT composer"
+                ) from exc
+            await self._ensure_composer_form_current()
+            readback_handle = await self._element_in_composer_form(
+                COMPOSER_ELEMENT_HANDLE_JS,
+                selector,
+                "the composer no longer belongs to the active form",
+            )
+            readback = await self._await_page_operation(
+                readback_handle.evaluate(COMPOSER_ELEMENT_READBACK_PROBE_JS)
             )
         except _DeadlineExpired:
             raise
-        except Exception as exc:
-            self._ensure_deadline()
-            self._settle_rediscovered("composer", "failure", "could not fill the ChatGPT composer")
-            raise GptProAskError(
-                "submit_failed", "could not fill the ChatGPT composer"
-            ) from exc
-        try:
-            readback = await self._await_page_operation(
-                self.page.evaluate(
-                    COMPOSER_READBACK_PROBE_JS,
-                    {"selector": selector},
-                )
-            )
-        except _DeadlineExpired:
+        except GptProAskError:
             raise
         except Exception as exc:
             self._settle_rediscovered("composer", "abandon")
             raise GptProAskError(
                 "submit_failed", "could not verify the ChatGPT composer contents"
             ) from exc
+        finally:
+            if readback_handle is not None:
+                await attachments._dispose_handle(readback_handle)
+            await attachments._dispose_handle(composer_handle)
         # Contenteditable can collapse blank lines and normalize line endings;
         # those changes are safe, but dropping prompt text is not.
         def normalize(value: str) -> str:
@@ -1059,13 +1192,20 @@ class _AskExecution:
         if not self.attachment_ready_counts:
             return []
         try:
+            await self._ensure_composer_form_current()
+            if self.composer_form_handle is None:
+                raise GptProAskError(
+                    "submit_failed", "the active composer form binding is unavailable",
+                )
             state = await self._await_page_operation(
-                self.page.evaluate(
-                    attachments.READ_COMPOSER_ATTACHMENT_STATE_JS,
+                self.composer_form_handle.evaluate(
+                    attachments.READ_COMPOSER_ATTACHMENT_STATE_FOR_FORM_JS,
                     list(self.attachment_ready_counts),
                 )
             )
         except _DeadlineExpired:
+            raise
+        except GptProAskError:
             raise
         except Exception as exc:
             raise GptProAskError(
@@ -1075,17 +1215,15 @@ class _AskExecution:
             raise GptProAskError(
                 "submit_failed", "active composer attachment probe returned invalid state"
             )
-        missing = [
-            name for name, (prior, requested) in self.attachment_ready_counts.items()
-            if state["ready"].get(name, 0) < prior + requested
-        ]
         self._record_evidence(
             ready_attachments=sum(
                 min(requested, max(0, state["ready"].get(name, 0) - prior))
                 for name, (prior, requested) in self.attachment_ready_counts.items()
             )
         )
-        return missing
+        # Per-name counters are advisory; the observer checks one current per-card snapshot.
+        await self._revalidate_attachment_observation()
+        return []
 
     async def _wait_for_send_ready(self) -> None:
         end = min(self.deadline, _monotonic() + SEND_READY_TIMEOUT_SECONDS)
@@ -1095,6 +1233,7 @@ class _AskExecution:
         check: LocatorCheck | None = None
         while _monotonic() < end:
             await self._process_network_actions()
+            await self._ensure_composer_form_current()
             selector = self._selector("send")
             readiness_error: Exception | None = None
             try:
@@ -1109,6 +1248,7 @@ class _AskExecution:
             except Exception as exc:
                 ready = False
                 readiness_error = exc
+            await self._ensure_composer_form_current()
             missing_attachments = await self._missing_ready_attachments()
             # Readiness alone cannot establish the contract. While waiting,
             # sample it once per second rather than on every readiness poll.
@@ -1155,18 +1295,51 @@ class _AskExecution:
             + (f" ({check.describe()})" if check is not None else "")
         )
 
+    async def _revalidate_attachment_observation(self) -> None:
+        observation = self.attachment_observation
+        if observation is None:
+            if self.attachment_ready_counts or self.attachment_paths:
+                raise GptProAskError(
+                    "submit_failed", "the live attachment binding observer is unavailable",
+                )
+            return
+        try:
+            blocker = await self._await_page_operation(
+                observation.revalidate_before_submit(),
+                maximum_seconds=attachments._MAX_PRE_SUBMIT_REVALIDATION_SECONDS,
+            )
+        except _DeadlineExpired:
+            raise
+        except Exception as exc:
+            raise GptProAskError(
+                "submit_failed", "could not revalidate attachment settlement before send",
+            ) from exc
+        if blocker is not None:
+            raise GptProAskError(
+                "submit_failed",
+                f"attachment settlement changed before send ({blocker}); "
+                f"affected names: {', '.join(repr(name) for name in self.attachment_ready_counts)}",
+            )
+
     async def _click_send(self) -> None:
         from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
+        if self.has_submitted:
+            raise GptProAskError(
+                "submit_failed", "a client submission attempt is already reserved",
+            )
         await self._dismiss_modal()
+        await self._ensure_composer_form_current()
         await self._wait_for_send_ready()
         await self._process_network_actions()
+        await self._ensure_composer_form_current()
         missing_attachments = await self._missing_ready_attachments()
         if missing_attachments:
             raise GptProAskError(
                 "submit_failed", "attachments no longer ready in the active "
                 "composer: " + ", ".join(repr(name) for name in missing_attachments)
             )
+        await self._ensure_composer_form_current()
         selector = self._selector("send")
         check = await self._check_locator("send", selector)
         if check.verdict != "valid":
@@ -1180,17 +1353,27 @@ class _AskExecution:
                 f"the ChatGPT send locator failed before click ({check.describe()})",
             )
         self.locator_selectors["send"] = selector
+        send_handle = await self._element_in_composer_form(
+            SEND_BUTTON_ELEMENT_HANDLE_JS,
+            selector,
+            "the send button no longer belongs to the active form",
+        )
         try:
+            await self._revalidate_attachment_observation()
+            if self.has_submitted:
+                raise GptProAskError(
+                    "submit_failed", "a client submission attempt is already reserved",
+                )
             self.has_submitted = True
             self._record_evidence(submission="uncertain")
             await self._await_page_operation(
-                self.page.click(
-                    selector,
-                    strict=True,
+                send_handle.click(
                     timeout=self._timeout_ms(SEND_READY_TIMEOUT_SECONDS),
                 )
             )
         except _DeadlineExpired:
+            raise
+        except GptProAskError:
             raise
         except Exception as exc:
             self._ensure_deadline()
@@ -1201,6 +1384,8 @@ class _AskExecution:
             raise GptProAskError(
                 "submit_failed", "could not click the ChatGPT send button"
             ) from exc
+        finally:
+            await attachments._dispose_handle(send_handle)
         if self.response_wait_started_at is None:
             self.response_wait_started_at = _monotonic()
             self.last_heartbeat_at = self.response_wait_started_at
@@ -1469,6 +1654,7 @@ class _AskExecution:
         )
 
     async def _fetch_finished_turn(self) -> str | None:
+        self._capture_trusted_page_conversation()
         if self.network.conversation_id is None:
             return None
         for attempt in range(API_TURN_ATTEMPTS):
@@ -1653,7 +1839,9 @@ class _AskExecution:
                     self.stage = "attachments"
                     await self._attach_files()
                 self.stage = "composer"
+                await self._ensure_composer_form_current()
                 pre_submit_ids = await self._stable_pre_submit_user_ids()
+                await self._ensure_composer_form_current()
                 await self._fill_and_verify()
                 self.stage = "submission"
                 await self._click_send()
@@ -1669,6 +1857,12 @@ class _AskExecution:
                 for target in tuple(self.unproven_locators):
                     self._settle_rediscovered(target, "abandon")
                 await self._remove_listeners()
+                if self.attachment_observation is not None:
+                    await self.attachment_observation.close()
+                    self.attachment_observation = None
+                if self.composer_form_handle is not None:
+                    await attachments._dispose_handle(self.composer_form_handle)
+                    self.composer_form_handle = None
 
             if isinstance(completion, AskSubmission):
                 if self.on_detach is None:

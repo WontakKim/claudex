@@ -724,6 +724,8 @@ def test_real_asgi_exit_joins_pending_heartbeat_read_and_preserves_primary(
         if has_cleanup_error:
             transport.cleanup_error = RuntimeError("synthetic ASGI cleanup failure")
         response = await _response(transport)
+        # The response prefetch already set this event; wait for the heartbeat's read.
+        transport.read_started.clear()
         failure = BrokenPipeError("synthetic ASGI send failure")
         ping_sent = asyncio.Event()
         disconnect = asyncio.Event()
@@ -736,6 +738,7 @@ def test_real_asgi_exit_joins_pending_heartbeat_read_and_preserves_primary(
                 raise failure
             if message.get("body") != _PING.encode():
                 return
+            await asyncio.wait_for(transport.read_started.wait(), timeout=1)
             assert transport.active_reads == 1
             pending_read = transport.read_tasks[-1]
             ping_sent.set()

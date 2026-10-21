@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from claudex.gptpro import ask, jobs
+from claudex.gptpro import ask, jobs, selectors
 from claudex.gptpro.jobs import service as jobs_service
 
 
@@ -1555,6 +1555,89 @@ def test_composer_rejection_resubmits_as_attachment(
             await service.aclose()
 
     caplog.set_level(logging.INFO, logger="claudex.gptpro.jobs")
+    asyncio.run(scenario())
+
+
+def test_form_binding_failure_does_not_spill_or_start_a_second_ask(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider_calls = 0
+    attachment_paths_seen: list[Sequence[str] | None] = []
+    spill_calls: list[Path] = []
+
+    class ReplacedFormHandle:
+        async def evaluate(self, expression: str, selector: str) -> bool:
+            assert expression == ask.attachments.COMPOSER_FORM_CURRENT_JS
+            assert selector == selectors.COMPOSER_SELECTOR
+            return False
+
+    def spill_question(
+        question: str, attachment_paths: Sequence[str] | None,
+    ) -> tuple[str, list[str], Path]:
+        path = tmp_path / f"gptpro-spill-{len(spill_calls)}.txt"
+        path.write_text(question, encoding="utf-8")
+        spill_calls.append(path)
+        return f"spill {path.name}", [str(path), *(attachment_paths or ())], path
+
+    monkeypatch.setattr(jobs_service, "_spill_question", spill_question)
+
+    async def provider(
+        question: str,
+        *,
+        callbacks: ask.AskCallbacks | None = None,
+        conversation_id: str | None = None,
+        timeout_seconds: float | None = None,
+        attachment_paths: Sequence[str] | None = None,
+    ) -> ask.AskOutcome:
+        nonlocal provider_calls
+        provider_calls += 1
+        attachment_paths_seen.append(attachment_paths)
+        if provider_calls > 1:
+            return ask.AskOutcome("unexpected fallback", "fallback-marker", conversation_id)
+        execution = ask._AskExecution(
+            object(), question, callbacks,
+            conversation_id=conversation_id,
+            timeout_seconds=timeout_seconds,
+            attachment_paths=attachment_paths,
+        )
+        execution.stage = "composer"
+        execution.composer_form_handle = ReplacedFormHandle()
+        execution.composer_selector = selectors.COMPOSER_SELECTOR
+        execution._record_evidence(
+            failure_stage="composer",
+            submission="not_attempted",
+            upload_receipts=1,
+            ready_attachments=1,
+        )
+        try:
+            await execution._ensure_composer_form_current()
+        except ask.GptProAskError as exc:
+            exc.evidence = execution.evidence
+            raise
+        raise AssertionError("the replaced form unexpectedly remained current")
+
+    async def scenario() -> None:
+        service = jobs.AskJobService(provider)
+        started = service.start("short inline question")
+        try:
+            job = None
+            for _ in range(1_000):
+                job = service.status(started.ask_id)
+                if job is not None and job.state in ("failed", "succeeded"):
+                    break
+                await asyncio.sleep(0.001)
+            assert job is not None
+            assert job.state == "failed"
+            assert job.failure == "error"
+            assert job.evidence.failure_stage == "composer"
+            assert job.evidence.submission == "not_attempted"
+            assert provider_calls == 1
+            assert attachment_paths_seen == [None]
+            assert spill_calls == []
+            assert not list(tmp_path.glob("gptpro-spill-*.txt"))
+        finally:
+            await service.aclose()
+
     asyncio.run(scenario())
 
 

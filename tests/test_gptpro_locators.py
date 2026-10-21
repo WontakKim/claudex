@@ -10,7 +10,7 @@ from typing import Any
 import pytest
 from playwright.async_api import async_playwright
 
-from claudex.gptpro import locators, selectors
+from claudex.gptpro import attachments, locators, selectors
 
 
 @pytest.mark.parametrize(
@@ -198,6 +198,139 @@ def test_composer_contract_prefers_known_composer_form() -> None:
     assert candidates[0]["formDataAttributes"] == ["data-chatgpt-composer"]
     assert _check(html, selector=candidates[0]["selector"]).verdict == "valid"
     assert _check(html, selector="form[data-other] textarea").eligible == 0
+
+
+def test_attachment_form_capture_and_drop_follow_generic_composer_contract() -> None:
+    html = (
+        '<form><textarea role="textbox">Text</textarea>'
+        '<button type="submit">Send</button></form>'
+    )
+    composer_selector = 'form textarea[role="textbox"]'
+
+    async def run() -> None:
+        async with async_playwright() as playwright:
+            executable = Path(playwright.chromium.executable_path)
+            if not executable.is_file():
+                candidates = sorted((Path.home() / "Library/Caches/ms-playwright").glob(
+                    "chromium-*/chrome-mac*/Google Chrome for Testing.app/"
+                    "Contents/MacOS/Google Chrome for Testing"
+                ))
+                if not candidates:
+                    pytest.skip("No local Chromium executable available")
+                executable = candidates[-1]
+            browser = await playwright.chromium.launch(
+                executable_path=str(executable), headless=True,
+            )
+            try:
+                page = await browser.new_page()
+                await page.set_content(html)
+                composer_check = await locators.check_locator(
+                    page.evaluate,
+                    "composer",
+                    composer_selector,
+                    composer_selector=composer_selector,
+                )
+                send_check = await locators.check_locator(
+                    page.evaluate,
+                    "send",
+                    'button[type="submit"]',
+                    composer_selector=composer_selector,
+                )
+                assert composer_check.verdict == "valid"
+                assert send_check.verdict == "valid"
+
+                form_reference = await page.evaluate_handle(
+                    attachments.CAPTURE_COMPOSER_FORM_HANDLE_JS,
+                    composer_selector,
+                )
+                form_handle = form_reference.as_element()
+                assert form_handle is not None
+                assert await form_handle.evaluate(
+                    attachments.COMPOSER_FORM_CURRENT_JS, composer_selector,
+                ) is True
+                transfer_handle = await page.evaluate_handle("() => new DataTransfer()")
+                drop_script = attachments._dispatch_attachment_drop_for_form_js(
+                    composer_selector,
+                )
+                assert await form_handle.evaluate(
+                    drop_script, transfer_handle,
+                ) == "intended-form"
+
+                await page.set_content(html)
+                assert await form_handle.evaluate(
+                    attachments.COMPOSER_FORM_CURRENT_JS, composer_selector,
+                ) is False
+                await transfer_handle.dispose()
+                await form_handle.dispose()
+            finally:
+                await browser.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    ("wrapper_open", "wrapper_close", "expected_current"),
+    [
+        ('<div style="opacity:0">', '</div>', False),
+        ('<div aria-hidden="true">', '</div>', False),
+        ('<div style="display:contents">', '</div>', True),
+    ],
+    ids=["opacity-hidden-ancestor", "aria-hidden-ancestor", "boxless-ancestor"],
+)
+def test_attachment_form_current_rejects_hidden_ancestors_but_allows_boxless(
+    wrapper_open: str, wrapper_close: str, expected_current: bool,
+) -> None:
+    html = (
+        wrapper_open
+        + '<form><textarea role="textbox">Text</textarea>'
+        '<button type="submit">Send</button></form>'
+        + wrapper_close
+    )
+    composer_selector = 'form textarea[role="textbox"]'
+
+    async def run() -> None:
+        async with async_playwright() as playwright:
+            executable = Path(playwright.chromium.executable_path)
+            if not executable.is_file():
+                candidates = sorted((Path.home() / "Library/Caches/ms-playwright").glob(
+                    "chromium-*/chrome-mac*/Google Chrome for Testing.app/"
+                    "Contents/MacOS/Google Chrome for Testing"
+                ))
+                if not candidates:
+                    pytest.skip("No local Chromium executable available")
+                executable = candidates[-1]
+            browser = await playwright.chromium.launch(
+                executable_path=str(executable), headless=True,
+            )
+            try:
+                page = await browser.new_page()
+                await page.set_content(html)
+                locator_check = await locators.check_locator(
+                    page.evaluate,
+                    "composer",
+                    composer_selector,
+                    composer_selector=composer_selector,
+                )
+                assert locator_check.verdict == "valid"
+                form_reference = await page.evaluate_handle(
+                    attachments.CAPTURE_COMPOSER_FORM_HANDLE_JS,
+                    composer_selector,
+                )
+                form_handle = form_reference.as_element()
+                is_current = (
+                    await form_handle.evaluate(
+                        attachments.COMPOSER_FORM_CURRENT_JS, composer_selector,
+                    )
+                    if form_handle is not None else False
+                )
+                assert is_current is expected_current
+                assert (form_handle is not None) is expected_current
+                if form_handle is not None:
+                    await form_handle.dispose()
+            finally:
+                await browser.close()
+
+    asyncio.run(run())
 
 
 def test_composer_contract_allows_generic_form_after_markup_drift() -> None:
