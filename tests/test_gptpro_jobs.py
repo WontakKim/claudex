@@ -2533,3 +2533,28 @@ def test_explicit_recovery_retains_generated_files_and_completeness() -> None:
         await service.aclose()
 
     asyncio.run(scenario())
+
+
+def test_partial_evidence_preserves_latest_attachment_diagnostics() -> None:
+    first = ask.attachments.AttachmentDiagnostics(phase="dispatch")
+    final = ask.attachments.AttachmentDiagnostics(phase="settlement", outcome="timeout")
+
+    async def provider(_question: str, *, callbacks: ask.AskCallbacks, **_kwargs: object) -> ask.AskOutcome:
+        callbacks.on_evidence(ask.AskEvidence(attachment_diagnostics=first))
+        callbacks.on_evidence(ask.AskEvidence(attachment_diagnostics=final))
+        callbacks.on_evidence(ask.AskEvidence())
+        failure = ask.GptProAskError("error", "attachment timeout")
+        failure.evidence = ask.AskEvidence(failure_stage="attachments")
+        raise failure
+
+    async def scenario() -> None:
+        service = jobs.AskJobService(provider)
+        started = service.start("synthetic")
+        failed = await _wait_for_state(service, started.ask_id, "failed")
+        assert failed.evidence.attachment_diagnostics == final
+        assert service.status(started.ask_id).evidence.attachment_diagnostics == final
+        assert service.result(started.ask_id).evidence.attachment_diagnostics == final
+        assert failed.evidence.submission == "not_attempted"
+        await service.aclose()
+
+    asyncio.run(scenario())

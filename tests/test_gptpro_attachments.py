@@ -9,6 +9,7 @@ import json
 import shutil
 import subprocess
 from collections.abc import Callable
+from dataclasses import asdict
 from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
@@ -71,6 +72,24 @@ class _FakeBindingTracker(_FakeHandle):
         raise AssertionError("unexpected binding tracker evaluation")
 
 
+class _FakeDropPreflight(_FakeHandle):
+    def __init__(self, page: _FakePage, expected: list[dict[str, Any]], data_transfer: Any) -> None:
+        super().__init__("drop-preflight")
+        self.page = page
+        self.expected = expected
+        self.data_transfer = data_transfer
+
+    async def evaluate(self, script: str, argument: Any = None) -> Any:
+        if script == "(preflight) => preflight.read()":
+            return {"state": "eligible", "reason": "observed-capture-path", "receiver_relationship": "ancestor",
+                    "file_count": len(self.expected), "item_count": len(self.expected),
+                    "file_sizes": [file["size"] for file in self.expected]}
+        if script == "(preflight) => preflight.dispatch()":
+            await self.page.evaluate(attachments.DISPATCH_ATTACHMENT_DROP_JS, self.data_transfer)
+            return {"target": "intended-form", "events": []}
+        raise AssertionError("unexpected preflight evaluation")
+
+
 class _FakeComposerFormHandle(_FakeHandle):
     def __init__(
         self, page: _FakePage, *, invalidate_after_state: bool = False,
@@ -82,7 +101,6 @@ class _FakeComposerFormHandle(_FakeHandle):
         self.composer_selector = composer_selector
         self.is_current = True
         self.calls: list[tuple[str, Any]] = []
-        self.drop_calls = 0
 
     def as_element(self) -> _FakeComposerFormHandle:
         return self
@@ -98,13 +116,6 @@ class _FakeComposerFormHandle(_FakeHandle):
             if self.invalidate_after_state:
                 self.is_current = False
             return state
-        if script == attachments._dispatch_attachment_drop_for_form_js(
-            self.composer_selector,
-        ):
-            self.drop_calls += 1
-            return await self.page.evaluate(
-                attachments.DISPATCH_ATTACHMENT_DROP_JS, argument,
-            )
         raise AssertionError("unexpected composer form evaluation")
 
 
@@ -131,12 +142,14 @@ class _FakePage:
         self.handles: list[_FakeHandle] = []
 
     def on(self, event: str, listener: Callable[[Any], None]) -> None:
-        self.listeners[event].append(listener)
+        self.listeners.setdefault(event, []).append(listener)
 
     def remove_listener(
         self, event: str, listener: Callable[[Any], None]
     ) -> None:
         self.listeners[event].remove(listener)
+        if event != "response" and not self.listeners[event]:
+            del self.listeners[event]
 
     async def evaluate_handle(self, script: str, argument: Any) -> _FakeHandle:
         self.evaluate_handle_calls.append((script, argument))
@@ -144,6 +157,8 @@ class _FakePage:
             handle = _FakeComposerFormHandle(self, composer_selector=argument)
         elif script == attachments.CREATE_ATTACHMENT_BINDING_TRACKER_JS:
             handle = _FakeBindingTracker(self.binding_states, self.baseline_valid)
+        elif script == attachments.CREATE_ATTACHMENT_DROP_PREFLIGHT_JS:
+            handle = _FakeDropPreflight(self, argument["expected"], argument["dataTransfer"])
         else:
             handle = _FakeHandle(f"handle-{len(self.handles)}")
         self.handles.append(handle)
@@ -343,6 +358,7 @@ def test_attach_files_dispatches_drop_and_waits_for_settlement(
         attachments.CREATE_ATTACHMENT_FILE_JS,
         attachments.CREATE_ATTACHMENT_DATA_TRANSFER_JS,
         attachments.CREATE_ATTACHMENT_BINDING_TRACKER_JS,
+        attachments.CREATE_ATTACHMENT_DROP_PREFLIGHT_JS,
     ]
     first_descriptor = page.evaluate_handle_calls[1][1]
     second_descriptor = page.evaluate_handle_calls[2][1]
@@ -401,7 +417,6 @@ def test_form_replacement_after_baseline_blocks_attachment_drop(
                for script, _ in form_handle.calls)
     assert any(script == attachments.READ_COMPOSER_ATTACHMENT_STATE_FOR_FORM_JS
                for script, _ in form_handle.calls)
-    assert form_handle.drop_calls == 0
     assert not any(script == attachments.DISPATCH_ATTACHMENT_DROP_JS
                    for script, _ in page.evaluate_calls)
     assert page.listeners == {"response": []}
@@ -1950,17 +1965,20 @@ def test_settlement_observer_catches_late_failure_before_submit(
             ],
         )
         observations = []
+        snapshots = []
         counts = await attachments.attach_files(
             page,
             [str(attachment)],
             timeout_seconds=1,
             on_settlement=observations.append,
+            on_diagnostics=snapshots.append,
         )
 
         assert counts == {attachment.name: (0, 1)}
         assert len(observations) == 1
         assert len(page.listeners["response"]) == 1
         assert await observations[0].revalidate_before_submit() is None
+        assert snapshots[-1].pre_submit_result == "ready"
         late_failure = _ProcessingResponse([{
             "file_id": "file_observed", "event": "file.processing.failed",
         }])
@@ -1968,6 +1986,8 @@ def test_settlement_observer_catches_late_failure_before_submit(
             listener(late_failure)
 
         assert await observations[0].revalidate_before_submit() == "processing-failed"
+        assert snapshots[-1].pre_submit_result == "processing-failed"
+        assert snapshots[-1].outcome == "blocked"
         await observations[0].close()
         assert page.listeners["response"] == []
 
@@ -1979,6 +1999,7 @@ def test_settlement_observer_catches_late_failure_before_submit(
 
 _BINDING_GRAPH_PROGRAM = r"""
 (function () {
+  globalThis.File ??= require('node:buffer').File;
   const fs = require('fs');
   const input = JSON.parse(fs.readFileSync(0, 'utf8'));
   const createTracker = new Function(`return (${input.source});`)();
@@ -2503,6 +2524,10 @@ def test_standalone_upload_pins_generic_form_before_local_drop(tmp_path: Path) -
                 await page.set_content('<main id="fallback"><form id="other"></form><form id="intended"><textarea id="composer"></textarea></form></main>')
                 await page.evaluate("""() => {
                   window.dropTargets = [];
+                  Object.defineProperty(document.querySelector('#intended'), '__reactProps$test', {value: {onDropCapture() {}}});
+                  Object.defineProperty(document.querySelector('main'), '__reactProps$test', {value: {
+                    onDragEnterCapture() {}, onDragOverCapture() {}, onDropCapture() {},
+                  }});
                   document.querySelector('main').addEventListener('drop', (event) => {
                     event.preventDefault(); window.dropTargets.push(event.target.id);
                   });
@@ -2656,3 +2681,405 @@ def test_processing_failure_during_binding_snapshot_is_not_settled(
     monkeypatch.setattr(attachments, "_monotonic", clock.monotonic)
     monkeypatch.setattr(attachments, "_sleep", clock.sleep)
     asyncio.run(run())
+
+
+@pytest.mark.parametrize("mode", ["no_request", "rejected", "transport_failed", "pending", "setup_exhausted"])
+def test_upload_diagnostics_distinguish_unobserved_and_failed_transport(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, mode: str,
+) -> None:
+    attachment = tmp_path / "private-name.txt"
+    attachment.write_text("private attachment text", encoding="utf-8")
+    clock = _FakeClock()
+    monkeypatch.setattr(attachments, "_monotonic", clock.monotonic)
+    monkeypatch.setattr(attachments, "_sleep", clock.sleep)
+    snapshots = []
+
+    class Page(_FakePage):
+        async def evaluate_handle(self, script: str, argument: Any) -> _FakeHandle:
+            if mode == "setup_exhausted" and script == attachments.CREATE_ATTACHMENT_FILE_JS:
+                clock.value += 1
+            return await super().evaluate_handle(script, argument)
+
+        async def evaluate(self, script: str, argument: Any = None) -> Any:
+            if script != attachments.DISPATCH_ATTACHMENT_DROP_JS:
+                return await super().evaluate(script, argument)
+            if mode in ("rejected", "transport_failed", "pending"):
+                request = SimpleNamespace(method="POST", url="https://chatgpt.com/backend-api/files")
+                for callback in tuple(self.listeners.get("request", [])):
+                    callback(request)
+                if mode == "rejected":
+                    response = SimpleNamespace(request=request, url=request.url, status=429)
+                    for callback in tuple(self.listeners["response"]):
+                        callback(response)
+                    for callback in tuple(self.listeners.get("requestfinished", [])):
+                        callback(request)
+                elif mode == "transport_failed":
+                    for callback in tuple(self.listeners.get("requestfailed", [])):
+                        callback(request)
+            return "intended-form"
+
+    page = Page(responses=[])
+    error = attachments.AttachmentPreflightError if mode == "setup_exhausted" else attachments.AttachmentSettleTimeoutError
+    with pytest.raises(error) as raised:
+        asyncio.run(attachments.attach_files(
+            page, [str(attachment)], timeout_seconds=0.01, on_diagnostics=snapshots.append,
+        ))
+    diagnostic = snapshots[-1]
+    assert diagnostic.outcome == ("failed" if mode == "setup_exhausted" else "timeout")
+    if mode == "setup_exhausted":
+        assert diagnostic.drop_started_ms is diagnostic.drop_returned_ms is None
+        assert not any(script == attachments.DISPATCH_ATTACHMENT_DROP_JS for script, _ in page.evaluate_calls)
+    else:
+        assert diagnostic.drop_started_ms is not None
+        assert diagnostic.drop_returned_ms is not None
+    assert diagnostic.file_sizes == (len(attachment.read_bytes()),)
+    if mode != "setup_exhausted":
+        assert raised.value.completed_file_create_responses == 0
+        assert raised.value.ready_attachments == 0
+    assert page.listeners == {"response": []}
+    events = [event.event for event in diagnostic.events]
+    if mode == "rejected":
+        assert "requestfinished" in events
+        assert any(event.status == 429 for event in diagnostic.events)
+    elif mode == "transport_failed":
+        assert "requestfailed" in events
+        assert "response" not in events
+    elif mode == "pending":
+        assert "request" in events
+        assert "response" not in events
+        assert "requestfinished" not in events
+    else:
+        assert "request" not in events
+    if mode == "setup_exhausted":
+        assert diagnostic.poll_attempts == diagnostic.poll_completions == 0
+        assert diagnostic.last_poll_ms is None
+    else:
+        assert diagnostic.poll_completions > 0
+    serialized = json.dumps(asdict(diagnostic))
+    assert str(tmp_path) not in serialized
+    assert "private-name" not in serialized
+    assert "private attachment text" not in serialized
+
+
+def test_pre_submit_diagnostics_record_current_binding_conflict(tmp_path: Path) -> None:
+    async def run() -> None:
+        attachment = tmp_path / "synthetic.txt"
+        attachment.write_text("synthetic", encoding="utf-8")
+        page = _FakePage(
+            states=[_attachment_state(), *[_attachment_state(ready={attachment.name: 1})] * 3],
+            responses=[_NamedCreateResponse(attachment.name, "file_synthetic")],
+            bindings=[_bound_cards(("upload-1", "card", attachment.name, "ready", True))],
+        )
+        observations = []
+        snapshots = []
+        await attachments.attach_files(
+            page, [str(attachment)], timeout_seconds=1,
+            on_settlement=observations.append, on_diagnostics=snapshots.append,
+        )
+        assert snapshots[-1].outcome == "settled"
+        assert snapshots[-1].binding_conflict is False
+        tracker = next(handle for handle in page.handles if isinstance(handle, _FakeBindingTracker))
+        tracker.states = iter([{**_bound_cards(), "conflict": True}])
+        assert await observations[0].revalidate_before_submit() == "attachment-binding-failed"
+        assert snapshots[-1].phase == "pre_submit"
+        assert snapshots[-1].binding_conflict is True
+        assert snapshots[-1].pre_submit_result == "attachment-binding-failed"
+        assert snapshots[-1].outcome == "blocked"
+        await observations[0].close()
+        assert not snapshots[-1].observer_active
+        assert snapshots[-1].outcome == "blocked"
+        assert page.listeners == {"response": []}
+
+    asyncio.run(run())
+
+
+def test_drop_preflight_waits_for_observed_capture_path_in_production_javascript() -> None:
+    program = _BINDING_GRAPH_PROGRAM.split("  const fiber =", 1)[0] + r"""
+  const assert = require('assert');
+  const file = new File(['synthetic bytes'], 'original.txt', {type: 'text/plain'});
+  const dataTransfer = {files: [file], items: [{kind: 'file', type: 'text/plain', getAsFile: () => file}]};
+  const tracker = createTracker({form, composerSelector: '.composer', dataTransfer,
+    files: [file], expected: [{name: file.name, mime: file.type, size: file.size}]});
+  assert.deepEqual(tracker.read().state, 'waiting');
+  assert.equal(tracker.read().reason, 'capture-path-uninitialized');
+  Object.defineProperty(form, '__reactProps$test', {value: {onDropCapture() {}}});
+  Object.defineProperty(container, '__reactProps$test', {value: {
+    onDragEnterCapture() {}, onDragOverCapture() {}, onDropCapture() {},
+  }});
+  const ready = tracker.read();
+  assert.equal(ready.state, 'eligible');
+  assert.equal(ready.receiver_relationship, 'ancestor');
+  assert.equal(ready.file_count, 1);
+  assert.equal(ready.item_count, 1);
+  assert.deepEqual(ready.file_sizes, [15]);
+})();
+"""
+    completed = subprocess.run(
+        ["node", "-e", program], text=True, capture_output=True, check=False, timeout=10,
+        input=json.dumps({"source": attachments.CREATE_ATTACHMENT_DROP_PREFLIGHT_JS}),
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
+@pytest.mark.parametrize("mutation, reason", [
+    ("form.isConnected = false", "form-changed"),
+    ("const replacement = form.append(new Element('textarea')); document.querySelectorAll = () => [replacement]", "form-changed"),
+    ("for (let index = 0; index < 513; index++) form.append(new Element('div'))", "descendant-limit"),
+    ("let parent = container; for (let index = 0; index < 129; index++) { parent.parentElement = new Element('div'); parent = parent.parentElement; }", "ancestor-limit"),
+    ("Object.defineProperty(container, '__reactProps$other', {value: receiverProps})", "handler-metadata-unavailable"),
+    ("dataTransfer.files.length = 0", "payload-invalid"),
+    ("dataTransfer.items = null", "payload-invalid"),
+    ("container.parentElement = new Element('main'); Object.defineProperty(container.parentElement, '__reactProps$test', {value: {onDropCapture() {}}})", "ambiguous-capture-path"),
+    ("dataTransfer.items[0].kind = 'string'", "payload-invalid"),
+    ("dataTransfer.files[0] = new File(['other'], 'original.txt', {type: 'text/plain'})", "payload-invalid"),
+    ("form.parentElement = new Element('main'); Object.defineProperty(form.parentElement, '__reactProps$test', {value: receiverProps})", "capture-path-changed"),
+    ("receiverProps.onDropCapture = () => {}", "capture-path-changed"),
+    ("formProps.onDropCapture = () => {}", "capture-path-changed"),
+    ("Object.defineProperty(composer, '__reactProps$test', {value: {onDrop() {}}})", "ambiguous-capture-path"),
+    ("Object.defineProperty(receiverProps, 'onDropCapture', {get() {throw Error('PRIVATE_SENTINEL')}})", "handler-metadata-unavailable"),
+])
+def test_drop_preflight_rejects_invalid_payload_or_changed_receivers(
+    mutation: str, reason: str,
+) -> None:
+    program = _BINDING_GRAPH_PROGRAM.split("  const fiber =", 1)[0] + r"""
+  const assert = require('assert');
+  const file = new File(['synthetic bytes'], 'original.txt', {type: 'text/plain'});
+  const dataTransfer = {files: [file], items: [{kind: 'file', type: 'text/plain', getAsFile: () => file}]};
+  const formProps = {onDropCapture() {}};
+  const receiverProps = {onDragEnterCapture() {}, onDragOverCapture() {}, onDropCapture() {}};
+  Object.defineProperty(form, '__reactProps$test', {value: formProps});
+  Object.defineProperty(container, '__reactProps$test', {value: receiverProps});
+  const tracker = createTracker({form, composerSelector: '.composer', dataTransfer,
+    files: [file], expected: [{name: file.name, mime: file.type, size: file.size}]});
+  assert.equal(tracker.read().state, 'eligible');
+  """ + mutation + r""";
+  const blocked = tracker.read();
+  assert.equal(blocked.state, 'blocked');
+  assert.equal(blocked.reason, input.reason);
+  assert(!JSON.stringify(blocked).includes('PRIVATE_SENTINEL'));
+})();
+"""
+    completed = subprocess.run(
+        ["node", "-e", program], text=True, capture_output=True, check=False, timeout=10,
+        input=json.dumps({"source": attachments.CREATE_ATTACHMENT_DROP_PREFLIGHT_JS, "reason": reason}),
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_drop_preflight_dispatches_original_payload_once_on_the_observed_capture_path(
+    tmp_path: Path,
+) -> None:
+    attachment = tmp_path / "original.txt"
+    original = "synthetic UTF-8 payload: Ω\n".encode()
+    attachment.write_bytes(original)
+
+    async def run() -> None:
+        async with async_playwright() as playwright:
+            executable = Path(playwright.chromium.executable_path)
+            if not executable.is_file():
+                candidates = sorted((Path.home() / "Library/Caches/ms-playwright").glob(
+                    "chromium-*/chrome-mac*/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing"
+                ))
+                if not candidates:
+                    pytest.skip("No local Chromium executable available")
+                executable = candidates[-1]
+            browser = await playwright.chromium.launch(executable_path=str(executable), headless=True)
+            try:
+                page = await browser.new_page()
+                await page.set_content('<main><form><textarea class="composer"></textarea></form></main>')
+                await page.evaluate("""() => {
+                  const form = document.querySelector('form');
+                  const receiver = document.querySelector('main');
+                  Object.defineProperty(form, '__reactProps$test', {value: {onDropCapture() {}}});
+                  Object.defineProperty(receiver, '__reactProps$test', {value: {
+                    onDragEnterCapture() {}, onDragOverCapture() {}, onDropCapture() {},
+                  }});
+                  window.events = [];
+                  for (const type of ['dragenter', 'dragover', 'drop']) {
+                    receiver.addEventListener(type, event => {
+                      event.preventDefault();
+                      window.events.push({type, targetIsForm: event.target === form,
+                        bubbles: event.bubbles, composed: event.composed, cancelable: event.cancelable});
+                      if (type === 'drop') window.droppedBytes = event.dataTransfer.files[0].arrayBuffer().then(value => Array.from(new Uint8Array(value)));
+                    }, true);
+                  }
+                }""")
+                form = await page.query_selector('form')
+                file = await page.evaluate_handle(attachments.CREATE_ATTACHMENT_FILE_JS, attachments._load_descriptors([str(attachment)])[0])
+                transfer = await page.evaluate_handle(attachments.CREATE_ATTACHMENT_DATA_TRANSFER_JS, [file])
+                preflight = await page.evaluate_handle(attachments.CREATE_ATTACHMENT_DROP_PREFLIGHT_JS, {
+                    "form": form, "composerSelector": ".composer", "files": [file], "dataTransfer": transfer,
+                    "expected": [{"name": attachment.name, "mime": "text/plain", "size": len(original)}],
+                })
+                assert (await preflight.evaluate("(preflight) => preflight.read()"))["state"] == "eligible"
+                outcome = await preflight.evaluate("(preflight) => preflight.dispatch()")
+                assert outcome == {"target": "intended-form", "events": [
+                    {"type": event, "dispatch_returned": False, "default_prevented": True}
+                    for event in ("dragenter", "dragover", "drop")
+                ]}
+                assert await page.evaluate("window.events") == [
+                    {"type": event, "targetIsForm": True, "bubbles": True, "composed": True, "cancelable": True}
+                    for event in ("dragenter", "dragover", "drop")
+                ]
+                assert bytes(await page.evaluate("window.droppedBytes")) == original
+                with pytest.raises(Exception, match="already-attempted"):
+                    await preflight.evaluate("(preflight) => preflight.dispatch()")
+                assert len(await page.evaluate("window.events")) == 3
+                await page.close()
+                fresh_page = await browser.new_page()
+                await fresh_page.set_content('<main><form><textarea class="composer"></textarea></form></main>')
+                fresh_form = await fresh_page.query_selector('form')
+                fresh_file = await fresh_page.evaluate_handle(attachments.CREATE_ATTACHMENT_FILE_JS, attachments._load_descriptors([str(attachment)])[0])
+                fresh_transfer = await fresh_page.evaluate_handle(attachments.CREATE_ATTACHMENT_DATA_TRANSFER_JS, [fresh_file])
+                fresh_preflight = await fresh_page.evaluate_handle(attachments.CREATE_ATTACHMENT_DROP_PREFLIGHT_JS, {
+                    "form": fresh_form, "composerSelector": ".composer", "files": [fresh_file], "dataTransfer": fresh_transfer,
+                    "expected": [{"name": attachment.name, "mime": "text/plain", "size": len(original)}],
+                })
+                assert (await fresh_preflight.evaluate("(preflight) => preflight.read()"))["state"] == "waiting"
+                with pytest.raises(Exception, match="capture-path-uninitialized"):
+                    await fresh_preflight.evaluate("(preflight) => preflight.dispatch()")
+            finally:
+                await browser.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("is_delayed", [False, True])
+def test_attach_files_waits_for_preflight_within_original_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, is_delayed: bool,
+) -> None:
+    attachment = tmp_path / "preflight.txt"
+    attachment.write_text("synthetic", encoding="utf-8")
+    page = _FakePage(
+        states=[_attachment_state(), _attachment_state(ready={attachment.name: 1})],
+        bindings=[_bound_cards(("upload-1", "new-card", attachment.name, "ready", True))],
+        responses=[_NamedCreateResponse(attachment.name, "file_preflight")],
+    )
+    reads = []
+    snapshots = []
+    tracker = _FakeHandle("preflight")
+    async def evaluate(script: str, argument: Any = None) -> Any:
+        if "preflight.read()" in script:
+            reads.append(True)
+            if is_delayed and len(reads) > 1:
+                return {"state": "eligible", "reason": "observed-capture-path", "receiver_relationship": "ancestor",
+                        "file_count": 1, "item_count": 1, "file_sizes": [9]}
+            return {"state": "waiting", "reason": "capture-path-uninitialized"}
+        if "preflight.dispatch()" in script:
+            assert len(reads) >= 2
+            await page.evaluate(attachments.DISPATCH_ATTACHMENT_DROP_JS)
+            return {"target": "intended-form", "events": []}
+        raise AssertionError("unexpected preflight operation")
+    tracker.evaluate = evaluate
+    original_evaluate_handle = page.evaluate_handle
+    async def evaluate_handle(script: str, argument: Any = None) -> Any:
+        if script == attachments.CREATE_ATTACHMENT_DROP_PREFLIGHT_JS:
+            page.handles.append(tracker)
+            return tracker
+        return await original_evaluate_handle(script, argument)
+    page.evaluate_handle = evaluate_handle
+    clock = _FakeClock()
+    monkeypatch.setattr(attachments, "_monotonic", clock.monotonic)
+    monkeypatch.setattr(attachments, "_sleep", clock.sleep)
+    if is_delayed:
+        assert asyncio.run(attachments.attach_files(page, [str(attachment)], timeout_seconds=0.5, on_diagnostics=snapshots.append)) == {
+            attachment.name: (0, 1),
+        }
+        assert len(reads) >= 2
+        assert sum(script == attachments.DISPATCH_ATTACHMENT_DROP_JS for script, _ in page.evaluate_calls) == 1
+    else:
+        with pytest.raises(RuntimeError, match="preflight"):
+            asyncio.run(attachments.attach_files(page, [str(attachment)], timeout_seconds=0.5, on_diagnostics=snapshots.append))
+        assert not any(script == attachments.DISPATCH_ATTACHMENT_DROP_JS for script, _ in page.evaluate_calls)
+    assert clock.monotonic() <= 0.5
+    assert tracker.dispose_calls == 1
+    assert page.listeners == {"response": []}
+    assert snapshots[-1].preflight_state == ("eligible" if is_delayed else "waiting")
+    assert snapshots[-1].dispatch_result == ("returned" if is_delayed else None)
+
+
+@pytest.mark.parametrize("change", ["handler", "form"])
+def test_drop_preflight_rechecks_receiving_contract_between_events(change: str) -> None:
+    program = _BINDING_GRAPH_PROGRAM.split("  const fiber =", 1)[0] + r"""
+  const assert = require('assert');
+  const file = new File(['synthetic'], 'original.txt', {type: 'text/plain'});
+  const dataTransfer = {files: [file], items: [{kind: 'file', type: 'text/plain', getAsFile: () => file}]};
+  const receiverProps = {onDragEnterCapture() {}, onDragOverCapture() {}, onDropCapture() {}};
+  Object.defineProperty(form, '__reactProps$test', {value: {onDropCapture() {}}});
+  Object.defineProperty(container, '__reactProps$test', {value: receiverProps});
+  const events = [];
+  globalThis.DragEvent = class {constructor(type, options) {this.type = type; Object.assign(this, options); this.defaultPrevented = false;}};
+  form.dispatchEvent = event => {
+    events.push(event.type);
+    if (input.change === 'handler') receiverProps.onDropCapture = () => {};
+    else form.isConnected = false;
+    return true;
+  };
+  const tracker = createTracker({form, composerSelector: '.composer', dataTransfer, files: [file],
+    expected: [{name: file.name, mime: file.type, size: file.size}]});
+  assert.equal(tracker.read().state, 'eligible');
+  assert.throws(() => tracker.dispatch(), /preflight rejected/);
+  assert.deepEqual(events, ['dragenter']);
+  assert.throws(() => tracker.dispatch(), /already-attempted/);
+  assert.deepEqual(events, ['dragenter']);
+})();
+"""
+    completed = subprocess.run(
+        ["node", "-e", program], text=True, capture_output=True, check=False, timeout=10,
+        input=json.dumps({"source": attachments.CREATE_ATTACHMENT_DROP_PREFLIGHT_JS, "change": change}),
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_cancellation_during_preflight_disposes_handles_and_observers_without_drop(tmp_path: Path) -> None:
+    async def run() -> None:
+        path = tmp_path / "cancel.txt"
+        path.write_text("synthetic", encoding="utf-8")
+        page = _FakePage(states=[_attachment_state()])
+        waiting = asyncio.Event()
+        original = page.evaluate_handle
+        async def evaluate_handle(script: str, argument: Any = None) -> Any:
+            handle = await original(script, argument)
+            if script == attachments.CREATE_ATTACHMENT_DROP_PREFLIGHT_JS:
+                async def evaluate(_script: str, _argument: Any = None) -> Any:
+                    waiting.set()
+                    await asyncio.Event().wait()
+                handle.evaluate = evaluate
+            return handle
+        page.evaluate_handle = evaluate_handle
+        task = asyncio.create_task(attachments.attach_files(page, [str(path)]))
+        await asyncio.wait_for(waiting.wait(), timeout=1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert all(handle.dispose_calls == 1 for handle in page.handles)
+        assert page.listeners == {"response": []}
+        assert not any(script == attachments.DISPATCH_ATTACHMENT_DROP_JS for script, _ in page.evaluate_calls)
+    asyncio.run(run())
+
+
+def test_preflight_eligibility_cannot_start_dispatch_after_attachment_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "deadline.txt"
+    path.write_text("synthetic", encoding="utf-8")
+    clock = _FakeClock()
+    monkeypatch.setattr(attachments, "_monotonic", clock.monotonic)
+    monkeypatch.setattr(attachments, "_sleep", clock.sleep)
+    class Page(_FakePage):
+        async def evaluate_handle(self, script: str, argument: Any) -> Any:
+            handle = await super().evaluate_handle(script, argument)
+            if script == attachments.CREATE_ATTACHMENT_DROP_PREFLIGHT_JS:
+                original = handle.evaluate
+                async def evaluate(expression: str, options: Any = None) -> Any:
+                    result = await original(expression, options)
+                    if "preflight.read()" in expression:
+                        clock.value = 1.0
+                    return result
+                handle.evaluate = evaluate
+            return handle
+    page = Page(states=[_attachment_state()], responses=[])
+    with pytest.raises(attachments.AttachmentPreflightError, match="deadline"):
+        asyncio.run(attachments.attach_files(page, [str(path)], timeout_seconds=0.5))
+    assert not any(script == attachments.DISPATCH_ATTACHMENT_DROP_JS for script, _ in page.evaluate_calls)
+    assert all(handle.dispose_calls == 1 for handle in page.handles)

@@ -264,6 +264,8 @@ def test_runtime_propagates_attachment_paths(
     context = _FakeContext()
     _RuntimeFakes(monkeypatch, [context])
     captured_paths: list[list[str] | None] = []
+    captured_pages = []
+    conversation_ids = []
 
     async def execute_ask_outcome(
         page: _FakePage,
@@ -276,8 +278,11 @@ def test_runtime_propagates_attachment_paths(
         ]
         | None = None,
         attachment_paths: list[str] | None = None,
+        conversation_id: str | None = None,
     ) -> ask.AskOutcome:
-        del page, callbacks
+        del callbacks
+        captured_pages.append(page)
+        conversation_ids.append(conversation_id)
         captured_paths.append(attachment_paths)
         return _outcome(question)
 
@@ -285,15 +290,21 @@ def test_runtime_propagates_attachment_paths(
 
     async def scenario() -> None:
         ask_runtime = runtime.AskRuntime()
-        outcome = await ask_runtime.ask(
-            "question", attachment_paths=["notes.txt"]
-        )
-        assert outcome.text == "question"
+        for _ in range(2):
+            outcome = await ask_runtime.ask(
+                "question", attachment_paths=["notes.txt"],
+                conversation_id="123e4567-e89b-12d3-a456-426614174000",
+            )
+            assert outcome.text == "question"
+            assert captured_pages[-1].close_calls == 1
         await ask_runtime.aclose()
 
     asyncio.run(scenario())
 
-    assert captured_paths == [["notes.txt"]]
+    assert captured_paths == [["notes.txt"], ["notes.txt"]]
+    assert conversation_ids == ["123e4567-e89b-12d3-a456-426614174000"] * 2
+    assert len(captured_pages) == 2 and captured_pages[0] is not captured_pages[1]
+    assert captured_pages == context.pages
 
 
 def test_runtime_limits_concurrent_asks_to_two(

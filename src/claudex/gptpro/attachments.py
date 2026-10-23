@@ -14,6 +14,12 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
+from claudex.gptpro.attachment_diagnostics import (
+    FILE_CREATE_PATH,
+    FILE_PROCESSING_PATH,
+    AttachmentDiagnosticObserver,
+    AttachmentDiagnostics,
+)
 from claudex.gptpro.conversation import is_trusted_origin_url
 from claudex.gptpro.selectors import COMPOSER_SELECTOR, LOCATOR_CONTRACT_JS
 
@@ -21,8 +27,6 @@ MAX_ATTACHMENTS_PER_ASK = 10
 _MAX_ATTACHMENT_RESPONSE_TASKS = MAX_ATTACHMENTS_PER_ASK * 4
 ATTACH_SETTLE_TIMEOUT_SECONDS = 120.0
 ATTACH_SETTLE_POLL_SECONDS = 0.25
-FILE_CREATE_PATH = "/backend-api/files"
-FILE_PROCESSING_PATH = "/backend-api/files/process_upload_stream"
 MAX_PROCESSING_RESPONSE_BYTES = 262_144
 MAX_TOTAL_ATTACHMENT_BYTES = 1_200_000
 _MAX_PRE_SUBMIT_REVALIDATION_SECONDS = 2.0
@@ -72,7 +76,7 @@ CAPTURE_COMPOSER_FORM_HANDLE_JS = (
     "}"
 )
 
-DISPATCH_ATTACHMENT_DROP_JS = """(dataTransfer, intendedForm = null) => {
+DISPATCH_ATTACHMENT_DROP_JS = """(dataTransfer, intendedForm = null, beforeEvent = null, outcomes = null) => {
   const preferredSelector = 'form[data-chatgpt-composer]';
   const fallbackSelector = 'main';
   let target;
@@ -92,20 +96,120 @@ DISPATCH_ATTACHMENT_DROP_JS = """(dataTransfer, intendedForm = null) => {
   }
 
   for (const eventType of ['dragenter', 'dragover', 'drop']) {
-    target.dispatchEvent(
-      new DragEvent(eventType, {
-        bubbles: true,
-        cancelable: true,
-        composed: true,
-        dataTransfer,
-      }),
-    );
+    if (beforeEvent !== null) beforeEvent();
+    const event = new DragEvent(eventType, {
+      bubbles: true, cancelable: true, composed: true, dataTransfer,
+    });
+    const dispatched = target.dispatchEvent(event);
+    if (outcomes !== null) outcomes.push({ type: eventType,
+      dispatch_returned: dispatched, default_prevented: event.defaultPrevented });
   }
   if (intendedForm !== null) return 'intended-form';
   return target.matches(preferredSelector)
     ? preferredSelector
     : fallbackSelector;
 }"""
+
+# The supported capture chain proves component installation, not application file acceptance.
+CREATE_ATTACHMENT_DROP_PREFLIGHT_JS = (
+    r"""({ form, composerSelector, dataTransfer, files, expected }) => {
+  const dispatch = """ + DISPATCH_ATTACHMENT_DROP_JS + r""";
+  const isCurrent = """ + COMPOSER_FORM_CURRENT_JS + r""";
+  const fields = ['onDragEnterCapture', 'onDragOverCapture', 'onDropCapture', 'onDrop'];
+  const ownValue = (object, key) => {
+    const descriptor = Object.getOwnPropertyDescriptor(object, key);
+    if (!descriptor) return undefined;
+    if (!Object.prototype.hasOwnProperty.call(descriptor, 'value')) throw new Error('accessor');
+    return descriptor.value;
+  };
+  const handlers = (node) => {
+    const keys = Object.getOwnPropertyNames(node);
+    if (keys.length > 512) throw new Error('key-limit');
+    const matches = keys.filter(key => key.startsWith('__reactProps$'));
+    if (matches.length > 1) throw new Error('ambiguous-props');
+    if (!matches.length) return [];
+    const props = ownValue(node, matches[0]);
+    if (!props || typeof props !== 'object') throw new Error('invalid-props');
+    return fields.map(field => ownValue(props, field));
+  };
+  const composer = document.querySelectorAll(composerSelector)[0];
+  let pinned = null;
+  let attempted = false;
+  const hasValidPayload = () => {
+    try {
+      return Array.isArray(files) && Array.isArray(expected) && files.length > 0 && files.length <= 10 &&
+        expected.length === files.length && dataTransfer.files.length === files.length &&
+        dataTransfer.items.length === files.length && files.every((file, index) => {
+          const item = dataTransfer.items[index];
+          return file instanceof File && dataTransfer.files[index] === file &&
+            item.kind === 'file' && item.type === 'text/plain' && item.getAsFile() === file &&
+            file.name === expected[index].name && file.type === expected[index].mime &&
+            file.type === 'text/plain' && file.size === expected[index].size;
+        });
+    } catch (_) { return false; }
+  };
+  const read = () => {
+    if (!hasValidPayload()) return { state: 'blocked', reason: 'payload-invalid' };
+    if (!isCurrent(form, composerSelector)) return { state: 'blocked', reason: 'form-changed' };
+    if (document.querySelectorAll(composerSelector)[0] !== composer) return { state: 'blocked', reason: 'form-changed' };
+    const descendants = form.querySelectorAll('*');
+    if (descendants.length > 512) return { state: 'blocked', reason: 'descendant-limit' };
+    for (const child of descendants) {
+      const current = handlers(child);
+      if (typeof current[2] === 'function' || typeof current[3] === 'function') {
+        return { state: 'blocked', reason: 'ambiguous-capture-path' };
+      }
+    }
+    const candidates = [];
+    let captureOwners = 0;
+    let ancestor = form.parentElement;
+    for (let depth = 0; ancestor !== null && depth < 128; depth += 1) {
+      const current = handlers(ancestor);
+      if (typeof current[2] === 'function') captureOwners += 1;
+      if (current.slice(0, 3).length === 3 && current.slice(0, 3).every(value => typeof value === 'function')) {
+        candidates.push({ node: ancestor, callbacks: current.slice(0, 3) });
+      }
+      if (typeof current[3] === 'function') return { state: 'blocked', reason: 'ambiguous-capture-path' };
+      ancestor = ancestor.parentElement;
+    }
+    if (ancestor !== null) return { state: 'blocked', reason: 'ancestor-limit' };
+    if (candidates.length > 1 || (candidates.length === 1 && captureOwners > 1)) {
+      return { state: 'blocked', reason: 'ambiguous-capture-path' };
+    }
+    const formCallbacks = handlers(form);
+    if (typeof formCallbacks[3] === 'function') return { state: 'blocked', reason: 'ambiguous-capture-path' };
+    if (candidates.length === 0 || typeof formCallbacks[2] !== 'function') {
+      return { state: pinned ? 'blocked' : 'waiting', reason: pinned ? 'capture-path-changed' : 'capture-path-uninitialized' };
+    }
+    const candidate = candidates[0];
+    const callbacks = [...candidate.callbacks, formCallbacks[2]];
+    if (pinned && (pinned.node !== candidate.node || callbacks.some((value, index) => value !== pinned.callbacks[index]))) {
+      return { state: 'blocked', reason: 'capture-path-changed' };
+    }
+    pinned = { node: candidate.node, callbacks };
+    return { state: 'eligible', reason: 'observed-capture-path', receiver_relationship: 'ancestor',
+      file_count: dataTransfer.files.length, item_count: dataTransfer.items.length,
+      file_sizes: Array.from(dataTransfer.files, file => file.size) };
+  };
+  return {
+    read() {
+      try { return read(); }
+      catch (_) { return { state: 'blocked', reason: 'handler-metadata-unavailable' }; }
+    },
+    dispatch() {
+      if (attempted) throw new Error('Attachment drop preflight rejected: already-attempted');
+      attempted = true;
+      const events = [];
+      const target = dispatch(dataTransfer, form, () => {
+        const snapshot = this.read();
+        if (snapshot.state !== 'eligible') throw new Error('Attachment drop preflight rejected: ' + snapshot.reason);
+      }, events);
+      return { target, events };
+    },
+  };
+}
+"""
+)
 
 def _dispatch_attachment_drop_for_form_js(composer_selector: str) -> str:
     selector_literal = json.dumps(composer_selector)
@@ -830,6 +934,10 @@ class AttachmentSettleTimeoutError(TimeoutError):
         self.ready_attachments = ready_attachments
 
 
+class AttachmentPreflightError(RuntimeError):
+    """The observed attachment drop contract was not eligible; no drop was attempted."""
+
+
 class AttachmentUploadFailedError(RuntimeError):
     """A newly attached composer chip reports an upload failure."""
 
@@ -981,6 +1089,7 @@ async def attach_files(
     composer_form_handle: Any | None = None,
     composer_selector: str = COMPOSER_SELECTOR,
     on_settlement: Callable[[AttachmentObservation], None] | None = None,
+    on_diagnostics: Callable[[AttachmentDiagnostics], None] | None = None,
 ) -> dict[str, tuple[int, int]]:
     """Upload text files and return per-name (prior, required) ready counts.
 
@@ -995,6 +1104,7 @@ async def attach_files(
     file_handles: list[Any] = []
     data_transfer_handle: Any | None = None
     binding_tracker_handle: Any | None = None
+    drop_preflight_handle: Any | None = None
     owned_form_handle: Any | None = None
     last_binding_snapshot: dict[str, Any] | None = None
     listener_tasks: set[asyncio.Task[None]] = set()
@@ -1011,7 +1121,18 @@ async def attach_files(
     settle_timeout = (
         ATTACH_SETTLE_TIMEOUT_SECONDS if timeout_seconds is None else timeout_seconds
     )
-    deadline = _monotonic() + settle_timeout
+    started_at = _monotonic()
+    deadline = started_at + settle_timeout
+    file_sizes = tuple(
+        len(descriptor["bytesBase64"]) // 4 * 3 - descriptor["bytesBase64"].count("=")
+        for descriptor in descriptors
+    )
+    diagnostics = AttachmentDiagnosticObserver(
+        page, timeout_seconds=settle_timeout, clock=_monotonic, started_at=started_at,
+        file_sizes=file_sizes,
+        on_update=on_diagnostics,
+    )
+    diagnostics.set_phase("baseline")
     drop_started = False
     ready_attachments = 0
     observer_generation = 0
@@ -1024,6 +1145,7 @@ async def attach_files(
         is_current = await composer_form_handle.evaluate(
             COMPOSER_FORM_CURRENT_JS, composer_selector,
         )
+        diagnostics.mark_form_current(is_current is True)
         if is_current is not True:
             raise RuntimeError("The intended composer form changed during attachment upload")
 
@@ -1039,10 +1161,18 @@ async def attach_files(
             READ_COMPOSER_ATTACHMENT_STATE_FOR_FORM_JS, list(names),
         )
 
-    async def dispatch_attachment_drop(data_transfer: Any) -> Any:
+    async def dispatch_attachment_drop() -> Any:
+        nonlocal drop_started
         await ensure_composer_form_current()
-        return await composer_form_handle.evaluate(
-            _dispatch_attachment_drop_for_form_js(composer_selector), data_transfer,
+        if drop_preflight_handle is None:
+            raise RuntimeError("Attachment drop preflight is unavailable")
+        remaining = deadline - _monotonic()
+        if remaining <= 0:
+            raise AttachmentPreflightError("Attachment deadline expired before dispatch; no upload or send attempted")
+        drop_started = True
+        diagnostics.mark_drop_started()
+        return await asyncio.wait_for(
+            drop_preflight_handle.evaluate("(preflight) => preflight.dispatch()"), timeout=remaining,
         )
 
     async def read_binding_snapshot(names: Sequence[str]) -> Any:
@@ -1217,6 +1347,7 @@ async def attach_files(
 
     def on_response(response: Any) -> None:
         nonlocal processing_pending, receipt_attribution_pending, observer_generation
+        diagnostics.on_response(response)
         if not drop_started:
             return
         if _is_completed_file_create_response(response):
@@ -1242,6 +1373,7 @@ async def attach_files(
 
     async def close_observer() -> None:
         nonlocal listener_installed, binding_tracker_handle, owned_form_handle
+        await diagnostics.close()
         if listener_installed:
             await _remove_response_listener(page, on_response)
             listener_installed = False
@@ -1280,6 +1412,8 @@ async def attach_files(
         last_state = initial_state
         page.on("response", on_response)
         listener_installed = True
+        diagnostics.install()
+        diagnostics.set_phase("file_objects")
         for descriptor in descriptors:
             file_handles.append(
                 await page.evaluate_handle(CREATE_ATTACHMENT_FILE_JS, descriptor)
@@ -1287,6 +1421,7 @@ async def attach_files(
         data_transfer_handle = await page.evaluate_handle(
             CREATE_ATTACHMENT_DATA_TRANSFER_JS, file_handles
         )
+        diagnostics.set_phase("identity_baseline")
         await ensure_composer_form_current()
         binding_tracker_handle = await page.evaluate_handle(
             CREATE_ATTACHMENT_BINDING_TRACKER_JS,
@@ -1294,8 +1429,44 @@ async def attach_files(
         )
         if await binding_tracker_handle.evaluate("(tracker) => tracker.baseline_valid") is not True:
             raise RuntimeError("Composer attachment identity baseline could not be verified; no upload attempted")
-        drop_started = True
-        await dispatch_attachment_drop(data_transfer_handle)
+        diagnostics.set_phase("preflight")
+        try:
+            remaining = deadline - _monotonic()
+            if remaining <= 0:
+                raise TimeoutError
+            drop_preflight_handle = await asyncio.wait_for(page.evaluate_handle(
+                CREATE_ATTACHMENT_DROP_PREFLIGHT_JS,
+                {"form": composer_form_handle, "composerSelector": composer_selector,
+                 "dataTransfer": data_transfer_handle, "files": file_handles,
+                 "expected": [
+                     {"name": descriptor["name"], "mime": descriptor["mime"], "size": size}
+                     for descriptor, size in zip(descriptors, file_sizes)
+                 ]},
+            ), timeout=remaining)
+            while True:
+                remaining = deadline - _monotonic()
+                if remaining <= 0:
+                    raise TimeoutError
+                snapshot = await asyncio.wait_for(
+                    drop_preflight_handle.evaluate("(preflight) => preflight.read()"), timeout=remaining,
+                )
+                diagnostics.record_preflight(snapshot)
+                if not isinstance(snapshot, dict) or snapshot.get("state") not in ("waiting", "blocked", "eligible"):
+                    raise AttachmentPreflightError("Attachment drop preflight returned invalid state; no upload or send attempted")
+                if snapshot["state"] == "blocked":
+                    raise AttachmentPreflightError("Attachment drop preflight rejected its receiving contract or payload; no upload or send attempted")
+                if snapshot["state"] == "eligible":
+                    break
+                await _sleep(min(ATTACH_SETTLE_POLL_SECONDS, max(0.0, deadline - _monotonic())))
+        except TimeoutError as exc:
+            raise AttachmentPreflightError(
+                "Attachment drop preflight eligibility was not established within the attachment deadline; no upload or send attempted"
+            ) from exc
+        diagnostics.set_phase("dispatch")
+        outcome = await dispatch_attachment_drop()
+        diagnostics.record_dispatch_result(outcome)
+        diagnostics.mark_drop_returned()
+        diagnostics.set_phase("settlement")
 
         def initial_count_for(name: str) -> int:
             return sum(
@@ -1554,7 +1725,11 @@ async def attach_files(
                 f"{len(filenames)} processing-qualified ready attachments; "
                 f"{describe_observations()}; expected filename "
                 f"chips for {expected}. File states: {describe_files()}; "
-                f"{describe_receipts()}; no send click attempted by attachment upload.",
+                f"{describe_receipts()}; "
+                f"diagnostic phase={diagnostics.snapshot().phase}; "
+                f"completed post-drop probes={diagnostics.snapshot().poll_completions}; "
+                "create count includes successful HTTP responses only; "
+                "no send click attempted by attachment upload.",
                 completed_file_create_responses=completed_file_create_responses,
                 ready_attachments=ready_attachments,
             )
@@ -1618,6 +1793,7 @@ async def attach_files(
                     read_binding_snapshot(list(required_names)),
                     timeout=_MAX_PRE_SUBMIT_REVALIDATION_SECONDS,
                 )
+                diagnostics.mark_binding(bound)
                 ready_count = qualified_ready_count(bound)
             except Exception:
                 return "attachment-binding-unavailable"
@@ -1627,12 +1803,26 @@ async def attach_files(
                 return "protocol-evidence-changed"
             return None if ready_count == len(filenames) else "attachments-not-ready"
 
+        async def revalidate_with_diagnostics() -> str | None:
+            diagnostics.set_phase("pre_submit")
+            try:
+                blocker = await revalidate_observation()
+            except asyncio.CancelledError:
+                diagnostics.record_pre_submit_result("observation-cancelled")
+                raise
+            except Exception:
+                diagnostics.record_pre_submit_result("observation-error")
+                raise
+            diagnostics.record_pre_submit_result(blocker)
+            return blocker
+
         while True:
             remaining = deadline - _monotonic()
             if remaining <= 0:
                 break
             await asyncio.sleep(0)
             required_names, completed_names = resolved_names()
+            diagnostics.mark_poll_started()
             try:
                 state = await asyncio.wait_for(
                     read_attachment_state(list(required_names)),
@@ -1644,6 +1834,7 @@ async def attach_files(
                 raise RuntimeError("Composer attachment probe returned invalid state")
             await asyncio.sleep(0)
             last_state = state
+            diagnostics.mark_poll_completed()
             current_names, current_completed = resolved_names()
             if required_names != current_names or completed_names != current_completed:
                 continue
@@ -1684,6 +1875,7 @@ async def attach_files(
                 )
             except TimeoutError:
                 break
+            diagnostics.mark_binding(bound)
             ready_attachments = qualified_ready_count(bound)
             if processing_failure:
                 raise AttachmentUploadFailedError(
@@ -1697,10 +1889,11 @@ async def attach_files(
                 and processing_pending == 0
                 and ready_attachments == len(filenames)
             ):
+                diagnostics.finish("settled")
                 if on_settlement is not None:
                     settled_observer_generation = observer_generation
                     on_settlement(AttachmentObservation(
-                        revalidate_observation, close_observer,
+                        revalidate_with_diagnostics, close_observer,
                     ))
                     observer_transferred = True
                 return {
@@ -1713,9 +1906,20 @@ async def attach_files(
             await _sleep(min(ATTACH_SETTLE_POLL_SECONDS, remaining))
 
         raise create_timeout_error()
+    except asyncio.CancelledError:
+        diagnostics.finish("cancelled")
+        raise
+    except AttachmentSettleTimeoutError:
+        diagnostics.finish("timeout")
+        raise
+    except Exception:
+        diagnostics.finish("failed")
+        raise
     finally:
         if not observer_transferred:
             await close_observer()
+        if drop_preflight_handle is not None:
+            await _dispose_handle(drop_preflight_handle)
         if data_transfer_handle is not None:
             await _dispose_handle(data_transfer_handle)
         for file_handle in file_handles:

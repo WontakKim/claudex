@@ -181,6 +181,25 @@ bytes in total. Each create receipt must identify a distinct file and match its
 requested filename exactly. A completed create response is not processing
 completion, composer readiness, or submission confirmation.
 
+Each ask opens a fresh page, even for an existing conversation. A current,
+visible composer form does not establish that its application drop handlers
+have initialized. Before attempting a drop, the gateway waits within the same
+120-second attachment budget used for settlement for the supported capture path:
+a form-level drop-capture hook and exactly one ancestor with callable drag-enter,
+drag-over, and drop-capture handlers in React host metadata. Inspection is bounded
+to 128 ancestors and 512 form descendants. Missing initialization waits; ambiguous,
+uninspectable, replaced, or changed receivers fail closed. An unsupported UI
+contract is not bypassed with a fallback target.
+
+Preflight also checks the browser-side File/DataTransfer counts, original File
+identities, filenames, MIME types, and byte sizes. It rechecks the pinned form,
+composer, receiver, and handler identities before each event in the one-time
+synthetic drop sequence. This establishes eligibility to attempt a drop, not
+application acceptance: handler presence, event cancellation, and a returned
+dispatch are not upload receipts. The gateway does not retry the drop or rename
+the input files. Upload success still requires the receipt, processing, and
+current-card checks below; any attachment failure blocks Send.
+
 ChatGPT may rename an attachment. The gateway accepts a validated
 `extra.library_file_name` from `file.indexing.completed`, or from
 `file.indexing.started` when `extra.retrieval_indexing_deferred` is exactly
@@ -321,14 +340,37 @@ Status and result snapshots include independent observations in `evidence`:
 `submission` is `not_attempted`, `uncertain` (click attempted without
 confirmation), or `confirmed` (a nonce-matched server user echo or recovered
 server answer); neither an upload response, click, nor outgoing request alone
-confirms server acceptance. `upload_receipts` counts completed file-create
-responses. During upload, `ready_attachments` uses the processing-qualified
-readiness count described above, not the diagnostic-only observed composer-ready
-count. A visible ready chip can therefore leave `ready_attachments` at zero while
+confirms server acceptance. `upload_receipts` counts completed successful (2xx)
+file-create responses. During upload, `ready_attachments` uses the
+processing-qualified readiness count described above, not the diagnostic-only
+observed composer-ready count. A visible ready chip can therefore leave `ready_attachments` at zero while
 receipt attribution, processing completion, a supported name, or current card
 binding is missing. Job snapshots retain the highest observed counts; they are
 not current eligibility predicates and do not prove submission or content
 consumption. Either field may be null when not observed.
+
+`attachment_diagnostics` separates preflight state/reason, receiver relationship,
+measured payload counts/sizes, dispatch outcomes, and bounded request-lifecycle
+observations from attachment readiness. A preflight failure occurs before any
+drop; a returned drop with no observed upload initiation is different from a
+create request that started but stalled, incomplete processing, or readiness
+that was not established. These observations do not trigger an automatic retry.
+
+`elapsed_ms` measures elapsed observer lifetime at each snapshot, including
+pre-submit observation and cleanup; it is not upload settlement duration. Use the
+`settled` event's timestamp for settlement time, if that event was retained.
+`poll_attempts` and `poll_completions` count internal post-drop probes, not caller
+status requests. `binding_valid` can be true for an empty binding set; it is not
+a ready attachment count.
+
+Request observation covers only this ask's Page and the trusted file-create and
+file-processing POST endpoints. Other pages, context-only/service-worker
+activity, and different endpoints are outside that scope. No observed request
+therefore does not prove that no network activity occurred. Observed requests
+are counted before receipt/filename eligibility filtering, but observation alone
+never qualifies a receipt or a ready card. Diagnostics retain bounded metadata,
+not request bodies, headers, raw file IDs, or attachment content.
+
 `conversation_id` is the known thread ID, either explicitly selected or
 observed from a correlated ChatGPT event. `generation_observed` and
 `answer_seen` do not imply `raw_extracted`: only a completed, correlated raw

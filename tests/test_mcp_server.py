@@ -19,6 +19,7 @@ from starlette.testclient import TestClient
 
 from claudex.config import GatewayConfig
 from claudex.gptpro import ask, jobs
+from claudex.gptpro.attachment_diagnostics import AttachmentDiagnosticEvent
 from claudex.mcp_server import LazyAskRuntime, McpEndpoint
 
 _PROTOCOL_VERSION = "2025-06-18"
@@ -665,6 +666,7 @@ def test_status_exposes_nonterminal_job_states(
         "evidence": {
             "submission": "not_attempted", "conversation_id": None,
             "upload_receipts": None, "ready_attachments": None,
+            "attachment_diagnostics": None,
             "generation_observed": False, "answer_seen": False,
             "raw_extracted": False, "failure_stage": None,
             "recovery_failure": None, "recovery_detail": None,
@@ -1719,3 +1721,33 @@ def test_lazy_runtime_forwards_live_concurrency(
     lazy_runtime.set_max_concurrent_asks(5)
     assert forwarded == [5]
     assert lazy_runtime.max_concurrent_asks == 5
+
+
+def test_failed_status_and_result_serialize_attachment_diagnostics() -> None:
+    diagnostic = ask.attachments.AttachmentDiagnostics(
+        phase="settlement", outcome="timeout", file_sizes=(1050000,), poll_completions=2,
+        events=(AttachmentDiagnosticEvent(
+            "response", 250, "dispatch", endpoint="create", request_id=1, status=429,
+        ),),
+    )
+    failure = ask.GptProAskError("error", "synthetic attachment timeout")
+    failure.evidence = ask.AskEvidence(failure_stage="attachments", attachment_diagnostics=diagnostic)
+    runtime = FakeAskRuntime(error=failure, conversation_id=_CONVERSATION_A)
+    with _mcp_client(runtime) as client:
+        _response, headers = _initialize(client)
+        submitted = _json_tool_payload(_call_tool(client, headers, "ask_gpt_pro", {
+            "question": "synthetic", "thread": _CONVERSATION_A,
+        }))
+        ask_id = submitted["ask_id"]
+        _finish_job(client, runtime, ask_id)
+        status = _json_tool_payload(_call_tool(client, headers, "ask_gpt_pro_status", {"ask_id": ask_id}))
+        result = _call_tool(client, headers, "ask_gpt_pro_result", {"ask_id": ask_id})
+        detail = json.loads(result["content"][1]["text"])
+        for evidence in (status["evidence"], detail["evidence"]):
+            assert evidence["attachment_diagnostics"]["phase"] == "settlement"
+            assert evidence["attachment_diagnostics"]["file_sizes"] == [1050000]
+            assert evidence["attachment_diagnostics"]["poll_completions"] == 2
+            assert evidence["attachment_diagnostics"]["events"][0]["status"] == 429
+            assert evidence["attachment_diagnostics"]["events"][0]["request_id"] == 1
+            assert evidence["submission"] == "not_attempted"
+            assert evidence["recovery"] == "not_attempted"
