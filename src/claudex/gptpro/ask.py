@@ -155,6 +155,7 @@ class AskEvidence:
     conversation_id: str | None = None
     upload_receipts: int | None = None
     ready_attachments: int | None = None
+    attachment_diagnostics: attachments.AttachmentDiagnostics | None = None
     generation_observed: bool = False
     answer_seen: bool = False
     raw_extracted: bool = False
@@ -987,6 +988,9 @@ class _AskExecution:
                 composer_selector=self.composer_selector or self._selector("composer"),
                 on_progress=lambda receipts, ready: self._record_evidence(
                     upload_receipts=receipts, ready_attachments=ready,
+                ),
+                on_diagnostics=lambda diagnostic: self._record_evidence(
+                    attachment_diagnostics=diagnostic,
                 ),
                 on_settlement=lambda observation: setattr(
                     self, "attachment_observation", observation,

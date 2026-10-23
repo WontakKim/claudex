@@ -665,6 +665,11 @@ class AskJobService:
                 ) if value is not None),
                 default=None,
             ),
+            attachment_diagnostics=(
+                evidence.attachment_diagnostics
+                if evidence.attachment_diagnostics is not None
+                else previous.attachment_diagnostics
+            ),
             generation_observed=(
                 previous.generation_observed or evidence.generation_observed
             ),

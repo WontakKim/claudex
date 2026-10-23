@@ -783,11 +783,13 @@ def test_attachment_upload_runs_after_composer_and_before_fill(
         composer_form_handle: Any | None = None,
         composer_selector: str | None = None,
         on_settlement: Callable[[attachments.AttachmentObservation], None] | None = None,
+        on_diagnostics: Callable[[attachments.AttachmentDiagnostics], None] | None = None,
     ) -> dict[str, tuple[int, int]]:
         assert attached_page is page
         assert composer_form_handle is page.form_handle
         assert composer_selector == selectors.COMPOSER_SELECTOR
         assert callable(on_settlement)
+        assert callable(on_diagnostics)
         page.call_order.append("attach")
         captured.append((attachment_paths, timeout_seconds))
         _transfer_attachment_observation(on_settlement)
@@ -3543,3 +3545,30 @@ def test_per_name_counters_cannot_override_current_binding_readiness(
 
     assert asyncio.run(execution._missing_ready_attachments()) == []
     assert validated == [True]
+
+
+@pytest.mark.parametrize("failure", ["settlement", "preflight", "dispatch"])
+def test_attachment_failure_retains_metadata_diagnostics_without_send(
+    monkeypatch: pytest.MonkeyPatch, failure: str,
+) -> None:
+    _install_clock(monkeypatch)
+    page = _FakePage()
+    diagnostic = ask.attachments.AttachmentDiagnostics(phase="settlement", outcome="timeout")
+
+    async def unsettled(*_args: Any, **kwargs: Any) -> None:
+        kwargs["on_diagnostics"](diagnostic)
+        if failure == "preflight":
+            raise ask.attachments.AttachmentPreflightError("eligibility not established")
+        if failure == "dispatch":
+            raise RuntimeError("Attachment drop preflight rejected: capture-path-changed")
+        raise ask.attachments.AttachmentSettleTimeoutError(
+            "upload not observed", completed_file_create_responses=0, ready_attachments=0,
+        )
+
+    monkeypatch.setattr(ask.attachments, "attach_files", unsettled)
+    with pytest.raises(ask.GptProAskError) as raised:
+        asyncio.run(ask.execute_ask_outcome(page, "synthetic", attachment_paths=["synthetic.txt"]))
+    assert raised.value.evidence.attachment_diagnostics == diagnostic
+    assert raised.value.evidence.failure_stage == "attachments"
+    assert raised.value.evidence.submission == "not_attempted"
+    assert page.click_count == 0
