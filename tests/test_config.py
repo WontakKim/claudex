@@ -1182,13 +1182,43 @@ class TestCustomProviders:
         with pytest.raises(ConfigError, match="unknown keys: timeout_seconds"):
             GatewayConfig.load(settings_file)
 
-    def test_missing_required_field_fails_at_boot(self, tmp_path: Path) -> None:
-        entry = self._entry()
+    @pytest.mark.parametrize("family", ["openai_compatible", "anthropic_compatible"])
+    @pytest.mark.parametrize("source", ["file", "env"])
+    def test_api_key_can_be_omitted(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, family: str, source: str
+    ) -> None:
+        entry = (
+            self._entry()
+            if family == "openai_compatible"
+            else self._anthropic_entry()
+        )
         del entry["api_key"]
-        settings_file = self._write(tmp_path, self._payload(entry=entry))
+        providers = {family: {"custom": entry}}
+        if source == "env":
+            monkeypatch.setenv("CLAUDEX_CUSTOM_PROVIDERS", json.dumps(providers))
+            config = GatewayConfig.from_env()
+        else:
+            config = GatewayConfig.load(
+                self._write(tmp_path, {"custom_providers": providers})
+            )
 
-        with pytest.raises(ConfigError, match="missing required keys: api_key"):
-            GatewayConfig.load(settings_file)
+        assert config.custom_providers["custom"].api_key == ""
+
+    @pytest.mark.parametrize("family", ["openai_compatible", "anthropic_compatible"])
+    @pytest.mark.parametrize("api_key", [None, "", "   ", 123, False])
+    def test_explicit_invalid_api_key_fails_at_boot(
+        self, tmp_path: Path, family: str, api_key: object
+    ) -> None:
+        entry = (
+            self._entry()
+            if family == "openai_compatible"
+            else self._anthropic_entry()
+        )
+        entry["api_key"] = api_key
+        with pytest.raises(ConfigError, match="api_key must be a non-empty string"):
+            GatewayConfig.load(
+                self._write(tmp_path, {"custom_providers": {family: {"custom": entry}}})
+            )
 
     def test_openai_compatible_still_requires_responses_wire_api(
         self, tmp_path: Path

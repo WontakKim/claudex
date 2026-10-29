@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import AsyncIterator
+from dataclasses import replace
 from typing import Any
 
 import httpx
@@ -60,7 +61,10 @@ async def _collect(
     return [event async for event in client.stream_responses(payload, "session-1")]
 
 
-def test_stream_responses_posts_to_prefixed_url_and_parses_function_call_events() -> None:
+@pytest.mark.parametrize("api_key", [_API_KEY, ""])
+def test_stream_responses_posts_to_prefixed_url_and_parses_function_call_events(
+    api_key: str,
+) -> None:
     captured: list[httpx.Request] = []
     upstream_events = [
         {"type": "response.created", "response": {"id": "response-1"}},
@@ -97,14 +101,18 @@ def test_stream_responses_posts_to_prefixed_url_and_parses_function_call_events(
 
     async def scenario() -> list[dict[str, Any]]:
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
-            client = OpenAICompatibleClient(_PROVIDER_NAME, _provider(), http_client)
+            client = OpenAICompatibleClient(
+                _PROVIDER_NAME, replace(_provider(), api_key=api_key), http_client
+            )
             assert _API_KEY not in repr(client)
             return await _collect(client, {"model": "gpt-5.5", "stream": True})
 
     assert asyncio.run(scenario()) == upstream_events
     (request,) = captured
     assert str(request.url) == f"{_BASE_URL}/responses"
-    assert request.headers["authorization"] == f"Bearer {_API_KEY}"
+    assert request.headers.get("authorization") == (
+        f"Bearer {api_key}" if api_key else None
+    )
     assert request.headers["content-type"] == "application/json"
     assert request.headers["accept"] == "text/event-stream"
     assert "x-grok-conv-id" not in request.headers
@@ -203,7 +211,8 @@ def test_stream_responses_redacts_api_key_echoed_by_upstream() -> None:
     assert _API_KEY not in repr(exc_info.value)
 
 
-def test_list_models_returns_openai_catalog_ids() -> None:
+@pytest.mark.parametrize("api_key", [_API_KEY, ""])
+def test_list_models_returns_openai_catalog_ids(api_key: str) -> None:
     captured: list[httpx.Request] = []
 
     async def handler(request: httpx.Request) -> httpx.Response:
@@ -224,13 +233,15 @@ def test_list_models_returns_openai_catalog_ids() -> None:
     async def scenario() -> list[str]:
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
             return await OpenAICompatibleClient(
-                _PROVIDER_NAME, _provider(), http_client
+                _PROVIDER_NAME, replace(_provider(), api_key=api_key), http_client
             ).list_models()
 
     assert asyncio.run(scenario()) == ["gpt-5.5", "gemini-3.1-pro"]
     (request,) = captured
     assert str(request.url) == f"{_BASE_URL}/models"
-    assert request.headers["authorization"] == f"Bearer {_API_KEY}"
+    assert request.headers.get("authorization") == (
+        f"Bearer {api_key}" if api_key else None
+    )
     assert request.headers["content-type"] == "application/json"
     assert request.headers["accept"] == "application/json"
 

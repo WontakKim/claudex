@@ -36,6 +36,7 @@ def _get_custom_provider_binding(
         configured_provider.api_key in name
         or configured_provider.api_key in provider.base_url
         for configured_provider in config.custom_providers.values()
+        if configured_provider.api_key
     ):
         raise RuntimeError(
             "custom provider public fields overlap a configured credential"
@@ -76,6 +77,8 @@ def _safe_route_target_error_detail(
 
 
 def _redact_configured_credential(value: str, credential: str) -> str:
+    if not credential:
+        return value.encode("utf-8", errors="replace").decode("utf-8")
     replacement = "[REDACTED]"
     if credential in replacement:
         replacement = "*" if credential != "*" else "?"
@@ -230,6 +233,7 @@ async def _handle_health(request: Request) -> JSONResponse:
             if not any(
                 provider.api_key in name
                 for provider in config.custom_providers.values()
+                if provider.api_key
             )
             else f"custom_provider_{index}"
         )

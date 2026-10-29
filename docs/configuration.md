@@ -121,9 +121,11 @@ A custom-provider document can contain both supported families:
 ```
 
 The OpenAI-compatible entry keeps the required `wire_api: "responses"` field.
-The Anthropic-compatible entry requires `base_url` and `api_key`. Its
-optional `tool_schema_regex_compat` JSON boolean defaults to `false` and should
-be enabled only for an upstream with the documented regex limitation. Its
+Both families accept an optional `api_key`; omit it for unauthenticated upstreams.
+When provided, it must be a non-empty string. The Anthropic-compatible entry
+requires `base_url`. Its optional `tool_schema_regex_compat` JSON boolean defaults
+to `false` and should be enabled only for an upstream with the documented regex
+limitation. Its
 `base_url` is a versioned API prefix to which the transport appends exactly
 `/messages`. Query and fragment suffixes are invalid. See
 [Custom providers](custom-providers.md#anthropic-compatible-schema) for the

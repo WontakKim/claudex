@@ -7,6 +7,7 @@ import inspect
 import json
 import logging
 from collections.abc import AsyncIterator
+from dataclasses import replace
 from typing import Any, get_type_hints
 
 import httpx
@@ -84,7 +85,10 @@ class _CloseFailingByteStream(_TrackedByteStream):
         raise self._close_error
 
 
-def test_send_messages_uses_only_the_versioned_messages_url_and_static_bearer() -> None:
+@pytest.mark.parametrize("api_key", [_API_KEY, ""])
+def test_send_messages_uses_only_the_versioned_messages_url_and_static_bearer(
+    api_key: str,
+) -> None:
     captured: list[httpx.Request] = []
     stream = _TrackedByteStream([b'{"type":"message"}'])
 
@@ -97,7 +101,7 @@ def test_send_messages_uses_only_the_versioned_messages_url_and_static_bearer() 
             transport=httpx.MockTransport(handler)
         ) as http_client:
             client = AnthropicCompatibleClient(
-                _PROVIDER_NAME, _provider(), http_client
+                _PROVIDER_NAME, replace(_provider(), api_key=api_key), http_client
             )
             assert _API_KEY not in repr(client)
             response = await client.send_messages(
@@ -121,7 +125,9 @@ def test_send_messages_uses_only_the_versioned_messages_url_and_static_bearer() 
     (request,) = captured
     assert request.method == "POST"
     assert str(request.url) == f"{_BASE_URL}/messages"
-    assert request.headers["authorization"] == f"Bearer {_API_KEY}"
+    assert request.headers.get("authorization") == (
+        f"Bearer {api_key}" if api_key else None
+    )
     assert "x-api-key" not in request.headers
     assert request.headers["content-type"] == "application/json"
     assert captured[0].content == b'{"model":"upstream-model"}'

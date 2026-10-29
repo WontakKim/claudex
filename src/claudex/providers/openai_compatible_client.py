@@ -107,11 +107,13 @@ class OpenAICompatibleClient:
         )
 
     def _base_headers(self) -> dict[str, str]:
-        return {
-            "Authorization": f"Bearer {self._api_key}",
+        headers = {
             "Content-Type": "application/json",
             "Accept": "text/event-stream",
         }
+        if self._api_key:
+            headers["Authorization"] = f"Bearer {self._api_key}"
+        return headers
 
     def _redact_api_key(self, text: str) -> str:
         if not self._api_key:

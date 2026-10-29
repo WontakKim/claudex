@@ -94,7 +94,7 @@ class OpenAICompatibleProvider:
 
     wire_api: str
     base_url: str
-    api_key: str = field(repr=False)
+    api_key: str = field(default="", repr=False)
 
     def __repr__(self) -> str:
         base_url = _redact_provider_credential(self.base_url, self.api_key)
@@ -109,7 +109,7 @@ class AnthropicCompatibleProvider:
     """A static Anthropic Messages-compatible upstream configuration."""
 
     base_url: str
-    api_key: str = field(repr=False)
+    api_key: str = field(default="", repr=False)
     tool_schema_regex_compat: bool = False
 
     def __repr__(self) -> str:
@@ -167,8 +167,8 @@ def parse_custom_providers(value: object) -> dict[str, _CustomProvider]:
         },
     }
     required_family_fields = {
-        "openai_compatible": {"wire_api", "base_url", "api_key"},
-        "anthropic_compatible": {"base_url", "api_key"},
+        "openai_compatible": {"wire_api", "base_url"},
+        "anthropic_compatible": {"base_url"},
     }
     valid_families = tuple(family_fields)
     if isinstance(value, str):
@@ -355,8 +355,10 @@ def parse_custom_providers(value: object) -> dict[str, _CustomProvider]:
                     "'http://127.0.0.1:8080/v1'"
                 )
 
-            api_key = entry["api_key"]
-            if not isinstance(api_key, str) or not api_key.strip():
+            api_key = entry.get("api_key", "")
+            if "api_key" in entry and (
+                not isinstance(api_key, str) or not api_key.strip()
+            ):
                 found = (
                     "empty string"
                     if isinstance(api_key, str)

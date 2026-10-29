@@ -6920,3 +6920,24 @@ class TestAdminGptproSettingsApi:
             )
             assert client.app.state.config.gptpro_max_concurrent_asks == 2
             assert client.app.state.gptpro_ask_runtime.max_concurrent_asks == 2
+
+
+@pytest.mark.parametrize("family", ["openai_compatible", "anthropic_compatible"])
+def test_custom_provider_without_api_key_has_metadata_and_health(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, family: str
+) -> None:
+    provider = (
+        _custom_provider()
+        if family == "openai_compatible"
+        else _anthropic_custom_provider()
+    )
+    config = GatewayConfig(custom_providers={"custom": replace(provider, api_key="")})
+    with _create_test_client(
+        monkeypatch, tmp_path, config=config, base_url="http://127.0.0.1:8787"
+    ) as client:
+        metadata = client.get("/admin/settings/mapping")
+        health = client.get("/health")
+    assert metadata.status_code == 200
+    assert metadata.json()["custom_providers"][0]["name"] == "custom"
+    assert "custom" in health.json()["providers"]
+    assert "custom provider public fields overlap" not in health.text

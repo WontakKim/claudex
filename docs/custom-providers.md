@@ -52,16 +52,18 @@ an unknown provider prefix.
 
 ## OpenAI-compatible schema
 
-Each `custom_providers.openai_compatible` entry requires exactly these fields:
+Each `custom_providers.openai_compatible` entry supports these fields:
 
-- `wire_api`: must be exactly `"responses"`. The backward-compatible
+- `wire_api`: required; must be exactly `"responses"`. The backward-compatible
   `wire_api="responses"` contract remains required; Chat Completions upstreams
   are not supported.
-- `base_url`: an HTTPS URL, except that plain HTTP is allowed for loopback
+- `base_url`: required; an HTTPS URL, except that plain HTTP is allowed for loopback
   hosts. It may contain a path prefix. The gateway appends `/responses` for
   inference and `/models` for catalog discovery.
-- `api_key`: a non-empty static credential. The gateway does not perform OAuth
-  or credential refresh for this family.
+- `api_key`: optional; a non-empty static credential when provided. Omit it for
+  an upstream that does not require authentication. Without it, inference and
+  catalog requests carry no gateway-supplied authentication header. The gateway
+  does not perform OAuth or credential refresh for this family.
 
 A mapped request uses the existing Claude-to-Responses translation path. The
 translated payload is sent as produced: custom providers do not receive the
@@ -102,13 +104,15 @@ other [Responses routes](providers.md#mcp-tool-search-and-context-usage):
 ## Anthropic-compatible schema
 
 Each `custom_providers.anthropic_compatible` entry requires `base_url` and
-`api_key` and accepts one optional compatibility field:
+accepts optional authentication and compatibility fields:
 
 - `base_url`: a versioned API prefix, such as an installation's documented
   `/v1` prefix. The gateway strips trailing slashes and appends exactly
   `/messages` for inference. A query string or fragment is invalid. As for the
   OpenAI-compatible family, HTTPS is required except for loopback HTTP hosts.
-- `api_key`: a non-empty static credential.
+- `api_key`: optional; a non-empty static credential when provided. Omit it for
+  an upstream that does not require authentication. Explicit empty strings,
+  whitespace-only strings, and non-string values are invalid in both families.
 - `tool_schema_regex_compat`: an optional JSON boolean, defaulting to `false`.
   Set it to `true` only when the configured upstream is known to reject
   ECMAScript Unicode property escapes in tool input schemas and accept the
@@ -134,9 +138,10 @@ added to `base_url`.
 For each Messages request, the gateway removes caller `Authorization` and
 `X-API-Key` credentials, removes connection-specific headers, removes the
 Claude OAuth beta marker, and sends the configured credential as
-`Authorization: Bearer <configured value>`. Authentication is always static:
-there is no browser or CLI OAuth flow, refresh, or automatic retry after `401`
-or `429`.
+`Authorization: Bearer <configured value>` only when `api_key` is provided.
+Without it, the request carries neither authentication header; caller credentials
+are never forwarded. Configured authentication is static: there is no browser or
+CLI OAuth flow, refresh, or automatic retry after `401` or `429`.
 
 The generic Messages relay supports streaming and non-streaming requests. It
 changes the outgoing top-level model to the mapped upstream model, then restores

@@ -17,7 +17,7 @@ class AnthropicCompatibleUpstreamError(UpstreamError):
 
 
 class AnthropicCompatibleClient:
-    """Send Messages requests with one configured static Bearer credential."""
+    """Send Messages requests with an optional static Bearer credential."""
 
     def __init__(
         self,
@@ -46,7 +46,8 @@ class AnthropicCompatibleClient:
             for key, value in headers.items()
             if key.lower() not in {"authorization", "x-api-key"}
         }
-        request_headers["Authorization"] = f"Bearer {self._api_key}"
+        if self._api_key:
+            request_headers["Authorization"] = f"Bearer {self._api_key}"
         try:
             request = self._http_client.build_request(
                 "POST",
@@ -154,6 +155,8 @@ class AnthropicCompatibleClient:
         return text
 
     def _api_key_forms(self) -> tuple[str, ...]:
+        if not self._api_key:
+            return ()
         unicode_escaped = self._api_key.encode("unicode_escape").decode("ascii")
         utf8_bytes_repr = repr(self._api_key.encode("utf-8"))
         bearer_value = f"Bearer {self._api_key}"
