@@ -1781,3 +1781,55 @@ def test_invalid_gptpro_concurrency_from_env(
     message = "must be between 1 and 10" if value in ("0", "11") else "must be an integer"
     with pytest.raises(ConfigError, match=message):
         GatewayConfig.from_env()
+
+
+@pytest.mark.parametrize("source", ["file", "env"])
+@pytest.mark.parametrize("effort_map", [{}, {"minimal": "low", "medium": "high"}, {"none": "low", "max": "none"}])
+def test_custom_reasoning_effort_map_loads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source: str,
+    effort_map: dict[str, str],
+) -> None:
+    providers = {"openai_compatible": {"local": {
+        "wire_api": "responses", "base_url": "http://127.0.0.1:8000/v1",
+        "reasoning_effort_map": effort_map,
+    }}}
+    settings_file = tmp_path / "settings.json"
+    if source == "env":
+        monkeypatch.setenv("CLAUDEX_CUSTOM_PROVIDERS", json.dumps(providers))
+        settings_file.write_text("{}")
+    else:
+        monkeypatch.delenv("CLAUDEX_CUSTOM_PROVIDERS", raising=False)
+        settings_file.write_text(json.dumps({"custom_providers": providers}))
+    config = GatewayConfig.load(settings_file)
+    assert config.custom_providers["local"].reasoning_effort_map == effort_map
+
+
+@pytest.mark.parametrize("effort_map", [
+    None, [], "medium=low", 1, True,
+    {"unknown": "low"}, {"medium": "unknown"}, {"medium": 75},
+    {"medium": None}, {"medium": []}, {"Medium": "low"}, {"medium": " low "},
+])
+def test_custom_reasoning_effort_map_rejects_invalid_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, effort_map: object,
+) -> None:
+    monkeypatch.delenv("CLAUDEX_CUSTOM_PROVIDERS", raising=False)
+    settings_file = tmp_path / "settings.json"
+    settings_file.write_text(json.dumps({"custom_providers": {"openai_compatible": {
+        "local": {"wire_api": "responses", "base_url": "http://127.0.0.1:8000/v1",
+                  "reasoning_effort_map": effort_map},
+    }}}))
+    with pytest.raises(ConfigError, match="reasoning_effort_map"):
+        GatewayConfig.load(settings_file)
+
+
+def test_anthropic_custom_provider_rejects_reasoning_effort_map(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("CLAUDEX_CUSTOM_PROVIDERS", raising=False)
+    settings_file = tmp_path / "settings.json"
+    settings_file.write_text(json.dumps({"custom_providers": {"anthropic_compatible": {
+        "local": {"base_url": "http://127.0.0.1:8000/v1",
+                  "reasoning_effort_map": {"medium": "low"}},
+    }}}))
+    with pytest.raises(ConfigError, match="unknown keys: reasoning_effort_map"):
+        GatewayConfig.load(settings_file)

@@ -32,6 +32,7 @@ class OpenAICompatibleClient:
         self._name = name
         self._base_url = provider.base_url
         self._api_key = provider.api_key
+        self._reasoning_effort_map = dict(provider.reasoning_effort_map)
         self._http_client = http_client
         self._context_windows: ModelCatalogCache[int] = ModelCatalogCache(
             self._fetch_context_windows,
@@ -42,6 +43,16 @@ class OpenAICompatibleClient:
         self, payload: dict[str, Any], session_id: str
     ) -> AsyncIterator[dict[str, Any]]:
         """POST a Responses payload and yield each SSE data event as a dict."""
+        reasoning = payload.get("reasoning")
+        effort = reasoning.get("effort") if isinstance(reasoning, dict) else None
+        if isinstance(effort, str) and effort in self._reasoning_effort_map:
+            payload = {
+                **payload,
+                "reasoning": {
+                    **reasoning,
+                    "effort": self._reasoning_effort_map[effort],
+                },
+            }
         headers = self._base_headers()
         async with aclosing(
             stream_sse_events(

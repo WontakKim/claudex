@@ -64,11 +64,38 @@ Each `custom_providers.openai_compatible` entry supports these fields:
   an upstream that does not require authentication. Without it, inference and
   catalog requests carry no gateway-supplied authentication header. The gateway
   does not perform OAuth or credential refresh for this family.
+- `reasoning_effort_map`: optional; a JSON object mapping Responses effort
+  strings to effort strings for an upstream that supports only a subset. Keys
+  and values must be exactly `none`, `minimal`, `low`, `medium`, `high`, `xhigh`,
+  or `max`. Invalid values, including integers and `null`, abort startup.
 
-A mapped request uses the existing Claude-to-Responses translation path. The
-translated payload is sent as produced: custom providers do not receive the
-built-in Codex or Grok payload sanitizers, `max_output_tokens` injection, or
-reasoning-effort clamping. Context-overflow phrase detection may not recognize
+For example, add this field to an OpenAI-compatible provider entry whose
+upstream rejects `minimal` and `medium` but accepts `low`:
+
+```json
+{
+  "reasoning_effort_map": {
+    "minimal": "low",
+    "medium": "low"
+  }
+}
+```
+
+The map applies to every model routed through that provider. Each outgoing
+`reasoning.effort` is looked up once immediately before transmission, after
+Claude-to-Responses translation and any global `reasoning_effort` override.
+Only explicit matches are replaced; mappings are not chained. Unlisted values,
+missing reasoning fields, and other request fields are preserved. An omitted
+map or `{}` preserves the default behavior. Connection-test requests use the
+same mapping. This setting does not select a vendor, infer model capabilities,
+or send vLLM-specific template parameters. It is not supported by the
+Anthropic-compatible family.
+
+A mapped request uses the existing Claude-to-Responses translation path. Apart
+from the optional effort mapping, the translated payload is sent as produced:
+custom providers do not receive the built-in Codex or Grok payload sanitizers,
+`max_output_tokens` injection, or automatic reasoning-effort clamping.
+Context-overflow phrase detection may not recognize
 an upstream's wording; use an exact provider-prefixed
 `context_window_map` override when catalog metadata is unavailable or
 insufficient.

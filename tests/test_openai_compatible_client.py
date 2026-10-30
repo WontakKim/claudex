@@ -398,3 +398,87 @@ class TestContextWindow:
 
         assert asyncio.run(scenario()) == (200000, 200000)
         assert calls["n"] == 2
+
+
+@pytest.mark.parametrize(("effort_map", "reasoning", "expected"), [
+    ({"medium": "low"}, {"effort": "medium", "summary": "auto"},
+     {"effort": "low", "summary": "auto"}),
+    ({"medium": "high"}, {"effort": "medium"}, {"effort": "high"}),
+    ({"medium": "low", "low": "high"}, {"effort": "medium"}, {"effort": "low"}),
+    ({"medium": "low"}, {"effort": "max"}, {"effort": "max"}),
+    ({"high": "none"}, {"effort": "high"}, {"effort": "none"}),
+    ({}, {"effort": "medium"}, {"effort": "medium"}),
+    ({"medium": "low"}, {"summary": "auto"}, {"summary": "auto"}),
+    ({"medium": "low"}, None, None),
+])
+def test_stream_responses_applies_only_explicit_effort_mapping(
+    effort_map: dict[str, str], reasoning: Any, expected: Any,
+) -> None:
+    captured: list[dict[str, Any]] = []
+    payload = {"model": "custom-model", "reasoning": reasoning, "input": [], "stream": True}
+    original = json.loads(json.dumps(payload))
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(json.loads(request.content))
+        return httpx.Response(200, content=_sse([]))
+
+    async def scenario() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+            mapped = replace(_provider(), reasoning_effort_map=effort_map)
+            await _collect(OpenAICompatibleClient("mapped", mapped, http_client), payload)
+            await _collect(OpenAICompatibleClient("unchanged", _provider(), http_client), payload)
+
+    asyncio.run(scenario())
+    assert captured == [{**original, "reasoning": expected}, original]
+    assert payload == original
+
+
+def test_stream_responses_does_not_add_missing_reasoning() -> None:
+    captured: list[dict[str, Any]] = []
+    payload = {"model": "custom-model", "input": [], "stream": True}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(json.loads(request.content))
+        return httpx.Response(200, content=_sse([]))
+
+    async def scenario() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+            provider = replace(_provider(), reasoning_effort_map={"medium": "low"})
+            await _collect(OpenAICompatibleClient("mapped", provider, http_client), payload)
+
+    asyncio.run(scenario())
+    assert captured == [payload]
+
+
+@pytest.mark.parametrize(("override", "expected_effort"), [(None, "low"), ("high", "max")])
+def test_translated_effort_is_mapped_after_global_override(
+    override: str | None, expected_effort: str,
+) -> None:
+    from claudex.config.schema import parse_custom_providers
+    from claudex.translate import translate_claude_request_to_codex
+
+    provider = parse_custom_providers({"openai_compatible": {"local": {
+        "wire_api": "responses",
+        "base_url": _BASE_URL,
+        "reasoning_effort_map": {"medium": "low", "high": "max"},
+    }}})["local"]
+    payload = translate_claude_request_to_codex(
+        {"model": "claude-test", "max_tokens": 128,
+         "messages": [{"role": "user", "content": "Hello"}]},
+        "custom-model",
+        reasoning_effort_override=override,
+        custom_provider="local",
+    )
+    captured: list[dict[str, Any]] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(json.loads(request.content))
+        return httpx.Response(200, content=_sse([]))
+
+    async def scenario() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+            await _collect(OpenAICompatibleClient("local", provider, http_client), payload)
+
+    asyncio.run(scenario())
+    assert captured[0]["reasoning"]["effort"] == expected_effort
+    assert payload["reasoning"]["effort"] == (override or "medium")

@@ -95,6 +95,7 @@ class OpenAICompatibleProvider:
     wire_api: str
     base_url: str
     api_key: str = field(default="", repr=False)
+    reasoning_effort_map: dict[str, str] = field(default_factory=dict)
 
     def __repr__(self) -> str:
         base_url = _redact_provider_credential(self.base_url, self.api_key)
@@ -159,7 +160,9 @@ def parse_custom_providers(value: object) -> dict[str, _CustomProvider]:
         '"base_url": "https://model.example/api/v1", "api_key": "secret"}}}'
     )
     family_fields = {
-        "openai_compatible": {"wire_api", "base_url", "api_key"},
+        "openai_compatible": {
+            "wire_api", "base_url", "api_key", "reasoning_effort_map",
+        },
         "anthropic_compatible": {
             "base_url",
             "api_key",
@@ -370,10 +373,25 @@ def parse_custom_providers(value: object) -> dict[str, _CustomProvider]:
                 )
 
             if family == "openai_compatible":
+                effort_map = entry.get("reasoning_effort_map", {})
+                allowed_efforts = ("none", *VALID_REASONING_EFFORTS)
+                if not isinstance(effort_map, dict) or any(
+                    not isinstance(source, str)
+                    or source not in allowed_efforts
+                    or not isinstance(target, str)
+                    or target not in allowed_efforts
+                    for source, target in effort_map.items()
+                ):
+                    raise ConfigError(
+                        f"custom provider {name!r} reasoning_effort_map must be a "
+                        "JSON object mapping effort strings to effort strings; "
+                        f"valid keys and values: {', '.join(allowed_efforts)}"
+                    )
                 providers[name] = OpenAICompatibleProvider(
                     wire_api=wire_api,
                     base_url=base_url,
                     api_key=api_key,
+                    reasoning_effort_map=dict(effort_map),
                 )
             else:
                 providers[name] = AnthropicCompatibleProvider(
