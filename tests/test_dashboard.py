@@ -1922,3 +1922,54 @@ def test_lockable_save_ownership_is_per_setting_not_a_global_save_lock(
     assert row["pending"] == [{"disabled": True, "text": "…"}] * 2
     assert row["compaction"] == "claude:claude-sonnet-5"
     assert row["routing"] == "fallback"
+
+
+@pytest.mark.parametrize("catalog", ["unavailable", "failed", "delayed"])
+def test_compaction_registered_target_events_and_save_contract(
+    dashboard_runtime_result: dict[str, Any], catalog: str,
+) -> None:
+    row = next(row for row in dashboard_runtime_result["compactionTargetStates"] if row["catalog"] == catalog)
+    assert not row.get("missingControl"), "Compaction needs an explicit provider selector"
+    for phase in ("beforeMetadata", "afterMetadata"):
+        assert row[phase]["provider"] == "vendor"
+        assert row[phase]["input"] == "Family:Version"
+        assert row[phase]["live"] == "vendor:Family:Version"
+    options = row["afterMetadata"]["providerOptions"]
+    assert 'value="claude"' in options and 'value="vendor"' in options
+    assert all(f'value="{provider}"' not in options for provider in ("codex", "kimi", "grok"))
+    assert 'value="disabled"' in row["afterMetadata"]["modelOptions"]
+    assert 'value="claude-sonnet-5"' not in row["afterMetadata"]["modelOptions"]
+    assert row["selected"]["provider"] == "vendor"
+    assert row["selected"]["input"] == "  MixedCase:Revision  "
+    assert "configured authentication" in row["selected"]["hint"]
+    assert row["beforeApplyRequests"] == []
+    assert len(row["metadataRequests"]) == (0 if catalog == "unavailable" else 1)
+    assert row["pending"]["disabled"] is True
+    assert row["pendingRequests"] == [{"url": "/admin/settings/compaction", "options": {
+        "method": "PUT", "headers": {"Content-Type": "application/json"},
+        "body": '{"model":"vendor:MixedCase:Revision"}',
+    }}]
+    assert row["saved"]["live"] == "vendor:Canonical:Version"
+    assert row["saved"]["provider"] == "vendor"
+    assert row["saved"]["input"] == "Canonical:Version"
+    for failure in row["failures"]:
+        assert failure["state"]["live"] == "vendor:Canonical:Version"
+        assert failure["state"]["disabled"] is False
+    assert row["disabledDraft"]["provider"] == "vendor"
+    assert json.loads(row["disableRequest"]["options"]["body"]) == {"model": None}
+    for native in row["native"]:
+        assert native["state"]["provider"] == "claude"
+        assert json.loads(native["request"]["options"]["body"]) == {"model": native["state"]["live"]}
+    assert row["native"][-1]["state"]["model"] == "custom"
+    assert row["native"][-1]["state"]["input"] == "MyNativeModel"
+    assert row["unknown"]["provider"] == "missing"
+    assert row["unknown"]["input"] == "Preserve:Case"
+    assert row["unknown"]["disabled"] is True
+    assert "not registered" in row["unknown"]["hint"]
+    assert row["legacy"]["provider"] == "claude"
+    assert row["legacy"]["input"] == "vendor:Legacy"
+    assert row["legacy"]["disabled"] is True
+    assert "Select the intended provider explicitly" in row["legacy"]["hint"]
+    assert row["unknownRequestCount"] == row["legacyRequestCount"] == row["lockedRequestCount"]
+    assert row["locked"]["providerDisabled"] is True
+    assert row["final"]["live"] == "vendor:Locked"

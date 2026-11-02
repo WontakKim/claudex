@@ -34,7 +34,7 @@ from claudex.config import (
     GatewayConfig,
     OpenAICompatibleProvider,
     parse_claude_account_id,
-    parse_compaction_model,
+    parse_compaction_target,
     update_settings_file,
     validate_model_map,
 )
@@ -284,7 +284,7 @@ _COMPACTION_KEYS = ("model",)
 def _compaction_payload(config: GatewayConfig, app_state: Any) -> dict[str, Any]:
     """Pinned {model, env_locked, last_reroute} envelope for /admin/compaction.
 
-    `model` is the raw "claude:<id>" value (or None), so a GET/PUT round-trip
+    `model` is the raw "<provider>:<id>" value (or None), so a GET/PUT round-trip
     is loss-free. `env_locked` is a plain boolean — true whenever
     CLAUDEX_COMPACTION_MODEL is present in the environment, including an
     empty value, mirroring _resolve's own "present even if empty" env
@@ -350,7 +350,7 @@ async def _handle_admin_compaction_put(request: Request) -> JSONResponse:
                 status_code=400,
             )
         try:
-            parse_compaction_model(value)
+            parse_compaction_target(value, request.app.state.config.custom_providers)
         except ConfigError as exc:
             return JSONResponse(
                 server_support._openai_error_body("invalid_request_error", str(exc)),

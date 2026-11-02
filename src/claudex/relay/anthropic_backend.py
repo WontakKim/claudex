@@ -18,6 +18,7 @@ from claudex.providers.client_support import _shield_response_cleanup
 from claudex.relay.common import (
     _PASSTHROUGH_SKIP_RESPONSE_HEADERS,
     _format_sse,
+    _reject_nonfinite_json,
 )
 from claudex.translate.claude_to_codex import (
     TranslationError,
@@ -139,6 +140,7 @@ async def _relay_via_anthropic_backend(
     claude_request: dict[str, Any],
     upstream_model: str,
     backend: AnthropicBackend,
+    *, is_compaction: bool = False,
 ) -> Response:
     """Relay a mapped Messages request through its bound native backend."""
     requested_model = str(claude_request.get("model", ""))
@@ -203,6 +205,8 @@ async def _relay_via_anthropic_backend(
             backend.header_policy(request),
         )
     except (UpstreamAuthError, UpstreamError, httpx.HTTPError) as exc:
+        if is_compaction:
+            raise
         status_code, body = backend.error_policy(exc)
         return JSONResponse(body, status_code=status_code)
 
@@ -222,9 +226,16 @@ async def _relay_via_anthropic_backend(
     finally:
         await upstream_response.aclose()
     try:
-        parsed = json.loads(payload)
+        if is_compaction:
+            parsed = json.loads(payload, parse_constant=_reject_nonfinite_json)
+        else:
+            parsed = json.loads(payload)
     except json.JSONDecodeError:
+        if is_compaction:
+            raise
         return Response(payload, headers=response_headers)
+    if is_compaction and (not isinstance(parsed, dict) or parsed.get("type") != "message"):
+        raise ValueError("invalid Messages response")
     if isinstance(parsed, dict) and "model" in parsed:
         parsed["model"] = requested_model
         payload = json.dumps(parsed, ensure_ascii=False).encode()

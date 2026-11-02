@@ -37,11 +37,14 @@
           <div class="srow" id="compaction-card">
             <div>
               <div class="name">Compact Reroute</div>
-              <div class="desc">Reroute oversized compaction requests to the selected Claude model.</div>
+              <div class="desc">Reroute oversized compaction requests to the selected provider and model.</div>
             </div>
             <div>
               <div class="complock" id="comp-lockband"><b>LOCKED</b> — <code id="comp-lock-env"></code> takes precedence. The compaction target is read-only.</div>
               <div class="ctrow">
+                <select id="comp-provider" aria-label="Compaction provider">
+                  <option value="claude">Claude</option>
+                </select>
                 <select id="comp-select" aria-label="Compaction model">
                   <option value="disabled">Disabled</option>
                   <option value="claude-sonnet-5">claude-sonnet-5 (recommended)</option>
@@ -55,7 +58,7 @@
                 <div class="ctnode grow"><input id="comp-custom-input" spellcheck="false" aria-label="Custom compaction model ID" placeholder="claude-…"></div>
                 <div class="cthint">unverified until first use</div>
               </div>
-              <div class="cthint">Uses eligible Claude credentials sent by the client; registered-account credentials are not substituted.</div>
+              <div class="cthint" id="comp-credentials">Uses eligible Claude credentials sent by the client; registered-account credentials are not substituted.</div>
             </div>
           </div>
           <!-- compaction-section:end -->

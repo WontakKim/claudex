@@ -8,6 +8,7 @@ reroute](#compaction-reroute) below) from the command line:
 ```sh
 uv run claudex-gateway compact                       # show current state
 uv run claudex-gateway compact set claude:<model-id>  # enable, target <model-id>
+uv run claudex-gateway compact set messages-local:large-model  # registered custom destination
 uv run claudex-gateway compact off                    # disable
 ```
 
@@ -26,24 +27,52 @@ a transport failure — exits non-zero without touching the settings file.
 ## Compaction reroute
 
 The compaction reroute is opt-in and disabled by default (unset
-`compaction.model`); once configured to a `claude:<model-id>` target, it
-triggers only for a detected Claude Code compaction request mapped to a
-Responses backend (Codex, Grok, or a Responses custom provider) whose
-estimated prompt size exceeds that backend's known context window, and
-makes a single Anthropic attempt using the client's own credentials, billed
-by Anthropic separately from the mapped backend. Its failure semantics: missing eligible
-Anthropic credentials skip the reroute entirely; connection failures and
-non-2xx responses before a streaming HTTP 2xx commit fall back silently to
-the mapped backend; failures after that commit surface as in-band SSE
-errors without fallback; non-streaming requests fall back on any failure
-before a complete, valid JSON response is obtained.
+`compaction.model`). Its **trigger source** is a detected Claude Code compaction
+request mapped to a Responses backend (Codex, Grok, or a Responses custom
+provider) whose estimated prompt size exceeds that source backend's known
+context window. Configuring a destination does not broaden this trigger to
+ordinary requests or Messages sources.
 
-Registered-account OAuth credentials are not substituted for the client's
-headers. The reroute keeps a nonblank `x-api-key` or a nonempty Bearer token,
-except a Bearer matching the configured `CLAUDEX_LOCAL_TOKEN`. It records
-`skipped_no_credentials` only when no credential header remains. The filter
+The **destination** is explicit and independent of the source mapping:
+
+- `claude:<model-id>` sends one direct Anthropic attempt.
+- `<registered-custom-provider>:<model-id>` sends one attempt through that
+  provider's configured Responses or Messages backend. Register it first as
+  described in [Custom providers](custom-providers.md). Provider registrations
+  are fixed for the process lifetime; adding or changing one requires a restart.
+- `codex:`, `kimi:`, `grok:`, and unregistered provider names are not supported
+  destinations. An identical source and destination bypass the reroute.
+
+Model IDs are not checked against a remote catalog when saving. Custom model
+IDs preserve case and may contain colons; native Claude IDs cannot contain
+colons. Selecting or saving a target does not send an inference request.
+
+Native Claude destinations use eligible client credentials and are billed by
+Anthropic separately from the mapped backend. Registered-account OAuth
+credentials are not substituted. The reroute keeps a nonblank `x-api-key` or a
+nonempty Bearer token, except a Bearer matching `CLAUDEX_LOCAL_TOKEN`. It records
+`skipped_no_credentials` only when no credential header remains, then skips
+rerouting and lets the mapped backend handle the request. The filter
 does not validate upstream credentials: a dummy Bearer can still trigger an
 Anthropic attempt, with a non-2xx response recorded as `fallback_mapped`.
+
+Custom destinations instead use their existing provider configuration and
+authentication, without requiring client Anthropic credentials. Caller
+credentials are not forwarded to the custom provider. If the provider is
+configured without an API key, the custom attempt is unauthenticated.
+
+Connection failures and non-2xx responses before stream commitment fall back
+to the original mapped backend. For native Claude and custom Messages
+destinations, commitment occurs when the upstream HTTP request is accepted
+with a 2xx response. Custom Responses destinations commit the downstream stream
+after the first decoded event passes basic envelope checks, not full
+event-specific validation. An upstream HTTP 200 alone is not enough: a failed
+envelope check still falls back, but malformed event-specific data discovered
+after commitment may produce an in-band SSE error without fallback.
+Non-streaming attempts fall back unless a complete, valid response is obtained.
+Custom Responses destinations reuse
+the [Responses stream liveness](providers.md#responses-stream-liveness) behavior;
+native Claude and custom Messages destinations do not.
 
 The context window is the provider-prefixed `context_window_map` override or,
 without one, the backend's catalog value; when neither is known, the reroute
@@ -61,6 +90,10 @@ curl http://127.0.0.1:8787/admin/settings/compaction
 curl -X PUT http://127.0.0.1:8787/admin/settings/compaction \
   -H 'Content-Type: application/json' \
   -d '{"model": "claude:claude-opus-5"}'
+# Requires a registered messages-local provider:
+curl -X PUT http://127.0.0.1:8787/admin/settings/compaction \
+  -H 'Content-Type: application/json' \
+  -d '{"model": "messages-local:large-model"}'
 curl -X PUT http://127.0.0.1:8787/admin/settings/compaction \
   -H 'Content-Type: application/json' \
   -d '{"model": null}'
@@ -71,4 +104,31 @@ setting on a running gateway, honoring the same `CLAUDEX_LOCAL_TOKEN` and
 Host guard as the other admin routes; a `PUT` persists the change to
 `settings.json` and, like the mapping API, is refused with `409` when
 `CLAUDEX_COMPACTION_MODEL` is set in the environment. The [`compact`
-command](#compact-command) is a CLI front end for this same API.
+command](#compact-command) is a CLI front end for this same API. To disable
+rerouting, send `PUT {"model": null}`; the API removes the stored
+`compaction.model` key rather than persisting JSON `null`. When editing
+`settings.json` directly, remove that key: explicit JSON `null` fails startup
+validation.
+
+A successful API save persists the target before making it effective for the
+next request; in-flight requests keep their original target. A failed save
+leaves the active target unchanged. The response remains
+`{"model": ..., "env_locked": ..., "last_reroute": ...}`. The dashboard does not
+show reroute diagnostics; use the API or `compact` command. A non-null
+`last_reroute` retains its seven fields: `outcome`, `timestamp`, `target_model`,
+`mapped_model`, `estimated_prompt_tokens`, `context_window`, and `detail`.
+`target_model` is a bare model ID for native Claude and a provider-qualified ID
+for custom destinations.
+
+### Correcting invalid legacy targets
+
+A value such as `claude:wrtn:model` is invalid; it is **not** automatically
+reinterpreted as a custom destination. Edit the stored `compaction.model` in
+`settings.json` explicitly to `wrtn:model` only if `wrtn` is the intended,
+registered custom provider. Otherwise choose a valid `claude:<model-id>` or
+remove the `compaction.model` key to disable rerouting; do not replace it with
+JSON `null`. Correct or unset `CLAUDEX_COMPACTION_MODEL` too if
+it contains the invalid target, then restart the gateway with the corrected
+configuration. Do not rely on `compact set` or `compact off` to repair invalid
+startup configuration: those commands also load and validate configuration
+before making a change.

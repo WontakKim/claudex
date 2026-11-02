@@ -20,6 +20,12 @@ from claudex.upstream_errors import UpstreamError
 
 logger = logging.getLogger("claudex.server")
 
+
+def _reject_nonfinite_json(constant: str) -> Any:
+    """`json.loads` parse_constant hook: refuse NaN/Infinity/-Infinity."""
+    raise ValueError(f"non-finite JSON constant {constant!r} in reroute response")
+
+
 _ANTHROPIC_API_BASE = "https://api.anthropic.com"
 
 # Hop-by-hop and transport headers that must not be forwarded verbatim.

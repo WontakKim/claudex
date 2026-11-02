@@ -27,7 +27,7 @@ from .schema import (
     is_loopback_host,
     parse_claude_account_id,
     parse_claude_account_routing,
-    parse_compaction_model,
+    parse_compaction_target,
     parse_custom_providers,
     parse_route_target,
     validate_context_window_map,
@@ -67,7 +67,7 @@ class GatewayConfig:
     kimi_code_home: Path = field(default_factory=_default_kimi_code_home)
     local_token: str | None = None
     log_level: str = "info"
-    # Raw "claude:<canonical-model-id>" value naming the Claude model to
+    # Raw "<provider>:<model-id>" value naming the destination to
     # reroute oversized compaction requests to. None means the feature is
     # disabled — there is no separate "enabled" flag.
     compaction_model: str | None = None
@@ -235,7 +235,7 @@ class GatewayConfig:
             compaction_model = value or None
             if compaction_model is not None:
                 try:
-                    parse_compaction_model(compaction_model)
+                    parse_compaction_target(compaction_model, custom_providers)
                 except ConfigError as exc:
                     raise ConfigError(f"{label}: {exc}") from exc
 

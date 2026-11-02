@@ -1998,6 +1998,103 @@ async function main() {
       live: {...parityContext.DIR.LIVE}, targetIds: parityContext.DIR.targets.map((target) => target.id)});
   }
 
+  const compactionTargetStates = [];
+  for (const catalog of ["unavailable", "failed", "delayed"]) {
+    const targetDocument = new FakeDocument(html);
+    const targetContext = Object.assign({}, context, {document: targetDocument});
+    vm.createContext(targetContext);
+    vm.runInContext(source, targetContext, {filename: javascriptPath});
+    const provider = targetDocument.getElementById("comp-provider");
+    if (!provider) { compactionTargetStates.push({catalog, missingControl: true}); continue; }
+    const model = targetDocument.getElementById("comp-select");
+    const input = targetDocument.getElementById("comp-custom-input");
+    const button = targetDocument.getElementById("comp-apply");
+    const requests = [];
+    let response = null;
+    const catalogResponse = createDeferred();
+    targetContext.jfetch = (url, options) => {
+      requests.push({url, options: options || null});
+      if (!options) return catalogResponse.promise;
+      return response.promise;
+    };
+    const flush = async () => { for (let index = 0; index < 12; index++) await Promise.resolve(); };
+    const snapshot = () => ({provider: provider.value, model: model.value, input: input.value,
+      live: targetContext.COMP.LIVE.model, providerOptions: provider.innerHTML,
+      modelOptions: model.innerHTML, disabled: button.disabled, providerDisabled: provider.disabled,
+      hint: targetDocument.getElementById("comp-credentials").textContent});
+    const change = (element, value, type = "change") => { element.value = value; element.dispatchEvent({type}); };
+    targetContext.renderCompactionState({model: "vendor:Family:Version", env_locked: false, last_reroute: null});
+    const beforeMetadata = snapshot();
+    targetContext.configureCustomProviders([{name: "vendor", wire_kind: "openai_responses", catalog_available: catalog !== "unavailable"}]);
+    const afterMetadata = snapshot();
+    if (catalog === "failed") catalogResponse.reject(new Error("catalog unavailable"));
+    if (catalog === "unavailable") catalogResponse.resolve({ok: true, body: {models: []}});
+    await flush();
+    const metadataRequests = requests.slice();
+    requests.length = 0;
+    change(provider, "claude");
+    change(provider, "vendor");
+    change(model, "custom");
+    change(input, "  MixedCase:Revision  ", "input");
+    const selected = snapshot();
+    const beforeApplyRequests = requests.slice();
+    response = createDeferred();
+    button.click();
+    const pending = snapshot();
+    change(provider, "claude");
+    change(model, "claude-sonnet-5");
+    button.click();
+    button.disabled = false;
+    button.dispatchEvent({type: "click"});
+    const pendingRequests = requests.slice();
+    response.resolve({ok: true, status: 200, body: {model: "vendor:Canonical:Version", env_locked: false, last_reroute: null}});
+    await flush();
+    const saved = snapshot();
+    const failures = [];
+    for (const outcome of ["http", "network"]) {
+      change(input, "Rejected:Target", "input");
+      response = createDeferred();
+      button.click();
+      if (outcome === "http") response.resolve({ok: false, status: 500, body: {error: {message: "save failed"}}});
+      else response.reject(new Error("network failure"));
+      await flush();
+      failures.push({outcome, state: snapshot()});
+    }
+    change(model, "disabled");
+    const disabledDraft = snapshot();
+    response = createDeferred();
+    button.click();
+    const disableRequest = requests[requests.length - 1];
+    response.resolve({ok: true, status: 200, body: {model: null, env_locked: false, last_reroute: null}});
+    await flush();
+    const native = [];
+    for (const target of ["claude:claude-sonnet-5", "claude:claude-opus-5", "claude:claude-fable-5", "claude:MyNativeModel"]) {
+      targetContext.renderCompactionState({model: target, env_locked: false, last_reroute: null});
+      response = createDeferred();
+      button.click();
+      native.push({state: snapshot(), request: requests[requests.length - 1]});
+      response.resolve({ok: true, status: 200, body: {model: target, env_locked: false, last_reroute: null}});
+      await flush();
+    }
+    targetContext.renderCompactionState({model: "missing:Preserve:Case", env_locked: false, last_reroute: null});
+    const unknown = snapshot();
+    button.click();
+    const unknownRequestCount = requests.length;
+    targetContext.renderCompactionState({model: "claude:vendor:Legacy", env_locked: false, last_reroute: null});
+    const legacy = snapshot();
+    button.click();
+    const legacyRequestCount = requests.length;
+    targetContext.renderCompactionState({model: "vendor:Locked", env_locked: true, last_reroute: null});
+    const locked = snapshot();
+    button.disabled = false;
+    button.dispatchEvent({type: "click"});
+    const lockedRequestCount = requests.length;
+    if (catalog === "delayed") { catalogResponse.resolve({ok: true, body: {models: [{id: "suggestion"}]}}); await flush(); }
+    compactionTargetStates.push({catalog, beforeMetadata, afterMetadata, metadataRequests, beforeApplyRequests,
+      selected, pending, pendingRequests, saved, failures, disabledDraft, disableRequest, native, unknown, legacy, locked,
+      unknownRequestCount, legacyRequestCount, lockedRequestCount, final: snapshot()});
+  }
+
   const lockableSaveStates = [];
   const flushLockableSaves = async () => { for (let index = 0; index < 12; index++) await Promise.resolve(); };
   for (const setting of ["compaction", "routing"]) {
@@ -2147,6 +2244,7 @@ async function main() {
       routeParsing,
       appliedRouteStates,
       routeBoundaryParity,
+      compactionTargetStates,
       lockableSaveStates,
       lockableSaveIndependence,
       localHeroStates,

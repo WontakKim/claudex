@@ -76,6 +76,7 @@ from claudex.translate.thought_signature import (
 
 _RELAY_SYMBOL_MANIFEST = {
     "common": {
+        "_reject_nonfinite_json",
         "_upstream_error_code",
         "_upstream_error_to_claude",
         "_format_sse",
@@ -129,10 +130,10 @@ _RELAY_SYMBOL_MANIFEST = {
         "_validate_mapped_claude_request",
         "_relay_via_responses_backend",
         "_rfc3339_now",
-        "_reject_nonfinite_json",
         "_assign_compaction_reroute",
         "_replace_compaction_reroute_if_current",
         "_reroute_compaction",
+        "_reroute_custom_compaction",
         "_CompactionStreamRelay",
         "_OwnedStreamingResponse",
         "_translate_claude_sse",
@@ -168,7 +169,7 @@ def test_relay_symbol_manifest_has_one_canonical_owner() -> None:
         for module_name in _RELAY_SYMBOL_MANIFEST
     }
 
-    assert len(_RELAY_MANIFEST_SYMBOLS) == 59
+    assert len(_RELAY_MANIFEST_SYMBOLS) == 60
     assert definitions_by_module == _RELAY_SYMBOL_MANIFEST
     for symbol in _RELAY_MANIFEST_SYMBOLS:
         owners = [

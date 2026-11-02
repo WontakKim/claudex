@@ -4653,19 +4653,6 @@ def test_dashboard_compaction_fetched_in_parallel_boot_sequence(
     assert 'jfetch("/admin/settings/compaction")' in parallel_calls
 
 
-def test_dashboard_compaction_keeps_configured_custom_model(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    with _create_test_client(monkeypatch, tmp_path) as client:
-        sources = _dashboard_sources(client)
-        page = sources["javascript"]
-
-    # A configured model that is not one of the three curated ids renders as
-    # Custom with its raw id filled in, instead of being dropped.
-    assert "COMPACTION_CURATED_MODELS.indexOf(id)>=0" in page
-    assert '{kind:"custom",custom:id}' in page
-
-
 def test_dashboard_compaction_diagnostics_ui_removed_by_design(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -4680,25 +4667,6 @@ def test_dashboard_compaction_diagnostics_ui_removed_by_design(
     assert 'id="comp-diagnostics"' not in page
     assert "renderCompactionDiagnostics" not in javascript
     assert "No compaction reroute has been attempted yet" not in javascript
-
-
-def test_dashboard_compaction_apply_body_matches_pinned_shape(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    with _create_test_client(monkeypatch, tmp_path) as client:
-        sources = _dashboard_sources(client)
-        page = sources["javascript"]
-
-    apply_fn = _compaction_apply_fn(page)
-    assert 'jfetch("/admin/settings/compaction",{' in apply_fn
-    assert 'method:"PUT"' in apply_fn
-    assert "headers:JSON_HEADERS" in apply_fn
-    assert "JSON.stringify({model:model})" in apply_fn
-    # Disabled sends exactly {"model": null}; curated/custom selections carry
-    # the "claude:" prefix parse_compaction_model expects.
-    assert "model=null" in apply_fn
-    assert '"claude:"+raw' in apply_fn
-    assert '"claude:"+COMP.draftKind' in apply_fn
 
 
 def test_dashboard_compaction_custom_submission_is_trimmed_and_guarded(

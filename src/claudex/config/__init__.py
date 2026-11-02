@@ -23,6 +23,7 @@ from .schema import (
     parse_claude_account_id,
     parse_claude_account_routing,
     parse_compaction_model,
+    parse_compaction_target,
     parse_custom_providers,
     parse_route_target,
     validate_model_map,

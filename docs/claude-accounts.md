@@ -117,14 +117,17 @@ Caveats to accept consciously:
   503. Re-add the account or run `account use off`. (With the `fallback`
   routing mode enabled — see the next section — the remaining ready accounts
   serve instead.)
-- The [compaction reroute](compaction.md#compaction-reroute) uses only eligible
+- Native Claude destinations for the
+  [compaction reroute](compaction.md#compaction-reroute) use only eligible
   credential headers sent by the client; registered-account OAuth credentials
   are not substituted. It records `skipped_no_credentials` only when its header
   filter leaves no credential—for example, a Bearer matching the configured
   gateway-local token with no nonblank `x-api-key`. A dummy Bearer when no local
   token is configured can instead trigger one direct Anthropic attempt; an
   upstream non-2xx response records `fallback_mapped`, not
-  `skipped_no_credentials`.
+  `skipped_no_credentials`. Custom compaction destinations instead use their
+  registered provider configuration and authentication; they do not require
+  client Anthropic credentials or use the registered Claude account pool.
 - Subscription OAuth tokens are licensed for the holder's own Claude Code
   use; serving other clients with them is a gray zone.
 

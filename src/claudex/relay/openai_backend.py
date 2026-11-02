@@ -17,19 +17,20 @@ from starlette.responses import JSONResponse, StreamingResponse
 
 import claudex.translate.context_overflow as context_overflow
 from claudex import server_support
-from claudex.providers.backends import ResponsesBackend, ResponsesTransport
+from claudex.providers.backends import AnthropicBackend, ResponsesBackend, ResponsesTransport
 from claudex.providers.client_support import _shield_response_cleanup
 from claudex.compaction import (
     build_reroute_headers,
     build_reroute_payload,
     is_compaction_request,
 )
-from claudex.config import GatewayConfig, RouteTarget, parse_compaction_model
+from claudex.config import GatewayConfig, RouteTarget, parse_compaction_target
 from claudex.relay.common import (
     _ANTHROPIC_API_BASE,
     _UpstreamStreamRelay,
     _UpstreamStreamingResponse,
     _format_sse,
+    _reject_nonfinite_json,
     _upstream_error_to_claude,
 )
 from claudex.translate import (
@@ -78,13 +79,17 @@ def _validate_mapped_claude_request(claude_request: dict[str, Any]) -> str | Non
 
 
 async def _relay_via_responses_backend(
-    request: Request, claude_request: dict[str, Any], route: RouteTarget
+    request: Request, claude_request: dict[str, Any], route: RouteTarget,
+    *, can_reroute: bool = True, _config: GatewayConfig | None = None,
 ) -> JSONResponse | StreamingResponse:
     """Relay a Messages request to a Responses-API backend.
 
     Codex, Grok, and custom providers consume the same translated payload and
     produce the same SSE event family. Their bound payload adapters preserve
     provider-specific wire behavior after translation.
+
+    `can_reroute=False` executes an already selected destination once, using
+    the captured `_config`, without re-entering the compaction trigger.
 
     Before translation, a Responses-mapped request also carries the compaction
     reroute trigger: when `config.compaction_model` is set, the
@@ -98,7 +103,7 @@ async def _relay_via_responses_backend(
     already resolved for the trigger check is reused rather than looked up
     again.
     """
-    config: GatewayConfig = request.app.state.config
+    config: GatewayConfig = _config or request.app.state.config
     provider = route.provider
     upstream_model = route.model
     backend = request.app.state.route_backends[provider]
@@ -115,8 +120,8 @@ async def _relay_via_responses_backend(
         )
 
     context_window: int | None = None
-    context_window_resolved = False
-    if config.compaction_model is not None and is_compaction_request(claude_request):
+    context_window_resolved = not can_reroute
+    if can_reroute and config.compaction_model is not None and is_compaction_request(claude_request):
         context_window = await _resolve_context_window(
             config, transport, provider, upstream_model
         )
@@ -153,15 +158,26 @@ async def _relay_via_responses_backend(
                 }
             estimated_prompt_tokens = context_overflow.estimate_overflow_prompt_tokens(overflow_request)
             if estimated_prompt_tokens > context_window:
-                target_model = parse_compaction_model(config.compaction_model)
-                reroute_response = await _reroute_compaction(
-                    request,
-                    claude_request,
-                    target_model=target_model,
-                    mapped_model=f"{provider}:{upstream_model}",
-                    estimated_prompt_tokens=estimated_prompt_tokens,
-                    context_window=context_window,
-                )
+                target = parse_compaction_target(config.compaction_model, config.custom_providers)
+                if target == route:
+                    target = None
+                reroute_response = None
+                if target is not None and target.provider != "claude":
+                    reroute_response = await _reroute_custom_compaction(
+                        request, claude_request, target, config=config,
+                        mapped_model=f"{provider}:{upstream_model}",
+                        estimated_prompt_tokens=estimated_prompt_tokens,
+                        context_window=context_window,
+                    )
+                elif target is not None:
+                    reroute_response = await _reroute_compaction(
+                        request,
+                        claude_request,
+                        target_model=target.model,
+                        mapped_model=f"{provider}:{upstream_model}",
+                        estimated_prompt_tokens=estimated_prompt_tokens,
+                        context_window=context_window,
+                    )
                 if reroute_response is not None:
                     return reroute_response
 
@@ -224,12 +240,28 @@ async def _relay_via_responses_backend(
     event_stream = transport.stream_responses(payload, session_id)
     try:
         first_event = await anext(event_stream, None)
+        if not can_reroute and (
+            not isinstance(first_event, dict)
+            or not isinstance(first_event.get("type"), str)
+            or not first_event["type"].startswith("response.")
+            or first_event["type"] in {"response.failed", "response.error"}
+            or ("response" in first_event and not isinstance(first_event["response"], dict))
+            or ("item" in first_event and not isinstance(first_event["item"], dict))
+            or (isinstance(first_event.get("response"), dict)
+                and "output" in first_event["response"]
+                and not isinstance(first_event["response"]["output"], list))
+        ):
+            raise ValueError("invalid first Responses event")
         if first_event is None:
+            await event_stream.aclose()
             return JSONResponse(
                 server_support._claude_error_body("api_error", f"{provider} stream ended without any events"),
                 status_code=502,
             )
     except UpstreamError as exc:
+        await event_stream.aclose()
+        if not can_reroute:
+            raise
         status_code, body = _upstream_error_to_claude(
             exc, claude_request=countable_request, context_window=context_window
         )
@@ -238,13 +270,23 @@ async def _relay_via_responses_backend(
         )
         return JSONResponse(body, status_code=status_code)
     except UpstreamAuthError as exc:
+        await event_stream.aclose()
+        if not can_reroute:
+            raise
         return JSONResponse(server_support._claude_error_body("authentication_error", str(exc)), status_code=401)
     except httpx.HTTPError as exc:
+        await event_stream.aclose()
+        if not can_reroute:
+            raise
         logger.warning("%s backend unreachable: %r", provider, exc)
         return JSONResponse(
             server_support._claude_error_body("api_error", f"failed to reach the {provider} backend: {exc!r}"),
             status_code=502,
         )
+
+    except BaseException:
+        await event_stream.aclose()
+        raise
 
     async def upstream_events() -> AsyncIterator[dict[str, Any]]:
         # This generator owns event_stream after iteration starts; the
@@ -286,17 +328,88 @@ async def _relay_via_responses_backend(
         function_schemas=function_schemas,
         regex_dialect="python" if backend.codex_regex_compat else "ecmascript",
         countable_request=countable_request,
+        should_raise_errors=not can_reroute,
     )
+
+
+async def _reroute_custom_compaction(
+    request: Request, body: dict[str, Any], target: RouteTarget, *,
+    config: GatewayConfig, mapped_model: str, estimated_prompt_tokens: int,
+    context_window: int,
+) -> JSONResponse | StreamingResponse | None:
+    """Execute one explicit destination; only uncommitted failures may fall back."""
+    def record(outcome: str, detail: str | None) -> int:
+        return _assign_compaction_reroute(
+            request.app.state, outcome=outcome,
+            target_model=f"{target.provider}:{target.model}", mapped_model=mapped_model,
+            estimated_prompt_tokens=estimated_prompt_tokens,
+            context_window=context_window, detail=detail,
+        )
+
+    payload = build_reroute_payload(body, target.model)
+    backend = request.app.state.route_backends[target.provider]
+    try:
+        if isinstance(backend, AnthropicBackend):
+            from claudex.relay.anthropic_backend import _relay_via_anthropic_backend
+            response = await _relay_via_anthropic_backend(
+                request, payload, target.model, backend, is_compaction=True
+            )
+        else:
+            response = await _relay_via_responses_backend(
+                request, payload, target, can_reroute=False, _config=config
+            )
+    except (UpstreamAuthError, UpstreamError, httpx.HTTPError) as exc:
+        detail = (f"http_{exc.status_code}" if isinstance(exc, UpstreamError)
+                  else "read_error" if isinstance(exc, httpx.ReadError)
+                  else "connect_error")
+        record("fallback_mapped", detail)
+        return None
+    except (ValueError, TypeError, AttributeError, RecursionError):
+        record("fallback_mapped", "invalid_json")
+        return None
+    if not 200 <= response.status_code < 300:
+        record("fallback_mapped", f"http_{response.status_code}")
+        return None
+    sequence = record("rerouted", None)
+    if isinstance(response, StreamingResponse):
+        original = response.body_iterator
+
+        async def observed_chunks() -> AsyncIterator[bytes | str]:
+            try:
+                async for chunk in original:
+                    text = chunk.decode() if isinstance(chunk, bytes) else chunk
+                    # Both backends yield complete SSE frames. Only field
+                    # lines name events; JSON data may contain the same text.
+                    fields = (line.partition(":") for line in text.splitlines())
+                    if any(
+                        field == "event" and value.removeprefix(" ") == "error"
+                        for field, _, value in fields
+                    ):
+                        _replace_compaction_reroute_if_current(
+                            request.app.state, sequence,
+                            outcome="midstream_error", detail="read_error",
+                        )
+                    yield chunk
+            except (ValueError, TypeError, AttributeError, RecursionError):
+                _replace_compaction_reroute_if_current(
+                    request.app.state, sequence,
+                    outcome="midstream_error", detail="read_error",
+                )
+                yield _format_sse(
+                    "error", server_support._claude_error_body(
+                        "api_error", "invalid compaction response stream"
+                    ),
+                )
+            finally:
+                await original.aclose()
+
+        response.body_iterator = _UpstreamStreamRelay(observed_chunks(), original.aclose)
+    return response
 
 
 def _rfc3339_now() -> str:
     """Return the current UTC time as an RFC 3339 string for diagnostics records."""
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
-
-
-def _reject_nonfinite_json(constant: str) -> Any:
-    """`json.loads` parse_constant hook: refuse NaN/Infinity/-Infinity."""
-    raise ValueError(f"non-finite JSON constant {constant!r} in reroute response")
 
 
 def _assign_compaction_reroute(
@@ -684,6 +797,7 @@ async def _aggregate_claude_response(
     function_schemas: dict[str, dict[str, Any]] | None = None,
     regex_dialect: str = "python",
     countable_request: dict[str, Any] | None = None,
+    should_raise_errors: bool = False,
 ) -> JSONResponse:
     claude_events: list[tuple[str, dict[str, Any]]] = []
     try:
@@ -706,16 +820,24 @@ async def _aggregate_claude_response(
                 claude_events.append(translated)
         translator.finish()
     except TranslationError as exc:
+        if should_raise_errors:
+            raise ValueError("invalid Responses event") from None
         return JSONResponse(server_support._claude_error_body("api_error", str(exc)), status_code=502)
     except UpstreamError as exc:
+        if should_raise_errors:
+            raise
         status_code, body = _upstream_error_to_claude(
             exc, claude_request=countable_request if countable_request is not None else claude_request,
             context_window=context_window
         )
         return JSONResponse(body, status_code=status_code)
     except UpstreamAuthError as exc:
+        if should_raise_errors:
+            raise
         return JSONResponse(server_support._claude_error_body("authentication_error", str(exc)), status_code=401)
     except httpx.HTTPError as exc:
+        if should_raise_errors:
+            raise
         logger.warning("responses stream aborted: %r", exc)
         return JSONResponse(
             server_support._claude_error_body("api_error", f"failed to reach the upstream backend: {exc!r}"),
@@ -728,8 +850,12 @@ async def _aggregate_claude_response(
     try:
         message = assemble_claude_message(claude_events)
     except TranslationError as exc:
+        if should_raise_errors:
+            raise ValueError("invalid Responses event") from None
         return JSONResponse(server_support._claude_error_body("api_error", str(exc)), status_code=502)
     if message is None:
+        if should_raise_errors:
+            raise ValueError("missing terminal Responses event")
         return JSONResponse(
             server_support._claude_error_body("api_error", "codex stream ended without a terminal response event"),
             status_code=502,

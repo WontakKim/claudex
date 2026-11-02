@@ -178,6 +178,25 @@ The Settings tab's **Claude accounts** category manages the accounts described i
 **General** category and is read-only while `CLAUDEX_CLAUDE_ACCOUNT_ROUTING` is
 set.
 
+**Compact Reroute** selects a destination provider explicitly: native Claude or
+one of the registered custom providers. Claude retains curated models and a
+**Custom** model-ID field; custom providers use manual model IDs, including IDs
+with colons. Enter only the model ID—the selected provider supplies its prefix.
+**Disabled** remains available for every provider. A missing or failed catalog
+does not prevent manual entry. Unknown or invalid saved targets remain visible
+for explicit correction rather than silently switching providers.
+
+Native Claude targets use eligible client credentials, not registered-account
+credentials. Custom targets use their provider's configured authentication.
+Selection does not probe the model; **Apply** saves the target and adopts the
+server's response. A successful save applies to the next request, in-flight
+requests retain their target, and a failed save leaves the active target
+unchanged. Provider registration itself requires configuration and restart;
+this control does not create providers. Reroute diagnostics remain available
+through the API and CLI, not this card. See
+[Compaction](compaction.md#compaction-reroute) for trigger conditions and
+[legacy configuration correction](compaction.md#correcting-invalid-legacy-targets).
+
 Compaction reroute and account routing each allow one pending save. Apply
 shows `…` and stays disabled until the save, including any `409` refresh,
 settles; changing a draft does not submit another request. On success,

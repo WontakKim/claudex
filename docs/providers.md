@@ -347,8 +347,9 @@ No custom provider is added to built-in usage or billing views.
 
 ## Responses stream liveness
 
-Ordinary streaming Codex, Grok, and custom Responses routes emit SSE `ping`
-events every 10 seconds while no translated event is ready. Pings begin only
+Streaming Codex, Grok, and custom Responses routes, including custom Responses
+compaction destinations, emit SSE `ping` events every 10 seconds while no
+translated event is ready. Pings begin only
 after the first upstream event has been received; earlier failures keep their
 normal HTTP status. A ping keeps the connection active without reporting
 content, usage, model progress, or success.
@@ -361,9 +362,9 @@ can run longer than 600 seconds. Arguments held for schema validation remain
 subject to the same inactivity bound.
 
 These intervals are fixed, not configurable. They do not apply to non-streaming
-aggregation, native Messages or Anthropic passthrough, compaction-reroute
-streams, or admin diagnostics. The limit bounds the gateway's wait, not the
-provider's compute time.
+aggregation, native Messages or Anthropic passthrough, native Claude or custom
+Messages compaction destinations, or admin diagnostics. The limit bounds the
+gateway's wait, not the provider's compute time.
 
 ## Limitations
 

@@ -9,12 +9,12 @@ from claudex.cli import admin_client
 from claudex.config import (
     ConfigError,
     GatewayConfig,
-    parse_compaction_model,
+    parse_compaction_target,
     update_settings_file,
 )
 
 _ADMIN_COMPACTION_PATH = "/admin/settings/compaction"
-_COMPACT_USAGE = "usage: claudex-gateway compact [set claude:<id>|off]"
+_COMPACT_USAGE = "usage: claudex-gateway compact [set <provider>:<id>|off]"
 
 # The pinned seven-key last_reroute record (see server's
 # _assign_compaction_reroute) and its detail grammar/outcome constraints.
@@ -200,6 +200,12 @@ def _compact_show() -> int:
 
 def _compact_apply(value: str | None) -> int:
     config = admin_client.daemon._load_config()
+    if value is not None:
+        try:
+            parse_compaction_target(value, config.custom_providers)
+        except ConfigError as exc:
+            print(f"compact set failed: {exc}", file=sys.stderr)
+            return 2
     host, port = admin_client._probe_endpoint(config)
     outcome = admin_client._classify_daemon(host, port)
 
@@ -247,7 +253,7 @@ def _compact_main(arguments: list[str]) -> int:
         return _compact_apply(None)
     if len(arguments) == 2 and arguments[0] == "set":
         try:
-            parse_compaction_model(arguments[1])
+            parse_compaction_target(arguments[1])
         except ConfigError as exc:
             print(f"compact set failed: {exc}", file=sys.stderr)
             return 2

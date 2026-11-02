@@ -6,6 +6,17 @@ The gateway supports two families:
 - `custom_providers.openai_compatible` for OpenAI Responses-compatible upstreams.
 - `custom_providers.anthropic_compatible` for Anthropic Messages-compatible upstreams.
 
+Registered providers can also be explicit [compaction reroute
+destinations](compaction.md#compaction-reroute), using `<name>:<model-id>`.
+This uses the same backend configuration and configured authentication as a
+normal custom route, not client Anthropic credentials. Both Responses and
+Messages destinations are supported, but only overflowing compaction requests
+mapped to Responses sources trigger rerouting. Provider registrations are fixed
+for the process lifetime; restart after changing their definitions. Changing
+only the compaction target through the running gateway takes effect without a
+restart. The dashboard accepts manual model IDs even without a working catalog;
+saving does not verify the model remotely.
+
 Define either or both families in `~/.claudex/settings.json`:
 
 ```json

@@ -6,7 +6,7 @@ import ipaddress
 import json
 import re
 import uuid
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from dataclasses import dataclass, field
 from typing import TypeAlias
 from urllib.parse import urlsplit
@@ -51,9 +51,9 @@ SETTINGS_KEYS: dict[str, str] = {
     "kimi_code_home": "KIMI_CODE_HOME",
     "local_token": "CLAUDEX_LOCAL_TOKEN",
     "log_level": "CLAUDEX_LOG_LEVEL",
-    # Opt-in: which Claude model oversized compaction requests are rerouted
-    # to. Absence of the key (or a resolved empty string) means the feature
-    # is disabled — there is no separate "enabled" flag.
+    # Opt-in: which native Claude or registered custom-provider model receives
+    # oversized compaction requests. An absent key or resolved empty string
+    # disables the feature — there is no separate "enabled" flag.
     "compaction.model": "CLAUDEX_COMPACTION_MODEL",
     # Opt-in: which registered Claude account serves Anthropic passthrough
     # traffic. Absence of the key (or a resolved empty string) means
@@ -419,12 +419,41 @@ def parse_compaction_model(value: str) -> str:
             f"compaction model {value!r} must be prefixed with 'claude:', "
             f"e.g. 'claude:claude-opus-5'"
         )
+    if ":" in model_id:
+        raise ConfigError(
+            "native compaction model must be claude:<id>, not a nested provider; "
+            "use <registered-custom-provider>:<model-id> directly"
+        )
     if not model_id or any(char.isspace() for char in model_id):
         raise ConfigError(
             f"compaction model {value!r} names no valid model after the "
             f"'claude:' prefix"
         )
     return model_id
+
+
+def parse_compaction_target(
+    value: str, custom_providers: Collection[str] | None = None
+) -> RouteTarget:
+    """Parse syntax first; when supplied, validate the local provider registry."""
+    provider, separator, model = value.partition(":")
+    if provider == "claude":
+        model = parse_compaction_model(value)
+    elif (
+        not separator or not provider or not model
+        or any(char.isspace() for char in value)
+        or provider in BUILTIN_ROUTE_PROVIDERS
+    ):
+        raise ConfigError(
+            "compaction model must be claude:<id> or "
+            "<registered-custom-provider>:<model-id> with no whitespace"
+        )
+    elif custom_providers is not None and provider not in custom_providers:
+        raise ConfigError(
+            f"unknown compaction provider {provider!r}; register it in "
+            "custom_providers or use claude:<id>"
+        )
+    return RouteTarget(provider, model)
 
 
 def parse_claude_account_id(value: str) -> str:

@@ -811,6 +811,7 @@ function configureCustomProviders(providers){
     });
   });
   renderProviderOptions();
+  renderCompaction();
 }
 /* Purely cosmetic gating for first-run clarity: kimi/grok are extensions, so
    they appear only when detected or required. A custom provider was explicitly
@@ -1201,60 +1202,77 @@ function applyLockableSetting(config){
   });
 }
 
-/* --- Compaction reroute: Claude Code's own compaction requests go directly
-   to Anthropic instead of the mapped provider. ---------------------------- */
+/* --- Compaction reroute destination --------------------------------------- */
 var COMP={
   envName:"CLAUDEX_COMPACTION_MODEL",
   locked:false,
   isSaving:false,
   LIVE:{model:null},
-  // draftKind: "disabled" | one of COMPACTION_CURATED_MODELS | "custom"
+  draftProvider:"claude",
   draftKind:"disabled",
-  draftCustom:""   // raw id typed into the custom input, untrimmed
+  draftCustom:""
 };
-/* Strips the pinned "claude:" prefix parse_compaction_model expects; a bare
-   or unprefixed value (should never reach here from the server) still
-   renders as its own id rather than throwing. */
-function compactionModelId(model){
-  var at=String(model).indexOf(":");
-  return at<0?model:model.slice(at+1);
-}
 function compactionDraftFromModel(model){
-  if(model==null)return{kind:"disabled",custom:""};
-  var id=compactionModelId(model);
-  return COMPACTION_CURATED_MODELS.indexOf(id)>=0
-    ?{kind:id,custom:""}
-    // Not one of the three curated ids: still render it, as Custom with the
-    // raw id filled in, rather than silently dropping it.
-    :{kind:"custom",custom:id};
+  if(model==null)return{provider:"claude",kind:"disabled",custom:""};
+  var raw=String(model),at=raw.indexOf(":"),provider=at<0?"claude":raw.slice(0,at);
+  var id=at<0?raw:raw.slice(at+1);
+  return provider==="claude"&&COMPACTION_CURATED_MODELS.indexOf(id)>=0
+    ?{provider:provider,kind:id,custom:""}
+    :{provider:provider,kind:"custom",custom:id};
+}
+function compactionDraftError(){
+  if(COMP.draftKind==="disabled")return "";
+  if(COMP.draftProvider!=="claude"&&!CUSTOM_PROVIDERS.some(function(p){return p.name===COMP.draftProvider}))
+    return "Provider is not registered. Select a registered provider or disable rerouting.";
+  if(COMP.draftKind!=="custom")return "";
+  var raw=COMP.draftCustom.trim();
+  if(!raw)return "Enter a model ID.";
+  if(COMP.draftProvider==="claude"&&raw.indexOf(":")>=0)
+    return "Claude model IDs cannot contain colons. Select the intended provider explicitly and enter its model ID.";
+  return "";
 }
 function renderCompaction(){
   document.getElementById("compaction-card").classList.toggle("locked",COMP.locked);
   document.getElementById("comp-lock-env").textContent=COMP.envName;
+  var provider=document.getElementById("comp-provider");
+  var providers=[{name:"claude"}].concat(CUSTOM_PROVIDERS);
+  if(!providers.some(function(p){return p.name===COMP.draftProvider}))providers.push({name:COMP.draftProvider,unknown:true});
+  provider.innerHTML=providers.map(function(p){return '<option value="'+esc(p.name)+'">'+
+    esc(p.name==="claude"?"Claude":p.name)+(p.unknown?" (not registered)":"")+'</option>'}).join("");
+  provider.value=COMP.draftProvider;
+  provider.disabled=COMP.locked;
   var select=document.getElementById("comp-select");
+  select.innerHTML='<option value="disabled">Disabled</option>'+
+    (COMP.draftProvider==="claude"?COMPACTION_CURATED_MODELS.map(function(id,index){return '<option value="'+id+'">'+id+(index===0?" (recommended)":"")+'</option>'}).join(""):"")+
+    '<option value="custom">Custom</option>';
   select.value=COMP.draftKind;
   select.disabled=COMP.locked;
   document.getElementById("comp-custom-wrap").classList.toggle("show",COMP.draftKind==="custom");
   var input=document.getElementById("comp-custom-input");
   input.value=COMP.draftCustom;
+  input.placeholder=COMP.draftProvider==="claude"?"claude-…":"Model ID (without provider prefix)";
   input.disabled=COMP.locked;
+  var error=compactionDraftError();
+  document.getElementById("comp-credentials").textContent=error||
+    (COMP.draftProvider==="claude"?"Uses eligible Claude credentials sent by the client; registered-account credentials are not substituted.":
+      "Uses the registered provider's configured authentication, not client Claude credentials.");
   var btn=document.getElementById("comp-apply");
-  btn.disabled=COMP.locked||COMP.isSaving;
+  btn.disabled=COMP.locked||COMP.isSaving||!!error;
   btn.textContent=COMP.isSaving?"…":"Apply";
 }
-/* Adopts a fresh /admin/settings/compaction GET/PUT envelope as the new live state
-   and re-derives the draft selection from it. */
+/* Adopts the saved server target, independently of provider metadata arrival. */
 function renderCompactionState(body){
   COMP.LIVE.model=body.model;
   COMP.locked=!!body.env_locked;
   var draft=compactionDraftFromModel(body.model);
+  COMP.draftProvider=draft.provider;
   COMP.draftKind=draft.kind;
   COMP.draftCustom=draft.custom;
   renderCompaction();
 }
 function applyCompaction(){
   var btn=document.getElementById("comp-apply");
-  if(COMP.locked||btn.disabled)return;
+  if(COMP.locked||btn.disabled||compactionDraftError())return;
   var model;
   if(COMP.draftKind==="disabled"){
     model=null;
@@ -1262,7 +1280,7 @@ function applyCompaction(){
     var input=document.getElementById("comp-custom-input");
     var raw=input.value.trim();
     if(!raw)return;
-    model="claude:"+raw;
+    model=COMP.draftProvider+":"+raw;
   }else{
     model="claude:"+COMP.draftKind;
   }
@@ -1286,6 +1304,12 @@ function applyCompaction(){
     successText:function(body){return "Compaction → "+esc(body.model||"Disabled")}
   });
 }
+document.getElementById("comp-provider").addEventListener("change",function(){
+  COMP.draftProvider=this.value;
+  if(COMP.draftKind!=="disabled")COMP.draftKind="custom";
+  COMP.draftCustom="";
+  renderCompaction();
+});
 document.getElementById("comp-select").addEventListener("change",function(){
   COMP.draftKind=this.value;
   COMP.draftCustom="";
@@ -1293,6 +1317,7 @@ document.getElementById("comp-select").addEventListener("change",function(){
 });
 document.getElementById("comp-custom-input").addEventListener("input",function(){
   COMP.draftCustom=this.value;
+  renderCompaction();
 });
 document.getElementById("comp-apply").addEventListener("click",applyCompaction);
 var CODEX={
