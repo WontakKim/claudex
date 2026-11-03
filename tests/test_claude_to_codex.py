@@ -941,11 +941,9 @@ def test_artifact_property_names_pattern_is_translated_to_a_python_regex() -> No
     # Astral codepoints stay as raw literal characters: the fixed-width \U
     # escape is valid for Python's re but not for JavaScript's u mode.
     assert "\\U" not in translated
-    # The u-mode lookahead's dot is rewritten to the exact JS dot class so
-    # the translated Python regex excludes the same line terminators, and
-    # the $ inside the lookahead gets the same strict end anchor.
-    assert "(?!__[^\\n\\r\\u2028\\u2029]*__$(?![\\s\\S]))" in translated
-    re.compile(translated)
+    compiled = re.compile(translated)
+    assert compiled.search("__ordinary")
+    assert not compiled.search("__reserved__")
 
 
 def test_translated_property_names_pattern_keeps_the_original_semantics() -> None:
@@ -1214,26 +1212,37 @@ def test_codex_regex_compat_is_opt_in_and_off_by_default() -> None:
     assert list(parameters["patternProperties"]) == ["^\\p{Zl}$"]
 
 
-def test_strict_anchor_rewrite_only_touches_unescaped_out_of_class_dollars() -> None:
-    # Only a rewritten pattern gets the strict $(?![\s\S]) end anchor; an
-    # escaped \$, a $ inside a character class, and any pattern without a
-    # property escape keep the original text untouched.
-    escaped_dollar = _translate_single_pattern("^\\p{Zl}\\$$")
-    # Only the final unescaped $ becomes a strict anchor; the escaped \\
-    # literal dollar before it keeps its exact text.
-    assert escaped_dollar.count("$(?![\\s\\S])") == 1
-    assert "\\$" in escaped_dollar
+@pytest.mark.parametrize(
+    "pattern",
+    [r"^\p{Zl}\$$", r"^\p{Zl}[$]$", r"^\p{Zl}[\$]$"],
+)
+def test_translated_patterns_preserve_literal_dollars(pattern: str) -> None:
+    compiled = re.compile(_translate_single_pattern(pattern))
+    assert compiled.search("\u2028$")
+    for value in ["\u2028", "\u2028$$", "x$", "\u2028x"]:
+        assert not compiled.search(value), f"expected to reject {value!r}"
+    for terminator in ["\n", "\r", "\u2028", "\u2029"]:
+        assert not compiled.search("\u2028$" + terminator)
 
-    in_class = _translate_single_pattern("^\\p{Zl}[$]$")
-    assert in_class.count("$(?![\\s\\S])") == 1
-    assert "[$]" in in_class
 
-    untouched = _translate_single_pattern("^\\$[a]+$")
-    assert untouched == "^\\$[a]+$"
+def test_literal_dollar_pattern_without_property_escapes_stays_verbatim() -> None:
+    pattern = r"^\$[a]+$"
+    assert _translate_single_pattern(pattern) == pattern
 
-    escaped_brace_dollar = _translate_single_pattern("^\\p{Zl}[\\$]$")
-    assert escaped_brace_dollar.count("$(?![\\s\\S])") == 1
-    assert "[\\$]" in escaped_brace_dollar
+
+@pytest.mark.parametrize("terminator", ["\n", "\r", "\u2028", "\u2029"])
+def test_translated_reserved_name_lookahead_preserves_line_terminator_semantics(
+    terminator: str,
+) -> None:
+    # The body permits line terminators so it cannot mask a divergent
+    # lookahead dot or end anchor in the reserved-name exclusion.
+    compiled = re.compile(
+        _translate_single_pattern(r"^(?!__.*__$)(?:\p{Zl}|[^x])+$")
+    )
+    assert not compiled.search("__reserved__")
+    assert compiled.search("__ordinary")
+    assert compiled.search("__a" + terminator + "__")
+    assert compiled.search("__reserved__" + terminator)
 
 
 def test_translated_patterns_reject_a_trailing_newline_before_the_end_anchor() -> None:
@@ -1331,8 +1340,7 @@ def test_patterns_without_property_escapes_keep_divergent_constructs() -> None:
 
 def test_pattern_properties_key_collisions_after_translation_fail_fast() -> None:
     # Two different patternProperties keys can map onto the same translated
-    # key, which would silently drop one subschema. The translated key
-    # includes the strict anchor rewrite, so the colliding key must too.
+    # key, which would silently drop one subschema.
     def schema_with(keys: list) -> dict:
         return {"type": "object", "patternProperties": {key: True for key in keys}}
 
@@ -1348,7 +1356,10 @@ def test_pattern_properties_key_collisions_after_translation_fail_fast() -> None
     )
     (translated_key,) = solo["tools"][0]["parameters"]["patternProperties"]
     assert translated_key != "^\\p{Zl}$"
-    assert translated_key.endswith("$(?![\\s\\S])")
+    compiled = re.compile(translated_key)
+    assert compiled.search("\u2028")
+    for terminator in ["\n", "\r", "\u2028", "\u2029"]:
+        assert not compiled.search("\u2028" + terminator)
 
     for first, second in [
         ("^\\p{Zl}$", translated_key),

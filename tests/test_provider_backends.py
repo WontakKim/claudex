@@ -12,6 +12,7 @@ import httpx
 import pytest
 from starlette.requests import Request
 
+from claudex.config import OpenAICompatibleProvider
 from claudex.providers.backends import (
     AnthropicBackend,
     AnthropicErrorPolicy,
@@ -338,7 +339,6 @@ def test_existing_responses_clients_match_the_structural_transport_shape(
     assert _parameter_shape(client_type.stream_responses) == _parameter_shape(
         ResponsesTransport.stream_responses
     )
-    assert inspect.isasyncgenfunction(client_type.stream_responses)
     stream_hints = get_type_hints(client_type.stream_responses)
     assert stream_hints == {
         "payload": dict[str, Any],
@@ -358,6 +358,53 @@ def test_existing_responses_clients_match_the_structural_transport_shape(
         "model": str,
         "return": int | None,
     }
+
+
+@pytest.mark.parametrize("close_early", [False, True])
+def test_responses_transport_iterator_consumption_closes_the_upstream(
+    close_early: bool,
+) -> None:
+    upstream_events = [
+        {"type": "response.output_text.delta", "delta": "hello"},
+        {"type": "response.completed"},
+    ]
+
+    class TrackedStream(httpx.AsyncByteStream):
+        is_closed = False
+
+        async def __aiter__(self) -> AsyncIterator[bytes]:
+            yield b'data: {"type":"response.output_text.delta","delta":"hello"}\n\n'
+            yield b'data: {"type":"response.completed"}\n\n'
+
+        async def aclose(self) -> None:
+            self.is_closed = True
+
+    async def scenario() -> None:
+        stream = TrackedStream()
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            assert request.method == "POST"
+            assert str(request.url) == "https://provider.example/v1/responses"
+            return httpx.Response(200, stream=stream)
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+            transport: ResponsesTransport = OpenAICompatibleClient(
+                "custom",
+                OpenAICompatibleProvider(
+                    wire_api="responses", base_url="https://provider.example/v1"
+                ),
+                http_client,
+            )
+            events = transport.stream_responses({"stream": True}, "session-1")
+            assert await anext(events) == upstream_events[0]
+            assert not stream.is_closed
+            if close_early:
+                await events.aclose()
+            else:
+                assert [event async for event in events] == upstream_events[1:]
+            assert stream.is_closed
+
+    asyncio.run(scenario())
 
 
 def test_existing_kimi_client_matches_the_open_response_transport_shape() -> None:
