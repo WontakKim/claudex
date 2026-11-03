@@ -759,6 +759,86 @@ async function main() {
   });
   gptProSessionStates.missing = statusText(document, "gptpro-session");
 
+  const sessionDocument = new FakeDocument(html);
+  const sessionIntervals = new Map();
+  const sessionTimerIds = new Set();
+  const sessionTimerEvents = [];
+  const sessionRequests = [];
+  let sessionClock = 0;
+  let nextSessionTimerId = 0;
+  const sessionContext = Object.assign({}, context, {
+    document: sessionDocument,
+    setInterval(callback, period) {
+      if (!(period > 0)) throw new Error("Session timer period must be positive");
+      const id = ++nextSessionTimerId;
+      sessionIntervals.set(id, {callback, period, nextDue: sessionClock + period});
+      sessionTimerEvents.push({type: "register", id, period, tab: sessionDocument.body.dataset.tab});
+      // Login stays idle in this fixture, so MCP registers only the session timer.
+      if (sessionDocument.body.dataset.tab === "mcp") sessionTimerIds.add(id);
+      return id;
+    },
+    clearInterval(id) {
+      sessionTimerEvents.push({type: "cancel", id, tab: sessionDocument.body.dataset.tab});
+      sessionIntervals.delete(id);
+    },
+  });
+  vm.createContext(sessionContext);
+  vm.runInContext(source, sessionContext, {filename: javascriptPath});
+  sessionContext.jfetch = (url) => {
+    if (url === "/admin/gptpro/session") {
+      sessionRequests.push({url, tab: sessionDocument.body.dataset.tab});
+      return Promise.resolve({ok: true, status: 200, body: {exists: false, valid: false}});
+    }
+    if (url === "/admin/gptpro/login") {
+      return Promise.resolve({ok: true, status: 200, body: {status: "idle"}});
+    }
+    return Promise.resolve({ok: false, status: 503, body: {}});
+  };
+  const sessionCheckpoint = () => ({
+    requests: sessionRequests.length,
+    active: Array.from(sessionIntervals, ([id, timer]) => ({id, period: timer.period}))
+      .filter((timer) => sessionTimerIds.has(timer.id)),
+    registrations: sessionTimerEvents.filter((event) => event.type === "register" && sessionTimerIds.has(event.id)).length,
+    cancellations: sessionTimerEvents.filter((event) => event.type === "cancel" && sessionTimerIds.has(event.id)).length,
+  });
+  const selectSessionTab = async (tab) => {
+    sessionContext.setTab(tab);
+    await new Promise((resolve) => setImmediate(resolve));
+    return sessionCheckpoint();
+  };
+  const advanceSessionClock = async (elapsed) => {
+    sessionClock += elapsed;
+    // Advance only session handles; log and other dashboard timers remain untouched.
+    for (const id of sessionTimerIds) {
+      const timer = sessionIntervals.get(id);
+      while (sessionIntervals.has(id) && timer.nextDue <= sessionClock) {
+        timer.nextDue += timer.period;
+        timer.callback();
+      }
+    }
+    await new Promise((resolve) => setImmediate(resolve));
+    return sessionCheckpoint();
+  };
+  const gptProSessionPolling = {};
+  gptProSessionPolling.initial = await selectSessionTab("settings");
+  gptProSessionPolling.initialTick = await advanceSessionClock(60000);
+  gptProSessionPolling.entry = await selectSessionTab("mcp");
+  gptProSessionPolling.beforeDue = await advanceSessionClock(59999);
+  gptProSessionPolling.due = await advanceSessionClock(1);
+  gptProSessionPolling.repeated = await selectSessionTab("mcp");
+  gptProSessionPolling.repeatedTick = await advanceSessionClock(60000);
+  gptProSessionPolling.exits = [];
+  for (const tab of ["settings", "status", "map", "log"]) {
+    const exit = await selectSessionTab(tab);
+    const offTabTick = await advanceSessionClock(60000);
+    const reentry = await selectSessionTab("mcp");
+    const resumedTick = await advanceSessionClock(60000);
+    gptProSessionPolling.exits.push({tab, exit, offTabTick, reentry, resumedTick});
+  }
+  gptProSessionPolling.finalExit = await selectSessionTab("settings");
+  gptProSessionPolling.events = sessionTimerEvents;
+  gptProSessionPolling.requests = sessionRequests;
+
   const mcpInfoStates = {};
   context.renderMcpInfo({
     endpoint: "http://127.0.0.1:8787/mcp",
@@ -2266,6 +2346,7 @@ async function main() {
       usageRendering,
       gptProConcurrencyStates,
       gptProSessionStates,
+      gptProSessionPolling,
       mcpInfoStates,
       mcpConnectStates,
       gptProLoginStates,

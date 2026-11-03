@@ -816,7 +816,7 @@ def test_gptpro_concurrency_runtime_uses_authenticated_json_channel(
     }]
 
 
-def test_gptpro_session_card_renders_states_and_polls_only_on_mcp(
+def test_gptpro_session_card_renders_states(
     dashboard_runtime_result: dict[str, Any],
 ) -> None:
     states = dashboard_runtime_result["gptProSessionStates"]
@@ -842,9 +842,59 @@ def test_gptpro_session_card_renders_states_and_polls_only_on_mcp(
     assert "claudex-gateway gptpro login" in states["expired"]["text"]
     assert states["missing"]["className"] == "stat"
     assert states["missing"]["text"].startswith("● NOT CONFIGURED ")
-    assert 'jfetch("/admin/gptpro/session")' in DASHBOARD_JAVASCRIPT
-    assert "setInterval(fetchGptProSession,60000)" in DASHBOARD_JAVASCRIPT
-    assert 'document.body.dataset.tab==="mcp"' in DASHBOARD_JAVASCRIPT
+
+
+def test_gptpro_session_polling_follows_mcp_tab_lifecycle(
+    dashboard_runtime_result: dict[str, Any],
+) -> None:
+    polling = dashboard_runtime_result["gptProSessionPolling"]
+    initial = {"requests": 0, "active": [], "registrations": 0, "cancellations": 0}
+    assert polling["initial"] == initial
+    assert polling["initialTick"] == initial
+
+    entry = polling["entry"]
+    assert entry["requests"] == 1
+    assert [timer["period"] for timer in entry["active"]] == [60000]
+    assert entry["registrations"] == 1
+    assert entry["cancellations"] == 0
+    assert polling["beforeDue"] == entry
+    assert polling["due"]["requests"] == entry["requests"] + 1
+
+    repeated = polling["repeated"]
+    assert repeated["active"] == entry["active"]
+    assert repeated["registrations"] == entry["registrations"]
+    assert repeated["cancellations"] == entry["cancellations"]
+    previous = polling["repeatedTick"]
+    assert previous["requests"] == repeated["requests"] + 1
+    assert previous["active"] == entry["active"]
+
+    assert [case["tab"] for case in polling["exits"]] == ["settings", "status", "map", "log"]
+    for case in polling["exits"]:
+        exit_state = case["exit"]
+        assert exit_state["requests"] == previous["requests"], case["tab"]
+        assert exit_state["active"] == [], case["tab"]
+        assert exit_state["registrations"] == previous["registrations"], case["tab"]
+        assert exit_state["cancellations"] == previous["cancellations"] + 1, case["tab"]
+        assert case["offTabTick"] == exit_state, case["tab"]
+
+        reentry = case["reentry"]
+        assert reentry["requests"] == exit_state["requests"] + 1, case["tab"]
+        assert [timer["period"] for timer in reentry["active"]] == [60000], case["tab"]
+        assert reentry["active"][0]["id"] != previous["active"][0]["id"], case["tab"]
+        assert reentry["registrations"] == exit_state["registrations"] + 1, case["tab"]
+        assert reentry["cancellations"] == exit_state["cancellations"], case["tab"]
+        previous = case["resumedTick"]
+        assert previous["requests"] == reentry["requests"] + 1, case["tab"]
+        assert previous["active"] == reentry["active"], case["tab"]
+
+    final_exit = polling["finalExit"]
+    assert final_exit["active"] == []
+    assert final_exit["requests"] == previous["requests"]
+    assert final_exit["cancellations"] == previous["cancellations"] + 1
+    registrations = [event for event in polling["events"] if event["type"] == "register" and event["tab"] == "mcp"]
+    cancelled_ids = {event["id"] for event in polling["events"] if event["type"] == "cancel"}
+    assert all(event["id"] in cancelled_ids for event in registrations)
+    assert all(request == {"url": "/admin/gptpro/session", "tab": "mcp"} for request in polling["requests"])
 
 
 def test_mcp_tab_assets_wire_admin_operations_and_polling() -> None:
