@@ -6,10 +6,12 @@ import asyncio
 import inspect
 import json
 import logging
+import sys
 import threading
 import time
 import uuid
 from collections.abc import AsyncIterator, Callable, Iterator
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -17,10 +19,12 @@ from typing import Any
 import httpx
 import pytest
 from starlette.requests import Request
+from starlette.responses import Response
 from starlette.testclient import TestClient
 
 import claudex.admin.settings as admin_settings
 import claudex.admin.system as admin_system
+import claudex.relay.balanced as relay_balanced
 import claudex.relay.endpoints as relay_endpoints
 import claudex.relay.kimi as relay_kimi
 import claudex.relay.openai_backend as relay_openai_backend
@@ -2294,17 +2298,10 @@ class TestBalancedRoutingExit:
 
 
 def test_balanced_request_during_controlled_exit_awaits_and_serves_under_target_mode(
-    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
-    """Step 6/8's spec-gate ruling, exercised directly against
-    `ClaudeBalancedRuntime` (the exact primitives
-    `relay._passthrough_with_claude_balanced` dispatches through): a request
-    arriving while `exit_mode` is draining awaits the transition, then observes
-    the ALREADY-published target mode -- never a 503 merely because the
-    controlled transition was in flight.
-    """
+    """A dispatch arriving during drain waits and serves the published fallback mode."""
     from claudex.claude.accounts import AccountRecord
-    from claudex.balanced.runtime import ClaudeBalancedRuntime
 
     account_id = "22222222-3333-4444-5555-666666666666"
     accounts_root = tmp_path / "accounts"
@@ -2324,15 +2321,40 @@ def test_balanced_request_during_controlled_exit_awaits_and_serves_under_target_
         account_incarnation_id="incarnation-1",
         upstream_account_uuid=_BALANCED_ACCOUNT_UUID,
     )
-    published = {"mode": "disabled"}
+    runtime = ClaudeBalancedRuntime()
+    app_state = SimpleNamespace(
+        claude_balanced_runtime=runtime,
+        config=GatewayConfig(
+            settings_file=tmp_path / "settings.json",
+            claude_account_routing_mode="disabled",
+        ),
+    )
+    request = Request({
+        "type": "http", "method": "POST", "path": "/v1/messages",
+        "headers": [], "query_string": b"", "app": SimpleNamespace(state=app_state),
+    })
+    parsed_body = _account_body()
+    raw_body = json.dumps(parsed_body).encode()
+    fallback_response = Response(b"fallback response")
+    fallback_calls = []
 
-    async def scenario() -> str:
-        runtime = ClaudeBalancedRuntime()
+    async def fallback(request: Request, raw_body: bytes, parsed_body: Any) -> Response:
+        fallback_calls.append(
+            (request, raw_body, parsed_body, app_state.config.claude_account_routing_mode)
+        )
+        return fallback_response
+
+    monkeypatch.setattr(relay_balanced, "_passthrough_to_anthropic", fallback)
+
+    def publish_mode(mode: str) -> None:
+        app_state.config = replace(app_state.config, claude_account_routing_mode=mode)
+
+    async def scenario() -> None:
         await runtime.prepare_and_publish(
             accounts=[account],
             accounts_root=accounts_root,
             runtime_db_path=tmp_path / "runtime.sqlite3",
-            persist=lambda: published.__setitem__("mode", "balanced"),
+            persist=lambda: publish_mode("balanced"),
             entry="admin_enable",
         )
         assert runtime.status == "active"
@@ -2342,29 +2364,42 @@ def test_balanced_request_during_controlled_exit_awaits_and_serves_under_target_
 
         exit_task = asyncio.create_task(
             runtime.exit_mode(
-                "fallback", publish=lambda: published.__setitem__("mode", "fallback")
+                "fallback", publish=lambda: publish_mode("fallback")
             )
         )
-        await asyncio.sleep(0)
-        assert runtime.status == "draining"
+        waiter_task = asyncio.create_task(
+            relay_balanced._passthrough_with_claude_balanced(request, raw_body, parsed_body)
+        )
+        try:
+            await asyncio.sleep(0)
+            assert runtime.status == "draining"
+            assert app_state.config.claude_account_routing_mode == "balanced"
+            assert not waiter_task.done()
+            assert fallback_calls == []
+        finally:
+            primary_error = sys.exception()
+            runtime.end_request()
+            if primary_error is not None:
+                waiter_task.cancel()
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(waiter_task, exit_task, return_exceptions=True),
+                    timeout=5.0,
+                )
+            except TimeoutError:
+                if primary_error is None:
+                    raise
+                primary_error.add_note("Dispatch and runtime transition cleanup timed out")
 
-        async def waiting_dispatch() -> str:
-            # Mirrors relay._passthrough_with_claude_balanced's transition-await
-            # branch: wait, then re-read the published mode.
-            await runtime.wait_for_transition()
-            return published["mode"]
-
-        waiter_task = asyncio.create_task(waiting_dispatch())
-        await asyncio.sleep(0)
-        assert not waiter_task.done()  # still awaiting -- draining hasn't resolved
-
-        runtime.end_request()  # the in-flight request finishes -> drain completes
-        target_mode_seen = await asyncio.wait_for(waiter_task, timeout=5.0)
-        await asyncio.wait_for(exit_task, timeout=5.0)
+        await exit_task
+        response = await waiter_task
         assert runtime.status == "disabled"
-        return target_mode_seen
+        assert app_state.config.claude_account_routing_mode == "fallback"
+        assert response.status_code == fallback_response.status_code == 200
+        assert response.body == fallback_response.body
+        assert fallback_calls == [(request, raw_body, parsed_body, "fallback")]
 
-    assert asyncio.run(scenario()) == "fallback"
+    asyncio.run(scenario())
 
 
 def test_balanced_graceful_shutdown_preserves_epoch_and_pin_for_restart(

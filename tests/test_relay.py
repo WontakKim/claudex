@@ -4062,13 +4062,17 @@ def test_closing_the_sse_generator_finalizes_the_upstream_generator() -> None:
 
     async def scenario() -> None:
         sse = _translate_claude_sse({"model": "claude-opus-4-6"}, upstream)
-        first = await anext(sse)
-        assert "message_start" in first
-        assert flags["closed"] is False
-        await sse.aclose()
+        try:
+            first = await anext(sse)
+            assert "message_start" in first
+            assert flags["closed"] is False
+            await sse.aclose()
+            assert flags["closed"] is True
+        finally:
+            await sse.aclose()
+            await upstream.aclose()
 
     asyncio.run(scenario())
-    assert flags["closed"] is True
 
 
 def test_cancellation_mid_stream_finalizes_the_upstream_generator() -> None:
@@ -4109,10 +4113,16 @@ def test_aggregation_error_return_finalizes_the_upstream_generator() -> None:
         ],
     )
 
-    response = asyncio.run(_aggregate_claude_response({}, upstream))
+    async def scenario() -> None:
+        try:
+            response = await _aggregate_claude_response({}, upstream)
+            assert flags["closed"] is True
+            assert response.status_code == 502
+            assert json.loads(response.body)["error"]["message"] == "boom"
+        finally:
+            await upstream.aclose()
 
-    assert response.status_code == 502
-    assert flags["closed"] is True
+    asyncio.run(scenario())
 
 
 class ScriptedCodexClient(FakeCodexClient):
