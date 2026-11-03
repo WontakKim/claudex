@@ -30,10 +30,19 @@ Starting is idempotent: when the port already answers with the same gateway
 version, the command reports the running instance and exits. That running
 instance keeps its configuration, so stop and start it to apply edited
 settings or environment variables (see [Configuration](configuration.md)).
-A daemon left running across a package update is stopped and replaced
-automatically when its identity can be verified (any 0.4.0+ daemon), and a
-port occupied by something else fails loudly. The background log file is
-rewritten on every start.
+A different-version daemon left running across a package update is stopped
+and replaced automatically when its identity can be verified (any 0.4.0+
+daemon). The background launcher first allows 10 seconds for graceful
+shutdown. Only this automatic version replacement escalates to forced
+termination where supported if the verified daemon is still running; it waits
+up to another 10 seconds to confirm exit before starting and checking the
+replacement. If forced termination is unavailable, or exit cannot be confirmed,
+replacement fails without starting a new daemon.
+Forced termination interrupts in-flight requests: clients may need to retry,
+and upstream work may continue even after the gateway exits. Manual `stop`
+remains graceful-only and reports failure after 10 seconds without forcing
+termination; foreground shutdown is unchanged. A port occupied by something
+else fails loudly. The background log file is rewritten on every start.
 
 `stop` (and the automatic stale-daemon replacement) verifies the daemon's
 identity before sending any signal: the pid, host, port, and per-start nonce
@@ -42,8 +51,7 @@ reports on `GET /api/hello`. A record that cannot be verified — the bare-pid
 file of a pre-0.4 install, a corrupt record, or a pid that no longer answers
 as the recorded gateway — is never signaled; the command explains what to
 stop manually instead (a one-time step when upgrading from 0.3.x). This
-makes pid reuse harmless: a recycled pid can no longer be terminated by
-mistake.
+prevents signaling a process solely because it inherited a recorded pid.
 
 ### From the macOS release
 

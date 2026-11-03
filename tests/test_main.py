@@ -7,6 +7,7 @@ import contextlib
 import io
 import json
 import os
+import runpy
 import signal
 import socket
 import stat
@@ -568,6 +569,270 @@ def test_start_restarts_a_stale_version_daemon(tmp_path: Path) -> None:
         with contextlib.suppress(ProcessLookupError):
             fake.kill()
         _kill_leaked_daemon(tmp_path)
+
+
+@pytest.mark.skipif(not hasattr(signal, "SIGKILL"), reason="SIGKILL is unavailable")
+def test_start_forces_a_draining_stale_daemon_and_waits_for_replacement_readiness(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    draining_server = "import signal, time\n" + _FAKE_SERVER.replace(
+        '_ReusableServer(("127.0.0.1", int(sys.argv[1])), Handler).serve_forever()',
+        'server = _ReusableServer(("127.0.0.1", int(sys.argv[1])), Handler)\n'
+        'def drain(*args):\n'
+        '    server.server_close()\n'
+        '    time.sleep(60)\n'
+        'signal.signal(signal.SIGTERM, drain)\n'
+        'server.serve_forever()',
+    )
+    monkeypatch.setattr(sys.modules[__name__], "_FAKE_SERVER", draining_server)
+    port = _free_port()
+    env = _gateway_env(tmp_path, port)
+    fake = _spawn_fake_server(
+        port,
+        {"hello": "claudex-gateway", "version": "old-version",
+         "__SELF_PID__": True, "nonce": "draining-nonce"},
+    )
+    _write_daemon_record(tmp_path, fake.pid, port, "draining-nonce")
+    try:
+        started = _run_cli(env)
+        assert started.returncode == 0, started.stderr
+        assert "restarting" in started.stdout
+        assert "started on" in started.stdout
+        assert fake.wait(timeout=2) == -signal.SIGKILL
+        record = json.loads(_record_file(tmp_path).read_text(encoding="utf-8"))
+        hello = _fetch_hello(port)
+        assert hello["pid"] == record["pid"] != fake.pid
+        assert hello["nonce"] == record["nonce"] != "draining-nonce"
+        assert hello["version"] == daemon.claudex.__version__
+        stopped = _run_cli(env, "stop")
+        assert stopped.returncode == 0, stopped.stderr
+    finally:
+        with contextlib.suppress(ProcessLookupError):
+            fake.kill()
+        fake.wait()
+        _kill_leaked_daemon(tmp_path)
+
+
+@pytest.mark.parametrize(
+    "scenario",
+    ["graceful-exit", "same-version", "manual-timeout", "force-timeout",
+     "nonce-mismatch", "unverified-process", "forced-exit", "record-changed"],
+)
+def test_background_replacement_signal_boundaries(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str],
+    scenario: str,
+) -> None:
+    if not hasattr(signal, "SIGKILL") and scenario in {"force-timeout", "forced-exit", "record-changed"}:
+        pytest.skip("SIGKILL is unavailable")
+    config = GatewayConfig(port=12345, settings_file=tmp_path / "settings.json")
+    monkeypatch.setattr(paths, "runtime_dir", lambda: tmp_path / ".claudex")
+    _write_daemon_record(tmp_path, 101, config.port, "old-nonce")
+    clock = _FakeLaunchClock()
+    monkeypatch.setattr(daemon, "time", clock)
+    signals: list[tuple[int, int, float]] = []
+    state = {"alive": True, "spawned": False, "forced_at": None}
+    old_record = json.loads(_record_file(tmp_path).read_text(encoding="utf-8"))
+
+    def hello(host: str, port: int) -> dict | None:
+        if state["spawned"]:
+            return {"hello": "claudex-gateway", "pid": 202, "nonce": "new-nonce"}
+        if not state["alive"] or signals:
+            return None
+        if scenario == "unverified-process":
+            return None
+        return {
+            "hello": "claudex-gateway", **old_record,
+            "version": daemon.claudex.__version__ if scenario == "same-version" else "old",
+            "nonce": "wrong-nonce" if scenario == "nonce-mismatch" else "old-nonce",
+        }
+
+    def kill(pid: int, requested_signal: int) -> None:
+        assert pid == 101
+        if requested_signal == 0:
+            if state["forced_at"] is not None and clock.elapsed >= state["forced_at"] + 0.2:
+                state["alive"] = False
+            if not state["alive"]:
+                raise ProcessLookupError
+            return
+        signals.append((pid, requested_signal, clock.elapsed))
+        if requested_signal == signal.SIGTERM and scenario == "record-changed":
+            _write_daemon_record(tmp_path, 303, config.port, "other-nonce")
+        if requested_signal == signal.SIGTERM and scenario == "graceful-exit":
+            state["alive"] = False
+        if requested_signal == getattr(signal, "SIGKILL", None) and scenario == "forced-exit":
+            state["forced_at"] = clock.elapsed
+
+    def spawn(*arguments: object, **options: object) -> SimpleNamespace:
+        assert not state["alive"], "replacement spawned before old process exit"
+        state["spawned"] = True
+        return SimpleNamespace(pid=202, poll=lambda: None)
+
+    monkeypatch.setattr(daemon, "_gateway_hello", hello)
+    monkeypatch.setattr(daemon, "_is_listening", lambda host, port: state["alive"] and not signals)
+    monkeypatch.setattr(daemon.os, "kill", kill)
+    monkeypatch.setattr(daemon.subprocess, "Popen", spawn)
+    monkeypatch.setattr(daemon.secrets, "token_hex", lambda count: "new-nonce")
+    if scenario == "manual-timeout":
+        with pytest.raises(SystemExit, match="1"):
+            daemon._stop_background()
+    elif scenario in {"force-timeout", "nonce-mismatch", "unverified-process", "record-changed"}:
+        with pytest.raises(SystemExit, match="1"):
+            daemon._start_background(config)
+    else:
+        daemon._start_background(config)
+
+    sent = [requested_signal for _, requested_signal, _ in signals]
+    if scenario in {"force-timeout", "forced-exit"}:
+        assert sent == [signal.SIGTERM, signal.SIGKILL]
+        assert signals[1][2] >= daemon._STOP_TIMEOUT
+        assert clock.elapsed <= 2 * daemon._STOP_TIMEOUT + 0.2
+    elif scenario in {"graceful-exit", "manual-timeout", "record-changed"}:
+        assert sent == [signal.SIGTERM]
+    else:
+        assert sent == []
+    assert state["spawned"] == (scenario in {"graceful-exit", "forced-exit"})
+    if scenario == "record-changed":
+        assert json.loads(_record_file(tmp_path).read_text(encoding="utf-8"))["pid"] == 303
+        assert "record changed" in capsys.readouterr().err
+    elif not state["spawned"]:
+        assert json.loads(_record_file(tmp_path).read_text(encoding="utf-8")) == old_record
+    if scenario == "force-timeout":
+        assert "after forced termination" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("failed_signal_name", ["SIGTERM", "SIGKILL", None])
+@pytest.mark.parametrize("error_type", [PermissionError, OSError])
+def test_replacement_reports_signal_errors_without_spawning(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str],
+    failed_signal_name: str | None, error_type: type[OSError],
+) -> None:
+    failed_signal = getattr(signal, failed_signal_name, None) if failed_signal_name else 0
+    if failed_signal is None:
+        pytest.skip("SIGKILL is unavailable")
+    config = GatewayConfig(port=12345, settings_file=tmp_path / "settings.json")
+    monkeypatch.setattr(paths, "runtime_dir", lambda: tmp_path / ".claudex")
+    _write_daemon_record(tmp_path, 101, config.port, "old-nonce")
+    monkeypatch.setattr(daemon, "time", _FakeLaunchClock())
+    monkeypatch.setattr(daemon, "_is_listening", lambda host, port: True)
+    monkeypatch.setattr(
+        daemon, "_gateway_hello",
+        lambda host, port: {"hello": "claudex-gateway", "version": "old",
+                            "pid": 101, "nonce": "old-nonce"},
+    )
+    signals: list[int] = []
+
+    def kill(pid: int, requested_signal: int) -> None:
+        assert pid == 101
+        if requested_signal == failed_signal:
+            raise error_type("signal denied")
+        if requested_signal:
+            signals.append(requested_signal)
+
+    def unexpected_spawn(*arguments: object, **options: object) -> None:
+        pytest.fail("must not spawn after a shutdown signal error")
+
+    monkeypatch.setattr(daemon.os, "kill", kill)
+    monkeypatch.setattr(daemon.subprocess, "Popen", unexpected_spawn)
+    with pytest.raises(SystemExit, match="1"):
+        daemon._start_background(config)
+    assert "signal denied" in capsys.readouterr().err
+    assert signals == ([] if failed_signal == signal.SIGTERM else [signal.SIGTERM])
+    assert _record_file(tmp_path).exists()
+
+
+@pytest.mark.parametrize("disappearing_signal_name", ["SIGTERM", "SIGKILL"])
+def test_verified_replacement_accepts_process_disappearing_before_signal(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, disappearing_signal_name: str,
+) -> None:
+    disappearing_signal = getattr(signal, disappearing_signal_name, None)
+    if disappearing_signal is None:
+        pytest.skip("SIGKILL is unavailable")
+    monkeypatch.setattr(paths, "runtime_dir", lambda: tmp_path / ".claudex")
+    _write_daemon_record(tmp_path, 101, 12345, "old-nonce")
+    monkeypatch.setattr(daemon, "time", _FakeLaunchClock())
+    monkeypatch.setattr(
+        daemon, "_gateway_hello", lambda host, port: {"pid": 101, "nonce": "old-nonce"},
+    )
+    signals: list[int] = []
+
+    def kill(pid: int, requested_signal: int) -> None:
+        assert pid == 101
+        if requested_signal:
+            signals.append(requested_signal)
+        if requested_signal == disappearing_signal:
+            raise ProcessLookupError
+
+    monkeypatch.setattr(daemon.os, "kill", kill)
+    assert daemon._stop_recorded_daemon(force_after_timeout=True) == (True, "101")
+    assert signals == ([signal.SIGTERM] if disappearing_signal == signal.SIGTERM
+                       else [signal.SIGTERM, signal.SIGKILL])
+    assert not _record_file(tmp_path).exists()
+
+
+@pytest.mark.parametrize(
+    "scenario", ["manual-exit", "manual-timeout", "replacement-exit", "replacement-timeout"],
+)
+def test_shutdown_without_sigkill_preserves_graceful_attempt(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str],
+    scenario: str,
+) -> None:
+    config = GatewayConfig(port=12345, settings_file=tmp_path / "settings.json")
+    monkeypatch.setattr(paths, "runtime_dir", lambda: tmp_path / ".claudex")
+    _write_daemon_record(tmp_path, 101, config.port, "old-nonce")
+    monkeypatch.setattr(daemon, "time", _FakeLaunchClock())
+    monkeypatch.delattr(signal, "SIGKILL", raising=False)
+    state = {"alive": True, "spawned": False}
+    signals: list[int] = []
+
+    def kill(pid: int, requested_signal: int) -> None:
+        assert pid == 101
+        if requested_signal == signal.SIGTERM:
+            signals.append(requested_signal)
+            state["alive"] = scenario.endswith("timeout")
+        elif requested_signal == 0:
+            if not state["alive"]:
+                raise ProcessLookupError
+        else:
+            pytest.fail("unexpected escalation without SIGKILL")
+
+    def spawn(*arguments: object, **options: object) -> SimpleNamespace:
+        assert not state["alive"], "replacement spawned before exit confirmation"
+        state["spawned"] = True
+        return SimpleNamespace(pid=202, poll=lambda: None)
+
+    def hello(host: str, port: int) -> dict:
+        if state["spawned"]:
+            return {"pid": 202, "nonce": "new-nonce"}
+        return {"pid": 101, "nonce": "old-nonce", "version": "old"}
+
+    monkeypatch.setattr(daemon.os, "kill", kill)
+    monkeypatch.setattr(daemon.subprocess, "Popen", spawn)
+    monkeypatch.setattr(daemon, "_gateway_hello", hello)
+    monkeypatch.setattr(daemon, "_is_listening", lambda host, port: state["alive"])
+    monkeypatch.setattr(daemon.secrets, "token_hex", lambda count: "new-nonce")
+    action = (
+        (lambda: daemon._start_background(config))
+        if scenario.startswith("replacement") else daemon._stop_background
+    )
+    if scenario.endswith("timeout"):
+        with pytest.raises(SystemExit, match="1"):
+            action()
+        assert _record_file(tmp_path).exists()
+        detail = capsys.readouterr().err
+        if scenario == "replacement-timeout":
+            assert "forced termination is unavailable" in detail
+        else:
+            assert "did not exit within 10s" in detail
+        assert daemon.time.elapsed <= daemon._STOP_TIMEOUT + 0.1
+    else:
+        action()
+    assert signals == [signal.SIGTERM]
+    assert state["spawned"] == (scenario == "replacement-exit")
+
+
+def test_main_test_module_imports_without_sigkill(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delattr(signal, "SIGKILL", raising=False)
+    runpy.run_path(str(Path(__file__).resolve()))
 
 
 def test_start_refuses_restart_with_legacy_pid_record(tmp_path: Path) -> None:

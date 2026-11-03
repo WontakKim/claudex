@@ -166,7 +166,7 @@ def _start_background_locked(config: GatewayConfig) -> None:
             f"claudex-gateway {running_version} is running but this launcher is "
             f"{claudex.__version__}; restarting"
         )
-        stopped, message = _stop_recorded_daemon()
+        stopped, message = _stop_recorded_daemon(force_after_timeout=True)
         if not stopped:
             print(
                 f"cannot restart automatically: {message}; "
@@ -278,11 +278,12 @@ def _read_daemon_record() -> tuple[dict[str, Any] | None, str]:
     )
 
 
-def _stop_recorded_daemon() -> tuple[bool, str]:
+def _stop_recorded_daemon(*, force_after_timeout: bool = False) -> tuple[bool, str]:
     """Verify the recorded daemon's identity via /api/hello, then SIGTERM it.
 
     Returns (stopped, detail): the stopped pid on success, the reason on
-    failure. Never signals a pid whose identity cannot be verified."""
+    failure. Only automatic version replacement opts into SIGKILL after the
+    graceful timeout. Never signals a pid whose identity cannot be verified."""
     record, reason = _read_daemon_record()
     if record is None:
         return False, reason
@@ -307,21 +308,47 @@ def _stop_recorded_daemon() -> tuple[bool, str]:
             f"daemon record; refusing to signal pid {pid}"
         )
 
-    try:
-        os.kill(pid, signal.SIGTERM)
-    except ProcessLookupError:
-        paths.daemon_record_file().unlink(missing_ok=True)
-        return False, "not running (stale daemon record removed)"
-
-    deadline = time.monotonic() + _STOP_TIMEOUT
-    while time.monotonic() < deadline:
+    shutdown_signals = (
+        (signal.SIGTERM, getattr(signal, "SIGKILL", None))
+        if force_after_timeout else (signal.SIGTERM,)
+    )
+    for shutdown_signal in shutdown_signals:
+        if shutdown_signal is None:
+            return False, (
+                f"pid {pid} did not exit within {_STOP_TIMEOUT:.0f}s; "
+                "forced termination is unavailable on this platform"
+            )
+        if shutdown_signal != signal.SIGTERM:
+            current_record, _ = _read_daemon_record()
+            if current_record != record:
+                return False, (
+                    f"daemon record changed while stopping pid {pid}; "
+                    "refusing forced termination"
+                )
+            # SIGTERM may close the listener while requests drain. Retain the
+            # verified identity instead of requiring another HTTP response.
         try:
-            os.kill(pid, 0)
+            os.kill(pid, shutdown_signal)
         except ProcessLookupError:
             paths.daemon_record_file().unlink(missing_ok=True)
-            return True, str(pid)
-        time.sleep(0.1)
-    return False, f"pid {pid} did not exit within {_STOP_TIMEOUT:.0f}s"
+            if force_after_timeout:
+                return True, str(pid)
+            return False, "not running (stale daemon record removed)"
+        except OSError as exc:
+            return False, f"cannot send {shutdown_signal.name} to pid {pid}: {exc}"
+
+        deadline = time.monotonic() + _STOP_TIMEOUT
+        while time.monotonic() < deadline:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                paths.daemon_record_file().unlink(missing_ok=True)
+                return True, str(pid)
+            except OSError as exc:
+                return False, f"cannot confirm exit of pid {pid}: {exc}"
+            time.sleep(0.1)
+    action = " after forced termination" if force_after_timeout else ""
+    return False, f"pid {pid} did not exit within {_STOP_TIMEOUT:.0f}s{action}"
 
 
 def _stop_background() -> None:
