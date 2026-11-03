@@ -1,6 +1,7 @@
 """Tests for the shared ~/.claudex path resolver module."""
 
 import ast
+import sys
 from pathlib import Path
 
 import pytest
@@ -94,15 +95,16 @@ def test_do_not_create_the_runtime_directory(tmp_path: Path) -> None:
 
 
 def test_imports_only_stdlib() -> None:
-    allowed_modules = {"__future__", "pathlib"}
     source = (_PACKAGE_DIR / "paths.py").read_text(encoding="utf-8")
     tree = ast.parse(source)
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
-                assert alias.name in allowed_modules
+                assert alias.name.split(".")[0] in sys.stdlib_module_names
         elif isinstance(node, ast.ImportFrom):
-            assert node.module in allowed_modules
+            assert node.level == 0, "paths must not depend on package-relative imports"
+            assert node.module is not None
+            assert node.module.split(".")[0] in sys.stdlib_module_names
 
 
 @pytest.mark.parametrize(
@@ -125,9 +127,19 @@ def test_consumers_use_shared_paths_module(module_name: str) -> None:
     assert 'Path.home() / ".claudex"' not in source
 
 
-def test_cli_daemon_imports_shared_paths_module() -> None:
-    source = (_PACKAGE_DIR / "cli" / "daemon.py").read_text(encoding="utf-8")
-    assert "from claudex import paths" in source
+def test_cli_daemon_uses_shared_paths_module(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    from claudex.cli import daemon
+
+    record_file = tmp_path / "shared-daemon-record.json"
+    monkeypatch.setattr(paths, "daemon_record_file", lambda: record_file)
+    daemon._write_daemon_record(123, "127.0.0.1", 54321, "synthetic-nonce")
+    assert record_file.is_file()
+    assert daemon._read_daemon_record() == (
+        {"pid": 123, "host": "127.0.0.1", "port": 54321, "nonce": "synthetic-nonce"},
+        "",
+    )
 
 
 def test_gptpro_output_dir_is_under_the_gptpro_runtime_dir(tmp_path: Path) -> None:

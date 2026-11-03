@@ -2302,7 +2302,11 @@ def test_read_only_recovery_keeps_failed_ask_and_conversation_ownership() -> Non
         await recovery_started.wait()
         assert (await _wait_for_state(service, recovered.ask_id, "detached")).source_ask_id == original.ask_id
         followup = service.start("follow-up", conversation_id=thread)
-        await _wait_for_state(service, followup.ask_id, "queued")
+        waiting = await _wait_for_status_message(
+            service, followup.ask_id, "waiting for the in-flight answer",
+        )
+        assert waiting.state == "queued"
+        assert not release_recovery.is_set()
         assert submitted_questions == ["original"]
         with pytest.raises(ValueError, match="already pending"):
             service.start_recovery(ask_id=original.ask_id)
