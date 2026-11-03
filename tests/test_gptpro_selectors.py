@@ -1,8 +1,8 @@
 """Tests pinning the gptpro DOM selectors to the redesigned ChatGPT markup.
 
-The suite has no JavaScript engine, so the JS probes are pinned structurally
-while the CSS selectors are exercised against a minimal element tree shaped
-like the observed ChatGPT DOM: a ``form[data-chatgpt-composer]`` hosting a
+Role probes execute in Node with inert DOM collaborators, while CSS selectors
+are exercised against a minimal element tree shaped like the observed ChatGPT DOM:
+a ``form[data-chatgpt-composer]`` hosting a
 ProseMirror contenteditable composer with aria-labeled buttons, and
 ``data-chatgpt-search-unit-key`` message units grouped in turn containers.
 """
@@ -10,7 +10,9 @@ ProseMirror contenteditable composer with aria-labeled buttons, and
 from __future__ import annotations
 
 import asyncio
+import json
 import re
+import subprocess
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -413,20 +415,104 @@ def test_user_units_expose_the_user_message_id() -> None:
     ] == [_USER_ID, _SECOND_USER_ID]
 
 
-def test_top_level_predicate_excludes_nested_unit_key_elements() -> None:
-    predicate = selectors.TOP_LEVEL_ROLE_PREDICATE_JS
+def _role_unit(
+    role: str, message_id: str, text: str = "", *, children: list[dict] | None = None,
+) -> dict:
+    return {
+        "attributes": {
+            "data-chatgpt-search-unit-key": f"fixture:{message_id}:{role}",
+            selectors.MESSAGE_ID_ATTRIBUTE: message_id,
+        },
+        "text": text,
+        "children": children or [],
+    }
 
-    assert "data-chatgpt-search-unit-key" in predicate
-    assert "data-message-author-role" not in predicate
-    assert "parentElement" in predicate
-    assert "closest(" in predicate
-    for probe in (
-        selectors.TOP_LEVEL_USER_IDS_PROBE_JS,
-        selectors.USER_ECHO_PROBE_JS,
-        selectors.RELOCK_USER_ECHO_PROBE_JS,
-        selectors.TURN_STATE_PROBE_JS,
-    ):
-        assert predicate in probe
+
+def _role_probes(tree: dict, *, locked_user_id: str = _USER_ID) -> dict:
+    completed = subprocess.run(
+        ["node", str(Path(__file__).with_name("gptpro-probe-runtime-harness.js"))],
+        input=json.dumps({
+            "mode": "roles",
+            "sources": {
+                "ids": selectors.TOP_LEVEL_USER_IDS_PROBE_JS,
+                "echo": selectors.USER_ECHO_PROBE_JS,
+                "relock": selectors.RELOCK_USER_ECHO_PROBE_JS,
+                "turn": selectors.TURN_STATE_PROBE_JS,
+            },
+            "tree": tree,
+            "args": {
+                "userSelector": selectors.USER_MESSAGE_SELECTOR,
+                "assistantSelector": selectors.ASSISTANT_MESSAGE_SELECTOR,
+                "stopSelector": '[data-stop]',
+                "idAttribute": selectors.MESSAGE_ID_ATTRIBUTE,
+                "preIds": [_USER_ID],
+                "nonceMarker": "[gptpro-transport-nonce:fixture]",
+                "lockedUserId": locked_user_id,
+            },
+        }),
+        text=True, capture_output=True, timeout=5, check=True,
+    )
+    return json.loads(completed.stdout)
+
+
+@pytest.mark.parametrize("has_top_level_echo", [False, True])
+@pytest.mark.parametrize("wrapper_depth", [0, 2])
+def test_role_probes_exclude_nested_quoted_nonce(
+    has_top_level_echo: bool, wrapper_depth: int,
+) -> None:
+    marker = "[gptpro-transport-nonce:fixture]"
+    quoted = {
+        "children": [
+            _role_unit("user", "quoted-user", marker),
+            _role_unit("assistant", "quoted-assistant", "quoted answer"),
+        ],
+    }
+    for _ in range(wrapper_depth):
+        quoted = {"children": [quoted]}
+    tree = {"children": [
+        _role_unit("user", _USER_ID, "earlier prompt"),
+        _role_unit("assistant", "answer", "Answer quoting: ", children=[quoted]),
+    ]}
+    if has_top_level_echo:
+        tree["children"].append(_role_unit("user", _SECOND_USER_ID, marker))
+
+    result = _role_probes(tree)
+
+    expected_echo = _SECOND_USER_ID if has_top_level_echo else None
+    assert result["ids"] == [_USER_ID, *([_SECOND_USER_ID] if has_top_level_echo else [])]
+    assert result["echo"] == expected_echo
+    assert result["relock"] == expected_echo
+    assert result["turn"]["anchorPresent"] is True
+    assert result["turn"]["assistantExists"] is True
+    assert result["turn"]["assistantTextLength"] == len(
+        "Answer quoting: " + marker + "quoted answer"
+    )
+    assert result["turn"]["hasStop"] is False
+
+    nested_anchor = _role_probes(tree, locked_user_id="quoted-user")
+    assert nested_anchor["turn"]["anchorPresent"] is False
+    assert nested_anchor["turn"]["assistantExists"] is False
+
+
+@pytest.mark.parametrize(
+    ("message_ids", "expected_echo", "expected_relock"),
+    [([_SECOND_USER_ID], _SECOND_USER_ID, _SECOND_USER_ID),
+     ([_USER_ID], None, _USER_ID),
+     ([_SECOND_USER_ID, "another-user"], None, None)],
+)
+def test_role_probes_require_unique_echo_and_exclude_preexisting_ids(
+    message_ids: list[str], expected_echo: str | None, expected_relock: str | None,
+) -> None:
+    tree = {"children": [
+        _role_unit("user", message_id, "[gptpro-transport-nonce:fixture]")
+        for message_id in message_ids
+    ]}
+
+    result = _role_probes(tree)
+
+    assert result["ids"] == message_ids
+    assert result["echo"] == expected_echo
+    assert result["relock"] == expected_relock
 
 
 def test_legacy_dom_markup_is_not_selected() -> None:

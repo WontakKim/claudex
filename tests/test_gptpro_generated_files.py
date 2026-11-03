@@ -13,6 +13,7 @@ import base64
 import hashlib
 import json
 import os
+import subprocess
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -756,14 +757,109 @@ def test_hanging_browser_fetch_is_bounded(
     assert "timed out" in failed.error
 
 
-def test_download_probe_refuses_redirects_and_bounds_reads() -> None:
+def _download_probe(
+    *,
+    chunks: list[list[int]],
+    max_bytes: int = 4,
+    response_headers: dict[str, str] | None = None,
+    page_origin: str = "https://chatgpt.com",
+    redirect: bool = False,
+) -> dict[str, Any]:
     from claudex.gptpro import selectors
 
-    probe = getattr(selectors, "FILE_DOWNLOAD_PROBE_JS", "")
-    assert "redirect: 'error'" in probe
-    assert "location.origin !== args.origin" in probe
-    assert "args.maxBytes" in probe
-    assert "controller.abort()" in probe
+    completed = subprocess.run(
+        ["node", str(Path(__file__).with_name("gptpro-probe-runtime-harness.js"))],
+        input=json.dumps({
+            "mode": "download",
+            "source": selectors.FILE_DOWNLOAD_PROBE_JS,
+            "pageOrigin": page_origin,
+            "redirect": redirect,
+            "responseHeaders": response_headers or {},
+            "chunks": chunks,
+            "args": {
+                "origin": "https://chatgpt.com",
+                "url": _CONTENT_URL,
+                "headers": {},
+                "maxBytes": max_bytes,
+                "timeoutMs": 1000,
+            },
+        }),
+        text=True, capture_output=True, timeout=5, check=True,
+    )
+    observation = json.loads(completed.stdout)
+    assert observation["pendingTimers"] == 0
+    return observation
+
+
+def test_download_probe_refuses_redirects() -> None:
+    observation = _download_probe(chunks=[[1]], redirect=True)
+
+    assert observation["requests"][0]["redirect"] == "error"
+    assert observation["result"]["fetchError"]
+    assert observation["result"]["bodyBase64"] is None
+    assert observation["reads"] == 0
+
+
+@pytest.mark.parametrize("page_origin", ["https://example.com", "https://chatgpt.com.evil.test"])
+def test_download_probe_refuses_untrusted_page_before_fetch(page_origin: str) -> None:
+    observation = _download_probe(chunks=[[1]], page_origin=page_origin)
+
+    assert observation["requests"] == []
+    assert observation["result"]["fetchError"]
+    assert observation["result"]["bodyBase64"] is None
+
+
+@pytest.mark.parametrize("max_bytes", [4, 7])
+def test_download_probe_rejects_declared_oversize_before_reading(max_bytes: int) -> None:
+    observation = _download_probe(
+        chunks=[[1] * (max_bytes + 1)], max_bytes=max_bytes,
+        response_headers={"content-length": str(max_bytes + 1)},
+    )
+
+    assert observation["result"]["tooLarge"] is True
+    assert observation["result"]["bodyBase64"] is None
+    assert observation["reads"] == 0
+    assert observation["cancellations"] >= 1
+
+
+@pytest.mark.parametrize("response_headers", [{}, {"content-length": "1"}])
+@pytest.mark.parametrize("max_bytes", [4, 7])
+def test_download_probe_stops_at_incremental_read_limit(
+    response_headers: dict[str, str], max_bytes: int,
+) -> None:
+    observation = _download_probe(
+        chunks=[[0] * max_bytes, [255], [1, 2, 3]], max_bytes=max_bytes,
+        response_headers=response_headers,
+    )
+
+    assert observation["result"]["tooLarge"] is True
+    assert observation["result"]["bodyBase64"] is None
+    assert observation["result"]["byteLength"] > max_bytes
+    assert observation["reads"] == 2
+    assert observation["cancellations"] >= 1
+
+
+@pytest.mark.parametrize(
+    ("chunks", "max_bytes", "response_headers"),
+    [([], 4, {}), ([[0, 128], [255, 65]], 4, {"content-length": "4"}),
+     ([[0, 128], [255, 65]], 7, {})],
+)
+def test_download_probe_preserves_valid_binary_data(
+    chunks: list[list[int]], max_bytes: int, response_headers: dict[str, str],
+) -> None:
+    observation = _download_probe(
+        chunks=chunks, max_bytes=max_bytes, response_headers=response_headers,
+    )
+
+    result = observation["result"]
+    assert result["fetchError"] is None
+    assert result["tooLarge"] is False
+    expected = bytes(byte for chunk in chunks for byte in chunk)
+    assert base64.b64decode(result["bodyBase64"]) == expected
+    assert result["byteLength"] == len(expected)
+    assert observation["cancellations"] == 0
+    assert observation["requests"][0]["url"] == _CONTENT_URL
+    assert observation["requests"][0]["credentials"] == "include"
 
 
 _OTHER_CONVERSATION_ID = "223e4567-e89b-12d3-a456-426614174000"
