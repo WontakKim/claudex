@@ -202,19 +202,23 @@ Boundaries to know:
 The `balanced` mode spreads Claude Code sessions across every ready
 registered account instead of waiting for a `429`. It does not need a
 serving account and never forwards client credentials, even after
-`account use off`. If an account is selected, it gets the first session
-while no usage readings or session assignments exist yet, and it wins ties.
+`account use off`. Selecting a serving account does not currently give it
+priority for initial balanced placement or ties.
 
-Each session stays on one account. The session is identified by Claude
-Code's session id, or by a hash of the first user message when the request
-has none. A new session goes to an account picked at random, weighted
-toward accounts with more remaining quota in their latest usage readings.
+Account affinity is maintained per session and quota family: one assignment
+for Fable models and another for all other models. A mixed-model session can
+therefore use different accounts. The session is identified by Claude Code's
+session id, or by a hash of the first user message when the request has none.
+A new assignment goes to an account picked at random, weighted toward accounts
+with more remaining quota for that family in their latest usage readings.
 Usage is polled in the background, with at most one upstream usage call
 every five minutes across the pool.
 
-When the session's account answers `429`, is already cooling down, was
-removed or needs a new login, or fails authentication, the gateway moves
-the session to another eligible account. As in fallback mode, this happens
+When the assigned account answers `429`, is already cooling down, was removed
+or needs a new login, or fails authentication, the gateway moves that
+assignment to another eligible account. A family-specific migration does not
+by itself move the other family's assignment; account-wide failures or
+cooldowns can affect both families. As in fallback mode, migration happens
 only before any response byte reaches the client. A Fable-model `429` cools
 only the account's Fable models when fresh usage readings show the Fable
 weekly window exhausted while the five-hour and seven-day windows still have
@@ -225,8 +229,8 @@ failed without a real quota `429`, the client gets the first actionable
 account failure unchanged: for example, `503` for unavailable authentication
 or `401` for rejection after a token refresh. If no account is ready to
 attempt, the client gets `503`.
-Token counting follows the session's account when one is already assigned,
-but never moves a session or retries another account.
+Token counting follows the assignment for the request's quota family when
+one already exists, but never migrates an assignment or retries another account.
 
 Enable balanced routing like the other modes:
 

@@ -189,11 +189,13 @@ for explicit correction rather than silently switching providers.
 Native Claude targets use eligible client credentials, not registered-account
 credentials. Custom targets use their provider's configured authentication.
 Selection does not probe the model; **Apply** saves the target and adopts the
-server's response. A successful save applies to the next request, in-flight
-requests retain their target, and a failed save leaves the active target
-unchanged. Provider registration itself requires configuration and restart;
-this control does not create providers. Reroute diagnostics remain available
-through the API and CLI, not this card. See
+server's response. A successful save applies to the next request, and
+in-flight requests retain their target. A server-rejected change leaves the
+active target unchanged. A network error or lost response does not establish
+whether the save was applied; reload the dashboard to read the current target
+before retrying. Provider registration itself requires configuration and
+restart; this control does not create providers. Reroute diagnostics remain
+available through the API and CLI, not this card. See
 [Compaction](compaction.md#compaction-reroute) for trigger conditions and
 [legacy configuration correction](compaction.md#correcting-invalid-legacy-targets).
 

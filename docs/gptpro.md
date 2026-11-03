@@ -410,6 +410,18 @@ composer contents are included.
 The gateway asks `claude-sonnet-5-5` through its own `/v1/messages` endpoint.
 This follows `model_map` like any client request: a `sonnet` mapping routes the
 request to the mapped provider; otherwise it passes through to Anthropic.
+
+Rediscovery needs a model route that works without Claude Code's client
+credentials. Map `sonnet` to a configured backend with any authentication it
+requires, or enable [registered Claude-account serving](claude-accounts.md#serving-with-a-registered-account-account-use)
+or [balanced routing](claude-accounts.md#balanced-routing-across-the-pool)
+with an eligible Claude account. The healer supplies only the configured
+gateway-local token, if any; it does not attach Claude Code's Anthropic
+credentials. With the default empty map or the README's Opus/Haiku-only map,
+configure gateway-managed Claude-account serving before relying on rediscovery.
+Ordinary ChatGPT asks can still work without this setup while their existing
+locators remain valid.
+
 The structure-only candidate description, including tags, roles, UI labels,
 data attribute names (not values), and positions, is sent to whichever provider handles that
 request. The gateway must be running and reachable at its configured host and

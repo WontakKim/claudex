@@ -114,9 +114,11 @@ wire when configured in that family.
 
 OpenAI-compatible entries retain the required `wire_api: "responses"` schema and
 live catalog behavior. Anthropic-compatible entries require `base_url` and
-`api_key` and accept an optional `tool_schema_regex_compat` boolean; their
-versioned prefix receives exactly `/messages`, they require manual model IDs,
-and token counting uses the local approximate characters/4 fallback. See [Custom providers](custom-providers.md#custom-providers).
+accept an optional `api_key` and an optional `tool_schema_regex_compat` boolean.
+Omit `api_key` for an unauthenticated upstream; explicitly empty or
+whitespace-only keys are invalid. Their versioned prefix receives exactly
+`/messages`, they require manual model IDs, and token counting uses the local
+approximate characters/4 fallback. See [Custom providers](custom-providers.md#custom-providers).
 
 ## Mixing Claude and Codex models
 

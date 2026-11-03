@@ -79,10 +79,12 @@ destinations. Remove the `compaction.model` key to disable it in `settings.json`
 do not store JSON `null`, which fails startup validation. The admin API instead
 accepts `PUT {"model": null}` to disable rerouting and removes the stored key.
 Registration is validated at startup; provider definitions are fixed until
-restart. Saving a target through the
-running gateway persists it first and applies it to the next request without
-restarting; in-flight requests retain their target and failed saves leave the
-active target unchanged. See [Compaction reroute](compaction.md#compaction-reroute)
+restart. Saving a target through the running gateway persists it first and
+applies it to the next request without restarting; in-flight requests retain
+their target. A server-rejected change leaves the active target unchanged.
+A network error or lost response leaves the outcome uncertain: read
+`GET /admin/settings/compaction` or reload the dashboard before retrying.
+See [Compaction reroute](compaction.md#compaction-reroute)
 for trigger conditions, authentication, and
 [invalid legacy target correction](compaction.md#correcting-invalid-legacy-targets).
 

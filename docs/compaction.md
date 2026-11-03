@@ -22,7 +22,10 @@ time the gateway starts). Ambiguous reachability fails closed for `set`
 and `off` and shows settings-file state with an unreachable warning for
 the read-only form. Any other failure from an identified daemon — an
 error status such as the environment-lock `409`, a malformed response, or
-a transport failure — exits non-zero without touching the settings file.
+a transport failure — exits non-zero without a local settings-file fallback.
+For a write request, a lost or unusable response does not prove the server
+rejected the change. Once the daemon is reachable, query its current target
+with `uv run claudex-gateway compact` before retrying.
 
 ## Compaction reroute
 
@@ -111,8 +114,10 @@ rerouting, send `PUT {"model": null}`; the API removes the stored
 validation.
 
 A successful API save persists the target before making it effective for the
-next request; in-flight requests keep their original target. A failed save
-leaves the active target unchanged. The response remains
+next request; in-flight requests keep their original target. A server-rejected
+change leaves the active target unchanged. A network error or lost response
+leaves the outcome uncertain: read `GET /admin/settings/compaction` or use the
+read-only `compact` command before retrying. The response remains
 `{"model": ..., "env_locked": ..., "last_reroute": ...}`. The dashboard does not
 show reroute diagnostics; use the API or `compact` command. A non-null
 `last_reroute` retains its seven fields: `outcome`, `timestamp`, `target_model`,
