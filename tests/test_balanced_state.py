@@ -151,12 +151,15 @@ def test_schema_contains_only_the_five_declared_tables(tmp_path: Path) -> None:
 def test_wal_journal_mode_and_full_synchronous_are_set(tmp_path: Path) -> None:
     path = tmp_path / "runtime.sqlite3"
     store = ClaudePoolRuntimeStateStore.open_(path)
-    store.close()
+    try:
+        # synchronous is connection-local, so inspect the live writer connection.
+        assert store._conn.execute("PRAGMA synchronous").fetchone()[0] == 2  # 2 == FULL
+    finally:
+        store.close()
 
     conn = sqlite3.connect(str(path))
     try:
         assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
-        assert conn.execute("PRAGMA synchronous").fetchone()[0] == 2  # 2 == FULL
     finally:
         conn.close()
 
@@ -1605,31 +1608,60 @@ def test_close_checkpoints_the_wal(tmp_path: Path) -> None:
 
 
 def test_high_priority_write_can_be_awaited_without_blocking_the_event_loop(tmp_path: Path) -> None:
-    def slow_fault(scope_key: Any, sequence: int) -> None:
-        time.sleep(0.3)
+    writer_entered = threading.Event()
+    release_writer = threading.Event()
+    wait_started = threading.Event()
+    loop_progress = threading.Event()
 
-    async def scenario() -> int:
-        # A high-priority write that takes noticeable wall time (via a slow
-        # apply through the writer thread) must not stall the event loop's
-        # own concurrent progress while it is awaited.
-        slow_store = ClaudePoolRuntimeStateStore.open_(
-            tmp_path / "runtime-slow.sqlite3", debounce_seconds=0.0, fault_injector=slow_fault
-        )
+    def gated_write(scope_key: Any, sequence: int) -> None:
+        writer_entered.set()
+        release_writer.wait(timeout=5)
+
+    def release_after_progress() -> None:
+        # An independent thread must also release the writer if wait_async blocks the loop.
         try:
-            ticks: list[float] = []
-
-            async def ticker() -> None:
-                for _ in range(15):
-                    ticks.append(time.monotonic())
-                    await asyncio.sleep(0.01)
-
-            pending = slow_store.rotate_epoch()
-
-            ticker_task = asyncio.create_task(ticker())
-            await asyncio.gather(pending.wait_async(timeout=5), ticker_task)
-            return len(ticks)
+            if wait_started.wait(timeout=5):
+                loop_progress.wait(timeout=2)
         finally:
-            slow_store.close()
+            release_writer.set()
 
-    tick_count = asyncio.run(scenario())
-    assert tick_count >= 5, "the event loop appears to have been blocked while awaiting the high-priority write"
+    store = ClaudePoolRuntimeStateStore.open_(
+        tmp_path / "runtime-gated.sqlite3", debounce_seconds=0.0, fault_injector=gated_write
+    )
+    releaser = threading.Thread(target=release_after_progress, daemon=True)
+    writer_thread = store._writer_thread
+    assert writer_thread is not None
+    try:
+        pending = store.rotate_epoch()
+        assert writer_entered.wait(timeout=5), "the writer never reached the gate"
+        releaser.start()
+
+        async def scenario() -> None:
+            async def wait_for_write() -> None:
+                wait_started.set()
+                await pending.wait_async(timeout=5)
+
+            waiter = asyncio.create_task(wait_for_write())
+
+            async def observe_progress() -> None:
+                await asyncio.sleep(0)
+                assert wait_started.is_set()
+                assert not release_writer.is_set(), "the event loop stalled until the writer was released"
+                assert not waiter.done(), "wait_async returned before the write completed"
+                with pytest.raises(TimeoutError):
+                    pending.wait(timeout=0)
+                loop_progress.set()
+
+            await asyncio.gather(waiter, observe_progress())
+            pending.wait(timeout=0)
+
+        asyncio.run(scenario())
+    finally:
+        release_writer.set()
+        wait_started.set()
+        loop_progress.set()
+        if releaser.ident is not None:
+            releaser.join(timeout=5)
+        store.close()
+    assert not releaser.is_alive()
+    assert not writer_thread.is_alive()

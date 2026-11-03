@@ -19,6 +19,7 @@ from claudex.claude.quota_429 import (
     capture_upstream_headers,
     enrich_record_degraded,
     enrich_record_fallback,
+    enrich_record_with_family_gate,
     finalize_quota_429_record,
     finalize_quota_429_record_strict,
     parse_upstream_error_body,
@@ -356,19 +357,51 @@ def test_finalization_failure_rebuilds_schema_valid_degraded_record() -> None:
 def test_observed_scope_unknown_for_family_gate_failure() -> None:
     record = _build_record()
     reason = "fable_weekly_not_saturated"
-    record["family_gate"] = {
-        "scope": "family",
-        "reason": reason,
-        "family_deadline_utc": None,
-    }
-    record["observed_scope"] = "unknown"
-    record["scope_rationale"] = reason
+
+    enriched = enrich_record_with_family_gate(
+        record,
+        scope="account",
+        reason=reason,
+        family_deadline_utc=None,
+        quota_family="fable",
+        session_fingerprint="session-fingerprint",
+    )
+
+    assert enriched is record
+    assert record["installed_scope"] == "account"
+    assert record["family_gate"]["scope"] == "account"
+    assert record["observed_scope"] == "unknown"
+    assert record["scope_rationale"] == reason
 
     persisted = json.loads(finalize_quota_429_record(record))
 
     assert persisted["observed_scope"] == "unknown"
     assert persisted["observed_scope"] != "account"
     assert persisted["scope_rationale"] == reason
+
+
+def test_observed_scope_family_for_successful_family_gate() -> None:
+    record = _build_record()
+    deadline = "2026-08-21T02:00:00Z"
+
+    enrich_record_with_family_gate(
+        record,
+        scope="family",
+        reason="family_gate_passed",
+        family_deadline_utc=deadline,
+        quota_family="fable",
+        session_fingerprint="session-fingerprint",
+    )
+
+    for incident in (record, json.loads(finalize_quota_429_record(record))):
+        assert incident["installed_scope"] == "family"
+        assert incident["family_gate"] == {
+            "scope": "family",
+            "reason": "family_gate_passed",
+            "family_deadline_utc": deadline,
+        }
+        assert incident["observed_scope"] == "family"
+        assert incident["scope_rationale"] == "family_gate_passed"
 
 
 def test_enrich_record_fallback_sets_account_scope_and_unknown_observed() -> None:
