@@ -1171,12 +1171,6 @@ def test_readback_mid_text_divergence_reports_normalized_details(
     normalized_prompt = page.filled_prompt.replace("\n\n", "\n")
     normalized_readback = normalized_prompt.replace("this", "changed", 1)
     first_difference = normalized_prompt.index("this")
-    expected_window = normalized_prompt[
-        max(0, first_difference - 40):first_difference + 40
-    ]
-    actual_window = normalized_readback[
-        max(0, first_difference - 40):first_difference + 40
-    ]
     assert raised.value.failure == "submit_failed"
     assert str(raised.value) == (
         "the ChatGPT composer did not retain the prompt "
@@ -1191,21 +1185,19 @@ def test_readback_mid_text_divergence_reports_normalized_details(
     assert records[0].levelno == logging.WARNING
     assert records[0].msg == (
         "gptpro composer readback diverged at char %d "
-        "(prompt %d chars, readback %d chars): expected %r, got %r"
+        "(prompt %d chars, readback %d chars)"
     )
     assert records[0].args == (
         first_difference,
         len(normalized_prompt),
         len(normalized_readback),
-        expected_window,
-        actual_window,
     )
-    assert records[0].getMessage() == (
-        f"gptpro composer readback diverged at char {first_difference} "
-        f"(prompt {len(normalized_prompt)} chars, "
-        f"readback {len(normalized_readback)} chars): "
-        f"expected {expected_window!r}, got {actual_window!r}"
-    )
+    assert normalized_prompt not in records[0].getMessage()
+    assert "changed" not in records[0].getMessage()
+    diagnostic = raised.value.evidence.composer_diagnostics
+    assert diagnostic.prompt_length == len(normalized_prompt)
+    assert diagnostic.readback_length == len(normalized_readback)
+    assert diagnostic.first_difference == first_difference
     assert page.click_count == 0
 
 
@@ -1255,8 +1247,7 @@ def test_non_string_readback_reports_unavailable_without_divergence_log(
 
     assert raised.value.failure == "submit_failed"
     assert str(raised.value) == (
-        "the ChatGPT composer did not retain the prompt "
-        "(readback unavailable: NoneType)"
+        "the ChatGPT composer readback is unavailable"
     )
     assert not any(
         record.name == "claudex.gptpro.ask"
@@ -3571,4 +3562,49 @@ def test_attachment_failure_retains_metadata_diagnostics_without_send(
     assert raised.value.evidence.attachment_diagnostics == diagnostic
     assert raised.value.evidence.failure_stage == "attachments"
     assert raised.value.evidence.submission == "not_attempted"
+    assert page.click_count == 0
+
+
+@pytest.mark.parametrize(
+    ("problem", "category"),
+    [("fill", "fill_failed"), ("readback", "readback_failed"),
+     (None, "readback_unavailable"), (123, "readback_unavailable"),
+     ("different private contents", "retention_mismatch")],
+)
+def test_composer_failures_have_safe_distinct_diagnostics(
+    monkeypatch: pytest.MonkeyPatch, problem: Any, category: str,
+) -> None:
+    from dataclasses import asdict
+
+    _install_clock(monkeypatch)
+    page = _FakePage()
+    original_evaluate = page.evaluate
+    secret = "secret credentials cookie and prompt body"
+
+    async def fill(*args: Any, **kwargs: Any) -> None:
+        raise RuntimeError(secret)
+
+    async def evaluate(expression: str, argument: Any = None) -> Any:
+        if expression == selectors.COMPOSER_READBACK_PROBE_JS:
+            if problem == "readback":
+                raise RuntimeError(secret)
+            return problem
+        return await original_evaluate(expression, argument)
+
+    if problem == "fill":
+        page.fill = fill  # type: ignore[method-assign]
+    page.evaluate = evaluate  # type: ignore[method-assign]
+    with pytest.raises(ask.GptProAskError) as raised:
+        _run(page)
+    evidence = raised.value.evidence
+    assert raised.value.failure == "submit_failed"
+    assert evidence is not None
+    assert evidence.failure_stage == "composer"
+    assert evidence.submission == "not_attempted"
+    assert evidence.composer_diagnostics.category == category
+    serialized = json.dumps(asdict(evidence))
+    assert secret not in serialized
+    assert "different private contents" not in serialized
+    if page.filled_prompt:
+        assert page.filled_prompt not in serialized
     assert page.click_count == 0

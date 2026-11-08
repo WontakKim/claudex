@@ -1451,7 +1451,7 @@ def test_composer_rejection_resubmits_as_attachment(
     original_question = "Review https://example.test/private-question; price: €"
     thread_ref = "123e4567-e89b-12d3-a456-426614174000"
     status_message = (
-        "composer did not retain the inline question; "
+        "inline composer preparation failed; "
         "resubmitting it as an attachment"
     )
 
@@ -1534,6 +1534,12 @@ def test_composer_rejection_resubmits_as_attachment(
             succeeded = await _wait_for_state(service, started.ask_id, "succeeded")
             assert succeeded.answer == "answer"
             assert succeeded.nonce_marker == "marker-2"
+            (initial,) = succeeded.evidence.attempt_failures
+            assert initial.attempt == "initial"
+            assert initial.failure == "submit_failed"
+            assert initial.nonce_marker == "marker-1"
+            assert initial.evidence.failure_stage == "composer"
+            assert initial.evidence.submission == "not_attempted"
             assert succeeded.evidence.failure_stage is None
             assert succeeded.evidence.submission == "confirmed"
             assert not spill_path.exists()
@@ -1543,7 +1549,7 @@ def test_composer_rejection_resubmits_as_attachment(
             ]
             assert len(warnings) == 1
             assert warnings[0].msg == (
-                "gptpro ask %.8s composer did not retain the inline question "
+                "gptpro ask %.8s inline composer preparation failed "
                 "(%s); resubmitting it as an attachment"
             )
             assert warnings[0].args == (
@@ -1687,7 +1693,11 @@ def test_composer_rejection_fallback_is_attempted_only_once() -> None:
             assert failed.failure == "submit_failed"
             assert failed.error_message == "the ChatGPT composer rejected the stub too"
             assert failed.nonce_marker == "marker-2"
-            assert failed.evidence == second_evidence
+            initial, fallback = failed.evidence.attempt_failures
+            assert (initial.attempt, fallback.attempt) == ("initial", "fallback")
+            assert initial.evidence.failure_stage == "composer"
+            assert fallback.evidence == second_evidence
+            assert failed.evidence.submission == second_evidence.submission
             fallback_paths = captured_attachment_paths[1]
             assert fallback_paths is not None
             assert len(fallback_paths) == 1
@@ -1743,7 +1753,9 @@ def test_composer_rejection_fallback_requires_unsubmitted_composer_evidence(
             assert failed.failure == failure
             assert failed.error_message == "the composer did not retain the prompt"
             if evidence is not None:
-                assert failed.evidence == evidence
+                (initial,) = failed.evidence.attempt_failures
+                assert initial.attempt == "initial"
+                assert initial.evidence == evidence
         finally:
             await service.aclose()
 
@@ -2560,5 +2572,104 @@ def test_partial_evidence_preserves_latest_attachment_diagnostics() -> None:
         assert service.result(started.ask_id).evidence.attachment_diagnostics == final
         assert failed.evidence.submission == "not_attempted"
         await service.aclose()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("conversation_id", [None, "123e4567-e89b-12d3-a456-426614174000"])
+@pytest.mark.parametrize("fallback", ["before_nonce", "attachment", "uncertain", "confirmed", "unexpected"])
+def test_fallback_failure_retains_both_attempts_without_changing_certainty(
+    conversation_id: str | None, fallback: str,
+) -> None:
+    from dataclasses import asdict
+    import json
+
+    calls = 0
+    diagnostic = ask.ComposerDiagnostics("readback_failed")
+    initial_attachment_diagnostic = ask.attachments.AttachmentDiagnostics(phase="dispatch")
+    attachment_diagnostic = ask.attachments.AttachmentDiagnostics(phase="settlement", outcome="timeout")
+    captured_conversations: list[str | None] = []
+    expected_submission = fallback if fallback in ("uncertain", "confirmed") else "not_attempted"
+    actual_conversation = conversation_id or "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+
+    async def provider(_question: str, *, callbacks: ask.AskCallbacks, conversation_id: str | None = None, **_kwargs: object) -> ask.AskOutcome:
+        nonlocal calls
+        calls += 1
+        captured_conversations.append(conversation_id)
+        if calls == 1:
+            callbacks.on_marker("initial-marker")
+            failure = ask.GptProAskError("submit_failed", "initial private error text")
+            failure.evidence = ask.AskEvidence(
+                failure_stage="composer", composer_diagnostics=diagnostic,
+                upload_receipts=2, ready_attachments=2,
+                attachment_diagnostics=initial_attachment_diagnostic,
+            )
+            # Exception evidence must survive even without an evidence callback.
+            raise failure
+        if fallback not in ("before_nonce", "unexpected"):
+            callbacks.on_marker("fallback-marker")
+            callbacks.on_conversation_id(actual_conversation)
+        if fallback == "unexpected":
+            raise RuntimeError("unexpected private error text")
+        failure = ask.GptProAskError("error", "fallback private error text")
+        failure.evidence = ask.AskEvidence(
+            failure_stage="attachments" if fallback == "attachment" else "submission",
+            submission=expected_submission,
+            upload_receipts=1 if fallback == "attachment" else None,
+            ready_attachments=0 if fallback == "attachment" else None,
+            attachment_diagnostics=attachment_diagnostic if fallback == "attachment" else None,
+        )
+        callbacks.on_evidence(failure.evidence)
+        callbacks.on_evidence(ask.AskEvidence())
+        raise failure
+
+    async def scenario() -> None:
+        service = jobs.AskJobService(provider)
+        started = service.start("synthetic question", conversation_id=conversation_id)
+        try:
+            failed = await _wait_for_state(service, started.ask_id, "failed")
+            assert calls == 2
+            assert captured_conversations == [conversation_id, conversation_id]
+            assert failed.failure == "error"
+            assert failed.error_message == (
+                "RuntimeError: unexpected private error text" if fallback == "unexpected"
+                else "fallback private error text"
+            )
+            expected_marker = None if fallback in ("before_nonce", "unexpected") else "fallback-marker"
+            expected_conversation = conversation_id if expected_marker is None else actual_conversation
+            assert failed.nonce_marker == expected_marker
+            assert failed.thread_ref == expected_conversation
+            assert failed.evidence.submission == expected_submission
+            initial, final = failed.evidence.attempt_failures
+            assert (initial.attempt, final.attempt) == ("initial", "fallback")
+            assert initial.failure == "submit_failed"
+            assert initial.nonce_marker == "initial-marker"
+            assert initial.evidence.failure_stage == "composer"
+            assert initial.evidence.composer_diagnostics == diagnostic
+            assert initial.evidence.attachment_diagnostics == initial_attachment_diagnostic
+            assert initial.evidence.upload_receipts == initial.evidence.ready_attachments == 2
+            assert initial.evidence.submission == "not_attempted"
+            assert initial.evidence.conversation_id == conversation_id
+            assert final.failure == "error"
+            assert final.nonce_marker == expected_marker
+            assert final.evidence.conversation_id == expected_conversation
+            assert final.evidence.submission == expected_submission
+            assert final.evidence.composer_diagnostics is None
+            assert final.evidence.upload_receipts == (1 if fallback == "attachment" else None)
+            assert final.evidence.ready_attachments == (0 if fallback == "attachment" else None)
+            assert final.evidence.failure_stage == (
+                "attachments" if fallback == "attachment" else
+                "provider" if fallback == "unexpected" else "submission"
+            )
+            assert final.evidence.attachment_diagnostics == (
+                attachment_diagnostic if fallback == "attachment" else None
+            )
+            assert initial.evidence.attempt_failures == final.evidence.attempt_failures == ()
+            serialized = json.dumps(asdict(failed.evidence))
+            assert "private error text" not in serialized
+            assert service.status(started.ask_id).evidence == failed.evidence
+            assert service.result(started.ask_id).evidence == failed.evidence
+        finally:
+            await service.aclose()
 
     asyncio.run(scenario())

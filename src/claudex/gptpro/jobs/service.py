@@ -8,11 +8,13 @@ import time
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 from uuid import uuid4
 
 from claudex.gptpro import ask as ask_module
-from claudex.gptpro.ask import AskCallbacks, AskEvidence, AskOutcome, GptProAskError
+from claudex.gptpro.ask import (
+    AskAttemptFailure, AskCallbacks, AskEvidence, AskOutcome, GptProAskError,
+)
 from claudex.gptpro.conversation import is_conversation_id
 
 from .models import AskJob, TurnFinished
@@ -431,6 +433,7 @@ class AskJobService:
         attachment_paths: Sequence[str] | None,
     ) -> None:
         spill_path: Path | None = None
+        attempt: Literal["initial", "fallback"] = "initial"
         try:
             if conversation_id is not None:
                 await self._claim_conversation(
@@ -503,20 +506,30 @@ class AskJobService:
                 if retry_budget <= 0:
                     raise
                 logger.warning(
-                    "gptpro ask %.8s composer did not retain the inline question "
+                    "gptpro ask %.8s inline composer preparation failed "
                     "(%s); resubmitting it as an attachment",
                     ask_id,
                     str(exc),
                 )
                 capture_status(
-                    "composer did not retain the inline question; "
+                    "inline composer preparation failed; "
                     "resubmitting it as an attachment"
                 )
+                self._on_evidence(ask_id, exc.evidence)
                 job = self._jobs[ask_id]
+                initial_failure = AskAttemptFailure(
+                    "initial", exc.failure, job.nonce_marker,
+                    replace(job.evidence, attempt_failures=()),
+                )
+                attempt = "fallback"
                 # Recovery must use the nonce of the attempt that submits.
                 self._jobs[ask_id] = replace(
                     job, nonce_marker=None,
-                    evidence=replace(job.evidence, failure_stage=None),
+                    evidence=replace(
+                        job.evidence, failure_stage=None, composer_diagnostics=None,
+                        upload_receipts=None, ready_attachments=None,
+                        attachment_diagnostics=None, attempt_failures=(initial_failure,),
+                    ),
                 )
                 provider_question, provider_attachment_paths, spill_path = (
                     _spill_question(question, attachment_paths)
@@ -595,14 +608,22 @@ class AskJobService:
                 "echo_timeout", "no_raw_turn",
             }:
                 submission = "uncertain"
+            evidence = replace(
+                evidence, failure_stage=stage, submission=submission,
+                conversation_id=job.thread_ref,
+            )
+            failure_record = AskAttemptFailure(
+                attempt, exc.failure, job.nonce_marker,
+                replace(evidence, attempt_failures=()),
+            )
             self._jobs[ask_id] = replace(
                 job,
                 state="failed",
                 failure=exc.failure,
                 error_message=str(exc),
                 evidence=replace(
-                    evidence, failure_stage=stage, submission=submission,
-                    conversation_id=job.thread_ref,
+                    evidence,
+                    attempt_failures=(*evidence.attempt_failures, failure_record),
                 ),
             )
             cause = _root_cause(exc)
@@ -615,11 +636,24 @@ class AskJobService:
                 "" if cause is None else f" (cause: {type(cause).__name__}: {cause})",
             )
         except Exception as exc:
+            job = self._jobs[ask_id]
+            evidence = replace(
+                job.evidence, failure_stage=job.evidence.failure_stage or "provider",
+                conversation_id=job.thread_ref,
+            )
+            failure_record = AskAttemptFailure(
+                attempt, "error", job.nonce_marker,
+                replace(evidence, attempt_failures=()),
+            )
             self._jobs[ask_id] = replace(
-                self._jobs[ask_id],
+                job,
                 state="failed",
                 failure="error",
                 error_message=f"{type(exc).__name__}: {exc}",
+                evidence=replace(
+                    evidence,
+                    attempt_failures=(*evidence.attempt_failures, failure_record),
+                ),
             )
             logger.exception(
                 "gptpro ask %.8s failed unexpectedly", ask_id
@@ -670,6 +704,10 @@ class AskJobService:
                 if evidence.attachment_diagnostics is not None
                 else previous.attachment_diagnostics
             ),
+            composer_diagnostics=(
+                evidence.composer_diagnostics or previous.composer_diagnostics
+            ),
+            attempt_failures=previous.attempt_failures,
             generation_observed=(
                 previous.generation_observed or evidence.generation_observed
             ),
