@@ -16,6 +16,8 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from pyee import EventEmitter
+from playwright._impl._browser_context import BrowserContext
 from playwright._impl._network import Request as ImplementationRequest
 from playwright._impl._network import Response as ImplementationResponse
 from playwright.async_api import Error, Response, async_playwright
@@ -679,12 +681,12 @@ def _processing_frames(file_id: str, display_name: str) -> list[dict[str, Any]]:
 @pytest.mark.parametrize(("frames", "expected_processing"), [
     pytest.param(
         _processing_frames("file_effect", "effect.ts")[:1],
-        "observed=yes, completion=no, indexed display name=yes, missing=completion",
+        "parsed evidence=yes, completion=no, indexed display name=yes, missing=completion",
         id="missing-completion",
     ),
     pytest.param(
         _processing_frames("file_effect", "effect.ts")[1:],
-        "observed=yes, completion=yes, indexed display name=no, missing=indexed display name",
+        "parsed evidence=yes, completion=yes, indexed display name=no, missing=indexed display name",
         id="missing-indexed-name",
     ),
 ])
@@ -758,7 +760,7 @@ def test_deferred_indexing_started_name_does_not_satisfy_processing_completion(
         ))
 
     assert raised.value.ready_attachments == 0
-    assert "processing upload-1: observed=yes, completion=no" in str(raised.value)
+    assert "processing upload-1: parsed evidence=yes, completion=no" in str(raised.value)
     assert "no send click attempted by attachment upload" in str(raised.value)
 
 
@@ -803,7 +805,7 @@ def test_deferred_indexing_name_is_candidate_not_card_binding(
     assert raised.value.ready_attachments == 0
     assert "name source candidate=deferred-indexing-started" in message
     assert "card binding=unverified" in message
-    assert "processing upload-1: observed=yes, completion=yes" in message
+    assert "processing upload-1: parsed evidence=yes, completion=yes" in message
 
 
 def test_invalid_deferred_name_fails_without_becoming_absence(
@@ -930,11 +932,11 @@ def test_timeout_distinguishes_unobserved_and_incomplete_processing(
     assert "1/2 processing-qualified ready attachments" in message
     assert "2/2 observed composer-ready attachments" in message
     assert (
-        "processing upload-2: observed=no, completion=no, "
-        "indexed display name=no, missing=not required without observation"
+        "processing upload-2: parsed evidence=no, completion=no, "
+        "indexed display name=no, missing=not required without parsed evidence"
     ) in message
     assert (
-        "processing upload-1: observed=yes, completion=no, "
+        "processing upload-1: parsed evidence=yes, completion=no, "
         "indexed display name=no, missing=completion, indexed display name"
     ) in message
 
@@ -975,7 +977,7 @@ def test_ready_chip_timeout_reports_pending_processing_response(
     assert "1/1 processing-qualified ready attachments" in message
     assert "1/1 observed composer-ready attachments" in message
     assert "1 pending processing responses" in message
-    assert "processing upload-1: observed=no" in message
+    assert "processing upload-1: parsed evidence=no" in message
     assert page.listeners == {"response": []}
     assert all(handle.dispose_calls == 1 for handle in page.handles)
 
@@ -1071,7 +1073,7 @@ def test_preexisting_renamed_chip_is_not_new_upload_evidence(
     assert raised.value.ready_attachments == 0
     assert "0/1 observed composer-ready attachments" in str(raised.value)
     assert (
-        "processing upload-1: observed=yes, completion=yes, "
+        "processing upload-1: parsed evidence=yes, completion=yes, "
         "indexed display name=yes, missing=none"
     ) in str(raised.value)
 
@@ -1112,7 +1114,7 @@ def test_processing_failure_blocks_even_ready_original_chip(
     ):
         assert private_value not in message
     assert (
-        "processing upload-1: observed=yes, completion=no, "
+        "processing upload-1: parsed evidence=yes, completion=no, "
         "indexed display name=no, missing=completion, indexed display name"
     ) in message
     assert "1/1 observed composer-ready attachments" in message
@@ -1565,7 +1567,10 @@ def test_attachment_probe_runs_in_local_synthetic_dom() -> None:
 def _create_lifecycle_response(closed: asyncio.Future[Any]) -> Response:
     """Use installed Playwright lifecycle methods without a connection or browser."""
     request = ImplementationRequest.__new__(ImplementationRequest)
-    page = SimpleNamespace(_closed_or_crashed_future=closed)
+    page = EventEmitter()
+    page._closed_or_crashed_future = closed
+    request._failure_text = None
+    request._timing = {"responseStart": -1, "responseEnd": -1}
     request._initializer = {
         "frame": SimpleNamespace(_object=SimpleNamespace(_page=page)),
     }
@@ -1597,6 +1602,8 @@ async def _assert_response_completion_cleanup(
     ]
     assert not closed.cancelled()
     assert all(not response._impl_obj._finished_future.cancelled() for response in responses)
+    assert all(not response._impl_obj._request._safe_page().listeners("requestfailed")
+               for response in responses)
     if not closed.done():
         closed.set_result(Error("synthetic late close"))
     await _flush_response_completion()
@@ -1989,7 +1996,7 @@ def test_settlement_observer_catches_late_failure_before_submit(
         assert snapshots[-1].pre_submit_result == "processing-failed"
         assert snapshots[-1].outcome == "blocked"
         await observations[0].close()
-        assert page.listeners["response"] == []
+        assert page.listeners == {"response": []}
 
     clock = _FakeClock()
     monkeypatch.setattr(attachments, "_monotonic", clock.monotonic)
@@ -3083,3 +3090,246 @@ def test_preflight_eligibility_cannot_start_dispatch_after_attachment_deadline(
         asyncio.run(attachments.attach_files(page, [str(path)], timeout_seconds=0.5))
     assert not any(script == attachments.DISPATCH_ATTACHMENT_DROP_JS for script, _ in page.evaluate_calls)
     assert all(handle.dispose_calls == 1 for handle in page.handles)
+
+
+@pytest.mark.parametrize("mode", [
+    "before", "after", "unrelated", "stale", "normal", "failure_without_text", "before_without_text",
+])
+def test_processing_request_terminal_lifecycle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str,
+) -> None:
+    attachment = tmp_path / "upload.txt"
+    attachment.write_text("attachment", encoding="utf-8")
+
+    async def poll_sleep(seconds: float) -> None:
+        await asyncio.sleep(min(seconds, 0.001))
+
+    monkeypatch.setattr(attachments, "_sleep", poll_sleep)
+
+    async def run() -> None:
+        loop = asyncio.get_running_loop()
+        warnings: list[str] = []
+        loop.set_exception_handler(lambda loop, context: warnings.append(context["message"]))
+        initial_tasks = asyncio.all_tasks()
+        closed = loop.create_future()
+        lifecycle = _create_lifecycle_response(closed)
+        implementation = lifecycle._impl_obj
+        request = implementation._request
+        implementation_page = request._safe_page()
+        processing = _ProcessingResponse(_processing_frames("file_upload", attachment.name))
+        processing._impl_obj = implementation
+        processing.request = SimpleNamespace(method="POST", url=processing.url)
+
+        class Page(_FakePage):
+            async def evaluate(self, script: str, argument: Any = None) -> Any:
+                result = await super().evaluate(script, argument)
+                if script == attachments.DISPATCH_ATTACHMENT_DROP_JS and mode in (
+                    "before", "before_without_text",
+                ):
+                    assert not implementation._finished_future._callbacks
+                    BrowserContext._on_request_failed(
+                        SimpleNamespace(emit=lambda *args: None), request, 1,
+                        None if mode == "before_without_text" else "synthetic transport failure",
+                        implementation_page,
+                    )
+                return result
+
+        page = Page(
+            bindings=[_bound_cards(("upload-1", "upload-card", attachment.name, "ready", True))],
+            responses=[_NamedCreateResponse(attachment.name, "file_upload"), processing],
+            states=[_attachment_state()] + [_attachment_state(ready={attachment.name: 1})] * 20,
+        )
+
+        unrelated_public_request = SimpleNamespace(method="POST", url=processing.url)
+
+        def forward_failure(failed: Any) -> None:
+            public_request = processing.request if failed is request else unrelated_public_request
+            for callback in tuple(page.listeners.get("requestfailed", [])):
+                callback(public_request)
+
+        implementation_page.on("requestfailed", forward_failure)
+        snapshots = []
+        try:
+            stale = _create_lifecycle_response(closed)._impl_obj._request
+            if mode == "stale":
+                BrowserContext._on_request_failed(
+                    SimpleNamespace(emit=lambda *args: None), stale, 1,
+                    "synthetic stale failure", implementation_page,
+                )
+            task = asyncio.create_task(attachments.attach_files(
+                page, [str(attachment)], timeout_seconds=0.6, on_diagnostics=snapshots.append,
+            ))
+            await _flush_response_completion()
+            if mode in ("after", "failure_without_text"):
+                assert not task.done()
+                assert implementation._finished_future._callbacks
+                BrowserContext._on_request_failed(
+                    SimpleNamespace(emit=lambda *args: None), request, 1,
+                    None if mode == "failure_without_text" else "synthetic transport failure",
+                    implementation_page,
+                )
+            elif mode in ("unrelated", "stale", "normal"):
+                if mode != "normal":
+                    BrowserContext._on_request_failed(
+                        SimpleNamespace(emit=lambda *args: None), stale, 1,
+                        "synthetic unrelated failure", implementation_page,
+                    )
+                    await _flush_response_completion()
+                    assert not task.done()
+                BrowserContext._on_request_finished(
+                    SimpleNamespace(emit=lambda *args: None), request, implementation, 1,
+                    implementation_page,
+                )
+            if mode in ("before", "after", "failure_without_text", "before_without_text"):
+                with pytest.raises(
+                    attachments.AttachmentUploadFailedError,
+                    match=r"processing observation failed \(Error\)",
+                ) as raised:
+                    await asyncio.wait_for(task, timeout=0.3)
+                assert "receipt attribution=complete" in str(raised.value)
+                assert "processing upload-1: parsed evidence=no" in str(raised.value)
+                assert snapshots[-1].processing_network.responses_received == 1
+                assert snapshots[-1].processing_network.requests_failed == 1
+                assert not implementation._finished_future.done()
+            else:
+                assert await task == {attachment.name: (0, 1)}
+            del task
+            assert not closed.done()
+            assert implementation_page.listeners("requestfailed") == [forward_failure]
+            assert page.listeners == {"response": []}
+            assert all(handle.dispose_calls == 1 for handle in page.handles)
+            implementation_page.remove_listener("requestfailed", forward_failure)
+            await _assert_response_completion_cleanup([lifecycle], closed, initial_tasks, warnings)
+        finally:
+            if forward_failure in implementation_page.listeners("requestfailed"):
+                implementation_page.remove_listener("requestfailed", forward_failure)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("mapping", ["complete", "missing", "duplicate"])
+def test_processing_failure_does_not_define_receipt_attribution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mapping: str,
+) -> None:
+    attachment = tmp_path / "upload.txt"
+    attachment.write_text("attachment", encoding="utf-8")
+    clock = _FakeClock()
+    monkeypatch.setattr(attachments, "_monotonic", clock.monotonic)
+    monkeypatch.setattr(attachments, "_sleep", clock.sleep)
+    create = _NamedCreateResponse(attachment.name, "file_upload")
+    responses = [_FakeResponse() if mapping == "missing" else create]
+    if mapping == "duplicate":
+        responses.append(_NamedCreateResponse(attachment.name, "file_upload"))
+    failure = {"event": "file.processing.failed"}
+    if mapping != "missing":
+        failure["file_id"] = "file_upload"
+    responses.append(_ProcessingResponse([failure]))
+    page = _FakePage(
+        bindings=[_bound_cards(("upload-1", "upload-card", attachment.name, "ready", True))],
+        responses=responses,
+        states=[_attachment_state()] + [_attachment_state(ready={attachment.name: 1})] * 20,
+    )
+    observations = []
+    snapshots = []
+    with pytest.raises(attachments.AttachmentUploadFailedError) as raised:
+        asyncio.run(attachments.attach_files(
+            page, [str(attachment)], timeout_seconds=0.5,
+            on_settlement=observations.append, on_diagnostics=snapshots.append,
+        ))
+    expected = "complete" if mapping == "complete" else "failed"
+    assert f"receipt attribution={expected}" in str(raised.value)
+    assert snapshots[-1].outcome == "failed"
+    assert observations == []
+    assert page.listeners == {"response": []}
+
+
+@pytest.mark.parametrize("start", ["baseline", "preflight", "current", "unobserved"])
+@pytest.mark.parametrize("outcome", ["failed", "pending"])
+def test_processing_request_crossing_attachment_operation_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, start: str, outcome: str,
+) -> None:
+    attachment = tmp_path / "upload.txt"
+    attachment.write_text("attachment", encoding="utf-8")
+
+    async def poll_sleep(seconds: float) -> None:
+        await asyncio.sleep(min(seconds, 0.001))
+
+    monkeypatch.setattr(attachments, "_sleep", poll_sleep)
+
+    async def run() -> None:
+        loop = asyncio.get_running_loop()
+        warnings: list[str] = []
+        loop.set_exception_handler(lambda loop, context: warnings.append(context["message"]))
+        initial_tasks = asyncio.all_tasks()
+        closed = loop.create_future()
+        lifecycle = _create_lifecycle_response(closed)
+        implementation = lifecycle._impl_obj
+        processing = _ProcessingResponse(_processing_frames("file_stale", "other.txt"))
+        processing._impl_obj = implementation
+        processing.request = SimpleNamespace(method="POST", url=processing.url)
+
+        class Page(_FakePage):
+            def emit_start(self) -> None:
+                for callback in tuple(self.listeners.get("request", [])):
+                    callback(processing.request)
+
+            async def evaluate_handle(self, script: str, argument: Any) -> _FakeHandle:
+                if (start == "baseline" and script == attachments.CAPTURE_COMPOSER_FORM_HANDLE_JS) or (
+                    start == "preflight" and script == attachments.CREATE_ATTACHMENT_FILE_JS
+                ):
+                    self.emit_start()
+                return await super().evaluate_handle(script, argument)
+
+            async def evaluate(self, script: str, argument: Any = None) -> Any:
+                if script == attachments.DISPATCH_ATTACHMENT_DROP_JS and start == "current":
+                    self.emit_start()
+                result = await super().evaluate(script, argument)
+                if script == attachments.DISPATCH_ATTACHMENT_DROP_JS and outcome == "failed":
+                    BrowserContext._on_request_failed(
+                        SimpleNamespace(emit=lambda *args: None), implementation._request, 1,
+                        None, implementation._request._safe_page(),
+                    )
+                return result
+
+        page = Page(
+            bindings=[_bound_cards(("upload-1", "upload-card", attachment.name, "ready", True))],
+            responses=[
+                _NamedCreateResponse(attachment.name, "file_upload"),
+                _ProcessingResponse(_processing_frames("file_upload", attachment.name)), processing,
+            ],
+            states=[_attachment_state()] + [_attachment_state(ready={attachment.name: 1})] * 20,
+        )
+
+        def forward_failure(request: Any) -> None:
+            assert request is implementation._request
+            for callback in tuple(page.listeners.get("requestfailed", [])):
+                callback(processing.request)
+
+        implementation_page = implementation._request._safe_page()
+        implementation_page.on("requestfailed", forward_failure)
+        observations = []
+        try:
+            upload = attachments.attach_files(
+                page, [str(attachment)], timeout_seconds=0.2, on_settlement=observations.append,
+            )
+            if start in ("baseline", "preflight"):
+                assert await upload == {attachment.name: (0, 1)}
+                assert await observations[0].revalidate_before_submit() is None
+                await observations[0].close()
+            else:
+                error = (attachments.AttachmentUploadFailedError if outcome == "failed"
+                         else attachments.AttachmentSettleTimeoutError)
+                with pytest.raises(error):
+                    await upload
+                assert observations == []
+            assert page.listeners == {"response": []}
+            assert not implementation._finished_future.done()
+            assert not closed.done()
+            assert all(handle.dispose_calls == 1 for handle in page.handles)
+            implementation_page.remove_listener("requestfailed", forward_failure)
+            await _assert_response_completion_cleanup([lifecycle], closed, initial_tasks, warnings)
+        finally:
+            if forward_failure in implementation_page.listeners("requestfailed"):
+                implementation_page.remove_listener("requestfailed", forward_failure)
+
+    asyncio.run(run())

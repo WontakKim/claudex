@@ -1035,14 +1035,14 @@ def _is_file_processing_response(response: Any) -> bool:
         return False
 
 
-async def _remove_response_listener(page: Any, listener: Any) -> None:
+async def _remove_page_listener(page: Any, event: str, listener: Any) -> None:
     try:
         remove_listener = getattr(page, "remove_listener", None)
         if not callable(remove_listener):
             remove_listener = getattr(page, "off", None)
         if not callable(remove_listener):
             return
-        result = remove_listener("response", listener)
+        result = remove_listener(event, listener)
         if inspect.isawaitable(result):
             await result
     except Exception:
@@ -1056,7 +1056,9 @@ async def _dispose_handle(handle: Any) -> None:
         return
 
 
-async def _wait_for_response_completion(response: Any) -> None:
+async def _wait_for_response_completion(
+    response: Any, request_failed: asyncio.Future[None] | None = None,
+) -> None:
     from playwright._impl._network import Response as ImplementationResponse
     from playwright.async_api import Error, Response
 
@@ -1070,13 +1072,17 @@ async def _wait_for_response_completion(response: Any) -> None:
     # Playwright's public finished() leaves a close watcher behind. These futures
     # belong to Playwright (the close future is shared), so never cancel them.
     finished = implementation._finished_future
-    closed = implementation._request._target_closed_future()
-    done, _ = await asyncio.wait(
-        (finished, closed), return_when=asyncio.FIRST_COMPLETED,
-    )
+    request = implementation._request
+    closed = request._target_closed_future()
+    futures = (finished, closed) if request_failed is None else (finished, closed, request_failed)
+    if request._failure_text is not None:
+        raise Error("Request failed")
+    done, _ = await asyncio.wait(futures, return_when=asyncio.FIRST_COMPLETED)
     if closed in done:
         closed.result()
         raise Error("Target closed")
+    if request_failed is not None and request_failed in done:
+        raise Error("Request failed")
     finished.result()
 
 
@@ -1108,6 +1114,9 @@ async def attach_files(
     owned_form_handle: Any | None = None
     last_binding_snapshot: dict[str, Any] | None = None
     listener_tasks: set[asyncio.Task[None]] = set()
+    response_failures: dict[asyncio.Future[None], Any] = {}
+    # Strong references preserve request identity across the drop boundary.
+    requests_before_drop: dict[int, Any] = {}
     completed_file_create_responses = 0
     receipt_attribution_pending = 0
     receipt_file_ids: list[str] = []
@@ -1200,12 +1209,12 @@ async def attach_files(
 
     report_progress()
 
-    async def record_completed_response(response: Any) -> None:
+    async def record_completed_response(response: Any, request_failed: asyncio.Future[None]) -> None:
         nonlocal completed_file_create_responses, processing_failure
         nonlocal receipt_attribution_pending
         try:
             try:
-                await _wait_for_response_completion(response)
+                await _wait_for_response_completion(response, request_failed)
             except Exception as exc:
                 record_metadata_failure(
                     f"response completion failed ({type(exc).__name__})"
@@ -1234,6 +1243,7 @@ async def attach_files(
             if file_id in receipt_file_ids:
                 alias = receipt_aliases[file_id]
                 processing_failure = f"duplicate receipt file ID {alias}"
+                record_metadata_failure(processing_failure)
                 return
             if len(receipt_file_ids) >= len(filenames):
                 record_metadata_failure("surplus receipt IDs")
@@ -1259,11 +1269,11 @@ async def attach_files(
         finally:
             receipt_attribution_pending -= 1
 
-    async def record_processing_response(response: Any) -> None:
+    async def record_processing_response(response: Any, request_failed: asyncio.Future[None]) -> None:
         nonlocal processing_failure, processing_pending
         try:
             await asyncio.wait_for(
-                _wait_for_response_completion(response),
+                _wait_for_response_completion(response, request_failed),
                 timeout=max(0.001, deadline - _monotonic())
             )
             if not 200 <= response.status < 300:
@@ -1356,33 +1366,69 @@ async def attach_files(
             is_file_create = False
         else:
             return
+        request = response.request
+        if requests_before_drop.get(id(request)) is request:
+            return
         observer_generation += 1
         if len(listener_tasks) >= _MAX_ATTACHMENT_RESPONSE_TASKS:
             record_metadata_failure("attachment response callback limit exceeded")
             return
+        # Register before scheduling the waiter so even an immediate terminal event
+        # is retained. Request identity, not URL or filename, owns this signal.
+        request_failed = asyncio.get_running_loop().create_future()
+        response_failures[request_failed] = request
         if is_file_create:
             receipt_attribution_pending += 1
-            task = asyncio.create_task(record_completed_response(response))
+            task = asyncio.create_task(record_completed_response(response, request_failed))
         else:
             processing_pending += 1
-            task = asyncio.create_task(record_processing_response(response))
+            task = asyncio.create_task(record_processing_response(response, request_failed))
         listener_tasks.add(task)
         task.add_done_callback(listener_tasks.discard)
+        task.add_done_callback(lambda _: response_failures.pop(request_failed, None))
+
+    def on_request(request: Any) -> None:
+        if drop_started:
+            return
+        try:
+            if request.method != "POST" or not is_trusted_origin_url(request.url) or urlsplit(
+                request.url,
+            ).path.rstrip("/") not in (FILE_CREATE_PATH, FILE_PROCESSING_PATH):
+                return
+        except (AttributeError, TypeError, ValueError):
+            return
+        requests_before_drop[id(request)] = request
+
+    def on_request_failed(request: Any) -> None:
+        for failed, observed_request in tuple(response_failures.items()):
+            if request is observed_request and not failed.done():
+                failed.set_result(None)
 
     listener_installed = False
+    request_listener_installed = False
+    request_failure_listener_installed = False
 
     async def close_observer() -> None:
-        nonlocal listener_installed, binding_tracker_handle, owned_form_handle
+        nonlocal listener_installed, request_listener_installed, request_failure_listener_installed
+        nonlocal binding_tracker_handle, owned_form_handle
         await diagnostics.close()
         if listener_installed:
-            await _remove_response_listener(page, on_response)
+            await _remove_page_listener(page, "response", on_response)
             listener_installed = False
+        if request_listener_installed:
+            await _remove_page_listener(page, "request", on_request)
+            request_listener_installed = False
+        if request_failure_listener_installed:
+            await _remove_page_listener(page, "requestfailed", on_request_failed)
+            request_failure_listener_installed = False
         tasks = tuple(listener_tasks)
         for task in tasks:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         listener_tasks.clear()
+        response_failures.clear()
+        requests_before_drop.clear()
         if binding_tracker_handle is not None:
             await _dispose_handle(binding_tracker_handle)
             binding_tracker_handle = None
@@ -1391,6 +1437,8 @@ async def attach_files(
             owned_form_handle = None
 
     try:
+        page.on("request", on_request)
+        request_listener_installed = True
         if composer_form_handle is None:
             owned_form_handle = await page.evaluate_handle(
                 CAPTURE_COMPOSER_FORM_HANDLE_JS, composer_selector,
@@ -1412,6 +1460,8 @@ async def attach_files(
         last_state = initial_state
         page.on("response", on_response)
         listener_installed = True
+        page.on("requestfailed", on_request_failed)
+        request_failure_listener_installed = True
         diagnostics.install()
         diagnostics.set_phase("file_objects")
         for descriptor in descriptors:
@@ -1555,7 +1605,6 @@ async def attach_files(
             if (
                 receipt_attribution_pending
                 or metadata_failures
-                or processing_failure
                 or completed_file_create_responses != len(filenames)
                 or len(receipt_file_ids) != len(filenames)
                 or len(set(receipt_file_ids)) != len(filenames)
@@ -1610,10 +1659,10 @@ async def attach_files(
                     missing.append(missing_name)
             missing_conditions = (
                 ", ".join(missing) or "none"
-                if details is not None else "not required without observation"
+                if details is not None else "not required without parsed evidence"
             )
             return (
-                f"processing {alias}: observed={'yes' if details is not None else 'no'}, "
+                f"processing {alias}: parsed evidence={'yes' if details is not None else 'no'}, "
                 f"completion={'yes' if has_completion else 'no'}, "
                 f"indexed display name={'yes' if has_indexed_display_name else 'no'}, "
                 f"missing={missing_conditions}, "
@@ -1698,7 +1747,7 @@ async def attach_files(
             )
             if metadata_failure_overflow:
                 failures += "; additional receipt metadata failures omitted"
-            if metadata_failures or processing_failure:
+            if metadata_failures:
                 attribution = "failed"
             elif receipt_attribution_pending:
                 attribution = "pending"
