@@ -283,3 +283,130 @@ def test_preflight_and_dispatch_diagnostics_are_bounded_and_sanitized() -> None:
     observer.record_preflight({"state": "PRIVATE_SENTINEL", "reason": "PRIVATE_SENTINEL"})
     observer.record_dispatch_result({"events": [{"type": "PRIVATE_SENTINEL"}]})
     assert "PRIVATE_SENTINEL" not in json.dumps(asdict(observer.snapshot()))
+
+
+@pytest.mark.parametrize("path, endpoint", [
+    ("/backend-api/files", "create"),
+    ("/backend-api/files/process_upload_stream", "processing"),
+])
+@pytest.mark.parametrize("code", ["net::ERR_ABORTED", "net::ERR_CONNECTION_RESET", "net::ERR_HTTP2_PROTOCOL_ERROR"])
+def test_transport_failure_code_is_correlated_with_the_same_http200_request(
+    path: str, endpoint: str, code: str,
+) -> None:
+    page = _Page()
+    observer = AttachmentDiagnosticObserver(page, file_sizes=(1,), timeout_seconds=120)
+    observer.install()
+    observer.mark_drop_started()
+    request = _request(url="https://chatgpt.com" + path, failure=code)
+    other_request = _request(url=request.url)
+    page.emit("request", other_request)
+    page.emit("request", request)
+    observer.on_response(SimpleNamespace(request=request, url=request.url, status=200))
+    page.emit("requestfailed", request)
+    asyncio.run(observer.close())
+
+    snapshot = observer.snapshot()
+    response, failure = [event for event in snapshot.events if event.request_id == 2][-2:]
+    assert response.event == "response"
+    assert response.status == 200
+    assert failure.event == "requestfailed"
+    assert failure.endpoint == response.endpoint == endpoint
+    assert failure.request_started_before_drop is False
+    assert failure.failure_code == code
+    assert failure.failure_code_status == "known_code"
+    assert response.failure_code is None
+    assert response.failure_code_status is None
+    serialized = json.dumps(asdict(snapshot))
+    assert code in serialized
+    assert "private" not in serialized
+    assert "https://" not in serialized
+    assert not snapshot.observer_active
+    assert all(not listeners for listeners in page.listeners.values())
+
+
+@pytest.mark.parametrize("reason, status", [
+    (None, "unavailable"),
+    ("", "unavailable"),
+    (42, "unrecognized"),
+    ({"errorText": "net::ERR_ABORTED"}, "unrecognized"),
+    ("private network error text", "unrecognized"),
+    ("net::ERR_ABORTED https://private.test/secret.txt", "unrecognized"),
+    ("https://private.test/net::ERR_ABORTED", "unrecognized"),
+    ("net::ERR_ABORTED\n", "unrecognized"),
+    ("net::err_aborted", "unrecognized"),
+    ("net::ERR_" + "A" * 1000, "unrecognized"),
+])
+def test_transport_failure_reason_is_never_retained_as_arbitrary_text(reason: Any, status: str) -> None:
+    page = _Page()
+    observer = AttachmentDiagnosticObserver(page, file_sizes=(1,), timeout_seconds=1)
+    observer.install()
+    page.emit("requestfailed", _request(failure=reason))
+    event = observer.snapshot().events[-1]
+    assert event.event == "requestfailed"
+    assert event.failure_code is None
+    assert event.failure_code_status == status
+    serialized = json.dumps(asdict(observer.snapshot()))
+    for secret in ("private", "secret.txt", "errorText", "net::err_aborted", "A" * 100):
+        assert secret not in serialized
+    asyncio.run(observer.close())
+
+
+@pytest.mark.parametrize("accessor", ["missing", "raises"])
+def test_unavailable_failure_accessor_preserves_failed_event_and_counter(
+    accessor: str, caplog: pytest.LogCaptureFixture,
+) -> None:
+    class Request:
+        method = "POST"
+        url = "https://chatgpt.com/backend-api/files/process_upload_stream"
+
+        @property
+        def failure(self) -> Any:
+            if accessor == "missing":
+                raise AttributeError("private missing property")
+            raise RuntimeError("private accessor failure")
+
+    page = _Page()
+    observer = AttachmentDiagnosticObserver(page, file_sizes=(1,), timeout_seconds=1)
+    observer.install()
+    request = Request()
+    page.emit("request", request)
+    page.emit("requestfailed", request)
+    snapshot = observer.snapshot()
+    event = snapshot.events[-1]
+    assert event.event == "requestfailed"
+    assert event.request_id == 1
+    assert event.endpoint == "processing"
+    assert event.failure_code is None
+    assert event.failure_code_status == "unavailable"
+    assert snapshot.processing_network.requests_failed == 1
+    assert "private" not in caplog.text + json.dumps(asdict(snapshot))
+    asyncio.run(observer.close())
+
+
+def test_failure_accessor_is_not_read_for_other_events_unrelated_requests_or_after_close() -> None:
+    class Request:
+        method = "POST"
+        url = "https://chatgpt.com/backend-api/files"
+        failure_reads = 0
+
+        @property
+        def failure(self) -> Any:
+            self.failure_reads += 1
+            raise RuntimeError("private unexpected access")
+
+    page = _Page()
+    observer = AttachmentDiagnosticObserver(page, file_sizes=(1,), timeout_seconds=1)
+    observer.install()
+    request = Request()
+    page.emit("request", request)
+    observer.on_response(SimpleNamespace(request=request, url=request.url, status=200))
+    page.emit("requestfinished", request)
+    unrelated = Request()
+    unrelated.url = "https://untrusted.test/backend-api/files"
+    page.emit("requestfailed", unrelated)
+    assert request.failure_reads == unrelated.failure_reads == 0
+    asyncio.run(observer.close())
+    closed = observer.snapshot()
+    page.emit("requestfailed", request)
+    assert request.failure_reads == 0
+    assert observer.snapshot() == closed

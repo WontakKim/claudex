@@ -16,9 +16,11 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from pyee import EventEmitter
+from playwright._impl._browser_context import BrowserContext
 from playwright._impl._network import Request as ImplementationRequest
 from playwright._impl._network import Response as ImplementationResponse
-from playwright.async_api import Error, Response, async_playwright
+from playwright.async_api import Error, Request, Response, async_playwright
 
 from claudex.gptpro import attachments
 
@@ -679,12 +681,12 @@ def _processing_frames(file_id: str, display_name: str) -> list[dict[str, Any]]:
 @pytest.mark.parametrize(("frames", "expected_processing"), [
     pytest.param(
         _processing_frames("file_effect", "effect.ts")[:1],
-        "observed=yes, completion=no, indexed display name=yes, missing=completion",
+        "parsed evidence=yes, completion=no, indexed display name=yes, missing=completion",
         id="missing-completion",
     ),
     pytest.param(
         _processing_frames("file_effect", "effect.ts")[1:],
-        "observed=yes, completion=yes, indexed display name=no, missing=indexed display name",
+        "parsed evidence=yes, completion=yes, indexed display name=no, missing=indexed display name",
         id="missing-indexed-name",
     ),
 ])
@@ -758,7 +760,7 @@ def test_deferred_indexing_started_name_does_not_satisfy_processing_completion(
         ))
 
     assert raised.value.ready_attachments == 0
-    assert "processing upload-1: observed=yes, completion=no" in str(raised.value)
+    assert "processing upload-1: parsed evidence=yes, completion=no" in str(raised.value)
     assert "no send click attempted by attachment upload" in str(raised.value)
 
 
@@ -803,7 +805,7 @@ def test_deferred_indexing_name_is_candidate_not_card_binding(
     assert raised.value.ready_attachments == 0
     assert "name source candidate=deferred-indexing-started" in message
     assert "card binding=unverified" in message
-    assert "processing upload-1: observed=yes, completion=yes" in message
+    assert "processing upload-1: parsed evidence=yes, completion=yes" in message
 
 
 def test_invalid_deferred_name_fails_without_becoming_absence(
@@ -930,11 +932,11 @@ def test_timeout_distinguishes_unobserved_and_incomplete_processing(
     assert "1/2 processing-qualified ready attachments" in message
     assert "2/2 observed composer-ready attachments" in message
     assert (
-        "processing upload-2: observed=no, completion=no, "
-        "indexed display name=no, missing=not required without observation"
+        "processing upload-2: parsed evidence=no, completion=no, "
+        "indexed display name=no, missing=not required without parsed evidence"
     ) in message
     assert (
-        "processing upload-1: observed=yes, completion=no, "
+        "processing upload-1: parsed evidence=yes, completion=no, "
         "indexed display name=no, missing=completion, indexed display name"
     ) in message
 
@@ -975,7 +977,7 @@ def test_ready_chip_timeout_reports_pending_processing_response(
     assert "1/1 processing-qualified ready attachments" in message
     assert "1/1 observed composer-ready attachments" in message
     assert "1 pending processing responses" in message
-    assert "processing upload-1: observed=no" in message
+    assert "processing upload-1: parsed evidence=no" in message
     assert page.listeners == {"response": []}
     assert all(handle.dispose_calls == 1 for handle in page.handles)
 
@@ -1071,7 +1073,7 @@ def test_preexisting_renamed_chip_is_not_new_upload_evidence(
     assert raised.value.ready_attachments == 0
     assert "0/1 observed composer-ready attachments" in str(raised.value)
     assert (
-        "processing upload-1: observed=yes, completion=yes, "
+        "processing upload-1: parsed evidence=yes, completion=yes, "
         "indexed display name=yes, missing=none"
     ) in str(raised.value)
 
@@ -1112,7 +1114,7 @@ def test_processing_failure_blocks_even_ready_original_chip(
     ):
         assert private_value not in message
     assert (
-        "processing upload-1: observed=yes, completion=no, "
+        "processing upload-1: parsed evidence=yes, completion=no, "
         "indexed display name=no, missing=completion, indexed display name"
     ) in message
     assert "1/1 observed composer-ready attachments" in message
@@ -1565,7 +1567,10 @@ def test_attachment_probe_runs_in_local_synthetic_dom() -> None:
 def _create_lifecycle_response(closed: asyncio.Future[Any]) -> Response:
     """Use installed Playwright lifecycle methods without a connection or browser."""
     request = ImplementationRequest.__new__(ImplementationRequest)
-    page = SimpleNamespace(_closed_or_crashed_future=closed)
+    page = EventEmitter()
+    page._closed_or_crashed_future = closed
+    request._failure_text = None
+    request._timing = {"responseStart": -1, "responseEnd": -1}
     request._initializer = {
         "frame": SimpleNamespace(_object=SimpleNamespace(_page=page)),
     }
@@ -1597,6 +1602,8 @@ async def _assert_response_completion_cleanup(
     ]
     assert not closed.cancelled()
     assert all(not response._impl_obj._finished_future.cancelled() for response in responses)
+    assert all(not response._impl_obj._request._safe_page().listeners("requestfailed")
+               for response in responses)
     if not closed.done():
         closed.set_result(Error("synthetic late close"))
     await _flush_response_completion()
@@ -1989,7 +1996,7 @@ def test_settlement_observer_catches_late_failure_before_submit(
         assert snapshots[-1].pre_submit_result == "processing-failed"
         assert snapshots[-1].outcome == "blocked"
         await observations[0].close()
-        assert page.listeners["response"] == []
+        assert page.listeners == {"response": []}
 
     clock = _FakeClock()
     monkeypatch.setattr(attachments, "_monotonic", clock.monotonic)
@@ -3083,3 +3090,903 @@ def test_preflight_eligibility_cannot_start_dispatch_after_attachment_deadline(
         asyncio.run(attachments.attach_files(page, [str(path)], timeout_seconds=0.5))
     assert not any(script == attachments.DISPATCH_ATTACHMENT_DROP_JS for script, _ in page.evaluate_calls)
     assert all(handle.dispose_calls == 1 for handle in page.handles)
+
+
+@pytest.mark.parametrize("mode", [
+    "before", "after", "unrelated", "stale", "normal", "failure_without_text", "before_without_text",
+])
+def test_processing_request_terminal_lifecycle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str,
+) -> None:
+    attachment = tmp_path / "upload.txt"
+    attachment.write_text("attachment", encoding="utf-8")
+
+    async def poll_sleep(seconds: float) -> None:
+        await asyncio.sleep(min(seconds, 0.001))
+
+    monkeypatch.setattr(attachments, "_sleep", poll_sleep)
+
+    async def run() -> None:
+        loop = asyncio.get_running_loop()
+        warnings: list[str] = []
+        loop.set_exception_handler(lambda loop, context: warnings.append(context["message"]))
+        initial_tasks = asyncio.all_tasks()
+        closed = loop.create_future()
+        lifecycle = _create_lifecycle_response(closed)
+        implementation = lifecycle._impl_obj
+        request = implementation._request
+        implementation_page = request._safe_page()
+        processing = _ProcessingResponse(_processing_frames("file_upload", attachment.name))
+        processing._impl_obj = implementation
+        processing.request = SimpleNamespace(method="POST", url=processing.url)
+
+        class Page(_FakePage):
+            async def evaluate(self, script: str, argument: Any = None) -> Any:
+                result = await super().evaluate(script, argument)
+                if script == attachments.DISPATCH_ATTACHMENT_DROP_JS and mode in (
+                    "before", "before_without_text",
+                ):
+                    assert not implementation._finished_future._callbacks
+                    BrowserContext._on_request_failed(
+                        SimpleNamespace(emit=lambda *args: None), request, 1,
+                        None if mode == "before_without_text" else "synthetic transport failure",
+                        implementation_page,
+                    )
+                return result
+
+        page = Page(
+            bindings=[_bound_cards(("upload-1", "upload-card", attachment.name, "ready", True))],
+            responses=[_NamedCreateResponse(attachment.name, "file_upload"), processing],
+            states=[_attachment_state()] + [_attachment_state(ready={attachment.name: 1})] * 20,
+        )
+
+        unrelated_public_request = SimpleNamespace(method="POST", url=processing.url)
+
+        def forward_failure(failed: Any) -> None:
+            public_request = processing.request if failed is request else unrelated_public_request
+            for callback in tuple(page.listeners.get("requestfailed", [])):
+                callback(public_request)
+
+        implementation_page.on("requestfailed", forward_failure)
+        snapshots = []
+        try:
+            stale = _create_lifecycle_response(closed)._impl_obj._request
+            if mode == "stale":
+                BrowserContext._on_request_failed(
+                    SimpleNamespace(emit=lambda *args: None), stale, 1,
+                    "synthetic stale failure", implementation_page,
+                )
+            task = asyncio.create_task(attachments.attach_files(
+                page, [str(attachment)], timeout_seconds=0.6, on_diagnostics=snapshots.append,
+            ))
+            await _flush_response_completion()
+            if mode in ("after", "failure_without_text"):
+                assert not task.done()
+                assert implementation._finished_future._callbacks
+                BrowserContext._on_request_failed(
+                    SimpleNamespace(emit=lambda *args: None), request, 1,
+                    None if mode == "failure_without_text" else "synthetic transport failure",
+                    implementation_page,
+                )
+            elif mode in ("unrelated", "stale", "normal"):
+                if mode != "normal":
+                    BrowserContext._on_request_failed(
+                        SimpleNamespace(emit=lambda *args: None), stale, 1,
+                        "synthetic unrelated failure", implementation_page,
+                    )
+                    await _flush_response_completion()
+                    assert not task.done()
+                BrowserContext._on_request_finished(
+                    SimpleNamespace(emit=lambda *args: None), request, implementation, 1,
+                    implementation_page,
+                )
+            if mode in ("before", "after", "failure_without_text", "before_without_text"):
+                with pytest.raises(
+                    attachments.AttachmentUploadFailedError,
+                    match=r"processing observation failed \(Error\)",
+                ) as raised:
+                    await asyncio.wait_for(task, timeout=0.3)
+                assert "receipt attribution=complete" in str(raised.value)
+                assert "processing upload-1: parsed evidence=no" in str(raised.value)
+                assert snapshots[-1].processing_network.responses_received == 1
+                assert snapshots[-1].processing_network.requests_failed == 1
+                assert not implementation._finished_future.done()
+            else:
+                assert await task == {attachment.name: (0, 1)}
+            del task
+            assert not closed.done()
+            assert implementation_page.listeners("requestfailed") == [forward_failure]
+            assert page.listeners == {"response": []}
+            assert all(handle.dispose_calls == 1 for handle in page.handles)
+            implementation_page.remove_listener("requestfailed", forward_failure)
+            await _assert_response_completion_cleanup([lifecycle], closed, initial_tasks, warnings)
+        finally:
+            if forward_failure in implementation_page.listeners("requestfailed"):
+                implementation_page.remove_listener("requestfailed", forward_failure)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("mapping", ["complete", "missing", "duplicate"])
+def test_processing_failure_does_not_define_receipt_attribution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mapping: str,
+) -> None:
+    attachment = tmp_path / "upload.txt"
+    attachment.write_text("attachment", encoding="utf-8")
+    clock = _FakeClock()
+    monkeypatch.setattr(attachments, "_monotonic", clock.monotonic)
+    monkeypatch.setattr(attachments, "_sleep", clock.sleep)
+    create = _NamedCreateResponse(attachment.name, "file_upload")
+    responses = [_FakeResponse() if mapping == "missing" else create]
+    if mapping == "duplicate":
+        responses.append(_NamedCreateResponse(attachment.name, "file_upload"))
+    failure = {"event": "file.processing.failed"}
+    if mapping != "missing":
+        failure["file_id"] = "file_upload"
+    responses.append(_ProcessingResponse([failure]))
+    page = _FakePage(
+        bindings=[_bound_cards(("upload-1", "upload-card", attachment.name, "ready", True))],
+        responses=responses,
+        states=[_attachment_state()] + [_attachment_state(ready={attachment.name: 1})] * 20,
+    )
+    observations = []
+    snapshots = []
+    with pytest.raises(attachments.AttachmentUploadFailedError) as raised:
+        asyncio.run(attachments.attach_files(
+            page, [str(attachment)], timeout_seconds=0.5,
+            on_settlement=observations.append, on_diagnostics=snapshots.append,
+        ))
+    expected = "complete" if mapping == "complete" else "failed"
+    assert f"receipt attribution={expected}" in str(raised.value)
+    assert snapshots[-1].outcome == "failed"
+    assert observations == []
+    assert page.listeners == {"response": []}
+
+
+@pytest.mark.parametrize("start", ["baseline", "preflight", "current", "unobserved"])
+@pytest.mark.parametrize("outcome", ["failed", "pending"])
+def test_processing_request_crossing_attachment_operation_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, start: str, outcome: str,
+) -> None:
+    attachment = tmp_path / "upload.txt"
+    attachment.write_text("attachment", encoding="utf-8")
+
+    async def poll_sleep(seconds: float) -> None:
+        await asyncio.sleep(min(seconds, 0.001))
+
+    monkeypatch.setattr(attachments, "_sleep", poll_sleep)
+
+    async def run() -> None:
+        loop = asyncio.get_running_loop()
+        warnings: list[str] = []
+        loop.set_exception_handler(lambda loop, context: warnings.append(context["message"]))
+        initial_tasks = asyncio.all_tasks()
+        closed = loop.create_future()
+        lifecycle = _create_lifecycle_response(closed)
+        implementation = lifecycle._impl_obj
+        processing = _ProcessingResponse(_processing_frames("file_stale", "other.txt"))
+        processing._impl_obj = implementation
+        processing.request = SimpleNamespace(method="POST", url=processing.url)
+
+        class Page(_FakePage):
+            def emit_start(self) -> None:
+                for callback in tuple(self.listeners.get("request", [])):
+                    callback(processing.request)
+
+            async def evaluate_handle(self, script: str, argument: Any) -> _FakeHandle:
+                if (start == "baseline" and script == attachments.CAPTURE_COMPOSER_FORM_HANDLE_JS) or (
+                    start == "preflight" and script == attachments.CREATE_ATTACHMENT_FILE_JS
+                ):
+                    self.emit_start()
+                return await super().evaluate_handle(script, argument)
+
+            async def evaluate(self, script: str, argument: Any = None) -> Any:
+                if script == attachments.DISPATCH_ATTACHMENT_DROP_JS and start == "current":
+                    self.emit_start()
+                result = await super().evaluate(script, argument)
+                if script == attachments.DISPATCH_ATTACHMENT_DROP_JS and outcome == "failed":
+                    BrowserContext._on_request_failed(
+                        SimpleNamespace(emit=lambda *args: None), implementation._request, 1,
+                        None, implementation._request._safe_page(),
+                    )
+                return result
+
+        page = Page(
+            bindings=[_bound_cards(("upload-1", "upload-card", attachment.name, "ready", True))],
+            responses=[
+                _NamedCreateResponse(attachment.name, "file_upload"),
+                _ProcessingResponse(_processing_frames("file_upload", attachment.name)), processing,
+            ],
+            states=[_attachment_state()] + [_attachment_state(ready={attachment.name: 1})] * 20,
+        )
+
+        def forward_failure(request: Any) -> None:
+            assert request is implementation._request
+            for callback in tuple(page.listeners.get("requestfailed", [])):
+                callback(processing.request)
+
+        implementation_page = implementation._request._safe_page()
+        implementation_page.on("requestfailed", forward_failure)
+        observations = []
+        try:
+            upload = attachments.attach_files(
+                page, [str(attachment)], timeout_seconds=0.2, on_settlement=observations.append,
+            )
+            if start in ("baseline", "preflight"):
+                assert await upload == {attachment.name: (0, 1)}
+                assert await observations[0].revalidate_before_submit() is None
+                await observations[0].close()
+            else:
+                error = (attachments.AttachmentUploadFailedError if outcome == "failed"
+                         else attachments.AttachmentSettleTimeoutError)
+                with pytest.raises(error):
+                    await upload
+                assert observations == []
+            assert page.listeners == {"response": []}
+            assert not implementation._finished_future.done()
+            assert not closed.done()
+            assert all(handle.dispose_calls == 1 for handle in page.handles)
+            implementation_page.remove_listener("requestfailed", forward_failure)
+            await _assert_response_completion_cleanup([lifecycle], closed, initial_tasks, warnings)
+        finally:
+            if forward_failure in implementation_page.listeners("requestfailed"):
+                implementation_page.remove_listener("requestfailed", forward_failure)
+
+    asyncio.run(run())
+
+
+class _StreamSession(EventEmitter):
+    """Passive CDP collaborator; parsing and settlement stay in production."""
+
+    def __init__(self, buffered: bytes = b"") -> None:
+        super().__init__()
+        self.buffered = buffered
+        self.commands: list[tuple[str, Any]] = []
+        self.detach_calls = 0
+        self.during_subscription: list[bytes] = []
+
+    async def send(self, method: str, arguments: Any = None) -> dict[str, Any]:
+        self.commands.append((method, arguments))
+        if method == "Network.streamResourceContent":
+            for chunk in self.during_subscription:
+                self.emit("Network.dataReceived", {
+                    "requestId": arguments["requestId"],
+                    "data": base64.b64encode(chunk).decode("ascii"),
+                })
+            return {"bufferedData": base64.b64encode(self.buffered).decode("ascii")}
+        assert method == "Network.enable"
+        return {}
+
+    async def detach(self) -> None:
+        self.detach_calls += 1
+
+
+@pytest.mark.parametrize("delivery", ["buffered", "chunks", "during-subscription", "tail", "duplicate-callbacks", "late-partial", "late-during-card"])
+def test_cdp_completed_processing_survives_installed_playwright_abort(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, delivery: str,
+) -> None:
+    path = tmp_path / "stream.txt"
+    path.write_text("synthetic", encoding="utf-8")
+
+    async def poll_sleep(seconds: float) -> None:
+        await asyncio.sleep(min(seconds, 0.001))
+
+    monkeypatch.setattr(attachments, "_sleep", poll_sleep)
+
+    async def run() -> None:
+        closed = asyncio.get_running_loop().create_future()
+        lifecycle = _create_lifecycle_response(closed)
+        implementation = lifecycle._impl_obj
+        processing = _ProcessingResponse([])
+        processing._impl_obj = implementation
+        implementation._request._loop = asyncio.get_running_loop()
+        implementation._request._fallback_overrides = SimpleNamespace(method=None, url=None)
+        implementation._request._initializer.update({"method": "POST", "url": processing.url})
+        processing.request = Request(implementation._request)
+        frames = _processing_frames("file_stream", path.name)
+        data = ("\n".join(map(json.dumps, frames)) + ("" if delivery == "tail" else "\n")).encode()
+        split = 17 if delivery in ("chunks", "during-subscription") else len(data)
+        session = _StreamSession(data[:split])
+        chunks = [data[index:index + 7] for index in range(split, len(data), 7)]
+        if delivery == "during-subscription":
+            session.during_subscription = chunks
+
+        class Page(_FakePage):
+            async def evaluate(self, script: str, argument: Any = None) -> Any:
+                if script == attachments.DISPATCH_ATTACHMENT_DROP_JS:
+                    session.emit("Network.requestWillBeSent", {
+                        "requestId": "current-stream", "request": {
+                            "method": "POST", "url": processing.url,
+                        },
+                    })
+                    session.emit("Network.responseReceived", {
+                        "requestId": "current-stream", "response": {
+                            "url": processing.url, "status": 200,
+                        },
+                    })
+                result = await super().evaluate(script, argument)
+                if script == attachments.DISPATCH_ATTACHMENT_DROP_JS:
+                    await _flush_response_completion()
+                    if delivery == "chunks":
+                        for chunk in chunks:
+                            session.emit("Network.dataReceived", {
+                                "requestId": "current-stream",
+                                "data": base64.b64encode(chunk).decode("ascii"),
+                            })
+                    session.emit("Network.loadingFailed", {
+                        "requestId": "current-stream", "canceled": True,
+                        "errorText": "net::ERR_ABORTED",
+                    })
+                    BrowserContext._on_request_failed(
+                        SimpleNamespace(emit=lambda *args: None), implementation._request,
+                        1, "net::ERR_ABORTED", implementation._request._safe_page(),
+                    )
+                    for callback in tuple(self.listeners.get("requestfailed", [])):
+                        callback(processing.request)
+                return result
+
+        page = Page(
+            states=[_attachment_state()] + [_attachment_state(ready={path.name: 1})] * 20,
+            responses=[_NamedCreateResponse(path.name, "file_stream"), processing],
+            bindings=[_bound_cards(("upload-1", "current-card", path.name, "ready", True))],
+        )
+
+        async def new_cdp_session(target: Any) -> _StreamSession:
+            assert target is page
+            return session
+
+        page.context = SimpleNamespace(new_cdp_session=new_cdp_session)
+        observations = []
+        assert await attachments.attach_files(
+            page, [str(path)], timeout_seconds=0.5, on_settlement=observations.append,
+        ) == {path.name: (0, 1)}
+        assert len(observations) == 1
+        if delivery == "duplicate-callbacks":
+            for callback in tuple(page.listeners["response"]):
+                callback(processing)
+            session.emit("Network.responseReceived", {
+                "requestId": "current-stream", "response": {"url": processing.url, "status": 200},
+            })
+        elif delivery == "late-partial":
+            session.emit("Network.dataReceived", {
+                "requestId": "current-stream", "data": base64.b64encode(b'{"file_id":').decode("ascii"),
+            })
+        elif delivery == "late-during-card":
+            tracker = next(handle for handle in page.handles if isinstance(handle, _FakeBindingTracker))
+            read = tracker.evaluate
+
+            async def read_with_late_data(script: str, argument: Any = None) -> Any:
+                result = await read(script, argument)
+                session.emit("Network.dataReceived", {
+                    "requestId": "current-stream", "data": base64.b64encode(b"{").decode("ascii"),
+                })
+                return result
+
+            tracker.evaluate = read_with_late_data
+        blocker = await observations[0].revalidate_before_submit()
+        assert (blocker is not None) if delivery.startswith("late-") else (blocker is None)
+        await observations[0].close()
+        assert session.detach_calls == 1
+        assert session.event_names() == set()
+        assert page.listeners == {"response": []}
+        assert not closed.done()
+        assert not implementation._finished_future.done()
+
+    asyncio.run(run())
+
+
+async def _open_processing_observer(session: _StreamSession, on_event: Any = None, *, byte_limit: int = 262_144) -> Any:
+    from claudex.gptpro.attachment_stream import ProcessingStreamObserver
+
+    page = SimpleNamespace()
+
+    async def new_cdp_session(target: Any) -> _StreamSession:
+        assert target is page
+        return session
+
+    page.context = SimpleNamespace(new_cdp_session=new_cdp_session)
+    observer = await ProcessingStreamObserver.open(page, on_event or (lambda event: None), byte_limit, 40)
+    assert observer is not None
+    return observer
+
+
+def _emit_processing_start(session: _StreamSession, identifier: str, *, response: bool = True) -> None:
+    session.emit("Network.requestWillBeSent", {
+        "requestId": identifier, "request": {"method": "POST", "url": _ProcessingResponse.url},
+    })
+    if response:
+        session.emit("Network.responseReceived", {
+            "requestId": identifier, "response": {"url": _ProcessingResponse.url, "status": 200},
+        })
+
+
+@pytest.mark.parametrize("loss", ["unknown-response", "session-close", "unstreamed-data", "unstreamed-after-completion"])
+def test_cdp_processing_coverage_loss_is_not_absence(loss: str) -> None:
+    async def run() -> None:
+        frames = _processing_frames("file_stream", "stream.txt")
+        data = ("\n".join(map(json.dumps, frames)) + "\n").encode()
+        session = _StreamSession(data if loss == "unstreamed-after-completion" else b"")
+        observer = await _open_processing_observer(session)
+        observer.arm()
+        if loss == "unknown-response":
+            session.emit("Network.responseReceived", {
+                "requestId": "unobserved-start", "response": {"url": _ProcessingResponse.url, "status": 200},
+            })
+        elif loss == "session-close":
+            session.emit("close", session)
+        else:
+            _emit_processing_start(session, "missing-data")
+            await _flush_response_completion()
+            session.emit("Network.dataReceived", {"requestId": "missing-data", "dataLength": 20})
+            session.emit("Network.loadingFinished", {"requestId": "missing-data"})
+            observer.observe_public_response(_ProcessingResponse([]))
+        assert observer.blocker({"file_stream"}) is not None
+        await observer.close()
+        assert session.detach_calls == 1
+        assert session.event_names() == set()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("mode", [
+    "incomplete-abort", "empty", "malformed", "oversized", "invalid-base64", "non-abort",
+    "not-canceled", "blocked", "cors", "unattributed", "pending-command", "missing-public", "extra-public", "failed-frame", "redirect",
+])
+def test_cdp_processing_rejects_unverified_streams(mode: str) -> None:
+    async def run() -> None:
+        frames = _processing_frames("file_stream", "stream.txt")
+        if mode == "incomplete-abort":
+            frames = frames[:1]
+        if mode == "failed-frame":
+            frames.append({"file_id": "file_stream", "event": "file.processing.failed"})
+        data = ("\n".join(map(json.dumps, frames)) + "\n").encode()
+        if mode == "empty":
+            data = b""
+        elif mode == "malformed":
+            data += b"not-json\n"
+        session = _StreamSession(data)
+        observer = await _open_processing_observer(session, byte_limit=8 if mode == "oversized" else 262_144)
+        observer.arm()
+        _emit_processing_start(session, "stream")
+        response = _ProcessingResponse([])
+        response.request = SimpleNamespace(method="POST", url=response.url, failure="net::ERR_ABORTED")
+        if mode != "missing-public":
+            observer.observe_public_response(response)
+        if mode == "extra-public":
+            observer.observe_public_response(_ProcessingResponse([]))
+        if mode == "pending-command":
+            assert observer.blocker({"file_stream"}) is not None
+        else:
+            await _flush_response_completion()
+            if mode == "redirect":
+                session.emit("Network.requestWillBeSent", {
+                    "requestId": "stream", "redirectResponse": {"status": 307},
+                    "request": {"method": "POST", "url": "https://chatgpt.com/other"},
+                })
+            if mode == "invalid-base64":
+                session.emit("Network.dataReceived", {"requestId": "stream", "data": "!!!"})
+            event = {"requestId": "stream", "canceled": mode != "not-canceled",
+                     "errorText": "net::ERR_CONNECTION_RESET" if mode == "non-abort" else "net::ERR_ABORTED"}
+            if mode == "blocked":
+                event["blockedReason"] = "other"
+            elif mode == "cors":
+                event["corsErrorStatus"] = {"corsError": "InvalidResponse"}
+            session.emit("Network.loadingFailed", event)
+            observer.observe_public_failure(response.request)
+            assert observer.blocker({"file_other"} if mode == "unattributed" else {"file_stream"}) is not None
+        await observer.close()
+        assert not observer.tasks
+        assert not observer.requests
+        assert session.detach_calls == 1
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("mode, accepted", [
+    ("normal", True), ("absent", True), ("deferred", True), ("no-name", True), ("stale", True),
+    ("undeferred", False), ("wrong-card", False), ("stale-card", False),
+    ("wrong-receipt", False), ("incomplete", False), ("failed-frame", False),
+    ("empty", False), ("malformed", False), ("public-only", False), ("cdp-only", False),
+    ("another-stream-fails", False), ("setup-unavailable", True),
+    ("public-pending", False), ("public-nonabort", False), ("public-abort-unowned", False),
+])
+def test_cdp_processing_settlement_keeps_receipt_name_and_card_contracts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str, accepted: bool,
+) -> None:
+    path = tmp_path / "requested.txt"
+    path.write_text("synthetic", encoding="utf-8")
+
+    async def poll_sleep(seconds: float) -> None:
+        await asyncio.sleep(min(seconds, 0.001))
+
+    monkeypatch.setattr(attachments, "_sleep", poll_sleep)
+
+    async def run() -> None:
+        display_name = "renamed.txt" if mode in ("deferred", "undeferred") else path.name
+        frames = _processing_frames("file_stream", display_name)
+        if mode in ("deferred", "undeferred"):
+            frames[0]["event"] = "file.indexing.started"
+            if mode == "deferred":
+                frames[0]["extra"]["retrieval_indexing_deferred"] = True
+        elif mode == "no-name":
+            frames = frames[1:]
+        elif mode == "incomplete":
+            frames = frames[:1]
+        elif mode == "failed-frame":
+            frames.append({"file_id": "file_stream", "event": "file.processing.failed"})
+        data = ("\n".join(map(json.dumps, frames)) + "\n").encode()
+        if mode == "empty":
+            data = b""
+        elif mode == "malformed":
+            data += b"broken\n"
+
+        class Session(_StreamSession):
+            async def send(self, method: str, arguments: Any = None) -> dict[str, Any]:
+                if mode == "setup-unavailable" and method == "Network.enable":
+                    raise Error("synthetic unsupported CDP")
+                return await super().send(method, arguments)
+
+        session = Session(data)
+        processing = _ProcessingResponse(frames)
+        uncovered_request = SimpleNamespace(method="POST", url=processing.url,
+                                            failure="net::ERR_ABORTED" if mode == "public-abort-unowned" else "net::ERR_CONNECTION_RESET")
+
+        stale_response = _ProcessingResponse([{"file_id": "file_old", "event": "file.processing.failed"}])
+        stale_response.request = SimpleNamespace(method="POST", url=processing.url, failure="net::ERR_ABORTED")
+
+        class Page(_FakePage):
+            async def evaluate_handle(self, script: str, argument: Any = None) -> Any:
+                if script == attachments.CAPTURE_COMPOSER_FORM_HANDLE_JS and mode == "stale":
+                    _emit_processing_start(session, "stale", response=False)
+                    for callback in tuple(self.listeners.get("request", [])):
+                        callback(stale_response.request)
+                return await super().evaluate_handle(script, argument)
+
+            async def evaluate(self, script: str, argument: Any = None) -> Any:
+                if script == attachments.DISPATCH_ATTACHMENT_DROP_JS and mode not in ("absent", "public-only", "setup-unavailable", "public-pending", "public-nonabort", "public-abort-unowned"):
+                    _emit_processing_start(session, "stream")
+                if script == attachments.DISPATCH_ATTACHMENT_DROP_JS and mode.startswith("public-") and mode != "public-only":
+                    for callback in tuple(self.listeners.get("request", [])):
+                        callback(uncovered_request)
+                    if mode != "public-pending":
+                        for callback in tuple(self.listeners.get("requestfailed", [])):
+                            callback(uncovered_request)
+                result = await super().evaluate(script, argument)
+                if script == attachments.DISPATCH_ATTACHMENT_DROP_JS:
+                    await _flush_response_completion()
+                    if mode == "stale":
+                        session.emit("Network.responseReceived", {
+                            "requestId": "stale", "response": {"url": processing.url, "status": 200},
+                        })
+                        session.emit("Network.loadingFailed", {
+                            "requestId": "stale", "canceled": True, "errorText": "net::ERR_ABORTED",
+                        })
+                        session.emit("Network.loadingFailed", {"requestId": "unrelated", "errorText": "net::ERR_FAILED"})
+                        for callback in tuple(self.listeners.get("requestfailed", [])):
+                            callback(stale_response.request)
+                    session.emit("Network.loadingFinished", {"requestId": "stream"})
+                    if mode == "another-stream-fails":
+                        _emit_processing_start(session, "failed-stream")
+                        session.emit("Network.loadingFailed", {
+                            "requestId": "failed-stream", "canceled": True, "errorText": "net::ERR_ABORTED",
+                        })
+                return result
+
+        responses = [_NamedCreateResponse(path.name, "file_other" if mode == "wrong-receipt" else "file_stream")]
+        if mode not in ("absent", "cdp-only", "public-pending", "public-nonabort", "public-abort-unowned"):
+            responses.append(processing)
+        if mode == "stale":
+            responses.append(stale_response)
+        page = Page(
+            responses=responses,
+            states=[_attachment_state()] + [_attachment_state(ready={display_name: 1})] * 100,
+            bindings=[_bound_cards(("upload-1", "card", "other.txt" if mode == "wrong-card" else display_name,
+                                    "ready", mode != "stale-card"))],
+        )
+
+        async def new_cdp_session(target: Any) -> _StreamSession:
+            assert target is page
+            return session
+
+        page.context = SimpleNamespace(new_cdp_session=new_cdp_session)
+        observations = []
+        operation = attachments.attach_files(page, [str(path)], timeout_seconds=0.15, on_settlement=observations.append)
+        if accepted:
+            assert await operation == {display_name: (0, 1)}
+            assert len(observations) == 1
+            assert await observations[0].revalidate_before_submit() is None
+            await observations[0].close()
+        else:
+            expected_error = (
+                attachments.AttachmentUploadFailedError
+                if mode in ("public-nonabort", "another-stream-fails", "failed-frame", "malformed")
+                else (attachments.AttachmentUploadFailedError, attachments.AttachmentSettleTimeoutError)
+            )
+            with pytest.raises(expected_error):
+                await operation
+            assert not observations
+        assert session.detach_calls == 1
+        assert session.event_names() == set()
+        assert page.listeners == {"response": []}
+        assert all(handle.dispose_calls == 1 for handle in page.handles)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("mode", ["normal", "malformed-tail", "detach-failure", "pending-command"])
+def test_cdp_processing_command_order_and_cleanup(mode: str) -> None:
+    async def run() -> None:
+        initial_tasks = asyncio.all_tasks()
+        command_started = asyncio.Event()
+        never = asyncio.get_running_loop().create_future()
+        frames = _processing_frames("file_stream", "stream.txt")
+        data = "\n".join(map(json.dumps, frames)).encode()
+        if mode == "malformed-tail":
+            data += b"\ninvalid-tail"
+
+        class Session(_StreamSession):
+            async def send(self, method: str, arguments: Any = None) -> dict[str, Any]:
+                if method == "Network.streamResourceContent" and mode == "pending-command":
+                    command_started.set()
+                    await never
+                return await super().send(method, arguments)
+
+            async def detach(self) -> None:
+                await super().detach()
+                if mode == "detach-failure":
+                    raise Error("synthetic detached target")
+
+        session = Session(data)
+        events = []
+        observer = await _open_processing_observer(session, events.append)
+        observer.arm()
+        _emit_processing_start(session, "stream")
+        observer.observe_public_response(_ProcessingResponse([]))
+        # CDP can deliver a terminal event while the command reply is pending.
+        session.emit("Network.loadingFinished", {"requestId": "stream"})
+        if mode == "pending-command":
+            await command_started.wait()
+            assert observer.blocker({"file_stream"}) is not None
+        else:
+            await _flush_response_completion()
+            blocker = observer.blocker({"file_stream"})
+            assert (blocker is not None) if mode == "malformed-tail" else (blocker is None)
+            assert events[:2] == frames
+        await observer.close()
+        assert session.detach_calls == 1
+        assert session.event_names() == set()
+        assert not observer.requests
+        assert not observer.public_requests
+        assert not observer.tasks
+        await _flush_response_completion()
+        assert asyncio.all_tasks() == initial_tasks
+
+    asyncio.run(run())
+
+
+def test_cdp_processing_known_stale_and_unrelated_requests_do_not_poison() -> None:
+    async def run() -> None:
+        session = _StreamSession()
+        events = []
+        observer = await _open_processing_observer(session, events.append)
+        _emit_processing_start(session, "before-drop", response=False)
+        observer.arm()
+        session.emit("Network.responseReceived", {
+            "requestId": "before-drop", "response": {"url": _ProcessingResponse.url, "status": 200},
+        })
+        for identifier in ("before-drop", "unrelated"):
+            session.emit("Network.loadingFailed", {"requestId": identifier, "errorText": "net::ERR_ABORTED"})
+            session.emit("Network.dataReceived", {"requestId": identifier, "data": "invalid"})
+        session.emit("Network.requestWillBeSent", {
+            "requestId": "other-endpoint", "request": {"method": "POST", "url": "https://chatgpt.com/unrelated"},
+        })
+        session.emit("Network.requestWillBeSent", {
+            "requestId": "non-post", "request": {"method": "GET", "url": _ProcessingResponse.url},
+        })
+        session.emit("Network.responseReceived", {
+            "requestId": "non-post", "response": {"url": _ProcessingResponse.url, "status": 200},
+        })
+        assert observer.blocker(set()) is None
+        assert not events
+        assert not any(command == "Network.streamResourceContent" for command, _ in session.commands)
+        await observer.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("phase, terminal", [
+    ("setup", "timeout"), ("setup", "cancel"), ("subscription", "timeout"), ("subscription", "cancel"),
+])
+def test_cdp_processing_upload_deadline_and_cancellation_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, phase: str, terminal: str,
+) -> None:
+    path = tmp_path / "deadline.txt"
+    path.write_text("synthetic", encoding="utf-8")
+
+    async def poll_sleep(seconds: float) -> None:
+        await asyncio.sleep(min(seconds, 0.001))
+
+    monkeypatch.setattr(attachments, "_sleep", poll_sleep)
+
+    async def run() -> None:
+        initial_tasks = asyncio.all_tasks()
+        started = asyncio.Event()
+        never = asyncio.get_running_loop().create_future()
+
+        class Session(_StreamSession):
+            async def send(self, method: str, arguments: Any = None) -> dict[str, Any]:
+                if method == ("Network.enable" if phase == "setup" else "Network.streamResourceContent"):
+                    started.set()
+                    await never
+                return await super().send(method, arguments)
+
+        session = Session()
+
+        class Page(_FakePage):
+            async def evaluate(self, script: str, argument: Any = None) -> Any:
+                if script == attachments.DISPATCH_ATTACHMENT_DROP_JS:
+                    _emit_processing_start(session, "stream")
+                return await super().evaluate(script, argument)
+
+        page = Page(
+            responses=[_NamedCreateResponse(path.name, "file_stream"), _ProcessingResponse([])],
+            states=[_attachment_state()] + [_attachment_state(ready={path.name: 1})] * 100,
+            bindings=[_bound_cards(("upload-1", "card", path.name, "ready", True))],
+        )
+
+        async def new_cdp_session(target: Any) -> _StreamSession:
+            assert target is page
+            return session
+
+        page.context = SimpleNamespace(new_cdp_session=new_cdp_session)
+        observations = []
+        task = asyncio.create_task(attachments.attach_files(
+            page, [str(path)], timeout_seconds=0.04, on_settlement=observations.append,
+        ))
+        try:
+            await started.wait()
+            if terminal == "cancel":
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+            else:
+                done, _ = await asyncio.wait({task}, timeout=0.2)
+                assert task in done, "The original upload deadline must also bound CDP setup"
+                with pytest.raises((attachments.AttachmentPreflightError, attachments.AttachmentSettleTimeoutError)):
+                    await task
+            assert not observations
+            assert session.detach_calls == 1
+            assert session.event_names() == set()
+            assert page.listeners == {"response": []}
+            assert all(handle.dispose_calls == 1 for handle in page.handles)
+        finally:
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        await _flush_response_completion()
+        assert asyncio.all_tasks() == initial_tasks
+
+    asyncio.run(run())
+
+
+def test_cdp_processing_deduplicates_callbacks_without_replaying_frames() -> None:
+    async def run() -> None:
+        frames = _processing_frames("file_stream", "stream.txt")
+        session = _StreamSession(("\n".join(map(json.dumps, frames)) + "\n").encode())
+        events = []
+        observer = await _open_processing_observer(session, events.append)
+        observer.arm()
+        _emit_processing_start(session, "stream")
+        _emit_processing_start(session, "stream")
+        response = _ProcessingResponse([])
+        observer.observe_public_response(response)
+        observer.observe_public_response(response)
+        await _flush_response_completion()
+        _emit_processing_start(session, "stream")
+        await _flush_response_completion()
+        session.emit("Network.loadingFinished", {"requestId": "stream"})
+        assert events == frames
+        assert sum(method == "Network.streamResourceContent" for method, _ in session.commands) == 1
+        assert observer.blocker({"file_stream"}) is None
+        await observer.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("overflow", [False, True])
+def test_cdp_processing_retains_split_utf8_and_enforces_aggregate_byte_budget(overflow: bool) -> None:
+    async def run() -> None:
+        frames = _processing_frames("file_stream", "Ω.txt")
+        data = ("\n".join(json.dumps(frame, ensure_ascii=False) for frame in frames) + "\n").encode()
+        split = data.index("Ω".encode()) + 1
+        session = _StreamSession(data[:split])
+        events = []
+        observer = await _open_processing_observer(session, events.append, byte_limit=len(data))
+        observer.arm()
+        _emit_processing_start(session, "stream")
+        observer.observe_public_response(_ProcessingResponse([]))
+        await _flush_response_completion()
+        session.emit("Network.dataReceived", {
+            "requestId": "stream", "data": base64.b64encode(data[split:]).decode("ascii"),
+        })
+        if overflow:
+            session.emit("Network.dataReceived", {"requestId": "stream", "data": "IA=="})
+        session.emit("Network.loadingFinished", {"requestId": "stream"})
+        assert events == frames
+        blocker = observer.blocker({"file_stream"})
+        assert (blocker is not None) if overflow else (blocker is None)
+        await observer.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("phase, pending_count", [
+    ("network", 1), ("subscription", 1), ("completed-incomplete", 0),
+])
+def test_cdp_processing_timeout_reports_current_pending_responses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, phase: str, pending_count: int,
+) -> None:
+    path = tmp_path / "pending.txt"
+    path.write_text("synthetic", encoding="utf-8")
+    clock = _FakeClock()
+    monkeypatch.setattr(attachments, "_monotonic", clock.monotonic)
+    monkeypatch.setattr(attachments, "_sleep", clock.sleep)
+
+    async def run() -> None:
+        never = asyncio.get_running_loop().create_future()
+        frame = {"file_id": "file_pending", "event": "file.indexing.started",
+                 "extra": {"private_payload": "PRIVATE_PROCESSING_PAYLOAD"}}
+
+        class Session(_StreamSession):
+            async def send(self, method: str, arguments: Any = None) -> dict[str, Any]:
+                if method == "Network.streamResourceContent" and phase == "subscription":
+                    await never
+                return await super().send(method, arguments)
+
+        session = Session((json.dumps(frame) + "\n").encode())
+
+        class Page(_FakePage):
+            async def evaluate_handle(self, script: str, argument: Any = None) -> Any:
+                if script == attachments.CAPTURE_COMPOSER_FORM_HANDLE_JS:
+                    _emit_processing_start(session, "stale-private-request-id", response=False)
+                return await super().evaluate_handle(script, argument)
+
+            async def evaluate(self, script: str, argument: Any = None) -> Any:
+                if script == attachments.DISPATCH_ATTACHMENT_DROP_JS:
+                    _emit_processing_start(session, "current-private-request-id")
+                    session.emit("Network.responseReceived", {
+                        "requestId": "stale-private-request-id",
+                        "response": {"url": _ProcessingResponse.url, "status": 200},
+                    })
+                result = await super().evaluate(script, argument)
+                if script == attachments.DISPATCH_ATTACHMENT_DROP_JS:
+                    await _flush_response_completion()
+                    if phase != "network":
+                        session.emit("Network.loadingFinished", {"requestId": "current-private-request-id"})
+                return result
+
+        page = Page(
+            responses=[_NamedCreateResponse(path.name, "file_pending"), _ProcessingResponse([])],
+            states=[_attachment_state()] + [_attachment_state(ready={path.name: 1})] * 10,
+            bindings=[_bound_cards(("upload-1", "card", path.name, "ready", True))],
+        )
+
+        async def new_cdp_session(target: Any) -> _StreamSession:
+            assert target is page
+            return session
+
+        page.context = SimpleNamespace(new_cdp_session=new_cdp_session)
+        observations = []
+        with pytest.raises(attachments.AttachmentSettleTimeoutError) as raised:
+            await attachments.attach_files(page, [str(path)], timeout_seconds=0.5, on_settlement=observations.append)
+        message = str(raised.value)
+        assert f"{pending_count} pending processing responses" in message
+        assert "private-request-id" not in message
+        assert "PRIVATE_PROCESSING_PAYLOAD" not in message
+        assert "file_pending" not in message
+        assert not observations
+        assert session.detach_calls == 1
+        assert session.event_names() == set()
+        assert page.listeners == {"response": []}
+
+    asyncio.run(run())

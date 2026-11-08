@@ -5,6 +5,7 @@ from __future__ import annotations
 import inspect
 import logging
 import platform
+import re
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
@@ -34,6 +35,8 @@ class AttachmentDiagnosticEvent:
     # None means no request-start event can be attributed, not that no request was sent.
     request_started_before_drop: bool | None = None
     status: int | None = None
+    failure_code: str | None = None
+    failure_code_status: str | None = None
 
 
 @dataclass(frozen=True)
@@ -107,6 +110,20 @@ def _endpoint(url: str, method: str) -> str | None:
     }.get(urlsplit(url).path.rstrip("/"))
 
 
+def _request_failure_code(request: Any) -> tuple[str | None, str]:
+    try:
+        reason = request.failure
+    except Exception:
+        logger.warning("attachment transport failure reason unavailable; continuing without code metadata")
+        return None, "unavailable"
+    if reason is None or (type(reason) is str and not reason):
+        return None, "unavailable"
+    # Accept only a complete, bounded Chromium error token, never surrounding text.
+    if type(reason) is str and len(reason) <= 73 and re.fullmatch(r"net::ERR_[A-Z][A-Z0-9_]{0,63}", reason):
+        return reason, "known_code"
+    return None, "unrecognized"
+
+
 class AttachmentDiagnosticObserver:
     """Observe only this page's upload endpoints; never read payloads or headers."""
 
@@ -154,14 +171,15 @@ class AttachmentDiagnosticObserver:
     def _record(
         self, event: str, *, endpoint: str | None = None,
         request_id: int | None = None, request_started_before_drop: bool | None = None,
-        status: int | None = None,
+        status: int | None = None, failure_code: str | None = None,
+        failure_code_status: str | None = None,
     ) -> None:
         if self._closed:
             return
         if len(self._events) < MAX_DIAGNOSTIC_EVENTS:
             self._events.append(AttachmentDiagnosticEvent(
                 event, self._elapsed_ms(), self._state.phase, endpoint,
-                request_id, request_started_before_drop, status,
+                request_id, request_started_before_drop, status, failure_code, failure_code_status,
             ))
         else:
             self._state = replace(self._state, events_dropped=self._state.events_dropped + 1)
@@ -279,6 +297,9 @@ class AttachmentDiagnosticObserver:
         if endpoint is None:
             return
         request_id, before_drop = self._request_identity(request, event)
+        failure_code, failure_code_status = (
+            _request_failure_code(request) if event == "requestfailed" else (None, None)
+        )
         summary_field = "create_network" if endpoint == "create" else "processing_network"
         summary = getattr(self._state, summary_field)
         if event == "request":
@@ -306,6 +327,7 @@ class AttachmentDiagnosticObserver:
             event, endpoint=endpoint, request_id=request_id,
             request_started_before_drop=before_drop,
             status=status if type(status) is int else None,
+            failure_code=failure_code, failure_code_status=failure_code_status,
         )
 
     def _on_request(self, event: str, request: Any) -> None:

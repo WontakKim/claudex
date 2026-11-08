@@ -150,12 +150,24 @@ class AskSubmission:
 
 
 @dataclass(frozen=True)
+class ComposerDiagnostics:
+    category: Literal[
+        "fill_failed", "readback_failed", "readback_unavailable", "retention_mismatch"
+    ]
+    prompt_length: int | None = None
+    readback_length: int | None = None
+    first_difference: int | None = None
+
+
+@dataclass(frozen=True)
 class AskEvidence:
     submission: Literal["not_attempted", "uncertain", "confirmed"] = "not_attempted"
     conversation_id: str | None = None
     upload_receipts: int | None = None
     ready_attachments: int | None = None
     attachment_diagnostics: attachments.AttachmentDiagnostics | None = None
+    composer_diagnostics: ComposerDiagnostics | None = None
+    attempt_failures: tuple[AskAttemptFailure, ...] = ()
     generation_observed: bool = False
     answer_seen: bool = False
     raw_extracted: bool = False
@@ -165,6 +177,16 @@ class AskEvidence:
     recovery: Literal[
         "not_attempted", "polling", "unavailable", "exhausted", "recovered"
     ] = "not_attempted"
+
+
+@dataclass(frozen=True)
+class AskAttemptFailure:
+    """One attempt's evidence snapshot, with its own attempt history empty."""
+
+    attempt: Literal["initial", "fallback"]
+    failure: str
+    nonce_marker: str | None
+    evidence: AskEvidence
 
 
 @dataclass(frozen=True)
@@ -1081,6 +1103,9 @@ class _AskExecution:
                 self._settle_rediscovered(
                     "composer", "failure", "could not fill the ChatGPT composer",
                 )
+                self._record_evidence(
+                    composer_diagnostics=ComposerDiagnostics("fill_failed")
+                )
                 raise GptProAskError(
                     "submit_failed", "could not fill the ChatGPT composer"
                 ) from exc
@@ -1099,6 +1124,9 @@ class _AskExecution:
             raise
         except Exception as exc:
             self._settle_rediscovered("composer", "abandon")
+            self._record_evidence(
+                composer_diagnostics=ComposerDiagnostics("readback_failed")
+            )
             raise GptProAskError(
                 "submit_failed", "could not verify the ChatGPT composer contents"
             ) from exc
@@ -1120,35 +1148,38 @@ class _AskExecution:
             self._ensure_deadline()
             self._settle_rediscovered(
                 "composer", "failure",
-                "the ChatGPT composer did not retain the prompt",
+                "the ChatGPT composer readback could not be verified",
             )
             if normalized_readback is None:
-                detail = f"readback unavailable: {type(readback).__name__}"
-            else:
-                prompt_length = len(normalized_prompt)
-                readback_length = len(normalized_readback)
-                first_difference = min(prompt_length, readback_length)
-                for index, (expected, actual) in enumerate(
-                    zip(normalized_prompt, normalized_readback)
-                ):
-                    if expected != actual:
-                        first_difference = index
-                        break
-                window_start = max(0, first_difference - 40)
-                window_end = first_difference + 40
-                logger.warning(
-                    "gptpro composer readback diverged at char %d "
-                    "(prompt %d chars, readback %d chars): expected %r, got %r",
-                    first_difference,
-                    prompt_length,
-                    readback_length,
-                    normalized_prompt[window_start:window_end],
-                    normalized_readback[window_start:window_end],
+                self._record_evidence(
+                    composer_diagnostics=ComposerDiagnostics("readback_unavailable")
                 )
-                detail = (
-                    f"prompt {prompt_length} chars, readback {readback_length} chars, "
-                    f"first difference at char {first_difference}"
+                raise GptProAskError(
+                    "submit_failed", "the ChatGPT composer readback is unavailable"
                 )
+            prompt_length = len(normalized_prompt)
+            readback_length = len(normalized_readback)
+            first_difference = min(prompt_length, readback_length)
+            for index, (expected, actual) in enumerate(
+                zip(normalized_prompt, normalized_readback)
+            ):
+                if expected != actual:
+                    first_difference = index
+                    break
+            self._record_evidence(composer_diagnostics=ComposerDiagnostics(
+                "retention_mismatch", prompt_length, readback_length, first_difference,
+            ))
+            logger.warning(
+                "gptpro composer readback diverged at char %d "
+                "(prompt %d chars, readback %d chars)",
+                first_difference,
+                prompt_length,
+                readback_length,
+            )
+            detail = (
+                f"prompt {prompt_length} chars, readback {readback_length} chars, "
+                f"first difference at char {first_difference}"
+            )
             raise GptProAskError(
                 "submit_failed",
                 f"the ChatGPT composer did not retain the prompt ({detail})",

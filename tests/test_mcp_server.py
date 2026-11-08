@@ -667,6 +667,7 @@ def test_status_exposes_nonterminal_job_states(
             "submission": "not_attempted", "conversation_id": None,
             "upload_receipts": None, "ready_attachments": None,
             "attachment_diagnostics": None,
+            "composer_diagnostics": None, "attempt_failures": [],
             "generation_observed": False, "answer_seen": False,
             "raw_extracted": False, "failure_stage": None,
             "recovery_failure": None, "recovery_detail": None,
@@ -1728,7 +1729,10 @@ def test_failed_status_and_result_serialize_attachment_diagnostics() -> None:
         phase="settlement", outcome="timeout", file_sizes=(1050000,), poll_completions=2,
         events=(AttachmentDiagnosticEvent(
             "response", 250, "dispatch", endpoint="create", request_id=1, status=429,
-        ),),
+        ), AttachmentDiagnosticEvent(
+            "requestfailed", 500, "settlement", endpoint="processing", request_id=2,
+            failure_code="net::ERR_CONNECTION_RESET", failure_code_status="known_code",
+        )),
     )
     failure = ask.GptProAskError("error", "synthetic attachment timeout")
     failure.evidence = ask.AskEvidence(failure_stage="attachments", attachment_diagnostics=diagnostic)
@@ -1749,5 +1753,72 @@ def test_failed_status_and_result_serialize_attachment_diagnostics() -> None:
             assert evidence["attachment_diagnostics"]["poll_completions"] == 2
             assert evidence["attachment_diagnostics"]["events"][0]["status"] == 429
             assert evidence["attachment_diagnostics"]["events"][0]["request_id"] == 1
+            failed_event = evidence["attachment_diagnostics"]["events"][1]
+            assert failed_event["event"] == "requestfailed"
+            assert failed_event["endpoint"] == "processing"
+            assert failed_event["request_id"] == 2
+            assert failed_event["failure_code"] == "net::ERR_CONNECTION_RESET"
+            assert failed_event["failure_code_status"] == "known_code"
             assert evidence["submission"] == "not_attempted"
             assert evidence["recovery"] == "not_attempted"
+
+
+def test_failed_status_and_result_serialize_both_attempt_failures() -> None:
+    class FallbackFailureRuntime(FakeAskRuntime):
+        async def _ask(self, question: str, *, callbacks: ask.AskCallbacks, **options: Any) -> ask.AskOutcome:
+            self.questions.append(question)
+            if len(self.questions) == 1:
+                callbacks.on_marker("initial-marker")
+                failure = ask.GptProAskError("submit_failed", "initial private exception")
+                failure.evidence = ask.AskEvidence(
+                    failure_stage="composer",
+                    composer_diagnostics=ask.ComposerDiagnostics("fill_failed"),
+                )
+                raise failure
+            callbacks.on_marker("fallback-marker")
+            failure = ask.GptProAskError("error", "fallback private exception")
+            failure.evidence = ask.AskEvidence(
+                failure_stage="attachments",
+                attachment_diagnostics=ask.attachments.AttachmentDiagnostics(
+                    phase="settlement", outcome="timeout",
+                ),
+            )
+            raise failure
+
+        async def finish_job(self, ask_id: str) -> None:
+            for _ in range(1000):
+                if self._job_service.status(ask_id).state == "failed":
+                    return
+                await asyncio.sleep(0)
+            raise AssertionError("the synthetic job did not finish")
+
+    runtime = FallbackFailureRuntime()
+    with _mcp_client(runtime) as client:
+        _response, headers = _initialize(client)
+        submitted = _json_tool_payload(_call_tool(client, headers, "ask_gpt_pro", {
+            "question": "synthetic", "thread": _CONVERSATION_A,
+        }))
+        ask_id = submitted["ask_id"]
+        _finish_job(client, runtime, ask_id)
+        status = _json_tool_payload(_call_tool(client, headers, "ask_gpt_pro_status", {"ask_id": ask_id}))
+        result = _call_tool(client, headers, "ask_gpt_pro_result", {"ask_id": ask_id})
+        detail = json.loads(result["content"][1]["text"])
+        for evidence in (status["evidence"], detail["evidence"]):
+            initial, fallback = evidence["attempt_failures"]
+            assert (initial["attempt"], fallback["attempt"]) == ("initial", "fallback")
+            assert initial["failure"] == "submit_failed"
+            assert initial["nonce_marker"] == "initial-marker"
+            assert initial["evidence"]["failure_stage"] == "composer"
+            assert initial["evidence"]["composer_diagnostics"]["category"] == "fill_failed"
+            assert fallback["failure"] == "error"
+            assert fallback["nonce_marker"] == "fallback-marker"
+            assert fallback["evidence"]["failure_stage"] == "attachments"
+            assert fallback["evidence"]["attachment_diagnostics"]["phase"] == "settlement"
+            assert fallback["evidence"]["composer_diagnostics"] is None
+            assert initial["evidence"]["attempt_failures"] == fallback["evidence"]["attempt_failures"] == []
+            assert evidence["submission"] == "not_attempted"
+            assert "private exception" not in json.dumps(evidence)
+            assert initial["evidence"]["conversation_id"] == _CONVERSATION_A
+            assert fallback["evidence"]["conversation_id"] == _CONVERSATION_A
+        assert status["error_message"] == "fallback private exception"
+        assert status["nonce_marker"] == "fallback-marker"
