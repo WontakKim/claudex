@@ -20,6 +20,7 @@ from claudex.gptpro.attachment_diagnostics import (
     AttachmentDiagnosticObserver,
     AttachmentDiagnostics,
 )
+from claudex.gptpro.attachment_stream import ProcessingStreamObserver
 from claudex.gptpro.conversation import is_trusted_origin_url
 from claudex.gptpro.selectors import COMPOSER_SELECTOR, LOCATOR_CONTRACT_JS
 
@@ -1127,6 +1128,7 @@ async def attach_files(
     processing_events: dict[str, dict[str, Any]] = {}
     processing_failure: str | None = None
     processing_pending = 0
+    stream_observer: ProcessingStreamObserver | None = None
     settle_timeout = (
         ATTACH_SETTLE_TIMEOUT_SECONDS if timeout_seconds is None else timeout_seconds
     )
@@ -1178,6 +1180,8 @@ async def attach_files(
         remaining = deadline - _monotonic()
         if remaining <= 0:
             raise AttachmentPreflightError("Attachment deadline expired before dispatch; no upload or send attempted")
+        if stream_observer is not None:
+            stream_observer.arm()
         drop_started = True
         diagnostics.mark_drop_started()
         return await asyncio.wait_for(
@@ -1269,6 +1273,66 @@ async def attach_files(
         finally:
             receipt_attribution_pending -= 1
 
+    def record_processing_event(event: Any) -> None:
+        nonlocal processing_failure
+        if not isinstance(event, dict):
+            processing_failure = "processing event invalid"
+            return
+        file_id = event.get("file_id")
+        event_name = event.get("event")
+        if not isinstance(file_id, str) or not re.fullmatch(
+            r"file_[A-Za-z0-9_-]{1,251}", file_id
+        ) or not isinstance(event_name, str):
+            processing_failure = "processing event identity unavailable"
+            return
+        if (
+            file_id not in processing_events
+            and len(processing_events) >= MAX_ATTACHMENTS_PER_ASK
+        ):
+            processing_failure = "too many processing file identities"
+            return
+        details = processing_events.setdefault(file_id, {})
+        if event_name in ("file.indexing.started", "file.indexing.completed"):
+            extra = event.get("extra")
+            if extra is None:
+                extra = {}
+            if not isinstance(extra, dict):
+                processing_failure = "processing name metadata invalid"
+                return
+            has_name = "library_file_name" in extra
+            display_name = extra.get("library_file_name")
+            if has_name:
+                details["name_metadata_observed"] = True
+            if event_name == "file.indexing.started" and "retrieval_indexing_deferred" in extra:
+                deferred = extra["retrieval_indexing_deferred"]
+                if type(deferred) is not bool:
+                    details["deferred_name_state"] = "invalid-deferred-flag"
+            else:
+                deferred = False
+            if has_name and not _is_valid_display_name(display_name):
+                if event_name == "file.indexing.started" and deferred is True:
+                    details["deferred_name_state"] = "invalid"
+                processing_failure = "processing display name invalid"
+                return
+            if has_name and details.get("observed_display_name", display_name) != display_name:
+                if details.get("deferred_name_state") == "valid":
+                    details["deferred_name_state"] = "conflicting"
+                processing_failure = "processing display name conflicted"
+                return
+            if has_name:
+                details["observed_display_name"] = display_name
+            if event_name == "file.indexing.completed" and has_name:
+                details["display_name"] = display_name
+            elif deferred is True and has_name and details.get("deferred_name_state") not in (
+                "invalid", "conflicting", "invalid-deferred-flag",
+            ):
+                details["deferred_display_name"] = display_name
+                details["deferred_name_state"] = "valid"
+        elif event_name == "file.processing.completed":
+            details["completed"] = True
+        elif event_name.endswith((".failed", ".error")):
+            details["failed"] = True
+
     async def record_processing_response(response: Any, request_failed: asyncio.Future[None]) -> None:
         nonlocal processing_failure, processing_pending
         try:
@@ -1293,63 +1357,9 @@ async def attach_files(
                 except ValueError:
                     processing_failure = "processing event invalid"
                     return
-                if not isinstance(event, dict):
-                    processing_failure = "processing event invalid"
+                record_processing_event(event)
+                if processing_failure:
                     return
-                file_id = event.get("file_id")
-                event_name = event.get("event")
-                if not isinstance(file_id, str) or not re.fullmatch(
-                    r"file_[A-Za-z0-9_-]{1,251}", file_id
-                ) or not isinstance(event_name, str):
-                    processing_failure = "processing event identity unavailable"
-                    return
-                if (
-                    file_id not in processing_events
-                    and len(processing_events) >= MAX_ATTACHMENTS_PER_ASK
-                ):
-                    processing_failure = "too many processing file identities"
-                    return
-                details = processing_events.setdefault(file_id, {})
-                if event_name in ("file.indexing.started", "file.indexing.completed"):
-                    extra = event.get("extra")
-                    if extra is None:
-                        extra = {}
-                    if not isinstance(extra, dict):
-                        processing_failure = "processing name metadata invalid"
-                        return
-                    has_name = "library_file_name" in extra
-                    display_name = extra.get("library_file_name")
-                    if has_name:
-                        details["name_metadata_observed"] = True
-                    if event_name == "file.indexing.started" and "retrieval_indexing_deferred" in extra:
-                        deferred = extra["retrieval_indexing_deferred"]
-                        if type(deferred) is not bool:
-                            details["deferred_name_state"] = "invalid-deferred-flag"
-                    else:
-                        deferred = False
-                    if has_name and not _is_valid_display_name(display_name):
-                        if event_name == "file.indexing.started" and deferred is True:
-                            details["deferred_name_state"] = "invalid"
-                        processing_failure = "processing display name invalid"
-                        return
-                    if has_name and details.get("observed_display_name", display_name) != display_name:
-                        if details.get("deferred_name_state") == "valid":
-                            details["deferred_name_state"] = "conflicting"
-                        processing_failure = "processing display name conflicted"
-                        return
-                    if has_name:
-                        details["observed_display_name"] = display_name
-                    if event_name == "file.indexing.completed" and has_name:
-                        details["display_name"] = display_name
-                    elif deferred is True and has_name and details.get("deferred_name_state") not in (
-                        "invalid", "conflicting", "invalid-deferred-flag",
-                    ):
-                        details["deferred_display_name"] = display_name
-                        details["deferred_name_state"] = "valid"
-                elif event_name == "file.processing.completed":
-                    details["completed"] = True
-                elif event_name.endswith((".failed", ".error")):
-                    details["failed"] = True
         except Exception as exc:
             processing_failure = f"processing observation failed ({type(exc).__name__})"
         finally:
@@ -1368,6 +1378,10 @@ async def attach_files(
             return
         request = response.request
         if requests_before_drop.get(id(request)) is request:
+            return
+        if not is_file_create and stream_observer is not None:
+            if stream_observer.observe_public_response(response):
+                observer_generation += 1
             return
         observer_generation += 1
         if len(listener_tasks) >= _MAX_ATTACHMENT_RESPONSE_TASKS:
@@ -1388,8 +1402,6 @@ async def attach_files(
         task.add_done_callback(lambda _: response_failures.pop(request_failed, None))
 
     def on_request(request: Any) -> None:
-        if drop_started:
-            return
         try:
             if request.method != "POST" or not is_trusted_origin_url(request.url) or urlsplit(
                 request.url,
@@ -1397,9 +1409,14 @@ async def attach_files(
                 return
         except (AttributeError, TypeError, ValueError):
             return
-        requests_before_drop[id(request)] = request
+        if not drop_started:
+            requests_before_drop[id(request)] = request
+        elif stream_observer is not None and urlsplit(request.url).path.rstrip("/") == FILE_PROCESSING_PATH:
+            stream_observer.observe_public_request(request)
 
     def on_request_failed(request: Any) -> None:
+        if stream_observer is not None and drop_started and requests_before_drop.get(id(request)) is not request:
+            stream_observer.observe_public_failure(request)
         for failed, observed_request in tuple(response_failures.items()):
             if request is observed_request and not failed.done():
                 failed.set_result(None)
@@ -1412,6 +1429,8 @@ async def attach_files(
         nonlocal listener_installed, request_listener_installed, request_failure_listener_installed
         nonlocal binding_tracker_handle, owned_form_handle
         await diagnostics.close()
+        if stream_observer is not None:
+            await stream_observer.close()
         if listener_installed:
             await _remove_page_listener(page, "response", on_response)
             listener_installed = False
@@ -1437,6 +1456,15 @@ async def attach_files(
             owned_form_handle = None
 
     try:
+        try:
+            stream_observer = await asyncio.wait_for(ProcessingStreamObserver.open(
+                page, record_processing_event, MAX_PROCESSING_RESPONSE_BYTES,
+                _MAX_ATTACHMENT_RESPONSE_TASKS,
+            ), timeout=max(0.001, deadline - _monotonic()))
+        except TimeoutError as exc:
+            raise AttachmentPreflightError(
+                "Attachment processing observer startup exceeded the attachment deadline; no upload or send attempted"
+            ) from exc
         page.on("request", on_request)
         request_listener_installed = True
         if composer_form_handle is None:
@@ -1677,9 +1705,12 @@ async def attach_files(
                 min(count, max(0, last_state["ready"].get(name, 0) - initial_count_for(name)))
                 for name, count in required_names.items()
             )
+            pending_responses = processing_pending
+            if stream_observer is not None:
+                pending_responses += stream_observer.pending_response_count
             return (
                 f"{observed_ready_attachments}/{len(filenames)} observed composer-ready "
-                f"attachments; {processing_pending} pending processing responses"
+                f"attachments; {pending_responses} pending processing responses"
             )
 
         def describe_files() -> str:
@@ -1803,6 +1834,8 @@ async def attach_files(
                 await asyncio.gather(*done, return_exceptions=True)
             if receipt_attribution_pending:
                 return "receipt-attribution-pending"
+            if stream_observer is not None and stream_observer.blocker(set(receipt_aliases)):
+                return "processing-stream-unverified"
             if processing_pending:
                 return "processing-pending"
             required_names, completed_names = resolved_names()
@@ -1850,6 +1883,8 @@ async def attach_files(
                 return "attachment-binding-failed"
             if observer_generation != settled_observer_generation:
                 return "protocol-evidence-changed"
+            if stream_observer is not None and stream_observer.blocker(set(receipt_aliases)):
+                return "processing-stream-unverified"
             return None if ready_count == len(filenames) else "attachments-not-ready"
 
         async def revalidate_with_diagnostics() -> str | None:
@@ -1870,6 +1905,8 @@ async def attach_files(
             if remaining <= 0:
                 break
             await asyncio.sleep(0)
+            if stream_observer is not None and stream_observer.failure:
+                processing_failure = stream_observer.failure
             required_names, completed_names = resolved_names()
             diagnostics.mark_poll_started()
             try:
@@ -1936,6 +1973,7 @@ async def attach_files(
             if (
                 has_exact_receipt_attribution()
                 and processing_pending == 0
+                and (stream_observer is None or stream_observer.blocker(set(receipt_aliases)) is None)
                 and ready_attachments == len(filenames)
             ):
                 diagnostics.finish("settled")
