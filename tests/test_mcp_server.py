@@ -1729,7 +1729,10 @@ def test_failed_status_and_result_serialize_attachment_diagnostics() -> None:
         phase="settlement", outcome="timeout", file_sizes=(1050000,), poll_completions=2,
         events=(AttachmentDiagnosticEvent(
             "response", 250, "dispatch", endpoint="create", request_id=1, status=429,
-        ),),
+        ), AttachmentDiagnosticEvent(
+            "requestfailed", 500, "settlement", endpoint="processing", request_id=2,
+            failure_code="net::ERR_CONNECTION_RESET", failure_code_status="known_code",
+        )),
     )
     failure = ask.GptProAskError("error", "synthetic attachment timeout")
     failure.evidence = ask.AskEvidence(failure_stage="attachments", attachment_diagnostics=diagnostic)
@@ -1750,6 +1753,12 @@ def test_failed_status_and_result_serialize_attachment_diagnostics() -> None:
             assert evidence["attachment_diagnostics"]["poll_completions"] == 2
             assert evidence["attachment_diagnostics"]["events"][0]["status"] == 429
             assert evidence["attachment_diagnostics"]["events"][0]["request_id"] == 1
+            failed_event = evidence["attachment_diagnostics"]["events"][1]
+            assert failed_event["event"] == "requestfailed"
+            assert failed_event["endpoint"] == "processing"
+            assert failed_event["request_id"] == 2
+            assert failed_event["failure_code"] == "net::ERR_CONNECTION_RESET"
+            assert failed_event["failure_code_status"] == "known_code"
             assert evidence["submission"] == "not_attempted"
             assert evidence["recovery"] == "not_attempted"
 
