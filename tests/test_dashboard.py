@@ -1974,7 +1974,7 @@ def test_lockable_save_ownership_is_per_setting_not_a_global_save_lock(
     assert row["routing"] == "fallback"
 
 
-@pytest.mark.parametrize("catalog", ["unavailable", "failed", "delayed"])
+@pytest.mark.parametrize("catalog", ["unavailable", "failed", "delayed", "available"])
 def test_compaction_registered_target_events_and_save_contract(
     dashboard_runtime_result: dict[str, Any], catalog: str,
 ) -> None:
@@ -1986,7 +1986,7 @@ def test_compaction_registered_target_events_and_save_contract(
         assert row[phase]["live"] == "vendor:Family:Version"
     options = row["afterMetadata"]["providerOptions"]
     assert 'value="claude"' in options and 'value="vendor"' in options
-    assert all(f'value="{provider}"' not in options for provider in ("codex", "kimi", "grok"))
+    assert all(f'value="{provider}"' in options for provider in ("codex", "kimi", "grok"))
     assert 'value="disabled"' in row["afterMetadata"]["modelOptions"]
     assert 'value="claude-sonnet-5"' not in row["afterMetadata"]["modelOptions"]
     assert row["selected"]["provider"] == "vendor"
@@ -2023,3 +2023,47 @@ def test_compaction_registered_target_events_and_save_contract(
     assert row["unknownRequestCount"] == row["legacyRequestCount"] == row["lockedRequestCount"]
     assert row["locked"]["providerDisabled"] is True
     assert row["final"]["live"] == "vendor:Locked"
+
+
+def test_compaction_catalog_models_save_provider_qualified_ids(dashboard_runtime_result):
+    for row in dashboard_runtime_result["compactionTargetStates"]:
+        expected = [("codex", "Codex:Known"), ("kimi", "KimiKnown"),
+                    ("grok", "GrokKnown"), ("vendor", "Vendor:Known")]
+        assert len(row["catalogChoices"]) == len(expected)
+        if row["catalog"] == "available":
+            assert ">Vendor:Known</option>" in row["afterCatalog"]["modelOptions"]
+            assert row["afterCatalog"]["input"] == "Family:Version"
+        for choice, (provider, model) in zip(row["catalogChoices"], expected):
+            state = choice["state"]
+            assert state["provider"] == provider
+            assert choice["renderedOption"]["label"] == model
+            assert state["model"] == choice["renderedOption"]["value"]
+            assert state["disabled"] is True  # Save owns the button until settled.
+            assert json.loads(choice["request"]["options"]["body"]) == {
+                "model": provider + ":" + model}
+
+
+def test_compaction_missing_catalog_allows_manual_ids_and_keeps_saved_target(dashboard_runtime_result):
+    for row in dashboard_runtime_result["compactionTargetStates"]:
+        initial_options = row["beforeMetadata"]["providerOptions"]
+        assert 'value="codex"' in initial_options
+        assert 'value="kimi"' not in initial_options
+        assert 'value="grok"' not in initial_options
+        for choice in row["manualChoices"]:
+            state = choice["state"]
+            assert state["model"] == "custom"
+            assert json.loads(choice["request"]["options"]["body"]) == {
+                "model": state["provider"] + ":Manual:Revision"}
+            saved = choice["afterCatalogLoss"]
+            assert saved["provider"] == state["provider"]
+            assert saved["live"] == state["provider"] + ":" + saved["input"]
+            assert saved["disabled"] is False
+
+
+def test_compaction_catalog_control_names_remain_model_ids(dashboard_runtime_result):
+    for row in dashboard_runtime_result["compactionTargetStates"]:
+        assert [choice["id"] for choice in row["reservedModelChoices"]] == ["disabled", "custom"]
+        for choice in row["reservedModelChoices"]:
+            assert choice["renderedOption"]["label"] == choice["id"]
+            assert json.loads(choice["request"]["options"]["body"]) == {
+                "model": "codex:" + choice["id"]}

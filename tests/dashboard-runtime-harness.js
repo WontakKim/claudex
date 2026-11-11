@@ -2079,7 +2079,7 @@ async function main() {
   }
 
   const compactionTargetStates = [];
-  for (const catalog of ["unavailable", "failed", "delayed"]) {
+  for (const catalog of ["unavailable", "failed", "delayed", "available"]) {
     const targetDocument = new FakeDocument(html);
     const targetContext = Object.assign({}, context, {document: targetDocument});
     vm.createContext(targetContext);
@@ -2105,12 +2105,60 @@ async function main() {
     const change = (element, value, type = "change") => { element.value = value; element.dispatchEvent({type}); };
     targetContext.renderCompactionState({model: "vendor:Family:Version", env_locked: false, last_reroute: null});
     const beforeMetadata = snapshot();
+    targetContext.CATALOG.codex = ["Codex:Known"];
+    targetContext.CATALOG.kimi = ["KimiKnown"];
+    targetContext.CATALOG.grok = ["GrokKnown"];
+    targetContext.setProviderVisibility({providers: {kimi: {status: "ok"}, grok: {required: true}}});
     targetContext.configureCustomProviders([{name: "vendor", wire_kind: "openai_responses", catalog_available: catalog !== "unavailable"}]);
     const afterMetadata = snapshot();
+    if (catalog === "available") catalogResponse.resolve({ok: true, body: {models: [{id: "Vendor:Known"}]}});
     if (catalog === "failed") catalogResponse.reject(new Error("catalog unavailable"));
     if (catalog === "unavailable") catalogResponse.resolve({ok: true, body: {models: []}});
     await flush();
+    const afterCatalog = snapshot();
     const metadataRequests = requests.slice();
+    requests.length = 0;
+    const catalogChoices = [];
+    const manualChoices = [];
+    const reservedModelChoices = [];
+    const chooseModelLabel = label => {
+      const options = Array.from(model.innerHTML.matchAll(/<option value="([^"]*)">([^<]*)<\/option>/g));
+      const option = options.find(option => option[2] === label);
+      if (!option) throw new Error("Missing rendered compaction model: " + label);
+      change(model, option[1]);
+      return {value: option[1], label: option[2]};
+    };
+    targetContext.CATALOG.codex = ["disabled", "custom"];
+    change(provider, "codex");
+    for (const id of ["disabled", "custom"]) {
+      const renderedOption = chooseModelLabel(id);
+      response = createDeferred();
+      button.click();
+      reservedModelChoices.push({id, renderedOption, request: requests[requests.length - 1]});
+      response.resolve({ok: true, status: 200, body: {model: "codex:" + id, env_locked: false, last_reroute: null}});
+      await flush();
+    }
+
+    for (const [name, id] of [["codex", "Codex:Known"], ["kimi", "KimiKnown"], ["grok", "GrokKnown"], ["vendor", "Vendor:Known"]]) {
+      if (name !== "vendor" || catalog !== "available") targetContext.CATALOG[name] = [id];
+      change(provider, name);
+      const renderedOption = chooseModelLabel(id);
+      response = createDeferred();
+      button.click();
+      catalogChoices.push({renderedOption, state: snapshot(), request: requests[requests.length - 1]});
+      response.resolve({ok: true, status: 200, body: {model: name + ":" + id, env_locked: false, last_reroute: null}});
+      await flush();
+      targetContext.CATALOG[name] = [];
+      targetContext.renderCompaction();
+      const afterCatalogLoss = snapshot();
+      change(model, "custom");
+      change(input, "  Manual:Revision  ", "input");
+      response = createDeferred();
+      button.click();
+      manualChoices.push({state: snapshot(), afterCatalogLoss, request: requests[requests.length - 1]});
+      response.resolve({ok: true, status: 200, body: {model: name + ":Manual:Revision", env_locked: false, last_reroute: null}});
+      await flush();
+    }
     requests.length = 0;
     change(provider, "claude");
     change(provider, "vendor");
@@ -2170,7 +2218,7 @@ async function main() {
     button.dispatchEvent({type: "click"});
     const lockedRequestCount = requests.length;
     if (catalog === "delayed") { catalogResponse.resolve({ok: true, body: {models: [{id: "suggestion"}]}}); await flush(); }
-    compactionTargetStates.push({catalog, beforeMetadata, afterMetadata, metadataRequests, beforeApplyRequests,
+    compactionTargetStates.push({catalog, catalogChoices, manualChoices, reservedModelChoices, beforeMetadata, afterMetadata, afterCatalog, metadataRequests, beforeApplyRequests,
       selected, pending, pendingRequests, saved, failures, disabledDraft, disableRequest, native, unknown, legacy, locked,
       unknownRequestCount, legacyRequestCount, lockedRequestCount, final: snapshot()});
   }

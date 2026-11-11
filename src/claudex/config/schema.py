@@ -408,10 +408,9 @@ def parse_compaction_model(value: str) -> str:
     """Parse a compaction.model value like "claude:claude-opus-5".
 
     Only the "claude:" prefix is accepted. This is deliberately independent
-    of parse_route_target/BUILTIN_ROUTE_PROVIDERS: compaction requests are
-    rerouted to a Claude model, not to a model_map upstream, and "claude"
-    must never become a valid model_map route provider. Returns the
-    canonical model id with the prefix stripped.
+    of parse_route_target/BUILTIN_ROUTE_PROVIDERS: this parses only native
+    Claude destinations, and "claude" must never become a valid model_map
+    route provider. Returns the canonical model id with the prefix stripped.
     """
     prefix, sep, model_id = value.partition(":")
     if not sep or prefix != "claude":
@@ -422,7 +421,7 @@ def parse_compaction_model(value: str) -> str:
     if ":" in model_id:
         raise ConfigError(
             "native compaction model must be claude:<id>, not a nested provider; "
-            "use <registered-custom-provider>:<model-id> directly"
+            "use <provider>:<model-id> directly"
         )
     if not model_id or any(char.isspace() for char in model_id):
         raise ConfigError(
@@ -442,13 +441,16 @@ def parse_compaction_target(
     elif (
         not separator or not provider or not model
         or any(char.isspace() for char in value)
-        or provider in BUILTIN_ROUTE_PROVIDERS
     ):
         raise ConfigError(
-            "compaction model must be claude:<id> or "
+            "compaction model must be claude:<id>, codex:<id>, kimi:<id>, grok:<id>, or "
             "<registered-custom-provider>:<model-id> with no whitespace"
         )
-    elif custom_providers is not None and provider not in custom_providers:
+    elif (
+        custom_providers is not None
+        and provider not in BUILTIN_ROUTE_PROVIDERS
+        and provider not in custom_providers
+    ):
         raise ConfigError(
             f"unknown compaction provider {provider!r}; register it in "
             "custom_providers or use claude:<id>"

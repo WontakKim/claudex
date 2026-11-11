@@ -30,7 +30,7 @@ The other GPT Pro scheduler variables are environment-only; see
 | `KIMI_CODE_HOME` | `~/.kimi-code` | Directory containing the Kimi Code CLI's credential store |
 | `CLAUDEX_LOG_LEVEL` | `info` | Process log verbosity: `debug`, `info`, `warning`, or `error`; editable at runtime from the dashboard |
 | `CLAUDEX_LOCAL_TOKEN` | unset | Bearer token required, when set, by the model request routes, the admin API behind the dashboard, and the GPT Pro `/mcp` endpoint; mandatory for non-loopback binds. `/health` and `/api/hello` stay unauthenticated; when a token is set, `/health` omits account ids, emails, and account names and replaces free-form error details with generic diagnostics unless a valid bearer token is supplied. Provider names and readiness stay unchanged. See [the passthrough interaction](model-mapping.md#mixing-claude-and-codex-models) |
-| `CLAUDEX_COMPACTION_MODEL` | unset | `compaction.model` setting: opt-in `claude:<model-id>` or `<registered-custom-provider>:<model-id>` reroute target for oversized Claude Code compaction requests; unset (default) disables the reroute entirely. See [Compaction reroute](compaction.md#compaction-reroute) |
+| `CLAUDEX_COMPACTION_MODEL` | unset | `compaction.model` setting: opt-in `<provider>:<model-id>` reroute target (Claude, Codex, Kimi, Grok, or a registered custom provider) for oversized Claude Code compaction requests; unset (default) disables the reroute entirely. See [Compaction reroute](compaction.md#compaction-reroute) |
 | `CLAUDEX_CLAUDE_ACCOUNT_ID` | unset | `claude_account.id` setting: id of the registered Claude account that serves Anthropic passthrough traffic; unset (default) forwards client credentials untouched. See [Serving with a registered account](claude-accounts.md#serving-with-a-registered-account-account-use) |
 | `CLAUDEX_CLAUDE_ACCOUNT_ROUTING` | unset | `claude_account.routing` setting as a JSON-encoded policy document, e.g. `{"mode": "fallback"}` or `{"mode": "balanced", "include_local_login": false}`; `include_local_login` defaults to `true` and controls local Claude Code login participation in balanced mode only. It is read at startup and can only be set through `settings.json` or this environment variable; mode changes through the dashboard or admin API preserve it, including across disable/re-enable. Unset or empty keeps multi-account routing disabled. See [Ordered fallback across registered accounts](claude-accounts.md#ordered-fallback-across-registered-accounts) and [Balanced routing across the pool](claude-accounts.md#balanced-routing-across-the-pool) |
 
@@ -73,9 +73,11 @@ would override the persisted value at the next start.
 
 ### Compaction destination
 
-`compaction.model` accepts native `claude:<model-id>` or a registered custom
-provider's `<name>:<model-id>`, not built-in `codex:`, `kimi:`, or `grok:`
-destinations. Remove the `compaction.model` key to disable it in `settings.json`;
+`compaction.model` accepts native `claude:<model-id>`, built-in
+`codex:<model-id>`, `kimi:<model-id>`, `grok:<model-id>`, or a registered custom
+provider's `<name>:<model-id>`. Non-Claude destinations use their existing
+configured provider authentication. Remove the `compaction.model` key to disable
+it in `settings.json`;
 do not store JSON `null`, which fails startup validation. The admin API instead
 accepts `PUT {"model": null}` to disable rerouting and removes the stored key.
 Registration is validated at startup; provider definitions are fixed until

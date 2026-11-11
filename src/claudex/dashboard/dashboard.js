@@ -13,9 +13,8 @@ var CLAUDE_KEYS=["fable","opus","sonnet","haiku"];
 var BUILTIN_ROUTE_PROVIDERS=["codex","kimi","grok"];
 var ROUTE_PROVIDERS=BUILTIN_ROUTE_PROVIDERS.slice();
 var CUSTOM_PROVIDERS=[];
-/* Live model IDs per provider. Purely autocomplete for the add-node box —
-   the gateway never validates map values against a catalog, so an
-   unreachable one only costs suggestions. */
+/* Live model IDs feed routing suggestions and compaction choices. Catalogs
+   are optional: model IDs can also be entered manually. */
 var CATALOG={codex:[],kimi:[],grok:[]};
 /* Curated compaction reroute targets, in the dashboard's <select> order.
    "claude-haiku" is deliberately never a curated choice here. */
@@ -805,9 +804,11 @@ function configureCustomProviders(providers){
     jfetch("/admin/providers/custom/"+encodeURIComponent(name)+"/models").then(function(r){
       if(r.ok)CATALOG[name]=catalogIds(r.body);
       refreshOpenPicker(name);
+      renderCompaction();
     }).catch(function(){
       CATALOG[name]=[];
       refreshOpenPicker(name);
+      renderCompaction();
     });
   });
   renderProviderOptions();
@@ -826,6 +827,7 @@ function setProviderVisibility(h){
     if(card)card.classList.toggle("provider-hidden",!visible);
   });
   renderProviderOptions();
+  renderCompaction();
 }
 function renderProviderHealth(provider,info,successDetail,account,unusedDetail,errorDetail,command){
   if(info.status==="ok"){
@@ -1222,7 +1224,7 @@ function compactionDraftFromModel(model){
 }
 function compactionDraftError(){
   if(COMP.draftKind==="disabled")return "";
-  if(COMP.draftProvider!=="claude"&&!CUSTOM_PROVIDERS.some(function(p){return p.name===COMP.draftProvider}))
+  if(COMP.draftProvider!=="claude"&&ROUTE_PROVIDERS.indexOf(COMP.draftProvider)<0)
     return "Provider is not registered. Select a registered provider or disable rerouting.";
   if(COMP.draftKind!=="custom")return "";
   var raw=COMP.draftCustom.trim();
@@ -1235,15 +1237,22 @@ function renderCompaction(){
   document.getElementById("compaction-card").classList.toggle("locked",COMP.locked);
   document.getElementById("comp-lock-env").textContent=COMP.envName;
   var provider=document.getElementById("comp-provider");
-  var providers=[{name:"claude"}].concat(CUSTOM_PROVIDERS);
-  if(!providers.some(function(p){return p.name===COMP.draftProvider}))providers.push({name:COMP.draftProvider,unknown:true});
+  var providers=[{name:"claude"}].concat(ROUTE_PROVIDERS.filter(function(p){return PROVIDER_VISIBLE[p]!==false}).map(function(p){return {name:p}}));
+  if(!providers.some(function(p){return p.name===COMP.draftProvider}))providers.push({name:COMP.draftProvider,unknown:ROUTE_PROVIDERS.indexOf(COMP.draftProvider)<0});
   provider.innerHTML=providers.map(function(p){return '<option value="'+esc(p.name)+'">'+
     esc(p.name==="claude"?"Claude":p.name)+(p.unknown?" (not registered)":"")+'</option>'}).join("");
   provider.value=COMP.draftProvider;
   provider.disabled=COMP.locked;
   var select=document.getElementById("comp-select");
+  // Catalog model IDs must not collide with the Disabled and Custom actions.
+  var modelPrefix=COMP.draftProvider==="claude"?"":"model:";
+  var models=COMP.draftProvider==="claude"?COMPACTION_CURATED_MODELS:(CATALOG[COMP.draftProvider]||[]);
+  var selectedModel=COMP.draftKind.slice(modelPrefix.length);
+  if(COMP.draftKind!=="disabled"&&COMP.draftKind!=="custom"&&models.indexOf(selectedModel)<0)
+    models=models.concat([selectedModel]);
   select.innerHTML='<option value="disabled">Disabled</option>'+
-    (COMP.draftProvider==="claude"?COMPACTION_CURATED_MODELS.map(function(id,index){return '<option value="'+id+'">'+id+(index===0?" (recommended)":"")+'</option>'}).join(""):"")+
+    models.map(function(id,index){return '<option value="'+esc(modelPrefix+id)+'">'+esc(id)+
+      (COMP.draftProvider==="claude"&&index===0?" (recommended)":"")+'</option>'}).join("")+
     '<option value="custom">Custom</option>';
   select.value=COMP.draftKind;
   select.disabled=COMP.locked;
@@ -1255,7 +1264,7 @@ function renderCompaction(){
   var error=compactionDraftError();
   document.getElementById("comp-credentials").textContent=error||
     (COMP.draftProvider==="claude"?"Uses eligible Claude credentials sent by the client; registered-account credentials are not substituted.":
-      "Uses the registered provider's configured authentication, not client Claude credentials.");
+      "Uses the provider's configured authentication, not client Claude credentials.");
   var btn=document.getElementById("comp-apply");
   btn.disabled=COMP.locked||COMP.isSaving||!!error;
   btn.textContent=COMP.isSaving?"…":"Apply";
@@ -1282,7 +1291,7 @@ function applyCompaction(){
     if(!raw)return;
     model=COMP.draftProvider+":"+raw;
   }else{
-    model="claude:"+COMP.draftKind;
+    model=COMP.draftProvider+":"+(COMP.draftProvider==="claude"?COMP.draftKind:COMP.draftKind.slice("model:".length));
   }
   applyLockableSetting({
     button:btn,
@@ -2660,13 +2669,14 @@ function boot(){
       showToast('<span class="chip chip-err">ERROR</span><span class="lat">'+mapping.status+
         '</span><br>GET /admin/settings/mapping<br><span class="dim">'+esc(errDetail(mapping.body))+"</span>",true);
     }
-    // Catalogs only feed add-node suggestions. Kimi/Grok failures are optional;
+    // Catalogs feed model suggestions and compaction choices. Kimi/Grok failures are optional;
     // a Codex failure means its local version probe or live catalog failed.
     if(codexCatalog.ok)CATALOG.codex=catalogIds(codexCatalog.body);
     else showToast('<span class="chip chip-err">ERROR</span><span class="lat">'+codexCatalog.status+
       '</span><br>GET /admin/providers/codex/models<br><span class="dim">'+esc(errDetail(codexCatalog.body))+"</span>",true);
     if(kimiCatalog.ok)CATALOG.kimi=catalogIds(kimiCatalog.body);
     if(grokCatalog.ok)CATALOG.grok=catalogIds(grokCatalog.body);
+    renderCompaction();
     DIR.mapping=Object.assign({},DIR.LIVE);
     if(health.body&&health.body.providers){
       renderHealth(health.body);

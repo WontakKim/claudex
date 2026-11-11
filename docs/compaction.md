@@ -7,7 +7,8 @@ reroute](#compaction-reroute) below) from the command line:
 
 ```sh
 uv run claudex-gateway compact                       # show current state
-uv run claudex-gateway compact set claude:<model-id>  # enable, target <model-id>
+uv run claudex-gateway compact set claude:<model-id>  # native Claude destination
+uv run claudex-gateway compact set codex:<model-id>   # built-in provider destination
 uv run claudex-gateway compact set messages-local:large-model  # registered custom destination
 uv run claudex-gateway compact off                    # disable
 ```
@@ -39,14 +40,25 @@ ordinary requests or Messages sources.
 The **destination** is explicit and independent of the source mapping:
 
 - `claude:<model-id>` sends one direct Anthropic attempt.
+- `codex:<model-id>`, `kimi:<model-id>`, or `grok:<model-id>` uses that built-in
+  provider's existing backend and login credentials. Authenticate the intended
+  provider first as described in [Providers](providers.md).
 - `<registered-custom-provider>:<model-id>` sends one attempt through that
   provider's configured Responses or Messages backend. Register it first as
   described in [Custom providers](custom-providers.md). Provider registrations
   are fixed for the process lifetime; adding or changing one requires a restart.
-- `codex:`, `kimi:`, `grok:`, and unregistered provider names are not supported
-  destinations. An identical source and destination bypass the reroute.
 
-Model IDs are not checked against a remote catalog when saving. Custom model
+Unregistered provider names are rejected. An identical source and destination
+bypass the reroute.
+
+In the dashboard, choose a provider and a model, then click **Apply**. Provider
+choices follow the dashboard's configured/available providers. Built-in and
+custom provider catalogs supply model choices when available; choose **Custom**
+to enter an unlisted ID or when a catalog is missing or fails. Native Claude
+keeps its curated choices and manual entry. Loading catalogs does not replace
+the saved target.
+
+Model IDs are not checked against a remote catalog when saving. Non-Claude model
 IDs preserve case and may contain colons; native Claude IDs cannot contain
 colons. Selecting or saving a target does not send an inference request.
 
@@ -59,23 +71,23 @@ rerouting and lets the mapped backend handle the request. The filter
 does not validate upstream credentials: a dummy Bearer can still trigger an
 Anthropic attempt, with a non-2xx response recorded as `fallback_mapped`.
 
-Custom destinations instead use their existing provider configuration and
-authentication, without requiring client Anthropic credentials. Caller
-credentials are not forwarded to the custom provider. If the provider is
+Built-in and custom destinations instead use their existing provider
+configuration and authentication, without requiring client Anthropic credentials. Caller
+credentials are not forwarded to these providers. If a custom provider is
 configured without an API key, the custom attempt is unauthenticated.
 
 Connection failures and non-2xx responses before stream commitment fall back
-to the original mapped backend. For native Claude and custom Messages
+to the original mapped backend. For native Claude and Messages
 destinations, commitment occurs when the upstream HTTP request is accepted
-with a 2xx response. Custom Responses destinations commit the downstream stream
+with a 2xx response. Responses destinations commit the downstream stream
 after the first decoded event passes basic envelope checks, not full
 event-specific validation. An upstream HTTP 200 alone is not enough: a failed
 envelope check still falls back, but malformed event-specific data discovered
 after commitment may produce an in-band SSE error without fallback.
 Non-streaming attempts fall back unless a complete, valid response is obtained.
-Custom Responses destinations reuse
+Responses destinations reuse
 the [Responses stream liveness](providers.md#responses-stream-liveness) behavior;
-native Claude and custom Messages destinations do not.
+native Claude and Messages destinations do not.
 
 The context window is the provider-prefixed `context_window_map` override or,
 without one, the backend's catalog value; when neither is known, the reroute
@@ -123,7 +135,7 @@ show reroute diagnostics; use the API or `compact` command. A non-null
 `last_reroute` retains its seven fields: `outcome`, `timestamp`, `target_model`,
 `mapped_model`, `estimated_prompt_tokens`, `context_window`, and `detail`.
 `target_model` is a bare model ID for native Claude and a provider-qualified ID
-for custom destinations.
+for non-Claude destinations.
 
 ### Correcting invalid legacy targets
 
