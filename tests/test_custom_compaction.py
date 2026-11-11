@@ -88,7 +88,7 @@ def test_custom_compaction_uses_registered_transport_without_client_credentials(
     assert record["mapped_model"] == "codex:source"
     assert record["outcome"] == "rerouted"
 
-@pytest.mark.parametrize("value", ["missing:model", "codex:model", "kimi:model", "grok:model", "summary: ", "summary:bad model", "claude:summary:model"])
+@pytest.mark.parametrize("value", ["missing:model", "summary: ", "summary:bad model", "claude:summary:model"])
 def test_invalid_stored_compaction_target_is_actionable(tmp_path, value):
     path = tmp_path / "settings.json"
     path.write_text(json.dumps({"compaction.model": value}))
@@ -421,3 +421,84 @@ def test_custom_messages_diagnostics_parse_sse_event_field_only(
     assert record["detail"] == (
         "read_error" if expected_outcome == "midstream_error" else None
     )
+
+
+@pytest.mark.parametrize("provider", ["codex", "kimi", "grok"])
+def test_builtin_compaction_target_config_cli_and_admin(provider, tmp_path, monkeypatch):
+    monkeypatch.delenv("CLAUDEX_COMPACTION_MODEL", raising=False)
+    target = provider + ":MixedCase:Revision"
+    path = tmp_path / "settings.json"
+    path.write_text(json.dumps({"compaction.model": target}))
+    config = GatewayConfig.load(path)
+    assert config.compaction_model == target
+    monkeypatch.setenv("CLAUDEX_COMPACTION_MODEL", target)
+    assert GatewayConfig.from_env().compaction_model == target
+    monkeypatch.delenv("CLAUDEX_COMPACTION_MODEL")
+    monkeypatch.setattr(admin_client.daemon, "_load_config", lambda: config)
+    monkeypatch.setattr(admin_client, "_classify_daemon", lambda *args: admin_client.ProbeOutcome.NO_LISTENER)
+    assert compact._compact_main(["set", target]) == 0
+    client, _ = _gateway(config, lambda request: pytest.fail("no inference on save"))
+    client.app.state.admin_lock = asyncio.Lock()
+    response = client.put("http://127.0.0.1/admin/settings/compaction", json={"model": target})
+    assert response.status_code == 200
+    assert response.json()["model"] == target
+    assert GatewayConfig.load(path).compaction_model == target
+
+
+@pytest.mark.parametrize("provider", ["codex", "kimi", "grok"])
+@pytest.mark.parametrize("stream", [False, True])
+def test_builtin_compaction_uses_bound_client_auth_and_transport(provider, stream, monkeypatch):
+    from claudex import server
+    from claudex.providers.codex_client import CodexClient
+    from claudex.providers.grok_client import GrokClient
+    from claudex.providers.kimi_client import KimiClient
+    from test_relay import AvailableCodexAuthManager, AvailableGrokAuthManager, AvailableKimiAuthManager
+
+    captured = []
+    protocol = "messages" if provider == "kimi" else "responses"
+
+    def handler(request):
+        captured.append(request)
+        return _successful_response(protocol, stream)
+
+    transport = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    if provider == "codex":
+        target = CodexClient(AvailableCodexAuthManager(), transport)
+    elif provider == "grok":
+        target = GrokClient(AvailableGrokAuthManager(), transport)
+    else:
+        target = KimiClient(AvailableKimiAuthManager(), transport)
+    if provider != "kimi":
+        async def version():
+            return "0.157.1"
+        monkeypatch.setattr(target._version_discovery, "get_version", version)
+    source_provider = "grok" if provider == "codex" else "codex"
+    config = GatewayConfig(
+        model_map={"opus": source_provider + ":source"},
+        compaction_model=provider + ":vendor:model",
+        context_window_map={source_provider + ":source": 1, provider + ":vendor:model": 1},
+    )
+    client, source = _gateway(config, lambda request: pytest.fail("native destination must not be called"))
+    app = client.app
+    clients = {"codex": source, "kimi": app.state.kimi_client, "grok": app.state.grok_client}
+    clients[provider] = target
+    app.state.route_backends = server._assemble_route_backends(
+        app, config, clients["codex"], clients["kimi"], clients["grok"], {})
+    body = _compaction_body("claude-opus", thinking_block=True)
+    body["stream"] = stream
+    response = client.post("/v1/messages", json=body, headers={
+        "x-api-key": "client-secret", "authorization": "Bearer client-bearer"})
+    assert response.status_code == 200
+    assert len(captured) == 1
+    outgoing = captured[0]
+    assert outgoing.url.path.endswith("/" + protocol)
+    expected_token = {"codex": "codex", "kimi": "kimi-token", "grok": "grok-token"}[provider]
+    assert outgoing.headers["authorization"] == "Bearer " + expected_token
+    assert "x-api-key" not in outgoing.headers
+    assert "client-secret" not in str(outgoing.headers)
+    assert "client-bearer" not in str(outgoing.headers)
+    assert json.loads(outgoing.content)["model"] == "vendor:model"
+    assert "sig-from-a-different-backend" not in outgoing.content.decode()
+    assert not source.payloads
+    assert app.state.compaction_last_reroute["outcome"] == "rerouted"
+    assert app.state.compaction_last_reroute["target_model"] == provider + ":vendor:model"

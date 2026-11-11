@@ -1490,7 +1490,7 @@ class TestCompactionModelSetting:
 
     @pytest.mark.parametrize(
         "value",
-        ["sonnet-5", "codex:x", "claude:", "claude: ", "anthropic:claude-sonnet-5"],
+        ["sonnet-5", "codex:", "claude:", "claude: ", "anthropic:claude-sonnet-5"],
     )
     def test_invalid_string_value_fails_to_load(
         self, monkeypatch: pytest.MonkeyPatch, value: str

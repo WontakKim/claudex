@@ -178,16 +178,18 @@ The Settings tab's **Claude accounts** category manages the accounts described i
 **General** category and is read-only while `CLAUDEX_CLAUDE_ACCOUNT_ROUTING` is
 set.
 
-**Compact Reroute** selects a destination provider explicitly: native Claude or
-one of the registered custom providers. Claude retains curated models and a
-**Custom** model-ID field; custom providers use manual model IDs, including IDs
-with colons. Enter only the model ID—the selected provider supplies its prefix.
-**Disabled** remains available for every provider. A missing or failed catalog
-does not prevent manual entry. Unknown or invalid saved targets remain visible
-for explicit correction rather than silently switching providers.
+**Compact Reroute** selects a destination provider explicitly: native Claude,
+configured/available built-in providers (Codex, Kimi, Grok), or registered custom
+providers. Claude retains curated models and a **Custom** model-ID field.
+Built-in and custom providers offer catalog models when available, with
+**Custom** for unlisted IDs or missing or failed catalogs. Manual non-Claude
+model IDs may include colons. Enter only the model ID—the selected provider
+supplies its prefix. **Disabled** remains available for every provider. Unknown
+or invalid saved targets remain visible for explicit correction rather than
+silently switching providers.
 
 Native Claude targets use eligible client credentials, not registered-account
-credentials. Custom targets use their provider's configured authentication.
+credentials. Non-Claude targets use their provider's configured authentication.
 Selection does not probe the model; **Apply** saves the target and adopts the
 server's response. A successful save applies to the next request, and
 in-flight requests retain their target. A server-rejected change leaves the
