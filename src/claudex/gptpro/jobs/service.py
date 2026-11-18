@@ -236,11 +236,14 @@ class AskJobService:
             raise ValueError("read-only answer recovery is unavailable")
         for job in self._jobs.values():
             if (
-                job.state in ACTIVE_JOB_STATES
-                and job.thread_ref is not None
-                and _ownership_key(job.thread_ref) == _ownership_key(conversation_id)
-                and job.nonce_marker == marker
+                job.thread_ref is None
+                or _ownership_key(job.thread_ref) != _ownership_key(conversation_id)
+                or job.nonce_marker != marker
             ):
+                continue
+            if job.failure in ask_module.MODEL_VERIFICATION_FAILURES:
+                raise ValueError(f"cannot recover a completed answer rejected as {job.failure}")
+            if job.state in ACTIVE_JOB_STATES:
                 raise ValueError(
                     "recovery already pending for this turn; poll its ask_id"
                 )
@@ -600,6 +603,7 @@ class AskJobService:
             evidence = job.evidence
             stage = evidence.failure_stage or {
                 "echo_timeout": "echo", "no_raw_turn": "answer",
+                "model_mismatch": "answer", "model_unverified": "answer",
                 "submit_failed": "submission", "navigation_failed": "navigation",
                 "expired": "queue",
             }.get(exc.failure, "provider")

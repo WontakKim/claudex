@@ -8,7 +8,7 @@ from dataclasses import asdict
 from typing import Any
 
 from claudex.gptpro import conversation
-from claudex.gptpro.ask import GptProAskError
+from claudex.gptpro.ask import MODEL_VERIFICATION_FAILURES, GptProAskError
 from claudex.gptpro.jobs.models import AskJob
 
 ASK_GPT_PRO_DESCRIPTION = (
@@ -48,6 +48,8 @@ _GPTPRO_FAILURE_ACTIONS_DESCRIPTION = (
     "- expired: queue admission ended before this job ran; a recovery job may "
     "still refer to an earlier submitted turn.\n"
     "- no_raw_turn: recovery polling did not obtain a finished nonce-correlated answer.\n"
+    "- model_mismatch / model_unverified: the completed answer was rejected because "
+    "it was not verified as Pro; do not retry recovery or automatically resubmit.\n"
     "- timeout / echo_timeout: submission may have reached ChatGPT; use read-only recovery.\n"
     "- rate_limited_timeout: wait, then use read-only recovery if submitted.\n"
     "- session_expired / challenge: run claudex-gateway gptpro login; "
@@ -57,8 +59,9 @@ _GPTPRO_FAILURE_ACTIONS_DESCRIPTION = (
     "repeated failures suspend rediscovery for an hour.\n"
     "- submit_failed / navigation_failed / error: inspect evidence; recover if "
     "submission may have happened.\n"
-    "Use recover_gpt_pro with a failed ask_id, or saved thread_ref and nonce_marker "
-    "after restart. Unknown outcome is not proof that no answer exists."
+    "For an uncertain outcome, use recover_gpt_pro with a failed ask_id, or saved "
+    "thread_ref and nonce_marker after restart. Unknown outcome is not proof that "
+    "no answer exists."
 )
 ASK_GPT_PRO_STATUS_DESCRIPTION = (
     "Poll a background ChatGPT Pro ask and return its current state, latest "
@@ -381,6 +384,11 @@ def _get_mcp_session_id(context: Any) -> str | None:
 def _recovery_guidance(job: AskJob) -> str | None:
     if job.state != "failed":
         return None
+    if job.failure in MODEL_VERIFICATION_FAILURES:
+        return (
+            "The completed answer was rejected, not lost. Do not retry recovery "
+            "or automatically resubmit the prompt."
+        )
     if job.evidence.failure_stage == "queue" and job.evidence.recovery == "unavailable":
         return (
             "Recovery queue admission expired before read-only polling. The "

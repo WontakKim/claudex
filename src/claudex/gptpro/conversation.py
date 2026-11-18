@@ -6,7 +6,7 @@ import json
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import SplitResult, unquote, urlsplit
 
 TRUSTED_ORIGIN = "https://chatgpt.com"
@@ -52,6 +52,9 @@ class SandboxFileReference:
     sandbox_path: str
 
 
+AnswerModelVerification = Literal["verified_pro", "model_mismatch", "model_unverified"]
+
+
 @dataclass(frozen=True)
 class AssistantTurn:
     """Raw markdown, completion state, and linked files for one assistant turn.
@@ -62,6 +65,7 @@ class AssistantTurn:
     text: str
     finished: bool
     file_references: tuple[SandboxFileReference, ...] = ()
+    model_verification: AnswerModelVerification = "model_unverified"
 
 
 def _parse_url(url: str) -> SplitResult | None:
@@ -248,6 +252,30 @@ def _is_user_facing_text(message: Mapping[str, Any]) -> bool:
     )
 
 
+def _verify_answer_model(message: Mapping[str, Any]) -> AnswerModelVerification:
+    metadata = message.get("metadata")
+    if not _message_text(message).strip() or not isinstance(metadata, Mapping):
+        return "model_unverified"
+
+    # The default model describes routing preference, not what answered.
+    model_ids: set[str] = set()
+    for key in ("resolved_model_slug", "model_slug"):
+        if key not in metadata:
+            continue
+        value = metadata[key]
+        if not isinstance(value, str) or not re.fullmatch(
+            r"[a-z0-9]+(?:[-_.][a-z0-9]+)*", value,
+        ):
+            return "model_unverified"
+        model_ids.add(value)
+
+    if len(model_ids) != 1:
+        return "model_unverified"
+    if "gpt-6-pro" in model_ids:
+        return "verified_pro"
+    return "model_mismatch"
+
+
 def extract_assistant_turn(
     conversation: Mapping[str, Any], nonce_marker: str
 ) -> AssistantTurn | None:
@@ -312,6 +340,9 @@ def extract_assistant_turn(
         text="\n\n".join(texts),
         finished=finished,
         file_references=_file_references(answer),
+        model_verification=(
+            _verify_answer_model(answer[-1]) if finished else "model_unverified"
+        ),
     )
 
 

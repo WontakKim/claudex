@@ -1543,6 +1543,44 @@ def test_failed_status_and_result_include_diagnostics_and_identifiers() -> None:
         assert "recover_gpt_pro" in detail["recovery_guidance"]
 
 
+@pytest.mark.parametrize("failure", ["model_mismatch", "model_unverified"])
+@pytest.mark.parametrize("lookup", ["ask_id", "thread_and_nonce"])
+def test_mcp_rejects_unverified_final_on_recovery_lookup(failure: str, lookup: str) -> None:
+    runtime = FakeAskRuntime(error=ask.GptProAskError(failure, "completed answer rejected"))
+    with _mcp_client(runtime) as client:
+        _response, headers = _initialize(client)
+        session_id = headers["mcp-session-id"]
+        runtime.bind_thread(session_id, _CONVERSATION_B)
+        submitted = _json_tool_payload(_call_tool(client, headers, "ask_gpt_pro", {
+            "question": "synthetic ask", "thread": _CONVERSATION_A,
+        }))
+        ask_id = submitted["ask_id"]
+        _finish_job(client, runtime, ask_id)
+        status = _json_tool_payload(_call_tool(client, headers, "ask_gpt_pro_status", {
+            "ask_id": ask_id,
+        }))
+        result = _call_tool(client, headers, "ask_gpt_pro_result", {"ask_id": ask_id})
+        assert result["isError"] is True
+        assert status["state"] == "failed"
+        assert status["failure"] == failure
+        assert runtime.lookup_thread(session_id) == _CONVERSATION_B
+
+        arguments = {"ask_id": ask_id} if lookup == "ask_id" else {
+            "thread_ref": status["thread_ref"], "nonce_marker": status["nonce_marker"],
+        }
+        recovery = _call_tool(client, headers, "recover_gpt_pro", arguments)
+
+        assert recovery["isError"] is True
+        assert failure in recovery["content"][0]["text"]
+        assert runtime.questions == ["synthetic ask"]
+        assert "Do not retry recovery" in status["recovery_guidance"]
+        detail = json.loads(result["content"][1]["text"])
+        assert detail["failure"] == failure
+        assert detail["evidence"]["failure_stage"] == "answer"
+        assert detail["recovery_guidance"] == status["recovery_guidance"]
+        assert "answer" not in detail and "files" not in detail
+
+
 def test_recover_failed_ask_read_only_and_poll_new_job() -> None:
     runtime = FakeAskRuntime(
         error=ask.GptProAskError("echo_timeout", "confirmation lost"),

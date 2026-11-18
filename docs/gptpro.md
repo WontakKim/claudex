@@ -128,7 +128,7 @@ listed below.
 | `ask_gpt_pro` | `question` (required string), `thread` (optional string), `attachments` (optional array of strings) | Starts a background ask and returns immediately with `{"ask_id": ..., "thread_ref": ...}`. A fresh ask can initially have a null `thread_ref`. |
 | `ask_gpt_pro_status` | `ask_id` (required string) | Returns `ask_id`, `state`, nullable `status_message`, `thread_ref`, `nonce_marker`, `failure`, and `error_message`, plus `evidence`, nullable `source_ask_id`, and `recovery_guidance`. Unknown or expired IDs are tool errors. |
 | `ask_gpt_pro_result` | `ask_id` (required string) | After `succeeded`, returns `ask_id`, the Markdown `answer`, `thread_ref`, `nonce_marker`, `evidence`, nullable `source_ask_id`, `files`, and `files_complete` (see [Generated files](#generated-files)). After `failed`, returns an MCP tool error with a readable explanation and structured diagnostics. Calling it while `queued`, `running`, or `detached` is an error. |
-| `recover_gpt_pro` | Either `ask_id` (a retained failed job) or `thread_ref` (conversation UUID) and `nonce_marker` | Starts a separate, bounded, read-only recovery job and returns its `ask_id`, nullable `source_ask_id`, and `thread_ref`. Poll its status and result as usual. It never sends a prompt or attaches files. |
+| `recover_gpt_pro` | Either `ask_id` (a retained failed job) or `thread_ref` (conversation UUID) and `nonce_marker` | For a turn whose outcome is still uncertain, starts a separate, bounded, read-only recovery job and returns its `ask_id`, nullable `source_ask_id`, and `thread_ref`. Poll its status and result as usual. It never sends a prompt or attaches files. |
 
 Use `ask_gpt_pro` when the user explicitly requests ChatGPT Pro or when a
 consequential judgment would materially benefit from a second opinion, not for
@@ -140,10 +140,10 @@ The normal caller flow is:
 2. Poll `ask_gpt_pro_status` while the state is `queued`, `running`, or
    `detached`.
 3. Call `ask_gpt_pro_result` only after the state is `succeeded` or `failed`.
-4. If a failed ask might have submitted, retain its `ask_id`, `thread_ref`, and
-   `nonce_marker`. Use `recover_gpt_pro` to look for that turn without sending a
-   second prompt. A recovery job has its own `ask_id` and does not rewrite the
-   failed source job.
+4. If a failed ask might have submitted and its outcome is still uncertain,
+   retain its `ask_id`, `thread_ref`, and `nonce_marker`. Use `recover_gpt_pro` to
+   look for that turn without sending a second prompt. A recovery job has its
+   own `ask_id` and does not rewrite the failed source job.
 5. After manual recovery succeeds, pass its `thread_ref` explicitly as `thread`
    in the next `ask_gpt_pro` call to continue the recovered conversation.
 
@@ -304,8 +304,8 @@ execution deadline fails the job even if the answer text was already observed.
 | `queued` | The job is waiting for admission, normally behind an in-flight ask on the same conversation. | Becomes `running` (a recovery job becomes `detached`), or `failed` with `expired` if same-conversation admission exceeds the 900-second queue TTL. |
 | `running` | The job is admitted; navigation, submission, or answer observation may be in progress. This state alone does not prove submission. | Becomes `detached` during read-only polling, or `succeeded` or `failed`. |
 | `detached` | The gateway polls the server for an existing answer; ChatGPT may still be generating, or extraction may have failed. | Remains observable through normal status polling, then becomes `succeeded` or `failed`. |
-| `succeeded` | The answer is settled and available from `ask_gpt_pro_result`. | Terminal. An ordinary `ask_gpt_pro` job binds its `thread_ref` to this MCP session; a manual `recover_gpt_pro` job leaves the binding unchanged. |
-| `failed` | The queue or provider execution ended with a classified failure. | Terminal. Fetch the result for the operational error and use any preserved conversation metadata for recovery. |
+| `succeeded` | The completed answer is verified as Pro and available from `ask_gpt_pro_result`. | Terminal. An ordinary `ask_gpt_pro` job binds its `thread_ref` to this MCP session; a manual `recover_gpt_pro` job leaves the binding unchanged. |
+| `failed` | The queue or provider execution ended with a classified failure. | Terminal. Fetch the result for the error and follow its recovery guidance. |
 
 `status_message` is supplemental progress. In particular, `waiting for the
 in-flight answer` identifies same-conversation queueing, while `detached; polling
@@ -317,8 +317,8 @@ A post-click `no_raw_turn`, `echo_timeout`, `timeout`, `navigation_failed`,
 the original ask's remaining 90-minute execution window, provided its
 conversation ID and nonce are known. Pre-click failures and `session_expired`,
 `challenge`, and `rate_limited_timeout` failures do not trigger this polling.
-A non-positive window disables it. Only a finished, nonempty, nonce-correlated
-raw assistant turn counts as a recovered answer. The job
+A non-positive window disables it. A recovered answer has the same completion
+and model verification requirements as a direct answer. The job
 retains conversation ownership while polling, so follow-up asks for the same
 conversation remain queued until it settles. `recover_gpt_pro` uses the same
 ownership rule to inspect an existing turn after a failure, with a new execution
@@ -333,6 +333,25 @@ before this job ran. A queued ordinary ask did not submit; a queued recovery
 job may still refer to an earlier server turn and retains its thread and nonce
 for another read-only lookup. An execution timeout or lost echo, by contrast,
 does not establish that submission failed.
+
+### Completed answer verification
+
+The gateway returns a finished, nonempty answer only when the final assistant
+message for the submitted nonce identifies a supported Pro model (currently
+`gpt-6-pro`). It uses the message's actual or resolved model ID, not the default
+model, status, a model name in the answer text, or metadata from other messages.
+This check applies to direct answers and to both automatic and manual recovery.
+
+- `model_mismatch`: The final message identifies a model other than a supported
+  Pro model.
+- `model_unverified`: The final message has missing, malformed, or conflicting
+  model metadata, so the gateway cannot verify it as Pro.
+
+Both failures mean the gateway found a completed answer but rejected it. It does
+not return the answer, download its files, bind the thread, continue polling, or
+resubmit the prompt. Do not retry recovery for either failure. While the failure
+record is retained, the gateway rejects recovery lookups for that turn. After a
+restart or expiry, any read-only lookup still has to verify the final message.
 
 ### Evidence and failed-turn recovery
 
@@ -374,20 +393,22 @@ not request bodies, headers, raw file IDs, or attachment content.
 `conversation_id` is the known thread ID, either explicitly selected or
 observed from a correlated ChatGPT event. `generation_observed` and
 `answer_seen` do not imply `raw_extracted`: only a completed, correlated raw
-answer establishes that. `failure_stage` identifies where execution stopped; `recovery_failure` and
-`recovery_detail` separately report why read-only recovery failed without
-erasing the original failure. `recovery` is `not_attempted`, `polling`,
+answer establishes that. `failure_stage` identifies where execution stopped;
+`recovery_failure` and `recovery_detail` report why read-only recovery failed. The original
+failure normally remains primary, unless recovery finds a completed answer that
+fails model verification. `recovery` is `not_attempted`, `polling`,
 `unavailable`, `exhausted`, or `recovered`. Null and false fields mean the
 observation was not made, not that
 ChatGPT definitely did nothing.
 
-If a failed ask retains a `thread_ref` and `nonce_marker`, call
-`recover_gpt_pro` with its `ask_id`. After a gateway restart, use the saved
-`thread_ref` and `nonce_marker` instead. Poll the new recovery job. On success,
+If the outcome is still uncertain and the failed ask retains a `thread_ref`
+and `nonce_marker`, call `recover_gpt_pro` with its `ask_id`. After a gateway
+restart, use the saved `thread_ref` and `nonce_marker` instead. Poll the new
+recovery job. On success,
 pass its `thread_ref` explicitly as `thread` in any follow-up `ask_gpt_pro` call:
 manual recovery does not update the implicit session binding, even after a
-restart. A failure to recover means no matching finished answer was obtained
-within the window, not proof that none exists. If either identifier is missing,
+restart. A recovery timeout means no verified answer was obtained within the
+window, not proof that no answer exists. If either identifier is missing,
 this read-only lookup cannot identify the turn: inspect the ChatGPT conversation
 before considering any new submission. Re-run login for `session_expired` or
 `challenge`; for `rate_limited_timeout`, wait, then recover if the ask may have

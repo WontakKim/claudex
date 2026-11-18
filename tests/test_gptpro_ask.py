@@ -323,6 +323,7 @@ class _FakePage:
                             "parts": [raw_text],
                         },
                         "status": "finished_successfully",
+                        "metadata": {"model_slug": "gpt-6-pro"},
                         "end_turn": True,
                     },
                 },
@@ -2353,6 +2354,38 @@ class _GeneratedFilePage(_FakePage):
                 "redirected": False, "url": url,
             }
         return await super().evaluate(expression, argument)
+
+
+@pytest.mark.parametrize(
+    ("metadata", "failure", "detail"),
+    [
+        ({"model_slug": "gpt-6-thinking"}, "model_mismatch", "not a verified Pro model"),
+        (None, "model_unverified", "missing or unusable model metadata"),
+    ],
+)
+def test_direct_ask_rejects_unverified_final_before_downloading_files(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any,
+    metadata: dict[str, str] | None, failure: str, detail: str,
+) -> None:
+    _install_clock(monkeypatch)
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    class UnverifiedFilePage(_GeneratedFilePage):
+        def _conversation(self, raw_text: str) -> dict[str, object]:
+            fixture = super()._conversation(raw_text)
+            fixture["mapping"]["assistant"]["message"]["metadata"] = metadata
+            return fixture
+
+    page = UnverifiedFilePage(b"unused", raw_text="[notes](sandbox:/mnt/data/notes.md)")
+    with pytest.raises(ask.GptProAskError, match=detail) as raised:
+        asyncio.run(ask.execute_ask_outcome(page, "Review this code"))
+
+    assert raised.value.failure == failure
+    assert raised.value.evidence is not None
+    assert raised.value.evidence.failure_stage == "answer"
+    assert raised.value.evidence.raw_extracted
+    assert page.click_count == page.fetch_count == 1
+    assert page.file_requests == []
 
 
 def test_direct_ask_delivers_generated_files_after_final_answer(

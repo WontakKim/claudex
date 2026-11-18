@@ -124,9 +124,14 @@ FailureClassification = Literal[
     "submit_failed",
     "echo_timeout",
     "no_raw_turn",
+    "model_mismatch",
+    "model_unverified",
     "timeout",
     "error",
 ]
+
+
+MODEL_VERIFICATION_FAILURES = frozenset({"model_mismatch", "model_unverified"})
 
 
 @dataclass(frozen=True)
@@ -212,6 +217,19 @@ class GptProAskError(Exception):
         super().__init__(message)
         self.failure = failure
         self.evidence: AskEvidence | None = None
+
+
+def require_verified_pro(turn: AssistantTurn) -> None:
+    """Reject a completed turn before releasing its answer or files."""
+    if turn.model_verification == "verified_pro":
+        return
+    if turn.model_verification == "model_mismatch":
+        raise GptProAskError(
+            "model_mismatch", "the completed answer was not a verified Pro model response"
+        )
+    raise GptProAskError(
+        "model_unverified", "the completed answer has missing or unusable model metadata"
+    )
 
 
 class GptProSessionExpiredError(GptProAskError):
@@ -1702,6 +1720,7 @@ class _AskExecution:
                     )
                     if turn.finished:
                         self._record_evidence(raw_extracted=True)
+                        require_verified_pro(turn)
                         self.finished_turn = turn
                         return turn.text
             if attempt + 1 < API_TURN_ATTEMPTS:
