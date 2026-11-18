@@ -139,6 +139,7 @@ _RELAY_SYMBOL_MANIFEST = {
         "_translate_claude_sse",
         "_with_responses_heartbeats",
         "_aggregate_claude_response",
+        "_log_tool_validation_failure",
     },
     "kimi": {
         "_kimi_request_headers",
@@ -169,7 +170,7 @@ def test_relay_symbol_manifest_has_one_canonical_owner() -> None:
         for module_name in _RELAY_SYMBOL_MANIFEST
     }
 
-    assert len(_RELAY_MANIFEST_SYMBOLS) == 60
+    assert len(_RELAY_MANIFEST_SYMBOLS) == 61
     assert definitions_by_module == _RELAY_SYMBOL_MANIFEST
     for symbol in _RELAY_MANIFEST_SYMBOLS:
         owners = [
@@ -8680,6 +8681,143 @@ def test_active_function_with_stale_arguments_never_emits_executable_tool_use(st
     else:
         assert response.status_code == 502
         assert response.json()['error']['type'] == 'api_error'
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("provider", ["codex", "wrtn"])
+@pytest.mark.parametrize("source", ["response.output_item.done", "response.completed", "response.incomplete"])
+def test_rejected_call_diagnostic_identifies_transmitted_target_and_source(
+    stream, provider, source, caplog,
+):
+    from dataclasses import replace
+
+    arguments = json.dumps({"query": "ARGUMENT_VALUE_CANARY", "UNKNOWN_SECRET_CANARY": "secret"})
+    events = _validation_call_events(arguments)
+    if source != "response.output_item.done":
+        item = events[2]["item"]
+        item["status"] = "completed"
+        events = [events[0], {"type": source, "response": {"output": [item]}}]
+    stub = StubOpenAICompatibleClient(events)
+    if provider == "wrtn":
+        client = _custom_provider_gateway(stub)
+    else:
+        client, codex = _gateway(GatewayConfig(model_map={"opus": "codex:gpt-5.5"}), _failing_anthropic_handler)
+        codex.stream_responses = stub.stream_responses
+    backend = client.app.state.route_backends[provider]
+
+    async def adapt_payload(payload, model):
+        return {**await backend.adapt_payload(payload, model), "model": "transmitted-model-target"}
+
+    client.app.state.route_backends[provider] = replace(backend, adapt_payload=adapt_payload)
+    body = _message_body("claude-opus-4-6")
+    body["stream"] = stream
+    body["messages"][0]["content"] = "PROMPT_VALUE_CANARY"
+    body["tools"] = [{"name": "lookup", "input_schema": {
+        "type": "object", "properties": {"query": {"type": "string"}, "max_results": {"type": "integer"}},
+        "required": ["query", "max_results"],
+    }}]
+    with caplog.at_level(logging.WARNING, logger="claudex.server"):
+        response = client.post("/v1/messages", json=body)
+    assert response.status_code == (200 if stream else 502)
+    assert "missing required keys" in response.text
+    assert "max_results" in response.text
+    assert '"tool_use"' not in response.text
+    assert len(stub.payloads) == 1
+    records = [record for record in caplog.records if record.getMessage().startswith("tool_validation_failure ")]
+    assert len(records) == 1
+    diagnostic = json.loads(records[0].getMessage().split(" ", 1)[1])
+    assert diagnostic["provider"] == provider
+    assert diagnostic["upstream_model"] == stub.payloads[0]["model"] == "transmitted-model-target"
+    assert diagnostic["event_type"] == source
+    assert diagnostic["item_type"] == "function_call"
+    assert diagnostic["validator"] == "required"
+    assert diagnostic["required"]["names"] == ["query", "max_results"]
+    assert diagnostic["present"]["names"] == ["query"]
+    assert diagnostic["present"]["redacted_count"] == 1
+    assert diagnostic["missing"]["names"] == ["max_results"]
+    assert "CANARY" not in response.text + caplog.text
+    assert records[0].exc_info is None
+    log_buffer = server._LogBufferHandler()
+    log_buffer.emit(records[0])
+    assert json.loads(log_buffer.records[-1]["message"].split(" ", 1)[1]) == diagnostic
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("arguments,schema,validator", [
+    ('{"DYNAMIC_SECRET_CANARY":"ARGUMENT_VALUE_CANARY"}',
+     {"patternProperties": {".*": {"type": "integer"}}}, "type"),
+    ('{MALFORMED_ARGUMENT_CANARY', {"type": "object"}, "invalid_json"),
+    ('[]', {"type": "object"}, "object_required"),
+])
+def test_rejected_argument_diagnostics_exclude_values_and_dynamic_paths(
+    stream, arguments, schema, validator, caplog,
+):
+    stub = StubOpenAICompatibleClient(_validation_call_events(arguments))
+    client = _custom_provider_gateway(stub)
+    body = _message_body("claude-opus-4-6")
+    body["stream"] = stream
+    body["tools"] = [{"name": "lookup", "input_schema": schema}]
+    with caplog.at_level(logging.WARNING, logger="claudex.server"):
+        response = client.post("/v1/messages", json=body)
+    assert response.status_code == (200 if stream else 502)
+    assert "CANARY" not in response.text + caplog.text
+    assert '"tool_use"' not in response.text
+    assert len(stub.payloads) == 1
+    messages = [record.getMessage() for record in caplog.records
+                if record.getMessage().startswith("tool_validation_failure ")]
+    assert len(messages) == 1
+    diagnostic = json.loads(messages[0].split(" ", 1)[1])
+    assert diagnostic["validator"] == validator
+    assert diagnostic["required"] is None
+    assert diagnostic["present"] is None
+    assert diagnostic["missing"] is None
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_private_translation_helpers_do_not_substitute_requested_alias_for_missing_target(stream, caplog):
+    async def events():
+        for event in _validation_call_events("{}"):
+            yield event
+
+    async def scenario():
+        kwargs = {"function_schemas": {"lookup": {"required": ["query"]}}}
+        request = {"model": "REQUESTED_ALIAS_CANARY"}
+        if stream:
+            return "".join([chunk async for chunk in relay_openai_backend._translate_claude_sse(request, events(), **kwargs)])
+        response = await relay_openai_backend._aggregate_claude_response(request, events(), **kwargs)
+        return response.body.decode()
+
+    with caplog.at_level(logging.WARNING, logger="claudex.server"):
+        result = asyncio.run(scenario())
+    assert "missing required keys" in result
+    messages = [record.getMessage() for record in caplog.records
+                if record.getMessage().startswith("tool_validation_failure ")]
+    assert len(messages) == 1
+    diagnostic = json.loads(messages[0].split(" ", 1)[1])
+    assert diagnostic["provider"] == "unavailable"
+    assert diagnostic["upstream_model"] == "unavailable"
+    assert "REQUESTED_ALIAS_CANARY" not in messages[0]
+
+
+def test_validation_log_redacts_hostile_context_and_marks_absent_event_unavailable(caplog):
+    from claudex.translate.claude_to_codex import TranslationError
+    from claudex.translate.tool_validation import compile_function_validators, validate_function_arguments
+
+    validators = compile_function_validators({"f": {"required": ["query"]}})
+    with pytest.raises(TranslationError) as failure:
+        validate_function_arguments(validators, "f", "{}")
+    with caplog.at_level(logging.WARNING, logger="claudex.server"):
+        relay_openai_backend._log_tool_validation_failure(
+            failure.value, None, "PROVIDER_SECRET_CANARY\n", "MODEL_SECRET_CANARY" + "x" * 10000,
+        )
+    message = caplog.records[-1].getMessage()
+    diagnostic = json.loads(message.split(" ", 1)[1])
+    assert diagnostic["provider"] == "redacted"
+    assert diagnostic["upstream_model"] == "redacted"
+    assert diagnostic["event_type"] == "unavailable"
+    assert diagnostic["missing"]["names"] == ["query"]
+    assert "CANARY" not in message
+    assert len(message) < 2000
 
 
 @pytest.mark.parametrize('path', ['/v1/messages', '/v1/messages/count_tokens'])
