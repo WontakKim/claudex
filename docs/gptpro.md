@@ -334,6 +334,22 @@ job may still refer to an earlier server turn and retains its thread and nonce
 for another read-only lookup. An execution timeout or lost echo, by contrast,
 does not establish that submission failed.
 
+### Pro selection before Send
+
+For ordinary asks, including existing conversations and fallback attempts, the
+saved account must offer **Pro** in ChatGPT's **Thinking effort** picker. The
+gateway leaves an already selected Pro setting alone. Otherwise it opens the
+composer's picker and moves the **Power** control toward Pro using its keyboard
+shortcuts, checking the displayed selection before attaching files or entering
+the prompt. It does not infer Pro from the GPT model name, an account badge, or
+the highest available effort, and it does not open an upgrade flow.
+
+After the final readiness and attachment checks, the gateway reads the current
+picker again. If the setting changed or cannot be verified, it stops without
+clicking Send, changing the setting again, or re-entering the prompt. A failure
+at this point has `evidence.submission: not_attempted`. Read-only recovery does
+not use the picker or change effort.
+
 ### Completed answer verification
 
 The gateway returns a finished, nonempty answer only when the final assistant
@@ -419,14 +435,14 @@ Poll status every 30-60 seconds or longer rather than in a tight loop. Detached
 answer recovery uses a separate server-side polling interval and does not
 require frequent client polling.
 
-### Composer and send locator recovery
+### Locator recovery
 
-The gateway locates the composer, send button, and stop button by structure
-because labels follow the UI language. Only the composer and send button can
-be rediscovered. A locator fault persisting for about four seconds while a
-contract-satisfying control is present triggers one rediscovery per control
-per ask. Candidates are collected by structure only: no conversation text or
-composer contents are included.
+The composer, Send button, model picker, and Power control can each be
+rediscovered at most once per ask. Composer and Send faults must persist for
+about four seconds; the picker and Power control must be uniquely identifiable
+in the intended composer or its linked menu. If the page does not offer readable
+Pro controls, the ask stops before submission. Rediscovery cannot add access to
+Pro or translate an unrecognized effort display.
 
 The gateway asks `claude-sonnet-5-5` through its own `/v1/messages` endpoint.
 This follows `model_map` like any client request: a `sonnet` mapping routes the
@@ -445,20 +461,24 @@ locators remain valid.
 
 The structure-only candidate description, including tags, roles, UI labels,
 data attribute names (not values), and positions, is sent to whichever provider handles that
-request. The gateway must be running and reachable at its configured host and
-port. If it is unreachable, for example during a CLI `claudex-gateway gptpro ask`
-while the gateway is stopped, rediscovery is unavailable and a locator fault
-ends the ask with `locator_unresolved`.
+request. Picker and Power candidates contain only fixed structural descriptors,
+not arbitrary labels, IDs, classes, or text from the page. No candidates include
+conversation text or composer contents. The gateway must be running and
+reachable at its configured host and port. If it is unreachable, for example
+when running `claudex-gateway gptpro ask` while the gateway is stopped,
+rediscovery is unavailable and a locator fault ends the ask with
+`locator_unresolved`.
 
 The selected candidate's structural selector is compiled locally and checked
 again against the control contract. It is used first and saved in
 `~/.claudex/gptpro/locators.json`, keyed by UI language, only after that use
-succeeds: retained prompt text proves the composer; a nonce-matched user echo
-proves the send button. While a rediscovered locator awaits its first successful
-use, other asks reuse it when it matches their page; otherwise they end with
-`locator_unresolved` without another rediscovery. A rediscovery that cannot
-finish within the control's wait budget ends the ask with `locator_unresolved`
-and does not count as a failed rediscovery. `locator_unresolved` means nothing
+succeeds: retained prompt text proves the composer, and a nonce-matched user echo
+proves Send. For the picker and Power control, the gateway must verify Pro on
+the current picker before saving the locator. While a rediscovered locator awaits
+its first successful use, other asks reuse it when it matches their page;
+otherwise they end with `locator_unresolved` without another rediscovery. A
+rediscovery that cannot finish within the control's wait budget ends the ask
+with `locator_unresolved` and does not count as a failed rediscovery. `locator_unresolved` means nothing
 was sent: retrying cannot duplicate that prompt, but may fail again.
 
 After a failed rediscovery, a 60-second backoff prevents another rediscovery.

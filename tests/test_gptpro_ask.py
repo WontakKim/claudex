@@ -75,6 +75,8 @@ class _FakeElementHandle:
         return self
 
     async def evaluate(self, expression: str, argument: Any = None) -> Any:
+        if expression == ask.PRO_STATE_JS:
+            return {"picker": True, "expanded": False, "level": "Pro"} if self.page.form_is_current else None
         if expression == ask.COMPOSER_ELEMENT_READBACK_PROBE_JS:
             return await self.page.evaluate(
                 selectors.COMPOSER_READBACK_PROBE_JS,
@@ -3241,6 +3243,8 @@ def test_concurrent_click_send_calls_reserve_one_client_attempt() -> None:
             both_at_boundary.set()
         await release_revalidation.wait()
 
+    execution.composer_form_handle = page.form_handle
+    execution.composer_selector = selectors.COMPOSER_SELECTOR
     execution._dismiss_modal = no_op
     execution._ensure_composer_form_current = no_op
     execution._wait_for_send_ready = no_op

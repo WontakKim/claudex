@@ -8,6 +8,8 @@ COMPOSER_SELECTOR = (
     '[role="textbox"]'
 )
 SEND_BUTTON_SELECTOR = 'form[data-chatgpt-composer] button[type="submit"]'
+MODEL_PICKER_SELECTOR = 'button[data-composer-navigation-target="reasoning"]'
+POWER_SELECTOR = '[role="menuitem"][data-reasoning-slider="true"]'
 # The composer's trailing slot is voice (type=button with a data-state tooltip
 # trigger) when empty, submit when text is present, and stop (type=button without
 # data-state) while streaming. Accessible names are localized; match structure.
@@ -383,6 +385,62 @@ async (args) => {
 """
 
 
+# The Power menu is rendered in a portal, not inside the composer. IDs are
+# checked locally in both directions, never used as persistent selectors.
+PRO_CONTROLS_JS = r"""
+(form, pickerSelector, powerSelector) => {
+  const visible = element => {
+    const rect = element.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0 &&
+      element.checkVisibility({opacityProperty: true, visibilityProperty: true}) &&
+      !element.closest('[hidden], [inert], [role="dialog"], dialog, nav, aside');
+  };
+  const enabled = element => !element.matches(':disabled, [aria-disabled="true"], [data-disabled]');
+  const matches = (element, selector) => {
+    try { return element.matches(selector); } catch (_) { return false; }
+  };
+  const labelLines = element => element.innerText.split('\n').map(line => line.trim()).filter(Boolean);
+  const pickers = [...form.querySelectorAll('button[type="button"][aria-haspopup="menu"]')]
+    .filter(element => element.form === form && visible(element) &&
+      /^(true|false)$/.test(element.getAttribute('aria-expanded')) &&
+      (element.getAttribute('aria-label') === 'Select ChatGPT model' ||
+       labelLines(element)[0] === 'Thinking effort'));
+  const picker = pickers.length === 1 && matches(pickers[0], pickerSelector) &&
+    enabled(pickers[0]) ? pickers[0] : null;
+  const expanded = picker?.getAttribute('aria-expanded') === 'true';
+  const lines = picker ? labelLines(picker) : [];
+  const pickerLevel = lines.length === 2 && lines[0] === 'Thinking effort' ? lines[1] : null;
+  const controls = expanded && picker.id && picker.getAttribute('aria-controls');
+  const menus = controls ? [...document.querySelectorAll('[role="menu"]')]
+    .filter(element => element.id === controls && visible(element) &&
+      element.getAttribute('aria-labelledby') === picker.id) : [];
+  const menu = menus.length === 1 ? menus[0] : null;
+  const describePower = element => {
+    const sliders = [...element.querySelectorAll('[role="slider"]')];
+    const statuses = [...menu.querySelectorAll('[role="status"][id]')].filter(status =>
+      status.closest('[role="menu"]') === menu &&
+      (element.getAttribute('aria-describedby') || '').split(/\s+/).includes(status.id));
+    const keys = (element.getAttribute('aria-keyshortcuts') || '').split(/\s+/);
+    if (!keys.includes('ArrowLeft') || !keys.includes('ArrowRight') ||
+        sliders.length !== 1 || statuses.length !== 1) return null;
+    const slider = sliders[0];
+    const numbers = ['aria-valuemin', 'aria-valuemax', 'aria-valuenow'].map(name => slider.getAttribute(name));
+    if (!numbers.every(value => /^\d+$/.test(value))) return null;
+    const [min, max, position] = numbers.map(Number);
+    const status = /^([^,]+), (\d+) of (\d+)\.?$/.exec(statuses[0].textContent.trim());
+    if (!status || min > position || position > max ||
+        Number(status[2]) !== position - min + 1 || Number(status[3]) !== max - min + 1) return null;
+    return {level: status[1].trim(), min, max, position};
+  };
+  const powers = menu ? [...menu.querySelectorAll('[role="menuitem"][aria-label="Power"]')]
+    .filter(element => element.closest('[role="menu"]') === menu && visible(element)) : [];
+  const feedback = powers.length === 1 && matches(powers[0], powerSelector) && enabled(powers[0])
+    ? describePower(powers[0]) : null;
+  return {picker, power: feedback ? powers[0] : null, pickers, powers, menu, expanded, pickerLevel, feedback};
+}
+"""
+
+
 # Composers are visible editable roots in forms outside dialogs, navigation,
 # message units, and search areas; known composer forms constrain eligibility when
 # present, otherwise generic forms qualify. Send buttons qualify only in the form
@@ -431,8 +489,42 @@ LOCATOR_CONTRACT_JS = r"""
 }
 """.replace("__MESSAGE_UNIT_SELECTOR__", USER_MESSAGE_SELECTOR.split("$=", 1)[0] + "]")
 
+# Match only in the semantic scope, even when an unrelated portal or form has
+# identical markup. Rediscovery receives fixed structural selectors, not DOM values.
+PRO_LOCATOR_SCOPE_JS = r"""
+(args, composerContract) => {
+  let composers;
+  try { composers = document.querySelectorAll(args.composerSelector); }
+  catch (_) { return null; }
+  if (composers.length !== 1 || !composerContract(composers[0])) return null;
+  const form = composers[0].closest('form');
+  const ui = (__CONTROLS__)(form, args.target === 'power' ? args.pickerSelector : '*', '*');
+  if (args.target === 'power') {
+    return {candidates: ui.powers, control: ui.power,
+      selector: '[role="menuitem"][aria-label="Power"][aria-keyshortcuts][aria-describedby]'};
+  }
+  return {
+    candidates: ui.pickers, control: ui.picker,
+    selector: 'button[type="button"][aria-haspopup="menu"][aria-expanded]'
+  };
+}
+""".replace("__CONTROLS__", PRO_CONTROLS_JS)
+
 LOCATOR_CHECK_PROBE_JS = r"""
 (args) => {
+  if (args.target === 'picker' || args.target === 'power') {
+    const scope = (__PRO_SCOPE__)(args, __LOCATOR_CONTRACT__('composer'));
+    let matches = [];
+    let invalidSelector = false;
+    try {
+      document.querySelector(args.selector);
+      matches = scope?.candidates.filter(element => element.matches(args.selector)) || [];
+    } catch (_) { invalidSelector = true; }
+    return {invalidSelector, matched: matches.length,
+      eligible: Number(matches.includes(scope?.control)),
+      candidates: scope?.candidates.length > 1 ? scope.candidates.length : Number(!!scope?.control),
+      lang: document.documentElement.lang || ''};
+  }
   const contract = __LOCATOR_CONTRACT__(args.target, args.composerSelector);
   let invalidSelector = false;
   let matches = [];
@@ -450,13 +542,24 @@ LOCATOR_CHECK_PROBE_JS = r"""
     lang: document.documentElement.lang || '',
   };
 }
-""".replace("__LOCATOR_CONTRACT__", "(" + LOCATOR_CONTRACT_JS + ")")
+""".replace("__LOCATOR_CONTRACT__", "(" + LOCATOR_CONTRACT_JS + ")").replace(
+    "__PRO_SCOPE__", PRO_LOCATOR_SCOPE_JS,
+)
 
 # Candidates expose structural metadata and aria-label UI labels, never conversation text,
 # input values, or element IDs. Element and form data attributes expose names only
 # (excluding data-state), never data-* values.
 LOCATOR_CANDIDATES_PROBE_JS = r"""
 (args) => {
+  if (args.target === 'picker' || args.target === 'power') {
+    const scope = (__PRO_SCOPE__)(args, __LOCATOR_CONTRACT__('composer'));
+    const candidates = scope?.control?.matches(scope.selector)
+      ? [{index: 0, selector: scope.selector, ...(args.target === 'picker'
+          ? {tag: 'button', popup: 'menu', inComposer: true}
+          : {role: 'menuitem', containsSlider: true, inLinkedMenu: true})}]
+      : [];
+    return {candidates};
+  }
   const contract = __LOCATOR_CONTRACT__(args.target, args.composerSelector);
   const dataNames = (element) => Array.from(element.attributes)
     .map(attribute => attribute.name)
@@ -505,4 +608,6 @@ LOCATOR_CANDIDATES_PROBE_JS = r"""
   });
   return {lang: document.documentElement.lang || '', candidates};
 }
-""".replace("__LOCATOR_CONTRACT__", "(" + LOCATOR_CONTRACT_JS + ")")
+""".replace("__LOCATOR_CONTRACT__", "(" + LOCATOR_CONTRACT_JS + ")").replace(
+    "__PRO_SCOPE__", PRO_LOCATOR_SCOPE_JS,
+)
