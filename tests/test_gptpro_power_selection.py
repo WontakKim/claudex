@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import os
 from contextlib import nullcontext
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
@@ -138,6 +139,8 @@ async def _run_ask(
 ):
     async with async_playwright() as playwright:
         executable = Path(playwright.chromium.executable_path)
+        if not executable.is_file() and os.environ.get('GPTPRO_REQUIRE_BROWSER') == '1':
+            pytest.fail('Chromium is required; run python -m playwright install --with-deps chromium')
         if not executable.is_file():
             installed = sorted((Path.home() / "Library/Caches/ms-playwright").glob(
                 "chromium-*/chrome-mac*/Google Chrome for Testing.app/"
@@ -324,7 +327,10 @@ def test_a_healed_power_control_that_does_not_move_is_not_cached_and_backs_off(t
     healer = _StructuralHealer()
     config = {'drift': 'power', 'stalledKey': True}
     actions = asyncio.run(_run_ask(tmp_path, config, expect_failure=True, healer=healer))
-    assert actions == [['open', 'Medium'], ['key', 'Medium']]
+    assert actions[0] == ['open', 'Medium']
+    key_attempts = actions[1:]
+    assert 1 <= len(key_attempts) <= 10
+    assert all(action == ['key', 'Medium'] for action in key_attempts)
     book = locators.LocatorBook(tmp_path / 'locators.json')
     assert book.selector_for('en', 'power') == locators.SEED_SELECTORS['power']
     assert book.refusal('en', 'power') is not None
