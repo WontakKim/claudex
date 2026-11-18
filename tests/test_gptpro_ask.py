@@ -2359,15 +2359,15 @@ class _GeneratedFilePage(_FakePage):
 
 
 @pytest.mark.parametrize(
-    ("metadata", "failure", "detail"),
+    ("metadata", "failure"),
     [
-        ({"model_slug": "gpt-6-thinking"}, "model_mismatch", "not a verified Pro model"),
-        (None, "model_unverified", "missing or unusable model metadata"),
+        ({"model_slug": "gpt-6-thinking"}, "model_mismatch"),
+        (None, "model_unverified"),
     ],
 )
 def test_direct_ask_rejects_unverified_final_before_downloading_files(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Any,
-    metadata: dict[str, str] | None, failure: str, detail: str,
+    metadata: dict[str, str] | None, failure: str,
 ) -> None:
     _install_clock(monkeypatch)
     monkeypatch.setenv("HOME", str(tmp_path))
@@ -2379,7 +2379,52 @@ def test_direct_ask_rejects_unverified_final_before_downloading_files(
             return fixture
 
     page = UnverifiedFilePage(b"unused", raw_text="[notes](sandbox:/mnt/data/notes.md)")
-    with pytest.raises(ask.GptProAskError, match=detail) as raised:
+    with pytest.raises(ask.GptProAskError) as raised:
+        asyncio.run(ask.execute_ask_outcome(page, "Review this code"))
+
+    assert raised.value.failure == failure
+    assert raised.value.evidence is not None
+    assert raised.value.evidence.failure_stage == "answer"
+    assert raised.value.evidence.raw_extracted
+    assert page.click_count == page.fetch_count == 1
+    assert page.file_requests == []
+
+
+@pytest.mark.parametrize(
+    ("metadata", "failure"),
+    [
+        ({"model_slug": "gpt-6-thinking"}, "model_mismatch"),
+        ({}, "model_unverified"),
+    ],
+)
+def test_direct_ask_rejects_unverified_contributing_message_before_file_delivery(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any,
+    metadata: dict[str, str], failure: str,
+) -> None:
+    _install_clock(monkeypatch)
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    class MixedModelPage(_GeneratedFilePage):
+        def _conversation(self, raw_text: str) -> dict[str, object]:
+            fixture = super()._conversation(raw_text)
+            mapping = fixture["mapping"]
+            mapping["first"] = {
+                "parent": "user",
+                "message": {
+                    "id": "11111111-2222-4333-8444-666666666666",
+                    "author": {"role": "assistant"}, "channel": "final",
+                    "content": {"content_type": "text", "parts": [
+                        "[notes](sandbox:/mnt/data/notes.md)",
+                    ]},
+                    "metadata": metadata,
+                },
+            }
+            mapping["assistant"]["parent"] = "first"
+            mapping["assistant"]["message"]["channel"] = "final"
+            return fixture
+
+    page = MixedModelPage(b"unused", raw_text="Pro ending")
+    with pytest.raises(ask.GptProAskError) as raised:
         asyncio.run(ask.execute_ask_outcome(page, "Review this code"))
 
     assert raised.value.failure == failure

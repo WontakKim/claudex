@@ -234,6 +234,9 @@ class AskJobService:
             )
         if self._recover is None:
             raise ValueError("read-only answer recovery is unavailable")
+        rejection = self.get_turn_rejection(conversation_id, marker)
+        if rejection is not None:
+            raise ValueError(f"cannot recover a completed answer rejected as {rejection}")
         for job in self._jobs.values():
             if (
                 job.thread_ref is None
@@ -241,8 +244,6 @@ class AskJobService:
                 or job.nonce_marker != marker
             ):
                 continue
-            if job.failure in ask_module.MODEL_VERIFICATION_FAILURES:
-                raise ValueError(f"cannot recover a completed answer rejected as {job.failure}")
             if job.state in ACTIVE_JOB_STATES:
                 raise ValueError(
                     "recovery already pending for this turn; poll its ask_id"
@@ -391,6 +392,20 @@ class AskJobService:
         if ownership is not None and ownership.owner_ask_id == ask_id:
             del self._conversation_owners[key]
             ownership.released.set()
+
+    def get_turn_rejection(self, conversation_id: str | None, marker: str | None) -> str | None:
+        """Find a retained model rejection for the same provider turn."""
+        if conversation_id is None or marker is None:
+            return None
+        for job in self._jobs.values():
+            if (
+                job.thread_ref is not None
+                and _ownership_key(job.thread_ref) == _ownership_key(conversation_id)
+                and job.nonce_marker == marker
+                and job.failure in ask_module.MODEL_VERIFICATION_FAILURES
+            ):
+                return job.failure
+        return None
 
     def status(self, ask_id: str) -> AskJob | None:
         return self._jobs.get(ask_id)

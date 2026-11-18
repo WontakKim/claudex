@@ -1007,7 +1007,11 @@ def test_read_only_readers_reject_unverified_final_before_file_delivery(
                     )
             assert raised.value.failure == failure
             await _wait_for_poller_idle(poller)
-            assert len(page.fetch_arguments) == 2  # Auth and one conversation fetch.
+            conversation_reads = [
+                request for request in page.fetch_arguments
+                if request["url"].endswith(f"/conversation/{_CONVERSATION_ID}")
+            ]
+            assert len(conversation_reads) == 1
             assert collections == []
         finally:
             await ask_runtime.aclose()
@@ -2188,7 +2192,11 @@ def test_runtime_rejects_unverified_final_without_resubmitting(
             with pytest.raises(ask.GptProAskError) as raised:
                 await ask_runtime.ask("synthetic question")
             assert raised.value.failure == failure
-            assert len(page.fetch_arguments) == (2 if found_during_recovery else 0)
+            conversation_reads = [
+                request for request in page.fetch_arguments
+                if request["url"].endswith(f"/conversation/{_CONVERSATION_ID}")
+            ]
+            assert len(conversation_reads) == (1 if found_during_recovery else 0)
             assert submissions == ["synthetic question"]
         finally:
             await ask_runtime.aclose()

@@ -27,8 +27,8 @@ ASK_GPT_PRO_DESCRIPTION = (
     "plain-text files totaling 1.2 MB with attachments. Questions over ~35 KB "
     "are spilled into an attachment automatically, so send the full text. "
     "An inline question the composer does not retain is resubmitted "
-    "automatically as an attachment, so do not resend it yourself unless the ask "
-    "fails. "
+    "automatically as an attachment, so do not resend it yourself. A failure "
+    "alone is not permission to resend; follow its recovery guidance. "
     "Omitting thread continues this MCP session's most recently completed "
     "conversation, or starts a new one when the session is unbound, so ChatGPT "
     "can see previous turns and short follow-up questions may rely on them. Set "
@@ -115,9 +115,12 @@ RECOVER_GPT_PRO_DESCRIPTION = (
     "for a retained failed job, OR thread_ref and nonce_marker saved before a "
     "gateway restart. Never sends a prompt or attaches files. Returns a new "
     "recovery ask_id and optional source_ask_id; poll its status and result. "
-    "Pending asks cannot be recovered twice, and missing identifiers cannot "
-    "identify a server turn. Recovery is bounded and requires a finished "
-    "nonce-correlated raw answer."
+    "Use only for uncertain outcomes, not completed answers rejected as "
+    "model_mismatch (a non-Pro model) or model_unverified (missing or unusable "
+    "model metadata). Pending asks cannot be recovered twice, and missing "
+    "identifiers cannot identify a server turn. Recovery is bounded and requires "
+    "a finished nonce-correlated raw answer with verified Pro model metadata "
+    "on every contributing answer message."
 )
 RECOVER_GPT_PRO_ALLOWED_ARGUMENT_KEYS = (
     "ask_id", "thread_ref", "nonce_marker",
@@ -321,7 +324,9 @@ def build_gptpro_server(app: Any) -> Any:
                     "error_message": job.error_message,
                     "evidence": asdict(job.evidence),
                     "source_ask_id": job.source_ask_id,
-                    "recovery_guidance": _recovery_guidance(job),
+                    "recovery_guidance": _recovery_guidance(
+                        job, runtime.get_turn_rejection(job.thread_ref, job.nonce_marker),
+                    ),
                 },
             )
 
@@ -346,7 +351,9 @@ def build_gptpro_server(app: Any) -> Any:
                     f"Ask {ask_id} is still running; poll ask_gpt_pro_status.",
                 )
             if job.state == "failed":
-                return _gptpro_error_result(types, job)
+                return _gptpro_error_result(
+                    types, job, runtime.get_turn_rejection(job.thread_ref, job.nonce_marker),
+                )
             return _json_result(
                 types,
                 {
@@ -381,10 +388,10 @@ def _get_mcp_session_id(context: Any) -> str | None:
     return session_id if isinstance(session_id, str) and session_id else None
 
 
-def _recovery_guidance(job: AskJob) -> str | None:
+def _recovery_guidance(job: AskJob, turn_rejection: str | None = None) -> str | None:
     if job.state != "failed":
         return None
-    if job.failure in MODEL_VERIFICATION_FAILURES:
+    if job.failure in MODEL_VERIFICATION_FAILURES or turn_rejection is not None:
         return (
             "The completed answer was rejected, not lost. Do not retry recovery "
             "or automatically resubmit the prompt."
@@ -419,10 +426,12 @@ def _recovery_guidance(job: AskJob) -> str | None:
     )
 
 
-def _gptpro_error_result(types: Any, job: AskJob) -> Any:
+def _gptpro_error_result(
+    types: Any, job: AskJob, turn_rejection: str | None = None,
+) -> Any:
     failure = job.failure or "error"
     detail = job.error_message or "unknown error"
-    guidance = _recovery_guidance(job)
+    guidance = _recovery_guidance(job, turn_rejection)
     message = (
         f"ChatGPT Pro request failed [{failure}] at "
         f"{job.evidence.failure_stage or 'unknown'}: {detail}. "

@@ -52,6 +52,32 @@ async def _wait_until_missing(
     raise AssertionError("job was not removed")
 
 
+@pytest.mark.parametrize("rejection", ["model_mismatch", "model_unverified"])
+def test_turn_rejection_lookup_matches_only_retained_thread_and_nonce(rejection: str) -> None:
+    conversation_id = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+    marker = "[gptpro-transport-nonce:rejected]"
+
+    async def provider(question: str, **options: object) -> ask.AskOutcome:
+        raise AssertionError("read-only recovery must not submit")
+
+    async def recover(thread: str, nonce: str) -> ask.AskOutcome:
+        raise ask.GptProAskError(rejection, "rejected answer")
+
+    async def scenario() -> None:
+        service = jobs.AskJobService(provider, recover=recover)
+        try:
+            recovery = service.start_recovery(conversation_id=conversation_id, marker=marker)
+            await _wait_for_state(service, recovery.ask_id, "failed")
+            assert service.get_turn_rejection(conversation_id.upper(), marker) == rejection
+            assert service.get_turn_rejection(conversation_id, marker + "other") is None
+            assert service.get_turn_rejection("11111111-2222-4333-8444-555555555555", marker) is None
+            assert service.get_turn_rejection(None, marker) is None
+        finally:
+            await service.aclose()
+
+    asyncio.run(scenario())
+
+
 def test_lifecycle_logs_submission_admission_and_success_without_content(
     caplog: pytest.LogCaptureFixture,
 ) -> None:

@@ -344,6 +344,10 @@ shortcuts, checking the displayed selection before attaching files or entering
 the prompt. It does not infer Pro from the GPT model name, an account badge, or
 the highest available effort, and it does not open an upgrade flow.
 
+The supported display is English: **Thinking effort**, **Power**, and the
+selection status `Pro, N of N`. Localized or unrecognized displays fail closed
+before Send; locator rediscovery cannot translate them.
+
 After the final readiness and attachment checks, the gateway reads the current
 picker again. If the setting changed or cannot be verified, it stops without
 clicking Send, changing the setting again, or re-entering the prompt. A failure
@@ -352,22 +356,26 @@ not use the picker or change effort.
 
 ### Completed answer verification
 
-The gateway returns a finished, nonempty answer only when the final assistant
-message for the submitted nonce identifies a supported Pro model (currently
-`gpt-6-pro`). It uses the message's actual or resolved model ID, not the default
-model, status, a model name in the answer text, or metadata from other messages.
+The gateway returns a finished, nonempty answer only when every assistant
+message contributing answer text or linked files for the submitted nonce
+identifies a supported Pro model (currently `gpt-6-pro`). A Pro terminal message
+does not validate earlier answer messages. The gateway uses each contributing
+message's actual or resolved model ID, not the default model, status, a model
+name in the text, or metadata from excluded commentary, tools, or prior turns.
 This check applies to direct answers and to both automatic and manual recovery.
 
-- `model_mismatch`: The final message identifies a model other than a supported
-  Pro model.
-- `model_unverified`: The final message has missing, malformed, or conflicting
-  model metadata, so the gateway cannot verify it as Pro.
+- `model_mismatch`: A contributing answer message identifies a model other than
+  a supported Pro model.
+- `model_unverified`: A contributing answer message has missing, malformed, or
+  conflicting model metadata, so the gateway cannot verify the answer as Pro.
 
 Both failures mean the gateway found a completed answer but rejected it. It does
 not return the answer, download its files, bind the thread, continue polling, or
 resubmit the prompt. Do not retry recovery for either failure. While the failure
-record is retained, the gateway rejects recovery lookups for that turn. After a
-restart or expiry, any read-only lookup still has to verify the final message.
+record is retained, the gateway rejects recovery lookups for that thread and
+nonce, and status/result guidance for earlier failed asks targeting the same
+turn also says not to recover or resubmit. After a restart or expiry, any
+read-only lookup still has to verify all contributing answer messages.
 
 ### Evidence and failed-turn recovery
 
@@ -410,9 +418,12 @@ not request bodies, headers, raw file IDs, or attachment content.
 observed from a correlated ChatGPT event. `generation_observed` and
 `answer_seen` do not imply `raw_extracted`: only a completed, correlated raw
 answer establishes that. `failure_stage` identifies where execution stopped;
-`recovery_failure` and `recovery_detail` report why read-only recovery failed. The original
-failure normally remains primary, unless recovery finds a completed answer that
-fails model verification. `recovery` is `not_attempted`, `polling`,
+`recovery_failure` and `recovery_detail` report why read-only recovery failed.
+During automatic recovery, the original failure normally remains primary; if a
+completed answer fails model verification, the model failure becomes primary.
+Manual recovery reports its own failure on a separate job and leaves the source
+job's failure and evidence unchanged, even when its recovery guidance changes
+because that turn was rejected. `recovery` is `not_attempted`, `polling`,
 `unavailable`, `exhausted`, or `recovered`. Null and false fields mean the
 observation was not made, not that
 ChatGPT definitely did nothing.

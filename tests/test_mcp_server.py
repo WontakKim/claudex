@@ -129,6 +129,9 @@ class FakeAskRuntime:
     def bind_thread(self, session_id: str, thread_ref: str) -> None:
         self._thread_registry.bind(session_id, thread_ref)
 
+    def get_turn_rejection(self, conversation_id: str | None, marker: str | None) -> str | None:
+        return self._job_service.get_turn_rejection(conversation_id, marker)
+
     def job_status(self, ask_id: str) -> jobs.AskJob | None:
         return self._job_service.status(ask_id)
 
@@ -1579,6 +1582,60 @@ def test_mcp_rejects_unverified_final_on_recovery_lookup(failure: str, lookup: s
         assert detail["evidence"]["failure_stage"] == "answer"
         assert detail["recovery_guidance"] == status["recovery_guidance"]
         assert "answer" not in detail and "files" not in detail
+
+
+@pytest.mark.parametrize("rejection", ["model_mismatch", "model_unverified"])
+def test_source_guidance_reflects_manual_recovery_rejection_without_rewriting_failure(
+    rejection: str,
+) -> None:
+    class RejectingRecoveryRuntime(FakeAskRuntime):
+        async def _recover(self, conversation_id: str, marker: str) -> ask.AskOutcome:
+            raise ask.GptProAskError(rejection, "completed answer rejected")
+
+    runtime = RejectingRecoveryRuntime(
+        error=ask.GptProAskError("echo_timeout", "confirmation lost"),
+    )
+    with _mcp_client(runtime) as client:
+        _response, headers = _initialize(client)
+        submitted = _json_tool_payload(_call_tool(client, headers, "ask_gpt_pro", {
+            "question": "synthetic original", "thread": _CONVERSATION_A,
+        }))
+        ask_id = submitted["ask_id"]
+        _finish_job(client, runtime, ask_id)
+        before = _json_tool_payload(_call_tool(client, headers, "ask_gpt_pro_status", {
+            "ask_id": ask_id,
+        }))
+        assert "recover_gpt_pro" in before["recovery_guidance"]
+        recovery = _json_tool_payload(_call_tool(client, headers, "recover_gpt_pro", {
+            "ask_id": ask_id,
+        }))
+        assert client.portal is not None
+
+        async def wait_for_rejection() -> None:
+            deadline = asyncio.get_running_loop().time() + 1
+            while asyncio.get_running_loop().time() < deadline:
+                if runtime.job_status(recovery["ask_id"]).state == "failed":
+                    return
+                await asyncio.sleep(0)
+            raise AssertionError("manual recovery did not fail")
+
+        client.portal.call(wait_for_rejection)
+        after = _json_tool_payload(_call_tool(client, headers, "ask_gpt_pro_status", {
+            "ask_id": ask_id,
+        }))
+        result = _call_tool(client, headers, "ask_gpt_pro_result", {"ask_id": ask_id})
+        detail = json.loads(result["content"][1]["text"])
+
+        assert after["failure"] == detail["failure"] == before["failure"] == "echo_timeout"
+        assert after["evidence"] == before["evidence"]
+        assert after["error_message"] == before["error_message"]
+        assert "Do not retry recovery" in after["recovery_guidance"]
+        assert detail["recovery_guidance"] == after["recovery_guidance"]
+        assert result["isError"] is True
+        assert runtime.job_status(recovery["ask_id"]).failure == rejection
+        assert runtime.questions == ["synthetic original"]
+        retry = _call_tool(client, headers, "recover_gpt_pro", {"ask_id": ask_id})
+        assert retry["isError"] is True
 
 
 def test_recover_failed_ask_read_only_and_poll_new_job() -> None:

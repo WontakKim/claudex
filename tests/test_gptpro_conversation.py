@@ -102,28 +102,58 @@ def test_rejects_non_pro_model(slug: str) -> None:
         ({"model_slug": "gpt-6-pro", "resolved_model_slug": "gpt-6-thinking"}, "model_unverified"),
     ],
 )
-def test_verifies_answer_model_from_final_message_only(
+def test_verifies_selected_answer_ignoring_excluded_messages(
     metadata: object, verification: str,
 ) -> None:
     prior = _node("prior", "user", "assistant", ["earlier text"])
     user = _node("user", None, "user", [NONCE_MARKER])
-    final = _node("final", "prior", "assistant", ["claimed gpt-6-pro"],
+    commentary = _node("commentary", "prior", "assistant", ["progress"], channel="commentary")
+    final = _node("final", "commentary", "assistant", ["claimed gpt-6-pro"],
                   channel="final", end_turn=True)
     tool = _node("tool", "final", "tool", ["tool output"])
     later_user = _node("later-user", "tool", "user", ["another prompt"])
     later_answer = _node("later-answer", "later-user", "assistant", ["later answer"],
                          channel="final", end_turn=True)
-    for node in (user, prior, tool, later_answer):
-        node["message"]["metadata"] = {"model_slug": "gpt-6-pro"}
+    for node in (user, prior, commentary, tool, later_answer):
+        node["message"]["metadata"] = {"model_slug": "gpt-6-thinking"}
     if metadata is not None:
         final["message"]["metadata"] = metadata
-    fixture = _conversation(user, prior, final, tool, later_user, later_answer,
+    fixture = _conversation(user, prior, commentary, final, tool, later_user, later_answer,
                             current_node="later-answer")
 
     turn = conversation.extract_assistant_turn(fixture, NONCE_MARKER)
 
     assert turn is not None and turn.finished
     assert turn.text == "claimed gpt-6-pro"
+    assert turn.model_verification == verification
+
+
+@pytest.mark.parametrize("channel", [None, "final"])
+@pytest.mark.parametrize(
+    ("metadata", "verification"),
+    [
+        ({"model_slug": "gpt-6-thinking"}, "model_mismatch"),
+        ({}, "model_unverified"),
+        ({"model_slug": "gpt-6-pro"}, "verified_pro"),
+    ],
+)
+def test_verifies_every_contributing_answer_message(
+    channel: str | None, metadata: dict[str, str], verification: str,
+) -> None:
+    user = _node("user", None, "user", [NONCE_MARKER])
+    first = _node("first", "user", "assistant", ["[notes](sandbox:/mnt/data/notes.md)"],
+                  channel=channel)
+    first["message"]["metadata"] = metadata
+    final = _node("final", "first", "assistant", ["final answer"],
+                  channel=channel, end_turn=True)
+    final["message"]["metadata"] = {"model_slug": "gpt-6-pro"}
+    fixture = _conversation(user, first, final, current_node="final")
+
+    turn = conversation.extract_assistant_turn(fixture, NONCE_MARKER)
+
+    assert turn is not None and turn.finished
+    assert turn.text == "[notes](sandbox:/mnt/data/notes.md)\n\nfinal answer"
+    assert len(turn.file_references) == 1
     assert turn.model_verification == verification
 
 

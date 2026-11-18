@@ -118,6 +118,11 @@ class LazyAskRuntime:
     def bind_thread(self, session_id: str, thread_ref: str) -> None:
         self._thread_registry.bind(session_id, thread_ref)
 
+    def get_turn_rejection(self, conversation_id: str | None, marker: str | None) -> str | None:
+        if self._job_service is None:
+            return None
+        return self._job_service.get_turn_rejection(conversation_id, marker)
+
     def job_status(self, ask_id: str) -> jobs.AskJob | None:
         if self._job_service is None:
             return None

@@ -336,13 +336,22 @@ def extract_assistant_turn(
 
     texts = [text for text in map(_message_text, answer) if text]
     finished = answer[-1].get("end_turn") is True
+    model_verification: AnswerModelVerification = "model_unverified"
+    if finished:
+        verifications = {
+            _verify_answer_model(message)
+            for message in answer
+            if _message_text(message) or message is answer[-1]
+        }
+        if verifications == {"verified_pro"}:
+            model_verification = "verified_pro"
+        elif "model_unverified" not in verifications:
+            model_verification = "model_mismatch"
     return AssistantTurn(
         text="\n\n".join(texts),
         finished=finished,
         file_references=_file_references(answer),
-        model_verification=(
-            _verify_answer_model(answer[-1]) if finished else "model_unverified"
-        ),
+        model_verification=model_verification,
     )
 
 
