@@ -391,6 +391,12 @@ class DetachPoller:
         if turn is None or not turn.finished or not turn.text:
             return status
         self._registrations.pop(registration_id, None)
+        try:
+            ask.require_verified_pro(turn)
+        except GptProAskError as exc:
+            if not registration.future.done():
+                registration.future.set_exception(exc)
+            return status
         if not turn.file_references:
             self._resolve(registration, turn, (), True)
             return status
@@ -880,6 +886,19 @@ class AskRuntime:
                     raise
                 except Exception as recovery_exc:
                     future.cancel()
+                    if (
+                        isinstance(recovery_exc, GptProAskError)
+                        and recovery_exc.failure in ask.MODEL_VERIFICATION_FAILURES
+                    ):
+                        recovery_exc.evidence = replace(
+                            evidence or AskEvidence(conversation_id=captured_conversation_id),
+                            failure_stage="answer", submission="confirmed",
+                            generation_observed=True, answer_seen=True, raw_extracted=True,
+                            recovery="exhausted", recovery_failure=recovery_exc.failure,
+                            recovery_detail=str(recovery_exc),
+                        )
+                        notify_recovery_evidence(recovery_exc.evidence)
+                        raise recovery_exc from exc
                     recovery_failure = (
                         recovery_exc.failure
                         if isinstance(recovery_exc, ask.GptProAskError)

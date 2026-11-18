@@ -46,6 +46,7 @@ from claudex.gptpro.selectors import (
     MODAL_BUTTON_TEXTS,
     MODAL_SELECTOR,
     PAGE_FETCH_PROBE_JS,
+    PRO_CONTROLS_JS,
     RELOCK_USER_ECHO_PROBE_JS,
     SEND_BUTTON_READY_PROBE_JS,
     STOP_BUTTON_SELECTOR,
@@ -54,6 +55,27 @@ from claudex.gptpro.selectors import (
     USER_ECHO_PROBE_JS,
     USER_MESSAGE_SELECTOR,
     VISIBLE_MODAL_PROBE_JS,
+)
+
+
+def _pro_control_probe(result: str) -> str:
+    return """(form, args) => {
+      if (!(__CURRENT__)(form, args.composerSelector)) return null;
+      const ui = (__CONTROLS__)(form, args.pickerSelector, args.powerSelector);
+      return __RESULT__;
+    }""".replace("__CURRENT__", attachments.COMPOSER_FORM_CURRENT_JS).replace(
+        "__CONTROLS__", PRO_CONTROLS_JS,
+    ).replace("__RESULT__", result)
+
+
+PRO_STATE_JS = _pro_control_probe(
+    "{picker: !!ui.picker, expanded: ui.expanded, linkedMenu: !!ui.menu, "
+    "level: ui.pickerLevel, feedback: ui.feedback}"
+)
+PRO_PICKER_HANDLE_JS = _pro_control_probe("ui.expanded || ui.pickerLevel === 'Pro' ? null : ui.picker")
+PRO_POWER_HANDLE_JS = _pro_control_probe(
+    "ui.feedback && Object.keys(args.feedback).every(key => args.feedback[key] === ui.feedback[key]) "
+    "? ui.power : null"
 )
 
 COMPOSER_ELEMENT_HANDLE_JS = """(form, selector) => {
@@ -94,6 +116,9 @@ COMPOSER_SLICE_SECONDS = 2.0
 SEND_READY_TIMEOUT_SECONDS = 30.0
 # Allow hydration and re-renders to settle before treating a locator fault as drift.
 LOCATOR_SETTLE_SECONDS = 4.0
+PRO_CONTROL_WAIT_SECONDS = 2.0
+PRO_CONTROL_RECOVERY_SECONDS = 30.0
+MAX_POWER_STEPS = 10
 PRE_SUBMIT_STABILITY_TIMEOUT_SECONDS = 10.0
 PRE_SUBMIT_POLL_INTERVAL_SECONDS = 0.2
 PRE_SUBMIT_STABLE_TICKS = 3
@@ -124,9 +149,14 @@ FailureClassification = Literal[
     "submit_failed",
     "echo_timeout",
     "no_raw_turn",
+    "model_mismatch",
+    "model_unverified",
     "timeout",
     "error",
 ]
+
+
+MODEL_VERIFICATION_FAILURES = frozenset({"model_mismatch", "model_unverified"})
 
 
 @dataclass(frozen=True)
@@ -212,6 +242,19 @@ class GptProAskError(Exception):
         super().__init__(message)
         self.failure = failure
         self.evidence: AskEvidence | None = None
+
+
+def require_verified_pro(turn: AssistantTurn) -> None:
+    """Reject a completed turn before releasing its answer or files."""
+    if turn.model_verification == "verified_pro":
+        return
+    if turn.model_verification == "model_mismatch":
+        raise GptProAskError(
+            "model_mismatch", "the completed answer was not a verified Pro model response"
+        )
+    raise GptProAskError(
+        "model_unverified", "the completed answer has missing or unusable model metadata"
+    )
 
 
 class GptProSessionExpiredError(GptProAskError):
@@ -749,10 +792,12 @@ class _AskExecution:
         self, target: locators.LocatorTarget, selector: str | None = None,
     ) -> LocatorCheck:
         selector = self._selector(target) if selector is None else selector
+        scope = {"picker_selector": self._selector("picker")} if target == "power" else {}
         check = await self._await_page_operation(
             check_locator(
                 self.page.evaluate, target, selector,
                 composer_selector=(self.composer_selector or self._selector("composer")),
+                **scope,
             )
         )
         if self.locator_environment is None and check.lang:
@@ -784,12 +829,14 @@ class _AskExecution:
         async def evaluate(expression: str, args: Any) -> Any:
             return await self._await_page_operation(self.page.evaluate(expression, args))
 
+        scope = {"picker_selector": self._selector("picker")} if target == "power" else {}
         try:
             result = await self._await_page_operation(
                 self.locator_book.rediscover(
                     evaluate, target, self.locator_environment or "unknown",
                     failed_selector=self._selector(target),
                     composer_selector=self._selector("composer"), deadline=end,
+                    **scope,
                 ),
                 maximum_seconds=end - _monotonic(),
             )
@@ -995,6 +1042,127 @@ class _AskExecution:
             "navigation_failed", f"the ChatGPT composer did not become visible ({detail})"
         ) from last_error
 
+    def _pro_probe_args(self) -> dict[str, str | None]:
+        return {
+            "composerSelector": self.composer_selector,
+            "pickerSelector": self._selector("picker"),
+            "powerSelector": self._selector("power"),
+        }
+
+    async def _pro_state(self) -> dict[str, Any]:
+        from playwright.async_api import Error as PlaywrightError
+
+        if self.composer_form_handle is None:
+            return {}
+        try:
+            state = await self._await_page_operation(
+                self.composer_form_handle.evaluate(PRO_STATE_JS, self._pro_probe_args()),
+            )
+        except PlaywrightError:
+            return {}
+        return state if isinstance(state, dict) else {}
+
+    async def _act_on_pro_control(
+        self, target: Literal["picker", "power"], key: str | None = None,
+        feedback: dict[str, Any] | None = None,
+    ) -> None:
+        from playwright.async_api import Error as PlaywrightError
+
+        args = {**self._pro_probe_args(), "feedback": feedback}
+        probe = PRO_PICKER_HANDLE_JS if target == "picker" else PRO_POWER_HANDLE_JS
+        handle = None
+        try:
+            handle = await self._await_page_operation(
+                self.composer_form_handle.evaluate_handle(probe, args),
+            )
+            element = handle.as_element()
+            if element is None:
+                raise GptProAskError("locator_unresolved", f"the ChatGPT {target} control changed")
+            timeout = self._timeout_ms(PRO_CONTROL_WAIT_SECONDS)
+            await self._await_page_operation(
+                element.click(timeout=timeout) if key is None else element.press(key, timeout=timeout),
+            )
+        except PlaywrightError as exc:
+            self._settle_rediscovered(target, "failure", "could not use the rediscovered Pro control")
+            raise GptProAskError("locator_unresolved", f"could not use the ChatGPT {target} control") from exc
+        finally:
+            if handle is not None:
+                await attachments._dispose_handle(handle)
+
+    async def _wait_for_pro_state(
+        self, predicate: Callable[[dict[str, Any]], bool],
+    ) -> dict[str, Any]:
+        end = min(self.deadline, _monotonic() + PRO_CONTROL_WAIT_SECONDS)
+        while True:
+            state = await self._pro_state()
+            if predicate(state) or _monotonic() >= end:
+                return state
+            if not state and self.composer_selector is not None:
+                # Before entering any data, a uniquely verified replacement form is safe.
+                check = await self._check_locator("composer", self.composer_selector)
+                if check.verdict == "valid":
+                    previous_form = self.composer_form_handle
+                    await self._bind_composer_form(self.composer_selector)
+                    await attachments._dispose_handle(previous_form)
+            await self._pause(min(POLL_INTERVAL_SECONDS, end - _monotonic()))
+
+    async def _wait_for_pro_feedback(self, previous: dict[str, Any] | None = None) -> dict[str, Any] | None:
+        state = await self._wait_for_pro_state(lambda state: state.get("feedback") not in (None, previous))
+        feedback = state.get("feedback")
+        return feedback if feedback != previous else None
+
+    @staticmethod
+    def _has_selected_pro(state: Mapping[str, Any]) -> bool:
+        return (state.get("picker") is True and state.get("expanded") is False
+                and state.get("level") == "Pro")
+
+    async def _rediscover_pro_control(self, target: Literal["picker", "power"]) -> bool:
+        check = await self._check_locator(target)
+        if check.verdict != "fault" or check.candidates != 1:
+            return False
+        await self._rediscover(target, check, _monotonic() + PRO_CONTROL_RECOVERY_SECONDS)
+        return True
+
+    async def _select_pro(self) -> None:
+        state = await self._wait_for_pro_state(lambda state: state.get("picker") is True)
+        if not state.get("picker") and await self._rediscover_pro_control("picker"):
+            state = await self._pro_state()
+        if not state.get("picker"):
+            self._settle_rediscovered("picker", "failure", "the model picker could not be verified")
+            raise GptProAskError("locator_unresolved", "the ChatGPT model picker is unavailable")
+        if self._has_selected_pro(state):
+            self._settle_rediscovered("picker", "success")
+            return
+        if not state.get("expanded"):
+            await self._act_on_pro_control("picker")
+        feedback = await self._wait_for_pro_feedback()
+        if feedback is None and await self._rediscover_pro_control("power"):
+            feedback = await self._wait_for_pro_feedback()
+        if feedback is None:
+            if not (await self._pro_state()).get("linkedMenu"):
+                self._settle_rediscovered("picker", "failure", "the model picker did not open its linked menu")
+            self._settle_rediscovered("power", "failure", "the Power control did not provide feedback")
+            raise GptProAskError("locator_unresolved", "the ChatGPT Power control is unavailable")
+        for _ in range(MAX_POWER_STEPS):
+            if feedback["level"] == "Pro":
+                break
+            if feedback["position"] >= feedback["max"]:
+                raise GptProAskError("locator_unresolved", "ChatGPT Power does not offer Pro")
+            await self._act_on_pro_control("power", "ArrowRight", feedback)
+            next_feedback = await self._wait_for_pro_feedback(feedback)
+            if (next_feedback is None or next_feedback["position"] != feedback["position"] + 1 or
+                    (next_feedback["min"], next_feedback["max"]) != (feedback["min"], feedback["max"])):
+                self._settle_rediscovered("power", "failure", "the Power control did not advance as verified")
+                raise GptProAskError("locator_unresolved", "ChatGPT Power did not advance as verified")
+            feedback = next_feedback
+        if feedback["level"] != "Pro":
+            raise GptProAskError("locator_unresolved", "ChatGPT Power did not reach Pro")
+        await self._act_on_pro_control("power", "Escape", feedback)
+        if not self._has_selected_pro(await self._wait_for_pro_state(self._has_selected_pro)):
+            raise GptProAskError("locator_unresolved", "the ChatGPT composer did not retain Pro")
+        self._settle_rediscovered("picker", "success")
+        self._settle_rediscovered("power", "success")
+
     async def _attach_files(self) -> None:
         self._ensure_deadline()
         await self._ensure_composer_form_current()
@@ -1094,6 +1262,8 @@ class _AskExecution:
         )
         readback_handle: Any | None = None
         try:
+            if not self._has_selected_pro(await self._pro_state()):
+                raise GptProAskError("locator_unresolved", "ChatGPT Pro is no longer verified before input")
             try:
                 await self._await_page_operation(composer_handle.fill(self.prompt))
             except _DeadlineExpired:
@@ -1399,6 +1569,13 @@ class _AskExecution:
                 raise GptProAskError(
                     "submit_failed", "a client submission attempt is already reserved",
                 )
+            pro_state = await self._pro_state()
+            if self.has_submitted:
+                raise GptProAskError(
+                    "submit_failed", "a client submission attempt is already reserved",
+                )
+            if not self._has_selected_pro(pro_state):
+                raise GptProAskError("submit_failed", "ChatGPT Pro is no longer verified before Send")
             self.has_submitted = True
             self._record_evidence(submission="uncertain")
             await self._await_page_operation(
@@ -1702,6 +1879,7 @@ class _AskExecution:
                     )
                     if turn.finished:
                         self._record_evidence(raw_extracted=True)
+                        require_verified_pro(turn)
                         self.finished_turn = turn
                         return turn.text
             if attempt + 1 < API_TURN_ATTEMPTS:
@@ -1870,6 +2048,7 @@ class _AskExecution:
                 await self._navigate()
                 self.stage = "composer"
                 await self._wait_for_composer()
+                await self._select_pro()
                 if self.attachment_paths:
                     self.stage = "attachments"
                     await self._attach_files()

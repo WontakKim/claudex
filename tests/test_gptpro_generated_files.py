@@ -75,6 +75,7 @@ def _conversation(
             "channel": "final",
             "recipient": "all",
             "status": "finished_successfully" if end_turn else "in_progress",
+            "metadata": {"model_slug": "gpt-6-pro"} if end_turn else {},
             "end_turn": end_turn,
         },
     }

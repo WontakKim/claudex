@@ -8,7 +8,7 @@ from dataclasses import asdict
 from typing import Any
 
 from claudex.gptpro import conversation
-from claudex.gptpro.ask import GptProAskError
+from claudex.gptpro.ask import MODEL_VERIFICATION_FAILURES, GptProAskError
 from claudex.gptpro.jobs.models import AskJob
 
 ASK_GPT_PRO_DESCRIPTION = (
@@ -27,8 +27,8 @@ ASK_GPT_PRO_DESCRIPTION = (
     "plain-text files totaling 1.2 MB with attachments. Questions over ~35 KB "
     "are spilled into an attachment automatically, so send the full text. "
     "An inline question the composer does not retain is resubmitted "
-    "automatically as an attachment, so do not resend it yourself unless the ask "
-    "fails. "
+    "automatically as an attachment, so do not resend it yourself. A failure "
+    "alone is not permission to resend; follow its recovery guidance. "
     "Omitting thread continues this MCP session's most recently completed "
     "conversation, or starts a new one when the session is unbound, so ChatGPT "
     "can see previous turns and short follow-up questions may rely on them. Set "
@@ -48,17 +48,20 @@ _GPTPRO_FAILURE_ACTIONS_DESCRIPTION = (
     "- expired: queue admission ended before this job ran; a recovery job may "
     "still refer to an earlier submitted turn.\n"
     "- no_raw_turn: recovery polling did not obtain a finished nonce-correlated answer.\n"
+    "- model_mismatch / model_unverified: the completed answer was rejected because "
+    "it was not verified as Pro; do not retry recovery or automatically resubmit.\n"
     "- timeout / echo_timeout: submission may have reached ChatGPT; use read-only recovery.\n"
     "- rate_limited_timeout: wait, then use read-only recovery if submitted.\n"
     "- session_expired / challenge: run claudex-gateway gptpro login; "
     "recover a known turn rather than resubmitting blindly.\n"
-    "- locator_unresolved: composer or send button was not found before submission; "
-    "rediscovery did not recover it; nothing was sent, retrying is safe, and "
-    "repeated failures suspend rediscovery for an hour.\n"
+    "- locator_unresolved: the composer, Send button, or required Pro selection "
+    "could not be verified before submission; nothing was sent. Repeated failed "
+    "locator rediscoveries can suspend rediscovery for an hour.\n"
     "- submit_failed / navigation_failed / error: inspect evidence; recover if "
     "submission may have happened.\n"
-    "Use recover_gpt_pro with a failed ask_id, or saved thread_ref and nonce_marker "
-    "after restart. Unknown outcome is not proof that no answer exists."
+    "For an uncertain outcome, use recover_gpt_pro with a failed ask_id, or saved "
+    "thread_ref and nonce_marker after restart. Unknown outcome is not proof that "
+    "no answer exists."
 )
 ASK_GPT_PRO_STATUS_DESCRIPTION = (
     "Poll a background ChatGPT Pro ask and return its current state, latest "
@@ -112,9 +115,12 @@ RECOVER_GPT_PRO_DESCRIPTION = (
     "for a retained failed job, OR thread_ref and nonce_marker saved before a "
     "gateway restart. Never sends a prompt or attaches files. Returns a new "
     "recovery ask_id and optional source_ask_id; poll its status and result. "
-    "Pending asks cannot be recovered twice, and missing identifiers cannot "
-    "identify a server turn. Recovery is bounded and requires a finished "
-    "nonce-correlated raw answer."
+    "Use only for uncertain outcomes, not completed answers rejected as "
+    "model_mismatch (a non-Pro model) or model_unverified (missing or unusable "
+    "model metadata). Pending asks cannot be recovered twice, and missing "
+    "identifiers cannot identify a server turn. Recovery is bounded and requires "
+    "a finished nonce-correlated raw answer with verified Pro model metadata "
+    "on every contributing answer message."
 )
 RECOVER_GPT_PRO_ALLOWED_ARGUMENT_KEYS = (
     "ask_id", "thread_ref", "nonce_marker",
@@ -318,7 +324,9 @@ def build_gptpro_server(app: Any) -> Any:
                     "error_message": job.error_message,
                     "evidence": asdict(job.evidence),
                     "source_ask_id": job.source_ask_id,
-                    "recovery_guidance": _recovery_guidance(job),
+                    "recovery_guidance": _recovery_guidance(
+                        job, runtime.get_turn_rejection(job.thread_ref, job.nonce_marker),
+                    ),
                 },
             )
 
@@ -343,7 +351,9 @@ def build_gptpro_server(app: Any) -> Any:
                     f"Ask {ask_id} is still running; poll ask_gpt_pro_status.",
                 )
             if job.state == "failed":
-                return _gptpro_error_result(types, job)
+                return _gptpro_error_result(
+                    types, job, runtime.get_turn_rejection(job.thread_ref, job.nonce_marker),
+                )
             return _json_result(
                 types,
                 {
@@ -378,9 +388,14 @@ def _get_mcp_session_id(context: Any) -> str | None:
     return session_id if isinstance(session_id, str) and session_id else None
 
 
-def _recovery_guidance(job: AskJob) -> str | None:
+def _recovery_guidance(job: AskJob, turn_rejection: str | None = None) -> str | None:
     if job.state != "failed":
         return None
+    if job.failure in MODEL_VERIFICATION_FAILURES or turn_rejection is not None:
+        return (
+            "The completed answer was rejected, not lost. Do not retry recovery "
+            "or automatically resubmit the prompt."
+        )
     if job.evidence.failure_stage == "queue" and job.evidence.recovery == "unavailable":
         return (
             "Recovery queue admission expired before read-only polling. The "
@@ -411,10 +426,12 @@ def _recovery_guidance(job: AskJob) -> str | None:
     )
 
 
-def _gptpro_error_result(types: Any, job: AskJob) -> Any:
+def _gptpro_error_result(
+    types: Any, job: AskJob, turn_rejection: str | None = None,
+) -> Any:
     failure = job.failure or "error"
     detail = job.error_message or "unknown error"
-    guidance = _recovery_guidance(job)
+    guidance = _recovery_guidance(job, turn_rejection)
     message = (
         f"ChatGPT Pro request failed [{failure}] at "
         f"{job.evidence.failure_stage or 'unknown'}: {detail}. "

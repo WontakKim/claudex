@@ -850,6 +850,7 @@ def _detached_conversation(marker: str, text: str) -> dict[str, object]:
                     "author": {"role": "assistant"},
                     "content": {"content_type": "text", "parts": [text]},
                     "status": "finished_successfully",
+                    "metadata": {"model_slug": "gpt-6-pro"},
                     "end_turn": True,
                 },
             },
@@ -961,6 +962,59 @@ def test_detach_poller_completes_finished_marker_turn_and_closes_tab() -> None:
         }
         assert page.close_calls == 1
         await poller.aclose()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("mode", ["detached", "manual"])
+@pytest.mark.parametrize(
+    ("metadata", "failure"),
+    [
+        ({"model_slug": "gpt-6-thinking"}, "model_mismatch"),
+        ({"default_model_slug": "gpt-6-pro"}, "model_unverified"),
+    ],
+)
+def test_read_only_readers_reject_unverified_final_before_file_delivery(
+    monkeypatch: pytest.MonkeyPatch, mode: str, metadata: dict[str, str], failure: str,
+) -> None:
+    monkeypatch.setenv("GPTPRO_RAW_TURN_RECOVERY_SECONDS", "60")
+    marker = "[gptpro-transport-nonce:unverified-final]"
+    final = _detached_conversation(marker, "[notes](sandbox:/mnt/data/notes.md)")
+    assistant = final["mapping"]["assistant"]["message"]  # type: ignore[index]
+    assistant["id"] = "11111111-2222-4333-8444-555555555555"
+    assistant["metadata"] = metadata
+    page = _PollerFakePage(marker, [(200, final)])
+    context = _PollerFakeContext(page)
+    collections: list[Any] = []
+
+    async def collect(*args: Any) -> tuple[tuple[Any, ...], bool]:
+        collections.append(args)
+        return (), True
+
+    monkeypatch.setattr(runtime.generated_files, "collect_generated_files", collect)
+
+    async def scenario() -> None:
+        ask_runtime = runtime.AskRuntime()
+        poller = runtime.DetachPoller(lambda: asyncio.sleep(0, result=context))
+        ask_runtime._poller = poller
+        try:
+            with pytest.raises(ask.GptProAskError) as raised:
+                if mode == "manual":
+                    await ask_runtime.recover(_CONVERSATION_ID, marker)
+                else:
+                    await poller.register(
+                        _CONVERSATION_ID, marker, deadline=runtime._monotonic() + 60,
+                    )
+            assert raised.value.failure == failure
+            await _wait_for_poller_idle(poller)
+            conversation_reads = [
+                request for request in page.fetch_arguments
+                if request["url"].endswith(f"/conversation/{_CONVERSATION_ID}")
+            ]
+            assert len(conversation_reads) == 1
+            assert collections == []
+        finally:
+            await ask_runtime.aclose()
 
     asyncio.run(scenario())
 
@@ -2087,6 +2141,63 @@ def test_auto_recovery_reports_real_conversation_challenge(
             assert page.close_calls == 1
             assert ask_runtime._poller._registrations == {}
             assert ask_runtime._ask_semaphore._value == 1
+        finally:
+            await ask_runtime.aclose()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("found_during_recovery", [True, False])
+@pytest.mark.parametrize(
+    ("metadata", "failure"),
+    [
+        ({"model_slug": "gpt-6-thinking"}, "model_mismatch"),
+        ({}, "model_unverified"),
+    ],
+)
+def test_runtime_rejects_unverified_final_without_resubmitting(
+    monkeypatch: pytest.MonkeyPatch, found_during_recovery: bool,
+    metadata: dict[str, str], failure: str,
+) -> None:
+    _RuntimeFakes(monkeypatch, [_FakeContext()])
+    monkeypatch.setenv("GPTPRO_RAW_TURN_RECOVERY_SECONDS", "60")
+    marker = "[gptpro-transport-nonce:auto-unverified]"
+    final = _detached_conversation(marker, "unverified answer")
+    final["mapping"]["assistant"]["message"]["metadata"] = metadata  # type: ignore[index]
+    page = _PollerFakePage(marker, [(200, final)])
+    context = _PollerFakeContext(page)
+    submissions: list[str] = []
+
+    async def execute(_page: _FakePage, question: str, **options: Any) -> ask.AskOutcome:
+        submissions.append(question)
+        callbacks = options["callbacks"]
+        callbacks.on_marker(marker)
+        callbacks.on_conversation_id(_CONVERSATION_ID)
+        initial = ask.GptProAskError(
+            "no_raw_turn" if found_during_recovery else failure, "initial error",
+        )
+        initial.evidence = ask.AskEvidence(
+            submission="confirmed", conversation_id=_CONVERSATION_ID,
+            failure_stage="answer",
+        )
+        raise initial
+
+    monkeypatch.setattr(runtime.ask, "execute_ask_outcome", execute)
+
+    async def scenario() -> None:
+        ask_runtime = runtime.AskRuntime()
+        poller = runtime.DetachPoller(lambda: asyncio.sleep(0, result=context))
+        ask_runtime._poller = poller
+        try:
+            with pytest.raises(ask.GptProAskError) as raised:
+                await ask_runtime.ask("synthetic question")
+            assert raised.value.failure == failure
+            conversation_reads = [
+                request for request in page.fetch_arguments
+                if request["url"].endswith(f"/conversation/{_CONVERSATION_ID}")
+            ]
+            assert len(conversation_reads) == (1 if found_during_recovery else 0)
+            assert submissions == ["synthetic question"]
         finally:
             await ask_runtime.aclose()
 

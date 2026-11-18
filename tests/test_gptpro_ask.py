@@ -75,6 +75,8 @@ class _FakeElementHandle:
         return self
 
     async def evaluate(self, expression: str, argument: Any = None) -> Any:
+        if expression == ask.PRO_STATE_JS:
+            return {"picker": True, "expanded": False, "level": "Pro"} if self.page.form_is_current else None
         if expression == ask.COMPOSER_ELEMENT_READBACK_PROBE_JS:
             return await self.page.evaluate(
                 selectors.COMPOSER_READBACK_PROBE_JS,
@@ -323,6 +325,7 @@ class _FakePage:
                             "parts": [raw_text],
                         },
                         "status": "finished_successfully",
+                        "metadata": {"model_slug": "gpt-6-pro"},
                         "end_turn": True,
                     },
                 },
@@ -2355,6 +2358,83 @@ class _GeneratedFilePage(_FakePage):
         return await super().evaluate(expression, argument)
 
 
+@pytest.mark.parametrize(
+    ("metadata", "failure"),
+    [
+        ({"model_slug": "gpt-6-thinking"}, "model_mismatch"),
+        (None, "model_unverified"),
+    ],
+)
+def test_direct_ask_rejects_unverified_final_before_downloading_files(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any,
+    metadata: dict[str, str] | None, failure: str,
+) -> None:
+    _install_clock(monkeypatch)
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    class UnverifiedFilePage(_GeneratedFilePage):
+        def _conversation(self, raw_text: str) -> dict[str, object]:
+            fixture = super()._conversation(raw_text)
+            fixture["mapping"]["assistant"]["message"]["metadata"] = metadata
+            return fixture
+
+    page = UnverifiedFilePage(b"unused", raw_text="[notes](sandbox:/mnt/data/notes.md)")
+    with pytest.raises(ask.GptProAskError) as raised:
+        asyncio.run(ask.execute_ask_outcome(page, "Review this code"))
+
+    assert raised.value.failure == failure
+    assert raised.value.evidence is not None
+    assert raised.value.evidence.failure_stage == "answer"
+    assert raised.value.evidence.raw_extracted
+    assert page.click_count == page.fetch_count == 1
+    assert page.file_requests == []
+
+
+@pytest.mark.parametrize(
+    ("metadata", "failure"),
+    [
+        ({"model_slug": "gpt-6-thinking"}, "model_mismatch"),
+        ({}, "model_unverified"),
+    ],
+)
+def test_direct_ask_rejects_unverified_contributing_message_before_file_delivery(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any,
+    metadata: dict[str, str], failure: str,
+) -> None:
+    _install_clock(monkeypatch)
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    class MixedModelPage(_GeneratedFilePage):
+        def _conversation(self, raw_text: str) -> dict[str, object]:
+            fixture = super()._conversation(raw_text)
+            mapping = fixture["mapping"]
+            mapping["first"] = {
+                "parent": "user",
+                "message": {
+                    "id": "11111111-2222-4333-8444-666666666666",
+                    "author": {"role": "assistant"}, "channel": "final",
+                    "content": {"content_type": "text", "parts": [
+                        "[notes](sandbox:/mnt/data/notes.md)",
+                    ]},
+                    "metadata": metadata,
+                },
+            }
+            mapping["assistant"]["parent"] = "first"
+            mapping["assistant"]["message"]["channel"] = "final"
+            return fixture
+
+    page = MixedModelPage(b"unused", raw_text="Pro ending")
+    with pytest.raises(ask.GptProAskError) as raised:
+        asyncio.run(ask.execute_ask_outcome(page, "Review this code"))
+
+    assert raised.value.failure == failure
+    assert raised.value.evidence is not None
+    assert raised.value.evidence.failure_stage == "answer"
+    assert raised.value.evidence.raw_extracted
+    assert page.click_count == page.fetch_count == 1
+    assert page.file_requests == []
+
+
 def test_direct_ask_delivers_generated_files_after_final_answer(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Any
 ) -> None:
@@ -3208,6 +3288,8 @@ def test_concurrent_click_send_calls_reserve_one_client_attempt() -> None:
             both_at_boundary.set()
         await release_revalidation.wait()
 
+    execution.composer_form_handle = page.form_handle
+    execution.composer_selector = selectors.COMPOSER_SELECTOR
     execution._dismiss_modal = no_op
     execution._ensure_composer_form_current = no_op
     execution._wait_for_send_ready = no_op

@@ -21,11 +21,13 @@ from claudex.gptpro.selectors import (
     COMPOSER_SELECTOR,
     LOCATOR_CANDIDATES_PROBE_JS,
     LOCATOR_CHECK_PROBE_JS,
+    MODEL_PICKER_SELECTOR,
+    POWER_SELECTOR,
     SEND_BUTTON_SELECTOR,
 )
 from claudex.providers.auth_support import write_private_json_atomic
 
-LocatorTarget = Literal["composer", "send"]
+LocatorTarget = Literal["composer", "send", "picker", "power"]
 
 
 @dataclass(frozen=True)
@@ -76,16 +78,22 @@ async def check_locator(
     selector: str,
     *,
     composer_selector: str,
+    picker_selector: str | None = None,
 ) -> LocatorCheck:
-    result = await evaluate(
-        LOCATOR_CHECK_PROBE_JS,
-        {"target": target, "selector": selector, "composerSelector": composer_selector},
-    )
+    args = {"target": target, "selector": selector, "composerSelector": composer_selector}
+    if target == "power":
+        args["pickerSelector"] = picker_selector or MODEL_PICKER_SELECTOR
+    result = await evaluate(LOCATOR_CHECK_PROBE_JS, args)
     return classify_check(result)
 
 
 logger = logging.getLogger(__name__)
-SEED_SELECTORS = {"composer": COMPOSER_SELECTOR, "send": SEND_BUTTON_SELECTOR}
+SEED_SELECTORS = {
+    "composer": COMPOSER_SELECTOR,
+    "send": SEND_BUTTON_SELECTOR,
+    "picker": MODEL_PICKER_SELECTOR,
+    "power": POWER_SELECTOR,
+}
 FAILURE_THRESHOLD = 3
 BREAKER_COOLDOWN_SECONDS = 3600
 RETRY_BACKOFF_SECONDS = 60
@@ -101,6 +109,8 @@ _TARGET_DESCRIPTIONS = {
         "the main message input where the user types a new chat message; "
         "not a search box and not an inline editor for an earlier message"
     ),
+    "picker": "the composer-local button that opens the ChatGPT model and Power menu",
+    "power": "the Power keyboard control with slider and status in the composer picker menu",
     "send": (
         "the button that submits the message typed in the main message input; "
         "not a voice, attachment, model-picker, or stop button"
@@ -255,6 +265,7 @@ class LocatorBook:
     async def rediscover(
         self, evaluate: Callable[..., Awaitable[Any]], target: LocatorTarget, env: str,
         *, failed_selector: str, composer_selector: str, deadline: float,
+        picker_selector: str | None = None,
     ) -> RediscoveredLocator:
         def ensure_budget() -> float:
             remaining = deadline - self.monotonic()
@@ -268,12 +279,14 @@ class LocatorBook:
         async with asyncio.timeout(ensure_budget()):
             return await self._rediscover(
                 evaluate, target, env, failed_selector=failed_selector,
-                composer_selector=composer_selector, remaining=ensure_budget,
+                composer_selector=composer_selector, picker_selector=picker_selector,
+                remaining=ensure_budget,
             )
 
     async def _rediscover(
         self, evaluate: Callable[..., Awaitable[Any]], target: LocatorTarget, env: str,
-        *, failed_selector: str, composer_selector: str, remaining: Callable[[], float],
+        *, failed_selector: str, composer_selector: str, picker_selector: str | None,
+        remaining: Callable[[], float],
     ) -> RediscoveredLocator:
         key = (environment_key(env), target)
         async with self._locks.setdefault(key, asyncio.Lock()):
@@ -282,6 +295,7 @@ class LocatorBook:
             if pending is not None:
                 check = await check_locator(
                     evaluate, target, pending.selector, composer_selector=composer_selector,
+                    picker_selector=picker_selector,
                 )
                 remaining()
                 if check.verdict == "valid":
@@ -295,6 +309,7 @@ class LocatorBook:
                 seen.add(selector)
                 check = await check_locator(
                     evaluate, target, selector, composer_selector=composer_selector,
+                    picker_selector=picker_selector,
                 )
                 remaining()
                 if check.verdict == "valid":
@@ -307,9 +322,10 @@ class LocatorBook:
             if self.healer is None:
                 raise HealerUnavailable("the locator healer is not configured")
             try:
-                probe = await evaluate(LOCATOR_CANDIDATES_PROBE_JS, {
-                    "target": target, "composerSelector": composer_selector,
-                })
+                args = {"target": target, "composerSelector": composer_selector}
+                if target == "power":
+                    args["pickerSelector"] = picker_selector or MODEL_PICKER_SELECTOR
+                probe = await evaluate(LOCATOR_CANDIDATES_PROBE_JS, args)
                 remaining()
                 candidates = probe.get("candidates") if isinstance(probe, Mapping) else None
                 if not isinstance(candidates, list) or not candidates:
@@ -339,6 +355,7 @@ class LocatorBook:
                     raise HealFailed("the selected candidate has no unique structural selector")
                 check = await check_locator(
                     evaluate, target, selector, composer_selector=composer_selector,
+                    picker_selector=picker_selector,
                 )
                 remaining()
                 if check.verdict == "wait":

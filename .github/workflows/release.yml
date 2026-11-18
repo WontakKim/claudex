@@ -54,6 +54,8 @@ jobs:
   linux-tests:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 15
+    env:
+      GPTPRO_REQUIRE_BROWSER: '1'
     permissions:
       contents: read
     container:
@@ -72,10 +74,13 @@ jobs:
           apt-get update
           apt-get install -y --no-install-recommends nodejs
 
-      - name: Test on Linux arm64
+      - name: Install test dependencies and Chromium
         run: |
           uv sync --frozen
-          uv run --frozen pytest
+          uv run --frozen python -m playwright install --with-deps chromium
+
+      - name: Test on Linux arm64
+        run: uv run --frozen pytest
 
       - name: Repeat daemon lifecycle tests
         run: |
