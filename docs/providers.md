@@ -83,6 +83,36 @@ stream that ends without a terminal event, no tool call is emitted. The gateway 
 instead: an `error` event on a streaming response, or HTTP 502 on a
 non-streaming one.
 
+For a missing required argument, the error names the missing keys at the failing
+object, including nested objects. It does not guess which branch of `anyOf` or
+`oneOf` should have matched. For schema mismatches or invalid JSON/object
+arguments, find the `tool_validation_failure` warning in the gateway logs or
+dashboard **Log** tab.
+The warning contains a JSON object with the routed `provider`, the final
+transmitted `upstream_model` target (not the Claude-facing requested alias), the
+triggering Responses `event_type`, and `item_type`. A terminal snapshot failure
+is labeled `response.completed` or `response.incomplete`, not as a separate item
+event. The target identifies what the gateway sent, not independent confirmation
+of which model the provider executed.
+
+The diagnostic includes the validation rule and, for a `required` failure,
+`required`, `present`, and `missing` key metadata for that object. Each contains
+`names`, `count`, `redacted_count`, and `omitted_count`. Only ordinary declared
+key names are shown: at most 16 names per list, each at most 64 ASCII identifier
+characters. Unknown or unsafe names are counted but redacted; additional safe
+names are counted as omitted. Paths include only bounded, declared safe property
+names, with other segments redacted. Unavailable or inapplicable key metadata is
+`null`; absent route or event context is `unavailable`, never inferred from the
+requested alias.
+Unsafe route labels are `redacted`.
+
+Argument values, prompts, conversation content, authentication data, raw schemas
+or payloads, and validation-library exception messages or tracebacks are
+deliberately absent from these diagnostics. Successful responses are unchanged.
+Diagnostics do not repair arguments, inject defaults, retry a call, or relax the
+schema. They describe newly observed failures only; they cannot recover an
+unrecorded field or model from a past failure.
+
 This bridge uses ordinary Responses functions. It does not reproduce Anthropic's
 position-specific schema rendering or guarantee the same prompt-cache behavior.
 Mapped token counting estimates the prepared prompt, while response usage remains

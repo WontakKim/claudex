@@ -126,6 +126,89 @@ def test_booleans_and_numbers_are_distinct(schema, arguments):
         validate_function_arguments(compile_function_validators({"f": schema}), "f", arguments)
 
 
+@pytest.mark.parametrize("nested", [False, True], ids=["root", "nested"])
+def test_required_failure_names_all_missing_keys_at_the_failing_object(nested):
+    schema = {"type": "object", "properties": {
+        "query": {"type": "string"}, "max_results": {"type": "integer"}},
+        "required": ["query", "max_results"]}
+    instance = {"query": "VALUE_MUST_NOT_APPEAR"}
+    if nested:
+        schema = {"type": "object", "properties": {"options": schema}, "required": ["options"]}
+        instance = {"options": instance}
+    validators = compile_function_validators({"search": schema})
+    with pytest.raises(TranslationError) as failure:
+        validate_function_arguments(validators, "search", json.dumps(instance))
+    message = str(failure.value)
+    assert "missing required keys" in message
+    assert "max_results" in message
+    assert "VALUE_MUST_NOT_APPEAR" not in message
+    diagnostic = failure.value.diagnostic
+    assert diagnostic["required"]["names"] == ["query", "max_results"]
+    assert diagnostic["present"]["names"] == ["query"]
+    assert diagnostic["missing"]["names"] == ["max_results"]
+    complete = {"query": "VALUE_MUST_NOT_APPEAR", "max_results": 3}
+    validate_function_arguments(validators, "search", json.dumps({"options": complete} if nested else complete))
+
+
+def test_required_failure_reports_every_missing_key_not_only_the_first():
+    validators = compile_function_validators({"search": {
+        "type": "object", "required": ["query", "max_results"]}})
+    with pytest.raises(TranslationError) as failure:
+        validate_function_arguments(validators, "search", "{}")
+    assert failure.value.diagnostic["missing"]["names"] == ["query", "max_results"]
+
+
+@pytest.mark.parametrize("keyword", ["anyOf", "oneOf"])
+def test_alternative_failure_does_not_invent_a_missing_branch_key(keyword):
+    schema = {keyword: [{"required": ["left"]}, {"required": ["right"]}]}
+    with pytest.raises(TranslationError) as failure:
+        validate_function_arguments(compile_function_validators({"f": schema}), "f", "{}")
+    assert failure.value.diagnostic["validator"] == keyword
+    assert failure.value.diagnostic["missing"] is None
+    assert "left" not in str(failure.value)
+    assert "right" not in str(failure.value)
+
+
+def test_key_metadata_is_bounded_and_never_discloses_unknown_or_hostile_keys():
+    hostile = "SECRET_KEY_CANARY\\n" + "x" * 10000
+    required = [f"field_{index}" for index in range(80)] + [hostile]
+    schema = {"type": "object", "required": required}
+    with pytest.raises(TranslationError) as failure:
+        validate_function_arguments(compile_function_validators({"f": schema}), "f",
+                                    json.dumps({"UNKNOWN_SECRET_CANARY": "VALUE_CANARY"}))
+    diagnostic = failure.value.diagnostic
+    assert diagnostic["missing"]["count"] == 81
+    assert len(diagnostic["missing"]["names"]) <= 16
+    assert diagnostic["missing"]["redacted_count"] == 1
+    assert diagnostic["missing"]["omitted_count"] == 64
+    assert diagnostic["present"]["names"] == []
+    assert diagnostic["present"]["redacted_count"] == 1
+    rendered = str(failure.value) + json.dumps(diagnostic)
+    assert len(rendered) < 3000
+    assert "CANARY" not in rendered
+
+
+@pytest.mark.parametrize("schema,instance", [
+    ({"patternProperties": {".*": {"type": "integer"}}}, {"DYNAMIC_SECRET_CANARY": "VALUE_CANARY"}),
+    ({"properties": {"safe": {"enum": ["SCHEMA_VALUE_CANARY"]}}}, {"safe": "VALUE_CANARY"}),
+])
+def test_nonrequired_errors_exclude_instance_values_schema_values_and_dynamic_paths(schema, instance):
+    with pytest.raises(TranslationError) as failure:
+        validate_function_arguments(compile_function_validators({"f": schema}), "f", json.dumps(instance))
+    assert "CANARY" not in str(failure.value) + json.dumps(failure.value.diagnostic)
+    assert "declared schema" in str(failure.value)
+
+
+@pytest.mark.parametrize("arguments", ["{MALFORMED_VALUE_CANARY", "[]", "{}"])
+def test_untrusted_function_names_are_not_exposed_in_argument_errors(arguments):
+    name = "FUNCTION_SECRET_CANARY\\n" + "x" * 10000
+    validators = compile_function_validators({name: {"required": ["query"]}})
+    with pytest.raises(TranslationError) as failure:
+        validate_function_arguments(validators, name, arguments)
+    assert "CANARY" not in str(failure.value)
+    assert len(str(failure.value)) < 2000
+
+
 def test_internal_defs_refs_and_composition_validate():
     schema = {"type": "object", "$defs": {"current": {"enum": ["B"]}},
               "properties": {"mode": {"allOf": [{"$ref": "#/$defs/current"}]}},

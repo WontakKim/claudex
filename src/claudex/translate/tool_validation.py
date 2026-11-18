@@ -12,6 +12,52 @@ from .claude_to_codex import TranslationError
 from .schema_patterns import pattern_validation_budget
 
 
+class FunctionArgumentValidationError(TranslationError):
+    """A rejected call with bounded metadata, never a validation-library message."""
+
+    def __init__(self, message: str, diagnostic: dict[str, Any]) -> None:
+        super().__init__(message)
+        self.diagnostic = {"required": None, "present": None, "missing": None, "path": None,
+                           **diagnostic}
+
+
+def _safe_function_name(name: str) -> str:
+    return name if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,63}", name) else "[redacted]"
+
+
+def _key_metadata(keys: list[str], declared: set[str]) -> dict[str, Any]:
+    names = []
+    redacted_count = 0
+    safe_count = 0
+    for key in keys:
+        if key not in declared or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,63}", key):
+            redacted_count += 1
+            continue
+        safe_count += 1
+        if len(names) < 16:
+            names.append(key)
+    return {"names": names, "count": len(keys), "redacted_count": redacted_count,
+            "omitted_count": safe_count - len(names)}
+
+
+def _safe_validation_path(schema: Any, path: Any) -> str:
+    location = "$"
+    for depth, key in enumerate(path):
+        if depth >= 16 or not isinstance(schema, dict):
+            return location + ".[redacted]"
+        properties = schema.get("properties", {})
+        if (isinstance(key, str) and key in properties
+                and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,63}", key)):
+            location += "." + key
+            schema = properties[key]
+        elif isinstance(key, int) and isinstance(schema.get("items"), dict):
+            location += "[item]"
+            schema = schema["items"]
+        else:
+            return location + ".[redacted]"
+    return location
+
+
 def _refuse_resource_retrieval(uri: str) -> Any:
     from referencing.exceptions import NoSuchResource
 
@@ -110,10 +156,16 @@ def parse_function_arguments(arguments: str, name: str) -> dict:
         instance = json.loads(
             arguments, parse_constant=_reject_json_constant, parse_float=_parse_finite_float
         )
-    except (TypeError, ValueError, RecursionError) as exc:
-        raise TranslationError(f"upstream function {name} returned invalid JSON arguments") from exc
+    except (TypeError, ValueError, RecursionError):
+        raise FunctionArgumentValidationError(
+            f"upstream function {_safe_function_name(name)} returned invalid JSON arguments",
+            {"function": _safe_function_name(name), "validator": "invalid_json"},
+        ) from None
     if not isinstance(instance, dict):
-        raise TranslationError(f"upstream function {name} arguments must be a JSON object")
+        raise FunctionArgumentValidationError(
+            f"upstream function {_safe_function_name(name)} arguments must be a JSON object",
+            {"function": _safe_function_name(name), "validator": "object_required"},
+        )
     return instance
 
 
@@ -124,18 +176,35 @@ def validate_function_arguments(validators: dict[str, Any], name: str, arguments
 
     validator = validators.get(name)
     if validator is None:
-        raise TranslationError(f"upstream returned an undeclared or removed function: {name}")
+        raise TranslationError(f"upstream returned an undeclared or removed function: {_safe_function_name(name)}")
     instance = parse_function_arguments(arguments, name)
     try:
         validator.validate(instance)
     except ValidationError as exc:
-        raise TranslationError(
-            f"upstream function {name} arguments violate the declared schema "
-            f"at {exc.json_path} ({exc.validator})"
-        ) from exc
+        diagnostic: dict[str, Any] = {
+            "function": _safe_function_name(name), "validator": exc.validator,
+            "required": None, "present": None, "missing": None,
+        }
+        suffix = ""
+        if exc.validator == "required" and isinstance(exc.instance, dict):
+            required = exc.validator_value
+            declared = set(required) | set(exc.schema.get("properties", {}))
+            missing = [key for key in required if key not in exc.instance]
+            diagnostic.update(
+                required=_key_metadata(required, declared),
+                present=_key_metadata(list(exc.instance), declared),
+                missing=_key_metadata(missing, declared),
+            )
+            suffix = "; missing required keys: " + json.dumps(diagnostic["missing"], ensure_ascii=True)
+        location = _safe_validation_path(validator.schema, exc.absolute_path)
+        diagnostic["path"] = location
+        raise FunctionArgumentValidationError(
+            f"upstream function {_safe_function_name(name)} arguments violate the declared schema "
+            f"at {location} ({exc.validator}){suffix}", diagnostic,
+        ) from None
     except re.error as exc:
         raise TranslationError(
-            f"cannot validate upstream arguments for function {name}: unsupported schema regex"
+            f"cannot validate upstream arguments for function {_safe_function_name(name)}: unsupported schema regex"
         ) from exc
     except (Unresolvable, TypeError, ValueError, OverflowError, RecursionError) as exc:
-        raise TranslationError(f"cannot validate upstream arguments for function {name}") from exc
+        raise TranslationError(f"cannot validate upstream arguments for function {_safe_function_name(name)}") from exc

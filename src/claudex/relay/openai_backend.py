@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import re
 from collections.abc import AsyncGenerator, AsyncIterator
 from datetime import datetime, timezone
 from typing import Any
@@ -42,7 +43,7 @@ from claudex.translate import (
 from claudex.upstream_errors import UpstreamAuthError, UpstreamError
 from claudex.translate.tool_protocol import ToolProtocolError, compile_tool_state
 from claudex.translate.claude_to_codex import build_function_validation_schemas
-from claudex.translate.tool_validation import compile_function_validators
+from claudex.translate.tool_validation import FunctionArgumentValidationError, compile_function_validators
 
 logger = logging.getLogger("claudex.server")
 
@@ -312,6 +313,8 @@ async def _relay_via_responses_backend(
                         function_schemas=function_schemas,
                         regex_dialect="python" if backend.codex_regex_compat else "ecmascript",
                         countable_request=countable_request,
+                        upstream_provider=provider,
+                        upstream_model=payload.get("model"),
                     ),
                 ),
                 event_stream.aclose,
@@ -329,6 +332,8 @@ async def _relay_via_responses_backend(
         regex_dialect="python" if backend.codex_regex_compat else "ecmascript",
         countable_request=countable_request,
         should_raise_errors=not can_reroute,
+        upstream_provider=provider,
+        upstream_model=payload.get("model"),
     )
 
 
@@ -742,6 +747,36 @@ async def _with_responses_heartbeats(
     ))
 
 
+def _log_tool_validation_failure(
+    error: TranslationError, event: dict[str, Any] | None,
+    provider: str | None, model: str | None,
+) -> None:
+    if not isinstance(error, FunctionArgumentValidationError):
+        return
+
+    def target_label(value: str | None) -> str:
+        if value is None:
+            return "unavailable"
+        if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9_./:-]{1,128}", value):
+            return "redacted"
+        return value
+
+    event_type = event.get("type") if event is not None else None
+    if event_type not in (
+        "response.output_item.added", "response.output_item.done",
+        "response.function_call_arguments.delta", "response.function_call_arguments.done",
+        "response.completed", "response.incomplete",
+    ):
+        event_type = "unavailable"
+    diagnostic = {
+        **error.diagnostic,
+        "provider": target_label(provider), "upstream_model": target_label(model),
+        "event_type": event_type, "item_type": "function_call",
+    }
+    # The Log tab consumes getMessage(), not logging extra fields.
+    logger.warning("tool_validation_failure %s", json.dumps(diagnostic, ensure_ascii=True))
+
+
 async def _translate_claude_sse(
     claude_request: dict[str, Any],
     upstream_events: AsyncGenerator[dict[str, Any], None],
@@ -752,7 +787,10 @@ async def _translate_claude_sse(
     function_schemas: dict[str, dict[str, Any]] | None = None,
     regex_dialect: str = "python",
     countable_request: dict[str, Any] | None = None,
+    upstream_provider: str | None = None,
+    upstream_model: str | None = None,
 ) -> AsyncIterator[str]:
+    event = None
     try:
         translator = await asyncio.to_thread(
             CodexToClaudeStreamTranslator, claude_request,
@@ -768,6 +806,7 @@ async def _translate_claude_sse(
                 yield _format_sse(event_name, payload)
         translator.finish()
     except TranslationError as exc:
+        _log_tool_validation_failure(exc, event, upstream_provider, upstream_model)
         yield _format_sse("error", server_support._claude_error_body("api_error", str(exc)))
     except UpstreamError as exc:
         _, body = _upstream_error_to_claude(
@@ -798,7 +837,10 @@ async def _aggregate_claude_response(
     regex_dialect: str = "python",
     countable_request: dict[str, Any] | None = None,
     should_raise_errors: bool = False,
+    upstream_provider: str | None = None,
+    upstream_model: str | None = None,
 ) -> JSONResponse:
+    event = None
     claude_events: list[tuple[str, dict[str, Any]]] = []
     try:
         translator = await asyncio.to_thread(
@@ -820,6 +862,7 @@ async def _aggregate_claude_response(
                 claude_events.append(translated)
         translator.finish()
     except TranslationError as exc:
+        _log_tool_validation_failure(exc, event, upstream_provider, upstream_model)
         if should_raise_errors:
             raise ValueError("invalid Responses event") from None
         return JSONResponse(server_support._claude_error_body("api_error", str(exc)), status_code=502)
