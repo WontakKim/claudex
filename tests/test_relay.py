@@ -8863,7 +8863,7 @@ def test_custom_ecmascript_pattern_is_enforced_without_losing_valid_calls(
         assert response.status_code == (200 if valid else 502)
 
 
-def _validation_call_events(arguments: str) -> list[dict[str, Any]]:
+def _validation_call_events(arguments: str, *, name: str = 'lookup') -> list[dict[str, Any]]:
     events = _custom_function_call_events('call_validation', 'signature')
     for event in events:
         if event.get('type') == 'response.function_call_arguments.delta':
@@ -8872,8 +8872,66 @@ def _validation_call_events(arguments: str) -> list[dict[str, Any]]:
             event['arguments'] = arguments
         item = event.get('item')
         if isinstance(item, dict) and item.get('type') == 'function_call':
+            item['name'] = name
             item['arguments'] = arguments
     return events
+
+
+@pytest.mark.parametrize('stream', [False, True])
+@pytest.mark.parametrize('supplied,declared,expected', [({}, 5, 5), ({}, 7, 7), ({'max_results': 2}, 5, 2)])
+def test_codex_toolsearch_returns_client_limit(stream, supplied, declared, expected):
+    arguments = {'query': 'select:Read', **supplied}
+    events = _validation_call_events(json.dumps(arguments), name='ToolSearch')
+    events[-1]['response']['output'] = [events[2]['item'].copy()]
+    stub = StubOpenAICompatibleClient(events)
+    client, codex = _gateway(GatewayConfig(model_map={'opus': 'codex:gpt-5.5'}), _failing_anthropic_handler)
+    codex.stream_responses = stub.stream_responses
+    body = _message_body('claude-opus-4-6')
+    body['stream'] = stream
+    body['tools'] = [{'name': 'ToolSearch', 'input_schema': {
+        'type': 'object', 'properties': {'query': {'type': 'string'},
+                                        'max_results': {'type': 'number', 'default': declared}},
+        'required': ['query', 'max_results'], 'additionalProperties': False,
+    }}]
+    response = client.post('/v1/messages', json=body)
+    assert response.status_code == 200
+    assert len(stub.payloads) == 1
+    if stream:
+        frames = _parse_native_sse_json(response.content)
+        assert [p['content_block']['name'] for e, p in frames if e == 'content_block_start'] == ['ToolSearch']
+        result = json.loads(''.join(p['delta']['partial_json'] for e, p in frames if e == 'content_block_delta'))
+        assert frames[-1][0] == 'message_stop'
+    else:
+        block, = response.json()['content']
+        assert (block['type'], block['name']) == ('tool_use', 'ToolSearch')
+        result = block['input']
+    assert result == {'query': 'select:Read', 'max_results': expected}
+
+
+@pytest.mark.parametrize('provider,name,limit_schema,arguments', [
+    ('codex', 'ToolSearch', {}, {'query': 'read'}),
+    ('codex', 'ToolSearch', {'default': 5}, {'max_results': 3}),
+    ('codex', 'ToolSearch', {'default': 5}, {'query': 'read', 'max_results': None}),
+    ('codex', 'ToolSearch', {'default': 5}, {'query': 'read', 'limit': 2}),
+    ('codex', 'ToolSearch', {'default': 5, 'maximum': 3}, {'query': 'read'}),
+    ('codex', 'lookup', {'default': 5}, {'query': 'read'}),
+    ('custom', 'ToolSearch', {'default': 5}, {'query': 'read'}),
+])
+def test_codex_toolsearch_default_does_not_relax_validation(provider, name, limit_schema, arguments):
+    stub = StubOpenAICompatibleClient(_validation_call_events(json.dumps(arguments), name=name))
+    if provider == 'codex':
+        client, codex = _gateway(GatewayConfig(model_map={'opus': 'codex:gpt-5.5'}), _failing_anthropic_handler)
+        codex.stream_responses = stub.stream_responses
+    else:
+        client = _custom_provider_gateway(stub)
+    body = _message_body('claude-opus-4-6')
+    body['tools'] = [{'name': name, 'input_schema': {
+        'type': 'object', 'properties': {'query': {'type': 'string'}, 'max_results': {'type': 'number', **limit_schema}},
+        'required': ['query', 'max_results'], 'additionalProperties': False,
+    }}]
+    response = client.post('/v1/messages', json=body)
+    assert response.status_code == 502
+    assert response.json()['error']['type'] == 'api_error'
 
 
 @pytest.mark.parametrize('path', ['/v1/messages', '/v1/messages/count_tokens'])
