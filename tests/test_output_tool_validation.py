@@ -74,6 +74,23 @@ def test_valid_call_is_buffered_until_item_done():
     assert not _tool_blocks(translator.translate_event(_terminal()))
 
 
+@pytest.mark.parametrize('declarations', [
+    {'required': ['query']},
+    {'$schema': 'http://json-schema.org/draft-03/schema#', 'required': False},
+])
+def test_codex_toolsearch_leaves_optional_limit_absent(declarations):
+    schema = {'type': 'object', 'properties': {
+        'query': {'type': 'string'}, 'max_results': {'type': 'number', 'default': 5}}, **declarations}
+    translator = CodexToClaudeStreamTranslator(
+        {}, upstream_provider='codex', tool_name_map={'ToolSearch': 'ToolSearch'},
+        function_schemas={'ToolSearch': schema},
+    )
+    events = translator.translate_event({'type': 'response.created', 'response': {'id': 'test'}})
+    events += translator.translate_event(_terminal(_item('done', name='ToolSearch', arguments='{"query":"read"}')['item']))
+    block, = assemble_claude_message(events)['content']
+    assert block['input'] == {'query': 'read'}
+
+
 def test_latest_declared_enum_blocks_stale_arguments_before_executable_start():
     translator = _translator()
     emitted = translator.translate_event(_item())

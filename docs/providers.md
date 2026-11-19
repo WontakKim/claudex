@@ -83,6 +83,13 @@ stream that ends without a terminal event, no tool call is emitted. The gateway 
 instead: an `error` event on a streaming response, or HTTP 502 on a
 non-streaming one.
 
+On the Codex route, a client `ToolSearch` call containing only `query` can omit
+`max_results` when the active client schema requires it and declares a numeric
+default for it. The gateway supplies that client default before validation; it
+does not use the native Codex `tool_search` default or translate its `limit` key.
+Explicit values, including `null`, are validated as supplied. Other tools and
+providers do not receive defaults.
+
 For a missing required argument, the error names the missing keys at the failing
 object, including nested objects. It does not guess which branch of `anyOf` or
 `oneOf` should have matched. For schema mismatches or invalid JSON/object

@@ -166,6 +166,7 @@ class CodexToClaudeStreamTranslator:
     countable_request: dict[str, Any] | None = None
     function_schemas: dict[str, dict] | None = None
     regex_dialect: str = "python"
+    upstream_provider: str | None = None
 
     _short_to_original: dict[str, str] = field(init=False)
     _function_validators: dict[str, Any] | None = field(init=False)
@@ -788,6 +789,24 @@ class CodexToClaudeStreamTranslator:
             call.output_index = output_index
         return call
 
+    def _validated_call_arguments(self, name: str, arguments: str) -> str:
+        if self.upstream_provider == "codex" and self._short_to_original.get(name) == "ToolSearch":
+            # Codex search permits an omitted limit; the client tool can require
+            # max_results with its own default, independent of Codex's limit.
+            schema = self.function_schemas.get(name, {})
+            limit = schema.get("properties", {}).get("max_results")
+            required = schema.get("required")
+            if (
+                isinstance(required, list) and "max_results" in required
+                and isinstance(limit, dict) and limit.get("type") in ("number", "integer")
+                and type(limit.get("default")) in (int, float)
+            ):
+                supplied = parse_function_arguments(arguments, name)
+                if supplied.keys() == {"query"} and isinstance(supplied["query"], str):
+                    arguments = json.dumps({**supplied, "max_results": limit["default"]})
+        validate_function_arguments(self._function_validators, name, arguments)
+        return arguments
+
     def _buffer_function_call_event(
         self, event: dict[str, Any], *, flush: bool = True
     ) -> list[ClaudeEvent]:
@@ -817,7 +836,7 @@ class CodexToClaudeStreamTranslator:
                 call.has_received_arguments_delta or call.arguments
             ):
                 if call.start_emitted:
-                    validate_function_arguments(self._function_validators, call.name, arguments)
+                    arguments = self._validated_call_arguments(call.name, arguments)
                     if not _json_values_equal(
                         parse_function_arguments(call.arguments, call.name),
                         parse_function_arguments(arguments, call.name),
@@ -843,7 +862,7 @@ class CodexToClaudeStreamTranslator:
             raise TranslationError("upstream returned an incomplete function call")
         call.is_complete = True
         if call.name:
-            validate_function_arguments(self._function_validators, call.name, call.arguments)
+            call.arguments = self._validated_call_arguments(call.name, call.arguments)
         return self._flush_validated_function_calls() if flush else []
 
     def _flush_validated_function_calls(self) -> list[ClaudeEvent]:
@@ -853,7 +872,7 @@ class CodexToClaudeStreamTranslator:
                 continue
             if not call.is_complete or not call.name:
                 break
-            validate_function_arguments(self._function_validators, call.name, call.arguments)
+            call.arguments = self._validated_call_arguments(call.name, call.arguments)
             events.extend(self._finalize_thinking_block())
             events.extend(self._stop_text_block())
             call.claude_tool_id = self._allocate_claude_tool_id(call.call_id)
