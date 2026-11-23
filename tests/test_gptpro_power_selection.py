@@ -21,7 +21,7 @@ _PAGE = """
   <button id="picker" type="button" aria-label="Select ChatGPT model" aria-haspopup="menu"
           aria-expanded="false" data-composer-navigation-target="reasoning"
           data-selected-reasoning-effort="medium">
-    <span>Thinking effort</span><br><span class="level"></span>
+    <span class="level"></span>
   </button>
   <button type="submit">Send</button>
 </form>
@@ -55,14 +55,25 @@ const replaceForm = () => {
   const form = picker().closest('form');
   form.replaceWith(form.cloneNode(true));
 };
+// A closed picker holds its level alone and gains the caption while its menu is open;
+// the 'captioned' variant also keeps the caption while closed. Both forms are supported.
+const drawCaption = () => {
+  picker().querySelector('.caption')?.remove();
+  if (config.closedLabel !== 'captioned' && picker().getAttribute('aria-expanded') !== 'true') return;
+  const caption = document.createElement('span');
+  caption.className = 'caption';
+  caption.append('Thinking effort', document.createElement('br'));
+  picker().prepend(caption);
+};
 const draw = () => {
-  picker().querySelector('.level').textContent = levels[level];
+  picker().querySelector('.level').textContent = config.pickerAlwaysShowsPro ? 'Pro' : levels[level];
   const slider = menu.querySelector('[role=slider]');
   slider.setAttribute('aria-valuemax', levels.length - 1);
   slider.setAttribute('aria-valuenow', level);
   document.getElementById('feedback').textContent = `${levels[level]}, ${level+1} of ${levels.length}.`;
 };
 draw();
+drawCaption();
 if (['power', 'both'].includes(config.drift)) {
   menu.querySelector('[aria-label=Power]').removeAttribute('data-reasoning-slider');
   const unrelated = menu.cloneNode(true);
@@ -103,12 +114,16 @@ document.addEventListener('click', event => {
   picker().setAttribute('aria-expanded', 'true');
   picker().setAttribute('aria-controls', menu.id);
   menu.hidden = false;
+  drawCaption();
 });
 document.addEventListener('keydown', event => {
   if (event.key === 'Escape' && !menu.hidden) {
     menu.hidden = true;
     picker().setAttribute('aria-expanded', 'false');
     picker().removeAttribute('aria-controls');
+    if (config.revertOnClose) level = 1;
+    draw();
+    drawCaption();
     if (config.replaceForm === 'close') replaceForm();
   }
   if (event.key === 'ArrowRight' && event.target === menu.querySelector('[aria-label=Power]')) {
@@ -225,17 +240,45 @@ def test_medium_is_promoted_before_first_input_on_replaced_composer(tmp_path, re
     assert actions[-1] == ['send', 'Pro']
 
 
+@pytest.mark.parametrize('closed_label', ['level', 'captioned'])
+def test_pro_is_verified_on_a_closed_picker_with_or_without_its_caption(tmp_path, closed_label):
+    actions = asyncio.run(_run_ask(tmp_path, {'closedLabel': closed_label}))
+    assert actions[:4] == [
+        ['open', 'Medium'], ['key', 'Medium'], ['key', 'High'], ['key', 'Extra High'],
+    ]
+    assert actions[4:-1] and all(action == ['input', 'Pro'] for action in actions[4:-1])
+    assert actions[-1] == ['send', 'Pro']
+
+
+def test_a_picker_label_of_pro_is_not_proof_while_power_reports_another_level(tmp_path):
+    actions = asyncio.run(_run_ask(tmp_path, {'pickerAlwaysShowsPro': True}))
+    assert actions[:4] == [
+        ['open', 'Medium'], ['key', 'Medium'], ['key', 'High'], ['key', 'Extra High'],
+    ]
+    assert actions[-1] == ['send', 'Pro']
+
+
+def test_power_that_reverts_when_the_menu_closes_never_receives_input(tmp_path):
+    actions = asyncio.run(_run_ask(tmp_path, {'revertOnClose': True}, expect_failure=True))
+    assert actions[:4] == [
+        ['open', 'Medium'], ['key', 'Medium'], ['key', 'High'], ['key', 'Extra High'],
+    ]
+    assert all(action[0] in ('open', 'key') for action in actions)
+
+
 @pytest.mark.parametrize('boundary', ['changed', 'unreadable'])
 def test_send_aborts_without_reselection_or_refill_after_final_check(tmp_path, boundary):
     actions = asyncio.run(_run_ask(tmp_path, {'level': 4, 'boundary': boundary},
                                    conversation_id=_CONVERSATION_ID, expect_failure=True))
-    assert actions and all(action == ['input', 'Pro'] for action in actions)
+    assert actions[0] == ['open', 'Pro']
+    assert actions[1:] and all(action == ['input', 'Pro'] for action in actions[1:])
 
 
 @pytest.mark.parametrize('conversation_id', [None, _CONVERSATION_ID])
-def test_already_pro_is_not_changed_on_new_or_existing_thread(tmp_path, conversation_id):
+def test_already_pro_is_confirmed_in_the_menu_and_not_changed(tmp_path, conversation_id):
     actions = asyncio.run(_run_ask(tmp_path, {'level': 4}, conversation_id=conversation_id))
-    assert actions[:-1] and all(action == ['input', 'Pro'] for action in actions[:-1])
+    assert actions[0] == ['open', 'Pro']
+    assert actions[1:-1] and all(action == ['input', 'Pro'] for action in actions[1:-1])
     assert actions[-1] == ['send', 'Pro']
 
 
@@ -280,7 +323,7 @@ def test_power_drift_heals_in_the_linked_menu_ignoring_other_portals(tmp_path, d
 
 def test_power_change_after_setup_aborts_before_first_input(tmp_path):
     actions = asyncio.run(_run_ask(tmp_path, {'level': 4, 'beforeInput': True}, expect_failure=True))
-    assert actions == []
+    assert actions == [['open', 'Pro']]
 
 
 @pytest.mark.parametrize('problem', [
@@ -342,7 +385,8 @@ def test_a_healed_power_control_that_does_not_move_is_not_cached_and_backs_off(t
 
 def test_picker_can_hydrate_after_the_composer(tmp_path):
     actions = asyncio.run(_run_ask(tmp_path, {'level': 4, 'delayedPicker': True}))
-    assert actions[:-1] and all(action == ['input', 'Pro'] for action in actions[:-1])
+    assert actions[0] == ['open', 'Pro']
+    assert actions[1:-1] and all(action == ['input', 'Pro'] for action in actions[1:-1])
     assert actions[-1] == ['send', 'Pro']
 
 

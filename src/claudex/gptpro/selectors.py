@@ -409,7 +409,9 @@ PRO_CONTROLS_JS = r"""
     enabled(pickers[0]) ? pickers[0] : null;
   const expanded = picker?.getAttribute('aria-expanded') === 'true';
   const lines = picker ? labelLines(picker) : [];
-  const pickerLevel = lines.length === 2 && lines[0] === 'Thinking effort' ? lines[1] : null;
+  // A closed picker shows its level alone or under a 'Thinking effort' caption.
+  const pickerLevel = lines.length === 2 && lines[0] === 'Thinking effort' ? lines[1]
+    : lines.length === 1 ? lines[0] : null;
   const controls = expanded && picker.id && picker.getAttribute('aria-controls');
   const menus = controls ? [...document.querySelectorAll('[role="menu"]')]
     .filter(element => element.id === controls && visible(element) &&

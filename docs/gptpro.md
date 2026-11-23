@@ -337,22 +337,28 @@ does not establish that submission failed.
 ### Pro selection before Send
 
 For ordinary asks, including existing conversations and fallback attempts, the
-saved account must offer **Pro** in ChatGPT's **Thinking effort** picker. The
-gateway leaves an already selected Pro setting alone. Otherwise it opens the
-composer's picker and moves the **Power** control toward Pro using its keyboard
-shortcuts, checking the displayed selection before attaching files or entering
-the prompt. It does not infer Pro from the GPT model name, an account badge, or
-the highest available effort, and it does not open an upgrade flow.
+saved account must offer **Pro** in ChatGPT's **Thinking effort** picker. Before
+attaching files or entering the prompt, the gateway opens the composer's picker
+and reads the **Power** control's selection status. If the status already
+reports Pro, the gateway leaves the setting unchanged; otherwise it moves the
+Power control toward Pro using its keyboard shortcuts. It then closes the menu
+and checks that the picker shows Pro. It does not infer Pro from the picker's
+label alone, the GPT model name, an account badge, or the highest available
+effort, and it does not open an upgrade flow.
 
-The supported display is English: **Thinking effort**, **Power**, and the
-selection status `Pro, N of N`. Localized or unrecognized displays fail closed
-before Send; locator rediscovery cannot translate them.
+The supported display is English. The gateway recognizes the picker by its
+accessible name `Select ChatGPT model` or by a **Thinking effort** caption, and
+the menu by its **Power** control and the selection status `Pro, N of N`. After
+the menu closes, the picker must show `Pro`, either alone or under that caption.
+Localized or unrecognized displays fail closed before Send; locator rediscovery
+cannot translate them.
 
-After the final readiness and attachment checks, the gateway reads the current
-picker again. If the setting changed or cannot be verified, it stops without
-clicking Send, changing the setting again, or re-entering the prompt. A failure
-at this point has `evidence.submission: not_attempted`. Read-only recovery does
-not use the picker or change effort.
+After the final readiness and attachment checks, the gateway reads the closed
+picker again without reopening its menu. If the setting changed or cannot be
+verified, it stops without clicking Send, changing the setting again, or
+re-entering the prompt. A failure at this point has
+`evidence.submission: not_attempted`. Read-only recovery does not use the
+picker or change effort.
 
 ### Completed answer verification
 

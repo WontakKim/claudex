@@ -65,6 +65,26 @@ class _FakeResponse:
         self.request = request or _FakeRequest(url, "POST")
 
 
+class _FakeProControl:
+    """The picker opens the Power menu; Escape on the Power control closes it."""
+
+    def __init__(self, page: _FakePage) -> None:
+        self.page = page
+
+    def as_element(self) -> _FakeProControl:
+        return self
+
+    async def click(self, *, timeout: int) -> None:
+        self.page.is_power_menu_open = True
+
+    async def press(self, key: str, *, timeout: int) -> None:
+        assert key == "Escape"
+        self.page.is_power_menu_open = False
+
+    async def dispose(self) -> None:
+        pass
+
+
 class _FakeElementHandle:
     def __init__(self, page: _FakePage, selector: str | None = None) -> None:
         self.page = page
@@ -76,7 +96,14 @@ class _FakeElementHandle:
 
     async def evaluate(self, expression: str, argument: Any = None) -> Any:
         if expression == ask.PRO_STATE_JS:
-            return {"picker": True, "expanded": False, "level": "Pro"} if self.page.form_is_current else None
+            if not self.page.form_is_current:
+                return None
+            is_open = self.page.is_power_menu_open
+            return {
+                "picker": True, "expanded": is_open, "linkedMenu": is_open,
+                "level": "Pro",
+                "feedback": {"level": "Pro", "min": 0, "max": 4, "position": 4} if is_open else None,
+            }
         if expression == ask.COMPOSER_ELEMENT_READBACK_PROBE_JS:
             return await self.page.evaluate(
                 selectors.COMPOSER_READBACK_PROBE_JS,
@@ -90,7 +117,9 @@ class _FakeElementHandle:
 
     async def evaluate_handle(
         self, expression: str, argument: Any = None,
-    ) -> _FakeElementHandle:
+    ) -> _FakeElementHandle | _FakeProControl:
+        if expression in (ask.PRO_PICKER_HANDLE_JS, ask.PRO_POWER_HANDLE_JS):
+            return _FakeProControl(self.page)
         return _FakeElementHandle(self.page, selector=argument)
 
     async def fill(self, value: str, *, timeout: int | None = None) -> None:
@@ -179,6 +208,7 @@ class _FakePage:
         self.relock_id = "user-relocked"
         self.call_order: list[str] = []
         self.form_is_current = True
+        self.is_power_menu_open = False
         self.form_capture_count = 0
         self.form_handle = _FakeElementHandle(self)
 

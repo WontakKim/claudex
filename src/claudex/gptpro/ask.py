@@ -72,7 +72,7 @@ PRO_STATE_JS = _pro_control_probe(
     "{picker: !!ui.picker, expanded: ui.expanded, linkedMenu: !!ui.menu, "
     "level: ui.pickerLevel, feedback: ui.feedback}"
 )
-PRO_PICKER_HANDLE_JS = _pro_control_probe("ui.expanded || ui.pickerLevel === 'Pro' ? null : ui.picker")
+PRO_PICKER_HANDLE_JS = _pro_control_probe("ui.expanded ? null : ui.picker")
 PRO_POWER_HANDLE_JS = _pro_control_probe(
     "ui.feedback && Object.keys(args.feedback).every(key => args.feedback[key] === ui.feedback[key]) "
     "? ui.power : null"
@@ -1124,15 +1124,14 @@ class _AskExecution:
         return True
 
     async def _select_pro(self) -> None:
+        # The Power status in the open menu establishes Pro. A closed picker shows a level
+        # without naming its control, so its label only confirms that Pro stays selected.
         state = await self._wait_for_pro_state(lambda state: state.get("picker") is True)
         if not state.get("picker") and await self._rediscover_pro_control("picker"):
             state = await self._pro_state()
         if not state.get("picker"):
             self._settle_rediscovered("picker", "failure", "the model picker could not be verified")
             raise GptProAskError("locator_unresolved", "the ChatGPT model picker is unavailable")
-        if self._has_selected_pro(state):
-            self._settle_rediscovered("picker", "success")
-            return
         if not state.get("expanded"):
             await self._act_on_pro_control("picker")
         feedback = await self._wait_for_pro_feedback()
