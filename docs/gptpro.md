@@ -348,15 +348,28 @@ effort, and it does not open an upgrade flow.
 
 The supported display is English. The gateway recognizes the picker by its
 accessible name `Select ChatGPT model` or by a **Thinking effort** caption, and
-the menu by its **Power** control and the selection status `Pro, N of N`. After
-the menu closes, the picker must show `Pro`, either alone or under that caption.
-Localized or unrecognized displays fail closed before Send; locator rediscovery
-cannot translate them.
+the menu by its **Power** control and the selection status `Pro, N of N`. A
+localized or unrecognized picker name, Power control, or selection status fails
+closed before Send; locator rediscovery cannot translate it.
+
+After the menu closes, the picker must still show Pro. The gateway recognizes
+`Pro` alone or under that caption on its own. For any other label that contains
+`Pro`, such as `6 Pro`, it asks the model used for
+[locator rediscovery](#locator-recovery) whether the label states Pro as the
+selected effort level. The level name and the picker's label are the only page
+content in that request, which goes to whichever provider serves that model. It
+never includes conversation text or composer contents, and a label longer than
+80 characters is not sent. A confirmed label is accepted, for that exact text
+and UI language, until the gateway restarts, so later asks compare the label
+without another request. The ask stops before attaching files or entering the
+prompt, with `locator_unresolved`, if the label does not contain `Pro` or
+exceeds that limit, the request fails or times out, or the model does not
+confirm the label.
 
 After the final readiness and attachment checks, the gateway reads the closed
-picker again without reopening its menu. If the setting changed or cannot be
-verified, it stops without clicking Send, changing the setting again, or
-re-entering the prompt. A failure at this point has
+picker again without reopening its menu or asking the model. If the setting
+changed or cannot be verified, it stops without clicking Send, changing the
+setting again, or re-entering the prompt. A failure at this point has
 `evidence.submission: not_attempted`. Read-only recovery does not use the
 picker or change effort.
 
@@ -458,12 +471,15 @@ The composer, Send button, model picker, and Power control can each be
 rediscovered at most once per ask. Composer and Send faults must persist for
 about four seconds; the picker and Power control must be uniquely identifiable
 in the intended composer or its linked menu. If the page does not offer readable
-Pro controls, the ask stops before submission. Rediscovery cannot add access to
-Pro or translate an unrecognized effort display.
+Pro controls, the ask stops before submission. Rediscovery replaces selectors
+only: it cannot add access to Pro or translate an unrecognized effort display.
+An unrecognized label on the closed picker is handled separately, by the label
+judgment described under [Pro selection before Send](#pro-selection-before-send).
 
 The gateway asks `claude-sonnet-5-5` through its own `/v1/messages` endpoint.
 This follows `model_map` like any client request: a `sonnet` mapping routes the
-request to the mapped provider; otherwise it passes through to Anthropic.
+request to the mapped provider; otherwise it passes through to Anthropic. Label
+judgment sends its request the same way and needs the same setup as rediscovery.
 
 Rediscovery needs a model route that works without Claude Code's client
 credentials. Map `sonnet` to a configured backend with any authentication it
@@ -480,7 +496,9 @@ The structure-only candidate description, including tags, roles, UI labels,
 data attribute names (not values), and positions, is sent to whichever provider handles that
 request. Picker and Power candidates contain only fixed structural descriptors,
 not arbitrary labels, IDs, classes, or text from the page. No candidates include
-conversation text or composer contents. The gateway must be running and
+conversation text or composer contents. Label judgment is the exception for
+picker text: it sends the closed picker's label, as described under
+[Pro selection before Send](#pro-selection-before-send). The gateway must be running and
 reachable at its configured host and port. If it is unreachable, for example
 when running `claudex-gateway gptpro ask` while the gateway is stopped,
 rediscovery is unavailable and a locator fault ends the ask with
@@ -507,6 +525,9 @@ After the hour, one ask may rediscover again; a failure restarts the one-hour
 suspension. An unreachable gateway or rejected Messages request does not count
 as a failed rediscovery. Deleting `locators.json` returns to the built-in
 locators and clears the suspension.
+
+Label judgment has no backoff or suspension. An ask whose closed picker label
+is not yet confirmed makes one request, bounded by 30 seconds.
 
 ## Scheduling behavior
 

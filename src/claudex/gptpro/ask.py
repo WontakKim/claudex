@@ -70,7 +70,7 @@ def _pro_control_probe(result: str) -> str:
 
 PRO_STATE_JS = _pro_control_probe(
     "{picker: !!ui.picker, expanded: ui.expanded, linkedMenu: !!ui.menu, "
-    "level: ui.pickerLevel, feedback: ui.feedback}"
+    "level: ui.pickerLevel, label: ui.pickerLabel, feedback: ui.feedback}"
 )
 PRO_PICKER_HANDLE_JS = _pro_control_probe("ui.expanded ? null : ui.picker")
 PRO_POWER_HANDLE_JS = _pro_control_probe(
@@ -1111,10 +1111,35 @@ class _AskExecution:
         feedback = state.get("feedback")
         return feedback if feedback != previous else None
 
-    @staticmethod
-    def _has_selected_pro(state: Mapping[str, Any]) -> bool:
-        return (state.get("picker") is True and state.get("expanded") is False
-                and state.get("level") == "Pro")
+    def _has_selected_pro(self, state: Mapping[str, Any]) -> bool:
+        if state.get("picker") is not True or state.get("expanded") is not False:
+            return False
+        return state.get("level") == "Pro" or self.locator_book.accepts_label(
+            self.locator_environment or "unknown", "Pro", state.get("label"),
+        )
+
+    async def _judge_closed_picker_label(self, state: Mapping[str, Any]) -> None:
+        label = state.get("label")
+        if state.get("picker") is not True or state.get("expanded") is not False or not isinstance(label, str):
+            raise GptProAskError("locator_unresolved", "the ChatGPT composer did not retain Pro")
+        self._status("the ChatGPT picker label is unrecognized; judging whether it shows Pro")
+        end = min(self.deadline, _monotonic() + PRO_CONTROL_RECOVERY_SECONDS)
+        try:
+            await self._await_page_operation(
+                self.locator_book.judge_label(
+                    self.locator_environment or "unknown", "Pro", label, deadline=end,
+                ),
+                maximum_seconds=end - _monotonic(),
+            )
+        except (TimeoutError, locators.LocatorHealingError) as exc:
+            self._ensure_deadline()
+            reason = str(exc) or "the picker label judgment timed out"
+            raise GptProAskError(
+                "locator_unresolved", f"the ChatGPT composer did not retain Pro: {reason}",
+            ) from exc
+        # The judgment covers the label read before it; the picker may differ by now.
+        if not self._has_selected_pro(await self._pro_state()):
+            raise GptProAskError("locator_unresolved", "the ChatGPT composer did not retain Pro")
 
     async def _rediscover_pro_control(self, target: Literal["picker", "power"]) -> bool:
         check = await self._check_locator(target)
@@ -1157,8 +1182,9 @@ class _AskExecution:
         if feedback["level"] != "Pro":
             raise GptProAskError("locator_unresolved", "ChatGPT Power did not reach Pro")
         await self._act_on_pro_control("power", "Escape", feedback)
-        if not self._has_selected_pro(await self._wait_for_pro_state(self._has_selected_pro)):
-            raise GptProAskError("locator_unresolved", "the ChatGPT composer did not retain Pro")
+        state = await self._wait_for_pro_state(self._has_selected_pro)
+        if not self._has_selected_pro(state):
+            await self._judge_closed_picker_label(state)
         self._settle_rediscovered("picker", "success")
         self._settle_rediscovered("power", "success")
 

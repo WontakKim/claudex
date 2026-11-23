@@ -72,6 +72,11 @@ const draw = () => {
   slider.setAttribute('aria-valuenow', level);
   document.getElementById('feedback').textContent = `${levels[level]}, ${level+1} of ${levels.length}.`;
 };
+// A model badge before the level gives the closed picker a label such as '6 Pro'.
+if (config.modelBadge) {
+  picker().querySelector('.level').before(Object.assign(
+    document.createElement('span'), {className: 'badge', textContent: config.modelBadge}), ' ');
+}
 draw();
 drawCaption();
 if (['power', 'both'].includes(config.drift)) {
@@ -103,7 +108,8 @@ upgrade.textContent = 'Upgrade';
 upgrade.onclick = () => actions.push(['upgrade']);
 menu.append(upgrade);
 window.changeProof = () => {
-  if (config.boundary !== 'unreadable') {
+  if (config.boundary === 'rebadged') picker().querySelector('.badge').textContent = '7';
+  else if (config.boundary !== 'unreadable') {
     level = 1;
     draw();
   } else picker().querySelector('.level').remove();
@@ -150,7 +156,7 @@ document.addEventListener('submit', event => {
 
 async def _run_ask(
     tmp_path: Path, config: dict, *, conversation_id=None, expect_failure=False,
-    healer=None, attachment=False,
+    healer=None, attachment=False, book=None,
 ):
     async with async_playwright() as playwright:
         executable = Path(playwright.chromium.executable_path)
@@ -170,7 +176,7 @@ async def _run_ask(
             await page.route('**/*', lambda route: route.fulfill(
                 content_type='text/html', body=_PAGE.replace('CONFIG', json.dumps(config)),
             ))
-            book = locators.LocatorBook(tmp_path / 'locators.json', healer=healer)
+            book = book or locators.LocatorBook(tmp_path / 'locators.json', healer=healer)
             execution = ask._AskExecution(
                 page, 'Synthetic prompt', None, timeout_seconds=35, conversation_id=conversation_id,
                 locator_book=book, attachment_paths=('synthetic.txt',) if attachment else (),
@@ -258,12 +264,65 @@ def test_a_picker_label_of_pro_is_not_proof_while_power_reports_another_level(tm
     assert actions[-1] == ['send', 'Pro']
 
 
-def test_power_that_reverts_when_the_menu_closes_never_receives_input(tmp_path):
-    actions = asyncio.run(_run_ask(tmp_path, {'revertOnClose': True}, expect_failure=True))
+@pytest.mark.parametrize('model_badge', [None, '6'])
+def test_power_that_reverts_when_the_menu_closes_never_receives_input(tmp_path, model_badge):
+    healer = _LabelHealer()
+    config = {'revertOnClose': True, 'modelBadge': model_badge}
+    actions = asyncio.run(_run_ask(tmp_path, config, expect_failure=True, healer=healer))
     assert actions[:4] == [
         ['open', 'Medium'], ['key', 'Medium'], ['key', 'High'], ['key', 'Extra High'],
     ]
     assert all(action[0] in ('open', 'key') for action in actions)
+    assert healer.calls == []
+
+
+class _LabelHealer:
+    def __init__(self, shows_level='yes'):
+        self.calls = []
+        self.shows_level = shows_level
+
+    async def complete(self, system, prompt, timeout_seconds):
+        self.calls.append(prompt)
+        return json.dumps({'shows_level': self.shows_level})
+
+
+def test_an_unrecognized_picker_label_is_judged_once_and_reused(tmp_path):
+    healer = _LabelHealer()
+    book = locators.LocatorBook(tmp_path / 'locators.json', healer=healer)
+    for _ in range(2):
+        actions = asyncio.run(_run_ask(tmp_path, {'level': 4, 'modelBadge': '6'}, book=book))
+        assert actions[0] == ['open', 'Pro']
+        assert actions[1:-1] and all(action == ['input', 'Pro'] for action in actions[1:-1])
+        assert actions[-1] == ['send', 'Pro']
+    assert len(healer.calls) == 1
+    assert json.loads(healer.calls[0].splitlines()[-1]) == {'level': 'Pro', 'label_lines': ['6 Pro']}
+    assert 'Synthetic prompt' not in healer.calls[0]
+
+
+@pytest.mark.parametrize('shows_level', ['no', 'uncertain', None])
+def test_an_unrecognized_picker_label_never_receives_input_without_a_confirming_judgment(
+    tmp_path, shows_level,
+):
+    healer = _LabelHealer(shows_level) if shows_level else None
+    actions = asyncio.run(_run_ask(
+        tmp_path, {'level': 4, 'modelBadge': '6'}, expect_failure=True, healer=healer,
+    ))
+    assert actions and all(action == ['open', 'Pro'] for action in actions)
+    assert healer is None or len(healer.calls) == 1
+
+
+@pytest.mark.parametrize('boundary', ['changed', 'rebadged'])
+def test_a_judged_picker_label_that_changes_before_send_aborts_without_another_judgment(
+    tmp_path, boundary,
+):
+    healer = _LabelHealer()
+    config = {'level': 4, 'modelBadge': '6', 'boundary': boundary}
+    actions = asyncio.run(_run_ask(
+        tmp_path, config, conversation_id=_CONVERSATION_ID, expect_failure=True, healer=healer,
+    ))
+    assert actions[0] == ['open', 'Pro']
+    assert actions[1:] and all(action == ['input', 'Pro'] for action in actions[1:])
+    assert len(healer.calls) == 1
 
 
 @pytest.mark.parametrize('boundary', ['changed', 'unreadable'])

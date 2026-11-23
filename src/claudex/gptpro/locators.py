@@ -1,4 +1,7 @@
-"""Structure-only locator recovery with first-use proof and per-language breakers."""
+"""Structure-only locator recovery with first-use proof and per-language breakers.
+
+Also judges, from its bounded text alone, whether a closed picker label shows a level.
+"""
 
 from __future__ import annotations
 
@@ -104,6 +107,21 @@ _SYSTEM_PROMPT = (
     '{"status":"selected","candidate":<index>}, {"status":"absent"}, or '
     '{"status":"uncertain"}. Use uncertain when two or more candidates are equally plausible.'
 )
+# Bounds the page text that a label judgment discloses to the healer.
+MAX_PICKER_LABEL_CHARACTERS = 80
+_LABEL_SYSTEM_PROMPT = (
+    'Judge what a button label shows. Reply with exactly one JSON object: '
+    '{"shows_level":"yes"}, {"shows_level":"no"}, or {"shows_level":"uncertain"}.'
+)
+_LABEL_QUESTION = (
+    "A chat composer button opens a menu that selects a model and a thinking effort level. "
+    "The menu just reported the selected effort level given below, and the closed button now "
+    "shows the label given below. Such a label states the selected effort level and can also "
+    "carry a caption or a model name or version. Answer yes if the label states that level as "
+    "the selected effort level. Answer no if it states a different effort level, or if the "
+    "level name appears only inside another word or as part of an offer or instruction. "
+    "Answer uncertain if neither reading is more plausible."
+)
 _TARGET_DESCRIPTIONS = {
     "composer": (
         "the main message input where the user types a new chat message; "
@@ -138,6 +156,20 @@ def environment_key(lang: str) -> str:
     return lang or "unknown"
 
 
+def _parse_reply(reply: str) -> dict[str, Any]:
+    try:
+        text = reply.strip()
+        lines = text.splitlines()
+        if len(lines) >= 3 and lines[0] in ("```", "```json") and lines[-1] == "```":
+            text = "\n".join(lines[1:-1]).strip()
+        selection = json.loads(text)
+    except (ValueError, TypeError, AttributeError) as exc:
+        raise HealFailed("the healer reply was not a single JSON object") from exc
+    if not isinstance(selection, dict):
+        raise HealFailed("the healer reply was not a single JSON object")
+    return selection
+
+
 @dataclass(frozen=True)
 class RediscoveredLocator:
     selector: str
@@ -152,6 +184,8 @@ class LocatorBook:
     clock: Callable[[], float] = time.time
     monotonic: Callable[[], float] = time.monotonic
     pending: dict[tuple[str, str], RediscoveredLocator] = field(default_factory=dict, init=False)
+    # (environment, level, label) of closed picker labels judged to show the level.
+    accepted_labels: set[tuple[str, str, str]] = field(default_factory=set, init=False)
     _locks: dict[tuple[str, str], asyncio.Lock] = field(default_factory=dict, init=False)
 
     def _load(self) -> dict[str, dict[str, dict[str, Any]]]:
@@ -335,16 +369,7 @@ class LocatorBook:
                     timeout_seconds=min(remaining(), 30),
                 )
                 remaining()
-                try:
-                    text = reply.strip()
-                    lines = text.splitlines()
-                    if len(lines) >= 3 and lines[0] in ("```", "```json") and lines[-1] == "```":
-                        text = "\n".join(lines[1:-1]).strip()
-                    selection = json.loads(text)
-                except (ValueError, TypeError, AttributeError) as exc:
-                    raise HealFailed("the healer reply was not a single JSON object") from exc
-                if not isinstance(selection, dict):
-                    raise HealFailed("the healer reply was not a single JSON object")
+                selection = _parse_reply(reply)
                 if selection.get("status") != "selected":
                     raise HealFailed("the healer found the control absent or uncertain")
                 index = selection.get("candidate")
@@ -372,6 +397,39 @@ class LocatorBook:
             result = RediscoveredLocator(selector, uuid4().hex, key[0])
             self.pending[key] = result
             return result
+
+    def accepts_label(self, env: str, level: str, label: object) -> bool:
+        return isinstance(label, str) and (environment_key(env), level, label) in self.accepted_labels
+
+    async def judge_label(self, env: str, level: str, label: str, *, deadline: float) -> None:
+        """Accept a closed picker label that the healer judges to show ``level``.
+
+        The caller has already read ``level`` from the open menu. Acceptance lasts
+        for the life of this book and applies to the exact label text only.
+        """
+        def remaining() -> float:
+            budget = deadline - self.monotonic()
+            if budget <= 0:
+                raise TimeoutError("picker label judgment deadline expired")
+            return budget
+
+        key = (environment_key(env), level, label)
+        async with asyncio.timeout(remaining()):
+            async with self._locks.setdefault((key[0], "picker-label"), asyncio.Lock()):
+                if key in self.accepted_labels:
+                    return
+                if level not in label or len(label) > MAX_PICKER_LABEL_CHARACTERS:
+                    raise HealFailed("the closed picker label does not show the level")
+                if self.healer is None:
+                    raise HealerUnavailable("the locator healer is not configured")
+                reply = await self.healer.complete(
+                    _LABEL_SYSTEM_PROMPT,
+                    _LABEL_QUESTION + "\n" + json.dumps({"level": level, "label_lines": label.split("\n")}),
+                    timeout_seconds=min(remaining(), 30),
+                )
+                if _parse_reply(reply).get("shows_level") != "yes":
+                    raise HealFailed("the healer did not confirm that the closed picker label shows the level")
+                self.accepted_labels.add(key)
 
 
 class GatewayMessagesHealer:

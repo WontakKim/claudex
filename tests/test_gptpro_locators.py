@@ -1017,3 +1017,80 @@ def test_success_transfer_checks_attempt_ownership(tmp_path, owned, destination)
             assert book.pending[("unknown", "composer")] == result
             assert not book.path.exists()
     asyncio.run(run())
+
+
+def _judge_label(book, label="6 Pro", *, env="ko", timeout_seconds=20):
+    return book.judge_label(env, "Pro", label, deadline=book.monotonic() + timeout_seconds)
+
+
+def test_judged_label_is_accepted_for_its_language_level_and_text(tmp_path: Path) -> None:
+    healer = _Healer('{"shows_level":"yes"}')
+    book = locators.LocatorBook(tmp_path / "locators.json", healer=healer)
+    assert not book.accepts_label("ko", "Pro", "6 Pro")
+    asyncio.run(_judge_label(book))
+    asyncio.run(_judge_label(book))
+    assert healer.calls == 1
+    assert book.accepts_label("ko", "Pro", "6 Pro")
+    assert not book.accepts_label("en", "Pro", "6 Pro")
+    assert not book.accepts_label("ko", "Pro", "6 Medium")
+    assert not book.path.exists()
+
+
+def test_label_judgment_discloses_only_the_level_and_label_lines(tmp_path: Path) -> None:
+    prompts = []
+
+    class Healer:
+        async def complete(self, system: str, prompt: str, timeout_seconds: float) -> str:
+            prompts.append(prompt)
+            return '{"shows_level":"yes"}'
+
+    book = locators.LocatorBook(tmp_path / "locators.json", healer=Healer())
+    asyncio.run(_judge_label(book, "Thinking effort\n6 Pro"))
+    assert json.loads(prompts[0].splitlines()[-1]) == {
+        "level": "Pro", "label_lines": ["Thinking effort", "6 Pro"],
+    }
+
+
+@pytest.mark.parametrize("reply", [
+    '{"shows_level":"no"}', '{"shows_level":"uncertain"}', '{"status":"selected"}',
+    'yes', '{"shows_level":"yes"} trailing prose',
+])
+def test_unconfirmed_label_judgment_is_not_accepted(tmp_path: Path, reply: str) -> None:
+    healer = _Healer(reply)
+    book = locators.LocatorBook(tmp_path / "locators.json", healer=healer)
+    for _ in range(2):
+        with pytest.raises(locators.HealFailed):
+            asyncio.run(_judge_label(book))
+    assert healer.calls == 2
+    assert not book.accepts_label("ko", "Pro", "6 Pro")
+
+
+@pytest.mark.parametrize("label", ["6 Medium", "", "Pro" + "x" * 78])
+def test_label_without_the_level_or_over_the_limit_is_never_sent(tmp_path: Path, label: str) -> None:
+    healer = _Healer('{"shows_level":"yes"}')
+    book = locators.LocatorBook(tmp_path / "locators.json", healer=healer)
+    with pytest.raises(locators.HealFailed):
+        asyncio.run(_judge_label(book, label))
+    assert healer.calls == 0
+    assert not book.accepts_label("ko", "Pro", label)
+
+
+def test_label_at_the_limit_is_judged(tmp_path: Path) -> None:
+    label = "Pro" + "x" * 77
+    assert len(label) == 80
+    healer = _Healer('{"shows_level":"yes"}')
+    book = locators.LocatorBook(tmp_path / "locators.json", healer=healer)
+    asyncio.run(_judge_label(book, label))
+    assert healer.calls == 1
+
+
+def test_label_judgment_needs_a_healer_and_remaining_time(tmp_path: Path) -> None:
+    book = locators.LocatorBook(tmp_path / "locators.json")
+    with pytest.raises(locators.HealerUnavailable):
+        asyncio.run(_judge_label(book))
+    healer = _Healer('{"shows_level":"yes"}')
+    book = locators.LocatorBook(tmp_path / "locators.json", healer=healer)
+    with pytest.raises(TimeoutError):
+        asyncio.run(_judge_label(book, timeout_seconds=0))
+    assert healer.calls == 0
+    assert not book.accepts_label("ko", "Pro", "6 Pro")

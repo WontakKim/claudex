@@ -409,7 +409,8 @@ PRO_CONTROLS_JS = r"""
     enabled(pickers[0]) ? pickers[0] : null;
   const expanded = picker?.getAttribute('aria-expanded') === 'true';
   const lines = picker ? labelLines(picker) : [];
-  // A closed picker shows its level alone or under a 'Thinking effort' caption.
+  // pickerLevel is exact only for a label that is the level alone or the level under a
+  // 'Thinking effort' caption. Any other label is not a level name; pickerLabel carries it.
   const pickerLevel = lines.length === 2 && lines[0] === 'Thinking effort' ? lines[1]
     : lines.length === 1 ? lines[0] : null;
   const controls = expanded && picker.id && picker.getAttribute('aria-controls');
@@ -438,7 +439,8 @@ PRO_CONTROLS_JS = r"""
     .filter(element => element.closest('[role="menu"]') === menu && visible(element)) : [];
   const feedback = powers.length === 1 && matches(powers[0], powerSelector) && enabled(powers[0])
     ? describePower(powers[0]) : null;
-  return {picker, power: feedback ? powers[0] : null, pickers, powers, menu, expanded, pickerLevel, feedback};
+  return {picker, power: feedback ? powers[0] : null, pickers, powers, menu, expanded, pickerLevel,
+    pickerLabel: lines.join('\n'), feedback};
 }
 """
 
