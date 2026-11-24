@@ -19,7 +19,8 @@ balanced routing's [local-login participation](#local-claude-code-login), which
 leaves token refresh to the CLI.
 
 The [dashboard](dashboard.md#claude-accounts) offers **Add account**,
-**Sign in again**, **Set serving pin**, **Clear serving pin**, and **Remove**.
+**Sign in again**, **Set serving pin**, **Clear serving pin**,
+[**Reset**](#resetting-a-local-cooldown), and **Remove**.
 Its add flow runs the same
 `claude auth login --claudeai` capture on the gateway host and takes the
 pasted login code in the browser. Only one Claude login, from the CLI or the
@@ -166,14 +167,14 @@ while set.
 How long a rate-limited account sits out is taken from the best signal the
 429 offers: a `Retry-After` header or a reset timestamp when present,
 otherwise the account's cached usage window resets (as shown in the
-dashboard), otherwise a 60-second default — in practice Anthropic's OAuth
-quota rejections carry no machine-readable reset, so the cached usage data
-is what turns a blind minute into an accurate multi-hour cooldown. Each
+dashboard), otherwise a 60-second default. Cached usage supplies a reset
+estimate when the rejection has no machine-readable reset signal. Each
 account's routing state is visible at
 `GET /admin/providers/claude/pool/status` (`ready`, `cooldown` with a
-`cooldown_until` epoch-ms deadline, or `unavailable`) and lives in daemon
-memory only: a restart clears it, at worst costing one extra upstream
-probe.
+`cooldown_until` epoch-ms deadline, or `unavailable`). In fallback mode,
+cooldowns live in daemon memory only and a restart clears them; a later
+request may receive another upstream rejection. Balanced cooldowns are
+persistent, as described below.
 
 Boundaries to know:
 
@@ -188,14 +189,44 @@ Boundaries to know:
   once everything is already cooling (upstream is then not contacted at all).
 - Failover only happens before any response byte is relayed; a stream that
   dies midway is reported in-band, as before.
-- Rate limits are per account **per model tier** upstream, but the fallback
-  pool's cooldown is per account: a Fable-scoped weekly limit cools the whole
-  account even for requests other models could still serve. Balanced routing
-  can limit such a cooldown to Fable models.
+- Provider limits include shared account windows and model-specific windows,
+  but the fallback pool's cooldown is per account: a Fable-scoped weekly limit
+  cools the whole account even for requests other models could still serve.
+  Balanced routing can limit such a cooldown to Fable models.
 - The CLI's own usage display remains unreliable under pooling: its usage
   query authenticates with the placeholder token and fails, and response
   rate-limit headers reflect whichever account served. Use the dashboard's
   per-account usage view instead.
+
+## Resetting a local cooldown
+
+**Reset permits a retry; it does not restore provider quota.** It clears only
+the selected registered account's local execution cooldowns. Usage readings,
+usage-API backoff, credentials, serving pins, session assignments, and other
+accounts are unchanged. A remaining Fable weekly allowance does not guarantee
+that shared five-hour or seven-day limits allow a request.
+
+1. Open **Settings → Claude accounts** in the dashboard and expand the cooling
+   account's details.
+2. Select **Reset** on the right of the cooldown notice. The button shows
+   **Resetting…** while the operation is pending.
+3. Wait for the result and refreshed routing status. A successful reset confirms
+   the local cooldown deletion, including durable storage where present. A
+   concurrent or subsequent `429` can retain or reapply a cooldown, so success
+   does not guarantee a **Ready for routing** badge or a successful model request.
+
+API clients must satisfy the same Host guard and configured
+`CLAUDEX_LOCAL_TOKEN` bearer authentication as other admin routes. Send a
+bodyless `DELETE /admin/providers/claude/accounts/{account_id}/cooldown` for a
+registered account: success returns `204`, and an unknown account returns `404`.
+The action works without changing the routing mode or serving pin.
+
+A storage failure returns `500` without confirming a complete reset. Resolve
+storage availability and retry. A timeout or lost response can leave the result
+unconfirmed, and queued writes may still settle later; do not assume rollback.
+If the reset succeeds but the status endpoint returns an error, the dashboard
+reports the reset separately from the refresh failure rather than claiming the
+account is ready.
 
 ## Balanced routing across the pool
 
@@ -257,10 +288,24 @@ for an unavailable runtime dependency, and balanced passthrough keeps
 returning `503`. You can instead switch to `disabled` or `fallback` through
 the same endpoint even while the balanced runtime is inactive.
 
-While balanced routing is active, `GET /admin/providers/claude/pool/usage`
-answers from cached readings only. Add `?refresh` to queue a rate-limited
-poll. `GET /admin/providers/claude/pool/status` adds a pool-wide
-`usage_freshness` value: `fresh`, `partial`, or `degraded`.
+While balanced routing is active, `GET /admin/providers/claude/pool/status`
+reflects the active router's cooldowns, including valid cooldowns restored after
+a restart. A cooling member has `cooldown_until` in epoch milliseconds and
+`cooldown_scope: "account"` for an account-wide gate, or
+`cooldown_scope: "family"` with `model_family: "fable"` for a Fable-only gate.
+A family-only gate does not block other model families. The endpoint also adds
+a pool-wide `usage_freshness` value: `fresh`, `partial`, or `degraded`.
+
+`GET /admin/providers/claude/pool/usage` answers from cached readings only.
+Startup restores valid stored usage for the current account identity and profile
+with its original observation age, source, and reset time; restoration is not a
+new usage check. Existing in-process cache results remain authoritative when
+balanced routing is re-enabled. An account awaiting its first usage result returns
+`status: "pending"`, displayed as **Waiting for first usage observation**, rather
+than a fetch failure. Actual probe failures remain errors. Add `?refresh` to
+queue a rate-limited poll; it does not fetch inline or bypass the shared usage-API
+cooldown. Wait for the scheduled poll and reopen the account view to see its
+result; the page does not automatically poll for updates.
 
 ### Local Claude Code login
 

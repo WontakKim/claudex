@@ -121,10 +121,10 @@ def _compute_usage_freshness(
 async def _handle_admin_claude_pool_status(request: Request) -> JSONResponse:
     """Per-account routing state: what the serving chain would see right now.
 
-    This is telemetry over the registry and the active serving cooldown source
-    — never the configured pin, which lives at pool/serving. While
-    balanced routing is active, this also carries the balanced `usage_freshness`
-    diagnostic (Step 6); in every other mode both fields are `None`.
+    This is telemetry over the registry and the active serving cooldown source,
+    not the configured pin, which lives at pool/serving. Active balanced routing
+    also exposes `usage_freshness` and `usage_diagnostics`; outside that runtime
+    both fields are `None`.
     """
     denied = _admin_guard(request)
     if denied is not None:
