@@ -96,6 +96,23 @@ def test_route_of_has_no_codex_or_provider_membership_fallback() -> None:
     assert "ROUTE_PROVIDERS" not in body
 
 
+def test_account_cooldown_scope_is_visible_without_blocking_other_families(
+    dashboard_runtime_result: dict[str, Any],
+) -> None:
+    states = dashboard_runtime_result["accountCooldownScopes"]
+    family = states["family"]
+    assert "Fable" in family["badge"]
+    assert "Fable" in family["detail"]
+    assert "Other model families are not blocked by this cooldown." in family["detail"]
+    assert "Ready for routing" not in family["badge"]
+    for scope in ("account", "legacy"):
+        assert "Cooldown until" in states[scope]["badge"]
+        assert "All model families" in states[scope]["detail"]
+        assert "Other model families are not blocked" not in states[scope]["detail"]
+    assert "Ready for routing" in states["ready"]["badge"]
+    assert "coolnote" not in states["ready"]["detail"]
+
+
 def test_dashboard_html_references_only_external_assets_at_document_end() -> None:
     assert 'rel="stylesheet" href="/dashboard.css"' in DASHBOARD_HTML
     assert re.search(r"<style\b", DASHBOARD_HTML, re.IGNORECASE) is None

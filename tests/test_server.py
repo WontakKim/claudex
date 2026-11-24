@@ -1701,10 +1701,11 @@ class TestAdminClaudeAccountsApi:
             base_url=_ADMIN_BASE,
         )
 
+    @pytest.mark.parametrize("mode", ["disabled", "fallback"])
     def test_pool_status_reports_ready_cooldown_and_unavailable_members(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, mode: str
     ) -> None:
-        client = self._client(monkeypatch, tmp_path)
+        client = self._client(monkeypatch, tmp_path, claude_account_routing_mode=mode)
         millis = iter(range(1_700_000_000_000, 1_700_000_000_100))
         monkeypatch.setattr(claude_accounts, "_now_millis", lambda: next(millis))
         ready_id = _register_serving_account()
@@ -2638,6 +2639,92 @@ def test_balanced_restart_restores_the_family_cooldown_without_a_repeat_429_burs
 
         assert second_response.status_code == 429
         assert len(calls) == 1  # no repeat-429 burst: the restored cooldown skipped upstream entirely
+
+
+@pytest.mark.parametrize("scope", ["account", "family"])
+def test_pool_status_reports_restored_balanced_cooldown(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, scope: str
+) -> None:
+    _balanced_env(monkeypatch, tmp_path)
+    account_id, _ = _register_balanced_accounts(1)[0]
+    settings_file = tmp_path / "settings.json"
+    with _create_test_client(
+        monkeypatch, tmp_path, config=GatewayConfig(settings_file=settings_file), base_url=_ADMIN_BASE
+    ) as client:
+        response = client.put("/admin/providers/claude/pool/routing", json={"mode": "balanced"})
+        assert response.status_code == 200
+        router = client.app.state.claude_balanced_runtime.router
+        record = claude_accounts.list_accounts()[0]
+        deadline_utc = time.time() + 120.0
+        pending = router.install_cooldown(
+            account_id=account_id,
+            account_incarnation_id=record.account_incarnation_id,
+            account_profile_fingerprint=server_support._account_profile_fingerprint(client.app.state, account_id),
+            scope=scope,
+            model_family="fable" if scope == "family" else "",
+            deadline=time.monotonic() + 120.0,
+            reason="quota",
+        )
+        pending.wait(timeout=5.0)
+
+    with _create_test_client(
+        monkeypatch, tmp_path, config=GatewayConfig.load(settings_file), base_url=_ADMIN_BASE
+    ) as client:
+        assert client.app.state.claude_balanced_runtime.status == "active"
+        assert not client.app.state.claude_account_cooldowns.is_cooling(account_id)
+        client.portal.call(client.app.state.claude_balanced_runtime._stop_usage_poll_driver)
+
+        async def reject_upstream(*args: Any, **kwargs: Any) -> Any:
+            pytest.fail("pool status must not fetch upstream or load/refresh credentials")
+
+        monkeypatch.setattr(client.app.state.http_client, "send", reject_upstream)
+        monkeypatch.setattr(server_support.ClaudeAccountAuthManager, "get_credentials", reject_upstream)
+        response = client.get("/admin/providers/claude/pool/status")
+        assert response.status_code == 200
+        member = response.json()["members"][0]
+        assert member["account_id"] == account_id
+        assert member["routing_state"] == "cooldown"
+        assert member["cooldown_scope"] == scope
+        assert member.get("model_family") == ("fable" if scope == "family" else None)
+        assert member["cooldown_until"] == pytest.approx(deadline_utc * 1000, abs=5_000)
+
+
+@pytest.mark.parametrize("scope", ["account", "family"])
+@pytest.mark.parametrize("invalidity", ["expired", "incarnation", "profile", "missing-profile"])
+def test_pool_status_ignores_invalid_balanced_cooldowns_and_fallback_tracker(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, scope: str, invalidity: str
+) -> None:
+    _balanced_env(monkeypatch, tmp_path)
+    account_id, _ = _register_balanced_accounts(1)[0]
+    with _create_test_client(
+        monkeypatch, tmp_path, config=GatewayConfig(settings_file=tmp_path / "settings.json"), base_url=_ADMIN_BASE
+    ) as client:
+        response = client.put("/admin/providers/claude/pool/routing", json={"mode": "balanced"})
+        assert response.status_code == 200
+        router = client.app.state.claude_balanced_runtime.router
+        record = claude_accounts.list_accounts()[0]
+        router.install_cooldown(
+            account_id=account_id,
+            account_incarnation_id="old-incarnation" if invalidity == "incarnation" else record.account_incarnation_id,
+            account_profile_fingerprint=server_support._account_profile_fingerprint(client.app.state, account_id),
+            scope=scope,
+            model_family="fable" if scope == "family" else "",
+            deadline=time.monotonic() + (-1.0 if invalidity == "expired" else 120.0),
+            reason="quota",
+        )
+        if invalidity in {"profile", "missing-profile"}:
+            profile_file = paths.accounts_dir("claude") / account_id / "oauth-account.json"
+            if invalidity == "missing-profile":
+                profile_file.unlink()
+            else:
+                profile = json.loads(profile_file.read_text(encoding="utf-8"))
+                profile["seatTier"] = "changed-tier"
+                profile_file.write_text(json.dumps(profile), encoding="utf-8")
+        client.app.state.claude_account_cooldowns.mark(account_id, 120.0)
+
+        response = client.get("/admin/providers/claude/pool/status")
+        assert response.status_code == 200
+        assert response.json()["members"] == [{"account_id": account_id, "routing_state": "ready"}]
 
 
 def test_balanced_account_removal_clears_its_durable_rows_for_that_incarnation(

@@ -1269,6 +1269,18 @@ async function main() {
   servingCopy.pinned = feedbackContext.acctRowHtml(account);
   feedbackContext.ACCT.serving = null;
   servingCopy.unpinned = feedbackContext.acctRowHtml(account);
+  const accountCooldownScopes = {};
+  for (const scope of ["account", "family", "legacy", "ready"]) {
+    feedbackContext.ACCT.routing[account.id] = scope === "ready"
+      ? {routing_state: "ready"}
+      : {routing_state: "cooldown", cooldown_until: 1800000000000,
+        ...(scope === "legacy" ? {} : {cooldown_scope: scope}),
+        ...(scope === "family" ? {model_family: "fable"} : {})};
+    accountCooldownScopes[scope] = {
+      badge: feedbackContext.routingBadgeHtml(account.id),
+      detail: feedbackContext.acctDetailHtml(account, false),
+    };
+  }
   feedbackContext.renderUsageProvider("codex", {status: "ok", session: {used_percent: 5, window_minutes: 60}});
   const unknownDurationUsage = feedbackDocument.getElementById("usage-body-codex").innerHTML;
   const operatorFeedback = {alertToast, statusToast, rejectedCode, retainedCodeError, disconnectedCode,
@@ -2391,6 +2403,7 @@ async function main() {
       },
       cards,
       operatorFeedback,
+      accountCooldownScopes,
       usageRendering,
       gptProConcurrencyStates,
       gptProSessionStates,

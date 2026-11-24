@@ -120,8 +120,8 @@ def _compute_usage_freshness(
 async def _handle_admin_claude_pool_status(request: Request) -> JSONResponse:
     """Per-account routing state: what the serving chain would see right now.
 
-    This is telemetry over the registry plus the daemon-memory cooldown
-    tracker — never the configured pin, which lives at pool/serving. While
+    This is telemetry over the registry and the active serving cooldown source
+    — never the configured pin, which lives at pool/serving. While
     balanced routing is active, this also carries the balanced `usage_freshness`
     diagnostic (Step 6); in every other mode both fields are `None`.
     """
@@ -138,6 +138,8 @@ async def _handle_admin_claude_pool_status(request: Request) -> JSONResponse:
             status_code=500,
         )
     tracker: AccountCooldownTracker = request.app.state.claude_account_cooldowns
+    runtime = _active_balanced_runtime(request)
+    router = runtime.router if runtime is not None else None
     members: list[dict[str, Any]] = []
     for record in records:
         if record.state != "ready":
@@ -149,21 +151,46 @@ async def _handle_admin_claude_pool_status(request: Request) -> JSONResponse:
                 }
             )
             continue
-        cooldown_until = _cooling_down_until_millis(tracker, record.id)
-        if cooldown_until is not None:
-            members.append(
-                {
-                    "account_id": record.id,
-                    "routing_state": "cooldown",
-                    "cooldown_until": cooldown_until,
-                }
+        cooldown_scope = "account"
+        if router is not None:
+            now = time.monotonic()
+            wall_now = time.time()
+            fingerprint = server_support._account_profile_fingerprint(request.app.state, record.id)
+            deadline = router.account_cooldown_deadline(
+                record.id,
+                account_incarnation_id=record.account_incarnation_id,
+                account_profile_fingerprint=fingerprint,
+                now=now,
+                wall_now=wall_now,
             )
+            if deadline is None:
+                deadline = router.family_cooldown_deadline(
+                    record.id,
+                    "fable",
+                    account_incarnation_id=record.account_incarnation_id,
+                    account_profile_fingerprint=fingerprint,
+                    now=now,
+                    wall_now=wall_now,
+                )
+                cooldown_scope = "family"
+            cooldown_until = int((wall_now + deadline - now) * 1000) if deadline is not None else None
+        else:
+            cooldown_until = _cooling_down_until_millis(tracker, record.id)
+        if cooldown_until is not None:
+            member = {
+                "account_id": record.id,
+                "routing_state": "cooldown",
+                "cooldown_until": cooldown_until,
+                "cooldown_scope": cooldown_scope,
+            }
+            if cooldown_scope == "family":
+                member["model_family"] = "fable"
+            members.append(member)
         else:
             members.append({"account_id": record.id, "routing_state": "ready"})
 
     usage_freshness: str | None = None
     usage_diagnostics: dict[str, Any] | None = None
-    runtime = _active_balanced_runtime(request)
     if runtime is not None:
         ready_ids = [record.id for record in records if record.state == "ready"]
         cache: ClaudeAccountUsageCache = request.app.state.claude_account_usage_cache

@@ -1698,7 +1698,7 @@ function routingBadgeHtml(accountId){
   var m=ACCT.routing[accountId];
   if(!m)return"";
   if(m.routing_state==="cooldown")
-    return'<span class="pill cool">Cooldown until '+esc(fmtCooldownUntil(m.cooldown_until))+'</span>';
+    return'<span class="pill cool">'+(m.cooldown_scope==="family"&&m.model_family==="fable"?"Fable cooldown until ":"Cooldown until ")+esc(fmtCooldownUntil(m.cooldown_until))+'</span>';
   if(m.routing_state==="ready")return'<span class="pill ready">Ready for routing</span>';
   if(m.routing_state==="unavailable")
     return'<span class="pill unavailable">Unavailable for routing'+(m.reason==="needs-reauth"?" · sign-in required":"")+'</span>';
@@ -1749,9 +1749,11 @@ function acctDetailHtml(row,serving){
       :'<button type="button" class="primary" data-act="serve"'+(ACCT.locked?" disabled":"")+'>Set serving pin</button>';
   // Account removal is available unless the account is the active serving pin.
   var member=ACCT.routing[row.id];
+  var familyCooldown=member&&member.cooldown_scope==="family"&&member.model_family==="fable";
   var coolnote=member&&member.routing_state==="cooldown"
-    ?'<div class="coolnote">Cooling down after a usage-limit response (429).'+
-      '<span class="hint">'+esc(fmtCooldownUntil(member.cooldown_until))+' onward, this account can rejoin routing.</span></div>'
+    ?'<div class="coolnote">'+(familyCooldown?"Fable is cooling down":"All model families are cooling down")+' after a usage-limit response (429).'+
+      '<span class="hint">Cooldown ends '+esc(fmtCooldownUntil(member.cooldown_until))+'.'+
+      (familyCooldown?' Other model families are not blocked by this cooldown.':"")+'</span></div>'
     :"";
   return coolnote+'<div class="ad-grid"><div>'+acctUsageHtml(row)+'</div><div>'+kv+'</div>'+
     '<div class="actions">'+primary+'<span class="spacer"></span>'+
