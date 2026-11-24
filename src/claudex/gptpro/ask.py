@@ -56,6 +56,7 @@ from claudex.gptpro.selectors import (
     USER_MESSAGE_SELECTOR,
     VISIBLE_MODAL_PROBE_JS,
 )
+from claudex.gptpro.session import find_auth_cookie
 
 
 def _pro_control_probe(result: str) -> str:
@@ -736,9 +737,29 @@ class _AskExecution:
             if action.action in ("entitlement", "fatal"):
                 raise GptProAskError("error", action.reason)
 
-    def _check_authenticated(self) -> None:
+    async def _check_authenticated(self) -> None:
+        from playwright.async_api import Error as PlaywrightError
+
         if AUTH_PATH_FRAGMENT in _page_url(self.page):
             raise GptProSessionExpiredError()
+        try:
+            cookies = await self._await_page_operation(
+                self.page.context.cookies(TRUSTED_ORIGIN)
+            )
+        except PlaywrightError as exc:
+            # An unreadable cookie jar is not evidence of a signed-out browser.
+            logger.warning(
+                "Could not read the browser cookies to check the ChatGPT sign-in: %s", exc
+            )
+            return
+        # ChatGPT can serve a signed-out browser a page with a composer and no Pro
+        # controls instead of its login page; only the cookie tells that page
+        # apart from one whose locators drifted.
+        if find_auth_cookie(cookies) is None:
+            raise GptProSessionExpiredError(
+                "the gptpro browser is not signed in to ChatGPT; "
+                "run claudex-gateway gptpro login"
+            )
 
     async def _navigate(self) -> None:
         target_url = (
@@ -762,7 +783,7 @@ class _AskExecution:
             raise GptProAskError(
                 "navigation_failed", "could not navigate to chatgpt.com"
             ) from exc
-        self._check_authenticated()
+        await self._check_authenticated()
         await self._process_network_actions()
 
     async def _probe_challenge(self) -> list[str]:
@@ -973,7 +994,7 @@ class _AskExecution:
         fault_since: float | None = None
         while _monotonic() < end:
             await self._process_network_actions()
-            self._check_authenticated()
+            await self._check_authenticated()
             slice_seconds = min(COMPOSER_SLICE_SECONDS, end - _monotonic())
             try:
                 await self._await_page_operation(
@@ -996,7 +1017,7 @@ class _AskExecution:
                 last_error = exc
                 check = None
             await self._process_network_actions()
-            self._check_authenticated()
+            await self._check_authenticated()
             if check is not None and check.verdict == "valid":
                 fault_since = None
                 # Learning the language can select a different recorded locator.
@@ -1696,7 +1717,7 @@ class _AskExecution:
             raise
         except Exception:
             pass
-        self._check_authenticated()
+        await self._check_authenticated()
         await self._process_network_actions()
 
     async def _relock_user_echo(self, timeout_seconds: float) -> str | None:
@@ -1773,7 +1794,7 @@ class _AskExecution:
         while True:
             current_url = _page_url(self.page)
             if not is_trusted_origin_url(current_url):
-                self._check_authenticated()
+                await self._check_authenticated()
                 raise GptProAskError(
                     "error",
                     "refusing a backend fetch from an untrusted page origin",

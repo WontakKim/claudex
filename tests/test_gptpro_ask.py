@@ -12,7 +12,9 @@ from typing import Any
 
 import pytest
 
-from claudex.gptpro import ask, locators, selectors
+from playwright.async_api import Error as PlaywrightError
+
+from claudex.gptpro import ask, locators, selectors, session
 
 
 @pytest.fixture(autouse=True)
@@ -28,6 +30,9 @@ _CONVERSATION_ID = "123e4567-e89b-12d3-a456-426614174000"
 _EVIL_CONVERSATION_ID = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
 _STREAM_URL = "https://chatgpt.com/backend-api/conversation"
 _LAT_URL = "https://chatgpt.com/backend-api/lat/report"
+_AUTH_COOKIE = {
+    "name": session.AUTH_COOKIE_PREFIX, "value": "signed-in", "domain": ".chatgpt.com",
+}
 
 
 class _FakeClock:
@@ -138,10 +143,23 @@ class _FakeElementHandle:
         self.disposed = True
 
 
+class _FakeContext:
+    """Browser cookie jar: `stored` is its cookies, or the error that reading it raises."""
+
+    def __init__(self, stored: list[dict[str, str]] | Exception) -> None:
+        self.stored = stored
+
+    async def cookies(self, urls: object = None) -> list[dict[str, str]]:
+        if isinstance(self.stored, Exception):
+            raise self.stored
+        return list(self.stored)
+
+
 class _FakePage:
     def __init__(
         self,
         *,
+        cookies: list[dict[str, str]] | Exception | None = None,
         signal: str = "weak",
         raw_text: str = "server **raw** markdown",
         api_payloads: list[str | None] | None = None,
@@ -161,6 +179,7 @@ class _FakePage:
         hang_operation: str | None = None,
     ) -> None:
         self.url = "https://chatgpt.com/"
+        self.context = _FakeContext([_AUTH_COOKIE] if cookies is None else cookies)
         self.signal = signal
         self.api_payloads = list(api_payloads or [raw_text])
         self.api_statuses = list(api_statuses or [200])
@@ -1884,6 +1903,67 @@ def test_idle_grace_bounds_completion_without_network_signal(
     assert _run(page) == "raw after idle grace"
     assert page.fetch_count == 1
     assert clock.value >= 3.0
+
+
+def test_browser_without_an_auth_cookie_is_session_expired_before_any_input(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_clock(monkeypatch)
+    device_cookie = {"name": "oai-did", "value": "device", "domain": ".chatgpt.com"}
+    page = _FakePage(cookies=[device_cookie])
+
+    with pytest.raises(ask.GptProSessionExpiredError) as raised:
+        _run(page)
+
+    assert raised.value.failure == "session_expired"
+    assert raised.value.evidence.submission == "not_attempted"
+    assert page.fill_actions == []
+    assert page.click_count == 0
+
+
+def test_auth_cookie_cleared_while_the_composer_loads_is_session_expired(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_clock(monkeypatch)
+
+    class SignedOutWhileLoadingPage(_FakePage):
+        async def wait_for_selector(
+            self, selector: str, *, state: str, timeout: int
+        ) -> object:
+            self.context.stored = []
+            return await super().wait_for_selector(
+                selector, state=state, timeout=timeout
+            )
+
+    page = SignedOutWhileLoadingPage()
+
+    with pytest.raises(ask.GptProSessionExpiredError) as raised:
+        _run(page)
+
+    assert raised.value.failure == "session_expired"
+    assert page.fill_actions == []
+    assert page.click_count == 0
+
+
+def test_an_auth_cookie_split_into_chunks_counts_as_signed_in(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_clock(monkeypatch)
+    chunks = [
+        {**_AUTH_COOKIE, "name": f"{session.AUTH_COOKIE_PREFIX}.{index}"} for index in range(2)
+    ]
+    page = _FakePage(cookies=chunks)
+
+    assert _run(page) == "server **raw** markdown"
+
+
+def test_an_unreadable_cookie_jar_does_not_stop_the_ask(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_clock(monkeypatch)
+    page = _FakePage(cookies=PlaywrightError("Protocol error (Storage.getCookies)"))
+
+    assert _run(page) == "server **raw** markdown"
 
 
 def test_missing_session_access_token_is_session_expired(

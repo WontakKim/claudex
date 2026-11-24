@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from playwright.async_api import async_playwright
 
-from claudex.gptpro import ask, locators
+from claudex.gptpro import ask, locators, session
 
 
 _CONVERSATION_ID = "123e4567-e89b-12d3-a456-426614174000"
@@ -156,7 +156,7 @@ document.addEventListener('submit', event => {
 
 async def _run_ask(
     tmp_path: Path, config: dict, *, conversation_id=None, expect_failure=False,
-    healer=None, attachment=False, book=None,
+    healer=None, attachment=False, book=None, signed_in=True,
 ):
     async with async_playwright() as playwright:
         executable = Path(playwright.chromium.executable_path)
@@ -173,6 +173,11 @@ async def _run_ask(
         browser = await playwright.chromium.launch(executable_path=str(executable), headless=True)
         try:
             page = await browser.new_page()
+            if signed_in:
+                await page.context.add_cookies([{
+                    'name': session.AUTH_COOKIE_PREFIX, 'value': 'synthetic',
+                    'domain': '.chatgpt.com', 'path': '/', 'secure': True, 'httpOnly': True,
+                }])
             await page.route('**/*', lambda route: route.fulfill(
                 content_type='text/html', body=_PAGE.replace('CONFIG', json.dumps(config)),
             ))
@@ -223,7 +228,10 @@ async def _run_ask(
                 if expect_failure:
                     with pytest.raises(ask.GptProAskError) as error:
                         await execution.run()
-                    expected = 'submit_failed' if config.get('boundary') else 'locator_unresolved'
+                    expected = (
+                        'session_expired' if not signed_in
+                        else 'submit_failed' if config.get('boundary') else 'locator_unresolved'
+                    )
                     assert error.value.failure == expected
                     assert execution.evidence.submission == 'not_attempted'
                     assert not book.pending
@@ -364,6 +372,15 @@ def test_picker_drift_heals_only_the_composer_control_after_proof(tmp_path):
     assert locators.LocatorBook(tmp_path / 'locators.json').selector_for('en', 'picker') != (
         locators.SEED_SELECTORS['picker']
     )
+
+
+def test_a_signed_out_browser_is_session_expired_without_locator_rediscovery(tmp_path):
+    healer = _StructuralHealer()
+    actions = asyncio.run(_run_ask(
+        tmp_path, {'drift': 'picker'}, expect_failure=True, healer=healer, signed_in=False,
+    ))
+    assert actions == []
+    assert healer.calls == []
 
 
 @pytest.mark.parametrize('drift', ['power', 'both'])

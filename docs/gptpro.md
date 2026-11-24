@@ -35,6 +35,14 @@ not contact ChatGPT, so a valid `status` does not prove that ChatGPT still
 accepts the session. `claudex-gateway gptpro ask "<question>"` runs one
 foreground ask in a new conversation, without attachments or MCP job handles.
 
+Each ask checks the sign-in in the browser profile itself. It fails with
+`session_expired` when the profile holds no ChatGPT authentication cookie, when
+ChatGPT shows its login page, or when ChatGPT rejects the session. An ask that
+opens ChatGPT without the authentication cookie fails before the prompt is
+entered. Run `login` again after `session_expired`, even while `status` reports
+the saved session as valid: the session file is written at sign-in and does not
+follow later changes to the profile's cookies.
+
 The dashboard MCP tab leads with gateway-wide Claude Code connection setup,
 including the MCP endpoint and a copyable command. Its GPT Pro backend card
 shows the saved session status, starts and monitors interactive ChatGPT sign-in,
