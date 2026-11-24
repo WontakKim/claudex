@@ -85,6 +85,14 @@ class AccountCooldownTracker:
             return 0.0
         return remaining
 
+    def get_cooldown(self, account_id: str) -> tuple[float, float] | None:
+        """Return an identity-stable snapshot until the next mark or clear.
+
+        Reset callers compare identity after awaiting durability so a later
+        429 survives even when its deadlines happen to be equal.
+        """
+        return self._deadlines.get(account_id)
+
     def clear(self, account_id: str) -> None:
         """Drop any cooldown for `account_id` (e.g. the account was removed)."""
         self._deadlines.pop(account_id, None)

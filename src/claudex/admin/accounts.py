@@ -21,6 +21,7 @@ from claudex.admin.common import (
     _require_json_content_type,
 )
 from claudex.balanced.runtime import ClaudeBalancedRuntime
+from claudex.balanced.state_store import ClaudePoolRuntimeStateStore
 from claudex.claude.account_pool import AccountCooldownTracker
 from claudex.claude.accounts import (
     AccountNotFoundError,
@@ -356,6 +357,58 @@ async def _handle_admin_claude_local_get(request: Request) -> JSONResponse:
     if denied is not None:
         return denied
     return JSONResponse({"local": _local_claude_login_fields()})
+
+
+async def _handle_admin_claude_account_cooldown_delete(request: Request) -> Response:
+    """Reset only the registered account's local execution cooldowns."""
+    denied = _admin_guard(request)
+    if denied is not None:
+        return denied
+    account_id = request.path_params["account_id"]
+    async with request.app.state.admin_lock:
+        try:
+            records = list_accounts()
+        except AccountRegistryError:
+            return JSONResponse(
+                server_support._openai_error_body("server_error", "Cannot read the account registry."),
+                status_code=500,
+            )
+        if not any(record.id == account_id for record in records):
+            return JSONResponse(
+                server_support._openai_error_body("invalid_request_error", "Unknown account."),
+                status_code=404,
+            )
+        tracker: AccountCooldownTracker = request.app.state.claude_account_cooldowns
+        previous = tracker.get_cooldown(account_id)
+        runtime: ClaudeBalancedRuntime = request.app.state.claude_balanced_runtime
+        # The admin lock serializes mode changes; the lifecycle lock also
+        # excludes process shutdown while a live store is being used.
+        async with runtime._lifecycle_lock:
+            try:
+                if runtime.router is not None:
+                    await runtime.router.reset_cooldowns(account_id)
+                else:
+                    path = paths.claude_account_pool_runtime_db()
+                    if path.exists():
+                        store = ClaudePoolRuntimeStateStore.open_(path, recover=False)
+                        try:
+                            writes = [
+                                store.delete_cooldown(account_id, "account", "", high_priority=True),
+                                store.delete_cooldown(account_id, "family", "fable", high_priority=True),
+                            ]
+                            await asyncio.gather(*(write.wait_async(timeout=5.0) for write in writes))
+                        finally:
+                            await asyncio.to_thread(store.close)
+            except Exception:
+                return JSONResponse(
+                    server_support._openai_error_body(
+                        "server_error", "Could not fully reset local cooldowns. Storage is unavailable; retry the reset."
+                    ),
+                    status_code=500,
+                )
+        if tracker.get_cooldown(account_id) is previous:
+            tracker.clear(account_id)
+    return Response(status_code=204)
 
 
 async def _handle_admin_claude_account_delete(request: Request) -> Response:

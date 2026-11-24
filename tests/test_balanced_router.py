@@ -3102,6 +3102,164 @@ def test_capability_key_bounded_family_token_or_lowercased_model_id() -> None:
     assert capability_key("gpt-4") == "model:gpt-4"
 
 
+def test_reset_cooldowns_clears_only_target_scopes_and_survives_reopen(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        path = tmp_path / "runtime.sqlite3"
+        store = ClaudePoolRuntimeStateStore.open_(path, debounce_seconds=0.0)
+        clock = _FakeClock()
+        wall_clock = _FakeClock(2_000_000_000.0)
+        router = _make_router(store=store, clock=clock, wall_clock=wall_clock)
+        try:
+            for account_id in ("acct-a", "acct-b"):
+                for scope, family in (("account", ""), ("family", "fable")):
+                    router.install_cooldown(
+                        account_id=account_id, account_incarnation_id="inc-" + account_id,
+                        account_profile_fingerprint="fp", scope=scope, model_family=family,
+                        deadline=clock() + 600, reason="429",
+                    ).wait(timeout=5)
+            store.upsert_usage_observation(
+                account_id="acct-a", window="five_hour", account_incarnation_id="inc-acct-a",
+                account_profile_fingerprint="fp", used_percent=99.0, reset_identity="quota",
+                reset_at_utc=wall_clock() + 3600, observed_at_utc=wall_clock(), source="usage_api",
+            ).wait(timeout=5)
+            router.place_session(
+                session_key=SessionKey(digest=b"p" * 32, kind="content_hash"), model="claude-sonnet-5",
+                candidates=[_candidate("acct-a")], seed=b"seed", now=clock(),
+            )
+            store.upsert_pin(
+                session_key_digest=b"p" * 32, key_kind="content_hash", account_id="acct-a",
+                account_incarnation_id="inc-acct-a", last_seen_utc=wall_clock(),
+                expires_at_utc=wall_clock() + 300, generation=0, balanced_epoch_id=store.balanced_epoch_id,
+            ).wait(timeout=5)
+            router.classify_capability_evidence(
+                account_id="acct-a", capability_key="fable", account_incarnation_id="inc-acct-a",
+                account_profile_fingerprint="fp", status_code=200, evidence_source="upstream",
+            )
+            # A completed write drains the earlier capability submission before snapshotting.
+            store.upsert_cooldown(
+                account_id="acct-b", scope="account", model_family="", account_incarnation_id="inc-acct-b",
+                account_profile_fingerprint="fp", deadline_utc=wall_clock() + 600,
+                reason="429", evidence="", updated_at_utc=wall_clock(), high_priority=True,
+            ).wait(timeout=5)
+            pin = router.get_pin(b"p" * 32)
+            assert pin is not None
+            # Snapshot all durable non-cooldown state, including the pin and quota observation.
+            with sqlite3.connect(path) as conn:
+                before = {table: conn.execute("SELECT * FROM " + table).fetchall()
+                          for table in ("meta", "pins", "usage_observations", "capability_evidence")}
+            other = store.get_cooldown("acct-b", "account", "")
+            await router.reset_cooldowns("acct-a")
+            await router.reset_cooldowns("acct-a")
+            assert router.account_cooldown_deadline("acct-a") is None
+            assert router.family_cooldown_deadline("acct-a", "fable") is None
+            assert router.get_pin(b"p" * 32) is pin
+            assert router.is_capability_eligible(
+                "acct-a", "fable", account_incarnation_id="inc-acct-a", account_profile_fingerprint="fp",
+            )
+            assert router.account_cooldown_deadline("acct-b") is not None
+            assert router.family_cooldown_deadline("acct-b", "fable") is not None
+            assert store.get_cooldown("acct-b", "account", "") == other
+            with sqlite3.connect(path) as conn:
+                assert {table: conn.execute("SELECT * FROM " + table).fetchall() for table in before} == before
+        finally:
+            store.close()
+        reopened = ClaudePoolRuntimeStateStore.open_(path)
+        try:
+            restored = _make_router(store=reopened, clock=clock, wall_clock=wall_clock)
+            restored.restore_from_store(reopened.restore(RestoreValidationContext(now_utc=wall_clock())))
+            assert restored.account_cooldown_deadline("acct-a") is None
+            assert restored.family_cooldown_deadline("acct-a", "fable") is None
+            assert restored.account_cooldown_deadline("acct-b") is not None
+        finally:
+            reopened.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("new_429", [False, True])
+def test_reset_cooldowns_supersedes_retries_but_preserves_new_429(tmp_path: Path, new_429: bool) -> None:
+    async def scenario() -> None:
+        clock = _FakeClock()
+        attempts: list[int] = []
+        reset_started, release_reset = threading.Event(), threading.Event()
+
+        def fault(scope: Any, sequence: int) -> None:
+            attempts.append(sequence)
+            if sequence <= 2:
+                raise sqlite3.OperationalError("old cooldown temporarily locked")
+            if sequence == 3:
+                reset_started.set()
+                assert release_reset.wait(timeout=5)
+
+        store = ClaudePoolRuntimeStateStore.open_(
+            tmp_path / "runtime.sqlite3", clock=clock, fault_injector=fault,
+            retry_backoff_initial_seconds=60, retry_backoff_max_seconds=60,
+        )
+        router = _make_router(store=store, clock=clock)
+        try:
+            writes = []
+            for scope, family in (("account", ""), ("family", "fable")):
+                writes.append(router.install_cooldown(
+                    account_id="acct-a", account_incarnation_id="inc-acct-a", account_profile_fingerprint="fp",
+                    scope=scope, model_family=family, deadline=clock() + 600, reason="old_429",
+                ))
+            with store._cv:
+                assert store._cv.wait_for(lambda: len(store._retrying) == 2, timeout=5)
+            reset = asyncio.create_task(router.reset_cooldowns("acct-a"))
+            await asyncio.to_thread(reset_started.wait, 5)
+            assert reset_started.is_set()
+            if new_429:
+                newer = router.install_cooldown(
+                    account_id="acct-a", account_incarnation_id="inc-acct-a", account_profile_fingerprint="fp",
+                    scope="account", deadline=clock() + 900, reason="new_429",
+                )
+            release_reset.set()
+            await reset
+            for write in writes:
+                write.wait(timeout=5)
+            if new_429:
+                newer.wait(timeout=5)
+                assert router.account_cooldown_deadline("acct-a") is not None
+                assert store.get_cooldown("acct-a", "account", "").reason == "new_429"
+            else:
+                assert router.account_cooldown_deadline("acct-a") is None
+                assert store.get_cooldown("acct-a", "account", "") is None
+            assert router.family_cooldown_deadline("acct-a", "fable") is None
+            assert store.get_cooldown("acct-a", "family", "fable") is None
+            assert attempts.count(1) == attempts.count(2) == 1
+        finally:
+            release_reset.set()
+            store.close()
+    asyncio.run(scenario())
+
+
+def test_reset_cooldowns_storage_failure_keeps_memory_gates(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        store = ClaudePoolRuntimeStateStore.open_(tmp_path / "runtime.sqlite3")
+        router = _make_router(store=store)
+        try:
+            for scope, family in (("account", ""), ("family", "fable")):
+                router.install_cooldown(
+                    account_id="acct-a", account_incarnation_id="inc-acct-a", account_profile_fingerprint="fp",
+                    scope=scope, model_family=family, deadline=router._clock() + 600, reason="429",
+                ).wait(timeout=5)
+
+            def fault(scope: Any, sequence: int) -> None:
+                if scope == ("cooldowns", "acct-a", "family", "fable"):
+                    error = sqlite3.OperationalError("private path: disk is full")
+                    error.sqlite_errorcode = sqlite3.SQLITE_FULL
+                    raise error
+
+            store._fault_injector = fault
+            with pytest.raises(sqlite3.OperationalError):
+                await router.reset_cooldowns("acct-a")
+            assert router.account_cooldown_deadline("acct-a") is not None
+            assert router.family_cooldown_deadline("acct-a", "fable") is not None
+            assert store.get_cooldown("acct-a", "family", "fable") is not None
+        finally:
+            store.close()
+    asyncio.run(scenario())
+
+
 # -- account removal: durable cleanup of all four row kinds ------------------
 
 

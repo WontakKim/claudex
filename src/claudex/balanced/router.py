@@ -820,6 +820,26 @@ class ClaudeBalancedRouter:
             high_priority=True,
         )
 
+    async def reset_cooldowns(self, account_id: str) -> None:
+        """Clear local execution gates only after both durable row deletes commit.
+
+        Row-scoped deletes share the upsert queue's coalescing/retry ordering.
+        A new 429 submitted while durability is pending supersedes the reset;
+        its replacement memory entry must also survive the await.
+        """
+        account_entry = self._account_cooldowns.get(account_id)
+        family_entry = self._family_cooldowns.get((account_id, "fable"))
+        if self._store is not None:
+            writes = [
+                self._store.delete_cooldown(account_id, "account", "", high_priority=True),
+                self._store.delete_cooldown(account_id, "family", "fable", high_priority=True),
+            ]
+            await asyncio.gather(*(write.wait_async(timeout=5.0) for write in writes))
+        if self._account_cooldowns.get(account_id) is account_entry:
+            self._account_cooldowns.pop(account_id, None)
+        if self._family_cooldowns.get((account_id, "fable")) is family_entry:
+            self._family_cooldowns.pop((account_id, "fable"), None)
+
     def account_cooldown_deadline(
         self,
         account_id: str,

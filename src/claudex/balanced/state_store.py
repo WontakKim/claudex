@@ -190,7 +190,7 @@ class ClaudePoolRuntimeStateStore:
     # -- lifecycle ---------------------------------------------------------
 
     @classmethod
-    def open_(cls, path: Path, **kwargs: Any) -> ClaudePoolRuntimeStateStore:
+    def open_(cls, path: Path, *, recover: bool = True, **kwargs: Any) -> ClaudePoolRuntimeStateStore:
         """Open (or create) the runtime-state store at `path`.
 
         Refuses (raising `UnsupportedSchemaVersionError`, file untouched) a
@@ -198,7 +198,9 @@ class ClaudePoolRuntimeStateStore:
         corrupt or older-schema database is quarantined together with its
         `-wal`/`-shm` siblings and replaced by a fresh store with a fresh
         epoch seed. Every reopen enforces 0700/0600 permissions and WAL +
-        `synchronous=FULL`.
+        `synchronous=FULL`. With `recover=False`, refuse corrupt or older
+        stores without replacing them; targeted admin mutations must not
+        recover unrelated runtime state as a side effect.
         """
         path = Path(path)
         needs_fresh = True
@@ -210,6 +212,8 @@ class ClaudePoolRuntimeStateStore:
                     f"newer than the {SCHEMA_VERSION} this build supports; refusing to touch it"
                 )
             needs_fresh = version != SCHEMA_VERSION
+            if needs_fresh and not recover:
+                raise ValueError("runtime-state database requires recovery; refusing to replace it")
 
         path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         os.chmod(path.parent, 0o700)  # defense in depth against a permissive umask

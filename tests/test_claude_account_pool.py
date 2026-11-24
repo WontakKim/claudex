@@ -49,6 +49,20 @@ def _record(account_id: str, created_at: int, state: str = "ready") -> AccountRe
 # ---------------------------------------------------------------------------
 
 
+def test_cooldown_snapshot_distinguishes_a_new_mark_with_identical_deadlines() -> None:
+    clock = FakeClock()
+    tracker = AccountCooldownTracker(clock=clock, wall_clock=clock)
+    assert tracker.get_cooldown("a") is None
+    tracker.mark("a", 30)
+    before = tracker.get_cooldown("a")
+    assert before is not None
+    assert tracker.get_cooldown("a") is before
+    tracker.mark("a", 30)
+    assert tracker.get_cooldown("a") is not before
+    tracker.clear("a")
+    assert tracker.get_cooldown("a") is None
+
+
 def test_mark_and_is_cooling_until_deadline() -> None:
     clock = FakeClock()
     tracker = AccountCooldownTracker(clock=clock)

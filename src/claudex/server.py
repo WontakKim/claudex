@@ -18,6 +18,7 @@ from claudex import paths, server_support
 from claudex.claude.account_usage_cache import ClaudeAccountUsageCache
 from claudex.claude.quota_429 import Quota429IncidentWriter
 from claudex.admin.accounts import (
+    _handle_admin_claude_account_cooldown_delete,
     _handle_admin_claude_account_delete,
     _handle_admin_claude_accounts_get,
     _handle_admin_claude_accounts_usage,
@@ -517,6 +518,11 @@ def create_app(config: GatewayConfig, daemon_nonce: str | None = None) -> Starle
                 "/admin/providers/claude/accounts",
                 _handle_admin_claude_accounts_get,
                 methods=["GET"],
+            ),
+            Route(
+                "/admin/providers/claude/accounts/{account_id}/cooldown",
+                _handle_admin_claude_account_cooldown_delete,
+                methods=["DELETE"],
             ),
             Route(
                 "/admin/providers/claude/accounts/{account_id}",

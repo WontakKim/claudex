@@ -113,6 +113,57 @@ def test_account_cooldown_scope_is_visible_without_blocking_other_families(
     assert "coolnote" not in states["ready"]["detail"]
 
 
+def test_account_cooldown_notice_offers_a_local_only_reset(
+    dashboard_runtime_result: dict[str, Any],
+) -> None:
+    states = dashboard_runtime_result["accountCooldownScopes"]
+    for scope in ("account", "family", "legacy"):
+        detail = states[scope]["detail"]
+        assert re.search(r'<button[^>]*data-act="reset-cooldown"[^>]*>Reset</button>', detail)
+        assert "local execution cooldowns" in detail
+        assert "provider quotas" in detail
+    assert 'data-act="reset-cooldown"' not in states["ready"]["detail"]
+
+
+@pytest.mark.parametrize("outcome", ["success", "ready-success"])
+def test_cooldown_reset_pending_and_status_only_refresh_preserve_account_view(
+    dashboard_runtime_result: dict[str, Any], outcome: str,
+) -> None:
+    state = dashboard_runtime_result["cooldownReset"][outcome]
+    assert state["requestsWhilePending"] == 1
+    assert re.search(r'<button[^>]*data-act="reset-cooldown"[^>]*disabled[^>]*>Resetting…</button>', state["pendingHtml"])
+    assert "Resetting…" not in state["otherHtml"]
+    assert state["requests"] == [
+        {"url": "/admin/providers/claude/accounts/copy-account/cooldown", "options": {"method": "DELETE"}},
+        {"url": "/admin/providers/claude/pool/status", "options": None},
+    ]
+    assert state["preserved"]
+    assert state["routing"]["copy-account"]["routing_state"] == ("ready" if outcome == "ready-success" else "cooldown")
+    if outcome == "ready-success":
+        assert "coolnote" not in state["settledHtml"]
+    assert state["routing"]["other"]["cooldown_scope"] == "family"
+    assert "Resetting…" not in state["settledHtml"]
+    assert "local" in state["toast"]["html"].lower()
+    assert "quotas" in state["toast"]["html"]
+    assert state["toast"]["role"] == "status"
+
+
+@pytest.mark.parametrize("outcome", ["http-error", "network-error", "status-error"])
+def test_cooldown_reset_errors_are_visible_and_retryable(
+    dashboard_runtime_result: dict[str, Any], outcome: str,
+) -> None:
+    state = dashboard_runtime_result["cooldownReset"][outcome]
+    assert state["requestsWhilePending"] == 1
+    assert state["preserved"]
+    assert "Resetting…" not in state["settledHtml"]
+    assert state["toast"]["role"] == "alert"
+    assert state["routing"]["copy-account"]["routing_state"] == "cooldown"
+    assert len(state["requests"]) == (2 if outcome == "status-error" else 1)
+    if outcome == "http-error":
+        assert "<storage unavailable>" not in state["toast"]["html"]
+        assert "<storage unavailable>" in unescape(state["toast"]["html"])
+
+
 def test_dashboard_html_references_only_external_assets_at_document_end() -> None:
     assert 'rel="stylesheet" href="/dashboard.css"' in DASHBOARD_HTML
     assert re.search(r"<style\b", DASHBOARD_HTML, re.IGNORECASE) is None

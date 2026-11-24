@@ -1665,7 +1665,7 @@ document.querySelectorAll("#tab-settings .rail-item").forEach(function(a){
    the open set survives re-renders. No interval polling: fetch on entry,
    the hero's Refresh button, and after a login succeeds. */
 var ACCT_ENV="CLAUDEX_CLAUDE_ACCOUNT_ID";
-var ACCT={rows:[],serving:null,local:null,localLoaded:false,locked:false,usage:{},open:{},removeArmed:{},localUsage:null,routing:{},usageFreshness:null};
+var ACCT={rows:[],serving:null,local:null,localLoaded:false,locked:false,usage:{},open:{},removeArmed:{},resetPending:{},localUsage:null,routing:{},usageFreshness:null};
 function attr(s){return esc(s).replace(/"/g,"&quot;")}
 function planLabel(planType){
   // claude_max -> MAX, claude_pro -> PRO; an absent plan renders as a dash.
@@ -1751,9 +1751,11 @@ function acctDetailHtml(row,serving){
   var member=ACCT.routing[row.id];
   var familyCooldown=member&&member.cooldown_scope==="family"&&member.model_family==="fable";
   var coolnote=member&&member.routing_state==="cooldown"
-    ?'<div class="coolnote">'+(familyCooldown?"Fable is cooling down":"All model families are cooling down")+' after a usage-limit response (429).'+
+    ?'<div class="coolnote"><div>'+(familyCooldown?"Fable is cooling down":"All model families are cooling down")+' after a usage-limit response (429).'+
       '<span class="hint">Cooldown ends '+esc(fmtCooldownUntil(member.cooldown_until))+'.'+
-      (familyCooldown?' Other model families are not blocked by this cooldown.':"")+'</span></div>'
+      (familyCooldown?' Other model families are not blocked by this cooldown.':"")+'</span></div>'+
+      '<button type="button" class="ghost" data-act="reset-cooldown" title="Clear only this account\'s local execution cooldowns, not provider quotas or usage."'+
+      (ACCT.resetPending[row.id]?' disabled>Resetting…':'>Reset')+'</button></div>'
     :"";
   return coolnote+'<div class="ad-grid"><div>'+acctUsageHtml(row)+'</div><div>'+kv+'</div>'+
     '<div class="actions">'+primary+'<span class="spacer"></span>'+
@@ -1954,6 +1956,34 @@ function setServingAccount(accountId){
     showToast('<span class="chip chip-err">ERROR</span><br>Serving pin update<br><span class="dim">Gateway unreachable. Check that the gateway is running and reachable, then retry.</span>',true);
   });
 }
+function resetAccountCooldown(accountId){
+  if(ACCT.resetPending[accountId])return;
+  ACCT.resetPending[accountId]=true;
+  renderAcctList();
+  return jfetch("/admin/providers/claude/accounts/"+encodeURIComponent(accountId)+"/cooldown",{method:"DELETE"}).then(function(r){
+    if(!r.ok){
+      showToast('<span class="chip chip-err">ERROR</span><br>Reset local cooldowns<br><span class="dim">'+esc(errDetail(r.body))+"</span>",true);
+      return;
+    }
+    // Refresh routing telemetry only: the accounts collection can probe upstream.
+    return jfetch("/admin/providers/claude/pool/status").then(function(status){
+      if(!status.ok){
+        showToast('<span class="chip chip-err">ERROR</span><br>Local reset applied; routing status could not be refreshed.<br><span class="dim">'+esc(errDetail(status.body))+"</span>",true);
+        return;
+      }
+      (status.body.members||[]).forEach(function(member){ACCT.routing[member.account_id]=member});
+      ACCT.usageFreshness=status.body.usage_freshness||null;
+      showToast('<span class="chip chip-ok">RESET</span><br>Local execution cooldowns reset. Provider quotas and usage are unchanged.'+
+        '<br><span class="dim">A new usage-limit response can apply another cooldown.</span>',false);
+    });
+  }).catch(function(){
+    showToast('<span class="chip chip-err">ERROR</span><br>Local cooldown reset or status refresh could not be confirmed.'+
+      '<br><span class="dim">Gateway unreachable. Retry the reset to confirm.</span>',true);
+  }).finally(function(){
+    delete ACCT.resetPending[accountId];
+    renderAcctList();
+  });
+}
 function removeAccount(accountId){
   var account=ACCT.rows.find(function(row){return row.id===accountId});
   jfetch("/admin/providers/claude/accounts/"+encodeURIComponent(accountId),{method:"DELETE"}).then(function(r){
@@ -1980,6 +2010,7 @@ document.getElementById("acct-list").addEventListener("click",function(e){
     if(btn.dataset.act==="serve")setServingAccount(id);
     else if(btn.dataset.act==="unserve")setServingAccount(null);
     else if(btn.dataset.act==="relogin")openLoginModal();
+    else if(btn.dataset.act==="reset-cooldown")resetAccountCooldown(id);
     else if(btn.dataset.act==="remove"){
       if(!ACCT.removeArmed[id]){
         ACCT.removeArmed[id]=true;

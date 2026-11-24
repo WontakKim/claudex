@@ -401,7 +401,9 @@ input[type="checkbox"]{width:15px;height:15px;accent-color:var(--info)}
 .adetail .age b{color:var(--fg);font-family:var(--mono);font-weight:600}
 .actions,.adetail .actions{display:flex;align-items:flex-start;gap:8px;flex-wrap:wrap;margin-top:0;border-top:0;padding-top:0}
 .actions .spacer,.adetail .actions .spacer{flex:1}
-.coolnote{border:1px solid var(--warn);border-radius:1px;padding:8px 10px;margin:0 0 10px;color:var(--warn);background:transparent;font-size:12.5px}
+.coolnote{display:flex;align-items:center;gap:10px;flex-wrap:wrap;border:1px solid var(--warn);border-radius:1px;padding:8px 10px;margin:0 0 10px;color:var(--warn);background:transparent;font-size:12.5px}
+.coolnote>div{flex:1;min-width:0;overflow-wrap:anywhere}
+.coolnote>button{flex:none;margin-left:auto}
 .coolnote .hint{display:block;margin-top:3px;color:var(--muted);font:400 12px var(--sans)}
 
 /* MCP and logs */

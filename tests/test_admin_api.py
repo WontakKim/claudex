@@ -122,6 +122,7 @@ _ADMIN_FUNCTION_MANIFEST = {
         "_account_plan_fields",
         "_handle_admin_claude_accounts_get",
         "_handle_admin_claude_local_get",
+        "_handle_admin_claude_account_cooldown_delete",
         "_handle_admin_claude_account_delete",
         "_cooling_down_until_millis",
         "_handle_admin_claude_accounts_usage",

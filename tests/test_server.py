@@ -6,6 +6,7 @@ import asyncio
 import inspect
 import json
 import logging
+import sqlite3
 import sys
 import threading
 import time
@@ -1741,6 +1742,87 @@ class TestAdminClaudeAccountsApi:
             "reason": "needs-reauth",
         }
 
+    @pytest.mark.parametrize("mode", ["disabled", "fallback"])
+    def test_cooldown_reset_is_local_target_only_and_idempotent(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, mode: str
+    ) -> None:
+        client = self._client(monkeypatch, tmp_path, claude_account_routing_mode=mode)
+        account_id = _register_serving_account()
+        other_id = _register_serving_account(email="other@example.com", account_uuid="other")
+        tracker = client.app.state.claude_account_cooldowns
+        tracker.mark(account_id, 120)
+        tracker.mark(other_id, 120)
+        with client:
+            records = claude_accounts.list_accounts()
+            assert client.put("/admin/providers/claude/pool/serving", json={"account_id": account_id}).status_code == 200
+            pin = client.get("/admin/providers/claude/pool/serving").json()
+            manager = object()
+            client.app.state.claude_account_auth_managers[account_id] = manager
+            usage_calls = []
+            async def fetch_usage(target: str) -> Any:
+                usage_calls.append(target)
+                return {"status": "error", "error": "429 quota", "updated_at": 123}, 600.0
+            cache = ClaudeAccountUsageCache(fetch_usage)
+            client.app.state.claude_account_usage_cache = cache
+            client.portal.call(cache.get, [account_id])
+            usage_before = cache.peek(account_id)
+            async def reject_upstream(*args: Any, **kwargs: Any) -> Any:
+                pytest.fail("local cooldown reset must not contact upstream")
+            monkeypatch.setattr(client.app.state.http_client, "send", reject_upstream)
+            for _ in range(2):
+                response = client.delete(f"/admin/providers/claude/accounts/{account_id}/cooldown")
+                assert response.status_code == 204, response.text
+                assert response.content == b""
+            assert not tracker.is_cooling(account_id)
+            assert tracker.is_cooling(other_id)
+            assert cache.peek(account_id) == usage_before
+            client.portal.call(cache.get, [other_id])
+            assert usage_calls == [account_id]  # The global usage API cooldown still suppresses fetches.
+            assert claude_accounts.list_accounts() == records
+            assert client.app.state.claude_account_auth_managers[account_id] is manager
+            assert client.get("/admin/providers/claude/pool/serving").json() == pin
+            assert client.app.state.config.claude_account_routing_mode == mode
+            assert client.delete("/admin/providers/claude/accounts/missing/cooldown").status_code == 404
+
+    @pytest.mark.parametrize("headers,status", [({}, 401), ({"Authorization": "Bearer secret", "Host": "foreign.example"}, 403)])
+    def test_cooldown_reset_uses_admin_guard(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, headers: dict[str, str], status: int
+    ) -> None:
+        client = self._client(monkeypatch, tmp_path, local_token="secret")
+        account_id = _register_serving_account()
+        client.app.state.claude_account_cooldowns.mark(account_id, 120)
+        with client:
+            response = client.delete(f"/admin/providers/claude/accounts/{account_id}/cooldown", headers=headers)
+            assert response.status_code == status
+            assert client.app.state.claude_account_cooldowns.is_cooling(account_id)
+
+    @pytest.mark.parametrize("contents", [b"corrupt", b"older", b"newer"])
+    def test_cooldown_reset_refuses_unsafe_inactive_store(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, contents: bytes
+    ) -> None:
+        client = self._client(monkeypatch, tmp_path)
+        account_id = _register_serving_account()
+        path = paths.claude_account_pool_runtime_db()
+        if contents == b"corrupt":
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(contents)
+        else:
+            store = ClaudePoolRuntimeStateStore.open_(path)
+            store.close()
+            with sqlite3.connect(path) as conn:
+                conn.execute("UPDATE meta SET value = ? WHERE key = 'schema_version'",
+                             ("0" if contents == b"older" else "999999",))
+        before = path.read_bytes()
+        client.app.state.claude_account_cooldowns.mark(account_id, 120)
+        with client:
+            response = client.delete(f"/admin/providers/claude/accounts/{account_id}/cooldown")
+            assert response.status_code == 500
+            assert "Could not fully reset local cooldowns" in response.text
+            assert str(path) not in response.text
+            assert client.app.state.claude_account_cooldowns.is_cooling(account_id)
+        assert path.read_bytes() == before
+        assert not list(path.parent.glob("*.quarantined-*"))
+
     def test_account_delete_removes_the_registry_row(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
@@ -2639,6 +2721,107 @@ def test_balanced_restart_restores_the_family_cooldown_without_a_repeat_429_burs
 
         assert second_response.status_code == 429
         assert len(calls) == 1  # no repeat-429 burst: the restored cooldown skipped upstream entirely
+
+
+def test_cooldown_reset_preserves_a_tracker_429_arriving_during_durability(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _balanced_env(monkeypatch, tmp_path)
+    account_id, _ = _register_balanced_accounts(1)[0]
+    with _create_test_client(
+        monkeypatch, tmp_path, config=GatewayConfig(settings_file=tmp_path / "settings.json"), base_url=_ADMIN_BASE
+    ) as client:
+        runtime = _enable_balanced(client, lambda request: pytest.fail("no inference expected"))
+        client.portal.call(runtime._stop_usage_poll_driver)
+        tracker = client.app.state.claude_account_cooldowns
+        tracker.mark(account_id, 120)
+        def new_429(scope: Any, sequence: int) -> None:
+            client.portal.call(tracker.mark, account_id, 900)
+        runtime._store._fault_injector = new_429
+        response = client.delete(f"/admin/providers/claude/accounts/{account_id}/cooldown")
+        assert response.status_code == 204
+        runtime._store._fault_injector = None
+        assert tracker.remaining_seconds(account_id) > 800
+        assert client.put("/admin/providers/claude/pool/routing", json={"mode": "fallback"}).status_code == 200
+        assert client.get("/admin/providers/claude/pool/status").json()["members"][0]["routing_state"] == "cooldown"
+
+
+def test_cooldown_reset_reports_durable_failure_without_exposing_storage_details(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _balanced_env(monkeypatch, tmp_path)
+    account_id, _ = _register_balanced_accounts(1)[0]
+    with _create_test_client(
+        monkeypatch, tmp_path, config=GatewayConfig(settings_file=tmp_path / "settings.json"), base_url=_ADMIN_BASE
+    ) as client:
+        runtime = _enable_balanced(client, lambda request: pytest.fail("no inference expected"))
+        client.portal.call(runtime._stop_usage_poll_driver)
+        record = claude_accounts.list_accounts()[0]
+        runtime.router.install_cooldown(
+            account_id=account_id, account_incarnation_id=record.account_incarnation_id,
+            account_profile_fingerprint=server_support._account_profile_fingerprint(client.app.state, account_id),
+            scope="account", deadline=time.monotonic() + 600, reason="429",
+        ).wait(timeout=5)
+        client.app.state.claude_account_cooldowns.mark(account_id, 120)
+
+        def fail_write(scope: Any, sequence: int) -> None:
+            error = sqlite3.OperationalError("private-path credentials.sqlite3 disk full")
+            error.sqlite_errorcode = sqlite3.SQLITE_FULL
+            raise error
+
+        runtime._store._fault_injector = fail_write
+        response = client.delete(f"/admin/providers/claude/accounts/{account_id}/cooldown")
+        assert response.status_code == 500
+        assert response.json()["error"]["type"] == "server_error"
+        assert "Could not fully reset local cooldowns" in response.text
+        assert "private-path" not in response.text
+        assert client.app.state.claude_account_cooldowns.is_cooling(account_id)
+        assert client.get("/admin/providers/claude/pool/status").json()["members"][0]["routing_state"] == "cooldown"
+        runtime._store._fault_injector = None
+        assert client.delete(f"/admin/providers/claude/accounts/{account_id}/cooldown").status_code == 204
+
+
+@pytest.mark.parametrize("mode", ["balanced", "disabled", "fallback"])
+def test_cooldown_reset_persists_across_mode_changes_and_restart(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, mode: str
+) -> None:
+    _balanced_env(monkeypatch, tmp_path)
+    accounts = _register_balanced_accounts(2)
+    account_id = accounts[0][0]
+    settings_file = tmp_path / "settings.json"
+    with _create_test_client(
+        monkeypatch, tmp_path, config=GatewayConfig(settings_file=settings_file), base_url=_ADMIN_BASE
+    ) as client:
+        runtime = _enable_balanced(client, lambda request: pytest.fail("no inference expected"))
+        client.portal.call(runtime._stop_usage_poll_driver)
+        for record in claude_accounts.list_accounts():
+            for scope, family in (("account", ""), ("family", "fable")):
+                runtime.router.install_cooldown(
+                    account_id=record.id, account_incarnation_id=record.account_incarnation_id,
+                    account_profile_fingerprint=server_support._account_profile_fingerprint(client.app.state, record.id),
+                    scope=scope, model_family=family, deadline=time.monotonic() + 600, reason="429",
+                ).wait(timeout=5)
+        records = claude_accounts.list_accounts()
+        if mode != "balanced":
+            assert client.put("/admin/providers/claude/pool/routing", json={"mode": mode}).status_code == 200
+        client.app.state.claude_account_cooldowns.mark(account_id, 120)
+        response = client.delete(f"/admin/providers/claude/accounts/{account_id}/cooldown")
+        assert response.status_code == 204, response.text
+        assert claude_accounts.list_accounts() == records
+        assert client.app.state.config.claude_account_routing_mode == mode
+        assert not client.app.state.claude_account_cooldowns.is_cooling(account_id)
+    with _create_test_client(
+        monkeypatch, tmp_path, config=GatewayConfig.load(settings_file), base_url=_ADMIN_BASE
+    ) as client:
+        if mode != "balanced":
+            _enable_balanced(client, lambda request: pytest.fail("no inference expected"))
+        client.portal.call(client.app.state.claude_balanced_runtime._stop_usage_poll_driver)
+        members = {member["account_id"]: member for member in client.get("/admin/providers/claude/pool/status").json()["members"]}
+        assert members[account_id]["routing_state"] == "ready"
+        assert members[accounts[1][0]]["routing_state"] == "cooldown"
+        router = client.app.state.claude_balanced_runtime.router
+        assert router.family_cooldown_deadline(account_id, "fable") is None
+        assert router.family_cooldown_deadline(accounts[1][0], "fable") is not None
 
 
 @pytest.mark.parametrize("scope", ["account", "family"])

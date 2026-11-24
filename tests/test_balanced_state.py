@@ -48,6 +48,25 @@ def store_factory(tmp_path: Path):
         store.close()
 
 
+@pytest.mark.parametrize("contents", [b"not sqlite", b"older-schema"])
+def test_reset_open_refuses_recovery_without_changing_existing_store(tmp_path: Path, contents: bytes) -> None:
+    path = tmp_path / "runtime.sqlite3"
+    if contents == b"older-schema":
+        store = ClaudePoolRuntimeStateStore.open_(path)
+        store.close()
+        with sqlite3.connect(path) as conn:
+            conn.execute("UPDATE meta SET value = '0' WHERE key = 'schema_version'")
+    else:
+        path.write_bytes(contents)
+    before = path.read_bytes()
+
+    with pytest.raises((ValueError, UnsupportedSchemaVersionError)):
+        ClaudePoolRuntimeStateStore.open_(path, recover=False)
+
+    assert path.read_bytes() == before
+    assert not list(tmp_path.glob("*.quarantined-*"))
+
+
 def _cooldown_kwargs(**overrides: Any) -> dict[str, Any]:
     now = time.time()
     base = dict(

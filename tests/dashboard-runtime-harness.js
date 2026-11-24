@@ -1281,6 +1281,49 @@ async function main() {
       detail: feedbackContext.acctDetailHtml(account, false),
     };
   }
+  const cooldownReset = {};
+  feedbackContext.ACCT.rows = [account, {id: "other", email: "other@example.com", state: "ready"}];
+  feedbackContext.ACCT.open = {[account.id]: true, other: true};
+  feedbackContext.ACCT.usage = {[account.id]: {status: "ok", updated_at: 123}, other: {status: "ok", updated_at: 456}};
+  const resetPreserved = JSON.stringify({rows: feedbackContext.ACCT.rows, open: feedbackContext.ACCT.open, usage: feedbackContext.ACCT.usage});
+  const resetList = feedbackDocument.getElementById("acct-list");
+  const clickReset = () => {
+    const button = feedbackDocument.createElement("button");
+    button.dataset.act = "reset-cooldown";
+    button.closest = (selector) => selector === ".adetail" ? {getAttribute: () => account.id} : null;
+    resetList.dispatchEvent({type: "click", target: {closest: () => button}});
+  };
+  const cooled = {account_id: account.id, routing_state: "cooldown", cooldown_scope: "account", cooldown_until: 1800000000000};
+  const otherCooled = {account_id: "other", routing_state: "cooldown", cooldown_scope: "family", model_family: "fable", cooldown_until: 1800000000000};
+  for (const outcome of ["success", "ready-success", "http-error", "network-error", "status-error"]) {
+    feedbackContext.ACCT.routing = {[account.id]: cooled, other: otherCooled};
+    const pendingReset = createDeferred();
+    const resetRequests = [];
+    feedbackContext.jfetch = (url, options) => {
+      resetRequests.push({url, options: options || null});
+      if (options && options.method === "DELETE") return pendingReset.promise;
+      return Promise.resolve(outcome === "status-error"
+        ? {ok: false, status: 500, body: {error: {message: "status unavailable"}}}
+        : {ok: true, status: 200, body: {members: [outcome === "ready-success"
+          ? {account_id: account.id, routing_state: "ready"} : cooled, otherCooled]}});
+    };
+    clickReset();
+    feedbackContext.renderAcctList();
+    const pendingHtml = feedbackContext.acctDetailHtml(account, false);
+    const otherHtml = feedbackContext.acctDetailHtml(feedbackContext.ACCT.rows[1], false);
+    clickReset();
+    const requestsWhilePending = resetRequests.length;
+    if (outcome === "network-error" && resetRequests.length) pendingReset.reject(new Error("reset response lost"));
+    else pendingReset.resolve(outcome === "http-error"
+      ? {ok: false, status: 500, body: {error: {message: "<storage unavailable>"}}}
+      : {ok: true, status: 204, body: null});
+    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => setImmediate(resolve));
+    cooldownReset[outcome] = {requests: resetRequests, requestsWhilePending, pendingHtml, otherHtml,
+      settledHtml: feedbackContext.acctDetailHtml(account, false), toast: captureToast(),
+      routing: feedbackContext.ACCT.routing,
+      preserved: resetPreserved === JSON.stringify({rows: feedbackContext.ACCT.rows, open: feedbackContext.ACCT.open, usage: feedbackContext.ACCT.usage})};
+  }
   feedbackContext.renderUsageProvider("codex", {status: "ok", session: {used_percent: 5, window_minutes: 60}});
   const unknownDurationUsage = feedbackDocument.getElementById("usage-body-codex").innerHTML;
   const operatorFeedback = {alertToast, statusToast, rejectedCode, retainedCodeError, disconnectedCode,
@@ -2404,6 +2447,7 @@ async function main() {
       cards,
       operatorFeedback,
       accountCooldownScopes,
+      cooldownReset,
       usageRendering,
       gptProConcurrencyStates,
       gptProSessionStates,
