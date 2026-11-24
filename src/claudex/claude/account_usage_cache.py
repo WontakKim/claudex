@@ -28,7 +28,7 @@ _FAILURE_BACKOFF_SECONDS = 60.0
 _RETRY_AFTER_MIN_SECONDS = 5.0
 _RETRY_AFTER_MAX_SECONDS = 3600.0
 
-# The only per-window source this cache ever observes: a live usage-API fetch.
+# Source for live fetches; hydrated windows retain their persisted source.
 _SOURCE_USAGE_API = "usage_api"
 
 # Envelope keys (see usage_envelope.provider_result / _map_claude_window) that carry
@@ -160,6 +160,34 @@ class ClaudeAccountUsageCache:
             for window_name, observation in entry.windows.items()
         }
         return entry.result, metadata
+
+    def restore_windows(
+        self, account_id: str, windows: dict[str, dict[str, Any]], *, now_utc: float
+    ) -> None:
+        """Seed persisted readings without fetching or changing their observation ages."""
+        # Hydration fills process-start misses only. A poll result in this
+        # process (including a failure/backoff) stays authoritative on mode reentry.
+        if not windows or account_id in self._entries:
+            return
+        now = self._clock()
+        observations = {
+            name: _WindowObservation(
+                observed_at=now - window["age_seconds"],
+                source=window["source"],
+                resets_at=window["reset_at"],
+            )
+            for name, window in windows.items()
+        }
+        result = provider_result("claude", status="ok", error=None)
+        for name, window in windows.items():
+            result[name] = {
+                "used_percent": window["used_percent"], "resets_at": window["reset_at"],
+            }
+        youngest_age = min(window["age_seconds"] for window in windows.values())
+        result["updated_at"] = now_utc - youngest_age
+        self._entries[account_id] = _Entry(
+            result=result, fetched_at=now - youngest_age, ok=True, windows=observations
+        )
 
     async def poll(self, account_id: str, *, force: bool = False) -> PollResult:
         """Attempt one account using the cache's freshness and cooldown rules.

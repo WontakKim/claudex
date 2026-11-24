@@ -3301,6 +3301,84 @@ class TestBalancedUsageCoordinatorEndpoints:
         assert payload["accounts"][account_id]["queued"] is False
         assert calls == [account_id]
 
+    @pytest.mark.parametrize(("age", "state", "freshness"), [
+        (90.0, "fresh", "fresh"), (420.0, "aging", "partial"),
+        (3600.0, "stale", "degraded"),
+    ])
+    def test_restored_usage_reads_preserve_original_freshness_without_fetching(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+        age: float, state: str, freshness: str,
+    ) -> None:
+        from claudex.claude.account_usage_cache import ClaudeAccountUsageCache
+        from claudex.balanced.runtime import ClaudeBalancedRuntime
+
+        _balanced_env(monkeypatch, tmp_path)
+        account_id, _ = _register_balanced_accounts(1)[0]
+        calls: list[str] = []
+
+        async def fetch(account_id: str) -> Any:
+            calls.append(account_id)
+            raise AssertionError("cache-only reads must not fetch")
+
+        monkeypatch.setattr(ClaudeBalancedRuntime, "_start_usage_poll_driver", lambda self: None)
+        with _create_test_client(
+            monkeypatch, tmp_path, config=GatewayConfig(), base_url="http://127.0.0.1:8787"
+        ) as client:
+            cache = ClaudeAccountUsageCache(fetch, clock=lambda: 1_000.0)
+            client.app.state.claude_account_usage_cache = cache
+            _enable_balanced(client, lambda request: pytest.fail("unexpected upstream request"))
+            wall_now = time.time()
+            cache.restore_windows(account_id, {
+                name: {"used_percent": 37.5, "age_seconds": age,
+                       "source": "usage_api", "reset_at": wall_now + 7200}
+                for name in ("session", "weekly")
+            }, now_utc=wall_now)
+            usage = client.get("/admin/providers/claude/pool/usage").json()["accounts"][account_id]
+            status = client.get("/admin/providers/claude/pool/status").json()
+
+        assert usage["status"] == "ok"
+        assert usage["updated_at"] == wall_now - age
+        assert usage["windows"]["session"] == {
+            "age_seconds": age, "source": "usage_api", "reset_at": wall_now + 7200,
+            "state": state,
+        }
+        assert status["usage_freshness"] == freshness
+        assert calls == []
+
+    @pytest.mark.parametrize("error", [None, "usage API returned 401: authentication failed", "usage API returned 500: boom", "failed to reach usage API"])
+    def test_usage_waits_for_first_observation_but_preserves_real_failures(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, error: str | None
+    ) -> None:
+        from claudex.claude.account_usage_cache import ClaudeAccountUsageCache
+        from claudex.balanced.runtime import ClaudeBalancedRuntime
+
+        _balanced_env(monkeypatch, tmp_path)
+        account_id, _ = _register_balanced_accounts(1)[0]
+        calls: list[str] = []
+
+        async def fetch(account_id: str) -> Any:
+            calls.append(account_id)
+            return {"provider": "claude", "status": "error", "error": error}, None
+
+        monkeypatch.setattr(ClaudeBalancedRuntime, "_start_usage_poll_driver", lambda self: None)
+        with _create_test_client(
+            monkeypatch, tmp_path, config=GatewayConfig(), base_url="http://127.0.0.1:8787"
+        ) as client:
+            cache = ClaudeAccountUsageCache(fetch)
+            client.app.state.claude_account_usage_cache = cache
+            _enable_balanced(client, lambda request: pytest.fail("unexpected upstream request"))
+            if error is not None:
+                client.portal.call(cache.get, [account_id])
+            response = client.get("/admin/providers/claude/pool/usage")
+            again = client.get("/admin/providers/claude/pool/usage")
+
+        envelope = response.json()["accounts"][account_id]
+        assert response.status_code == again.status_code == 200
+        assert envelope["status"] == ("pending" if error is None else "error")
+        assert envelope["error"] == error
+        assert envelope["windows"] == {}
+        assert calls == ([] if error is None else [account_id])
+
     def test_manual_refresh_returns_queued_without_fetching_in_active_balanced_mode(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:

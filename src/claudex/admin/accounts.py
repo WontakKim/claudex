@@ -538,9 +538,8 @@ async def _handle_admin_claude_accounts_usage(request: Request) -> JSONResponse:
             if peeked is None:
                 envelope = provider_result(
                     "claude",
-                    status="unavailable",
-                    error="no usage observation yet; the balanced poll coordinator "
-                    "has not polled this account",
+                    status="pending",
+                    error=None,
                 )
                 windows: dict[str, Any] = {}
             else:

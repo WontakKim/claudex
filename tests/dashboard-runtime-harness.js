@@ -1269,6 +1269,21 @@ async function main() {
   servingCopy.pinned = feedbackContext.acctRowHtml(account);
   feedbackContext.ACCT.serving = null;
   servingCopy.unpinned = feedbackContext.acctRowHtml(account);
+  const accountUsageStates = {};
+  for (const [name, usage] of Object.entries({
+    waiting: {status: "pending", error: null, windows: {}, queued: false},
+    queued: {status: "pending", error: null, windows: {}, queued: true},
+    auth: {status: "error", error: "Authentication failed"},
+    http: {status: "error", error: "usage API returned 500"},
+    network: {status: "error", error: "Gateway unreachable"},
+    restored: {status: "ok", session: {used_percent: 37.5, resets_at: 1800003600},
+      updated_at: Date.now() / 1000 - 420,
+      windows: {session: {age_seconds: 420, source: "usage_api", state: "aging"}}},
+  })) {
+    feedbackContext.ACCT.usage[account.id] = usage;
+    accountUsageStates[name] = feedbackContext.acctUsageHtml(account);
+  }
+  delete feedbackContext.ACCT.usage[account.id];
   const accountCooldownScopes = {};
   for (const scope of ["account", "family", "legacy", "ready"]) {
     feedbackContext.ACCT.routing[account.id] = scope === "ready"
@@ -2447,6 +2462,7 @@ async function main() {
       cards,
       operatorFeedback,
       accountCooldownScopes,
+      accountUsageStates,
       cooldownReset,
       usageRendering,
       gptProConcurrencyStates,

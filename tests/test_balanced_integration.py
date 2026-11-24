@@ -1070,12 +1070,111 @@ def test_post_commit_crash_analog_retains_the_pin_that_finished_committing_befor
 
 
 # ===========================================================================
-# Restored observation bucketing: fresh / stale / unknown (store-level
-# restore, since neither the router's live `ObservationView` nor the
-# in-memory-only `ClaudeAccountUsageCache` has a restore path for
-# `usage_observations` -- that table's only restore-time consumer is the
-# store's own freshness classification exercised below)
+# Persisted usage restoration: runtime cache hydration and store reset expiry.
 # ===========================================================================
+
+
+@pytest.mark.parametrize("invalid", [
+    None, "incarnation", "profile", "not-ready", "future", "expired-reset", "invalid-reset",
+])
+def test_runtime_restart_restores_usage_before_first_poll_with_original_age(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, invalid: str | None
+) -> None:
+    from claudex.claude.account_usage_cache import ClaudeAccountUsageCache
+
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    account_id = _register_balanced_ready_account()
+    record = claude_accounts.list_accounts()[0]
+    fingerprint = compute_account_profile_fingerprint({"accountUuid": _BALANCED_ACCOUNT_UUID})
+    wall_now = 1_800_000_000.0
+    monkeypatch.setattr("claudex.balanced.runtime.time.time", lambda: wall_now)
+    db_path = tmp_path / "runtime.sqlite3"
+    store = ClaudePoolRuntimeStateStore.open_(db_path)
+    store.upsert_usage_observation(
+        account_id=account_id, window="five_hour",
+        account_incarnation_id="old-incarnation" if invalid == "incarnation" else record.account_incarnation_id,
+        account_profile_fingerprint="old-profile" if invalid == "profile" else fingerprint,
+        used_percent=37.5, reset_identity="session-reset",
+        reset_at_utc=(
+            float("inf") if invalid == "invalid-reset"
+            else wall_now - 1 if invalid == "expired-reset" else wall_now + 3600
+        ),
+        observed_at_utc=wall_now + 10 if invalid == "future" else wall_now - 420,
+        source="usage_api",
+    ).wait(timeout=5.0)
+    if invalid is None:
+        for window, age in (("seven_day", 90.0), ("fable_weekly", 1_200.0)):
+            store.upsert_usage_observation(
+                account_id=account_id, window=window,
+                account_incarnation_id=record.account_incarnation_id,
+                account_profile_fingerprint=fingerprint,
+                used_percent=20.0, reset_identity=window,
+                reset_at_utc=wall_now + 7200, observed_at_utc=wall_now - age,
+                source="usage_api",
+            ).wait(timeout=5.0)
+    store.close()
+    calls: list[str] = []
+    responses: list[dict[str, Any]] = []
+
+    async def fetch(account_id: str) -> Any:
+        calls.append(account_id)
+        assert responses, "restoration must not fetch usage"
+        return responses.pop(0), None
+
+    if invalid == "not-ready":
+        from dataclasses import replace
+
+        record = replace(record, state="needs-reauth")
+    clock = _FakeClock()
+    cache = ClaudeAccountUsageCache(fetch, clock=clock)
+    runtime = ClaudeBalancedRuntime()
+    # Keep the scheduled driver from polling; preparation/cache hydration remain real.
+    monkeypatch.setattr(runtime, "_start_usage_poll_driver", lambda: None)
+
+    async def scenario() -> None:
+        await runtime.prepare_and_publish(
+            accounts=[record], accounts_root=paths.accounts_dir("claude"),
+            runtime_db_path=db_path, persist=lambda: None,
+            entry="startup_restore", usage_cache=cache,
+        )
+        try:
+            peeked = cache.peek_with_metadata(account_id)
+            if invalid is not None:
+                assert peeked is None
+                assert calls == []
+                return
+            assert peeked is not None
+            envelope, metadata = peeked
+            assert envelope["session"]["used_percent"] == 37.5
+            assert envelope["session"]["resets_at"] == wall_now + 3600
+            assert metadata["weekly"]["age_seconds"] == 90.0
+            assert metadata["fable_weekly"]["age_seconds"] == 1_200.0
+            assert envelope["fable_weekly"]["resets_at"] == wall_now + 7200
+            assert envelope["updated_at"] == wall_now - 90
+            assert metadata["session"] == {
+                "age_seconds": 420.0, "source": "usage_api", "reset_at": wall_now + 3600,
+            }
+            clock.value += 30
+            assert cache.peek_with_metadata(account_id)[1]["session"]["age_seconds"] == 450
+            assert calls == []
+
+            responses.append({"provider": "claude", "status": "ok", "error": None,
+                              "session": {"used_percent": 12.0, "resets_at": wall_now + 3600},
+                              "updated_at": wall_now})
+            assert (await cache.poll(account_id)).source == "fetched"
+            newer = cache.peek_with_metadata(account_id)
+            await runtime.exit_mode("fallback", publish=lambda: None)
+            await runtime.prepare_and_publish(
+                accounts=[record], accounts_root=paths.accounts_dir("claude"),
+                runtime_db_path=db_path, persist=lambda: None,
+                entry="admin_enable", usage_cache=cache,
+            )
+            assert cache.peek_with_metadata(account_id) == newer
+            assert calls == [account_id]
+        finally:
+            await runtime.shutdown_preserving_epoch()
+
+    asyncio.run(scenario())
 
 
 def test_restored_fresh_usage_observation_is_kept_after_a_restart(tmp_path: Path) -> None:

@@ -351,3 +351,53 @@ def test_poll_reports_cooldown_without_fetching_while_the_global_cooldown_is_act
     forced = asyncio.run(cache.poll("b", force=True))
     assert forced.source == "cooldown"
     assert fetch.calls == ["a"]
+
+
+def test_restoring_older_usage_preserves_newer_live_results_and_failure_backoff() -> None:
+    clock = FakeClock()
+    fetch = FakeFetch()
+    fetch.queue("ok", _ok_with_windows(session_resets_at=2_500.0))
+    fetch.queue("failed", _err("usage API returned 401: authentication failed"))
+    cache = _cache(fetch, clock)
+    asyncio.run(cache.get(["ok", "failed"]))
+    clock.advance(10)
+    before = {account_id: cache.peek_with_metadata(account_id) for account_id in ("ok", "failed")}
+
+    for account_id in before:
+        cache.restore_windows(account_id, {"session": {
+            "used_percent": 99.0, "age_seconds": 420.0,
+            "source": "usage_api", "reset_at": 2_000.0,
+        }}, now_utc=1_800_000_000.0)
+        assert cache.peek_with_metadata(account_id) == before[account_id]
+        assert asyncio.run(cache.poll(account_id)).source == "cache_hit"
+    assert fetch.calls == ["ok", "failed"]
+
+
+def test_restored_window_ages_sources_ttl_and_global_cooldown_are_preserved() -> None:
+    clock = FakeClock()
+    fetch = FakeFetch()
+    cache = _cache(fetch, clock)
+    cache.restore_windows("a", {"session": {
+        "used_percent": 37.5, "age_seconds": 90.0,
+        "source": "unified_header", "reset_at": 1_800_003_600.0,
+    }}, now_utc=1_800_000_000.0)
+    assert cache.peek_with_metadata("a")[1]["session"]["source"] == "unified_header"
+    assert cache.peek("a")["updated_at"] == 1_799_999_910.0
+    clock.advance(29)
+    assert asyncio.run(cache.poll("a")).source == "cache_hit"
+    assert fetch.calls == []
+    clock.advance(2)
+    fetch.queue("a", _ok_with_windows())
+    assert asyncio.run(cache.poll("a")).source == "fetched"
+
+    fetch.queue("limited", _err("usage API rate-limited (429)"), 300.0)
+    asyncio.run(cache.poll("limited"))
+    cache.restore_windows("b", {"weekly": {
+        "used_percent": 65.0, "age_seconds": 900.0,
+        "source": "usage_api", "reset_at": 1_800_007_200.0,
+    }}, now_utc=1_800_000_031.0)
+    result = asyncio.run(cache.poll("b"))
+    assert result.source == "cooldown"
+    assert result.result["weekly"]["used_percent"] == 65.0
+    assert cache.peek_with_metadata("b")[1]["weekly"]["age_seconds"] == 900.0
+    assert fetch.calls == ["a", "limited"]

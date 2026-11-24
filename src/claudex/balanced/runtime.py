@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import time
 from collections.abc import Callable, Sequence
 from pathlib import Path
@@ -12,6 +13,7 @@ from typing import Literal
 from claudex.claude.account_usage_cache import ClaudeAccountUsageCache
 from claudex.balanced.polling import ClaudeUsagePollCoordinator, UsagePollAccount
 from claudex.balanced.router import ClaudeBalancedRouter
+from claudex.balanced.selection import _PEEK_WINDOW_TO_BINDING
 from claudex.balanced.state_model import RestoreValidationContext
 from claudex.balanced.state_store import ClaudePoolRuntimeStateStore
 from claudex.claude.account_profile import load_account_profile_fingerprint
@@ -190,6 +192,7 @@ class ClaudeBalancedRuntime:
                     # stale epoch/pins can never be resurrected by a later
                     # administrative re-entry.
                     await store.rotate_epoch().wait_async()
+                fingerprints: dict[str, str] = {}
                 for record in accounts:
                     if record.state != "ready":
                         continue
@@ -201,6 +204,7 @@ class ClaudeBalancedRuntime:
                             "cannot participate in balanced routing until it is "
                             "re-authenticated"
                         )
+                    fingerprints[record.id] = fingerprint
 
                 restore_result = store.restore(RestoreValidationContext(now_utc=time.time()))
                 router = ClaudeBalancedRouter(
@@ -209,6 +213,33 @@ class ClaudeBalancedRuntime:
                 router.restore_from_store(restore_result)
 
                 persist()
+
+                if usage_cache is not None:
+                    window_names = {
+                        binding: name for name, binding in _PEEK_WINDOW_TO_BINDING.items()
+                    }
+                    now_utc = time.time()
+                    for record in accounts:
+                        if record.state != "ready":
+                            continue
+                        windows = {
+                            window_names[row.window]: {
+                                "used_percent": row.used_percent,
+                                "age_seconds": now_utc - row.observed_at_utc,
+                                "source": row.source, "reset_at": row.reset_at_utc,
+                            }
+                            for row in restore_result.usage_observations.values()
+                            if row.account_id == record.id and row.window in window_names
+                            and row.account_incarnation_id == record.account_incarnation_id
+                            and row.account_profile_fingerprint == fingerprints[record.id]
+                            and math.isfinite(row.observed_at_utc)
+                            and row.observed_at_utc <= now_utc
+                            and (
+                                row.reset_at_utc is None
+                                or (math.isfinite(row.reset_at_utc) and row.reset_at_utc > now_utc)
+                            )
+                        }
+                        usage_cache.restore_windows(record.id, windows, now_utc=now_utc)
 
                 self._store = store
                 self.epoch_id = store.balanced_epoch_id

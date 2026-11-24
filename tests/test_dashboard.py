@@ -96,6 +96,23 @@ def test_route_of_has_no_codex_or_provider_membership_fallback() -> None:
     assert "ROUTE_PROVIDERS" not in body
 
 
+def test_account_usage_waiting_is_not_a_fetch_failure(
+    dashboard_runtime_result: dict[str, Any],
+) -> None:
+    states = dashboard_runtime_result["accountUsageStates"]
+    for name in ("waiting", "queued"):
+        assert "Waiting for first usage observation" in states[name]
+        assert "observation. Usage will be available" in re.sub(r"<[^>]+>", "", states[name])
+        assert "Could not load usage" not in states[name]
+        assert "just now" not in states[name]
+    for name, message in (("auth", "Authentication failed"), ("http", "usage API returned 500"), ("network", "Gateway unreachable")):
+        assert "Could not load usage" in states[name]
+        assert message in states[name]
+        assert "Waiting for first" not in states[name]
+    assert "7m ago" in states["restored"]
+    assert "just now" not in states["restored"]
+
+
 def test_account_cooldown_scope_is_visible_without_blocking_other_families(
     dashboard_runtime_result: dict[str, Any],
 ) -> None:

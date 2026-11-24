@@ -1721,6 +1721,9 @@ function acctUsageHtml(row){
       '<span class="hint">Authentication needs renewal. Choose Sign in again to update this account.</span></div>';
   var u=ACCT.usage[row.id];
   if(!u)return ACCT_USAGE_SKELETON+ACCT_USAGE_SKELETON;
+  if(u.status==="pending")
+    return'<div class="ureset">Waiting for first usage observation. '+
+      '<span class="hint">Usage will be available after this account’s scheduled poll. Reopen Claude accounts to check.</span></div>';
   if(u.status!=="ok")
     return'<div class="unavail">Could not load usage.'+
       (u.error?'<span class="hint">'+esc(u.error)+"</span>":"")+"</div>";
