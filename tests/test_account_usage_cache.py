@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from copy import deepcopy
 from typing import Any
 
 from claudex.claude.account_usage_cache import ClaudeAccountUsageCache
@@ -361,7 +362,7 @@ def test_restoring_older_usage_preserves_newer_live_results_and_failure_backoff(
     cache = _cache(fetch, clock)
     asyncio.run(cache.get(["ok", "failed"]))
     clock.advance(10)
-    before = {account_id: cache.peek_with_metadata(account_id) for account_id in ("ok", "failed")}
+    before = {account_id: deepcopy(cache.peek_with_metadata(account_id)) for account_id in ("ok", "failed")}
 
     for account_id in before:
         cache.restore_windows(account_id, {"session": {

@@ -28,6 +28,7 @@ import sqlite3
 import time
 import uuid
 from collections.abc import AsyncIterator, Iterator
+from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -1162,7 +1163,7 @@ def test_runtime_restart_restores_usage_before_first_poll_with_original_age(
                               "session": {"used_percent": 12.0, "resets_at": wall_now + 3600},
                               "updated_at": wall_now})
             assert (await cache.poll(account_id)).source == "fetched"
-            newer = cache.peek_with_metadata(account_id)
+            newer = deepcopy(cache.peek_with_metadata(account_id))
             await runtime.exit_mode("fallback", publish=lambda: None)
             await runtime.prepare_and_publish(
                 accounts=[record], accounts_root=paths.accounts_dir("claude"),

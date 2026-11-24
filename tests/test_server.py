@@ -12,6 +12,7 @@ import threading
 import time
 import uuid
 from collections.abc import AsyncIterator, Callable, Iterator
+from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -1765,7 +1766,7 @@ class TestAdminClaudeAccountsApi:
             cache = ClaudeAccountUsageCache(fetch_usage)
             client.app.state.claude_account_usage_cache = cache
             client.portal.call(cache.get, [account_id])
-            usage_before = cache.peek(account_id)
+            usage_before = deepcopy(cache.peek(account_id))
             async def reject_upstream(*args: Any, **kwargs: Any) -> Any:
                 pytest.fail("local cooldown reset must not contact upstream")
             monkeypatch.setattr(client.app.state.http_client, "send", reject_upstream)
