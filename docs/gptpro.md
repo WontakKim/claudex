@@ -225,8 +225,11 @@ verifies that the current file owner actually owns the selected card wrapper.
 A marker, matching host node, filename, or ready count alone is insufficient.
 Unknown, malformed, stale, unrelated, or over-budget identity cannot qualify.
 Pre-existing cards in any state are excluded across renames and rerenders.
-Unclassifiable non-control composer content stops the upload before the drop;
-it is not treated as an empty attachment baseline.
+Presentation-only UI tooltips (`role="tooltip"`), including their nested text,
+are not attachment content and do not invalidate the attachment baseline or
+current-card checks. Other unclassifiable non-control composer content still
+blocks attachment validation; before the drop, it is not treated as an empty
+attachment baseline.
 Same-name files require distinct receipt IDs and distinct new cards; repeated
 ID witnesses within one card count once, while conflicting ID/card assignments
 block settlement.

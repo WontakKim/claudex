@@ -2548,7 +2548,13 @@ def test_standalone_upload_pins_generic_form_before_local_drop(tmp_path: Path) -
     asyncio.run(run())
 
 
-def test_current_attachment_binding_with_real_dom_visibility_and_replacement() -> None:
+@pytest.mark.parametrize(("tooltip_phase", "nested_tooltip"), [
+    ("none", False), ("baseline", False), ("baseline", True),
+    ("current", False), ("current", True),
+])
+def test_current_attachment_binding_with_real_dom_visibility_and_replacement(
+    tooltip_phase: str, nested_tooltip: bool,
+) -> None:
     async def run() -> None:
         async with async_playwright() as playwright:
             executable = Path(playwright.chromium.executable_path)
@@ -2563,10 +2569,16 @@ def test_current_attachment_binding_with_real_dom_visibility_and_replacement() -
             try:
                 page = await browser.new_page()
                 await page.set_content('<main><form data-chatgpt-composer><textarea class="composer"></textarea></form></main>')
-                result = await page.evaluate(r"""(source) => {
+                result = await page.evaluate(r"""({ source, tooltipPhase, nestedTooltip }) => {
                   const form = document.querySelector('form');
+                  const tooltip = document.createElement('div');
+                  tooltip.setAttribute('role', 'tooltip');
+                  if (nestedTooltip) tooltip.innerHTML = '<div><div>Show full composer</div></div>';
+                  else tooltip.textContent = 'Expand';
+                  if (tooltipPhase === 'baseline') form.appendChild(tooltip);
                   const create = new Function(`return (${source});`)();
                   const tracker = create({ form, composerSelector: '.composer', names: ['dom.txt'] });
+                  const baselineValid = tracker.baseline_valid;
                   const wrapper2 = form.appendChild(document.createElement('div'));
                   wrapper2.style.display = 'contents';
                   wrapper2.innerHTML = '<div style="display:contents"><div><span><svg></svg></span><span><span>Text</span><span>dom.txt</span></span><span>91 B</span><button aria-label="Remove dom.txt">Remove</button></div></div>';
@@ -2591,6 +2603,13 @@ def test_current_attachment_binding_with_real_dom_visibility_and_replacement() -
                   Object.defineProperty(wrapper1, '__reactFiber$test', { value: host[0] });
                   const options = { aliases: { file_dom: 'upload-1' }, names: ['dom.txt'] };
                   const ready = tracker.read(options);
+                  if (tooltipPhase === 'current') form.appendChild(tooltip);
+                  const withTooltip = tracker.read(options);
+                  const unknownContent = document.createElement('div');
+                  unknownContent.innerHTML = '<div><div>Show full composer</div></div>';
+                  form.appendChild(unknownContent);
+                  const unclassified = tracker.read(options);
+                  unknownContent.remove();
                   card.setAttribute('aria-busy', 'true');
                   const processing = tracker.read(options);
                   card.removeAttribute('aria-busy');
@@ -2606,10 +2625,15 @@ def test_current_attachment_binding_with_real_dom_visibility_and_replacement() -
                   navigation.remove();
                   rootState.current = root[1];
                   const stale = tracker.read(options);
-                  return { ready, processing, hidden, ineligibleForm, stale };
-                }""", attachments.CREATE_ATTACHMENT_BINDING_TRACKER_JS)
+                  return { baselineValid, ready, withTooltip, unclassified, processing, hidden, ineligibleForm, stale };
+                }""", {"source": attachments.CREATE_ATTACHMENT_BINDING_TRACKER_JS,
+                       "tooltipPhase": tooltip_phase, "nestedTooltip": nested_tooltip})
             finally:
                 await browser.close()
+        assert result["baselineValid"] is True
+        assert result["withTooltip"] == result["ready"]
+        assert result["unclassified"]["valid"] is False
+        assert result["unclassified"]["bindings"] == []
         ready = result["ready"]
         assert ready["valid"] and not ready["conflict"]
         assert len(ready["bindings"]) == 1

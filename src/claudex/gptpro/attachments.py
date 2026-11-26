@@ -680,7 +680,7 @@ CREATE_ATTACHMENT_BINDING_TRACKER_JS = r"""({ form: suppliedForm, composerSelect
     const safeElements = elements.filter((node) =>
       !['INPUT', 'TEXTAREA', 'SCRIPT', 'STYLE', 'IFRAME', 'OBJECT', 'EMBED'].includes(node.tagName) &&
       (node.tagName === 'BUTTON' || !node.closest('button')) &&
-      !node.closest('[contenteditable], [role="textbox"]'));
+      !node.closest('[contenteditable], [role="textbox"], [role="tooltip"]'));
     const expected = new Set([...names, ...extraNames]);
     // File cards place the filename at child path 1/1 beside an SVG file icon.
     const structuredCards = new Map();
